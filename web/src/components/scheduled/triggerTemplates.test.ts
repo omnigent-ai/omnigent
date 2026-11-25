@@ -9,15 +9,20 @@ import {
   describePagerDutyFilter,
   describeSlackFilter,
   emptyTriggerFields,
+  FOLLOWED_SLACK_THREAD_HOURS,
+  MAX_FOLLOWED_SLACK_THREADS,
   jiraAssignee,
   parseGithubReviewer,
+  promptMayRunSavedWorkflow,
   isTaskSessionTriggerPrompt,
   hasTriggerHeader,
   isTriggerPrompt,
   triggerPromptSource,
   readTriggerMessageMaxChars,
+  readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   LEGACY_MAX_INSTRUCTIONS_CHARS,
+  LEGACY_SESSION_MESSAGE_MAX_CHARS,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerConfigPrompt,
   renderTriggerPrompt,
@@ -26,12 +31,14 @@ import {
   splitTriggerPrompt,
   stripScopePrefix,
   splitJqlOrderBy,
+  syncTriggerWorkflowId,
   triggerConditionFields,
   triggerEventDescription,
   stripTriggerHeader,
   triggerFieldsComplete,
   triggerMessageBudget,
   triggerScopeOperators,
+  updateTriggerWorkerPlacement,
   updateTriggerWorkerSettings,
   withTriggerEvent,
   TRIGGER_SOURCES,
@@ -85,6 +92,108 @@ describe("saved trigger prompts", () => {
     expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("permission_mode");
   });
 
+  const WORKFLOW_ID = "0123456789abcdef0123456789abcdef";
+  const WORKFLOW_RUN = `/workflow Run the saved workflow "Triage" (ID ${WORKFLOW_ID}).\n\nOnly bugs`;
+
+  it.each(TRIGGER_SOURCES)(
+    "starts each %s match's session as a run of the saved workflow its instructions run",
+    (source) => {
+      const prompt = renderTriggerPrompt(source, fields({ instructions: WORKFLOW_RUN }), {
+        ...CTX,
+        model: "old",
+        workflowIdSupported: true,
+      });
+      expect(prompt).toContain(`, workflow_id "${WORKFLOW_ID}", model "old"`);
+      // The session's first message still opens with the instructions, which run the workflow skill.
+      expect(prompt).toContain("The message starts with the instructions below");
+      expect(splitTriggerPrompt(prompt).userPrompt).toBe(WORKFLOW_RUN);
+      expect(readTriggerWorkerSettings(prompt)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "old" });
+      expect(readTriggerWorkerPlacement(prompt)).toBe("same_host");
+      expect(readTriggerMessageMaxChars(prompt)).toBe(32000);
+      // Changing the worker settings keeps the workflow.
+      expect(updateTriggerWorkerSettings(prompt, { ...AGENT_DEFAULT_WORKERS, model: "new" })).toBe(
+        prompt.replace('model "old"', 'model "new"'),
+      );
+      // Moving the workers keeps the workflow and the other settings.
+      const managed = updateTriggerWorkerPlacement(prompt, "managed");
+      expect(managed).toBe(prompt.replace('placement "same_host"', 'placement "managed"'));
+      expect(readTriggerWorkerPlacement(managed)).toBe("managed");
+      expect(updateTriggerWorkerPlacement(managed, "same_host")).toBe(prompt);
+      expect(updateTriggerWorkerPlacement(prompt, "same_host")).toBe(prompt);
+    },
+  );
+
+  it("starts workers as workflow runs only for their own sessions, on a server that can", () => {
+    const runsWorkflow = fields({ instructions: WORKFLOW_RUN });
+    const supported = { ...CTX, workflowIdSupported: true };
+    expect(renderTriggerPrompt("jira", runsWorkflow, CTX)).not.toContain("workflow_id");
+    expect(renderTriggerPrompt("jira", fields(), supported)).not.toContain("workflow_id");
+    expect(
+      renderTriggerPrompt("jira", runsWorkflow, { ...supported, taskSessionMode: "continue" }),
+    ).not.toContain("workflow_id");
+  });
+
+  it("reads a prompt's saved workflow as the server does, even when it won't split", () => {
+    const unsplittable = `${WORKFLOW_RUN}\n\nInstructions for each session:\nfirst.`;
+    const render = (instructions: string) =>
+      renderTriggerPrompt("jira", fields({ instructions }), CTX);
+    expect(promptMayRunSavedWorkflow(render(WORKFLOW_RUN))).toBe(true);
+    expect(splitTriggerPrompt(render(unsplittable)).systemPrompt).toBeNull();
+    expect(promptMayRunSavedWorkflow(render(unsplittable))).toBe(true);
+    expect(
+      promptMayRunSavedWorkflow(render(unsplittable.replace(WORKFLOW_RUN, "Triage it."))),
+    ).toBe(false);
+    expect(promptMayRunSavedWorkflow(WORKFLOW_RUN)).toBe(true);
+    expect(promptMayRunSavedWorkflow("Summarize overnight activity")).toBe(false);
+  });
+
+  it("keeps a prompt's creation call on the workflow its instructions now run", () => {
+    const supported = { ...CTX, workflowIdSupported: true };
+    const otherRun = WORKFLOW_RUN.replace(WORKFLOW_ID, "f".repeat(32));
+    const saved = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), supported);
+    const withInstructions = (instructions: string) =>
+      combineTriggerPrompt(instructions, splitTriggerPrompt(saved).systemPrompt);
+    expect(syncTriggerWorkflowId(saved, true)).toBe(saved);
+    // Another workflow, or none, takes over the call, as a fresh render would.
+    expect(syncTriggerWorkflowId(withInstructions(otherRun), true)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: otherRun }), supported),
+    );
+    expect(syncTriggerWorkflowId(withInstructions("Investigate the ticket."), true)).toBe(
+      renderTriggerPrompt("jira", fields(), supported),
+    );
+    // A server that can't take workflow_id gets none.
+    expect(syncTriggerWorkflowId(saved, false)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), CTX),
+    );
+    // A task session never starts as a run, and a call written by hand stays as written.
+    const taskSession = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), {
+      ...supported,
+      taskSessionMode: "continue",
+    });
+    expect(syncTriggerWorkflowId(taskSession, true)).toBe(taskSession);
+    expect(syncTriggerWorkflowId("A handwritten automation.", true)).toBe(
+      "A handwritten automation.",
+    );
+    // Instructions that repeat the heading keep a prompt from splitting; the call still
+    // follows the workflow they open with.
+    const unsplittable = (instructions: string) =>
+      renderTriggerPrompt(
+        "jira",
+        fields({ instructions: `${instructions}\n\nInstructions for each session:\nfirst.` }),
+        supported,
+      );
+    const seeded = unsplittable(WORKFLOW_RUN);
+    expect(splitTriggerPrompt(seeded).systemPrompt).toBeNull();
+    expect(seeded).toContain(`workflow_id "${WORKFLOW_ID}"`);
+    expect(syncTriggerWorkflowId(seeded, true)).toBe(seeded);
+    expect(syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, otherRun), true)).toBe(
+      unsplittable(otherRun),
+    );
+    expect(
+      syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, "Investigate the ticket."), true),
+    ).toBe(unsplittable("Investigate the ticket."));
+  });
+
   it.each(SOURCE_MODES)(
     "reads and edits $source worker settings saved under the older 8000-character limit in $taskSessionMode mode",
     ({ source, taskSessionMode }) => {
@@ -133,10 +242,8 @@ describe("saved trigger prompts", () => {
           ? 'agent_id "worker-agent", placement "same_host", title "Triage \\"orchestrator\\""'
           : 'agent_id "worker-agent", placement "same_host"',
       );
-      // Slack start replies carry the placeholder the runner fills in, kept as written.
-      const placeholder = source === "slack" ? ', session_id_placeholder "CONVERSATION_ID"' : "";
       expect(updated).toContain(
-        `model "model-with-\\"quotes\\"", reasoning_effort "low", permission_mode "approve-for-me"${placeholder}, and a message`,
+        'model "model-with-\\"quotes\\"", reasoning_effort "low", permission_mode "approve-for-me", and a message',
       );
       expect(updated).toContain("Keep this custom instruction.");
       const context = { ...CTX, taskSessionMode };
@@ -606,7 +713,9 @@ describe("Slack DM triggers", () => {
       slack({ scope: "eng-support, C0123ABCD", scopeOperator: "in" }),
       CTX,
     );
-    expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
+    expect(prompt).toContain(
+      "Watch: new Slack messages in #eng-support, C0123ABCD, then new replies in their threads\n",
+    );
   });
 
   it("saves a channel trigger's Slack lookups in its reply and bounds history reads", () => {
@@ -693,6 +802,193 @@ describe("Slack DM triggers", () => {
 
     expect(withAuthor).toContain("adding one yes/no column per author ID the conditions name");
     expect(withoutAuthor).not.toContain("yes/no column per author ID");
+  });
+});
+
+describe("Slack thread replies", () => {
+  const channel = (overrides: Partial<TriggerFields> = {}) =>
+    fields({
+      event: "posted",
+      scope: "eng-support",
+      scopeOperator: "is",
+      conditions: [{ field: "text", operator: "contains", value: "help" }],
+      ...overrides,
+    });
+  /** The numbered step of `prompt` that starts with `start`, e.g. 6 for "6. Then send". */
+  const stepNumber = (prompt: string, start: string) => {
+    const match = new RegExp(`\\n(\\d+)\\. ${start}`).exec(prompt);
+    if (match === null) throw new Error(`No step starts with: ${start}`);
+    return Number(match[1]);
+  };
+
+  it("sends new replies in a channel trigger's threads to the session the thread's message went to", () => {
+    const prompt = renderTriggerPrompt("slack", channel(), CTX);
+
+    expect(prompt).toContain(
+      'Watch: new Slack messages in #eng-support whose text contains "help", then new replies in their threads\n',
+    );
+    // The thread step runs after sessions start, so this run's new threads are followed too.
+    const create = stepNumber(
+      prompt,
+      "For each other message, oldest first, call sys_session_create",
+    );
+    const threads = stepNumber(prompt, "Then send new replies in the threads you follow");
+    expect(threads).toBe(create + 1);
+    expect(stepNumber(prompt, "Reply with the title and session ID")).toBe(threads + 1);
+
+    // Thread state comes from the same reply as the check time, so a reply without it can't
+    // drop the followed threads.
+    expect(prompt).toContain(
+      `The reply you read your check time from, when it has a "Slack threads:" line, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>"`,
+    );
+    // A session an earlier run started without recording it still gets its thread followed, but
+    // only once its history shows the task: it can exist without one, and follow-ups would reach
+    // a session that never got its instructions.
+    expect(prompt).toContain(
+      "Add the thread of each message this run started a session for with its task delivered, or that you found an earlier run started one for without recording it in its reply once that session's history (sys_session_get_history) shows your task message, with session set to that session's conversation_id and through set to the message's own ts",
+    );
+    expect(prompt).toContain(
+      'If such an earlier session\'s history doesn\'t show your task message, list it as "<title> <conversation_id>" on a "Delivery pending:" line instead, so its thread is followed once the task is confirmed, and never resend the task.',
+    );
+    // Re-adding a followed thread mustn't rewind it and send its replies again.
+    expect(prompt).toContain("a thread you already follow keeps its through.");
+    // The cap bounds reads up front; expiry waits until a thread is read, so a reply posted just
+    // before a thread would expire still reaches its session.
+    const cap = `Follow at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`;
+    const read = "For each thread you follow, read the replies posted in it";
+    const expire = `Then stop following each thread whose read in this run was complete and found nothing posted in it in the ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted, and whose through is older than that too`;
+    for (const rule of [cap, read, expire]) expect(prompt).toContain(rule);
+    expect(prompt.indexOf(cap)).toBeLessThan(prompt.indexOf(read));
+    expect(prompt.indexOf(read)).toBeLessThan(prompt.indexOf(expire));
+    // A deferred lookup or refused send leaves through old, so expiry mustn't drop that thread.
+    expect(prompt).toContain(
+      "a thread with a reply you deferred or couldn't send keeps being followed.",
+    );
+    // A reply posted during a run waits for the next run instead of moving through past it.
+    expect(prompt).toContain(
+      "read the replies posted in it after its through and by the time you noted, for example with conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, latest set to the time you noted as a Unix timestamp, inclusive false",
+    );
+    expect(prompt).toContain("replies posted after the time you noted (the next run reads them)");
+    expect(prompt).toContain(
+      "If a read fails or you can't read every page of a thread, keep its through and send nothing for it in this run, so the next run reads it again.",
+    );
+    // A worker's own thread posts (bot replies, or the owner's account with the attribution
+    // line) must not come back to it as new replies.
+    expect(prompt).toContain(
+      'messages with a system subtype or the bot_message subtype, posts that end with a "Sent with Omnigent" line, which Omnigent sessions add to what they post, and posts by bots.',
+    );
+    // Slack sets bot_id on what a person posts through an app (such as a Slack MCP), so a
+    // bot_id alone mustn't drop a person's follow-up.
+    expect(prompt).toContain(
+      "A person can post through an app, so a reply with a bot_id is a bot's only when its user is a bot: check each such user with users.info",
+    );
+    // Only a confirmed bot is left out: a failed lookup defers the thread rather than moving
+    // through past what may be a person's reply.
+    expect(prompt).toContain(
+      "leave the reply out only when is_bot is true. If a lookup fails, keep that thread's through and send nothing for it in this run, so the next run checks again.",
+    );
+    // A privacy filter can hide the user of a person's app-posted reply; skipping it would lose it.
+    expect(prompt).toContain(
+      "A reply whose user is missing or hidden counts as a person's, since a filter can hide the user of a person's reply",
+    );
+    expect(prompt).toContain(
+      "The conditions above apply only to the message that starts a thread, so every other reply counts.",
+    );
+    expect(prompt).toContain(
+      "send its session one message under 32000 characters with sys_session_message, with session_id set to the thread's session",
+    );
+    expect(prompt).toContain(
+      '"Slack <channel> <thread ts> replies through <ts of the newest reply it carries>"',
+    );
+    expect(prompt).toContain("following the instructions it already has");
+    // Every channel trigger follows its threads, so the session stays quiet unless a reply needs it.
+    expect(prompt).toContain(
+      "It says to post in that same thread only when a reply asks it something or needs it to act, and not for thanks, acknowledgements or people talking among themselves",
+    );
+    expect(prompt).toContain(
+      "to name the message that started the thread, not a reply, wherever a Slack tool asks which message to reply to",
+    );
+    expect(prompt).toContain("between <slack-replies> and </slack-replies> lines");
+    // A backlog too big for one message is sent oldest first, and through covers only what went.
+    expect(prompt).toContain(
+      "If the replies still don't fit, the message carries only the oldest ones that do, and the rest wait for the next run.",
+    );
+    // Dedupe: an accepted or uncertain send, or a thread whose new replies were all left out,
+    // moves the thread past those replies for good.
+    expect(prompt).toContain(
+      "Once a send is accepted, set the thread's through to the ts of the newest reply that message carried; when you left out every new reply in a thread, set it to the ts of the newest reply you read in it.",
+    );
+    expect(prompt).toContain(
+      "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
+    );
+    // Match prior delivery titles after the sender prefix to avoid resending an uncheckpointed batch.
+    const recover =
+      "An earlier run can send replies and stop before its reply records them, so before sending a thread's replies, look through your own earlier calls in this session that sent replies to that thread, and the latest items of the thread's session (sys_session_get_history, tail_items 50), for a message from your session that names a \"Slack <channel> <thread ts> replies through <ts>\" title for this thread. Treat every reply up to the newest ts such a title names as already handled, whether that send was accepted or unclear";
+    expect(prompt).toContain(recover);
+    expect(prompt.indexOf(recover)).toBeLessThan(
+      prompt.indexOf("For each thread with replies left, send its session one message"),
+    );
+    // Pending entries name top-level messages; a thread send there would be read back as one, so
+    // the step uses the line only for an unconfirmed top-level task.
+    const threadStep =
+      prompt.split("\n").find((line) => line.includes("Then send new replies")) ?? "";
+    expect(threadStep.split('"Delivery pending:"').length - 1).toBe(1);
+    expect(threadStep).toContain(
+      'list it as "<title> <conversation_id>" on a "Delivery pending:" line instead, so its thread is followed once the task is confirmed',
+    );
+    expect(prompt).toContain("stop following that thread and say so in your reply");
+    expect(prompt).toContain(
+      "Stopping means starting no more sessions in this run; still send new thread replies and write your reply.",
+    );
+    expect(prompt).toContain("Do this step even if you stopped starting sessions above");
+    expect(prompt).toContain(
+      'above "Checked through:" write a "Slack threads:" line followed by one-line JSON of the threads you follow after this run\'s changes, carried over unchanged when you skipped that step, or {} when you follow none.',
+    );
+  });
+
+  it("sends a task session's thread replies there with its instructions", () => {
+    const prompt = renderTriggerPrompt("slack", channel(), { ...CTX, taskSessionMode: "continue" });
+    // A delivery an earlier run made without recording it still gets its thread followed. It was
+    // found in the task session's history, so it needs no separate task confirmation.
+    expect(prompt).toContain(
+      "Add the thread of each message this run sent to your task session, or that you found an earlier run sent there without recording it, with session set to the task session it went to",
+    );
+    expect(prompt).not.toContain(
+      "If such an earlier session's history doesn't show your task message",
+    );
+    expect(prompt).toContain(
+      'a sentence saying that this is the task session of a Slack automation and that someone replied in the thread of a Slack message it was sent earlier, titled "Slack <channel> <thread ts>", then the instructions below',
+    );
+    expect(prompt).toContain("Do this step even if you stopped sending matches above");
+    expect(prompt).toContain(
+      "Stopping means sending no more matches in this run; still send new thread replies and write your reply.",
+    );
+  });
+
+  it("sizes thread messages to the server's message budget in both modes", () => {
+    for (const taskSessionMode of ["new", "continue"] as const) {
+      const prompt = renderTriggerPrompt("slack", channel(), {
+        ...CTX,
+        taskSessionMode,
+        messageMaxChars: LEGACY_SESSION_MESSAGE_MAX_CHARS,
+      });
+      expect(prompt).toContain(
+        `send its session one message under ${LEGACY_SESSION_MESSAGE_MAX_CHARS} characters with sys_session_message`,
+      );
+    }
+  });
+
+  it("leaves DM and group DM triggers without a thread step", () => {
+    for (const event of ["dm", "group_dm"]) {
+      const prompt = renderTriggerPrompt(
+        "slack",
+        channel({ event, scope: "alice, bob", conditions: [] }),
+        CTX,
+      );
+      expect(prompt).not.toContain("Slack threads:");
+      expect(prompt).not.toContain("replies in their threads");
+      expect(prompt).toContain("still write your reply.");
+    }
   });
 });
 
@@ -1146,6 +1442,71 @@ describe("trigger header", () => {
     expect(prompt).toContain('"Team" = "Backend"');
   });
 
+  it("round-trips a workflow trigger, and one saved before its workers started as runs", () => {
+    const workflowId = "a".repeat(32);
+    const saved = config("jira", {
+      instructions: `/workflow Run the saved workflow "Triage" (ID ${workflowId}).`,
+    });
+    const prompt = encodeTriggerPrompt(saved, { ...CTX, workflowIdSupported: true });
+    expect(prompt).toContain(`workflow_id "${workflowId}"`);
+    expect(decodeTriggerPrompt(prompt)).toEqual(saved);
+    const older = encodeTriggerPrompt(saved, CTX);
+    expect(older).not.toContain("workflow_id");
+    expect(decodeTriggerPrompt(older)).toEqual(saved);
+  });
+
+  it("still saves workflow trigger prompts in the layout the server reads", async () => {
+    // tests/server/scheduled/test_workflow_automations.py checks that the server reads
+    // these layouts as the form does. Only the parts it reads are kept, so this changes
+    // only with them: then update this snapshot with `vitest -u` and run those tests.
+    const layout = (saved: string) => {
+      const prompt = stripTriggerHeader(saved);
+      const mode = isTaskSessionTriggerPrompt(prompt) ? "the task session" : "each session";
+      const instructions = `\n\nInstructions for ${mode}:\n`;
+      const posting = `\n\nPosting instructions for ${mode}:\n`;
+      const opening =
+        /^This automation watches \S+ and starts one Omnigent session(?:, its task session,)?/.exec(
+          prompt,
+        )![0];
+      // The generated steps come before the instructions; after a posting heading, the
+      // server needs only that the heading is there.
+      const rest = prompt.slice(prompt.indexOf(instructions));
+      const postingAt = rest.lastIndexOf(posting);
+      return `${opening} ...${postingAt < 0 ? rest : `${rest.slice(0, postingAt + posting.length)}...`}`;
+    };
+    const scopes: Record<TriggerConfig["source"], string> = {
+      jira: "ES",
+      slack: "triage",
+      github: "example/project",
+      linear: "ENG",
+      pagerduty: "Checkout",
+    };
+    const save = (source: TriggerConfig["source"], taskSession: boolean, details = "Only bugs") =>
+      encodeTriggerPrompt(
+        {
+          ...emptyTriggerFields(source),
+          source,
+          scope: scopes[source],
+          instructions: `/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).\n\n${details}`,
+          ...(taskSession ? { taskSessionMode: "continue" as const } : {}),
+          worker: WORKER,
+        },
+        { ...CTX, workflowIdSupported: true },
+      );
+    const prompts: Record<string, string> = {};
+    for (const source of TRIGGER_SOURCES) {
+      prompts[`${source}_task_session`] = layout(save(source, true));
+      prompts[`${source}_per_match`] = layout(save(source, false));
+    }
+    // Instructions that repeat the heading keep the saved prompt from splitting.
+    prompts.jira_task_session_unsplittable = layout(
+      save("jira", true, "Read the notes under\n\nInstructions for the task session:\nfirst."),
+    );
+    await expect(`${JSON.stringify(prompts, null, 2)}\n`).toMatchFileSnapshot(
+      "../../../../tests/server/scheduled/fixtures/workflow_trigger_prompts.json",
+    );
+  });
+
   it("reads a header saved without the newer optional settings", () => {
     // Headers written before worker permissions existed have no permissionMode key.
     const saved = encodeTriggerPrompt(config("slack"), CTX);
@@ -1325,16 +1686,9 @@ describe("renderTriggerPrompt", () => {
         "<slack-reply>\n:hourglass_flowing_sand: Omnigent is working on it...\n\nTrack progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session>\nSent with Omnigent\n</slack-reply>\nReply in the same thread";
       if (linkBack) {
         expect(worker).toContain(startReply);
-        // The runner fills in the link, so the worker looks its ID up only as a fallback.
-        expect(manager).toContain('session_id_placeholder "CONVERSATION_ID", and a message under');
-        expect(worker.split("Track progress:")[0]).not.toContain("CONVERSATION_ID");
-        expect(worker).toContain(
-          "If the link still ends with an uppercase placeholder word instead of a session ID",
-        );
       } else {
         expect(worker).not.toContain("Track progress:");
         expect(worker).toContain("Do not send an acknowledgement or a session link.");
-        expect(manager).not.toContain("session_id_placeholder");
       }
       expect(worker).toContain('ends with a line "Sent with Omnigent"');
       expect(worker).toContain(
@@ -1349,10 +1703,26 @@ describe("renderTriggerPrompt", () => {
     },
   );
 
+  it.each(SOURCE_MODES)(
+    "loads a $source manager's tools in one search in $taskSessionMode mode",
+    ({ source, taskSessionMode }) => {
+      const prompt = renderTriggerPrompt(source, fields(), { ...CTX, taskSessionMode });
+
+      // One search, not one per tool, when the manager's tools load on demand.
+      expect(prompt).toContain(
+        "Each run:\n1. If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all:",
+      );
+      // Loading get_info up front avoids a second search for a blank worker agent's ID.
+      expect(prompt).toContain(
+        "each sys_session tool the steps below use, and sys_session_get_info, which returns your session and agent IDs.",
+      );
+      // The creation call stays the only sys_session_create the saved-prompt parser reads.
+      expect(readTriggerWorkerSettings(prompt)).not.toBeNull();
+    },
+  );
+
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
-    // Only Slack workers post their own session link, so only they opt in to the fill-in.
-    expect(prompt).not.toContain("session_id_placeholder");
 
     // Link-backs and worker posts go out under the owner's account, so both are signed.
     expect(prompt).toContain(
@@ -1412,8 +1782,13 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       'Skip any ticket you already started a session for, or that is on a "Delivery pending:" line. Check the sessions your earlier replies in this session say you started first.',
     );
+    // Only a run that read everything saw nothing after its checkpoint. A failed run can
+    // repeat an older checkpoint after an interrupted run left an unrecorded worker.
     expect(prompt).toContain(
-      "For results not listed there, call sys_session_list once with include_archived true, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID",
+      'If the last message you wrote before this run\'s message is a reply with no "Delivery pending:" entries whose "Checked through:" time equals the "Run time:" of the message it answered, that run read and handled every result, so a result created after that time can\'t have a session yet: start it without the check below. A reply that ends earlier, such as after a failed or partial run, doesn\'t count, even if it repeats an older check time.',
+    );
+    expect(prompt).toContain(
+      "For other results not listed there, call sys_session_list once with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID",
     );
     // Older runners silently ignore include_archived; their rows lack the archived field.
     expect(prompt).toContain(
@@ -1462,7 +1837,7 @@ describe("renderTriggerPrompt", () => {
       'If it returns a conversation_id with status created_initial_message_failed, the session exists but its task wasn\'t delivered: don\'t create another or resend now; list it as "<title> <conversation_id>" on a "Delivery pending:" line and go on.',
     );
     expect(prompt).toContain(
-      "2. For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true, following next_cursor through every page).",
+      "2. For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page).",
     );
     // An unconfirmed start that never happened is fetched again by key, since the
     // checkpoint may have moved past its creation time while it was pending.
@@ -1526,7 +1901,9 @@ describe("renderTriggerPrompt", () => {
       fields({ event: "posted", scope: "#eng-support", conditions: [] }),
       CTX,
     );
-    expect(unfiltered).toContain("Watch: new Slack messages in #eng-support\n");
+    expect(unfiltered).toContain(
+      "Watch: new Slack messages in #eng-support, then new replies in their threads\n",
+    );
     expect(unfiltered).toContain("Every top-level message counts.");
     // Bot posts still count, so a channel of alerts or a bot author can match.
     expect(unfiltered).not.toContain("bot_id set");
@@ -1912,7 +2289,7 @@ describe("one task session for every match", () => {
     );
     // The same lookup runs before a first start and before a replacement.
     expect(prompt).toContain(
-      `So before you start a task session, and to resolve an unconfirmed start, call sys_session_list once with include_archived true, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID and whose title is ${TITLE}. One that isn't archived and wasn't known as a task session before this run (named on a "Task session:" line, returned by your own earlier calls, or named after "replacing" on a pending entry) is your task session.`,
+      `So before you start a task session, and to resolve an unconfirmed start, call sys_session_list once with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID and whose title is ${TITLE}. One that isn't archived and wasn't known as a task session before this run (named on a "Task session:" line, returned by your own earlier calls, or named after "replacing" on a pending entry) is your task session.`,
     );
     expect(prompt).toContain(
       "If you have no task session, look for one as in step 2. If you find one, the run that started it may already have sent it this ticket: check its latest items for the title before sending. If there is none, start one",

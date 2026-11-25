@@ -78,6 +78,7 @@ RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+CAP_CODEX_SIDE_CHAT_RESUME = "codex_side_chat_resume"
 # The runner starts a codex-native session whose collaboration-mode label is
 # ``plan`` (armed on the New Session screen) in Codex Plan mode:
 CAP_CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
@@ -103,10 +104,14 @@ CAP_WORKSPACE_API = "workspace_api"
 # The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
 # (32,000) instead of 8,000, so automations can send long instructions:
 CAP_LONG_SESSION_MESSAGES = "long_session_messages"
+# The host's runners ship the ``import-memory`` framework skill, so the server may
+# list it; an older runner cannot load its content:
+CAP_MEMORY_IMPORT_SKILL = "memory_import_skill"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
+    CAP_CODEX_SIDE_CHAT_RESUME,
     CAP_CODEX_PLAN_AT_LAUNCH,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
@@ -125,6 +130,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
     CAP_LONG_SESSION_MESSAGES,
+    CAP_MEMORY_IMPORT_SKILL,
 ]
 # The workspace API needs the optional `omnigent[workspace-api]` extra.
 if importlib.util.find_spec("connectrpc") is not None:
@@ -235,6 +241,7 @@ def classify_launch_refusal(
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
+    RECOVER_SESSIONS = "host.recover_sessions"
     HELLO = "host.hello"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
@@ -364,6 +371,14 @@ class HostHelloFrame:
     connection_id: str | None = None
     workspace_socket: str | None = None
     workspace_token_key: str | None = field(default=None, repr=False)
+    recover_interrupted_sessions: bool = False
+
+
+@dataclass
+class HostRecoverSessionsFrame:
+    """Host requests reconciliation after its provider has restored local state."""
+
+    runners: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -442,6 +457,7 @@ class HostLaunchRunnerFrame:
     scheduled_run: ScheduledRunLogContext | None = None
     mcp_disabled_servers_active_harnesses: list[str] | None = None
     session_env_handoff_id: str | None = None
+    recovery: bool = False
 
 
 @dataclass
@@ -1298,6 +1314,20 @@ class HostFsWriteFrame:
     params: _JsonObject = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class PullRequestVouch:
+    """The server's word for the pull request a call reads, from the PRs it stores.
+
+    :param server_tracked: The server stores the session's PRs and the call's PR is one of
+        them, so the host serves it even if it never recorded it.
+    :param default_pr_url: The PR a call that names none reads, e.g.
+        ``"https://github.com/example/app/pull/7"``.
+    """
+
+    server_tracked: bool = False
+    default_pr_url: str | None = None
+
+
 @dataclass
 class HostWorkspaceCallFrame:
     """Server → host: one workspace API call (``omnigent.api.workspace.v1alpha1``).
@@ -1306,12 +1336,18 @@ class HostWorkspaceCallFrame:
     :param workspace: The session's workspace on the host, chosen by the server.
     :param method: Method name, e.g. ``"ReadFile"``.
     :param request: The serialized request message.
+    :param session_id: The session the caller was authorized for, on pull request calls.
+        Only the server sets it; a host serves no pull request call without it.
+    :param vouch: The server's vouch for a pull request call's PR, or ``None`` when the
+        server stores none of the session's PRs yet, so the host's own record decides.
     """
 
     request_id: str
     workspace: str
     method: str
     request: bytes = b""
+    session_id: str | None = None
+    vouch: PullRequestVouch | None = None
 
 
 @dataclass
@@ -1658,7 +1694,8 @@ class HostImportLocalDoneFrame:
 
 
 HostFrame = (
-    HostHelloFrame
+    HostRecoverSessionsFrame
+    | HostHelloFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
@@ -1796,6 +1833,13 @@ def encode_host_frame(frame: HostFrame) -> str:
     :returns: JSON string for the WebSocket text message.
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
+    if isinstance(frame, HostRecoverSessionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RECOVER_SESSIONS.value,
+                "runners": list(frame.runners),
+            }
+        )
     if isinstance(frame, HostHelloFrame):
         return _encode_payload(
             {
@@ -1814,6 +1858,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "connection_id": frame.connection_id,
                 "workspace_socket": frame.workspace_socket,
                 "workspace_token_key": frame.workspace_token_key,
+                "recover_interrupted_sessions": frame.recover_interrupted_sessions,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1851,6 +1896,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             )
         if frame.scheduled_run is not None:
             payload["scheduled_run"] = frame.scheduled_run.model_dump()
+        if frame.recovery:
+            payload["recovery"] = True
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -2259,6 +2306,18 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "method": frame.method,
                 "request": base64.b64encode(frame.request).decode(),
+                # Older hosts ignore these keys, and serve no pull request call.
+                **({"session_id": frame.session_id} if frame.session_id is not None else {}),
+                **(
+                    {
+                        "vouch": {
+                            "server_tracked": frame.vouch.server_tracked,
+                            "default_pr_url": frame.vouch.default_pr_url,
+                        }
+                    }
+                    if frame.vouch is not None
+                    else {}
+                ),
             }
         )
     if isinstance(frame, HostWorkspaceReplyFrame):
@@ -2726,6 +2785,10 @@ def _decode_known_host_frame(
     :raises ValueError: If the kind is unexpectedly unhandled.
     """
     match kind:
+        case HostFrameKind.RECOVER_SESSIONS:
+            return HostRecoverSessionsFrame(
+                runners=_optional_str_list(msg, "runners"),
+            )
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
         case HostFrameKind.CONNECTION_ERROR:
@@ -2867,6 +2930,8 @@ def _decode_known_host_frame(
                 workspace=_required_str(msg, "workspace"),
                 method=_required_str(msg, "method"),
                 request=base64.b64decode(_optional_nullable_str(msg, "request") or ""),
+                session_id=_optional_nullable_str(msg, "session_id"),
+                vouch=_optional_pull_request_vouch(msg, "vouch"),
             )
         case HostFrameKind.WORKSPACE_REPLY:
             message = _optional_nullable_str(msg, "message")
@@ -3006,6 +3071,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         connection_id=_optional_nullable_str(msg, "connection_id"),
         workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
         workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
+        recover_interrupted_sessions=_optional_bool(msg, "recover_interrupted_sessions"),
     )
 
 
@@ -3039,6 +3105,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         raise ValueError("inference_config must be an object or null")
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
+        recovery=_optional_bool(msg, "recovery"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
@@ -4017,6 +4084,29 @@ def optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:
     if not isinstance(val, dict):
         return None
     return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, bool)}
+
+
+def _optional_pull_request_vouch(msg: _JsonObject, key: str) -> PullRequestVouch | None:
+    """Return a workspace call's vouch, typed strictly: it decides which PRs ``gh`` reads.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, ``"vouch"``.
+    :returns: The vouch, or ``None`` when absent or null. Unknown keys are ignored.
+    :raises ValueError: If it isn't an object, ``server_tracked`` isn't a boolean, or
+        ``default_pr_url`` isn't a string or null.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, dict):
+        raise ValueError(f"frame field must be an object or null: {key!r}")
+    server_tracked = val.get("server_tracked", False)
+    if not isinstance(server_tracked, bool):
+        raise ValueError("frame field must be a boolean: 'vouch.server_tracked'")
+    default_pr_url = val.get("default_pr_url")
+    if default_pr_url is not None and not isinstance(default_pr_url, str):
+        raise ValueError("frame field must be a string or null: 'vouch.default_pr_url'")
+    return PullRequestVouch(server_tracked=server_tracked, default_pr_url=default_pr_url or None)
 
 
 def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "./sessionFamilies";
+import {
+  heldFolderRows,
+  isIndentedSibling,
+  isSessionPinned,
+  orderSessionFamilies,
+} from "./sessionFamilies";
 
 const member = (id: string, created_at: number, representative_id = "a") =>
   ({ id, created_at, family: { id: "family", representative_id, pinned: false } }) as Conversation;
@@ -12,8 +17,8 @@ describe("session families", () => {
     expect(orderSessionFamilies([standalone, c, a, b]).map((row) => row.id)).toEqual([
       "x",
       "a",
-      "b",
       "c",
+      "b",
     ]);
     expect([a, b, c].map(isIndentedSibling)).toEqual([false, true, true]);
     const promoted = [member("c", 3, "b"), member("b", 2, "b")];
@@ -38,5 +43,19 @@ describe("session families", () => {
     expect(isSessionPinned({ ...pinned, family: { ...pinned.family!, pinned: true } })).toBe(true);
     expect(isSessionPinned({ ...a, labels: { "omnigent.pinned": "50" } })).toBe(true);
     expect(isSessionPinned(b, new Set(["a"]))).toBe(true);
+  });
+
+  it("holds the open session's family under a collapsed folder", () => {
+    const [a, b, c] = [member("a", 1), member("b", 2), member("c", 3)];
+    const standalone = { id: "x", created_at: 4 } as Conversation;
+    const rows = [standalone, a, c, b];
+    const ids = (held: Conversation[]) => held.map((row) => row.id);
+    const none = new Set<string>();
+    expect(ids(heldFolderRows(rows, "b", none))).toEqual(["a", "c", "b"]);
+    expect(ids(heldFolderRows(rows, "x", none))).toEqual(["x"]);
+    expect(heldFolderRows(rows, "missing", none)).toEqual([]);
+    const collapsed = new Set(["family"]);
+    expect(ids(heldFolderRows(rows, "a", collapsed))).toEqual(["a", "c", "b"]);
+    expect(ids(heldFolderRows(rows, "b", collapsed))).toEqual(["b"]);
   });
 });

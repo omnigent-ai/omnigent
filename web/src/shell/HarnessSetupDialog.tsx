@@ -39,6 +39,7 @@ import {
   type ResolvedSetupStep,
 } from "@/lib/harnessSetup";
 import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
+import { HarnessSubscriptionSignIn } from "@/shell/HarnessSubscriptionSignIn";
 
 export function HarnessSetupDialog({
   open,
@@ -307,7 +308,11 @@ function SetupStepRow({
             harness={step.harness}
             label={label}
             host={host}
-            command={step.command}
+            subscription={
+              step.command ? (
+                <HarnessSubscriptionSignIn command={step.command} hostName={host?.name} />
+              ) : undefined
+            }
             onDone={() => setFormOpen(false)}
           />
         </div>

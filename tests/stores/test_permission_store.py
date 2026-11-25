@@ -10,14 +10,16 @@ SQLite file and tears it down automatically.
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, insert
+from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_checks_scope
-from omnigent.db.db_models import workspace_scope
-from omnigent.entities import ScheduledTaskPermission, SessionPermission
+from omnigent.db.db_models import SqlWorkflowShare, workspace_scope
+from omnigent.entities import ScheduledTaskPermission, SessionPermission, WorkflowPermission
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import session_sharing
 from omnigent.server.auth import (
@@ -34,6 +36,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.permission_store import (
     MAX_GRANTS_PAGE_SIZE,
     MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE,
+    MAX_SHARED_WORKFLOWS_PAGE_SIZE,
     PermissionStore,
 )
 from omnigent.stores.permission_store import sqlalchemy_store as permission_module
@@ -41,6 +44,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from omnigent.stores.workflow_store import WorkflowStore
 
 
 @pytest.fixture()
@@ -85,6 +89,22 @@ def _create_scheduled_task(db_uri: str, owner: str = "owner@example.com") -> str
         uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", owner, uuid.uuid4().hex, "UTC"
     )
     return task.id
+
+
+def _create_workflow(db_uri: str, owner: str = "owner@example.com") -> str:
+    """Save a workflow and return its id; grants refuse a missing workflow."""
+    workflow = WorkflowStore(db_uri).create(
+        user_id=owner, name=f"flow {uuid.uuid4().hex[:8]}", description="d", steps=[]
+    )
+    return workflow.id
+
+
+@pytest.fixture()
+def wider_workflow_grant_levels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allow Edit as well as Read, as a widened allowlist would, to exercise level changes."""
+    monkeypatch.setattr(
+        session_sharing, "WORKFLOW_GRANT_LEVELS", frozenset({LEVEL_READ, LEVEL_EDIT})
+    )
 
 
 @pytest.fixture()
@@ -1701,6 +1721,15 @@ def test_delete_for_scheduled_task_removes_only_that_tasks_grants(
     )
 
 
+def test_every_scheduled_task_is_shareable_by_default(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Only a store that cannot keep some automation's grants reports it unshareable."""
+    task_id = _create_scheduled_task(db_uri)
+    assert store.scheduled_task_shareable(task_id) is True
+    assert PermissionStore.scheduled_task_shareable(store, task_id) is True
+
+
 def test_scheduled_task_grant_refuses_a_missing_or_deleted_task(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
@@ -1833,6 +1862,308 @@ def test_store_without_scheduled_task_grants_keeps_safe_defaults() -> None:
     # The caller alone, and no automation shared with them.
     assert minimal.caller_principals("alice@example.com") == ["alice@example.com"]
     assert minimal.list_scheduled_tasks_shared_with(["alice@example.com"]) == ([], None)
+
+
+# ── workflow grants ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.usefixtures("wider_workflow_grant_levels")
+def test_workflow_grants_upsert_page_resolve_and_revoke(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A grant overwrites its level, pages by user_id, resolves the highest principal level,
+    and revoke reports whether it removed one."""
+    workflow_id, other_workflow_id = _create_workflow(db_uri), _create_workflow(db_uri)
+    user_ids = [f"user{i:02d}@example.com" for i in range(5)]
+    for user_id in [*reversed(user_ids), "editors"]:
+        _ensure_user(store, user_id)
+    assert store.supports_workflow_grants is True
+    assert store.workflow_shareable(workflow_id) is True
+    for user_id in reversed(user_ids):
+        assert store.grant_for_workflow(user_id, workflow_id, LEVEL_READ) == WorkflowPermission(
+            user_id, workflow_id, LEVEL_READ
+        )
+    store.grant_for_workflow("user00@example.com", other_workflow_id, LEVEL_READ)
+    store.grant_for_workflow("user00@example.com", workflow_id, LEVEL_EDIT)
+    store.grant_for_workflow("editors", workflow_id, LEVEL_EDIT)
+
+    pages: list[list[str]] = []
+    cursor = None
+    while True:
+        page, cursor = store.list_for_workflow(workflow_id, limit=2, after_user_id=cursor)
+        pages.append([grant.user_id for grant in page])
+        if cursor is None:
+            break
+    assert pages == [["editors", user_ids[0]], user_ids[1:3], user_ids[3:]]
+    assert store.list_for_workflow(other_workflow_id) == (
+        [WorkflowPermission("user00@example.com", other_workflow_id, LEVEL_READ)],
+        None,
+    )
+    for limit in (0, MAX_GRANTS_PAGE_SIZE + 1):
+        with pytest.raises(OmnigentError) as caught:
+            store.list_for_workflow(workflow_id, limit=limit)
+        assert caught.value.code == ErrorCode.INVALID_INPUT
+
+    assert store.resolve_workflow_access(["user01@example.com", "editors"], workflow_id) == 2
+    assert store.resolve_workflow_access(["user01@example.com", "viewers"], workflow_id) == 1
+    assert store.resolve_workflow_access(["bob@example.com"], workflow_id) is None
+    assert store.resolve_workflow_access([], workflow_id) is None
+
+    store.grant_for_workflow("user00@example.com", workflow_id, LEVEL_READ)
+    assert store.resolve_workflow_access(["user00@example.com"], workflow_id) == LEVEL_READ
+    assert store.revoke_for_workflow("user00@example.com", workflow_id) is True
+    assert store.revoke_for_workflow("user00@example.com", workflow_id) is False
+    assert store.resolve_workflow_access(["user00@example.com"], workflow_id) is None
+    assert store.resolve_workflow_access(["user00@example.com"], other_workflow_id) == 1
+
+
+def test_workflows_shared_with_a_caller_page_once_each_and_skip_deleted_ones(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Pages walk workflow IDs past the cursor; a workflow granted to two principals lists
+    once, and a deleted workflow's leftover grant is skipped without stalling the cursor."""
+    workflows = WorkflowStore(db_uri)
+    workflow_ids = sorted(_create_workflow(db_uri) for _ in range(5))
+    for user_id in ("alice@example.com", "team", "bob@example.com"):
+        _ensure_user(store, user_id)
+    for workflow_id in workflow_ids[:3]:
+        store.grant_for_workflow("alice@example.com", workflow_id, LEVEL_READ)
+    for workflow_id in workflow_ids[2:]:
+        store.grant_for_workflow("team", workflow_id, LEVEL_READ)
+    store.grant_for_workflow("bob@example.com", _create_workflow(db_uri), LEVEL_READ)
+
+    principals = ["team", "alice@example.com", "team"]
+    pages: list[list[str]] = []
+    cursors: list[str | None] = []
+    cursor = None
+    while True:
+        page, cursor = store.list_workflows_shared_with(
+            principals, limit=2, after_workflow_id=cursor
+        )
+        pages.append(page)
+        cursors.append(cursor)
+        if cursor is None:
+            break
+    assert pages == [workflow_ids[:2], workflow_ids[2:4], workflow_ids[4:]]
+    assert cursors == [workflow_ids[1], workflow_ids[3], None]
+    assert store.list_workflows_shared_with(["carol@example.com"]) == ([], None)
+    assert store.list_workflows_shared_with([]) == ([], None)
+    for limit in (0, MAX_SHARED_WORKFLOWS_PAGE_SIZE + 1):
+        with pytest.raises(OmnigentError) as caught:
+            store.list_workflows_shared_with(principals, limit=limit)
+        assert caught.value.code == ErrorCode.INVALID_INPUT
+
+    # The grants outlive their deleted workflows until delete_for_workflow runs.
+    assert workflows.delete(workflow_ids[0], user_id="owner@example.com")
+    assert workflows.delete(workflow_ids[1], user_id="owner@example.com")
+    first = store.list_workflows_shared_with(["alice@example.com"], limit=2)
+    assert first == ([], workflow_ids[1])
+    assert store.list_workflows_shared_with(
+        ["alice@example.com"], limit=2, after_workflow_id=first[1]
+    ) == ([workflow_ids[2]], None)
+
+
+def test_delete_for_workflow_removes_only_that_workflows_grants(
+    store: SqlAlchemyPermissionStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grants go in batches that each commit on their own, until a batch comes back empty."""
+    workflow_id, other_workflow_id = _create_workflow(db_uri), _create_workflow(db_uri)
+    user_ids = [f"user{i}@example.com" for i in range(5)]
+    for user_id in user_ids:
+        _ensure_user(store, user_id)
+        store.grant_for_workflow(user_id, workflow_id, LEVEL_READ)
+    store.grant_for_workflow("user0@example.com", other_workflow_id, LEVEL_READ)
+    monkeypatch.setattr(store, "_cleanup_batch_size", 2)
+    batch_deletions: list[int] = []
+    run_write_transaction = permission_module.run_write_transaction
+
+    def recording_transaction(session_maker, operation_name, callback, **kwargs):
+        result = run_write_transaction(session_maker, operation_name, callback, **kwargs)
+        batch_deletions.append(result[1])
+        return result
+
+    monkeypatch.setattr(permission_module, "run_write_transaction", recording_transaction)
+
+    assert store.delete_for_workflow(workflow_id) == 5
+    assert max(batch_deletions) <= 2
+    assert len([count for count in batch_deletions if count]) >= 3
+    assert store.delete_for_workflow(workflow_id) == 0
+    assert store.list_for_workflow(workflow_id) == ([], None)
+    assert store.list_for_workflow(other_workflow_id) == (
+        [WorkflowPermission("user0@example.com", other_workflow_id, LEVEL_READ)],
+        None,
+    )
+
+
+def test_workflow_grant_cleanup_reads_only_the_batchs_grants(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """A cleanup batch reads O(batch) grant rows however many other grants the workspace has."""
+    if store._engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL execution-plan regression")
+    # Other workflows' grants sit on both sides of the deleted ones in key order.
+    deleting = [f"{index:032x}" for index in (20_000, 20_001)]
+    rows = [
+        {
+            "workspace_id": 0,
+            "workflow_id": f"{index:032x}",
+            "user_id": f"u{index % 97}",
+            "level": 1,
+        }
+        for index in range(1_000, 41_000)
+        if index not in (20_000, 20_001)
+    ] + [
+        {"workspace_id": 0, "workflow_id": workflow_id, "user_id": f"g{n:03d}", "level": 1}
+        for workflow_id in deleting
+        for n in range(80)
+    ]
+    with store._engine.begin() as connection:
+        connection.execute(insert(SqlWorkflowShare), rows)
+        connection.exec_driver_sql("ANALYZE workflow_shares")
+    plans: list[str] = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT workflow_shares."):
+            explained = conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters)
+            plans.append("\n".join(row[0] for row in explained))
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        with Session(store._engine) as session:
+            assert (
+                permission_module.delete_grants_on_workflows(session, deleting, batch_size=100)
+                == 100
+            )
+            session.rollback()
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert plans
+    for plan in plans:
+        # Rows each step actually read, and any a filter threw away.
+        examined = [int(n) for n in re.findall(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", plan)]
+        assert examined and max(examined) <= 100, plan
+        assert "Rows Removed by Filter" not in plan, plan
+    # One read per workflow: 80 grants, then the batch's last 20.
+    assert len(plans) == 2, plans
+
+
+@pytest.mark.parametrize(
+    ("user_id", "level", "storable"),
+    [
+        ("x" * 128, LEVEL_READ, True),
+        ("x" * 129, LEVEL_READ, False),
+        ("alice@example.com", LEVEL_EDIT, False),
+        ("alice@example.com", LEVEL_OWNER, False),
+        (RESERVED_USER_PUBLIC, LEVEL_READ, False),
+        ("__PUBLIC__", LEVEL_READ, False),
+        (RESERVED_USER_LOCAL, LEVEL_READ, False),
+        ("owner@example.com", LEVEL_READ, False),
+    ],
+    ids=[
+        "widest-id",
+        "over-wide-id",
+        "edit",
+        "owner-level",
+        "public",
+        "public-variant",
+        "local",
+        "owner",
+    ],
+)
+def test_workflow_grant_refuses_what_the_store_must_not_hold(
+    store: SqlAlchemyPermissionStore, db_uri: str, user_id: str, level: int, storable: bool
+) -> None:
+    """IDs fit the column on every engine; grants are Read only, never to the owner, and
+    never public or local."""
+    workflow_id = _create_workflow(db_uri, owner="owner@example.com")
+    if storable:
+        _ensure_user(store, user_id)
+        store.grant_for_workflow(user_id, workflow_id, level)
+    else:
+        with pytest.raises(OmnigentError) as caught:
+            store.grant_for_workflow(user_id, workflow_id, level)
+        assert caught.value.code == ErrorCode.INVALID_INPUT
+    assert store.list_for_workflow(workflow_id)[0] == (
+        [WorkflowPermission(user_id, workflow_id, level)] if storable else []
+    )
+
+
+def test_workflow_grant_refuses_a_missing_workflow_and_follows_the_key_collation(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """No foreign key cascades, so a grant on a missing workflow would outlive nothing.
+    MySQL's keys fold case and accents: a grantee's variant merges into one grant, and
+    variants of the owner or a reserved ID are refused."""
+    _ensure_user(store, "alice@example.com")
+    with pytest.raises(OmnigentError) as missing:
+        store.grant_for_workflow("alice@example.com", uuid.uuid4().hex, LEVEL_READ)
+    assert missing.value.code == ErrorCode.NOT_FOUND
+
+    workflow_id = _create_workflow(db_uri, owner="alice@example.com")
+    accent_variants = ["__públic__", "lócal"]
+    for user_id in ("bob@example.com", "Bob@example.com", "Alice@example.com", *accent_variants):
+        _ensure_user(store, user_id)
+        try:
+            store.grant_for_workflow(user_id, workflow_id, LEVEL_READ)
+        except OmnigentError as error:
+            assert error.code == ErrorCode.INVALID_INPUT, error
+    folds_case = store._engine.dialect.name == "mysql"
+    grants, _ = store.list_for_workflow(workflow_id)
+    assert {grant.user_id for grant in grants} == (
+        {"bob@example.com"}
+        if folds_case
+        else {"bob@example.com", "Bob@example.com", "Alice@example.com", *accent_variants}
+    )
+
+
+def test_workflow_grants_are_scoped_to_the_workspace(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    with workspace_scope(101):
+        workflow_id = _create_workflow(db_uri)
+        _ensure_user(store, "alice@example.com")
+        store.grant_for_workflow("alice@example.com", workflow_id, LEVEL_READ)
+
+    with workspace_scope(102):
+        with pytest.raises(OmnigentError) as caught:
+            store.grant_for_workflow("alice@example.com", workflow_id, LEVEL_READ)
+        assert caught.value.code == ErrorCode.NOT_FOUND
+        assert store.list_for_workflow(workflow_id) == ([], None)
+        assert store.resolve_workflow_access(["alice@example.com"], workflow_id) is None
+        assert store.list_workflows_shared_with(["alice@example.com"]) == ([], None)
+        assert store.revoke_for_workflow("alice@example.com", workflow_id) is False
+        assert store.delete_for_workflow(workflow_id) == 0
+
+    with workspace_scope(101):
+        assert store.resolve_workflow_access(["alice@example.com"], workflow_id) == LEVEL_READ
+        assert store.list_workflows_shared_with(["alice@example.com"]) == ([workflow_id], None)
+
+
+def test_store_without_workflow_grants_keeps_safe_defaults() -> None:
+    """A subclass without workflow grants still instantiates and holds or grants none."""
+    workflow_methods = {
+        "workflow_shareable",
+        "grant_for_workflow",
+        "revoke_for_workflow",
+        "list_for_workflow",
+        "resolve_workflow_access",
+        "list_workflows_shared_with",
+        "delete_for_workflow",
+    }
+    assert not workflow_methods & PermissionStore.__abstractmethods__
+    minimal = _minimal_store()
+
+    assert minimal.supports_workflow_grants is False
+    assert minimal.workflow_shareable("flow") is True
+    with pytest.raises(OmnigentError) as caught:
+        minimal.grant_for_workflow("alice@example.com", "flow", LEVEL_READ)
+    assert caught.value.code == ErrorCode.FORBIDDEN
+    assert minimal.revoke_for_workflow("alice@example.com", "flow") is False
+    assert minimal.list_for_workflow("flow") == ([], None)
+    assert minimal.resolve_workflow_access(["alice@example.com"], "flow") is None
+    assert minimal.list_workflows_shared_with(["alice@example.com"]) == ([], None)
+    assert minimal.delete_for_workflow("flow") == 0
+    assert minimal.deleted_accounts(["alice@example.com"]) == set()
 
 
 def test_direct_session_reads_default_to_the_stores_reads() -> None:

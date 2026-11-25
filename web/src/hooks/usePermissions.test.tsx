@@ -42,6 +42,7 @@ import { useSession } from "./useSession";
 import {
   useCanEdit,
   useCanStartSideChat,
+  useIsSessionOwner,
   useGrantPermission,
   useRevokePermission,
 } from "./usePermissions";
@@ -174,6 +175,22 @@ describe("useCanStartSideChat", () => {
     // Single-user mode resolves no level and treats the viewer as the owner.
     setHooks({ session: null });
     expect(renderHook(() => useCanStartSideChat("conv_1", null)).result.current).toBe(true);
+  });
+});
+
+describe("useIsSessionOwner", () => {
+  it("is the server's answer, even against an admin's owner level", () => {
+    setHooks({ session: { ...makeSession(4), sideChatAllowed: false } });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBe(false);
+    setHooks({ session: { ...makeSession(4), sideChatAllowed: true } });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBe(true);
+  });
+
+  it("is unknown while loading or when the server doesn't say", () => {
+    setHooks({ session: null, sessionLoading: true });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBeNull();
+    setHooks({ session: makeSession(4) });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBeNull();
   });
 });
 

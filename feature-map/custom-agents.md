@@ -24,6 +24,13 @@ and deletes owned agents.
   and a server card opens its read-only summary.
 - Direct links: `/settings/custom-agents`, `/settings/custom-agents/new`, and
   `/settings/custom-agents/<agent-id>` open those same pages.
+- Settings search: the create form's fields are `#custom-agent-create:<part>` targets,
+  such as `instructions` or an MCP server's `command`. Picking one in Settings search
+  opens `/settings/custom-agents#custom-agent-create:<part>`, which lands on the Custom
+  agents list with Search agents focused, as the form isn't open there. Only a same-page
+  link, where just the hash changes on `/settings/custom-agents/new`, focuses the field
+  itself. An MCP server's fields are named after it ("Command for docs"), or after its
+  place ("Command for server 1") until it has a name.
 - Creation and review pages: Custom agents returns to the list; Cancel also
   returns from creation and configuration review. Owned agents open directly in
   an editable form with Save changes and Delete when the server supports them.

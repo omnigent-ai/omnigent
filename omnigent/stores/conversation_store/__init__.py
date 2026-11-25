@@ -16,6 +16,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.session_recovery import SessionRecovery
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -25,6 +26,9 @@ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
 MAX_PENDING_INPUTS = 100
+# Most sub-agents of one spawn tree read in a single bounded read; a bigger
+# tree is read in pages or not at all, depending on the reader.
+SPAWN_TREE_READ_CAP = 2000
 
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
@@ -131,6 +135,10 @@ class DailyCostState(TypedDict):
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# A viewer's mute (dimmed row, no notifications). Stored per-user and presented
+# under this bare key exactly like ``PINNED_LABEL_KEY``; deleted on unmute.
+MUTED_LABEL_KEY = "omnigent.muted"
+
 # Marks a top-level fork created as a side chat. A side chat surfaces only as a
 # Workspace-rail tab, so a conversation carrying this label is hidden from the
 # left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
@@ -173,6 +181,17 @@ def pinned_label_key(user_id: str | None) -> str:
         the id is too long).
     """
     return _scoped_pin_key(PINNED_LABEL_KEY + ".", user_id)
+
+
+def muted_label_key(user_id: str | None) -> str:
+    """
+    The per-user muted-label key for ``user_id``, derived like :func:`pinned_label_key`.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :returns: ``"omnigent.muted.<suffix>"``.
+    """
+    return _scoped_pin_key(MUTED_LABEL_KEY + ".", user_id)
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
@@ -579,6 +598,35 @@ class ConversationStore(ABC):
     ) -> bool:
         """Compare-and-set delivery state; None discards a canceled, unsent input."""
         raise NotImplementedError
+
+    supports_session_recovery = False
+
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against new input and the current host/runner binding."""
+        del conversation_id, expected
+        return False
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        """Read private recovery intent; unsupported stores do not opt in."""
+        del conversation_id
+        return None
+
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Original disconnect-error timestamp, or None when unavailable."""
+        del conversation_id
+        return None
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
+    ) -> bool:
+        """Compare and replace recovery intent under the conversation input lock."""
+        del conversation_id, expected, recovery, expected_conversation
+        return False
 
     def list_host_conversation_ids(
         self,
@@ -1148,6 +1196,8 @@ class ConversationStore(ABC):
         query: str,
         conversation_id: str | None = None,
         limit: int = 20,
+        *,
+        accessible_by: str,
     ) -> list[ConversationItem]:
         """
         Full-text search over conversation items.
@@ -1161,6 +1211,8 @@ class ConversationStore(ABC):
         :param conversation_id: Optional conversation to scope
             the search to, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of results to return.
+        :param accessible_by: Authenticated user whose session permissions
+            restrict matches before the result limit.
         :returns: A list of matching :class:`ConversationItem`
             objects ranked by relevance.
         """
@@ -1579,8 +1631,16 @@ class ConversationStore(ABC):
         """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
-    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+    def add_new_sibling(
+        self, source_id: str, session_id: str, *, user_id: str | None, move_existing: bool = False
+    ) -> None:
         """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        """Move one independent session into a nest, or detach it with ``None``."""
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:
@@ -2123,6 +2183,10 @@ class ConversationStore(ABC):
 
     def get_profile_host_binding(self, conversation_id: str) -> ProfileHostBinding:
         """Read host metadata and canonical profile labels by their complete unique keys."""
+        raise NotImplementedError
+
+    def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
+        """Read many sessions' canonical profile labels in one query; unlabeled ones are absent."""
         raise NotImplementedError
 
     def bind_profiled_host(

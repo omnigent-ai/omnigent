@@ -34,7 +34,12 @@ from unittest.mock import patch
 import pytest
 import yaml as _yaml
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import (
+    CodexSignerConfigurationError,
+    ErrorCode,
+    HarnessConfigurationError,
+    OmnigentError,
+)
 from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
@@ -44,6 +49,7 @@ from omnigent.inner.datamodel import (
     OSEnvSpec,
 )
 from omnigent.onboarding import ambient, harness_install
+from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from omnigent.runtime.workflow import (
     _apply_codex_provider_env,
     _bind_codex_gateway_credential,
@@ -58,6 +64,7 @@ from omnigent.runtime.workflow import (
     _resolve_catalog_default_model,
     _resolve_provider_for_build,
 )
+from omnigent.spec.parser import parse
 from omnigent.spec.types import (
     AgentSpec,
     ApiKeyAuth,
@@ -397,6 +404,32 @@ def _brokered_codex_spec(
     return spec, sandbox, binding
 
 
+@pytest.mark.parametrize("broker_gateway", [None, False], ids=["absent", "disabled"])
+def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    broker_gateway: bool | None,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.runtime import workflow
+
+    spec, _, binding = _brokered_codex_spec(
+        CredentialSourceSpec(kind="unix_socket", path="/private/model-token.sock"),
+        host="openai.example.com",
+        response_path="/v1/responses",
+    )
+    if broker_gateway is None:
+        spec.executor.config.pop("broker_gateway")
+    else:
+        spec.executor.config["broker_gateway"] = broker_gateway
+    binding.inject_env = ["UNRELATED_TOKEN"]
+    resolve_provider = Mock()
+    monkeypatch.setattr(workflow, "_resolve_provider_for_build", resolve_provider)
+    with pytest.raises(OmnigentError, match="credential_proxy"):
+        _build_codex_spawn_env(spec)
+    resolve_provider.assert_not_called()
+
+
 def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> None:
     _write_config(config_home, _openai_default_config())
     spec, _, binding = _brokered_codex_spec(
@@ -414,15 +447,9 @@ def test_codex_gateway_binding_uses_only_placeholder_auth(config_home: Path) -> 
     assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
     assert "/private/model-token.sock" not in env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]
 
-    spec.executor.config.pop("broker_gateway")
-    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
-        _build_codex_spawn_env(spec)
-    spec.executor.config["broker_gateway"] = False
-    with pytest.raises(OmnigentError, match=r"requires executor\.config\.broker_gateway: true"):
-        _build_codex_spawn_env(spec)
     for value in (None, 0, 1, "true", "false"):
         spec.executor.config["broker_gateway"] = value
-        with pytest.raises(OmnigentError, match="broker_gateway must be a boolean"):
+        with pytest.raises(HarnessConfigurationError, match="broker_gateway must be a boolean"):
             _build_codex_spawn_env(spec)
     spec.executor.config["broker_gateway"] = True
 
@@ -521,18 +548,7 @@ def test_locked_codex_gateway_requires_private_renewable_source_and_exact_route(
         _build_codex_spawn_env(spec)
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {},
-        {"web_search": False, "disable_native_tools": True},
-        {"web_search": "false", "disable_native_tools": 1},
-    ],
-)
-def test_codex_gateway_keeps_auth_for_ordinary_same_host_binding(
-    config_home: Path, settings: dict[str, object]
-) -> None:
-    _write_config(config_home, _openai_default_config())
+def test_codex_binding_keeps_ordinary_auth_for_non_reserved_same_host_token() -> None:
     binding = CredentialProxyEntry(
         host="openai.example.com",
         scheme="bearer",
@@ -545,13 +561,190 @@ def test_codex_gateway_keeps_auth_for_ordinary_same_host_binding(
         credential_proxy=CredentialProxySpec(entries=[binding]),
     )
     spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
+    ordinary_env = {
+        "HARNESS_CODEX_GATEWAY_BASE_URL": "https://openai.example.com/v1",
+        "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf %s sk-oai-secret",
+    }
+    env = ordinary_env.copy()
+
+    _bind_codex_gateway_credential(env, spec)
+
+    assert env == ordinary_env
+    assert "HARNESS_CODEX_BROKERED_GATEWAY" not in env
+
+
+@pytest.mark.parametrize(
+    ("settings", "tool_env"),
+    [
+        ({}, {}),
+        (
+            {"web_search": False, "disable_native_tools": True},
+            {
+                "HARNESS_CODEX_ENABLE_WEB_SEARCH": "false",
+                "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "true",
+            },
+        ),
+        ({"web_search": True, "disable_native_tools": False}, {}),
+    ],
+)
+def test_codex_gateway_without_proxy_retains_ordinary_auth(
+    config_home: Path, settings: dict[str, object], tool_env: dict[str, str]
+) -> None:
+    _write_config(config_home, _openai_default_config())
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        egress_rules=["POST openai.example.com/v1/responses"],
+    )
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
     spec.executor.config.update(settings)
 
     env = _build_codex_spawn_env(spec)
-
     assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
-    assert "HARNESS_CODEX_ENABLE_WEB_SEARCH" not in env
-    assert "HARNESS_CODEX_DISABLE_NATIVE_TOOLS" not in env
+    assert "HARNESS_CODEX_BROKERED_GATEWAY" not in env
+    assert {
+        key: value
+        for key, value in env.items()
+        if key in ("HARNESS_CODEX_ENABLE_WEB_SEARCH", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS")
+    } == tool_env
+
+
+@pytest.mark.parametrize(("key", "value"), [("web_search", "false"), ("disable_native_tools", 1)])
+def test_codex_tool_switches_reject_non_boolean_values(
+    config_home: Path, key: str, value: object
+) -> None:
+    spec = _make_spec(harness="codex")
+    spec.executor.config[key] = value
+
+    with pytest.raises(OmnigentError, match=rf"executor\.config\.{key} must be a boolean"):
+        _build_codex_spawn_env(spec)
+
+
+def test_codex_permissive_switches_keep_operator_restrictions(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
+    monkeypatch.setenv("HARNESS_CODEX_DISABLE_NATIVE_TOOLS", "true")
+    spec = _make_spec(harness="codex")
+    spec.executor.config.update({"web_search": True, "disable_native_tools": False})
+
+    env = _build_harness_spawn_env(_build_codex_spawn_env(spec))
+
+    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "false"
+    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
+
+
+def _parse_bundle(directory: Path, config_yaml: str) -> AgentSpec:
+    directory.mkdir()
+    (directory / "config.yaml").write_text(config_yaml)
+    return parse(directory)
+
+
+@pytest.mark.parametrize(
+    "provider_config", [{}, _openai_default_config()], ids=["codex-login", "key-provider"]
+)
+@pytest.mark.parametrize(
+    ("web_search_yaml", "disable_native_tools_yaml", "tool_env"),
+    [
+        (
+            "false",
+            "true",
+            {
+                "HARNESS_CODEX_ENABLE_WEB_SEARCH": "false",
+                "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "true",
+            },
+        ),
+        ("null", "null", {}),
+    ],
+    ids=["restrictive", "null"],
+)
+def test_codex_spec_tool_switches_reach_ordinary_spawn_env(
+    config_home: Path,
+    tmp_path: Path,
+    provider_config: dict[str, object],
+    web_search_yaml: str,
+    disable_native_tools_yaml: str,
+    tool_env: dict[str, str],
+) -> None:
+    _write_config(config_home, provider_config)
+    spec = _parse_bundle(
+        tmp_path / "codex-worker",
+        f"""\
+spec_version: 1
+name: codex-worker
+prompt: You are a worker.
+executor:
+  config:
+    harness: codex
+    disable_native_tools: {disable_native_tools_yaml}
+    web_search: {web_search_yaml}
+""",
+    )
+
+    env = _build_codex_spawn_env(spec)
+
+    assert {
+        key: value
+        for key, value in env.items()
+        if key in ("HARNESS_CODEX_ENABLE_WEB_SEARCH", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS")
+    } == tool_env
+
+
+def test_locked_codex_profile_yaml_builds_brokered_spawn_env(
+    config_home: Path, tmp_path: Path
+) -> None:
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "locked-model": {
+                    "kind": "gateway",
+                    "openai": {
+                        "base_url": "https://model.example.com/cyber/v1",
+                        "wire_api": "responses",
+                        "auth_command": "false",
+                        "models": {"default": "gpt-locked-model"},
+                    },
+                }
+            }
+        },
+    )
+    spec = _parse_bundle(
+        tmp_path / "locked-codex",
+        """\
+spec_version: 1
+name: locked-codex
+prompt: You are a worker.
+executor:
+  model: gpt-locked-model
+  auth:
+    type: provider
+    name: locked-model
+  config:
+    harness: codex
+    broker_gateway: true
+    web_search: false
+    disable_native_tools: true
+os_env:
+  type: caller_process
+  sandbox:
+    type: linux_bwrap
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          unix_socket: /private/model-token.sock
+          refresh_interval_seconds: 300
+""",
+    )
+
+    env = _build_codex_spawn_env(spec)
+
+    assert env["HARNESS_CODEX_BROKERED_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
+    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "false"
 
 
 @pytest.mark.parametrize("auth_source", ["spec", "global"])
@@ -1104,8 +1297,10 @@ def test_named_provider_auth_missing_provider_fails_loud(config_home: Path) -> N
     _write_config(config_home, _anthropic_default_config())
     spec = _make_spec(harness="claude-sdk", auth=ProviderAuth(name="does-not-exist"))
 
-    with pytest.raises(Exception, match="does-not-exist"):
+    with pytest.raises(HarnessConfigurationError, match="does-not-exist") as raised:
         _build_claude_sdk_spawn_env(spec, workdir=None)
+    assert "executor.auth.name" in raised.value.client_message
+    assert "does-not-exist" not in raised.value.client_message
 
 
 def test_named_provider_auth_survives_inference_config_overlay(
@@ -1632,8 +1827,47 @@ def test_codex_legacy_databricks_profile_fails_without_broker_policy(
     _write_config(config_home, {})
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="ucode Codex state"):
+    with pytest.raises(OmnigentError, match="configured provider state"):
         _build_codex_spawn_env(spec, workdir=None)
+
+
+@pytest.mark.parametrize(
+    "failure_kind,repair",
+    [
+        ("auth_command", "remove that environment override"),
+        ("worker_egress", "use model_egress"),
+        ("profile", "Set the Databricks provider's 'profile'"),
+        ("state", "Codex setup"),
+    ],
+)
+def test_codex_signer_configuration_failures_keep_fixed_repair_guidance(
+    monkeypatch: pytest.MonkeyPatch, failure_kind: str, repair: str
+) -> None:
+    from omnigent.onboarding.provider_config import ProviderEntry
+    from omnigent.runtime import workflow
+
+    monkeypatch.delenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", raising=False)
+    monkeypatch.setattr(workflow, "get_workspace_url_for_profile", lambda profile: None)
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=policy))
+    provider = ProviderEntry(
+        name="test-provider",
+        kind="databricks",
+        profile=None if failure_kind == "profile" else "test-profile",
+    )
+    if failure_kind == "auth_command":
+        monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", "private-command")
+    elif failure_kind == "worker_egress":
+        policy.egress_rules = ["POST provider.example.test/**"]
+
+    with pytest.raises(CodexSignerConfigurationError) as raised:
+        _apply_codex_provider_env({}, spec, provider)
+    assert raised.value.code == ErrorCode.INVALID_INPUT
+    assert raised.value.http_status == 400
+    assert str(raised.value) == raised.value.client_message
+    assert repair in raised.value.client_message
+    assert "provider.example.test" not in raised.value.client_message
+    assert "private-command" not in raised.value.client_message
 
 
 def test_legacy_profile_still_suppresses_global_default_provider(config_home: Path) -> None:
@@ -1648,7 +1882,7 @@ def test_legacy_profile_still_suppresses_global_default_provider(config_home: Pa
     _write_config(config_home, _openai_default_config())  # global default exists
     spec = _make_spec(harness="codex", model="some-model", profile="legacy-profile")
 
-    with pytest.raises(OmnigentError, match="ucode Codex state"):
+    with pytest.raises(OmnigentError, match="configured provider state"):
         _build_codex_spawn_env(spec, workdir=None)
 
 
@@ -1697,9 +1931,23 @@ def test_codex_spec_databricks_auth_routes_via_synthesized_provider(
                     )
                 },
             ),
-        ),
+        ) as read_provider_state,
     ):
         env = _build_codex_spawn_env(spec, workdir=None)
+        read_provider_state.return_value = SimpleNamespace(
+            workspace_host="https://provider.example.test",
+            agent=lambda name: SimpleNamespace(
+                base_url="https://provider.example.test/private-route"
+            ),
+        )
+        with pytest.raises(
+            CodexSignerConfigurationError, match="supported trusted model endpoint"
+        ) as raised:
+            _build_codex_spawn_env(spec, workdir=None)
+        assert isinstance(raised.value.__cause__, ValueError)
+        assert "Codex setup" in raised.value.client_message
+        assert "provider.example.test" not in raised.value.client_message
+        assert "private-route" not in raised.value.client_message
 
     assert env["HARNESS_CODEX_DATABRICKS_PROFILE"] == "test-dbx-ws"
     assert env["HARNESS_CODEX_SIGNER_PROVIDER"] == "databricks-ucode-v1"
@@ -2163,13 +2411,13 @@ def test_kimi_declared_auth_raises(
     ``--mcp-config-file``), so declared auth can't be threaded. Silently
     launching against whatever ambient ``~/.kimi-code/config.toml`` resolves to
     would be a confused-deputy / mis-attribution risk, so the builder raises
-    instead. Regression guard for the originally-dead ``OmnigentError``."""
-    from omnigent.errors import OmnigentError
+    instead. The typed error allows only this fixed guidance through to clients."""
+    from omnigent.errors import KimiAuthConfigurationError
 
     _write_config(config_home, {"providers": {}})
     spec = _make_spec(harness="kimi", auth=auth)
 
-    with pytest.raises(OmnigentError, match=r"kimi.*does not support"):
+    with pytest.raises(KimiAuthConfigurationError, match=r"kimi.*does not support"):
         _build_kimi_spawn_env(spec, cwd=None)
 
 

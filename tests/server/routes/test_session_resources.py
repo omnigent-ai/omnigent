@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import ntpath
@@ -21,6 +22,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.types import Message, Receive, Scope, Send
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
@@ -44,6 +46,12 @@ from omnigent.server.auth import (
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes._gzip_route import (
+    GZIP_COMPRESSLEVEL,
+    GZIP_MINIMUM_SIZE,
+    SKIP_GZIP_STATE_KEY,
+    _StateAwareGZipResponder,
+)
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -2772,7 +2780,7 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
     )
 
     assert resp.status_code == 415, resp.text
-    assert "Claude Code or Codex" in resp.text
+    assert "local file attachments" in resp.text
     listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
     assert listed.data == []
 
@@ -3564,6 +3572,82 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
     ) in fake_runner.calls
 
 
+@pytest.mark.asyncio
+async def test_only_a_github_info_poll_lets_the_runner_answer_from_its_previous_read(
+    client: httpx.AsyncClient,
+) -> None:
+    """A client's poll forwards ``allow_cached``; other reads ask the runner for a fresh one."""
+    runner = _FakeRunnerClient(payload={"object": "session.github.info", "available": True})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github"
+
+    polled = await client.get(path, params={"allow_cached": "true"})
+    plain = await client.get(path)
+
+    assert (polled.status_code, plain.status_code) == (200, 200)
+    assert runner.get_params == [{"allow_cached": True}, None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [{}, {"allow_cached": "true"}], ids=["one-shot", "poll"])
+async def test_github_info_serves_a_tunnelled_runners_late_answer_unchanged(
+    client: httpx.AsyncClient, params: dict[str, str]
+) -> None:
+    """A runner answer that arrives over the tunnel late and in parts is served unchanged."""
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        HelloFrame,
+        ResponseBodyFrame,
+        ResponseEndFrame,
+        ResponseHeadFrame,
+    )
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+
+    class _QuietRunnerSocket:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    registry = TunnelRegistry()
+    hello = HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+    registry.register("runner_one", _QuietRunnerSocket(), hello)
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"),
+        base_url="http://runner",
+        timeout=httpx.Timeout(5.0, read=None),
+    )
+    set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
+    payload = {"object": "session.github.info", "available": True, "pr": None}
+
+    read = asyncio.create_task(
+        client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github", params=params)
+    )
+    session = registry.get("runner_one")
+    assert session is not None
+    await poll_until_async(lambda: len(session.in_flight) == 1, timeout_s=budget(5))
+    request_id = next(iter(session.in_flight))
+    await asyncio.sleep(0.2)
+    registry.route_response_frame(
+        "runner_one",
+        ResponseHeadFrame(
+            id=request_id, status=200, headers=[["content-type", "application/json"]]
+        ),
+    )
+    await asyncio.sleep(0.2)
+    registry.route_response_frame(
+        "runner_one", ResponseBodyFrame(id=request_id, body=json.dumps(payload), encoding="utf-8")
+    )
+    registry.route_response_frame("runner_one", ResponseEndFrame(id=request_id))
+    resp = await asyncio.wait_for(read, timeout=budget(5))
+    await runner_client.aclose()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == payload
+    assert not session.in_flight
+
+
 def _pr_app(db_uri: str, **router_options: Any) -> FastAPI:
     """App whose sessions keep their pull requests in a real SQLite store."""
     SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
@@ -3691,6 +3775,25 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
 
 
 @pytest.mark.asyncio
+async def test_a_cached_runner_answer_does_not_replace_a_newer_stored_state(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    """A runner answer from an earlier read is stored as of when that read began."""
+    path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+    merged = {**_pr_info(), "pr": {**_pr_info()["pr"], "state": "MERGED"}}  # type: ignore[dict-item]
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=merged)))  # type: ignore[arg-type]
+    assert (await pr_client.get(path)).status_code == 200
+
+    cached = {**_pr_info(), "cache_age_s": 60.0}
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=cached)))  # type: ignore[arg-type]
+    answered = await pr_client.get(path)
+    assert answered.status_code == 200, answered.text
+    assert "cache_age_s" not in answered.json()
+    listed = await pr_client.get(f"/v1/sessions/{_PR_SESSION}/pull-requests")
+    assert listed.json()["data"][0]["state"] == "MERGED"
+
+
+@pytest.mark.asyncio
 async def test_linking_checks_the_session_limit_before_asking_the_host(
     pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3770,6 +3873,41 @@ async def test_a_listed_session_is_imported_from_its_runner_in_the_background(
 
 
 @pytest.mark.asyncio
+async def test_background_pr_refreshes_and_plain_reads_ask_the_runner_for_a_fresh_read(
+    runner_globals_reset: None, db_uri: str
+) -> None:
+    """Only a client's poll may take the runner's earlier read; refreshes after turns may not."""
+    from omnigent.server.session_pull_requests import PullRequestRefresher
+
+    del runner_globals_reset
+    SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
+    conversation_store = _ConversationStore()
+    conversation_store.storage_location = db_uri  # type: ignore[attr-defined]
+    conversation_store._conversations[_PR_SESSION].runner_id = "runner_pr"
+    refresher = PullRequestRefresher()
+    app = _sessions_app(conversation_store, pull_request_refresher=refresher)
+    runner = _FakeRunnerClient(payload=_pr_info())
+    set_runner_router(_OnlineRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        refresher.request(_PR_SESSION)
+        await asyncio.sleep(0)
+        while refresher._running:
+            await asyncio.gather(*refresher._running.values())
+        plain = await client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
+    assert plain.status_code == 200, plain.text
+    gets = [url for method, url in runner.calls if method == "GET"]
+    github_reads = [
+        params or {}
+        for url, params in zip(gets, runner.get_params, strict=True)
+        if url.endswith("/resources/github")
+    ]
+    assert len(github_reads) == 2
+    assert all("allow_cached" not in params for params in github_reads)
+
+
+@pytest.mark.asyncio
 async def test_pull_request_list_pages_by_url(pr_client: httpx.AsyncClient) -> None:
     set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
     await pr_client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
@@ -3825,7 +3963,7 @@ async def test_unlink_on_the_wrong_replica_asks_the_client_to_re_address(
 @pytest.mark.parametrize(
     ("level", "list_status", "unlink_status"),
     # Without a grant the session reads as missing.
-    [(None, 404, 404), (LEVEL_READ, 200, 403), (LEVEL_EDIT, 200, 200)],
+    [(None, 404, 404), (LEVEL_READ, 200, 403), (LEVEL_EDIT, 200, 403), (LEVEL_OWNER, 200, 200)],
 )
 async def test_stored_pull_request_routes_check_session_access(
     runner_globals_reset: None,
@@ -11234,6 +11372,54 @@ async def test_sibling_environment_routes_are_not_gzipped(
     assert "content-encoding" not in resp.headers
 
 
+@pytest.mark.asyncio
+async def test_skip_gzip_responder_forwards_start_before_bodies() -> None:
+    """An opted-out response is forwarded as soon as each message is sent.
+
+    Holding the start message ties the opt-out to when a Starlette version
+    flushes it; 1.8.0 drops it, so the server answers 500.
+
+    :returns: None.
+    """
+    start: Message = {
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/json")],
+    }
+    first_body: Message = {
+        "type": "http.response.body",
+        "body": b"x" * (GZIP_MINIMUM_SIZE * 2),
+        "more_body": True,
+    }
+    final_body: Message = {"type": "http.response.body", "body": b"", "more_body": False}
+    # Starlette's gzip path rewrites messages in place, so compare against copies.
+    expected = copy.deepcopy([start, first_body, final_body])
+    sent: list[Message] = []
+    sent_when_start_returned: list[Message] = []
+
+    async def handler(scope: Scope, receive: Receive, send: Send) -> None:
+        scope["state"][SKIP_GZIP_STATE_KEY] = True
+        await send(start)
+        sent_when_start_returned.extend(sent)
+        await send(first_body)
+        await send(final_body)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def record(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {"type": "http", "headers": [(b"accept-encoding", b"gzip")], "state": {}}
+    responder = _StateAwareGZipResponder(
+        handler, GZIP_MINIMUM_SIZE, GZIP_COMPRESSLEVEL, scope["state"]
+    )
+    await responder(scope, receive, record)
+
+    assert sent == expected
+    assert sent_when_start_returned == expected[:1]
+
+
 @pytest.mark.parametrize(
     "resource,op",
     [
@@ -11601,6 +11787,7 @@ async def test_native_send_rechecks_runtime_after_upload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("filename", ["trace.gz", "clip.mp4"])
 @pytest.mark.parametrize(
     ("retained_history", "host_has_attachments", "status"),
     [(False, True, 409), (True, True, 202), (True, False, 409)],
@@ -11609,11 +11796,12 @@ async def test_native_send_requires_delivery_support_for_new_types(
     file_client: httpx.AsyncClient,
     file_app: FastAPI,
     file_conv_store: _ConversationStore,
+    filename: str,
     retained_history: bool,
     host_has_attachments: bool,
     status: int,
 ) -> None:
-    """Only a file sent now needs the runtime to deliver types beyond the defaults.
+    """Only a file sent now needs the runtime to deliver types beyond the legacy extensions.
 
     A recorded file in retained history still needs filesystem attachment support.
     """
@@ -11627,12 +11815,13 @@ async def test_native_send_requires_delivery_support_for_new_types(
     runner = _FakeRunnerClient(payload={})
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
     set_runner_client(runner)  # type: ignore[arg-type]
-    file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
-        all_types=True
-    )
+    if filename.endswith(".gz"):
+        file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
+            all_types=True
+        )
     upload = await file_client.post(
         f"/v1/sessions/{session_id}/resources/files",
-        files={"file": ("trace.gz", b"\x1f\x8b", "application/gzip")},
+        files={"file": (filename, b"data", "application/octet-stream")},
     )
     assert upload.status_code == 201, upload.text
     content = [{"type": "input_file", "file_id": upload.json()["id"]}]

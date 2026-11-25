@@ -34,6 +34,7 @@ import {
   markRecentlyCreated,
   withMoveTombstone,
 } from "@/hooks/useConversations";
+import { muteReadMarker, onMuteRecheck, reconcileMuteLabel } from "@/lib/sessionMute";
 import {
   type ConversationsInfiniteData,
   type MembershipChange,
@@ -42,6 +43,7 @@ import {
   filtersFromConversationQueryKey,
   filtersFromProjectQueryKey,
   insertNewRowsIntoPages,
+  LIST_ROW_QUERY_ROOTS,
   mergeItemsIntoPages,
   nullsToUndefined,
   parseProjectSessionsQueryKey,
@@ -97,12 +99,17 @@ function applyItemsToCache(
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
   const itemsById = new Map<string, SessionListWireItem>();
+  // The server re-reads a row just before pushing it, so it counts as read on arrival.
+  const readMarker = muteReadMarker();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
     itemsById.set(
       item.id,
       nullsToUndefined(
-        withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+        reconcileMuteLabel(
+          withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+          readMarker,
+        ),
       ),
     );
   }
@@ -287,6 +294,30 @@ function applyItemsToCache(
     }
   }
   return targets;
+}
+
+/** Query hashes of the caches holding a session's row: list pages, Pinned, and its fetched row. */
+function queriesHoldingSession(queryClient: QueryClient, id: string): Set<string> {
+  const cache = queryClient.getQueryCache();
+  const hashes = new Set<string>();
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    for (const query of cache.findAll({ queryKey: [root] })) {
+      const data = query.state.data as ConversationsInfiniteData | undefined;
+      if (data?.pages.some((page) => page.data.some((row) => row.id === id))) {
+        hashes.add(query.queryHash);
+      }
+    }
+  }
+  const pinned = cache.find<PinnedConversationsResult>({
+    queryKey: PINNED_CONVERSATIONS_KEY,
+    exact: true,
+  });
+  if (pinned?.state.data?.conversations.some((row) => row.id === id)) {
+    hashes.add(pinned.queryHash);
+  }
+  const backfill = cache.find({ queryKey: ["conversation-backfill", id], exact: true });
+  if (backfill?.state.data) hashes.add(backfill.queryHash);
+  return hashes;
 }
 
 /**
@@ -518,6 +549,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     };
     // Replay changes after all saves, including their settlement refetches, finish.
     const unsubscribeMutations = queryClient.getMutationCache().subscribe(refreshProjects);
+    // A saved mute masked disagreeing data while the index caught up; re-read it now.
+    const unsubscribeMuteRecheck = onMuteRecheck((id) => {
+      const targets = queriesHoldingSession(queryClient, id);
+      if (targets.size > 0) reconciler.schedule(targets);
+    });
 
     const unsubscribeFrames = sessionUpdatesSocket.subscribe((frame: SessionUpdatesFrame) => {
       switch (frame.type) {
@@ -655,6 +691,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     return () => {
       unsubscribeFrames();
       unsubscribeMutations();
+      unsubscribeMuteRecheck();
       unsubscribeCache();
       reconciler.dispose();
       if (watchTimer !== null) clearTimeout(watchTimer);

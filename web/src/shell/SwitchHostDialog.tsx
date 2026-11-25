@@ -338,7 +338,7 @@ function SupportedSwitchHostDialog({
         // The new runner is booting but nothing on the wire says so yet, and
         // no turn is in flight to imply it — without this the session reads as
         // idle and the move lands on a silent, empty chat.
-        markRunnerLaunched();
+        markRunnerLaunched(sessionId);
         addRecent(workspaceTrimmed);
       }
       // Close before refreshing. The session refetch reports the new host,

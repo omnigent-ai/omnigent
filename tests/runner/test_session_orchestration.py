@@ -46,7 +46,6 @@ def test_create_schema_exposes_project_name_and_permission_mode():
     assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
     assert schema["parameters"]["properties"]["project_id"]["type"] == "string"
     assert schema["parameters"]["properties"]["workflow_id"]["type"] == "string"
-    assert schema["parameters"]["properties"]["session_id_placeholder"]["type"] == "string"
 
 
 @pytest.mark.asyncio
@@ -195,7 +194,10 @@ async def test_runner_disabled_message_never_contacts_server(monkeypatch):
                 conversation_id="manager",
             )
         )
-    assert result == {"error": "Messaging other sessions is disabled on this runner"}
+    assert result == {
+        "error": "Messaging other sessions is disabled on this runner",
+        "delivery": "refused",
+    }
 
 
 @pytest.mark.asyncio
@@ -450,7 +452,10 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
             server_client=client,
             conversation_id="manager",
         )
-    assert "do not automatically resend" in result
+    assert json.loads(result) == {
+        "error": "Delivery could not be confirmed; do not automatically resend",
+        "delivery": "unconfirmed",
+    }
     assert len(requests) == (2 if after_routing else 1)
 
 
@@ -498,6 +503,8 @@ async def test_same_host_first_task_failure_returns_created_session(status, monk
         assert result["initial_message"]["denied"] is True
     if status == "runner_disabled":
         assert "disabled on this runner" in result["initial_message"]["error"]
+    expected_delivery = "unconfirmed" if status == 502 else "refused"
+    assert result["initial_message"]["delivery"] == expected_delivery
     assert len(requests) == (1 if status == "runner_disabled" else 2)
 
 
@@ -714,7 +721,10 @@ async def test_message_destination_accepts_supported_session_ids(spelling):
             f"http://server/v1/sessions/{expected_id}/events"
         ]
     else:
-        assert result == {"error": "Provide a valid session_id (UUID or numeric managed ID)"}
+        assert result == {
+            "error": "Provide a valid session_id (UUID or numeric managed ID)",
+            "delivery": "refused",
+        }
         assert requests == []
 
 
@@ -740,7 +750,8 @@ async def test_message_content_validation_is_distinct_from_invalid_id(message):
             )
         )
     assert result == {
-        "error": f"Provide a non-blank message of 1–{SESSION_MESSAGE_MAX_CHARS} characters"
+        "error": f"Provide a non-blank message of 1–{SESSION_MESSAGE_MAX_CHARS} characters",
+        "delivery": "refused",
     }
 
 
@@ -876,151 +887,6 @@ async def test_long_first_task_needs_a_server_that_delivers_it(server_info, serv
     ]
     assert json.loads(posts[1].content)["data"]["message"] == message
     assert result["initial_message"] == {"queued": True}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("placement", "placeholder", "filled"),
-    [
-        # The runner sends same_host and host messages itself, so it can name the new ID.
-        ("same_host", "CONVERSATION_ID", True),
-        ("host", "CONVERSATION_ID", True),
-        # Without the argument, the text is never rewritten.
-        ("same_host", None, False),
-        # A managed message rides in the create body, before the ID exists.
-        ("managed", "CONVERSATION_ID", False),
-    ],
-    ids=["same_host-filled", "host-filled", "same_host-unset", "managed-unchanged"],
-)
-async def test_session_id_placeholder_is_filled_only_where_the_runner_sends_the_message(
-    placement, placeholder, filled
-):
-    session_id = uuid4().hex
-    # Every occurrence is filled, not just the first.
-    message = (
-        "Track progress: <https://omni.example.com/c/CONVERSATION_ID|Omni Session> "
-        "(CONVERSATION_ID)"
-    )
-    posts = []
-
-    def respond(request):
-        if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"scripted_sessions": True})
-        posts.append(request)
-        if request.url.path.endswith("/events"):
-            return httpx.Response(202, json={"queued": True})
-        return httpx.Response(
-            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
-        )
-
-    arguments = {"agent_id": "worker", "placement": placement, "message": message}
-    if placement == "host":
-        arguments.update(host_id=uuid4().hex, workspace="/workspace")
-    if placeholder is not None:
-        arguments["session_id_placeholder"] = placeholder
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond), base_url="http://server"
-    ) as client:
-        result = json.loads(
-            await execute_tool(
-                tool_name="sys_session_create",
-                arguments=json.dumps(arguments),
-                server_client=client,
-                conversation_id="manager",
-            )
-        )
-
-    if placement in ("same_host", "host"):
-        sent = json.loads(posts[1].content)["data"]["message"]
-        assert result["initial_message"] == {"queued": True}
-    else:
-        sent = json.loads(posts[0].content)["initial_input"]["data"]["content"][0]["text"]
-    expected = message.replace("CONVERSATION_ID", session_id) if filled else message
-    assert sent == expected
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("message_chars", "filled"),
-    [
-        # At the advertised limit, so a longer ID would push it over.
-        (32_000, False),
-        # At the legacy limit, so the server's limit isn't fetched; the ID would cross it.
-        (8_000, False),
-        # The filled message lands exactly on the legacy limit, which still fits.
-        (8_000 - (32 - len("CONVERSATION_ID")), True),
-    ],
-    ids=["over_advertised_limit", "over_legacy_limit", "fits_exactly"],
-)
-async def test_session_id_placeholder_is_left_when_filling_it_would_exceed_the_limit(
-    message_chars, filled
-):
-    session_id = uuid4().hex
-    message = "CONVERSATION_ID" + "x" * (message_chars - len("CONVERSATION_ID"))
-    posts = []
-
-    def respond(request):
-        if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"session_message_max_chars": 32_000})
-        posts.append(request)
-        if request.url.path.endswith("/events"):
-            return httpx.Response(202, json={"queued": True})
-        return httpx.Response(
-            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
-        )
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond), base_url="http://server"
-    ) as client:
-        result = json.loads(
-            await execute_tool(
-                tool_name="sys_session_create",
-                arguments=json.dumps(
-                    {
-                        "agent_id": "worker",
-                        "placement": "same_host",
-                        "message": message,
-                        "session_id_placeholder": "CONVERSATION_ID",
-                    }
-                ),
-                server_client=client,
-                conversation_id="manager",
-            )
-        )
-
-    # The task always arrives; unfilled, it keeps the placeholder the worker resolves itself.
-    assert result["initial_message"] == {"queued": True}
-    expected = message.replace("CONVERSATION_ID", session_id) if filled else message
-    assert json.loads(posts[1].content)["data"]["message"] == expected
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "placeholder", ["", "  ", 1, "x" * 65], ids=["empty", "blank", "non_text", "too_long"]
-)
-async def test_session_id_placeholder_must_be_a_short_string(placeholder):
-    def unexpected(request):
-        pytest.fail("An invalid placeholder must not reach the server")
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(unexpected), base_url="http://server"
-    ) as client:
-        result = json.loads(
-            await execute_tool(
-                tool_name="sys_session_create",
-                arguments=json.dumps(
-                    {
-                        "agent_id": "worker",
-                        "placement": "same_host",
-                        "message": "Hi",
-                        "session_id_placeholder": placeholder,
-                    }
-                ),
-                server_client=client,
-                conversation_id="manager",
-            )
-        )
-    assert "session_id_placeholder must be a nonempty string of at most 64" in result["error"]
 
 
 @pytest.mark.asyncio

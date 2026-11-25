@@ -217,6 +217,22 @@ describe("useWorkflowRuns live refresh", () => {
     },
   );
 
+  it("reads whether a run's sandbox is launching, which older servers leave out", async () => {
+    let serverRuns: object[] = [
+      { ...RUNNING_RUN, session_status: "idle", sandbox_launching: true },
+    ];
+    vi.mocked(authenticatedFetch).mockImplementation(async () =>
+      Response.json({ data: serverRuns, next_cursor: null }),
+    );
+    const { result } = renderRuns();
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(result.current.data?.pages[0].runs[0]?.sandboxLaunching).toBe(true);
+
+    serverRuns = [{ ...RUNNING_RUN, session_status: "idle" }];
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(result.current.data?.pages[0].runs[0]?.sandboxLaunching).toBe(false);
+  });
+
   it("does not poll without a workflow ID", async () => {
     renderRuns("");
     await act(() => vi.advanceTimersByTimeAsync(30_000));
@@ -233,6 +249,7 @@ describe("useWorkflowRuns runs below a run", () => {
             ...RUNNING_RUN,
             workflow_id: "workflow",
             started_by: null,
+            automation: { id: "automation", name: "Nightly triage" },
             workflow_name: "Workflow",
             descendant_runs: [
               {
@@ -260,6 +277,7 @@ describe("useWorkflowRuns runs below a run", () => {
       workflowId: "workflow",
       workflowName: "Workflow",
       startedBy: undefined,
+      automation: { id: "automation", name: "Nightly triage" },
       descendantRunCount: 3,
       descendantRunsCursor: "session_old",
       descendantRunsActive: true,
@@ -270,6 +288,7 @@ describe("useWorkflowRuns runs below a run", () => {
         workflowId: "called",
         workflowName: null,
         startedBy: { sessionId: "session_new", title: "New run" },
+        automation: undefined,
         descendantRuns: [],
         descendantRunsCursor: null,
         descendantRunsActive: false,

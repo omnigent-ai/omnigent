@@ -116,7 +116,10 @@ async def _launch_local_codex(
         command=sys.executable, args=args, cwd=str(root), tmux_start_on_attach=False
     )
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+        base_url="http://server.example.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"id": "osc-test", "harness": "codex-native"})
+        ),
     ) as server_client:
         app = create_runner_app(
             server_client=server_client, terminal_registry=registry, resource_registry=resources

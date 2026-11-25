@@ -15,9 +15,9 @@ This module owns the small filesystem rendezvous directory plus two
 helper surfaces:
 
 - An MCP stdio server (``serve-mcp`` subcommand) that Claude Code
-  launches as a child process. It advertises Omnigent tools to
-  Claude (workspace ``sys_os_*`` tools outside an active turn,
-  active-turn Omnigent tools via a per-turn relay).
+  launches as a child process. It advertises the Omnigent tools the
+  runner's tool relay serves; Claude's own Bash, Read, Write and Edit
+  cover workspace file and shell access.
 - A tmux send-keys path. Web UI messages are delivered to Claude by
   typing them into the same tmux pane the user is attached to;
   Claude treats them as ordinary user input. The runner advertises
@@ -39,6 +39,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -82,6 +83,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    hook_blocked_prompt,
 )
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
@@ -102,8 +104,6 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     import httpx
 
-    from omnigent.inner.datamodel import OSEnvSandboxSpec
-    from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.llms.context_window import ModelPricing
 
@@ -116,7 +116,6 @@ from omnigent.inner.terminal_lifecycle import (
     TERMINAL_LAUNCH_SESSION_ID_ENV,
 )
 from omnigent.native import native_bridge_common, policy_allow_cache
-from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
@@ -283,6 +282,8 @@ _EXPECTED_CLOSE_FILE = "expected_close"
 _OMNIGENT_KILL_FILE = "omnigent_kill"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
+# The cost a cold resume seeded into the next Claude process; see ResumeCostBaseline.
+_RESUME_COST_BASELINE_FILE = "resume_cost_baseline.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
 # Read by the static relay entry in an enterprise managed-mcp.json; see
@@ -511,11 +512,13 @@ _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)*\s+to\s+\w", re.IGNORECASE)
 # Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
 # than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
-# question exits 0). Only the person may answer them.
+# question exits 0; 2.1.326: the --add-dir trust question exits 1). Only the
+# person may answer them.
 _ESCAPE_QUITS_DIALOG_HEADLINES = (
     "Settings Error",
     "Accessing workspace",
     "Do you trust the files in this folder",
+    "Adding a new directory",
 )
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
@@ -1881,15 +1884,6 @@ def build_claude_native_spawn_env(
     }
 
 
-def _bridge_sandbox_payload(sandbox: OSEnvSandboxSpec) -> dict[str, Any]:
-    """Persist sandbox settings without parent-only credential sources."""
-    from omnigent.inner.os_env_serialization import encode_sandbox_spec
-
-    payload = encode_sandbox_spec(sandbox)
-    payload.pop("credential_proxy", None)
-    return payload
-
-
 def prepare_bridge_dir(
     conversation_id: str,
     *,
@@ -1898,7 +1892,6 @@ def prepare_bridge_dir(
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
     picker_values: Sequence[str] | None = None,
-    sandbox: OSEnvSandboxSpec | None = None,
 ) -> Path:
     """
     Create or refresh the bridge directory for a native Claude session.
@@ -1910,7 +1903,7 @@ def prepare_bridge_dir(
         ``"conv_abc123"``.
     :param bridge_id: Opaque bridge id, e.g. ``"bridge_abc123"``.
         ``None`` normalizes old sessions by using *conversation_id*.
-    :param workspace: Runner workspace/cwd used for local OS tools.
+    :param workspace: Runner workspace/cwd of the Claude session.
     :param launch_model: Gateway model name that Claude was launched
         with, e.g. ``"databricks-claude-opus-4-7"``.  Persisted so the
         forwarder can re-inject it when Claude Code's ``/model``
@@ -1925,14 +1918,6 @@ def prepare_bridge_dir(
         offers, e.g. ``["system.ai.glm-5-3"]``. Persisted for the same
         translation: a gateway-managed picker names rows by served id, and
         no pin spells those.
-    :param sandbox: Resolved ``os_env.sandbox`` for this session (the
-        agent spec's declared sandbox, already overridden by any
-        ``enforce_sandbox``/``force_sandbox`` policy verdict). Persisted
-        so :func:`_build_tools` can build the bridge's own
-        ``sys_os_*`` tools against it instead of always running
-        unsandboxed. ``None`` preserves the prior unsandboxed default.
-        Its ``credential_proxy`` is never written — see
-        :func:`_bridge_sandbox_payload`.
     :returns: Bridge directory path.
     """
     resolved_bridge_id = bridge_id or conversation_id
@@ -1968,8 +1953,6 @@ def prepare_bridge_dir(
             payload["model_env"] = model_env
         if picker_values is not None:
             payload["model_picker_values"] = list(picker_values)
-        if sandbox is not None:
-            payload["sandbox"] = _bridge_sandbox_payload(sandbox)
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
         if previous_session_id != conversation_id:
             # A window opened for another session must not answer this one's hooks.
@@ -2083,7 +2066,12 @@ def _account_home_dir() -> Path:
         return Path.home()
 
 
-def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
+def ensure_claude_workspace_trusted(
+    workspace: Path,
+    env: Mapping[str, str] | None = None,
+    *,
+    added_dirs: Sequence[Path] = (),
+) -> None:
     """
     Pre-accept Claude Code's first-run trust, onboarding, and mode prompts.
 
@@ -2092,15 +2080,16 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     top-level ``hasCompletedOnboarding`` key in its global config
     (:func:`claude_global_config_path`, usually ``~/.claude.json``), a
     per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, and a "Make auto
-    mode your default permission mode?" question gated by
-    ``hasSeenAutoDefaultNudge``. None fires a
+    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, an "Adding a new
+    directory" question (2.1.326+) for each ``--add-dir`` gated by the same
+    key, and a "Make auto mode your default permission mode?" question gated
+    by ``hasSeenAutoDefaultNudge``. None fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
     per-session git worktrees, which hand Claude a brand-new —
-    therefore untrusted — directory on every session, and for sessions
-    rooted at the home directory, whose interactively accepted trust
+    therefore untrusted — directory on every session, and for the home
+    directory and added directories, whose interactively accepted trust
     Claude keeps for that session only.
 
     Seed the gating keys idempotently so the launch never blocks. Only
@@ -2125,6 +2114,8 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     :param env: Environment the Claude terminal is launched with, used to
         find the config file Claude will load. ``None`` uses this process's
         environment.
+    :param added_dirs: Omnigent-owned directories passed to ``--add-dir``
+        to trust as well, e.g. the portable-skill overlay.
     :returns: None.
     :raises ValueError: If the existing global config is not a regular
         file or is a broken or looping symlink, or it (or its ``projects`` map /
@@ -2167,18 +2158,20 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the
     # resolved absolute path, so match that exactly.
-    project_key = str(workspace.resolve())
     projects = data.setdefault("projects", {})
     if not isinstance(projects, dict):
         raise ValueError(f"{config_path} 'projects' is not a JSON object; refusing to overwrite.")
-    project = projects.setdefault(project_key, {})
-    if not isinstance(project, dict):
-        raise ValueError(
-            f"{config_path} projects[{project_key!r}] is not a JSON object; refusing to overwrite."
-        )
-    if project.get("hasTrustDialogAccepted") is not True:
-        project["hasTrustDialogAccepted"] = True
-        changed = True
+    for directory in (workspace, *added_dirs):
+        project_key = str(directory.resolve())
+        project = projects.setdefault(project_key, {})
+        if not isinstance(project, dict):
+            raise ValueError(
+                f"{config_path} projects[{project_key!r}] is not a JSON object; "
+                "refusing to overwrite."
+            )
+        if project.get("hasTrustDialogAccepted") is not True:
+            project["hasTrustDialogAccepted"] = True
+            changed = True
 
     if not changed:
         return
@@ -2673,7 +2666,9 @@ def build_hook_settings(
     server (``enableAllProjectMcpServers``): the "New MCP server found"
     dialog is another unhookable startup gate that a host-spawned terminal
     can never answer. It also turns off auto mode's post-turn
-    environment-setup offer (``skillOverrides``) for the same reason.
+    environment-setup offer (``skillOverrides``) for the same reason, and keeps
+    automatic compaction on (``autoCompactEnabled``) so a full context compacts
+    instead of refusing every turn until someone types ``/compact``.
 
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
@@ -3019,6 +3014,10 @@ def build_hook_settings(
     # only the terminal can answer it, so web-UI messages stall behind it. This
     # Claude Code switch turns off that offer and its /auto-mode-setup wizard.
     settings["skillOverrides"] = {"auto-mode-setup": "off"}
+    # With auto-compaction off, a full context refuses every turn until someone
+    # types /compact, which an unattended run never does. This outranks the
+    # user's setting; DISABLE_AUTO_COMPACT and managed policy still win.
+    settings["autoCompactEnabled"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
@@ -3300,6 +3299,29 @@ def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
     return "--dangerously-skip-permissions" in args or (
         _arg_value(args, "--permission-mode") == "bypassPermissions"
     )
+
+
+_CLAUDE_LAUNCH_PERMISSION_MODES = frozenset(
+    {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+)
+
+
+def claude_launch_permission_mode(args: Sequence[str] | None) -> str | None:
+    """Return the known permission mode Claude Code launches in with ``args``.
+
+    The bypass flag wins over any ``--permission-mode``; otherwise the last one does.
+    Everything from an ``--`` option terminator on is positional text.
+
+    :param args: Claude CLI args, e.g. ``["--permission-mode=plan"]``.
+    :returns: The mode, e.g. ``"plan"``, or ``None`` when absent or unknown.
+    """
+    launch_args = tuple(args or ())
+    if "--" in launch_args:
+        launch_args = launch_args[: launch_args.index("--")]
+    if _args_request_bypass_permissions(launch_args):
+        return "bypassPermissions"
+    candidate = _arg_value(launch_args, "--permission-mode")
+    return candidate if candidate in _CLAUDE_LAUNCH_PERMISSION_MODES else None
 
 
 def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -5860,6 +5882,56 @@ def _permission_mode_from_pane(pane: str) -> str | None:
     return None
 
 
+# Claude Code's spinner row while it retries a request, its error cut to the pane
+# width with "…". Transcript text is indented, so it never starts at column 0.
+_API_RETRY_ROW_RE = re.compile(
+    r"^✻ (?P<error>\S.*?) · Retrying in [^·]+"
+    r" · attempt (?P<attempt>\d+)/(?P<max_retries>\d+)\s*$"
+)
+_API_RETRY_STATUS_RE = re.compile(r"^(?P<status>[1-5]\d\d)\b")
+
+
+@dataclass(frozen=True)
+class ApiRetry:
+    """
+    Claude Code's visible retry of a failed API request.
+
+    :param status: HTTP status leading the error text, e.g. ``403``, or
+        ``None`` when the row shows no status (Claude's generic "API error").
+    :param error: The error text as rendered, possibly cut with ``"…"``.
+    :param attempt: The attempt the row reports, e.g. ``3``.
+    :param max_retries: Claude Code's retry limit, e.g. ``10``.
+    """
+
+    status: int | None
+    error: str
+    attempt: int
+    max_retries: int
+
+
+def _api_retry_from_pane(pane: str) -> ApiRetry | None:
+    """
+    Read Claude Code's API retry row off a captured pane.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The retry the pane shows, or ``None`` when no request is
+        being retried.
+    """
+    for line in reversed(pane.splitlines()):
+        row = _API_RETRY_ROW_RE.match(line)
+        if row is None:
+            continue
+        error = row.group("error")
+        status = _API_RETRY_STATUS_RE.match(error)
+        return ApiRetry(
+            status=int(status.group("status")) if status else None,
+            error=error,
+            attempt=int(row.group("attempt")),
+            max_retries=int(row.group("max_retries")),
+        )
+    return None
+
+
 # ── /btw side-chat overlay ─────────────────────────────────────────
 # Claude Code's ``/btw`` ("by the way") opens an in-TUI overlay that
 # answers a side question without ever persisting it — not to the
@@ -5929,10 +6001,12 @@ class PaneSignals:
         ``"auto"``, or ``None`` when no mode footer is visible.
     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
         when none is shown / it is still generating.
+    :param api_retry: The API request retry Claude Code shows, or ``None``.
     """
 
     permission_mode: str | None = None
     btw_overlay: BtwOverlay | None = None
+    api_retry: ApiRetry | None = None
 
 
 def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
@@ -8544,7 +8618,6 @@ def _serve_mcp(bridge_dir: Path) -> None:
     notification_queue: queue.Queue[_JsonObject | None] = queue.Queue()
     stdout_lock = threading.Lock()
     httpd = _start_http_ingress(bridge_dir, token, notification_queue)
-    tools, close_tools = _build_tools(config)
     writer = threading.Thread(
         target=_notification_writer,
         args=(notification_queue, stdout_lock),
@@ -8553,12 +8626,11 @@ def _serve_mcp(bridge_dir: Path) -> None:
     )
     writer.start()
     try:
-        _stdio_jsonrpc_loop(tools, stdout_lock, bridge_dir)
+        _stdio_jsonrpc_loop(stdout_lock, bridge_dir)
     finally:
         notification_queue.put(None)
         httpd.shutdown()
         httpd.server_close()
-        close_tools()
 
 
 def _start_http_ingress(
@@ -9255,14 +9327,12 @@ def _notification_writer(
 
 
 def _stdio_jsonrpc_loop(
-    tools: dict[str, Tool],
     stdout_lock: threading.Lock,
     bridge_dir: Path,
 ) -> None:
     """
     Run the minimal MCP JSON-RPC stdio loop.
 
-    :param tools: Omnigent tools exposed over MCP.
     :param stdout_lock: Lock protecting JSON-RPC writes to stdout.
     :param bridge_dir: Bridge directory path used to read the
         active tool relay.
@@ -9279,7 +9349,7 @@ def _stdio_jsonrpc_loop(
         token = _MCP_CALL_CANCEL_EVENT.set(cancelled)
         try:
             _handle_and_write_mcp_request(
-                request_id, method, params, tools, bridge_dir, stdout_lock, framed, request_slots
+                request_id, method, params, bridge_dir, stdout_lock, framed, request_slots
             )
         finally:
             _MCP_CALL_CANCEL_EVENT.reset(token)
@@ -9488,7 +9558,6 @@ def _handle_and_write_mcp_request(
     request_id: object,
     method: str,
     params: object,
-    tools: dict[str, Tool],
     bridge_dir: Path,
     stdout_lock: threading.Lock,
     framed: bool,
@@ -9500,7 +9569,6 @@ def _handle_and_write_mcp_request(
     :param request_id: JSON-RPC request identifier returned to the client.
     :param method: JSON-RPC method name.
     :param params: Method parameters from the request.
-    :param tools: Omnigent tools exposed over MCP.
     :param bridge_dir: Bridge directory used to resolve the active relay.
     :param stdout_lock: Lock serializing responses and notifications.
     :param framed: Whether to emit a Content-Length framed response.
@@ -9508,7 +9576,6 @@ def _handle_and_write_mcp_request(
     :returns: None after the response is written.
     """
     # Heartbeat relay calls only: execution and approval waits are bounded.
-    # A hung local tool must stay killable by the client's static timeout.
     progress_token = (
         _extract_progress_token(params)
         if method == "tools/call" and _is_relay_tool_call(params, bridge_dir)
@@ -9517,7 +9584,7 @@ def _handle_and_write_mcp_request(
     heartbeat = _McpProgressHeartbeat(progress_token, stdout_lock, framed=framed)
     try:
         with heartbeat:
-            result = _handle_mcp_request(method, params, tools, bridge_dir)
+            result = _handle_mcp_request(method, params, bridge_dir)
         response: _JsonObject = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -9538,7 +9605,6 @@ def _handle_and_write_mcp_request(
 def _handle_mcp_request(
     method: str,
     params: object,
-    tools: dict[str, Tool],
     bridge_dir: Path,
 ) -> _JsonObject:
     """
@@ -9546,7 +9612,6 @@ def _handle_mcp_request(
 
     :param method: JSON-RPC method name, e.g. ``"initialize"``.
     :param params: Request params object.
-    :param tools: Omnigent tools exposed over MCP.
     :param bridge_dir: Bridge directory path used to read the
         active tool relay.
     :returns: MCP result object.
@@ -9563,57 +9628,31 @@ def _handle_mcp_request(
             },
             "instructions": (
                 "Omnigent tools are available as MCP tools when the "
-                "active Omnigent turn advertises them; local sys_os_* "
-                "tools are available outside an active turn for "
-                "workspace file and shell access."
+                "active Omnigent turn advertises them."
             ),
         }
     if method == "tools/list":
-        return {"tools": _combined_mcp_tool_schemas(tools, bridge_dir)}
+        return {"tools": _relay_mcp_tool_schemas(bridge_dir)}
     if method == "tools/call":
-        return _call_mcp_tool(params, tools, bridge_dir)
+        return _call_mcp_tool(params, bridge_dir)
     if method == "ping":
         return {}
     return {}
 
 
-def _mcp_tool_schema(tool: Tool) -> _JsonObject:
+def _relay_mcp_tool_schemas(bridge_dir: Path) -> list[_JsonObject]:
     """
-    Convert an Omnigent tool schema into MCP tool-list shape.
+    Return the active relay tools in MCP list shape.
 
-    :param tool: Tool instance, e.g. ``SysOsReadTool``.
-    :returns: MCP tool descriptor.
-    """
-    schema = tool.get_schema()["function"]
-    return {
-        "name": schema["name"],
-        "description": schema.get("description", ""),
-        "inputSchema": schema.get("parameters", {"type": "object", "properties": {}}),
-    }
-
-
-def _combined_mcp_tool_schemas(
-    local_tools: dict[str, Tool],
-    bridge_dir: Path,
-) -> list[_JsonObject]:
-    """
-    Return local and active-turn relay tools in MCP list shape.
-
-    :param local_tools: Tools the bridge can run directly, e.g.
-        ``{"sys_os_read": SysOsReadTool(...)}``.
     :param bridge_dir: Bridge directory path used to read
         ``tool_relay.json``.
-    :returns: MCP tool descriptors. Active relay tools override
-        local tools with the same name so calls flow through Omnigent and
-        appear in the Omnigent event stream during web turns.
+    :returns: MCP tool descriptors, one per named relay tool.
     """
-    schemas = {name: _mcp_tool_schema(tool) for name, tool in local_tools.items()}
-    for tool_spec in _read_relay_tool_specs(bridge_dir):
-        name = tool_spec.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        schemas[name] = _mcp_tool_schema_from_spec(tool_spec)
-    return list(schemas.values())
+    return [
+        _mcp_tool_schema_from_spec(tool_spec)
+        for tool_spec in _read_relay_tool_specs(bridge_dir)
+        if isinstance(tool_spec.get("name"), str) and tool_spec.get("name")
+    ]
 
 
 def _mcp_tool_schema_from_spec(tool_spec: _JsonObject) -> _JsonObject:
@@ -9636,15 +9675,13 @@ def _mcp_tool_schema_from_spec(tool_spec: _JsonObject) -> _JsonObject:
 
 def _call_mcp_tool(
     params: object,
-    tools: dict[str, Tool],
     bridge_dir: Path,
 ) -> _JsonObject:
     """
-    Execute one MCP tool call.
+    Execute one MCP tool call through the active relay.
 
     :param params: MCP tool-call params, e.g.
-        ``{"name": "sys_os_read", "arguments": {"path": "README.md"}}``.
-    :param tools: Omnigent tools exposed over MCP.
+        ``{"name": "list_comments", "arguments": {}}``.
     :param bridge_dir: Bridge directory path used to read the
         active tool relay.
     :returns: MCP tool-call result.
@@ -9653,48 +9690,11 @@ def _call_mcp_tool(
         return _mcp_error("tool call params must be an object")
     name = params.get("name")
     arguments = params.get("arguments")
-    if not isinstance(name, str):
+    if not isinstance(name, str) or name not in _read_relay_tool_names(bridge_dir):
         return _mcp_error(f"unknown tool: {name!r}")
     if not isinstance(arguments, dict):
         arguments = {}
-    if name in _read_relay_tool_names(bridge_dir):
-        return _call_relay_tool(bridge_dir, name, arguments)
-    if name not in tools:
-        return _mcp_error(f"unknown tool: {name!r}")
-    bridge_config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    workspace_raw = bridge_config.get("workspace") if isinstance(bridge_config, dict) else None
-    workspace = Path(workspace_raw) if isinstance(workspace_raw, str) and workspace_raw else None
-    ctx = ToolContext(
-        task_id="claude-native",
-        agent_id="claude-native-ui",
-        workspace=workspace,
-        conversation_id=read_active_session_id(bridge_dir),
-    )
-    result = tools[name].invoke(json.dumps(arguments), ctx)
-    response: _JsonObject = {"content": [{"type": "text", "text": result}]}
-    if _local_result_is_error(result):
-        response["isError"] = True
-    return response
-
-
-def _local_result_is_error(result: object) -> bool:
-    """Whether a bridge-local tool's JSON result reports an error.
-
-    Relay-routed calls get ``isError`` from
-    :func:`omnigent.runtime.mcp_tool_result.mcp_response_from_tool_result`;
-    the local ``sys_os_*`` tools served outside an active turn return the same
-    ``{"error": ...}`` / ``{"blocked": true}`` shapes and must flag them the
-    same way, or the model reads a failure as a result.
-    """
-    if not isinstance(result, str):
-        return False
-    try:
-        payload = json.loads(result)
-    except ValueError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    return payload.get("blocked") is True or bool(payload.get("error"))
+    return _call_relay_tool(bridge_dir, name, arguments)
 
 
 def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
@@ -9851,57 +9851,6 @@ def _empty_object_schema() -> _JsonObject:
     :returns: ``{"type": "object", "properties": {}}``.
     """
     return {"type": "object", "properties": {}}
-
-
-def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], None]]:
-    """
-    Build Omnigent MCP tools served by the bridge.
-
-    :param config: Bridge config JSON object. An optional ``"sandbox"``
-        key, written by :func:`prepare_bridge_dir` from the session's
-        resolved ``os_env.sandbox`` (policy overrides included), is
-        applied to the ``sys_os_*`` tools built here. Its absence
-        (older bridge configs, or sessions with no sandbox to carry)
-        falls back to the prior unsandboxed default. ``credential_proxy``
-        is never present (see :func:`_bridge_sandbox_payload`), so the
-        rebuilt spec always has it unset here.
-    :returns: ``(tools, close_tools)`` where ``close_tools``
-        releases any helper processes.
-    """
-    # Imported here, not at module top: this drags the tools/spec/pydantic
-    # graph (~300 ms of interpreter startup), and this module is on the
-    # import path of every per-chunk/per-tool-call Claude hook subprocess.
-    # Only the bridge MCP server (launch path) ever builds these tools.
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.os_env import create_os_environment
-    from omnigent.inner.os_env_serialization import decode_sandbox_spec
-    from omnigent.tools.builtins.os_env import build_os_env_tools
-
-    workspace_raw = config.get("workspace")
-    workspace = Path(workspace_raw) if isinstance(workspace_raw, str) and workspace_raw else None
-    os_env: OSEnvironment | None = None
-    if workspace is not None:
-        sandbox_payload = config.get("sandbox")
-        sandbox = (
-            decode_sandbox_spec(sandbox_payload)
-            if isinstance(sandbox_payload, dict)
-            else OSEnvSandboxSpec(type="none")
-        )
-        spec = OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            sandbox=sandbox,
-            fork=False,
-        )
-        os_env = create_os_environment(spec)
-    tools = {tool.name(): tool for tool in build_os_env_tools(os_env)} if os_env else {}
-
-    def _close_tools() -> None:
-        """Close helper resources owned by this bridge server."""
-        if os_env is not None:
-            os_env.close()
-
-    return tools, _close_tools
 
 
 def _write_jsonrpc(
@@ -10062,8 +10011,8 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     Read every poll-time footer signal from ONE Claude pane capture.
 
     Non-blocking, best-effort, read-only. Captures the pane a single time
-    and parses both the permission-mode footer and any settled ``/btw``
-    overlay from it, so the forwarder spawns one ``capture-pane``
+    and parses the permission-mode footer, any settled ``/btw`` overlay and
+    any API retry row from it, so the forwarder spawns one ``capture-pane``
     subprocess per poll rather than one per signal. Returns an empty
     :class:`PaneSignals` when the terminal isn't up.
 
@@ -10082,6 +10031,7 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
     return PaneSignals(
         permission_mode=_permission_mode_from_pane(pane),
         btw_overlay=_btw_overlay_from_pane(pane),
+        api_retry=_api_retry_from_pane(pane),
     )
 
 
@@ -10139,6 +10089,110 @@ def read_claude_status_model(bridge_dir: Path) -> str | None:
         return None
     model = parsed.get("model")
     return model if isinstance(model, str) and model else None
+
+
+@dataclass(frozen=True)
+class ResumeCostBaseline:
+    """
+    The session cost a cold resume seeded into a resumed Claude process.
+
+    :param claude_session_id: Claude session id the process resumed, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``. The baseline applies only
+        while the forwarded transcript belongs to that session.
+    :param cost_usd: Cost written into the transcript's ``cost-state`` record,
+        e.g. ``1.25``.
+    :param restored: Whether the process reported that cost back, or ``None``
+        until its first non-zero statusLine cost is seen.
+    """
+
+    claude_session_id: str
+    cost_usd: float
+    restored: bool | None = None
+
+
+def record_resume_cost_baseline(
+    bridge_dir: Path, *, claude_session_id: str, cost_usd: float
+) -> None:
+    """
+    Record the cost a cold resume seeds into the next Claude process.
+
+    Also removes the previous process's statusLine snapshot, so the first
+    cost the forwarder reads comes from the resumed process.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :param claude_session_id: Claude session id passed to ``--resume``, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param cost_usd: Cost written into the ``cost-state`` record, e.g.
+        ``1.25``.
+    :raises OSError: When the snapshot can't be removed or the record written.
+    :raises RuntimeError: When the bridge dir fails its ownership check.
+    """
+    for name in (_CONTEXT_FILE, CONTEXT_RAW_FILE):
+        with contextlib.suppress(FileNotFoundError):
+            (bridge_dir / name).unlink()
+    write_resume_cost_baseline(
+        bridge_dir,
+        ResumeCostBaseline(claude_session_id=claude_session_id, cost_usd=cost_usd),
+    )
+
+
+def write_resume_cost_baseline(bridge_dir: Path, baseline: ResumeCostBaseline) -> None:
+    """
+    Persist *baseline*, so a restarted forwarder keeps its restore decision.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :param baseline: Baseline to store.
+    :raises OSError: When the record can't be written.
+    :raises RuntimeError: When the bridge dir fails its ownership check.
+    """
+    _write_json_file(
+        bridge_dir / _RESUME_COST_BASELINE_FILE,
+        {
+            "claude_session_id": baseline.claude_session_id,
+            "cost_usd": baseline.cost_usd,
+            "restored": baseline.restored,
+        },
+    )
+
+
+def clear_resume_cost_baseline(bridge_dir: Path) -> None:
+    """
+    Forget any seeded cost, e.g. before a launch that seeds none.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :raises OSError: When an existing record can't be removed.
+    """
+    with contextlib.suppress(FileNotFoundError):
+        (bridge_dir / _RESUME_COST_BASELINE_FILE).unlink()
+
+
+def read_resume_cost_baseline(bridge_dir: Path) -> ResumeCostBaseline | None:
+    """
+    Read the cost the last cold resume seeded into Claude.
+
+    :param bridge_dir: Bridge directory shared with the forwarder.
+    :returns: The baseline, or ``None`` when absent or malformed.
+    :raises OSError: When an existing record can't be read.
+    """
+    payload = _read_json_file(bridge_dir / _RESUME_COST_BASELINE_FILE)
+    claude_session_id = payload.get("claude_session_id")
+    cost_usd = payload.get("cost_usd")
+    restored = payload.get("restored")
+    if not isinstance(claude_session_id, str) or not claude_session_id:
+        return None
+    if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
+        return None
+    try:
+        cost = float(cost_usd)
+    except OverflowError:  # an integer too large for a float
+        return None
+    if not math.isfinite(cost) or cost <= 0:
+        return None
+    if restored is not None and not isinstance(restored, bool):
+        return None
+    return ResumeCostBaseline(
+        claude_session_id=claude_session_id, cost_usd=cost, restored=restored
+    )
 
 
 def read_user_status_line_command() -> str | None:
@@ -10350,6 +10404,11 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    if (blocked := hook_blocked_prompt(entry)) is not None:
+        # A blocked prompt neither starts nor ends a turn.
+        return current_response_id, _blocked_agent_message_items(
+            entry, *blocked, line_number=line_number, record_offset=record_offset
+        )
     # Only ``user``/``assistant`` records are conversation turns. Other typed
     # records can carry a ``message`` too, e.g. ``api-request-blob`` copies of
     # API requests that include injected ``<system-reminder>`` context.
@@ -10461,6 +10520,127 @@ def _attachment_transcript_items_from_entry(
         ),
     )
     return None, [item]
+
+
+# Claude Code writes this frame line at column zero and indents the report.
+_SUBAGENT_HANDBACK_HEADER_RE = re.compile(r"^\[Subagent hand-back\] ", re.MULTILINE)
+_AGENT_MESSAGE_SENDER_RE = re.compile(
+    r'\A<(?:agent-message\s[^>]*\bfrom|teammate-message\s[^>]*\bteammate_id)="([^"]+)"'
+)
+_AGENT_MESSAGE_TAG_RES = {
+    name: re.compile(rf"<(/?){name}[\s>]") for name in ("agent-message", "teammate-message")
+}
+AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE = "native_agent_message_blocked_by_hook"
+
+
+def _leading_agent_message(text: str, *, outermost: bool) -> tuple[str, str, str] | None:
+    """
+    Split a leading delivery from another agent into its sender, text, and what follows.
+
+    :param text: Text that starts with a delivery envelope.
+    :param outermost: End at the last closing tag instead of the matching one.
+    :returns: The sender, the delivered text, and the text after the delivery, or
+        ``None`` when ``text`` does not start with a complete delivery.
+    """
+    opening = _AGENT_MESSAGE_SENDER_RE.match(text)
+    tag_end = text.find(">", opening.end()) if opening is not None else -1
+    if opening is None or tag_end < 0:
+        return None
+    name = "agent-message" if text.startswith("<agent-message") else "teammate-message"
+    if outermost:
+        content, found, rest = text[tag_end + 1 :].rpartition(f"</{name}>")
+        return (opening.group(1), content, rest) if found else None
+    depth = 1
+    for tag in _AGENT_MESSAGE_TAG_RES[name].finditer(text, tag_end + 1):
+        depth += -1 if tag.group(1) else 1
+        if depth == 0:
+            return opening.group(1), text[tag_end + 1 : tag.start()], text[tag.end() :]
+    return None
+
+
+def _agent_message_deliveries(prompt: str) -> list[tuple[str, str]]:
+    """
+    Split a prompt of deliveries from other agents into each sender and its text.
+
+    Each delivery ends at its matching closing tag, so balanced markup quoted inside
+    it neither ends it nor names a sender. With unbalanced quoted markup, the prompt
+    is one delivery that ends at the last closing tag.
+
+    :param prompt: Prompt text, e.g. ``'<agent-message from="worker">Done</agent-message>'``.
+    :returns: Each sender and its delivered text; empty for any other prompt.
+    """
+    body, wrapped = _strip_teammate_message_prefix(prompt)
+
+    def is_end(remainder: str) -> bool:
+        remainder = remainder.strip()
+        return not remainder or (wrapped and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE))
+
+    deliveries: list[tuple[str, str]] = []
+    rest = body
+    while (delivery := _leading_agent_message(rest, outermost=False)) is not None:
+        sender, text, rest = delivery
+        deliveries.append((sender, text))
+        rest = rest.lstrip()
+        if is_end(rest):
+            return deliveries
+    outer = _leading_agent_message(body, outermost=True)
+    return [(outer[0], outer[1])] if outer is not None and is_end(outer[2]) else []
+
+
+def _blocked_agent_message_items(
+    entry: _JsonObject,
+    reason: str,
+    prompt: str,
+    *,
+    line_number: int,
+    record_offset: int | None,
+) -> list[ClaudeTranscriptItem]:
+    """
+    Report another agent's message that a ``UserPromptSubmit`` hook blocked.
+
+    Claude Code records the block only as a ``system`` notice, and tells a
+    handing-back subagent its report was delivered, so nothing else shows the
+    loss. The blocked text is not repeated: the hook flagged it.
+
+    :param entry: Claude ``system`` record of the blocked prompt.
+    :param reason: The hook's reason, e.g. ``"Secret detected"``.
+    :param prompt: The original prompt, e.g. ``'<agent-message from="worker">…'``.
+    :param line_number: One-based transcript line number.
+    :param record_offset: Byte offset where the transcript record
+        starts, or ``None`` for legacy line-cursor reads.
+    :returns: One error item per blocked delivery; none for any other prompt.
+    """
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    items: list[ClaudeTranscriptItem] = []
+    for index, (sender, text) in enumerate(_agent_message_deliveries(prompt)):
+        if _SUBAGENT_HANDBACK_HEADER_RE.search(text) is not None:
+            title = "A hook blocked a subagent's report"
+            message = (
+                f'A UserPromptSubmit hook blocked the report from subagent "{sender}", so the '
+                "agent never received it, although Claude Code reported it as delivered."
+            )
+        else:
+            title = "A hook blocked a message from another agent"
+            message = (
+                f'A UserPromptSubmit hook blocked a message from agent "{sender}", so the '
+                "agent never received it."
+            )
+        if reason.strip():
+            message = f"{message}\n\nHook reason: {reason.strip()}"
+        items.append(
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, index, "error"),
+                item_type="error",
+                data={
+                    "source": "harness",
+                    "code": AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE,
+                    "title": title,
+                    "message": message,
+                },
+                response_id=_response_id_from_source(source_key),
+            )
+        )
+    return items
 
 
 # Slash-command marker handling. Claude Code's embedded TUI emits
@@ -10629,7 +10809,7 @@ _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
 #   web message that opens one would never be confirmed delivered.
 # - SURFACED — commands that change the next turn's behavior or the
 #   conversation state (``/effort high``, ``/clear``, ``/compact``,
-#   ``/model``, ``/ultrareview``). A web observer needs to see these,
+#   ``/goal``, ``/model``, ``/ultrareview``). A web observer needs to see these,
 #   otherwise the next assistant turn appears to shift unprompted.
 #
 # Unknown names fall through to the Skill branch — a safer default
@@ -10680,6 +10860,7 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
         "clear",
         "compact",
         "effort",
+        "goal",
         "model",
         "ultrareview",
     }
@@ -10980,17 +11161,20 @@ def _peer_message_wake_marker(
     )
 
 
+def _strip_teammate_message_prefix(text: str) -> tuple[str, bool]:
+    """Drop Claude's peer-delivery preamble and report whether one was present."""
+    stripped = text.lstrip()
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            return stripped[len(prefix) :].lstrip(), True
+    return stripped, False
+
+
 def _is_agent_notification_text(text: str) -> bool:
     """Recognize possible agent context; text alone does not prove its origin."""
     if _is_trusted_agent_notification_text(text):
         return True
-    stripped = text.lstrip()
-    wrapped = False
-    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix) :].lstrip()
-            wrapped = True
-            break
+    stripped, wrapped = _strip_teammate_message_prefix(text)
     if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
         return False
     while match := _TEAMMATE_MESSAGE_RE.match(stripped):
@@ -11586,6 +11770,22 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
     "space, or /clear to start a new conversation."
 )
 
+# Claude Code's record for a response that ended with stop_reason "max_tokens";
+# its remedy (CLAUDE_CODE_MAX_OUTPUT_TOKENS on the CLI process) is a dead end in
+# the web chat. Loose on count, apostrophe and prefix so a CLI wording bump matches.
+_OUTPUT_TOKEN_LIMIT_RE = re.compile(
+    r"^(?:API Error: )?Claude['’]s response exceeded the [\d,]+ output token maximum\.",
+    re.IGNORECASE,
+)
+
+# ``classify_native_turn_error`` keys on "exceeded the model’s maximum output length";
+# keep that phrase if the wording changes.
+_OUTPUT_TOKEN_LIMIT_REPLACEMENT = (
+    "Output limit reached — the response exceeded the model’s maximum "
+    "output length and was cut off. Ask for a shorter answer, or break "
+    "the request into smaller pieces and continue step by step."
+)
+
 # Claude Code points its auth failures at ``/login`` — a dead end in the
 # web chat, where ``/login`` is a dropped command: it is escaped into
 # plain text and answered by the same expired session with the same
@@ -11721,8 +11921,8 @@ def _assistant_message_item(
     :param text: Assistant text block.
     :param is_api_error: Whether Claude Code flagged the record as its
         own API error (see :func:`_is_api_error_entry`). Gates the
-        ``/login`` guidance append, which is safe only on CLI-authored
-        text.
+        output-limit rewrite and the ``/login`` guidance append, which
+        are safe only on CLI-authored text.
     :param failure_context: Original error fields before display-text rewriting.
     :returns: Parsed transcript item.
     """
@@ -11747,12 +11947,15 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
 
     :param text: Assistant or CLI error text, e.g. ``"Prompt is too long"``.
     :param is_api_error: Whether Claude Code authored the text as its own
-        error; gates the ``/login`` guidance append.
+        error; gates the output-limit rewrite and the ``/login`` guidance
+        append.
     :returns: The text to show, e.g. the context-overflow guidance.
     """
     stripped = text.strip()
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
+    if is_api_error and _OUTPUT_TOKEN_LIMIT_RE.match(stripped):
+        return _OUTPUT_TOKEN_LIMIT_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_login_guidance()}"
     return text

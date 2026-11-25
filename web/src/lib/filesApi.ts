@@ -1,4 +1,5 @@
 import { attachmentFilename } from "./attachments";
+import type { UploadProgressListener } from "./host";
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
@@ -9,7 +10,15 @@ export interface UploadedFile {
   created_at: number;
 }
 
-export async function uploadFile(sessionId: string, file: File): Promise<UploadedFile> {
+/**
+ * Upload one file to a session. `signal` stops the upload; `onUploadProgress` is told how much
+ * has gone, where the transport can say.
+ */
+export async function uploadFile(
+  sessionId: string,
+  file: File,
+  guard: { signal?: AbortSignal; onUploadProgress?: UploadProgressListener } = {},
+): Promise<UploadedFile> {
   const form = new FormData();
   const filename = attachmentFilename(file);
   form.append("file", file, filename);
@@ -18,6 +27,8 @@ export async function uploadFile(sessionId: string, file: File): Promise<Uploade
     {
       method: "POST",
       body: form,
+      signal: guard.signal,
+      onUploadProgress: guard.onUploadProgress,
     },
   );
   // Carry the server's reason ("Unsupported attachment type 'application/zip'…"
@@ -39,6 +50,14 @@ export async function uploadFile(sessionId: string, file: File): Promise<Uploade
     bytes: resource.metadata?.bytes ?? file.size,
     created_at: resource.metadata?.created_at ?? 0,
   };
+}
+
+export async function deleteSessionFile(sessionId: string, fileId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(fileId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
 }
 
 /**

@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import type { AnyBlock } from "@/lib/blocks";
+import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY, readCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { setEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
@@ -30,6 +31,7 @@ const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype,
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
 afterEach(() => {
+  localStorage.removeItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY);
   setEmbedRoot(null);
   vi.unstubAllGlobals();
   cleanup();
@@ -572,6 +574,8 @@ describe("MessageResponse table fullscreen", () => {
     fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
 
     const dialog = within(embedRoot).getByRole("dialog", { name: "View fullscreen" });
+    // Marks a full-window view, which clears the window's top inset (index.css).
+    expect(dialog).toHaveAttribute("data-fullscreen-overlay");
     expect(within(dialog).getByRole("cell", { name: "Alpha" })).toBeInTheDocument();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Exit fullscreen" }));
@@ -627,6 +631,26 @@ describe("MessageResponse code-block copy", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(block).toHaveClass("chat-code-wrap");
+  });
+
+  it("applies one block's wrap toggle to every code block and keeps it after a remount", async () => {
+    const markdown = "```ts\nconst first = 1;\n```\n\n```py\nsecond = 2\n```";
+    const firstRender = render(<MessageResponse>{markdown}</MessageResponse>);
+    const toggles = await screen.findAllByRole("button", { name: "Toggle word wrap" });
+    expect(toggles).toHaveLength(2);
+
+    fireEvent.click(toggles[0]!);
+    for (const toggle of toggles) expect(toggle).toHaveAttribute("aria-pressed", "false");
+    for (const block of firstRender.container.querySelectorAll(".chat-code-block")) {
+      expect(block).not.toHaveClass("chat-code-wrap");
+    }
+
+    // A fresh render stands in for a refresh or another session's transcript.
+    firstRender.unmount();
+    render(<MessageResponse>{"```sh\necho later\n```"}</MessageResponse>);
+    const laterToggle = await screen.findByRole("button", { name: "Toggle word wrap" });
+    expect(laterToggle).toHaveAttribute("aria-pressed", "false");
+    expect(readCodeBlockWordWrap()).toBe(false);
   });
 
   it("copies the exact fenced code text through the fallback path", async () => {
