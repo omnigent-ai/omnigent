@@ -4,6 +4,8 @@ import type { Session } from "@/lib/types";
 import type * as ConversationEntryStateModule from "@/hooks/useConversationEntryState";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
 import type * as GridSessionsModule from "./GridSessionsContext";
+import type * as IdentityModule from "@/lib/identity";
+import type * as UseFloatingPanesModule from "@/shell/useFloatingPanes";
 import {
   type ComponentProps,
   type ReactElement,
@@ -110,6 +112,33 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+// Floating panes ask the runner before a shell closes; off by default here, as without the flag.
+const shellRead = vi.hoisted(() => ({
+  floating: false,
+  body: { state: "unknown" } as Record<string, unknown>,
+  asked: [] as string[],
+}));
+vi.mock("@/shell/useFloatingPanes", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseFloatingPanesModule>()),
+  useFloatingPanes: () => shellRead.floating,
+}));
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return {
+    ...actual,
+    authenticatedFetch: (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!url.endsWith("/shell")) return actual.authenticatedFetch(input, init);
+      shellRead.asked.push(url);
+      return Promise.resolve(
+        new Response(JSON.stringify(shellRead.body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    },
+  };
+});
 vi.mock("@/shell/PullRequestPanel", () => ({ selectPullRequestInPanel: vi.fn() }));
 vi.mock("@/shell/FilesPanel", async (original) => ({
   ...(await original<typeof FilesPanelModule>()),
@@ -336,6 +365,9 @@ afterEach(() => {
   fixture.readOnlySessions = [];
   fixture.launches = {};
   fixture.inferenceConfigured = undefined;
+  shellRead.floating = false;
+  shellRead.body = { state: "unknown" };
+  shellRead.asked = [];
   vi.restoreAllMocks();
 });
 
@@ -523,6 +555,37 @@ it("asks once before a bulk shell close and kills nothing when cancelled", () =>
   fireEvent.click(within(workspace).getByText("Close shells"));
   fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
   expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
+});
+
+it("asks about a bulk shell close without reading the runner when floating panes are off", () => {
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  shellRead.body = { state: "idle" };
+  render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+  expect(shellRead.asked).toEqual([]);
+});
+
+it("with floating panes, closes idle shells without asking and asks about a busy one", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  shellRead.floating = true;
+  fixture.terminals = [{ id: "terminal_a", name: "a", session: "main", running: true }];
+  shellRead.body = { state: "busy", foreground: "vim", background_jobs: 0 };
+  const { unmount } = render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  await waitFor(() => expect(screen.getByRole("dialog")).toHaveTextContent("vim is running in a"));
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+  unmount();
+
+  shellRead.body = { state: "idle" };
+  render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  await waitFor(() => expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"]]));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(shellRead.asked).toHaveLength(2);
 });
 
 it("opens chat-linked folders and PRs in that pane's workspace", () => {
