@@ -20,6 +20,7 @@ _STATES = {"idle", "working", "done", "blocked", "error", "clear"}
 _KINDS = {"permission", "question", "auth"}
 _VALUE = re.compile(r"[A-Za-z0-9_.,+/=-]*")
 _SEGMENT = re.compile(r"[A-Za-z0-9_.+-]{1,32}")
+_TMUX_PREFIX = b"\x1bPtmux;"
 _REPLY = b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
 # A child that stops reading its input cannot queue query replies without bound.
 _UNSENT_INPUT_LIMIT = 1 << 20
@@ -34,11 +35,14 @@ class ProgramStatus:
     id: str | None = None
     kind: str | None = None
     message: str | None = None
+    title: str | None = None
 
 
 def parse_report(body: bytes) -> ProgramStatus | None:
     """Parse an OSC body, validating all fields before applying any of it."""
-    text = body.decode("ascii", errors="replace")
+    if any(not 32 <= byte <= 126 for byte in body):
+        return None
+    text = body.decode("ascii")
     pairs: dict[str, str] = {}
     decoded: dict[str, str] = {}
     for pair in text.split(":"):
@@ -59,7 +63,7 @@ def parse_report(body: bytes) -> ProgramStatus | None:
         if sep and key == "app" and len(value) > 32:
             return None
         if not (sep and re.fullmatch("[a-z]+", key) and _VALUE.fullmatch(value)):
-            continue
+            return None
         if key in {"msg", "title"}:
             encoded_limit, decoded_limit = (2732, 2048) if key == "msg" else (256, 192)
             if len(value) > encoded_limit:
@@ -80,7 +84,7 @@ def parse_report(body: bytes) -> ProgramStatus | None:
     record_id = pairs.get("id")
     app = pairs.get("app")
     if app is not None and not _SEGMENT.fullmatch(app):
-        app = None
+        return None
     kind = pairs.get("kind") if state == "blocked" else None
     return ProgramStatus(
         state=state,
@@ -88,7 +92,23 @@ def parse_report(body: bytes) -> ProgramStatus | None:
         id=record_id,
         kind=kind if kind in _KINDS else None,
         message=decoded.get("msg"),
+        title=decoded.get("title"),
     )
+
+
+def _serialize_report(report: ProgramStatus, ending: bytes) -> bytes:
+    """Build the forwarded report from validated fields, never child escape bytes."""
+    fields = [
+        ("state", report.state),
+        ("app", report.app),
+        ("id", report.id),
+        ("kind", report.kind),
+    ]
+    for key, text in (("title", report.title), ("msg", report.message)):
+        if text is not None:
+            fields.append((key, base64.b64encode(text.encode("utf-8")).decode("ascii")))
+    body = ":".join(f"{key}={value}" for key, value in fields if value is not None)
+    return b"\x1b]7501;" + body.encode("ascii") + ending
 
 
 class ProgramStatusParser:
@@ -96,6 +116,7 @@ class ProgramStatusParser:
 
     Other bytes pass through unchanged. Oversized strings stop being buffered;
     parsing resumes after their terminator, without interpreting their contents.
+    Forwarding mode discards child-supplied tmux wrappers.
     """
 
     def __init__(
@@ -132,7 +153,9 @@ class ProgramStatusParser:
                     self._overflow = False
                     self._state = "string"
                     self._held.append(byte)
-                    if not self._osc:
+                    if byte == ord("P") and self._tmux_passthrough:
+                        self._state = "dcs_prefix"
+                    elif not self._osc:
                         output.extend(self._held)
                         self._held.clear()
                 else:
@@ -145,6 +168,29 @@ class ProgramStatusParser:
                         self._held.append(byte)
                     else:
                         output.append(byte)
+            elif self._state == "dcs_prefix":
+                self._held.append(byte)
+                if _TMUX_PREFIX.startswith(self._held):
+                    if len(self._held) == len(_TMUX_PREFIX):
+                        self._held.clear()
+                        self._state = "discard"
+                else:
+                    output.extend(self._held)
+                    self._held.clear()
+                    if byte in (24, 26):
+                        self._state = "ground"
+                    elif byte == 27:
+                        self._state = "string_escape"
+                    else:
+                        self._state = "string"
+            elif self._state in {"discard", "discard_escape"}:
+                # Doubled escapes belong to the payload, not the wrapper's terminator.
+                if byte in (24, 26) or (self._state == "discard_escape" and byte == 92):
+                    self._state = "ground"
+                elif self._state == "discard" and byte == 27:
+                    self._state = "discard_escape"
+                else:
+                    self._state = "discard"
             else:
                 if self._osc and not self._overflow:
                     self._held.append(byte)
@@ -172,7 +218,7 @@ class ProgramStatusParser:
 
     def finish(self) -> bytes:
         """Flush an incomplete escape sequence on process exit."""
-        pending = bytes(self._held)
+        pending = b"" if self._state == "dcs_prefix" else bytes(self._held)
         self._held.clear()
         self._state = "ground"
         return pending
@@ -186,8 +232,11 @@ class ProgramStatusParser:
             if report is not None:
                 self._report(report)
                 if self._tmux_passthrough:
+                    ending = b"\x07" if self._held[-1] == 7 else b"\x1b\\"
                     return (
-                        b"\x1bPtmux;" + bytes(self._held).replace(b"\x1b", b"\x1b\x1b") + b"\x1b\\"
+                        _TMUX_PREFIX
+                        + _serialize_report(report, ending).replace(b"\x1b", b"\x1b\x1b")
+                        + b"\x1b\\"
                     )
         elif body == b"133;A" or body.startswith(b"133;A;"):
             self._reset(False)

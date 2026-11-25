@@ -74,16 +74,22 @@ def test_fragmented_reports_queries_and_resets(ending: bytes) -> None:
         b"state=working:msg=" + base64.b64encode("\u0085".encode()),
         b"state=working:title=" + base64.b64encode(b"a" * 193),
         b"state=working:msg=" + base64.b64encode(b"a" * 2049),
+        b"state=working:broken",
+        b"state=working:future=invalid!",
+        b"state=working:future=\x1b!",
+        b"state=working:future=\n",
+        b"state=working:future=\xff",
+        b"state=working:app=invalid/name",
     ],
 )
 def test_invalid_reports_are_discarded_whole(body: bytes) -> None:
     assert parse_report(body) is None
 
 
-def test_unknown_keys_and_malformed_pairs_do_not_discard_valid_state() -> None:
-    assert parse_report(
-        b" broken : state=idle : future=x : state=working : msg=invalid! : kind=auth"
-    ) == ProgramStatus("working")
+def test_unknown_keys_and_repeated_state_are_supported() -> None:
+    assert parse_report(b" state=idle : future=x : state=working : kind=auth") == ProgramStatus(
+        "working"
+    )
 
 
 def test_other_control_strings_and_oversized_reports_cannot_change_status() -> None:
@@ -446,7 +452,6 @@ def test_reports_are_wrapped_in_place_and_discovery_is_local(chunk_size: int) ->
         b"\x1b]7501;state=working:" + b"x" * 5000 + b"\x07",
         b"\x1b]7501;state=working\x18",
         b"\x1b]7501;state=working",
-        _wrapped(_report("working")),
         b"\x1bP" + _report("working") + b"\x1b\\",
     ],
     ids=[
@@ -456,7 +461,6 @@ def test_reports_are_wrapped_in_place_and_discovery_is_local(chunk_size: int) ->
         "oversized",
         "cancelled",
         "incomplete",
-        "wrapped",
         "dcs",
     ],
 )
@@ -477,6 +481,55 @@ def test_observer_parser_keeps_plain_reports() -> None:
         on_report=lambda report: None, on_query=lambda: None, on_reset=lambda full: None
     )
     assert parser.feed(_report("working")) == _report("working")
+
+
+@pytest.mark.parametrize("chunk_size", [1, 17, 65536])
+@pytest.mark.parametrize(
+    "payload",
+    [b"opaque", b"nested\x1b\\tail", b"x" * 5000],
+    ids=["plain", "escaped-terminator", "oversized"],
+)
+def test_child_tmux_passthrough_is_dropped(chunk_size: int, payload: bytes) -> None:
+    parser = ProgramStatusParser(
+        on_report=lambda report: pytest.fail("child wrapper supplied a report"),
+        on_query=lambda: pytest.fail("child wrapper supplied a query"),
+        on_reset=lambda full: pytest.fail("child wrapper supplied a reset"),
+        tmux_passthrough=True,
+    )
+    stream = b"before" + _wrapped(payload) + b"after"
+    output = b"".join(
+        parser.feed(stream[i : i + chunk_size]) for i in range(0, len(stream), chunk_size)
+    )
+    assert output + parser.finish() == b"beforeafter"
+
+
+@pytest.mark.parametrize("data", [b"\x1bPtm", b"\x1bPtmux;unfinished"])
+def test_incomplete_child_tmux_passthrough_is_not_flushed(data: bytes) -> None:
+    parser = ProgramStatusParser(
+        on_report=lambda report: None,
+        on_query=lambda: None,
+        on_reset=lambda full: None,
+        tmux_passthrough=True,
+    )
+    assert parser.feed(data) + parser.finish() == b""
+
+
+def test_forwarding_serializes_validated_fields_and_preserves_titles() -> None:
+    reports = []
+    parser = ProgramStatusParser(
+        on_report=reports.append,
+        on_query=lambda: None,
+        on_reset=lambda full: None,
+        tmux_passthrough=True,
+    )
+    body = b"app=codex:state=blocked:future=x:id=child:kind=question:title=VGFzaw:msg=QXNrPw"
+    expected = _report("blocked", extra=":id=child:kind=question:title=VGFzaw==:msg=QXNrPw==")
+    assert parser.feed(b"\x1b]7501;" + body + b"\x1b\\") == _wrapped(expected)
+    assert reports == [
+        ProgramStatus(
+            "blocked", app="codex", id="child", kind="question", title="Task", message="Ask?"
+        )
+    ]
 
 
 def test_bel_terminated_report_and_st_terminated_query() -> None:
