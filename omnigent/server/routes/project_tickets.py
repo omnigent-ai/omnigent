@@ -820,7 +820,9 @@ def create_project_tickets_router(
         # Project sessions already carry this guidance in their instructions.
         if include_guidance and who.session_id is not None:
             page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
-        await enrich(project_id, page["data"], who, board=await board_stall(request, page, who))
+        # Agents read the list as data and never draw cards, so they skip the stall lookup.
+        board = await board_stall(request, page, who) if who.session_id is None else None
+        await enrich(project_id, page["data"], who, board=board)
         return page
 
     async def text_mentions(

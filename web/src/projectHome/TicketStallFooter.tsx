@@ -2,12 +2,13 @@ import { CirclePauseIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import type { ProjectTicket } from "@/lib/projectTicketsApi";
+import { useProjectRecord } from "./useProjectAgentSession";
 import { useTicketActions } from "./useProjectTickets";
-import { ticketStalled, wakeLeadComment } from "./ticketStall";
+import { routerLabel, ticketStalled, wakeRouterComment } from "./ticketStall";
 
 /**
  * The amber band under a stalled card, with Wake the Lead. Waking posts the viewer's
- * comment @mentioning the Lead, so it takes the same permission as any comment, shows on
+ * comment @mentioning the project's router (the Lead unless the owner chose another), so it takes the same permission as any comment, shows on
  * the ticket, and, as new activity, clears the band until the card idles again.
  */
 export function TicketStallFooter({ ticket, nowMs }: { ticket: ProjectTicket; nowMs: number }) {
@@ -25,6 +26,9 @@ function StalledBand({
   nowMs: number;
 }) {
   const { comment } = useTicketActions(ticket.project_id);
+  // The board page already loads this record, so the band adds no request.
+  const router = useProjectRecord(ticket.project_id).data?.router?.name || "Lead";
+  const who = routerLabel(router);
   const idleFor = relativeTime(since, nowMs);
   return (
     <div
@@ -40,19 +44,19 @@ function StalledBand({
         size="xs"
         className="-mr-1.5 ml-auto font-semibold text-inherit underline-offset-2 hover:bg-amber-500/15 hover:text-inherit hover:underline"
         loading={comment.isPending}
-        title="Ask the Lead to find out why and get this moving"
+        title={`Ask ${who} to find out why and get this moving`}
         onClick={() =>
           comment.mutate({
             id: ticket.id,
-            body: { text: wakeLeadComment(idleFor), kind: "comment" },
+            body: { text: wakeRouterComment(router, idleFor), kind: "comment" },
           })
         }
       >
-        Wake the Lead
+        Wake {who}
       </Button>
       {comment.isError && (
         <span role="alert" className="basis-full text-xs text-destructive">
-          Couldn't wake the Lead: {comment.error.message}
+          Couldn't wake {who}: {comment.error.message}
         </span>
       )}
     </div>

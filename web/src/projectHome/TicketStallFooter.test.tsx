@@ -10,6 +10,10 @@ import { ticketStalled } from "./ticketStall";
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ project_tickets: true, project_ticket_stages: true }),
 }));
+const projects = vi.hoisted(() => ({ router: { identity_id: "orchestrator", name: "Lead" } }));
+vi.mock("./useProjectAgentSession", () => ({
+  useProjectRecord: () => ({ data: { id: "project", name: "Shipping", router: projects.router } }),
+}));
 vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof api>()),
   commentOnTicket: vi.fn(),
@@ -28,6 +32,7 @@ const ticket = {
 afterEach(() => {
   cleanup();
   vi.resetAllMocks();
+  projects.router = { identity_id: "orchestrator", name: "Lead" };
 });
 
 function renderFooter(card: ProjectTicket) {
@@ -56,6 +61,19 @@ describe("stalled cards", () => {
     await waitFor(() =>
       expect(api.commentOnTicket).toHaveBeenCalledWith("project", "stuck", {
         text: "@Lead this ticket has had no one on it for 2h. Please find out why and get it moving.",
+        kind: "comment",
+      }),
+    );
+  });
+
+  it("wake the project's own router when the owner chose another persona", async () => {
+    projects.router = { identity_id: "pm", name: "Product Manager" };
+    vi.mocked(api.commentOnTicket).mockResolvedValue(ticket);
+    renderFooter(ticket);
+    fireEvent.click(screen.getByRole("button", { name: "Wake Product Manager" }));
+    await waitFor(() =>
+      expect(api.commentOnTicket).toHaveBeenCalledWith("project", "stuck", {
+        text: "@Product Manager this ticket has had no one on it for 2h. Please find out why and get it moving.",
         kind: "comment",
       }),
     );

@@ -1091,7 +1091,12 @@ async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user
     assert response.status_code == 201, response.text
     ticket_id = response.json()["id"]
     guided = {"include_guidance": "true"}
-    assert "agent_guidance" not in (await client.get(path, headers=headers)).json()
+    agent_page = (await client.get(path, headers=headers)).json()
+    assert "agent_guidance" not in agent_page
+    # Agents never draw cards, so their lists skip the stall lookup; a person's keeps it.
+    assert agent_page["data"] and all("stall" not in row for row in agent_page["data"])
+    person_page = (await client.get(path, headers=_as_user(ALICE))).json()
+    assert all("stall" in row for row in person_page["data"])
     assert (await client.get(path, headers=headers, params=guided)).json()["agent_guidance"] == (
         PROJECT_TICKET_WORK_INSTRUCTION
     )

@@ -12,9 +12,14 @@ export function ticketStalled(ticket: Pick<ProjectTicket, "stall">, nowMs: numbe
   return Boolean(stall) && nowMs / 1000 - stall!.idle_since >= stall!.after_s;
 }
 
-/** The comment Wake the Lead posts: it @mentions the Lead, which delivers it to the Lead. */
-export function wakeLeadComment(idleFor: string): string {
-  return `@Lead this ticket has had no one on it for ${idleFor}. Please find out why and get it moving.`;
+/** The router as the button names it: "the Lead", or another persona by name. */
+export function routerLabel(name: string): string {
+  return name === "Lead" ? "the Lead" : name;
+}
+
+/** The comment Wake the Lead posts: it @mentions the router, which delivers it to them. */
+export function wakeRouterComment(routerName: string, idleFor: string): string {
+  return `@${routerName} this ticket has had no one on it for ${idleFor}. Please find out why and get it moving.`;
 }
 
 const NO_IDS: string[] = [];
