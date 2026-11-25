@@ -10474,6 +10474,64 @@ _SUBAGENT_HANDBACK_HEADER_RE = re.compile(r"^\[Subagent hand-back\] ", re.MULTIL
 _AGENT_MESSAGE_SENDER_RE = re.compile(
     r'\A<(?:agent-message\s[^>]*\bfrom|teammate-message\s[^>]*\bteammate_id)="([^"]+)"'
 )
+_AGENT_MESSAGE_TAG_RES = {
+    name: re.compile(rf"<(/?){name}[\s>]") for name in ("agent-message", "teammate-message")
+}
+AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE = "native_agent_message_blocked_by_hook"
+
+
+def _leading_agent_message(text: str, *, outermost: bool) -> tuple[str, str, str] | None:
+    """
+    Split a leading delivery from another agent into its sender, text, and what follows.
+
+    :param text: Text that starts with a delivery envelope.
+    :param outermost: End at the last closing tag instead of the matching one.
+    :returns: The sender, the delivered text, and the text after the delivery, or
+        ``None`` when ``text`` does not start with a complete delivery.
+    """
+    opening = _AGENT_MESSAGE_SENDER_RE.match(text)
+    tag_end = text.find(">", opening.end()) if opening is not None else -1
+    if opening is None or tag_end < 0:
+        return None
+    name = "agent-message" if text.startswith("<agent-message") else "teammate-message"
+    if outermost:
+        content, found, rest = text[tag_end + 1 :].rpartition(f"</{name}>")
+        return (opening.group(1), content, rest) if found else None
+    depth = 1
+    for tag in _AGENT_MESSAGE_TAG_RES[name].finditer(text, tag_end + 1):
+        depth += -1 if tag.group(1) else 1
+        if depth == 0:
+            return opening.group(1), text[tag_end + 1 : tag.start()], text[tag.end() :]
+    return None
+
+
+def _agent_message_deliveries(prompt: str) -> list[tuple[str, str]]:
+    """
+    Split a prompt of deliveries from other agents into each sender and its text.
+
+    Each delivery ends at its matching closing tag, so balanced markup quoted inside
+    it neither ends it nor names a sender. With unbalanced quoted markup, the prompt
+    is one delivery that ends at the last closing tag.
+
+    :param prompt: Prompt text, e.g. ``'<agent-message from="worker">Done</agent-message>'``.
+    :returns: Each sender and its delivered text; empty for any other prompt.
+    """
+    body, wrapped = _strip_teammate_message_prefix(prompt)
+
+    def is_end(remainder: str) -> bool:
+        remainder = remainder.strip()
+        return not remainder or (wrapped and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE))
+
+    deliveries: list[tuple[str, str]] = []
+    rest = body
+    while (delivery := _leading_agent_message(rest, outermost=False)) is not None:
+        sender, text, rest = delivery
+        deliveries.append((sender, text))
+        rest = rest.lstrip()
+        if is_end(rest):
+            return deliveries
+    outer = _leading_agent_message(body, outermost=True)
+    return [(outer[0], outer[1])] if outer is not None and is_end(outer[2]) else []
 
 
 def _blocked_agent_message_items(
@@ -10497,43 +10555,39 @@ def _blocked_agent_message_items(
     :param line_number: One-based transcript line number.
     :param record_offset: Byte offset where the transcript record
         starts, or ``None`` for legacy line-cursor reads.
-    :returns: One error item, or none when the prompt is not an agent message.
+    :returns: One error item per blocked delivery; none for any other prompt.
     """
-    # Only the outer delivery envelope names the sender; markup inside the content does not.
-    body, _wrapped = _strip_teammate_message_prefix(prompt)
-    envelope = _TEAMMATE_MESSAGE_RE.match(body) if _is_agent_notification_text(prompt) else None
-    if envelope is None:
-        return []
-    sender = _AGENT_MESSAGE_SENDER_RE.match(envelope.group(0))
-    sender_name = f' "{sender.group(1)}"' if sender is not None else ""
-    if _SUBAGENT_HANDBACK_HEADER_RE.search(envelope.group(0)) is not None:
-        title = "A hook blocked a subagent's report"
-        message = (
-            f"A UserPromptSubmit hook blocked the report from subagent{sender_name}, so the "
-            "agent never received it, although Claude Code reported it as delivered."
-        )
-    else:
-        title = "A hook blocked a message from another agent"
-        message = (
-            f"A UserPromptSubmit hook blocked a message from agent{sender_name}, so the "
-            "agent never received it."
-        )
-    if reason.strip():
-        message = f"{message}\n\nHook reason: {reason.strip()}"
     source_key = _transcript_source_key(entry, line_number, record_offset)
-    return [
-        ClaudeTranscriptItem(
-            source_id=_source_id(source_key, 0, "error"),
-            item_type="error",
-            data={
-                "source": "harness",
-                "code": "native_agent_message_blocked_by_hook",
-                "title": title,
-                "message": message,
-            },
-            response_id=_response_id_from_source(source_key),
+    items: list[ClaudeTranscriptItem] = []
+    for index, (sender, text) in enumerate(_agent_message_deliveries(prompt)):
+        if _SUBAGENT_HANDBACK_HEADER_RE.search(text) is not None:
+            title = "A hook blocked a subagent's report"
+            message = (
+                f'A UserPromptSubmit hook blocked the report from subagent "{sender}", so the '
+                "agent never received it, although Claude Code reported it as delivered."
+            )
+        else:
+            title = "A hook blocked a message from another agent"
+            message = (
+                f'A UserPromptSubmit hook blocked a message from agent "{sender}", so the '
+                "agent never received it."
+            )
+        if reason.strip():
+            message = f"{message}\n\nHook reason: {reason.strip()}"
+        items.append(
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, index, "error"),
+                item_type="error",
+                data={
+                    "source": "harness",
+                    "code": AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE,
+                    "title": title,
+                    "message": message,
+                },
+                response_id=_response_id_from_source(source_key),
+            )
         )
-    ]
+    return items
 
 
 # Slash-command marker handling. Claude Code's embedded TUI emits

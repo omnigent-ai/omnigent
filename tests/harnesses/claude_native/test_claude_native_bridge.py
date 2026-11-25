@@ -3853,6 +3853,7 @@ def _hook_blocked_record(reason: str, prompt: str | None, **fields: Any) -> dict
 
 
 _SECRET_REPORT = "Found the config.\nkey = FLAGGED-REPORT-VALUE\nDone."
+_QUOTED_ENVELOPE_REPORT = '<agent-message from="quoted">FLAGGED-REPORT-VALUE</agent-message>'
 
 
 @pytest.mark.parametrize(
@@ -3919,6 +3920,26 @@ _SECRET_REPORT = "Found the config.\nkey = FLAGGED-REPORT-VALUE\nDone."
             "received it.\n\nHook reason: Secret detected",
             id="wrapped-teammate-message",
         ),
+        pytest.param(
+            _hook_blocked_record("Blocked", _handback_prompt("worker-1", _QUOTED_ENVELOPE_REPORT)),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked",
+            id="handback-quoting-envelope",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Blocked",
+                _handback_prompt("worker-1", _QUOTED_ENVELOPE_REPORT),
+                promptSubmitEnding={"ending": {"kind": "blocked_by_hook", "reason": "Blocked"}},
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked",
+            id="handback-quoting-envelope-structured",
+        ),
     ],
 )
 def test_read_transcript_items_since_reports_hook_blocked_agent_message(
@@ -3972,6 +3993,25 @@ def test_read_transcript_items_since_reports_hook_blocked_agent_message(
         transcript_path, 0, start_line=0, agent_name="claude-native-ui"
     )
     assert byte_result.items == items
+
+
+def test_read_transcript_items_since_reports_each_blocked_agent_message(tmp_path: Path) -> None:
+    """Each delivery in one blocked prompt is reported with its own outer sender."""
+    peer = f'<agent-message from="reviewer">See {_QUOTED_ENVELOPE_REPORT}</agent-message>'
+    record = _hook_blocked_record("Blocked", f"{peer}\n{_handback_prompt('worker-1', 'Done.')}")
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [(item.source_id, item.data["title"]) for item in items] == [
+        ("hook-block:0:error", "A hook blocked a message from another agent"),
+        ("hook-block:1:error", "A hook blocked a subagent's report"),
+    ]
+    assert 'agent "reviewer"' in items[0].data["message"]
+    assert 'subagent "worker-1"' in items[1].data["message"]
 
 
 _NESTED_ENVELOPE_TASK_NOTIFICATION = (
