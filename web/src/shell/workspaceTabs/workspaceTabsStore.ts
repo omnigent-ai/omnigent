@@ -1188,7 +1188,10 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     // Only pages the strip will add take room under the cap, in Settings order: not ones
     // already open, already taken (a closed pin stays closed), or the session can't show.
     const empty = isOnlyEmptyNewTab(tabs);
-    let room = MAX_WORKSPACE_TABS - (empty ? 0 : tabs.length);
+    // Only a strip opening on the settings gives its New tab's place to the pins. A pin that
+    // arrives later, as the session can show it or a setting changes, joins the strip as is.
+    const opening = tabSettings === undefined;
+    let room = MAX_WORKSPACE_TABS - (empty && opening ? 0 : tabs.length);
     const taken = tabSettings?.pinned ?? [];
     const openable = new Set<DefaultWorkspaceTab>();
     for (const page of settings.pinned) {
@@ -1208,7 +1211,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       change.pin.length === 0 && change.unpin.length === 0 && change.select === null;
     if (nothingToDo && sameAppliedTabSettings(tabSettings, change.applied)) return false;
     tabSettings = change.applied;
-    if (change.pin.length > 0 || change.select !== null) takeEmptyNewTabsPlace();
+    if ((opening && change.pin.length > 0) || change.select !== null) takeEmptyNewTabsPlace();
     const unpinned = new Set(change.unpin.map(settingsPageTab).map((tab) => tab?.id));
     const pinned = new Set<TabId>();
     for (const page of change.pin) {

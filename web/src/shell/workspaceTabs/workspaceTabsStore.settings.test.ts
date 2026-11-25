@@ -124,6 +124,28 @@ describe("a strip following the Workspace settings", () => {
     expect(selectedKind(store)).toBe("tasks");
   });
 
+  it("keeps the New tab and its selection when the only pin arrives late", () => {
+    const { store } = makeStore();
+    let pullRequests = false;
+    const canShow = (page: DefaultWorkspaceTab) => page !== "github" || pullRequests;
+    store.applyTabSettings(settings(["github"], "github"), canShow);
+    expect(strip(store)).toEqual(["new"]);
+    pullRequests = true;
+    store.applyTabSettings(settings(["github"], "github"), canShow);
+    expect(strip(store)).toEqual(["pulls (pinned)", "new"]);
+    expect(selectedKind(store)).toBe("new");
+  });
+
+  it("keeps the New tab and its selection when a setting pins a page later", () => {
+    const { store } = makeStore();
+    store.applyTabSettings(settings([], null), showsAll);
+    expect(strip(store)).toEqual(["new"]);
+    // Another window or a settings import pins a page, without changing the first page.
+    store.applyTabSettings(settings(["tasks"], null), showsAll);
+    expect(strip(store)).toEqual(["tasks (pinned)", "new"]);
+    expect(selectedKind(store)).toBe("new");
+  });
+
   it("selects a first page chosen while another waited, after the user opened a file", async () => {
     const { store } = makeStore();
     const canShow = (page: DefaultWorkspaceTab) => page !== "github";
