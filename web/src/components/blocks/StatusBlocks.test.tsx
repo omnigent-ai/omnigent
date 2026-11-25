@@ -393,7 +393,9 @@ describe("ErrorBanner", () => {
       />,
     );
     expect(screen.getByTestId("error-headline")).toHaveTextContent("This session's queue is full");
-    expect(screen.getByTestId("error-notice-body")).toHaveTextContent("press Stop to clear the queue");
+    expect(screen.getByTestId("error-notice-body")).toHaveTextContent(
+      "press Stop to clear the queue",
+    );
   });
 
   it("shows a completed sign-in notice's line without expanding it", () => {
@@ -532,6 +534,20 @@ describe("ErrorBanner", () => {
     expect(screen.getByTestId("error-headline")).toHaveTextContent(
       "Message not delivered. Try sending it again.",
     );
+  });
+
+  it("titles a message lost to a restart plainly instead of 'Something went wrong'", () => {
+    render(
+      <ErrorBanner
+        message="The runner did not confirm this message within 10 minutes."
+        source="execution"
+        code="startup_input_failed"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "This message wasn't delivered after a restart. Send it again.",
+    );
+    expect(screen.getByTestId("error-headline")).not.toHaveTextContent("Something went wrong");
   });
 
   it("dismisses only the visible banner", () => {
