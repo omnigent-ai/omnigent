@@ -9,26 +9,138 @@ import type { TreeEntryMeta } from "./treeSort";
 
 const isHidden = (name: string) => name.startsWith(".");
 
+/** The filter's include and exclude patterns: comma-separated, as the name search takes them. */
+export interface TreePatterns {
+  include: string;
+  exclude: string;
+}
+
+export const NO_TREE_PATTERNS: TreePatterns = { include: "", exclude: "" };
+
+/** One pattern, compiled; `folderOnly` when it names a folder, which a file never matches. */
+interface PatternMatcher {
+  regex: RegExp;
+  folderOnly: boolean;
+}
+
 /**
- * `entries` as the tree shows them. With hidden files hidden, dot-entries are
- * left out, and a chain hint stops before its first hidden folder.
+ * One pattern as a matcher for tree paths. `*` and `?` stay within a name and `**`
+ * crosses folders. A leading or middle `/` anchors the pattern at the browsed folder;
+ * without one it matches a name at any depth. A trailing `/` or `/**` names a folder,
+ * which also covers everything in it.
+ */
+function patternMatcher(pattern: string): PatternMatcher | null {
+  const written = pattern.trim();
+  const trimmed = written.replace(/^\.?\/+/, "");
+  let glob = trimmed.replace(/(?:\/\*\*)+\/?$|\/+$/, "");
+  if (!glob) return null;
+  const folderOnly = glob !== trimmed;
+  // As in gitignore, a leading or middle `/` anchors, decided before either end is trimmed:
+  // `/src/` and `src/**` are the top-level `src`, while `src/` is any `src` folder.
+  const anchored = trimmed !== written || trimmed.replace(/\/+$/, "").includes("/");
+  if (!anchored) glob = `**/${glob}`;
+  let source = "";
+  for (let index = 0; index < glob.length; index++) {
+    const char = glob[index];
+    if (char === "*" && glob[index + 1] === "*") {
+      const crossesFolder = glob[index + 2] === "/";
+      source += crossesFolder ? "(?:.*/)?" : ".*";
+      index += crossesFolder ? 2 : 1;
+    } else if (char === "*") {
+      source += "[^/]*";
+    } else if (char === "?") {
+      source += "[^/]";
+    } else {
+      source += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return { regex: new RegExp(`^${source}$`), folderOnly };
+}
+
+function patternMatchers(list: string): PatternMatcher[] {
+  return list.split(",").flatMap((pattern) => patternMatcher(pattern) ?? []);
+}
+
+/** Whether `path`, or a folder holding it, matches one of `matchers`. */
+function matchesWithin(
+  path: string,
+  type: WorkspaceFile["type"],
+  matchers: readonly PatternMatcher[],
+): boolean {
+  for (let prefix = path; prefix; prefix = prefix.slice(0, Math.max(0, prefix.lastIndexOf("/")))) {
+    // Every prefix but the path itself is a folder holding it.
+    const isFolder = prefix !== path || type === "directory";
+    if (matchers.some(({ regex, folderOnly }) => (isFolder || !folderOnly) && regex.test(prefix))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether the tree shows a path, under the hidden-files setting and the patterns.
+ * An exclude hides what it matches, folders with their contents. An include keeps
+ * only the files it matches, and every folder, since a folder's files aren't known
+ * until it opens.
+ */
+export function treePathFilter(
+  showHidden: boolean,
+  patterns: TreePatterns = NO_TREE_PATTERNS,
+): (path: string, type: WorkspaceFile["type"]) => boolean {
+  const excluded = patternMatchers(patterns.exclude);
+  const included = patternMatchers(patterns.include);
+  return (path, type) => {
+    if (!showHidden && isHidden(path.slice(path.lastIndexOf("/") + 1))) return false;
+    if (matchesWithin(path, type, excluded)) return false;
+    return type === "directory" || included.length === 0 || matchesWithin(path, type, included);
+  };
+}
+
+/** A filter for files deep in the tree: one shows only where every folder above it does too. */
+export function treeFilePathFilter(
+  showHidden: boolean,
+  patterns: TreePatterns = NO_TREE_PATTERNS,
+): (path: string) => boolean {
+  const shows = treePathFilter(showHidden, patterns);
+  return (path) => {
+    const parts = path.split("/");
+    return parts.every((_, depth) =>
+      shows(parts.slice(0, depth + 1).join("/"), depth === parts.length - 1 ? "file" : "directory"),
+    );
+  };
+}
+
+/** Whether `patterns` narrow the tree at all. */
+export function hasTreePatterns(patterns: TreePatterns): boolean {
+  return (
+    patternMatchers(patterns.include).length > 0 || patternMatchers(patterns.exclude).length > 0
+  );
+}
+
+/**
+ * `entries` as the tree shows them. Hidden and excluded entries are left out (see
+ * `treePathFilter`), and a chain hint stops before its first such folder.
  */
 export function visibleEntries(
   entries: readonly WorkspaceFile[],
   showHidden: boolean,
+  patterns: TreePatterns = NO_TREE_PATTERNS,
 ): WorkspaceFile[] {
-  if (showHidden) return [...entries];
+  if (showHidden && !hasTreePatterns(patterns)) return [...entries];
+  const shows = treePathFilter(showHidden, patterns);
   const visible: WorkspaceFile[] = [];
   for (const entry of entries) {
-    if (isHidden(entry.name)) continue;
+    if (!shows(entry.path, entry.type)) continue;
     const leaf = entry.leaf_directory_path;
     if (!leaf?.startsWith(`${entry.path}/`)) {
       visible.push(entry);
       continue;
     }
     const kept: string[] = [];
+    let chainPath = entry.path;
     for (const name of leaf.slice(entry.path.length + 1).split("/")) {
-      if (!name || isHidden(name)) break;
+      chainPath = `${chainPath}/${name}`;
+      if (!name || !shows(chainPath, "directory")) break;
       kept.push(name);
     }
     const { leaf_directory_path: _leaf, ...rest } = entry;
@@ -149,4 +261,30 @@ export function withChangedFiles(
   }
   if (!changed) return [...listings];
   return [...byFolder].map(([folder, entries]) => ({ folder, entries }));
+}
+
+/** The changes the tree lists, under the hidden-files setting and the patterns. */
+export function visibleChangedFiles(
+  changes: readonly TreeChange[],
+  showHidden: boolean,
+  patterns: TreePatterns = NO_TREE_PATTERNS,
+): readonly TreeChange[] {
+  if (showHidden && !hasTreePatterns(patterns)) return changes;
+  const shows = treeFilePathFilter(showHidden, patterns);
+  return changes.filter((change) => shows(change.path));
+}
+
+/**
+ * The rows at the top of the tree: the listing's visible entries and the folders or
+ * files that only Git knows of, such as a deleted file.
+ */
+export function treeRootEntries(
+  entries: readonly WorkspaceFile[],
+  changes: readonly TreeChange[],
+  showHidden: boolean,
+  patterns: TreePatterns = NO_TREE_PATTERNS,
+): readonly WorkspaceFile[] {
+  const root = { folder: "", entries: visibleEntries(entries, showHidden, patterns) };
+  const merged = withChangedFiles([root], visibleChangedFiles(changes, showHidden, patterns));
+  return merged.find((listing) => listing.folder === "")?.entries ?? root.entries;
 }

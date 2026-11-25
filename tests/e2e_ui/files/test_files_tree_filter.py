@@ -1,7 +1,8 @@
-"""E2E: the tabs sidebar's Files tree filters by name, narrowed by globs.
+"""E2E: the tabs sidebar's Files tree filters by name and by globs.
 
 With ``workspace_sidebar_v2`` on, the tree header's ⋯ Filter by name opens a
-filter under it. Typing a name shows the workspace's matches as a tree, under a strip
+filter under it. Globs alone narrow the tree itself, an exclude hiding what it matches.
+Typing a name shows the workspace's matches as a tree, under a strip
 that says what the filter does. Include and exclude globs narrow the search, a match
 opens like a tree row, and Clear or Escape return to the whole tree. ⌘K's row opens the
 filter with focus in it, and closing it, in the narrow popover too, leaves focus on its
@@ -25,6 +26,8 @@ _FILES = {
     "src/ui/button.test.ts": "button test\n",
     "docs/button.md": "# Button\n",
     "README.md": "# Repo\n",
+    "pnpm.lock": "lock\n",
+    "src/deps.lock": "lock\n",
 }
 
 
@@ -44,6 +47,34 @@ def _open_filter(page: Page, scope: Locator) -> None:
         "button", name=re.compile(r"^Tree options")
     ).click()
     page.get_by_role("menuitem", name="Filter by name").click()
+
+
+def test_an_exclude_alone_hides_its_files_from_the_tree_until_cleared(
+    page: Page, filter_session: tuple[str, str]
+) -> None:
+    base_url, session_id = filter_session
+    sidebar = open_workspace(page, base_url, session_id)
+    _open_app(page, sidebar, "Files")
+    tree = sidebar.get_by_role("tree", name="Workspace files")
+    expect(_row(tree, "pnpm.lock")).to_be_visible(timeout=30_000)
+    _row(tree, "src/").click()
+    expect(_row(tree, "src/deps.lock")).to_be_visible(timeout=15_000)
+
+    _open_filter(page, sidebar)
+    sidebar.get_by_role("button", name="Files to include or exclude").click()
+    sidebar.get_by_role("textbox", name="Files to exclude").fill("*.lock")
+    strip = sidebar.get_by_test_id("tree-filter-strip")
+    expect(strip).to_have_text(re.compile("Hiding \\*\\.lock"), timeout=15_000)
+    # The tree stays, without the lock files, at the root and in the opened folder.
+    expect(_row(tree, "pnpm.lock")).to_have_count(0, timeout=15_000)
+    expect(_row(tree, "src/deps.lock")).to_have_count(0)
+    expect(_row(tree, "README.md")).to_be_visible()
+    expect(_row(tree, "src/ui/")).to_be_visible()
+
+    strip.get_by_role("button", name="Clear").click()
+    expect(strip).to_have_count(0)
+    expect(_row(tree, "pnpm.lock")).to_be_visible(timeout=15_000)
+    expect(_row(tree, "src/deps.lock")).to_be_visible()
 
 
 def test_the_tree_filters_by_name_narrows_by_globs_and_clears(

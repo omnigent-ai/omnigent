@@ -19,6 +19,7 @@ import { useFileActionStore } from "../fileCommands/fileActionStore";
 import { pathToCopy } from "../fileCommands/target";
 import { FileViewerContext } from "../FileViewerContext";
 import { FilesTree, type FilesTreeProps, type FilesTreeReveal } from "./FilesTree";
+import type { TreePatterns } from "./filesTreeListings";
 
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
@@ -81,6 +82,7 @@ function renderTree(
   const props = (
     entries: readonly WorkspaceFile[],
     reveal: FilesTreeReveal | null = null,
+    patterns?: TreePatterns,
   ): FilesTreeProps => ({
     conversationId: "conv_tree",
     browseLocation: "",
@@ -89,6 +91,7 @@ function renderTree(
     sort: "alpha",
     showHidden: false,
     showIgnored: true,
+    patterns,
     refreshToken: 0,
     onFileSelect,
     reveal,
@@ -103,6 +106,9 @@ function renderTree(
     /** Ask, with the listings unchanged, to reveal a folder. */
     reveal: (entries: readonly WorkspaceFile[], reveal: FilesTreeReveal) =>
       view.rerender(<FilesTree {...props(entries, reveal)} />),
+    /** Filter the same listings by `patterns`, or stop filtering. */
+    filter: (entries: readonly WorkspaceFile[], patterns?: TreePatterns) =>
+      view.rerender(<FilesTree {...props(entries, null, patterns)} />),
   };
 }
 
@@ -301,6 +307,42 @@ describe("FilesTree", () => {
     renderTree(entries);
     await screen.findByRole("treeitem", { name: "f0.txt" });
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("hides what an exclude matches, in the root and in an opened folder, until it clears", async () => {
+    serveListings({ web: [file("web/pnpm.lock"), file("web/app.ts")] });
+    const entries = [folder("web"), file("Cargo.lock"), file("README.md")];
+    const tree = renderTree(entries);
+    fireEvent.click(await screen.findByRole("treeitem", { name: "web" }));
+    await screen.findByRole("treeitem", { name: "pnpm.lock" });
+
+    await act(async () => tree.filter(entries, { include: "", exclude: "*.lock" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("treeitem", { name: "pnpm.lock" })).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("treeitem", { name: "Cargo.lock" })).not.toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: "app.ts" })).toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: "README.md" })).toBeInTheDocument();
+
+    await act(async () => tree.filter(entries));
+    expect(await screen.findByRole("treeitem", { name: "pnpm.lock" })).toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: "Cargo.lock" })).toBeInTheDocument();
+  });
+
+  it("keeps a deleted file the exclude lets through, though no file on disk passes", async () => {
+    const readme = {
+      path: "README.md",
+      name: "README.md",
+      status: "deleted" as const,
+      bytes: 3,
+      modified_at: 9,
+    };
+    renderTree([file("pnpm.lock")], vi.fn(), {
+      changedFiles: [readme],
+      patterns: { include: "", exclude: "*.lock" },
+    });
+    expect(await screen.findByRole("treeitem", { name: /README\.md/ })).toBeInTheDocument();
+    expect(screen.queryByRole("treeitem", { name: /pnpm\.lock/ })).not.toBeInTheDocument();
   });
 
   describe("opening a folder of hundreds of entries", () => {

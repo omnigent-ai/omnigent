@@ -38,8 +38,10 @@ import { RevealBaseContext } from "../RevealInFileManager";
 import type { FolderListing } from "../folderTreeSync";
 import {
   type TreeChange,
+  type TreePatterns,
   listingsVersion,
   treeMetadata,
+  visibleChangedFiles,
   visibleEntries,
   withChangedFiles,
 } from "./filesTreeListings";
@@ -77,6 +79,8 @@ export interface FilesTreeProps {
   showHidden: boolean;
   /** List what Git ignores, marked as ignored; otherwise the host leaves it out. */
   showIgnored: boolean;
+  /** The filter's include and exclude patterns, applied to every folder the tree lists. */
+  patterns?: TreePatterns;
   refreshToken: number;
   /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
@@ -143,18 +147,17 @@ function FilesTreeRows(props: FilesTreeProps) {
     hideIgnored: !showIgnored,
   });
 
+  // Held by value, so a caller's fresh object for the same patterns changes nothing.
+  const include = props.patterns?.include ?? "";
+  const exclude = props.patterns?.exclude ?? "";
+  const patterns = useMemo<TreePatterns>(() => ({ include, exclude }), [include, exclude]);
   const rootListing = useMemo<FolderListing>(
-    () => ({ folder: "", entries: visibleEntries(props.rootEntries, showHidden) }),
-    [props.rootEntries, showHidden],
+    () => ({ folder: "", entries: visibleEntries(props.rootEntries, showHidden, patterns) }),
+    [props.rootEntries, showHidden, patterns],
   );
   const visibleChanges = useMemo(
-    () =>
-      showHidden
-        ? props.changedFiles
-        : props.changedFiles.filter(
-            (change) => !change.path.split("/").some((part) => part.startsWith(".")),
-          ),
-    [props.changedFiles, showHidden],
+    () => visibleChangedFiles(props.changedFiles, showHidden, patterns),
+    [props.changedFiles, showHidden, patterns],
   );
   const [initial] = useState(() =>
     initialFolderTree(withChangedFiles([rootListing], visibleChanges)),
@@ -220,9 +223,9 @@ function FilesTreeRows(props: FilesTreeProps) {
     const data = directories.get(folder)?.data;
     if (data) rawListings.push({ folder, entries: data });
   }
-  const rawVersion = `${listingsVersion(rawListings)}\u0002${showHidden}\u0002${listingsVersion([
-    { folder: "changes", entries: visibleChanges as unknown as WorkspaceFile[] },
-  ])}`;
+  const rawVersion = `${listingsVersion(rawListings)}\u0002${showHidden}\u0002${include}\u0002${exclude}\u0002${listingsVersion(
+    [{ folder: "changes", entries: visibleChanges as unknown as WorkspaceFile[] }],
+  )}`;
   const latestRaw = useRef(rawListings);
   latestRaw.current = rawListings;
   const listings = useMemo<FolderListing[]>(
@@ -230,7 +233,8 @@ function FilesTreeRows(props: FilesTreeProps) {
       withChangedFiles(
         latestRaw.current.map(({ folder, entries }) => ({
           folder,
-          entries: folder === "" ? rootListing.entries : visibleEntries(entries, showHidden),
+          entries:
+            folder === "" ? rootListing.entries : visibleEntries(entries, showHidden, patterns),
         })),
         visibleChanges,
       ),

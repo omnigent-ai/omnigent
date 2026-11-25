@@ -682,17 +682,89 @@ describe("FilesPageTree", () => {
       ]);
     });
 
-    it("narrows the search with globs, which do nothing until a name is set", () => {
+    const setGlob = (field: "Files to include" | "Files to exclude", value: string) => {
+      if (!screen.queryByRole("textbox", { name: field })) {
+        fireEvent.click(screen.getByRole("button", { name: "Files to include or exclude" }));
+      }
+      fireEvent.change(screen.getByRole("textbox", { name: field }), { target: { value } });
+      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+    };
+
+    it("narrows the tree itself with globs alone, and shows all of it again once they clear", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("pnpm.lock"), entry("src")]));
+      openFilter();
+      setGlob("Files to exclude", "*.lock");
+      expect(captured.tree?.patterns).toEqual({ include: "", exclude: "*.lock" });
+      expect(screen.getByTestId("tree-filter-strip")).toHaveTextContent("Hiding *.lock");
+      // Globs alone don't search: the tree stays, narrowed.
+      expect(searches().at(-1)?.[4]).toMatchObject({ enabled: false });
+      expect(screen.queryByText("Applies once a name is set.")).toBeNull();
+      expect(paletteLabels()).toContain("Clear Files Tree Filter");
+
+      setGlob("Files to exclude", "");
+      expect(captured.tree?.patterns).toBeUndefined();
+      expect(screen.queryByTestId("tree-filter-strip")).toBeNull();
+    });
+
+    it("says when the globs leave nothing in the browsed folder", () => {
+      vi.useFakeTimers();
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: { available: true, data: [] },
+      } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
+      renderTree(listed([entry("pnpm.lock"), entry("yarn.lock")]));
+      openFilter();
+      setGlob("Files to exclude", "*.lock");
+      expect(screen.getByText("No files here pass the filter.")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+      expect(screen.getByTestId("files-tree")).toBeInTheDocument();
+    });
+
+    it("keeps the tree for a deleted file the globs let through, and settles a reveal there", () => {
+      vi.useFakeTimers();
+      vi.mocked(toast.info).mockClear();
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: { available: true, data: [{ path: "README.md", status: "deleted" }] },
+      } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
+      renderTree(listed([entry("pnpm.lock")]));
+      openFilter();
+      setGlob("Files to exclude", "*.lock");
+      // Only Git knows README.md now, but it passes, so the tree shows it rather than say none do.
+      expect(screen.queryByText("No files here pass the filter.")).toBeNull();
+      expect(captured.tree?.changedFiles).toEqual([{ path: "README.md", status: "deleted" }]);
+      // The tree is there to take the viewed file's reveal, so the page doesn't call it missing.
+      act(() => {
+        requestActiveFileReveal("conv_1", "src/a.ts");
+      });
+      expect(captured.tree?.activeReveal).toMatchObject({ file: "src/a.ts" });
+      expect(toast.info).not.toHaveBeenCalled();
+    });
+
+    it("ends globs that leave out a file asked to be revealed, and keeps ones that don't", () => {
+      vi.useFakeTimers();
+      vi.mocked(toast.info).mockClear();
+      renderTree(listed([entry("src")]));
+      openFilter();
+      setGlob("Files to exclude", "*.lock");
+      fireEvent.click(screen.getByRole("button", { name: "Reveal Active File" }));
+      // The viewed src/a.ts passes the filter, so it stays.
+      expect(captured.tree?.patterns).toEqual({ include: "", exclude: "*.lock" });
+
+      // Excluding src empties the listing, yet the reveal ends the globs rather than miss.
+      setGlob("Files to exclude", "src");
+      act(() => {
+        requestActiveFileReveal("conv_1", "src/a.ts");
+      });
+      expect(captured.tree?.patterns).toBeUndefined();
+      expect(captured.tree?.activeReveal).toMatchObject({ file: "src/a.ts" });
+      expect(toast.info).not.toHaveBeenCalled();
+    });
+
+    it("narrows a name search with globs", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));
       openFilter();
-      fireEvent.click(screen.getByRole("button", { name: "Files to include or exclude" }));
-      fireEvent.change(screen.getByRole("textbox", { name: "Files to include" }), {
-        target: { value: "*.ts" },
-      });
-      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
-      expect(screen.getByText("Applies once a name is set.")).toBeInTheDocument();
-      expect(screen.getByTestId("files-tree")).toBeInTheDocument();
+      setGlob("Files to include", "*.ts");
       typeName("app");
       expect(searches().at(-1)?.slice(1, 4)).toEqual(["app", "*.ts", ""]);
       expect(screen.getByTestId("tree-filter-strip")).toHaveTextContent(

@@ -3,7 +3,10 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import {
   changesWithinFolder,
   listingsVersion,
+  treeFilePathFilter,
   treeMetadata,
+  treePathFilter,
+  treeRootEntries,
   visibleEntries,
   withChangedFiles,
 } from "./filesTreeListings";
@@ -45,6 +48,115 @@ describe("visibleEntries", () => {
   it("keeps a chain hint with no hidden folders", () => {
     const [kept] = visibleEntries([folder("review", "review/rules")], false);
     expect(kept?.leaf_directory_path).toBe("review/rules");
+  });
+
+  it("leaves out what an exclude matches, and brings it back once the patterns clear", () => {
+    const entries = [file("pnpm.lock"), file("a.ts"), folder("node_modules"), folder("src")];
+    const shown = (exclude: string) =>
+      visibleEntries(entries, true, { include: "", exclude }).map((entry) => entry.path);
+    expect(shown("*.lock, node_modules")).toEqual(["a.ts", "src"]);
+    expect(shown("")).toEqual(["pnpm.lock", "a.ts", "node_modules", "src"]);
+  });
+
+  it("keeps every folder under an include, and only the files it matches", () => {
+    const entries = [file("a.ts"), file("b.md"), folder("docs"), folder("src")];
+    const shown = visibleEntries(entries, true, { include: "*.ts", exclude: "" });
+    expect(shown.map((entry) => entry.path)).toEqual(["a.ts", "docs", "src"]);
+  });
+
+  it("cuts a chain hint before its first excluded folder", () => {
+    const patterns = { include: "", exclude: "generated" };
+    const [cut] = visibleEntries([folder("com", "com/app/generated/v1")], true, patterns);
+    expect(cut?.leaf_directory_path).toBe("com/app");
+  });
+});
+
+describe("treePathFilter", () => {
+  const shows = (include: string, exclude: string, path: string, type: "file" | "directory") =>
+    treePathFilter(true, { include, exclude })(path, type);
+
+  it.each([
+    ["*.lock", "pnpm.lock", true],
+    ["*.lock", "web/pnpm.lock", true],
+    ["*.lock", "pnpm.lock.bak", false],
+    ["web/*.lock", "web/pnpm.lock", true],
+    ["web/*.lock", "web/sub/pnpm.lock", false],
+    ["web/**/*.lock", "web/sub/deep/pnpm.lock", true],
+    ["web/**/*.lock", "web/pnpm.lock", true],
+    ["file?.ts", "file1.ts", true],
+    ["file?.ts", "file10.ts", false],
+    ["node_modules", "a/node_modules/x/index.js", true],
+    ["build/", "build/out.js", true],
+    ["src/**", "src/a/b.ts", true],
+    ["./src/*.ts", "src/a.ts", true],
+    ["a.b", "axb", false],
+  ])("exclude %j hides %j: %s", (exclude, path, hidden) => {
+    expect(shows("", exclude, path, "file")).toBe(!hidden);
+  });
+
+  // A trailing `/` or `/**` names a folder: never a file of the same name.
+  it.each([
+    ["build/", "build", "file", false],
+    ["build/", "build", "directory", true],
+    ["build/", "build/out.js", "file", true],
+    ["build/**", "build", "file", false],
+    ["build/**", "build", "directory", true],
+    ["out/build/", "out/build", "file", false],
+    ["out/build/", "out/build", "directory", true],
+  ] as const)("a folder pattern %j matches %j as a %s: %s", (pattern, path, type, matches) => {
+    expect(shows("", pattern, path, type)).toBe(!matches);
+    // Folders always pass an include, so only a file shows whether the include matched.
+    if (type === "file") expect(shows(pattern, "", path, type)).toBe(matches);
+  });
+
+  // A leading or middle `/` anchors a pattern at the browsed folder; without one it matches at
+  // any depth. A trailing `/` alone doesn't anchor, as in gitignore and the name search's globs.
+  it.each([
+    ["/src/", "src/main.ts", true],
+    ["/src/", "vendor/src/main.ts", false],
+    ["/README.md", "README.md", true],
+    ["/README.md", "docs/README.md", false],
+    ["src/", "src/main.ts", true],
+    ["a/b", "a/b", true],
+    ["a/b", "x/a/b", false],
+    ["a/b", "a/b/c.ts", true],
+    ["src/**", "src/main.ts", true],
+    ["src/**", "vendor/src/main.ts", false],
+    ["src/", "vendor/src/main.ts", true],
+    ["src/*.ts", "vendor/src/main.ts", false],
+    ["src", "vendor/src/main.ts", true],
+    ["**/src/**", "vendor/src/main.ts", true],
+  ])("%j matches %j: %s", (pattern, path, matches) => {
+    expect(shows("", pattern, path, "file")).toBe(!matches);
+    expect(shows(pattern, "", path, "file")).toBe(matches);
+  });
+
+  it("reads a comma-separated list, ignoring blanks and spaces", () => {
+    expect(shows("", " *.lock , ,*.log ", "out.log", "file")).toBe(false);
+    expect(shows("", " *.lock , ,*.log ", "a.ts", "file")).toBe(true);
+  });
+
+  it("lets an include through the files inside a matching folder", () => {
+    expect(shows("src/**", "", "src/a/b.ts", "file")).toBe(true);
+    expect(shows("src/**", "", "lib/b.ts", "file")).toBe(false);
+    expect(shows("src/**", "", "lib", "directory")).toBe(true);
+  });
+
+  it("lets an exclude win over an include", () => {
+    expect(shows("*.ts", "*.test.ts", "a.test.ts", "file")).toBe(false);
+  });
+
+  it("still hides dot-entries while hidden files are hidden", () => {
+    expect(treePathFilter(false, { include: "*.env", exclude: "" })(".env", "file")).toBe(false);
+  });
+});
+
+describe("treeFilePathFilter", () => {
+  it("hides a file under an excluded or hidden folder", () => {
+    const shows = treeFilePathFilter(false, { include: "", exclude: "dist" });
+    expect(shows("dist/out/app.js")).toBe(false);
+    expect(shows(".cache/app.js")).toBe(false);
+    expect(shows("src/app.js")).toBe(true);
   });
 });
 
@@ -155,5 +267,31 @@ describe("changesWithinFolder", () => {
 
   it("has none for a folder outside the workspace", () => {
     expect(changesWithinFolder(changes, "/tmp", "/work/repo")).toEqual([]);
+  });
+});
+
+describe("treeRootEntries", () => {
+  const deleted = (path: string) => ({
+    path,
+    name: path.split("/").at(-1)!,
+    status: "deleted" as const,
+    bytes: 3,
+    modified_at: 9,
+  });
+  const lockOut = { include: "", exclude: "*.lock" };
+
+  it("counts a deleted file the globs let through, though the listing has none left", () => {
+    const rows = treeRootEntries([file("pnpm.lock")], [deleted("README.md")], false, lockOut);
+    expect(rows.map((row) => row.path)).toEqual(["README.md"]);
+  });
+
+  it("leaves out deleted files the globs or the hidden-files setting hide", () => {
+    expect(treeRootEntries([file("pnpm.lock")], [deleted("yarn.lock")], false, lockOut)).toEqual(
+      [],
+    );
+    expect(treeRootEntries([], [deleted(".env")], false)).toEqual([]);
+    expect(treeRootEntries([], [deleted("docs/old.md")], false).map((row) => row.path)).toEqual([
+      "docs",
+    ]);
   });
 });
