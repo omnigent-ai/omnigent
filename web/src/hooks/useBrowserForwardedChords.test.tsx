@@ -1,10 +1,12 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BrowserForwardedKeydown } from "@/lib/nativeBridge";
 
 import { workspaceTabActionCommands } from "@/shell/workspaceCommands/model";
+import { useWorkspaceFullScreenCommand } from "@/shell/workspaceCommands/useWorkspaceFullScreenCommand";
 import { useWorkspaceTabChords } from "@/shell/workspaceCommands/useWorkspaceTabChords";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { useCommandPaletteHotkey } from "./useCommandPaletteHotkey";
 import {
@@ -82,6 +84,17 @@ describe("forwardedChordsFor", () => {
     ]);
   });
 
+  it("adds ⇧⌘F, and Ctrl+Shift+F off the Mac, where the sidebar can fill the window", () => {
+    const fullScreen = { code: "KeyF", shiftKey: true };
+    expect(forwardedChordsFor(tabsSidebarForwardedShortcuts(true, true), true)).toContainEqual(
+      chord({ ...fullScreen, metaKey: true }),
+    );
+    expect(forwardedChordsFor(tabsSidebarForwardedShortcuts(false, true), false)).toContainEqual(
+      chord({ ...fullScreen, ctrlKey: true }),
+    );
+    expect(tabsSidebarForwardedShortcuts(true)).not.toContain("workspace.toggleFullScreen");
+  });
+
   it("leaves Reopen's chord with the page while there's no closed tab", () => {
     expect(tabsSidebarForwardedShortcuts(false)).not.toContain("workspace.reopenTab");
     expect(tabsSidebarForwardedShortcuts(true)).toContain("workspace.reopenTab");
@@ -150,6 +163,25 @@ describe("useBrowserForwardedChords", () => {
     expect(run.mock.calls.map(([command]) => (command as { action: string }).action)).toEqual([
       "close-tab",
     ]);
+  });
+
+  it("replays a forwarded ⇧⌘F where the workspace's full screen toggle hears it", async () => {
+    const bridge = capableBridge();
+    const toggle = vi.fn();
+    renderHook(() => {
+      useWorkspaceFullScreenCommand({ conversationId: "c", fullScreen: false, toggle }, true);
+      useBrowserForwardedChords(tabsSidebarForwardedShortcuts(false, true), true);
+    });
+    // The toggle's chord loads with the tabs sidebar's code.
+    await waitFor(() =>
+      expect(
+        Object.values(usePaletteCommandsStore.getState().groups).flatMap((group) => group.commands),
+      ).toHaveLength(1),
+    );
+
+    act(() => bridge.forward({ ...COMMAND_K, key: "F", code: "KeyF", shiftKey: true }));
+    expect(toggle).toHaveBeenCalledTimes(1);
+    usePaletteCommandsStore.setState({ groups: {} });
   });
 
   it("asks for nothing without a desktop bridge, on a shell missing either method, or with an empty list", () => {
