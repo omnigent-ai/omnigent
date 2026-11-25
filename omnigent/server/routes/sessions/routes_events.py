@@ -1082,16 +1082,19 @@ def _runs_as_native_command(content: list[dict[str, Any]], native_harness: str |
     :param content: Message content blocks as posted.
     :param native_harness: The session's native pane harness, e.g. ``"codex-native"``,
         or ``None`` when an API harness turns every message into model input.
-    :returns: ``True`` for a slash command, Claude Code shell or exit input, or a
-        lone Codex ``!command``.
+    :returns: ``True`` for input the terminal handles without prompting the model.
     """
     if native_harness is None:
         return False
-    if native_harness == "codex-native" and shell_command_from_input(content) is not None:
-        return True
-    return pending_inputs.is_native_command(
-        content, claude_commands=native_harness == "claude-native"
-    )
+    if native_harness == "codex-native":
+        # Codex takes every message as model input except a lone ``!command``.
+        return shell_command_from_input(content) is not None
+    if native_harness == "claude-native":
+        from omnigent.harnesses.claude_native.bridge import runs_as_terminal_command
+
+        return runs_as_terminal_command(content)
+    # Other terminals run their own ``/`` commands.
+    return pending_inputs.is_native_command(content, claude_commands=False)
 
 
 def register_events_routes(

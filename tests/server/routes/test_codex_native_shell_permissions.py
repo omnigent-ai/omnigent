@@ -80,13 +80,15 @@ async def codex_client(
     runner_globals_reset: None,  # noqa: F811 — imported fixture
 ) -> AsyncIterator[tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation]]:
     del runner_globals_reset
-    # Indirect parametrization adds release features, e.g. {Feature.MESSAGE_SENDER_CONTEXT}.
-    extra_features: frozenset[Feature] = getattr(request, "param", frozenset())
+    # Indirect parametrization adds release features and may keep the store's
+    # Claude Code pane, e.g. (frozenset({Feature.MESSAGE_SENDER_CONTEXT}), "claude-native").
+    extra_features, harness = getattr(request, "param", (frozenset(), "codex-native"))
     store = _ConversationStore()
     conv = store.get_conversation(_SESSION_ID)
     assert conv is not None
-    conv.harness_override = "codex-native"
-    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    if harness == "codex-native":
+        conv.harness_override = "codex-native"
+        conv.labels["omnigent.wrapper"] = "codex-native-ui"
     permissions = _ShellPermissionStore()
     for user, level in (
         ("viewer", LEVEL_READ),
@@ -187,45 +189,47 @@ async def test_codex_editor_model_input_keeps_edit_access(
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
 
 
+_NAMING = frozenset({Feature.MESSAGE_SENDER_CONTEXT})
+_FILE = {"type": "input_file", "filename": "note.txt", "file_data": "aGk="}
+
+
+def _typed(*texts: str) -> list[dict[str, Any]]:
+    return [{"type": "input_text", "text": text} for text in texts]
+
+
 @pytest.mark.parametrize(
-    "codex_client", [frozenset({Feature.MESSAGE_SENDER_CONTEXT})], indirect=True
-)
-@pytest.mark.parametrize(
-    ("caller", "content", "named"),
+    ("codex_client", "caller", "content", "named"),
     [
-        ("owner", [{"type": "input_text", "text": "Explain this code"}], False),
-        ("editor", [{"type": "input_text", "text": "Explain this code"}], True),
-        ("admin", [{"type": "input_text", "text": "Explain this code"}], True),
-        ("editor", [{"type": "input_text", "text": "!!literal bang"}], True),
-        (
-            "editor",
-            [
-                {"type": "input_text", "text": "!printf FIRST"},
-                {"type": "input_text", "text": "more"},
-            ],
-            True,
-        ),
-        (
-            "editor",
-            [
-                {"type": "input_text", "text": "!inspect this file"},
-                {"type": "input_file", "filename": "note.txt", "file_data": "aGk="},
-            ],
-            True,
-        ),
-        ("editor", [{"type": "input_text", "text": "/compact"}], False),
-        ("admin", [{"type": "input_text", "text": "!printf authorized"}], False),
+        ((_NAMING, "codex-native"), "owner", _typed("Explain this code"), False),
+        ((_NAMING, "codex-native"), "editor", _typed("Explain this code"), True),
+        ((_NAMING, "codex-native"), "admin", _typed("Explain this code"), True),
+        ((_NAMING, "codex-native"), "editor", _typed("!!literal bang"), True),
+        ((_NAMING, "codex-native"), "editor", _typed("!printf FIRST", "more"), True),
+        ((_NAMING, "codex-native"), "editor", [*_typed("!inspect this file"), _FILE], True),
+        ((_NAMING, "codex-native"), "editor", _typed("/compact"), True),
+        ((_NAMING, "codex-native"), "admin", _typed("!printf authorized"), False),
+        ((_NAMING, "claude-native"), "editor", _typed("Explain this code"), True),
+        ((_NAMING, "claude-native"), "editor", _typed("/help with tests"), True),
+        ((_NAMING, "claude-native"), "editor", [*_typed("/compact"), _FILE], True),
+        ((_NAMING, "claude-native"), "editor", _typed("/compact"), False),
+        ((_NAMING, "claude-native"), "editor", _typed("!git status"), False),
     ],
     ids=[
-        "owner",
-        "editor",
-        "admin",
-        "escaped-bang",
-        "multiple-blocks",
-        "attachment",
-        "slash-command",
-        "shell-command",
+        "codex-owner",
+        "codex-editor",
+        "codex-admin",
+        "codex-escaped-bang",
+        "codex-multiple-blocks",
+        "codex-attachment",
+        "codex-slash-is-a-prompt",
+        "codex-shell-command",
+        "claude-editor",
+        "claude-escaped-built-in",
+        "claude-attachment",
+        "claude-command",
+        "claude-shell",
     ],
+    indirect=["codex_client"],
 )
 async def test_only_collaborators_model_input_names_them(
     codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],

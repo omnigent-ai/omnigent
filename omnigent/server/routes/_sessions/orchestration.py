@@ -3681,9 +3681,8 @@ async def _persist_external_conversation_item_unlocked(
             cleared_pending_id = drained.pending_id
             if drained.named_sender is not None and match_method != "fifo_fallback":
                 # The echo carries the sender line typed for the agent; store what was typed.
-                item = item.model_copy(
-                    update={"data": item.data.model_copy(update={"content": drained.content})}
-                )
+                typed = {"content": drained.content, "sender_in_context": True}
+                item = item.model_copy(update={"data": item.data.model_copy(update=typed)})
             item = _merge_pending_file_blocks(item, drained.content)
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
