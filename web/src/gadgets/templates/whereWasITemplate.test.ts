@@ -102,6 +102,7 @@ function startRadar({
   canWrite = true,
   delivery = "sent",
   allowErrors = false,
+  listSessions = () => Promise.resolve({ items: [] }),
 }: {
   html?: string;
   preview?: boolean;
@@ -111,6 +112,8 @@ function startRadar({
   delivery?: "sent" | "starting";
   /** A design that is meant to throw while the page loads. */
   allowErrors?: boolean;
+  /** The viewer's session list, one page per call, as the host answers sessions.v1.list. */
+  listSessions?: (params: { limit?: number; after?: string }) => Promise<unknown>;
 } = {}) {
   const { listeners, writes, pages, failing, collection } = recordingCollections();
   let actionListener: Listener | null = null;
@@ -128,7 +131,7 @@ function startRadar({
     can: (requirement: string) => (requirement === "write" ? canWrite : canAct),
     ui: { colorScheme: "light" },
     data: { collection },
-    sessions: { canList: true, list: () => Promise.resolve({ items: [] }) },
+    sessions: { canList: true, list: listSessions },
     navigation: {
       openSession: () => Promise.resolve({ opened: true }),
       newAutomation: (params: unknown) => {
@@ -1010,6 +1013,57 @@ describe("where was I tasks", () => {
     expect(byId("others-list").textContent).toContain("Read about indexes");
     expect(byId("others-list").textContent).toContain("Research");
     expect(byId("others-list").textContent).toContain("Orphan session");
+  });
+
+  it("reads live status past the first page, and says a session isn't checked until then", async () => {
+    let secondPage: (page: unknown) => void = () => undefined;
+    const asked: { after?: string }[] = [];
+    const { emit, ready } = startRadar({
+      listSessions: (params) => {
+        asked.push(params);
+        if (!params.after) {
+          return Promise.resolve({
+            items: [{ id: "unrelated", status: "idle" }],
+            nextCursor: "c2",
+          });
+        }
+        return new Promise((resolve) => {
+          secondPage = resolve;
+        });
+      },
+    });
+    await waitFor(() => expect(ready()).toBe(true));
+    const quiet = { id: "s2", title: "Ramp notes", task: "rollout", status: "idle" };
+    emit("radar", [
+      { id: "current", version: "v1", value: { ...RADAR, sessions: [...RADAR.sessions, quiet] } },
+    ]);
+    await waitFor(() => expect(button("Show live status")).toBeDefined());
+
+    const link = () => document.querySelector('.session-link[data-omnigent-label="Ramp notes"]');
+    const card = () => document.querySelector('.session[data-omnigent-label="Ramp checkout flag"]');
+    // Saved as idle, before live status is on.
+    await waitFor(() =>
+      expect(link()?.querySelector(".live-dot")?.getAttribute("data-live")).toBe("idle"),
+    );
+
+    button("Show live status")?.click();
+    // The first page doesn't have them: not checked, rather than the saved idle shown as live.
+    await waitFor(() => expect(asked).toEqual([{ limit: 100 }, { limit: 100, after: "c2" }]));
+    await waitFor(() => expect(link()?.getAttribute("title")).toBe("Not checked yet"));
+    expect(link()?.querySelector(".live-dot")?.getAttribute("data-live")).toBe("unchecked");
+    expect(card()?.textContent).toContain("Not checked yet");
+
+    secondPage({
+      items: [
+        { id: "s1", status: "idle", needsInput: true },
+        { id: "s2", status: "idle", needsInput: true },
+      ],
+      nextCursor: null,
+    });
+    await waitFor(() => expect(link()?.getAttribute("title")).toBe("Needs your input"));
+    expect(link()?.querySelector(".live-dot")?.getAttribute("data-live")).toBe("needs_input");
+    expect(card()?.textContent).toContain("Needs your input");
+    expect(card()?.querySelector(".live-dot")?.getAttribute("data-live")).toBe("needs_input");
   });
 
   it("names where a next step sits on its task's track", async () => {

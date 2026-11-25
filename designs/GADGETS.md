@@ -141,6 +141,11 @@ What a gadget keeps, and how long:
   last far longer than that.
 - **Rule state** rotates every 100 writes and retires epochs two behind the current one, so it
   stays a few records however many writes the gadget takes.
+- **Disk use** has no byte quota yet. Revisions have no count limit, a record keeps every
+  revision until it is removed, and a collection's order index keeps an entry for each record
+  ever created, so edits and create/delete churn grow a gadget's directory until the gadget is
+  deleted. A per-gadget byte quota and compaction of old revisions and order entries are the
+  controls to add before gadgets see heavy, long-lived use.
 
 ## Permissions
 

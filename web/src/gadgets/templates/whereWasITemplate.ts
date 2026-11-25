@@ -401,6 +401,7 @@ button.chip:hover { background: var(--line); }
 .live-dot[data-live='waiting'] { background: var(--waiting); }
 .live-dot[data-live='failed'] { background: var(--blocked); }
 .live-dot[data-live='done'], .live-dot[data-live='idle'] { background: var(--done); }
+.live-dot[data-live='unchecked'] { background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
 .steps-bar { display: flex; gap: 3px; margin-top: 3px; }
 .steps-bar i { width: 14px; height: 5px; border-radius: 3px; background: var(--faint); }
 .steps-bar i[data-s='done'] { background: var(--done); }
@@ -493,7 +494,7 @@ ${GADGET_KIT_HELPERS}
     finished_unreported: 'Stopped before it reported',
     interrupted: 'Stopped before it finished',
   };
-  var LIVE_TEXT = { running: 'Running', needs_input: 'Needs your input', waiting: 'Waiting', failed: 'Failed', idle: 'Idle', done: 'Finished' };
+  var LIVE_TEXT = { running: 'Running', needs_input: 'Needs your input', waiting: 'Waiting', failed: 'Failed', idle: 'Idle', done: 'Finished', unchecked: 'Not checked yet' };
   // Next up shows a step only when the session's estimate that the viewer clicks it reaches its
   // pattern's bar. A shown step nobody clicked or hid within IGNORED_MS counts as ignored.
   var DEFAULT_BAR = 0.7;
@@ -531,7 +532,11 @@ ${GADGET_KIT_HELPERS}
   var pendingRestore = null;
   var dismissing = dict();
   var scanOpenSince = 0;
-  var live = { on: false, timer: null, byId: dict(), error: '' };
+  // Live status reads the viewer's session list a few pages per poll, resuming where it
+  // stopped, so a long list is covered over several polls. seen holds the walk in
+  // progress, last the previous complete walk; a session in neither is not checked yet.
+  var LIVE_PAGES_PER_POLL = 3;
+  var live = { on: false, timer: null, seen: dict(), last: dict(), cursor: null, polling: false, error: '' };
   var renderQueued = false;
   var viewDirty = true;
   var previewSeeded = false;
@@ -990,37 +995,79 @@ ${GADGET_KIT_HELPERS}
   function setLive(on) {
     live.on = on;
     if (live.timer) { clearInterval(live.timer); live.timer = null; }
+    live.seen = dict();
+    live.last = dict();
+    live.cursor = null;
+    live.walk = (live.walk || 0) + 1;
     if (on) {
       pollLive();
       live.timer = setInterval(pollLive, 20000);
-    } else {
-      live.byId = dict();
     }
     schedule();
   }
   function pollLive() {
-    client.sessions.list({ limit: 100 }).then(function (page) {
-      var byId = dict();
-      ((page && page.items) || []).forEach(function (session) { byId[session.id] = session; });
-      live.byId = byId;
-      live.error = '';
-      schedule();
-    }, function (error) {
-      live.error = error && error.code === 'PERMISSION_DENIED'
-        ? 'Live status is off: this gadget was not allowed to see your sessions.'
-        : 'Could not read live status: ' + message(error);
-      setLive(false);
-      notice(live.error, 'error');
-    });
+    if (live.polling || !live.on) return;
+    live.polling = true;
+    var walk = live.walk;
+    var pages = 0;
+    (function read(cursor) {
+      var params = { limit: 100 };
+      if (cursor) params.after = cursor;
+      client.sessions.list(params).then(function (page) {
+        if (walk !== live.walk) { live.polling = false; return; }
+        var at = Date.now();
+        ((page && page.items) || []).forEach(function (session) {
+          if (session && typeof session.id === 'string') live.seen[session.id] = { session: session, at: at };
+        });
+        pages += 1;
+        var next = page && page.nextCursor;
+        if (!next) {
+          // The walk is complete: it is now what the page shows, and the next poll starts over.
+          live.last = live.seen;
+          live.seen = dict();
+          live.cursor = null;
+        } else {
+          live.cursor = next;
+        }
+        live.error = '';
+        if (next && pages < LIVE_PAGES_PER_POLL) { read(next); return; }
+        live.polling = false;
+        schedule();
+      }, function (error) {
+        live.polling = false;
+        if (walk !== live.walk) return;
+        live.error = error && error.code === 'PERMISSION_DENIED'
+          ? 'Live status is off: this gadget was not allowed to see your sessions.'
+          : 'Could not read live status: ' + message(error);
+        setLive(false);
+        notice(live.error, 'error');
+      });
+    })(live.cursor);
   }
+  // What the live poll last saw of a session, with when, or null when it hasn't seen it.
+  function liveSeen(sessionId) {
+    if (!live.on) return null;
+    if (owns(live.seen, sessionId)) return live.seen[sessionId];
+    if (owns(live.last, sessionId)) return live.last[sessionId];
+    return null;
+  }
+  // A session's state: live once the poll has seen it, unchecked while live status is on
+  // and the poll hasn't reached it, and the scan's saved status with live status off.
   function liveState(sessionId, captured) {
-    var session = live.on ? live.byId[sessionId] : null;
-    if (session) {
-      if (session.needsInput) return 'needs_input';
-      if (session.status === 'running' || session.backgroundWork) return 'running';
-      return session.status;
-    }
-    return captured || '';
+    if (!live.on) return captured || '';
+    var seen = liveSeen(sessionId);
+    if (!seen) return 'unchecked';
+    var session = seen.session;
+    if (session.needsInput) return 'needs_input';
+    if (session.status === 'running' || session.backgroundWork) return 'running';
+    return session.status;
+  }
+  // The words for a session's state, saying how old a live reading is once it's a minute old.
+  function liveText(sessionId, state) {
+    var text = owns(LIVE_TEXT, state) ? LIVE_TEXT[state] : state;
+    var seen = liveSeen(sessionId);
+    if (text && seen && Date.now() - seen.at >= 60000) text += ' (checked ' + ago(new Date(seen.at).toISOString()) + ')';
+    return text;
   }
 
   // ---- Pieces a design reuses
@@ -1212,8 +1259,9 @@ ${GADGET_KIT_HELPERS}
     var state = liveState(session.id, session.status);
     var steps = session.steps || [];
     var meta = [];
-    if (state) meta.push(owns(LIVE_TEXT, state) ? LIVE_TEXT[state] : state);
-    if (live.on && live.byId[session.id] && live.byId[session.id].unread) meta.push('new messages');
+    var seen = liveSeen(session.id);
+    if (state) meta.push(liveText(session.id, state));
+    if (seen && seen.session.unread) meta.push('new messages');
     if (session.why) meta.push(session.why);
     var finished = steps.filter(function (step) { return step.status === 'done'; }).length;
     if (steps.length) meta.push(finished + ' of ' + steps.length + ' steps done');
@@ -1261,7 +1309,7 @@ ${GADGET_KIT_HELPERS}
   // A session as a short link with its live status, for a task's row.
   function sessionLink(session) {
     var state = liveState(session.id, session.status);
-    var tip = [owns(LIVE_TEXT, state) ? LIVE_TEXT[state] : state, session.outcome].filter(Boolean).join(' · ');
+    var tip = [liveText(session.id, state), session.outcome].filter(Boolean).join(' · ');
     return el('button', { type: 'button', class: 'session-link', title: tip || null, 'data-omnigent-ref': ref('sessions/' + session.id), 'data-omnigent-label': session.title || 'Session', on: { click: function () { openSession(session.id); } } }, [
       el('span', { class: 'live-dot', 'data-live': state || 'unknown', 'aria-hidden': 'true' }),
       el('span', { text: session.title || 'Untitled session' }),
@@ -1934,7 +1982,8 @@ waits on or blocks; taskSessions(task) is one element with its sessions, session
 same sessions as data, and sessionLink(session) a short link with live status;
 dependents(task) are the tasks waiting on it; stepButton(task, step) is a next step that runs
 and shows its progress; stepCard(task, step) adds its reason, evidence and a way to hide it;
-sessionCard(session) is a session with its live status and journal outcome; openSession(id);
+sessionCard(session) is a session with its live status and journal outcome; liveState(id,
+saved) is a session's state, unchecked until live status has read it; openSession(id);
 openSteps(task) are the steps sure enough to show (confidence at or above their pattern's bar)
 that the viewer has not hidden; laterSteps(task) are those Next up does not show already: draw
 only these as buttons; sure(step); patternOf(step) is its pattern or null; ordered(tasks) puts
