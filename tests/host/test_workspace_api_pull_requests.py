@@ -229,9 +229,11 @@ async def test_get_pull_request_stores_the_reported_prs_and_answers_with_the_ser
     client = _client(tmp_path, monkeypatch, _Store(stored))
 
     response = await client.get_pull_request(pb.GetPullRequestRequest(pr_url=_PR))
+    assert ingested == [{"pr": None, "prs": [{"url": _PR}], "count": 2}]
+    # The Struct carries numbers as floats; what's stored gets the integer back.
+    assert type(ingested[0]["count"]) is int
     await client.list_pull_request_files(pb.ListPullRequestFilesRequest(pr_url=_PR))
 
-    assert ingested == [{"pr": None, "prs": [{"url": _PR}], "count": 2}]
     assert payload_dict(response.payload) == {"pr": None, "prs": ["server"], "count": 2}
     # The other reads store nothing.
     assert len(ingested) == 1
@@ -309,3 +311,42 @@ async def test_a_newer_hosts_methods_this_server_doesnt_serve_arent_listed(
         "archive_pull_request.undo",
     ]
     assert list(response.capabilities) == expected
+
+
+@pytest.fixture
+def owner_lookups(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Each owner lookup the route made, and whether it ran on the event loop's thread."""
+    import threading
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    lookups: list[bool] = []
+    real = routes_resources._is_session_owner
+    loop_thread = threading.current_thread()
+
+    def recording(*args: Any, **kwargs: Any) -> bool:
+        lookups.append(threading.current_thread() is loop_thread)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(routes_resources, "_is_session_owner", recording)
+    return lookups
+
+
+async def test_only_owner_gated_calls_look_up_the_owner_and_never_on_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner_lookups: list[bool]
+) -> None:
+    """With permissions on, the lookup reads the database."""
+    monkeypatch.setattr(
+        WorkspaceReader, "github_info", lambda _self, _session, _url: {"pr": None, "prs": []}
+    )
+    client = _client(tmp_path, monkeypatch, None)
+
+    await client.list_directory(pb.ListDirectoryRequest())
+    # A PR the session never linked; the host refuses it, after the gate.
+    with pytest.raises(ConnectError):
+        await client.list_pull_request_files(pb.ListPullRequestFilesRequest(pr_url=_PR))
+    assert owner_lookups == []
+    await client.get_capabilities(pb.GetCapabilitiesRequest())
+    await client.get_pull_request(pb.GetPullRequestRequest())
+
+    assert owner_lookups == [False, False]

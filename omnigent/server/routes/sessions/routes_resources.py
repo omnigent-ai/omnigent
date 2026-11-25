@@ -2874,7 +2874,11 @@ def register_resources_routes(
         else:
             conv = await _validate_session(session_id, request, LEVEL_READ)
         # The owner grant itself, with no admin pass: only the owner reads as the host's account.
-        session_owner = _is_session_owner(
+        # Only an owner-gated method and GetCapabilities, which lists them, need it.
+        session_owner = (
+            gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities"
+        ) and await asyncio.to_thread(
+            _is_session_owner,
             _get_user_id(request, auth_provider),
             conv,
             auth_provider=auth_provider,
