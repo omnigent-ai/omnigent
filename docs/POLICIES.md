@@ -423,7 +423,9 @@ Controls GitLab access through `git` and `glab` shell commands on gitlab.com and
 
 Arguments are parsed using command-specific option definitions; unsupported options and API write routes return ASK. Aliases receive the same checks as their canonical actions. With `write_branches` configured, merges and rebases ask because the destination branch cannot be established from an MR number. API content writes require an explicit allowed branch; an opaque input body asks. MR creation that also pushes or creates a source branch (`--fill`, `--push`, or `--create-source-branch`), restores saved options (`--recover`), or selects another head project asks because its additional targets are unknown.
 
-`glab repo fork` asks because its source project does not identify the new destination project.
+`glab repo fork` asks because its source project does not identify the new destination project. MR API creation and updates check literal target-branch names and ask when a body or project-ID field leaves another destination unknown. Branch allowlist entries are literal names; `main` and `heads/main` are distinct.
+
+Git push parsing retains option values and uncertainty through authorization. Recursive pushes that can update submodule remotes ask, while `check` and `no` modes remain eligible for automatic approval. Destination-changing Git configuration, configuration includes, and clone configuration that can affect later pushes ask for approval.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

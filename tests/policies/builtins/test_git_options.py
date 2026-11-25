@@ -114,6 +114,7 @@ def test_push_option_values_are_not_remote_arguments() -> None:
     assert parsed is not None
     assert parsed[0] == "https://github.com/example/allowed"
     assert parsed[1] == ["main"]
+    assert parsed.option_values["--push-option"] == ["https://github.com/example/other"]
 
 
 def test_attached_push_option_values_are_not_remote_arguments() -> None:
@@ -122,6 +123,7 @@ def test_attached_push_option_values_are_not_remote_arguments() -> None:
     )
     assert parsed is not None
     assert parsed[0] == "https://github.com/example/allowed"
+    assert parsed.option_values["--push-option"] == ["https://github.com/example/other"]
 
 
 def test_push_policy_checks_the_actual_remote() -> None:

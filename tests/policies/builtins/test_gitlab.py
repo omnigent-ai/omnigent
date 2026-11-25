@@ -148,11 +148,39 @@ def test_write_branches(command: str, expected: str) -> None:
         (f"git config url.file:///tmp/sink.git.insteadOf {_URL}", "ASK"),
         (f"GIT_CONFIG_COUNT=1 git push {_URL} main", "ASK"),
         (f"git -c user.name=bot push {_URL} main", "ALLOW"),
+        (f"git push --future-option {_URL} main", "ASK"),
+        (f"git push --recurse-submodules=on-demand {_URL} main", "ASK"),
+        (f"git push --recurse-submodules only {_URL} main", "ASK"),
+        (f"git push --recurse-sub=only {_URL} main", "ASK"),
+        (f"git push --recurse-submodules=no {_URL} main", "ALLOW"),
+        (f"git push --no-recurse-submodules {_URL} main", "ALLOW"),
+        (f"git -c push.recurseSubmodules=on-demand push {_URL} main", "ASK"),
+        (f"git -cpush.recurseSubmodules=only push {_URL} main", "ASK"),
+        (f"git --config-env=push.recurseSubmodules=MODE push {_URL} main", "ASK"),
+        (f"git -c push.recurseSubmodules=check push {_URL} main", "ALLOW"),
+        (f"git -c push.recurseSubmodules=no push {_URL} main", "ALLOW"),
+        (f"git -c remote.{_URL}.pushurl=https://gitlab.com/grp/other.git push {_URL} main", "ASK"),
+        (f"git -c remote.{_URL}.url=https://gitlab.com/grp/other.git push {_URL} main", "ASK"),
+        (f"git -c include.path=extra.conf push {_URL} main", "ASK"),
+        (f"git -c includeIf.gitdir:work/.path=extra.conf push {_URL} main", "ASK"),
+        (f"git config remote.{_URL}.pushurl https://gitlab.com/grp/other.git", "ASK"),
+        ("git config set include.path extra.conf", "ASK"),
+        ("git config --add includeIf.gitdir:work/.path extra.conf", "ASK"),
+        ("git config push.recurseSubmodules on-demand", "ASK"),
+        ("git config push.recurseSubmodules check", "ALLOW"),
+        ("git remote add mirror https://gitlab.com/grp/other.git", "ASK"),
+        ("git remote set-url --push origin https://gitlab.com/grp/other.git", "ASK"),
+        ("git remote -v add mirror https://gitlab.com/grp/other.git", "ASK"),
+        ("git remote get-url origin", "ALLOW"),
     ],
 )
-def test_git_push_remote_and_flag_parsing(command: str, expected: str) -> None:
+@pytest.mark.parametrize("write_branches", [None, ["main"]])
+def test_git_push_remote_and_flag_parsing(
+    command: str, expected: str, write_branches: list[str] | None
+) -> None:
     """Remote detection and flags follow ``git push -h``, not the first URL-like token."""
-    assert _result(gitlab_policy(write_repos=[_PROJECT])(_sh(command))) == expected
+    policy = gitlab_policy(write_repos=[_PROJECT], write_branches=write_branches)
+    assert _result(policy(_sh(command))) == expected
 
 
 def test_mirror_push_is_destructive() -> None:
@@ -170,6 +198,17 @@ def test_restricted_reads() -> None:
     assert _result(policy(_sh(f"git clone {_URL}"))) == "ALLOW"
     assert _result(policy(_sh("git clone https://gitlab.com/grp/secret.git"))) == "DENY"
     assert _result(policy(_sh("git fetch origin"))) == "ASK"
+    for config in (
+        "-c url.https://gitlab.com/grp/other.insteadOf=https://gitlab.com/grp/sub/app",
+        "--config=include.path=extra.conf",
+        "-cincludeIf.gitdir:work/.path=extra.conf",
+        f"-c remote.{_URL}.url=https://gitlab.com/grp/other.git",
+        "-c push.recurseSubmodules=on-demand",
+    ):
+        command = f"git clone {config} {_URL} work"
+        assert _result(policy(_sh(command))) == "ASK"
+        assert _result(gitlab_policy()(_sh(command))) == "ASK"
+    assert _result(policy(_sh(f"git clone -c user.name=bot {_URL} work"))) == "ALLOW"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -266,6 +305,11 @@ def test_glab_target_branch_gated() -> None:
     policy = gitlab_policy(write_repos=[_PROJECT], write_branches=["main"])
     assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b main"))) == "ALLOW"
     assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b release"))) == "DENY"
+    for branch in ("heads/main", "refs/heads/main"):
+        assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b {branch}"))) == "DENY"
+        literal = gitlab_policy(write_repos=[_PROJECT], write_branches=[branch])
+        assert _result(literal(_sh(f"glab mr create -R {_PROJECT} -b {branch}"))) == "ALLOW"
+        assert _result(literal(_sh(f"glab mr create -R {_PROJECT} -b main"))) == "DENY"
     # glab uses the last repeated flag, so an earlier allowed value cannot mask it.
     assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b main -b release"))) == "DENY"
     for action in ("merge", "accept", "rebase"):
@@ -508,6 +552,16 @@ def test_glab_dispatch(command: str, expected: str) -> None:
         ("glab api -X POST projects/grp%2Fsub%2Fapp/issues -f", "ASK"),
         ("glab api -X POST -- projects/grp%2Fsub%2Fapp/issues", "ALLOW"),
         ("glab api -X DELETE projects/grp%2Fsub%2Fapp/unmodelled", "DENY"),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests -f target_project_id=123", "ASK"),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests -F target_project_id=123", "ASK"),
+        (
+            "glab api -X POST 'projects/grp%2Fsub%2Fapp/merge_requests?target_project_id=123'",
+            "ASK",
+        ),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests --input body.json", "ASK"),
+        ("glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12 --input body.json", "ASK"),
+        ("glab api -X PATCH projects/grp%2Fsub%2Fapp/merge_requests/12 -f title=x", "ASK"),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests -f remove_source_branch=true", "DENY"),
     ],
 )
 def test_glab_api_method(command: str, expected: str) -> None:
@@ -541,6 +595,25 @@ _FILES_API = "glab api -X PUT projects/grp%2Fsub%2Fapp/repository/files/a.txt -f
     [
         (f"{_FILES_API} -f branch=main", "ALLOW"),
         (f"{_FILES_API} -f branch=release", "DENY"),
+        (f"{_FILES_API} -f branch=heads/main", "DENY"),
+        (f"{_FILES_API} -f branch=refs/heads/main", "DENY"),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests -f target_branch=release", "DENY"),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests -f target_branch=heads/main", "DENY"),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests -f target_branch=main", "ALLOW"),
+        ("glab api projects/grp%2Fsub%2Fapp/merge_requests -f title=x", "ASK"),
+        (
+            "glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12 -f target_branch=release",
+            "DENY",
+        ),
+        (
+            "glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12 -f target_branch=main",
+            "ALLOW",
+        ),
+        ("glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12 -f title=x", "ALLOW"),
+        (
+            "glab api -X POST 'projects/grp%2Fsub%2Fapp/merge_requests?target_branch=release'",
+            "DENY",
+        ),
         ("glab api projects/grp%2Fsub%2Fapp/repository/commits?branch=release -f x=y", "DENY"),
         ("glab api -X POST projects/grp%2Fsub%2Fapp/repository/branches -f branch=main", "ALLOW"),
         # The destination cannot be known from a body file or a placeholder.
@@ -671,3 +744,5 @@ def test_registry_discovers_gitlab_policy() -> None:
     configured = gitlab_policy(write_repos=[_PROJECT], deny_reason="Custom project restriction.")
     denied = configured(_sh("glab issue create -R grp/other"))
     assert denied is not None and denied["reason"].startswith("Custom project restriction.")
+    forced = configured(_sh(f"git push --force {_URL} main"))
+    assert forced is not None and forced["reason"].startswith("Custom project restriction.")

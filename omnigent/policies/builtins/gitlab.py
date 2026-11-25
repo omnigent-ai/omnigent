@@ -63,11 +63,14 @@ from omnigent.policies.builtins._shell import (
 # Forge-neutral git push parsing and decision helpers; a candidate to move to a
 # shared module once a third forge policy needs them.
 from omnigent.policies.builtins.github import (
+    _GIT_GLOBAL_VALUE_OPTS,
     _ask,
     _classify_git,
+    _classify_git_push,
     _deny,
     _git_subcommand_index,
-    _normalize_branches,
+    _parse_git_push_args,
+    _unparsed_git_push,
     _worse,
 )
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
@@ -78,13 +81,17 @@ _Project = tuple[str | None, str]
 _SCP_REMOTE = re.compile(r"^[\w.-]+@([^:/]+):(.+)$")
 # ``projects/<url-encoded path>`` in a ``glab api`` endpoint; numeric IDs don't match.
 _API_PROJECT_PATH = re.compile(r"/?projects/([^/]+)(?:/(.*))?$")
-# ``url.<base>.insteadOf`` / ``pushInsteadOf`` rewrite a remote URL after it is parsed.
-_URL_REWRITE_KEY = re.compile(r"url\..+\.(?:push)?insteadof", re.IGNORECASE)
+# These settings can change destinations or add writes outside the parsed target.
+_GIT_TARGET_CONFIG = re.compile(
+    r"(?:url\..+\.(?:push)?insteadof|remote\..+|include(?:if\..+)?\.path|"
+    r"submodule\..+\.url|push\.recursesubmodules)",
+    re.IGNORECASE,
+)
 # API routes that write branch content; the destination is the ``branch`` parameter.
 _API_BRANCH_WRITE = re.compile(r"repository/(?:files|commits|branches)(?:/|$)")
 _API_MERGE_WRITE = re.compile(r"merge_requests/[0-9]+/(?:merge|rebase)$")
 _API_METADATA_WRITE = re.compile(
-    r"(?:issues|merge_requests|labels|milestones|variables|releases|pipelines|jobs)"
+    r"(?:issues|labels|milestones|variables|releases|pipelines|jobs)"
     r"(?:/[^/]+)?$"
 )
 # Variables that point glab at another host or config (see ``glab config --help``).
@@ -95,40 +102,6 @@ _HOST_CONFIG_KEYS: frozenset[str] = frozenset(
     {"host", "gitlab_host", "gitlab_uri", "gl_host", "api_host", "gitlab_api_host"}
 )
 
-# Long options of ``git push`` (``git push -h``), for expanding the abbreviations git accepts.
-_GIT_PUSH_OPTIONS: tuple[str, ...] = tuple(
-    f"--{name}"
-    for name in [
-        "all",
-        "atomic",
-        "branches",
-        "delete",
-        "dry-run",
-        "exec",
-        "follow-tags",
-        "force",
-        "force-if-includes",
-        "force-with-lease",
-        "ipv4",
-        "ipv6",
-        "mirror",
-        "porcelain",
-        "progress",
-        "prune",
-        "push-option",
-        "quiet",
-        "receive-pack",
-        "recurse-submodules",
-        "repo",
-        "set-upstream",
-        "signed",
-        "tags",
-        "thin",
-        "verbose",
-        "verify",
-    ]
-)
-
 
 def _value_options(long_names: str, short_letters: str) -> tuple[frozenset[str], str]:
     """Build a ``(long options, short letters)`` pair from space-separated names."""
@@ -137,7 +110,6 @@ def _value_options(long_names: str, short_letters: str) -> tuple[frozenset[str],
 
 # Options whose value is the next token, from each subcommand's ``git <sub> -h``.
 _GIT_VALUE_OPTIONS: dict[str, tuple[frozenset[str], str]] = {
-    "push": _value_options("repo receive-pack exec push-option recurse-submodules", "o"),
     "clone": _value_options(
         "jobs template reference reference-if-able origin branch revision upload-pack depth "
         "shallow-since shallow-exclude separate-git-dir ref-format config server-option "
@@ -480,121 +452,142 @@ def _project_matches(project: _Project, allowed: set[_Project]) -> bool | None:
     return None if any(allowed_path == path for _, allowed_path in allowed) else False
 
 
-def _git_arguments(sub: str, args: list[str]) -> tuple[list[str], list[str], str | None]:
-    """
-    Split ``git <sub>`` arguments into flags and positionals, dropping option values.
-
-    Long options are expanded from the abbreviations git accepts (``--force-w``);
-    short bundles keep only their flag letters (``-uo ci.skip`` → ``-u``).
-
-    :param sub: A remote subcommand, e.g. ``"push"``.
-    :param args: Tokens after the subcommand.
-    :returns: ``(flags, positionals, repo_option)``, where *repo_option* is the
-        value of ``git push --repo``.
-    """
+def _git_read_arguments(sub: str, args: list[str]) -> tuple[list[str], list[str]] | None:
+    """Consume read-command options, retaining clone configuration for inspection."""
     value_names, value_letters = _GIT_VALUE_OPTIONS[sub]
-    flags: list[str] = []
-    positionals: list[str] = []
-    repo_option: str | None = None
+    operands: list[str] = []
+    configuration: list[str] = []
     index = 0
     while index < len(args):
         token = args[index]
         index += 1
         if token == "--":
-            positionals.extend(args[index:])
+            operands.extend(args[index:])
             break
+        config_option = False
         if token.startswith("--"):
-            name, has_value, value = token.partition("=")
-            if sub == "push":
-                expansions = [option for option in _GIT_PUSH_OPTIONS if option.startswith(name)]
-                name = name if name in expansions or len(expansions) != 1 else expansions[0]
-            # An abbreviation of a value option also takes the next token.
-            if not has_value and any(option.startswith(name) for option in value_names):
-                value = args[index] if index < len(args) else ""
-                index += 1
-            if name == "--repo":
-                repo_option = value
-            elif not any(option.startswith(name) for option in value_names):
-                flags.append(name + has_value + value)
+            name, attached, value = token.partition("=")
+            matches = (
+                [name]
+                if name in value_names
+                else [option for option in value_names if option.startswith(name)]
+            )
+            if not matches:
+                continue
+            if len(matches) != 1:
+                return None
+            config_option = matches[0] == "--config"
         elif token.startswith("-") and len(token) > 1:
-            letters = ""
             for position, letter in enumerate(token[1:], start=1):
                 if letter in value_letters:
-                    # The value is the rest of the token, else the next token.
-                    if position == len(token) - 1:
-                        index += 1
+                    value = token[position + 1 :]
+                    attached = bool(value)
+                    config_option = sub == "clone" and letter == "c"
                     break
-                letters += letter
-            if letters:
-                flags.append(f"-{letters}")
+            else:
+                continue
         else:
-            positionals.append(token)
-    return flags, positionals, repo_option
+            operands.append(token)
+            continue
+        if not attached:
+            if index == len(args):
+                return None
+            value = args[index]
+            index += 1
+        if config_option:
+            configuration.append(value)
+    return operands, configuration
+
+
+def _uncertain_git_config(value: str, *, dynamic: bool = False) -> bool:
+    """Check a configuration assignment for unresolved destinations or side effects."""
+    key, _, setting = value.partition("=")
+    if not _GIT_TARGET_CONFIG.fullmatch(key):
+        return False
+    return not (
+        key.lower() == "push.recursesubmodules"
+        and not dynamic
+        and setting.lower() in {"check", "no", "false", "off", "0"}
+    )
+
+
+def _git_changes_targets(tokens: list[str], index: int) -> bool:
+    """Inspect global configuration and persistent config/remote changes."""
+    position = 1
+    while position < index:
+        token = tokens[position]
+        position += 1
+        name, _, value = token.partition("=")
+        if token in _GIT_GLOBAL_VALUE_OPTS:
+            name, value = token, tokens[position]
+            position += 1
+        elif token.startswith("-c") and token != "-c":
+            name, value = "-c", token[2:]
+        if name in {"-c", "--config-env"} and _uncertain_git_config(
+            value, dynamic=name == "--config-env"
+        ):
+            return True
+    sub, args = tokens[index], tokens[index + 1 :]
+    if sub == "config":
+        return any(
+            _uncertain_git_config(
+                token
+                + ("=" + args[offset + 1] if "=" not in token and offset + 1 < len(args) else "")
+            )
+            for offset, token in enumerate(args)
+        )
+    while args and args[0] in {"-v", "--verbose"}:
+        args = args[1:]
+    return sub == "remote" and bool(args) and args[0] not in {"show", "get-url"}
 
 
 def _classify_git_command(
     tokens: list[str], hosts: frozenset[str], other_forge_hosts: frozenset[str]
 ) -> _GitLabOp | None:
-    """
-    Classify a ``git`` invocation, reusing the GitHub policy's push parsing.
-
-    :param tokens: Tokens starting at ``git``.
-    :param hosts: Configured GitLab authorities.
-    :param other_forge_hosts: Hosts of other git providers, left to their policies.
-    :returns: An op, or ``None`` for local commands and other forges' remotes.
-    """
-    if _rewrites_remote_urls(tokens):
-        return _unparseable("git config rewriting remote URLs")
-    op = _classify_git(tokens)
-    if op is None:
-        return None
-    if op.kind == "unparseable":
-        return _unparseable(op.detail)
-    index = _git_subcommand_index(tokens)
+    """Retain parsed push targets, options and uncertainty through authorization."""
+    try:
+        index = _git_subcommand_index(tokens)
+    except ValueError:
+        return _unparseable("incomplete or unsupported Git global options")
     if index is None:
         return None
-    sub = tokens[index]
-    flags, positionals, repo_option = _git_arguments(sub, tokens[index + 1 :])
-    if not positionals and repo_option:
-        positionals = [repo_option]
+    if _git_changes_targets(tokens, index):
+        return _unparseable("git configuration with uncertain targets")
+    sub, args = tokens[index], tokens[index + 1 :]
+    uncertain_effects = False
     if sub == "push":
-        # Re-parse without option values, which could otherwise pass for refspecs.
-        op = _classify_git(["git", "push", *flags, *positionals]) or op
-    remote = positionals[0] if positionals else None
+        parsed = _parse_git_push_args(args, allow_abbreviations=True)
+        op = _classify_git_push(parsed) if parsed else _unparsed_git_push(args)
+        remote = parsed.remote if parsed else None
+        if parsed:
+            uncertain_effects = any(
+                value not in {"check", "no"}
+                for value in parsed.option_values.get("--recurse-submodules", [])
+            )
+    elif sub in _GIT_VALUE_OPTIONS:
+        read_args = _git_read_arguments(sub, args)
+        if read_args is None:
+            return _unparseable(f"git {sub} options")
+        operands, configuration = read_args
+        if any(_uncertain_git_config(value) for value in configuration):
+            return _unparseable("git clone configuration with uncertain targets")
+        remote = operands[0] if operands else None
+        op = _classify_git(tokens)
+        assert op is not None
+    else:
+        return None
     is_url, project = _parse_url(remote, hosts) if remote else (False, None)
     if is_url and project is None and host_of(remote or "") in other_forge_hosts:
         return None
-    short_letters = "".join(flag[1:] for flag in flags if not flag.startswith("--"))
-    mirror = sub == "push" and "--mirror" in flags
     return _GitLabOp(
         kind=op.kind,
         project=project,
         branches=op.branches if op.branch_targeted else None,
         detail=op.detail,
-        # ``--mirror`` force-updates and deletes remote refs; ``--prune`` deletes them.
-        destructive=op.destructive
-        or mirror
-        or (sub == "push" and ("--prune" in flags or "d" in short_letters)),
-        tag_push=op.tag_push or mirror,
-        force_push=op.force_push or mirror,
-    )
-
-
-def _rewrites_remote_urls(tokens: list[str]) -> bool:
-    """
-    Whether a ``git`` call sets URL rewriting, which changes the remote it reaches.
-
-    Covers ``-c`` / ``--config-env`` before the subcommand and ``git config``
-    writing the key for later commands.
-    """
-    try:
-        index = _git_subcommand_index(tokens)
-    except ValueError:
-        return False  # _classify_git reports these as unparseable.
-    end = len(tokens) if index is not None and tokens[index] == "config" else index
-    return any(
-        _URL_REWRITE_KEY.match(token.removeprefix("-c").removeprefix("--config-env="))
-        for token in tokens[1:end]
+        destructive=op.destructive,
+        tag_push=op.tag_push,
+        force_push=op.force_push,
+        uncertain_effects=uncertain_effects,
     )
 
 
@@ -747,7 +740,7 @@ def _classify_glab(
     )
     branches = None
     if target := args.last("target-branch"):
-        branches = frozenset(_normalize_branches([target]))
+        branches = frozenset({target})
     if (group == "mr" and (action in {"merge", "rebase"} or args.enabled("auto-merge"))) or (
         (group, action) == ("stack", "sync") and not args.enabled("skip-push")
     ):
@@ -789,20 +782,30 @@ def _classify_glab_api(args: _GlabArguments, override: str | None) -> _GitLabOp:
         route = unquote(match[2] or "").rstrip("/")
     branches = None
     uncertain_effects = False
+    parameters = parse_qsl(endpoint.query, keep_blank_values=True)
+    parameters += [(key, value) for key, _, value in (field.partition("=") for field in fields)]
+    effective_method = method or ("POST" if is_write else "GET")
     if is_write:
         if _API_BRANCH_WRITE.match(route):
-            branches = _api_branches(endpoint.query, fields, has_input)
+            branches = _api_branches(parameters, has_input)
         elif _API_MERGE_WRITE.fullmatch(route):
             branches = frozenset()
+        elif (effective_method == "POST" and route == "merge_requests") or (
+            effective_method == "PUT" and re.fullmatch(r"merge_requests/[0-9]+", route)
+        ):
+            uncertain_effects = has_input or any(
+                key in {"target_project_id", "source_project_id"} for key, _ in parameters
+            )
+            if effective_method == "POST" or any(key == "target_branch" for key, _ in parameters):
+                branches = _api_branches(parameters, has_input, key="target_branch")
+        elif effective_method == "DELETE" and re.fullmatch(r"merge_requests/[0-9]+", route):
+            pass
         elif not _API_METADATA_WRITE.fullmatch(route):
             uncertain_effects = True
     removes_branch = any(
-        key == "should_remove_source_branch" and value.lower() not in {"false", "0"}
-        for key, _, value in (field.partition("=") for field in fields)
-    )
-    removes_branch = removes_branch or any(
-        key == "should_remove_source_branch" and value.lower() not in {"false", "0"}
-        for key, value in parse_qsl(endpoint.query, keep_blank_values=True)
+        key in {"should_remove_source_branch", "remove_source_branch"}
+        and value.lower() not in {"false", "0"}
+        for key, value in parameters
     )
     if is_write and _API_MERGE_WRITE.fullmatch(route) and has_input:
         uncertain_effects = True
@@ -816,17 +819,16 @@ def _classify_glab_api(args: _GlabArguments, override: str | None) -> _GitLabOp:
     )
 
 
-def _api_branches(query: str, fields: list[str], has_input: bool) -> frozenset[str]:
+def _api_branches(
+    parameters: list[tuple[str, str]], has_input: bool, *, key: str = "branch"
+) -> frozenset[str]:
     """Identify explicit branch destinations; opaque bodies and values stay unknown."""
     if has_input:
         return frozenset()
-    values = [value for key, value in parse_qsl(query, keep_blank_values=True) if key == "branch"]
-    values += [
-        value for key, _, value in (field.partition("=") for field in fields) if key == "branch"
-    ]
+    values = [value for name, value in parameters if name == key]
     if any(not value or value.startswith(("@", ":", "[", "{")) for value in values):
         return frozenset()
-    return frozenset(_normalize_branches(values))
+    return frozenset(values)
 
 
 def _sets_unowned_host(raw_tokens: list[str], hosts: frozenset[str]) -> str | None:
@@ -972,7 +974,7 @@ def gitlab_policy(
 
     allowed_read = _projects(read_repos, "read_repos")
     allowed_write = _projects(write_repos, "write_repos")
-    allowed_branches = _normalize_branches(write_branches)
+    allowed_branches = set(write_branches or [])
     shell_tool_names = frozenset(shell_tools) if shell_tools is not None else SHELL_TOOLS
 
     def _describe(project: _Project) -> str:
@@ -1016,7 +1018,7 @@ def gitlab_policy(
             )
         if op.force_push and deny_force_push:
             return _deny(
-                "Force push is blocked by policy. Remove the force flag "
+                f"{deny_reason} Force push is blocked by policy. Remove the force flag "
                 "(--force / -f / --force-with-lease / --force-if-includes / "
                 "+refspec) or set deny_force_push=False."
             )

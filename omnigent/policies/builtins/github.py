@@ -72,7 +72,7 @@ import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from omnigent.policies.builtins._shell import (
@@ -922,10 +922,20 @@ _GIT_PUSH_BOOLEAN_OPTIONS = frozenset(
 _GIT_PUSH_SHORT_OPTIONS = frozenset({"v", "q", "d", "n", "f", "u", "4", "6"})
 
 
-def _parse_git_push_args(args: list[str]) -> tuple[str | None, list[str], set[str]] | None:
+class _GitPushArguments(NamedTuple):
+    remote: str | None
+    refspecs: list[str]
+    flags: set[str]
+    option_values: dict[str, list[str]]
+
+
+def _parse_git_push_args(
+    args: list[str], *, allow_abbreviations: bool = False
+) -> _GitPushArguments | None:
     """Isolate the push remote and refspecs without treating option values as targets."""
     positionals: list[str] = []
     flags: set[str] = set()
+    option_values: dict[str, list[str]] = {}
     repo_option: str | None = None
     options_done = False
     i = 0
@@ -940,6 +950,12 @@ def _parse_git_push_args(args: list[str]) -> tuple[str | None, list[str], set[st
             continue
         if token.startswith("--"):
             name, equal, attached = token.partition("=")
+            if allow_abbreviations:
+                known = _GIT_PUSH_VALUE_OPTIONS | _GIT_PUSH_BOOLEAN_OPTIONS
+                known |= {"--no-" + option[2:] for option in _GIT_PUSH_BOOLEAN_OPTIONS}
+                matches = [option for option in known if option.startswith(name)]
+                if name not in known and len(matches) == 1:
+                    name = matches[0]
             if name in _GIT_PUSH_VALUE_OPTIONS:
                 if not equal:
                     if i == len(args):
@@ -950,6 +966,7 @@ def _parse_git_push_args(args: list[str]) -> tuple[str | None, list[str], set[st
                     if repo_option is not None:
                         return None
                     repo_option = attached
+                option_values.setdefault(name, []).append(attached)
                 flags.add(name)
             elif name in _GIT_PUSH_BOOLEAN_OPTIONS or (
                 name.startswith("--no-") and "--" + name[5:] in _GIT_PUSH_BOOLEAN_OPTIONS
@@ -965,17 +982,22 @@ def _parse_git_push_args(args: list[str]) -> tuple[str | None, list[str], set[st
                 return None
             flags.add("-" + option)
             if option == "o":
-                if offset == len(token) - 2:
+                attached = token[offset + 2 :]
+                if not attached:
                     if i == len(args):
                         return None
+                    attached = args[i]
                     i += 1
+                option_values.setdefault("--push-option", []).append(attached)
                 break
     if repo_option is not None:
         # The interaction of --repo and positional arguments is ambiguous here.
         if positionals:
             return None
-        return repo_option, [], flags
-    return (positionals[0] if positionals else None), positionals[1:], flags
+        return _GitPushArguments(repo_option, [], flags, option_values)
+    return _GitPushArguments(
+        positionals[0] if positionals else None, positionals[1:], flags, option_values
+    )
 
 
 def _unparsed_git_push(args: list[str]) -> _ShellOp:
@@ -1151,42 +1173,47 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         parsed = _parse_git_push_args(args)
         if parsed is None:
             return _unparsed_git_push(args)
-        remote, refspecs, flags = parsed
-        repo = _repo_from_url(remote, allow_subpath=False) if remote else None
-        branches: set[str] = set()
-        tag_push = bool(flags & {"--tags", "--follow-tags", "--mirror"})
-        for refspec in refspecs:
-            dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
-            dest = dest.lstrip("+")
-            if dest.startswith("refs/tags/"):
-                tag_push = True
-                continue
-            branch = _normalize_branch(dest)
-            if branch:
-                branches.add(branch)
-        # Detect delete semantics: ``--delete`` / ``-d`` flag, or a refspec
-        # starting with ``:`` (empty left side = delete the remote branch).
-        is_destructive = bool(flags & {"--delete", "-d", "--mirror", "--prune"}) or any(
-            refspec.startswith(":") for refspec in refspecs
-        )
-        # Detect force-push from parsed flags and ``+refspec`` prefixes.
-        is_force = bool(
-            flags & {"--force", "-f", "--force-with-lease", "--force-if-includes", "--mirror"}
-        ) or any(refspec.startswith("+") for refspec in refspecs)
-        if flags & {"--all", "--branches", "--mirror", "--prune"}:
-            # These modes may affect refs beyond any explicit refspec.
-            branches.clear()
-        return _ShellOp(
-            kind="write",
-            repo=repo,
-            branches=frozenset(branches),
-            branch_targeted=True,
-            detail="git push",
-            destructive=is_destructive,
-            tag_push=tag_push,
-            force_push=is_force,
-        )
+        return _classify_git_push(parsed)
     return None
+
+
+def _classify_git_push(parsed: _GitPushArguments) -> _ShellOp:
+    """Classify the effects of an already parsed push without rescanning argv."""
+    remote, refspecs, flags, _ = parsed
+    repo = _repo_from_url(remote, allow_subpath=False) if remote else None
+    branches: set[str] = set()
+    tag_push = bool(flags & {"--tags", "--follow-tags", "--mirror"})
+    for refspec in refspecs:
+        dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
+        dest = dest.lstrip("+")
+        if dest.startswith("refs/tags/"):
+            tag_push = True
+            continue
+        branch = _normalize_branch(dest)
+        if branch:
+            branches.add(branch)
+    # Detect delete semantics: ``--delete`` / ``-d`` flag, or a refspec
+    # starting with ``:`` (empty left side = delete the remote branch).
+    is_destructive = bool(flags & {"--delete", "-d", "--mirror", "--prune"}) or any(
+        refspec.startswith(":") for refspec in refspecs
+    )
+    # Detect force-push from parsed flags and ``+refspec`` prefixes.
+    is_force = bool(
+        flags & {"--force", "-f", "--force-with-lease", "--force-if-includes", "--mirror"}
+    ) or any(refspec.startswith("+") for refspec in refspecs)
+    if flags & {"--all", "--branches", "--mirror", "--prune"}:
+        # These modes may affect refs beyond any explicit refspec.
+        branches.clear()
+    return _ShellOp(
+        kind="write",
+        repo=repo,
+        branches=frozenset(branches),
+        branch_targeted=True,
+        detail="git push",
+        destructive=is_destructive,
+        tag_push=tag_push,
+        force_push=is_force,
+    )
 
 
 def _classify_gh(tokens: list[str]) -> _ShellOp | None:
