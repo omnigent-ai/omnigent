@@ -2,13 +2,11 @@ import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
 import {
-  contentSearchPattern,
-  fetchContentSearch,
-  fitsContentSearchLimit,
   type ContentMatch,
+  contentSearchProblem,
   type ContentSearchInput,
   EMPTY_CONTENT_SEARCH,
-  wholeWordRegexProblem,
+  runContentSearch,
 } from "@/lib/contentSearch";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -49,12 +47,9 @@ export function ContentSearchPanel({
   const filtersId = useId();
   const { query, caseSensitive, regex, include, exclude } = input;
   const wholeWord = input.wholeWord === true;
-  // Whole word is sent as a regular expression, which can outgrow the server's query limit.
-  const sent = contentSearchPattern({ query, regex, wholeWord });
-  const tooLong = wholeWord && !fitsContentSearchLimit(sent.pattern);
-  // Such an expression could escape the Whole word wrapper and lose its boundaries.
-  const regexProblem = wholeWord && regex ? wholeWordRegexProblem(query) : null;
-  const canSearch = query.trim() !== "" && !tooLong && regexProblem === null;
+  // The same checks Go to File's text search makes, such as Whole word's length limit.
+  const problem = contentSearchProblem(input);
+  const canSearch = query.trim() !== "" && problem === null;
   // A search handed over while the page shows, such as Go to File's "Open in Search",
   // replaces what was typed here.
   const handOff = useQuery<ContentSearchInput | null>({
@@ -79,12 +74,7 @@ export function ContentSearchPanel({
     retry: false,
     // Keep the latest search, including in-flight work, when its panel unmounts.
     queryFn: async (): Promise<ContentSearchAnswer> => {
-      const result = await fetchContentSearch(conversationId, sent.pattern, {
-        caseSensitive,
-        regex: sent.regex,
-        include,
-        exclude,
-      });
+      const result = await runContentSearch(conversationId, input);
       return { ...result, query };
     },
   });
@@ -161,21 +151,9 @@ export function ContentSearchPanel({
             Regular expression
           </label>
         </div>
-        {tooLong && (
+        {problem && (
           <p role="alert" className="text-xs text-destructive">
-            This search is too long to match whole words. Shorten it, or turn off Whole word.
-          </p>
-        )}
-        {regexProblem === "unopened-group" && (
-          <p role="alert" className="text-xs text-destructive">
-            This expression closes a group it never opened, so it can’t match whole words. Balance
-            its parentheses, or turn off Whole word.
-          </p>
-        )}
-        {regexProblem === "verbose" && (
-          <p role="alert" className="text-xs text-destructive">
-            Whole word can’t be used with verbose mode (?x). Remove that flag, or turn off Whole
-            word.
+            {problem}
           </p>
         )}
         <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">
