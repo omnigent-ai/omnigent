@@ -10,6 +10,7 @@ view. Spec policies have ``id=None`` and cannot be patched or deleted.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -196,8 +197,11 @@ def create_session_policies_router(
                     f"must add custom handlers via the 'policy_modules' config.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            # Validate factory_params against the registry schema.
-            validation_error = validate_factory_params(body.handler, body.factory_params)
+            # Validate factory_params against the registry schema. Off the event
+            # loop: a handler's validator can evaluate user code (CEL dry runs).
+            validation_error = await asyncio.to_thread(
+                validate_factory_params, body.handler, body.factory_params
+            )
             if validation_error:
                 raise OmnigentError(validation_error, code=ErrorCode.INVALID_INPUT)
         policy_id = _generate_policy_id()

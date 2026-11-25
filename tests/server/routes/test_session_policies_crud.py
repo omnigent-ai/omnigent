@@ -108,6 +108,48 @@ async def test_create_session_policy_unregistered_python(
     assert resp.status_code == 400
 
 
+async def test_create_session_cel_policy_rejects_expression_failing_on_a_phase(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """A CEL policy that cannot evaluate on some event type is not stored."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies",
+        json=_policy_payload(
+            name="unguarded_cel",
+            type="python",
+            handler="omnigent.policies.builtins.cel.cel_policy",
+            factory_params={
+                "expression": 'event.data.name == "sys_os_shell" ? {"result": "DENY"} : null'
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "fails to evaluate on request events" in resp.json()["error"]["message"]
+    listed = await client.get(f"/v1/sessions/{session_id}/policies")
+    assert [p for p in listed.json()["data"] if p["source"] == "session"] == []
+
+
+async def test_create_session_cel_policy_accepts_guarded_expression(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """A CEL policy that evaluates on every event type is stored."""
+    expression = (
+        'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+        ' ? {"result": "DENY"} : null'
+    )
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies",
+        json=_policy_payload(
+            name="guarded_cel",
+            type="python",
+            handler="omnigent.policies.builtins.cel.cel_policy",
+            factory_params={"expression": expression},
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["factory_params"] == {"expression": expression}
+
+
 # ── GET /sessions/{session_id}/policies ───────────────────────────────
 
 

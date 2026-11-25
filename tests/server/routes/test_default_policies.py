@@ -167,6 +167,24 @@ async def test_create_policy_unregistered_python_handler(policy_client: httpx.As
     assert resp.status_code == 400
 
 
+async def test_create_cel_policy_rejects_expression_failing_on_a_phase(
+    policy_client: httpx.AsyncClient,
+) -> None:
+    """A default CEL policy that cannot evaluate on some event type is rejected."""
+    resp = await policy_client.post(
+        "/v1/policies",
+        json=_policy_payload(
+            name="unguarded_cel",
+            handler="omnigent.policies.builtins.cel.cel_policy",
+            factory_params={
+                "expression": 'event.data.name == "sys_os_shell" ? {"result": "DENY"} : null'
+            },
+        ),
+    )
+    assert resp.status_code == 400
+    assert "fails to evaluate on request events" in resp.json()["error"]["message"]
+
+
 # ── GET /v1/policies ─────────────────────────────────────────────────
 
 
