@@ -3,7 +3,8 @@ import { SearchQuery, openSearchPanel, search, setSearchQuery } from "@codemirro
 import { EditorSelection, EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
-import { FindMatchIndex, findStatusLabel, stepToMatch } from "./codeMirrorFind";
+import { DEFAULT_FIND_OPTIONS } from "@/components/FindBar";
+import { applyFindQuery, FindMatchIndex, findStatusLabel, stepToMatch } from "./codeMirrorFind";
 import { FindReplacer } from "./codeMirrorReplace";
 import { type FindScheduler, inlineMatchSource } from "./findMatchSource";
 import {
@@ -74,11 +75,20 @@ describe("findScope", () => {
     view.dispatch({ selection: { anchor: 0, head: 5 }, userEvent: "select.search" });
     expect(findScopeCandidate(view.state)).toEqual([LINE_2]);
     // A query's jump to the top keeps it; a click that collapses the selection lets it go.
-    view.dispatch({ selection: { anchor: 0 } });
+    expect(applyFindQuery(view, "three", DEFAULT_FIND_OPTIONS)).toBe(true);
+    expect(view.state.selection.main.head).toBe(0);
     expect(findScopeCandidate(view.state)).toEqual([LINE_2]);
     view.dispatch({ selection: { anchor: 3 }, userEvent: "select.pointer" });
     expect(findScopeCandidate(view.state)).toBeNull();
     expect(toggleFindInSelection(view, true)).toBe(false);
+  });
+
+  it("lets go of the reader's selection when the editor moves the cursor away itself", () => {
+    const view = editor();
+    view.dispatch({ selection: { anchor: LINE_2.from, head: LINE_2.to }, userEvent: "select" });
+    // Such as jumping to a comment, which names no user event.
+    view.dispatch({ selection: { anchor: LINE_3.from } });
+    expect(findScopeCandidate(view.state)).toBeNull();
   });
 
   it("keeps every range of a multiple selection", () => {

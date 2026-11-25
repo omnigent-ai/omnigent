@@ -76,8 +76,8 @@ function nextCandidate(
   if (!transaction.selection || transaction.isUserEvent("select.search")) return mapped;
   const chosen = nonEmptyRanges(transaction.selection);
   if (chosen) return chosen;
-  // A click or arrow key that collapses the selection lets it go; find's own moves don't.
-  return transaction.isUserEvent("select") ? null : mapped;
+  // Any other collapse lets it go, except a replacement's, which keeps find's place.
+  return transaction.isUserEvent("input.replace") ? mapped : null;
 }
 
 const findScopeField = StateField.define<FindScopeState>({

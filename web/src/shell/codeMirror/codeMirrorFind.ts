@@ -51,7 +51,7 @@ export function applyFindQuery(view: EditorView, search: string, options: FindOp
   view.dispatch(
     keepSelection
       ? { effects: setSearchQuery.of(query) }
-      : { effects: setSearchQuery.of(query), selection: { anchor: 0 } },
+      : { effects: setSearchQuery.of(query), selection: { anchor: 0 }, userEvent: "select.search" },
   );
   return query.valid && query.search !== "" && !keepSelection;
 }
