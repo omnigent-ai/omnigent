@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { WORKSPACE_SIDEBAR_BINDINGS } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
@@ -557,5 +560,35 @@ describe("Keyboard shortcuts page metadata", () => {
     // Settings keeps its own chord in a browser and shows the menu's ⌘, in the desktop app.
     expect(shortcutRowKeys("settings.open", menu, page)).toEqual(["⌘", ","]);
     expect(shortcutRowKeys("settings.open", resolved(mac), page)).toEqual(["⌘", "⌥", ","]);
+  });
+});
+
+describe("binding handlers", () => {
+  const sourceRoot = resolve(__dirname, "../..");
+
+  it("names a module in this tree for every app and widget handler", () => {
+    const missing = SHORTCUT_BINDINGS.flatMap((binding) =>
+      binding.handler.scope === "app" || binding.handler.scope === "widget"
+        ? existsSync(resolve(sourceRoot, binding.handler.module))
+          ? []
+          : [`${binding.id}: ${binding.handler.module}`]
+        : [],
+    );
+    expect(missing).toEqual([]);
+  });
+
+  it("leaves the Session menu's pin, archive and fork to the desktop menu", () => {
+    expect(shortcutBinding("session.pin").handler).toEqual({
+      scope: "menu",
+      command: "toggle-pin-session",
+    });
+    expect(shortcutBinding("session.archive").handler).toEqual({
+      scope: "menu",
+      command: "archive-session",
+    });
+    expect(shortcutBinding("session.fork").handler).toEqual({
+      scope: "menu",
+      command: "fork-session",
+    });
   });
 });

@@ -242,6 +242,22 @@ const SIDEBAR_BINDINGS = {
   },
   "file.foldAll": { group: "files", label: "Fold all", chords: () => [] },
   "file.unfoldAll": { group: "files", label: "Unfold all", chords: () => [] },
+  "pullRequests.removeSelected": {
+    label: "Remove selected pull requests",
+    group: "general",
+    chords: () => [mod({ eitherCommandKey: true, key: "Backspace" })],
+  },
+  // Down and up a PR's stack on its page, as on github.com; text and menus keep the keys.
+  "pullRequestStack.next": {
+    label: "Next in stack",
+    group: "navigation",
+    chords: () => [{ shift: true, code: "KeyJ" }],
+  },
+  "pullRequestStack.previous": {
+    label: "Previous in stack",
+    group: "navigation",
+    chords: () => [{ shift: true, code: "KeyK" }],
+  },
   // A row that opens a place (a changed file, a commit or a pull request) opens it in a new tab.
   "rows.openInNewTab": {
     group: "workspace",
