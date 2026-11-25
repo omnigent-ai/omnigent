@@ -187,8 +187,8 @@ def test_split_move_between_list_and_close_panes_in_the_terminal_view(
     expect(shell).to_be_focused()
     shell_strip = panes.get_by_role("toolbar", name=re.compile(r"^zsh · .* pane$"))
     shell_strip.click(button="right")
+    # The shell is idle at its prompt, so Close Pane ends it without asking.
     page.get_by_role("menuitem", name="Close Pane").click()
-    page.get_by_role("button", name="Close shell").click()
     expect(panes.get_by_test_id("terminal-view")).to_have_count(1, timeout=30_000)
     expect(panes.locator(_AGENT_PANE)).to_be_visible()
 
@@ -275,8 +275,8 @@ def test_a_tabs_sidebar_shell_splits_keeps_both_shells_through_a_reload_and_clos
             "data-state", "connected", timeout=60_000
         )
 
+    # Both shells are idle at their prompts, so the split closes without asking.
     sidebar.get_by_role("button", name=re.compile(r"^Close zsh · .* \+1$")).click()
-    page.get_by_role("button", name="Close shells").click()
     expect(sidebar.get_by_test_id("terminal-view")).to_have_count(0, timeout=30_000)
     expect(sidebar.get_by_role("tab", name=re.compile(r"^zsh · "))).to_have_count(0)
 

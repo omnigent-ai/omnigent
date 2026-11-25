@@ -166,12 +166,11 @@ def test_right_panel_terminals_and_file_viewer(
         expect(
             page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
         ).to_have_count(0)
-        # Closing the tab kills the terminal, so its "x" confirms first; after
-        # confirming the xterm unmounts. It was the last open tab, so the rail
-        # hides; reopen it for the Files steps below.
+        # Closing the tab kills the terminal; the shell sits idle at its prompt,
+        # so its "x" closes it without asking and the xterm unmounts. It was the
+        # last open tab, so the rail hides; reopen it for the Files steps below.
         rail.get_by_role("button", name="Close zsh · main", exact=True).click()
-        page.get_by_role("button", name="Close shell").click()
-        expect(terminal_view).to_have_count(0)
+        expect(terminal_view).to_have_count(0, timeout=30_000)
         # The tab leaves, and the rail hides, once the kill returns; wait for that
         # before reopening it.
         expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=30_000)
