@@ -929,6 +929,7 @@ describe("CodeMirrorComposerInput reply cards", () => {
       <CodeMirrorComposerInput
         aria-label="Message the agent"
         value={removedMiddle}
+        replyQuotes
         ref={setTarget}
       />,
     );
@@ -936,7 +937,12 @@ describe("CodeMirrorComposerInput reply cards", () => {
 
     const swapped = `A\n${card("Four", "four")}\nB`;
     rerender(
-      <CodeMirrorComposerInput aria-label="Message the agent" value={swapped} ref={setTarget} />,
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={swapped}
+        replyQuotes
+        ref={setTarget}
+      />,
     );
     expect(target().value).toBe(swapped);
   });
@@ -985,7 +991,7 @@ describe("CodeMirrorComposerInput reply cards", () => {
       return (
         <CodeMirrorComposerInput
           aria-label="Message the agent"
-          value={replyDraft.value}
+          value={replyDraft.replyDocument}
           replyQuotes
           ref={() => {}}
           onChange={(event) => replyDraft.setEditorDocument(event.currentTarget.value)}

@@ -33,6 +33,8 @@ describe("useReplyDraft in single-document mode", () => {
     expect(result.current.draft.quotes).toEqual([{ id: "kept", before: "Head", text: "Kept" }]);
     expect(result.current.draft.text).toBe("Tail");
     expect(result.current.replyDocument).toBe(`Head\n${card}\nTail`);
+    // In one document, `value` is the tail that writes address; the whole document is replyDocument.
+    expect(result.current.value).toBe("Tail");
   });
 
   it("keeps a card when text is appended to a document that ends on one", () => {

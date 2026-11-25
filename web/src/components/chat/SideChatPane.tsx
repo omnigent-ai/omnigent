@@ -1433,7 +1433,7 @@ function SideChatComposer({
       : null;
   const outgoingText = isSlashCommandText(text) ? text.trim() : text.trimEnd();
   const highlight = useComposerHighlight({
-    value: text,
+    value: editorText,
     commandNames: menuCommandNames,
     enabled: quotes.length === 0 && files.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
@@ -1843,6 +1843,8 @@ function SideChatComposer({
                   voiceEditsRef.current.clear();
                   for (const [id, edit] of edits) {
                     const target = singleDocument ? editorSurface() : undefined;
+                    // Without the editor there is nothing to revert in one document.
+                    if (singleDocument && !target) continue;
                     if (target) {
                       // Only the dictated text goes, so a quote added during the take stays.
                       const revert = dictationRevertEdit(target.value, edit.before, edit.after);

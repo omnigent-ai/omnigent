@@ -2482,10 +2482,9 @@ function ComposerImpl(
     },
     [focusText],
   );
-  // Declared after textareaRef so dictation can place the caret after the
-  // text it inserts (and insert at the caret rather than the draft's end).
-  // Writes the text the caret-relative helpers compute. In one document that is the editor's own
-  // edit, so a card it spans is kept; in the textarea it is the active input.
+  // The whole composer text, which the editor shows; `value` is the tail in one document.
+  const composerValue = renderedEngine === "codemirror" ? replyDocument : value;
+  // Caret-relative writes go through the editor in one document, so its cards stay whole.
   const writeDocument = (next: string) => {
     if (renderedEngine !== "codemirror") setValue(next);
     else if (textareaRef.current) replaceComposerDocument(textareaRef.current, next);
@@ -2496,7 +2495,8 @@ function ComposerImpl(
     writeDocument(next);
     voiceAfterRef.current = textareaRef.current?.value ?? next;
   };
-  const dictation = useDictationInsert(value, writeDictation, textareaRef);
+  // Declared after textareaRef so dictation inserts at the caret.
+  const dictation = useDictationInsert(composerValue, writeDictation, textareaRef);
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3204,7 +3204,7 @@ function ComposerImpl(
     setMention,
     mentionEntries,
     sessionEntries,
-    text: value,
+    text: composerValue,
     setText: (next) => {
       writeDocument(next);
       dirtyRef.current = true;
@@ -3252,7 +3252,7 @@ function ComposerImpl(
     [draft, fullText, liveMentions, localReviewComments],
   );
   const highlight = useComposerHighlight({
-    value,
+    value: composerValue,
     commandNames: slashCommandNames,
     // With context the text goes out as typed, so only exact-case commands run.
     anyCaseCommandNames: carriesMessageContext(draft, attachedFiles, sendContext)
@@ -3791,7 +3791,7 @@ function ComposerImpl(
 
   // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
-    text: value,
+    text: composerValue,
     commands: slashCompletionCommands,
     skills: skillCommands,
     builtinNames: goalBuiltinNames,
@@ -4879,15 +4879,16 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
-                  voiceSnapshotRef.current = value;
-                  voiceAfterRef.current = value;
+                  voiceSnapshotRef.current = composerValue;
+                  voiceAfterRef.current = composerValue;
                 }}
                 onVoiceDiscard={() => {
-                  const target = textareaRef.current;
-                  if (renderedEngine !== "codemirror" || !target) {
+                  if (renderedEngine !== "codemirror") {
                     setValue(voiceSnapshotRef.current);
                     return;
                   }
+                  const target = textareaRef.current;
+                  if (!target) return;
                   // Only the dictated text goes, so a quote added during the take stays.
                   const edit = dictationRevertEdit(
                     target.value,

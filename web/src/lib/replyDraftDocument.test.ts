@@ -161,6 +161,17 @@ describe("reply draft document", () => {
       to: 20,
       insert: "",
     });
+    // A dictation that only deleted text puts the deleted text back where it was.
+    expect(dictationRevertEdit("Hello", "Hello world", "Hello")).toEqual({
+      from: 5,
+      to: 5,
+      insert: " world",
+    });
+    expect(dictationRevertEdit("Hi", "Hello world", "Hello")).toEqual({
+      from: 2,
+      to: 2,
+      insert: " world",
+    });
     // Once the dictated text is gone, there is nothing to revert.
     expect(dictationRevertEdit("Hello", before, after)).toBeNull();
     expect(dictationRevertEdit("anything", before, before)).toEqual({ from: 0, to: 0, insert: "" });

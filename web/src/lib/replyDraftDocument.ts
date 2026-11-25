@@ -250,8 +250,12 @@ export function minimalTextChange(before: string, after: string): TextEdit | nul
   };
 }
 
-/** The occurrence of `needle` in `text` that starts nearest `near`, or -1 when there is none. */
+/**
+ * The occurrence of `needle` in `text` that starts nearest `near`, or -1 when there is none. An
+ * empty needle sits at `near`; searching for it would never run out of occurrences.
+ */
 function nearestOccurrence(text: string, needle: string, near: number): number {
+  if (needle === "") return Math.min(near, text.length);
   let best = -1;
   for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
     if (best === -1 || Math.abs(at - near) < Math.abs(best - near)) best = at;

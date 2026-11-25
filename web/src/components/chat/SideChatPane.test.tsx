@@ -3904,6 +3904,28 @@ describe("side-chat reply in one editor", () => {
     expect(pendingSeed()).toBe("Seed passage");
   });
 
+  it("streams interim updates and a final transcript in full, with a quote present", async () => {
+    await renderEditor();
+    act(() => {
+      useChatStore.getState().updateSideChatComposer(seeded, (current) => ({
+        ...current,
+        ...appendReplyQuote(current, "Reply quote"),
+      }));
+    });
+    const end = editorText().length;
+    typeAt(end, end, "Draft ");
+    act(() => mic.current!.onVoiceStart!());
+    // A recognizer revises its partials, so they grow, shrink and clear before the final.
+    for (const partial of ["", "server", "", "server dictation", "server", ""]) {
+      act(() => mic.current!.onInterim!(partial));
+    }
+    act(() => mic.current!.onInterim!("server dictation smoke"));
+    act(() => mic.current!.onTranscript!("server dictation smoke test transcript"));
+    expect(storeText()).toBe("Draft server dictation smoke test transcript");
+    expect(editorText().endsWith("Draft server dictation smoke test transcript")).toBe(true);
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+  });
+
   it("discards only the dictated text, and keeps a quote added during the take", async () => {
     await renderEditor();
     const end = editorText().length;

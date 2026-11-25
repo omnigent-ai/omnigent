@@ -31,8 +31,8 @@ function stateOfDocument(document: string): ReplyDraftState {
 
 /**
  * The reply draft. With `singleDocument`, the CodeMirror composer shows the whole draft as one
- * document, and every text write here addresses the tail: the text after the last card. A write
- * never removes or moves a card; the document's cards and the text before them stay as they are.
+ * document. `value` is its tail, the text after the last card, and every text write addresses that
+ * tail. A write never removes or moves a card.
  */
 export function useReplyDraft(singleDocument = false) {
   const [{ draft, typed }, setState] = useState<ReplyDraftState>({
@@ -43,8 +43,10 @@ export function useReplyDraft(singleDocument = false) {
   const replyDocument = useMemo(() => typedDocumentFor(draft, typed), [draft, typed]);
   // Single-document mode has no quote inputs, so no quote is ever the active one.
   const activeTextId = singleDocument ? null : focusedId;
+  // `value` is the text the writes below address: the tail in one document, else the active input.
+  // The whole document is `replyDocument`.
   const value = singleDocument
-    ? replyDocument
+    ? tailOf(replyDocument)
     : (draft.quotes.find((quote) => quote.id === activeTextId)?.before ?? draft.text);
 
   const editText = useCallback(
