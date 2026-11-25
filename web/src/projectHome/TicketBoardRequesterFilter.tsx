@@ -94,7 +94,7 @@ function RequesterFilterChips({
   const viewerId = useViewerId();
   const chip = (selected: boolean) =>
     cn(
-      "inline-flex h-7 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium ring-1 transition-colors ring-inset focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+      "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium whitespace-nowrap ring-1 transition-colors ring-inset focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
       selected
         ? "bg-brand-accent/10 text-brand-accent ring-brand-accent/35"
         : "text-muted-foreground ring-border hover:bg-accent hover:text-foreground",

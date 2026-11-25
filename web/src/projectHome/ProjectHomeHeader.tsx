@@ -142,10 +142,9 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const settingsLabel = rulesPage ? "Project rules and settings" : "Project settings";
   // Members other than the owner and product approvers only read the mandate.
   const viewerId = useViewerId();
-  const mandateReadOnly = !canEditMandate(
-    useProjectMandate(projectId, mandateEnabled).data,
-    viewerId,
-  );
+  const mandate = useProjectMandate(projectId, mandateEnabled).data;
+  const mandateReadOnly = !canEditMandate(mandate, viewerId);
+  const pendingProposals = mandateEnabled ? (mandate?.mandate_proposals?.length ?? 0) : 0;
   const { actions, dialogs } = useProjectFolderMenu(
     projectName,
     projectId,
@@ -158,7 +157,8 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   return (
     <div className={isMobile ? "contents" : "flex shrink-0 items-center gap-0.5"}>
-      {mandateEnabled && (
+      {/* Phones keep these in the menu below: eight header buttons don't fit beside the sidebar button. */}
+      {mandateEnabled && !isMobile && (
         <MandateProposalsButton
           projectId={projectId}
           className={buttonClass}
@@ -166,24 +166,26 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
           onOpen={() => setEditingMandate(true)}
         />
       )}
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <MobileHeaderButton
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label={settingsLabel}
-            data-testid="project-home-settings"
-            className={buttonClass}
-            onClick={
-              rulesPage ? () => navigate(projectRulesPath(projectName)) : actions.openSettings
-            }
-          >
-            <Settings2Icon className={iconClass} />
-          </MobileHeaderButton>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">{settingsLabel}</TooltipContent>
-      </Tooltip>
+      {!isMobile && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <MobileHeaderButton
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label={settingsLabel}
+              data-testid="project-home-settings"
+              className={buttonClass}
+              onClick={
+                rulesPage ? () => navigate(projectRulesPath(projectName)) : actions.openSettings
+              }
+            >
+              <Settings2Icon className={iconClass} />
+            </MobileHeaderButton>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">{settingsLabel}</TooltipContent>
+        </Tooltip>
+      )}
       {/* Non-modal on phones, as in the session header: a modal menu leaves itself the only touch target. */}
       <DropdownMenu
         modal={!isMobile}
@@ -201,9 +203,16 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             size="icon-sm"
             aria-label={`Project actions for ${projectName}`}
             data-testid="project-home-actions"
-            className={buttonClass}
+            className={cn(buttonClass, "relative")}
           >
             <MoreHorizontalIcon className={iconClass} />
+            {isMobile && pendingProposals > 0 && (
+              <span
+                aria-hidden
+                data-testid="project-actions-proposals-dot"
+                className="absolute top-2 right-2 size-2 rounded-full bg-brand-accent"
+              />
+            )}
           </MobileHeaderButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -220,6 +229,30 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
           }}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
+          {isMobile && pendingProposals > 0 && (
+            <DropdownMenuItem
+              className={itemClass}
+              data-testid="project-mandate-proposals-item"
+              onSelect={() => setEditingMandate(true)}
+            >
+              <ScrollTextIcon className="size-3.5" />
+              Review {pendingProposals} proposed mandate{" "}
+              {pendingProposals === 1 ? "addition" : "additions"}
+            </DropdownMenuItem>
+          )}
+          {isMobile && (
+            <DropdownMenuItem
+              className={itemClass}
+              data-testid="project-home-settings"
+              onSelect={
+                rulesPage ? () => navigate(projectRulesPath(projectName)) : actions.openSettings
+              }
+            >
+              <Settings2Icon className="size-3.5" />
+              {settingsLabel}
+            </DropdownMenuItem>
+          )}
+          {isMobile && <DropdownMenuSeparator />}
           {stagesEnabled && (
             <DropdownMenuItem className={itemClass} onSelect={() => setEditingStages(true)}>
               <Columns3Icon className="size-3.5" />

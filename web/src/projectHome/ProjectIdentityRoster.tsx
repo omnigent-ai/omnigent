@@ -122,8 +122,9 @@ export function ProjectIdentityRoster({
   // Overlapping avatars; a ring in the page color separates neighbours.
   const avatarButton =
     "relative size-7 rounded-full p-0 ring-2 ring-background hover:z-10 hover:bg-transparent focus-visible:z-10";
+  // Bottom-left: each avatar paints over its left neighbour, so a right-side mark would be hidden.
   const busyMark = (
-    <RunningDot className="absolute -right-0.5 -bottom-0.5 size-3 rounded-full bg-background p-px" />
+    <RunningDot className="absolute -bottom-0.5 -left-0.5 size-3 rounded-full bg-background p-px" />
   );
   return (
     <div
@@ -132,7 +133,7 @@ export function ProjectIdentityRoster({
       aria-label="Team members"
       data-testid="project-identity-roster"
     >
-      <div className="flex items-center -space-x-1.5">
+      <div className="flex items-center -space-x-1">
         {leadPath !== undefined && (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -144,7 +145,10 @@ export function ProjectIdentityRoster({
               </Button>
             </TooltipTrigger>
             <TooltipContent side="bottom">
-              <span className="font-medium">{leadName ?? "Lead"}</span>: coordinates the board
+              {/* One text node: the tooltip is a flex row that would split each part into a column. */}
+              <span>
+                <span className="font-medium">{leadName ?? "Lead"}</span>: coordinates the board
+              </span>
             </TooltipContent>
           </Tooltip>
         )}
@@ -168,14 +172,16 @@ export function ProjectIdentityRoster({
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom">
-                <span className="font-medium">{identity.name}</span>
-                {": "}
-                {busy
-                  ? `${identity.name} is working; open its session`
-                  : identity.active_session_id
-                    ? `Open ${identity.name}'s session`
-                    : `Start a session with ${identity.name}`}
-                {identity.router && ". It receives ticket events and escalations."}
+                <span>
+                  <span className="font-medium">{identity.name}</span>
+                  {": "}
+                  {busy
+                    ? "working; open its session"
+                    : identity.active_session_id
+                      ? "open its session"
+                      : "start a session"}
+                  {identity.router && ". It receives ticket events and escalations."}
+                </span>
               </TooltipContent>
             </Tooltip>
           );

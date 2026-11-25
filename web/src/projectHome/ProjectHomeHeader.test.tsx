@@ -355,7 +355,7 @@ describe("ProjectHomeTitle", () => {
     expect(screen.getByRole("dialog", { name: "Payments mandate" })).toBeInTheDocument();
   });
 
-  it("hides the title and moves the project actions beside New session on phones", () => {
+  it("hides the title and keeps phone header actions to New session and one menu", () => {
     mocks.isMobile = true;
     render(
       <MemoryRouter initialEntries={["/projects/Payments"]}>
@@ -374,7 +374,13 @@ describe("ProjectHomeTitle", () => {
     const actions = screen.getByRole("navigation", { name: "Header actions" });
     expect(
       [...actions.querySelectorAll("button")].map((button) => button.getAttribute("aria-label")),
-    ).toEqual(["New session", "Project settings", "Project actions for Payments"]);
+    ).toEqual(["New session", "Project actions for Payments"]);
+    // Settings moves into the menu so the phone header's buttons fit beside the sidebar button.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Payments" }), {
+      button: 0,
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Project settings" }));
+    expect(mocks.actions.openSettings).toHaveBeenCalledOnce();
   });
 });
 

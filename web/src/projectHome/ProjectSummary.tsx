@@ -222,7 +222,7 @@ function HeadlineNumbers({
             : () => onDrill({ label: "Spent", metric: "spend_usd", range })
         }
       />
-      <StatTile label="Team" value={teamCount(summary.members)} />
+      <StatTile label="Team" value={<TeamValue members={summary.members} />} />
       <StatTile
         label="Tickets done"
         value={String(totals.tickets_done)}
@@ -232,13 +232,48 @@ function HeadlineNumbers({
   );
 }
 
-/** "2 people · 10 roles": the Lead and named roles count as roles; the agents pool doesn't. */
-export function teamCount(members: readonly ProjectStatusMember[]): string {
+/** People and team members (the Lead and named roles; the agents pool doesn't count). */
+function teamParts(members: readonly ProjectStatusMember[]) {
   const people = members.filter((member) => member.kind === "human").length;
   const roles = members.filter((member) => member.kind === "identity").length;
-  const plural = (count: number, one: string, many: string) =>
-    `${count} ${count === 1 ? one : many}`;
-  return `${plural(people, "person", "people")} · ${plural(roles, "team member", "team members")}`;
+  return [
+    { count: people, noun: people === 1 ? "person" : "people", narrowDrops: "" },
+    { count: roles, noun: roles === 1 ? "team member" : "team members", narrowDrops: "team " },
+  ];
+}
+
+/** "2 people · 10 team members". */
+export function teamCount(members: readonly ProjectStatusMember[]): string {
+  return teamParts(members)
+    .map((part) => `${part.count} ${part.noun}`)
+    .join(" · ");
+}
+
+/** The team tile's value: big numbers, small words, on one line in a quarter-width tile. */
+function TeamValue({ members }: { members: readonly ProjectStatusMember[] }) {
+  const words = "text-sm font-medium text-muted-foreground";
+  return (
+    <span className="whitespace-nowrap">
+      {teamParts(members).map((part, index) => (
+        <span key={part.noun}>
+          {index > 0 && <span className={words}> · </span>}
+          {part.count}
+          <span className={words}>
+            {" "}
+            {part.narrowDrops ? (
+              <>
+                {/* Read in full, shown only when the tile has room for it. */}
+                <span className="@max-[16rem]/tile:sr-only">{part.narrowDrops}</span>
+                {part.noun.slice(part.narrowDrops.length)}
+              </>
+            ) : (
+              part.noun
+            )}
+          </span>
+        </span>
+      ))}
+    </span>
+  );
 }
 
 function StatTile({
@@ -248,19 +283,19 @@ function StatTile({
   onOpen,
 }: {
   label: string;
-  value: string;
+  value: ReactNode;
   note?: string;
   onOpen?: () => void;
 }) {
   return (
-    <div className="rounded-lg border border-border/60 p-3">
+    <div className="@container/tile rounded-lg border border-border/60 p-3">
       <dt className="text-sm text-muted-foreground">{label}</dt>
       <dd className="mt-1 text-2xl font-semibold tabular-nums">
         {onOpen ? (
           <button
             type="button"
             className="rounded-sm underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-            aria-label={`${label}: ${value}. Show the items behind it`}
+            aria-label={`${label}${typeof value === "string" ? `: ${value}` : ""}. Show the items behind it`}
             onClick={onOpen}
           >
             {value}
@@ -461,11 +496,16 @@ export function ProjectHomeTabs({
     <div
       className={cn(
         // Named like the top bar so tools moved here collapse at the same widths.
-        "@container/topbar mx-4 mb-3 flex shrink-0 items-center gap-3 border-b border-border/70 pb-2.5",
+        // One line at any width: on phones it scrolls sideways instead of wrapping labels.
+        "@container/topbar mx-4 mb-3 flex shrink-0 items-center gap-3 overflow-x-auto border-b border-border/70 pt-0.5 pb-2.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
         className,
       )}
     >
-      <div role="tablist" aria-label="Project views" className="flex rounded-[9px] bg-muted p-0.5">
+      <div
+        role="tablist"
+        aria-label="Project views"
+        className="flex shrink-0 rounded-[9px] bg-muted p-0.5"
+      >
         {(
           [
             { id: "board", label: "Board", Icon: SquareKanbanIcon },
@@ -481,14 +521,15 @@ export function ProjectHomeTabs({
               role="tab"
               aria-selected={selected}
               className={cn(
-                "inline-flex h-7 items-center gap-1.5 rounded-[7px] px-2.5 text-[13px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                "inline-flex h-7 items-center gap-1.5 rounded-[7px] px-2.5 text-[13px] font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
                 selected
                   ? "bg-background text-foreground shadow-xs dark:bg-white/12"
                   : "text-muted-foreground hover:text-foreground",
               )}
               onClick={() => onChange(id)}
             >
-              <Icon aria-hidden className="size-3.5" />
+              {/* Phones drop the icons so the whole toolbar fits on one line. */}
+              <Icon aria-hidden className="size-3.5 max-sm:hidden" />
               <span className="text-optical">{label}</span>
             </button>
           );
@@ -496,8 +537,8 @@ export function ProjectHomeTabs({
       </div>
       {trailing && (
         <>
-          <span aria-hidden className="h-4 w-px bg-border" />
-          <div className="flex items-center">{trailing}</div>
+          <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
+          <div className="flex shrink-0 items-center">{trailing}</div>
         </>
       )}
       {end && <div className="ml-auto flex min-w-0 items-center gap-1">{end}</div>}
