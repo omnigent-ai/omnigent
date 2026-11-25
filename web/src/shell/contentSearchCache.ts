@@ -16,19 +16,24 @@ export const contentSearchResultKey = (sessionId: string) =>
 export const contentSearchHandOffKey = (sessionId: string) =>
   ["content-search-hand-off", sessionId] as const;
 
-/** Gives `sessionId`'s Search page this search, and its answer when there is one. */
-export function handSearchToSearchPage(
+/**
+ * Gives `sessionId`'s Search page this search, and its answer when there is one. A search the
+ * page still runs is cancelled first, so its late answer can't replace the handed one; with no
+ * answer handed over, the page's older one goes rather than showing under the new query.
+ */
+export async function handSearchToSearchPage(
   queryClient: QueryClient,
   sessionId: string,
   input: ContentSearchInput,
   result: ContentSearchResult | undefined,
-): void {
+): Promise<void> {
+  const resultKey = contentSearchResultKey(sessionId);
+  await queryClient.cancelQueries({ queryKey: resultKey, exact: true });
   queryClient.setQueryData(contentSearchInputKey(sessionId), { ...input });
-  queryClient.setQueryData(contentSearchHandOffKey(sessionId), { ...input });
   if (result) {
-    queryClient.setQueryData<ContentSearchAnswer>(contentSearchResultKey(sessionId), {
-      ...result,
-      query: input.query,
-    });
+    queryClient.setQueryData<ContentSearchAnswer>(resultKey, { ...result, query: input.query });
+  } else {
+    await queryClient.resetQueries({ queryKey: resultKey, exact: true });
   }
+  queryClient.setQueryData(contentSearchHandOffKey(sessionId), { ...input });
 }

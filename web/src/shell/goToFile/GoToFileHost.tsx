@@ -115,7 +115,8 @@ export function GoToFileHost({
       openFile={openFile}
       openInSearch={(input, result) => {
         if (!sessionId) return;
-        handSearchToSearchPage(queryClient, sessionId, input, result);
+        // The page shows at once; the search lands once any search it still runs is cancelled.
+        void handSearchToSearchPage(queryClient, sessionId, input, result);
         requestTextSearchFocus(sessionId);
         showTextSearch();
       }}

@@ -353,7 +353,7 @@ it("shows a search handed over from Go to File, whether or not the page already 
     warning: null,
   };
   // Handed over before the page shows: it opens on that search and its lines.
-  handSearchToSearchPage(client, "session-one", handed, found);
+  await handSearchToSearchPage(client, "session-one", handed, found);
   render(
     <QueryClientProvider client={client}>
       <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
@@ -368,7 +368,7 @@ it("shows a search handed over from Go to File, whether or not the page already 
 
   // Handed over while it shows: it takes the new search in place of what was typed.
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "typed here" } });
-  act(() =>
+  await act(() =>
     handSearchToSearchPage(
       client,
       "session-one",
@@ -398,7 +398,7 @@ it("takes the keyboard when a text search asks this session's page for it", () =
   expect(screen.getByRole("searchbox")).toHaveFocus();
 });
 
-it("keeps remembered filters folded when nothing was handed over, as with the flag off", () => {
+it("keeps remembered filters folded when nothing was handed over", () => {
   const client = new QueryClient();
   client.setQueryData(contentSearchInputKey("session-one"), {
     ...EMPTY_CONTENT_SEARCH,
@@ -412,5 +412,89 @@ it("keeps remembered filters folded when nothing was handed over, as with the fl
   );
   expect(screen.getByRole("searchbox")).toHaveValue("needle");
   expect(screen.getByLabelText("Include")).not.toBeVisible();
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+});
+
+it("keeps a handed search over the page's own search that answers later", async () => {
+  const { handSearchToSearchPage } = await import("./contentSearchCache");
+  let answerOwnSearch: (response: Response) => void = () => {};
+  vi.mocked(authenticatedFetch).mockImplementation(
+    () =>
+      new Promise<Response>((resolve) => {
+        answerOwnSearch = resolve;
+      }),
+  );
+  const client = new QueryClient();
+  render(
+    <QueryClientProvider client={client}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  const field = screen.getByRole("searchbox");
+  fireEvent.change(field, { target: { value: "old" } });
+  fireEvent.submit(field.closest("form")!);
+  await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+
+  // Go to File hands its search over while the page's own one still runs.
+  const handedMatch = { path: "src/new.ts", line: 2, column: 1, text: "new", match_start: 0 };
+  await act(() =>
+    handSearchToSearchPage(
+      client,
+      "session-one",
+      { ...EMPTY_CONTENT_SEARCH, query: "new" },
+      { matches: [{ ...handedMatch, match_end: 3 }], truncated: false, warning: null },
+    ),
+  );
+  await waitFor(() => expect(field).toHaveValue("new"));
+  await act(async () => {
+    answerOwnSearch(
+      new Response(
+        JSON.stringify({
+          matches: [{ ...handedMatch, path: "src/old.ts", text: "old", match_end: 3 }],
+          truncated: false,
+          warning: null,
+        }),
+      ),
+    );
+  });
+  // Let the late answer settle wherever it would land.
+  await act(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      }),
+  );
+  expect(field).toHaveValue("new");
+  expect(screen.getByRole("button", { name: "Open src/new.ts at line 2" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Open src/old.ts at line 2" })).toBeNull();
+});
+
+it("clears the page's older answer when a search is handed over without one", async () => {
+  const { handSearchToSearchPage } = await import("./contentSearchCache");
+  const client = new QueryClient();
+  const older = { path: "src/old.ts", line: 5, column: 1, text: "old", match_start: 0 };
+  await handSearchToSearchPage(
+    client,
+    "session-one",
+    { ...EMPTY_CONTENT_SEARCH, query: "old" },
+    { matches: [{ ...older, match_end: 3 }], truncated: false, warning: null },
+  );
+  render(
+    <QueryClientProvider client={client}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("button", { name: "Open src/old.ts at line 5" })).toBeInTheDocument();
+  // Go to File's own search hadn't answered yet, so only the query comes over.
+  await act(() =>
+    handSearchToSearchPage(
+      client,
+      "session-one",
+      { ...EMPTY_CONTENT_SEARCH, query: "new" },
+      undefined,
+    ),
+  );
+  await waitFor(() => expect(screen.getByRole("searchbox")).toHaveValue("new"));
+  expect(screen.queryByRole("button", { name: "Open src/old.ts at line 5" })).toBeNull();
   expect(authenticatedFetch).not.toHaveBeenCalled();
 });
