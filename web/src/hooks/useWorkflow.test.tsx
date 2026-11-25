@@ -165,6 +165,37 @@ describe("useSaveWorkflowPlan", () => {
     expect(bodies).toEqual([{ ...proposal, expected_steps: steps }, { steps }]);
   });
 
+  it("redoes a refused save over a time limit saved since its read", async () => {
+    const steps = [{ id: "review", name: "Review", goal: "Read it.", depends_on: [] }];
+    const limited = [{ ...steps[0]!, goal: "Read it.\n\n**Time limit:** 2 hours" }];
+    const first = { id: "workflow", name: "Review", description: "Review changes.", steps };
+    const newer = { ...first, steps: limited };
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(Response.json(first))
+      .mockResolvedValueOnce(
+        Response.json({ error: { code: "conflict", message: "changed" } }, { status: 409 }),
+      )
+      .mockResolvedValueOnce(Response.json(newer))
+      .mockResolvedValueOnce(Response.json(newer));
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveWorkflowPlan("workflow"), { wrapper });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync({ steps })).resolves.toEqual(newer);
+    });
+    // The redo names the newer steps and keeps the limit saved in them.
+    const bodies = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(bodies).toEqual([
+      { steps, expected_steps: steps },
+      { steps: limited, expected_steps: limited },
+    ]);
+  });
+
   it("keeps the description, without the steps check, for a server from before that check", async () => {
     const steps = [{ id: "review", name: "Review", goal: null, depends_on: [] }];
     const saved = { id: "workflow", name: "Review", description: "Review changes.", steps };

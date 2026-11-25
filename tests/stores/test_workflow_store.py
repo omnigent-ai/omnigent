@@ -311,10 +311,14 @@ def test_a_kept_description_time_goes_once_an_older_server_writes_the_descriptio
     reread = store.get(saved.id, user_id=ALICE)
     assert reread is not None and reread.description == "Older words."
     assert reread.description_updated_at == 115
+    # Setting the first description again drops the time kept for it before.
+    restored = store.update(saved.id, user_id=ALICE, description="Run deploy.")
+    assert restored is not None and restored.description_updated_at == 120
+    assert store.get(saved.id, user_id=ALICE) == restored
     # The next write of the steps keeps the time of the description it has now.
     stepped = store.update(saved.id, user_id=ALICE, steps=STEPS)
     assert stepped is not None
-    assert (stepped.updated_at, stepped.description_updated_at) == (120, 115)
+    assert (stepped.updated_at, stepped.description_updated_at) == (130, 120)
     assert store.get(saved.id, user_id=ALICE) == stepped
 
 

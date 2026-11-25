@@ -240,7 +240,7 @@ describe("a step's time limit", () => {
       "true",
     );
     expect(screen.queryAllByRole("menuitem")).toEqual([]);
-    // Picking the limit it has already changes nothing.
+    // Re-picking the checked option is ignored, so a limit worded at more length isn't rewritten.
     onTimeLimitChange.mockClear();
     fireEvent.click(screen.getByRole("menuitemradio", { name: "2 hours" }));
     expect(onTimeLimitChange).not.toHaveBeenCalled();

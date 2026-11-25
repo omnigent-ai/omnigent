@@ -64,7 +64,8 @@ interface MarkdownNode {
 const parsedCode = new Map<string, CodeLines>();
 const PARSED_CODE_KEPT = 200;
 
-function codeLines(lines: readonly string[]): CodeLines {
+/** Where *lines* hold code, kept for the next read unless *keep* is false, as for a probe. */
+function codeLines(lines: readonly string[], keep = true): CodeLines {
   const text = lines.join("\n");
   const parsed = parsedCode.get(text);
   if (parsed) return parsed;
@@ -85,6 +86,7 @@ function codeLines(lines: readonly string[]): CodeLines {
   };
   visit(unified().use(remarkParse).parse(text) as MarkdownNode);
   const code = { blocks, spans };
+  if (!keep) return code;
   if (parsedCode.size >= PARSED_CODE_KEPT) parsedCode.delete(parsedCode.keys().next().value!);
   parsedCode.set(text, code);
   return code;
@@ -190,7 +192,7 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       // reads it: then just before that block.
       const tail = lines.length > 0 && lines.at(-1)!.trim() !== "" ? ["", limitLine] : [limitLine];
       const last = lines.length + tail.length - 1;
-      const open = codeLines([...lines, ...tail]).blocks.find(
+      const open = codeLines([...lines, ...tail], false).blocks.find(
         ({ start, end }) => start < lines.length && end === last,
       );
       if (open) {

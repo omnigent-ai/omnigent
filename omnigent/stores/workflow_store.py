@@ -210,13 +210,19 @@ class WorkflowStore:
 
     def _workflows(self, rows: Sequence[SqlWorkflow]) -> list[Workflow]:
         """Decode a page's descriptions and plans in one call."""
+        return [workflow for workflow, _ in self._workflows_and_plans(rows)]
+
+    def _workflows_and_plans(
+        self, rows: Sequence[SqlWorkflow]
+    ) -> list[tuple[Workflow, dict[str, Any]]]:
+        """:meth:`_workflows`, each with its plan as stored."""
         texts = (
             self._decode_texts([value for row in rows for value in (row.description, row.plan)])
             if rows
             else []
         )
         pairs = zip(texts[::2], texts[1::2], strict=True)
-        workflows = []
+        workflows: list[tuple[Workflow, dict[str, Any]]] = []
         for row, (description, plan) in zip(rows, pairs, strict=True):
             saved = json.loads(plan)
             text = description.decode("utf-8") if isinstance(description, bytes) else description
@@ -225,20 +231,19 @@ class WorkflowStore:
             kept = kept_at is not None and saved.get("description_digest") == (
                 _description_digest(text)
             )
-            workflows.append(
-                Workflow(
-                    id=row.id,
-                    user_id=row.user_id,
-                    name=row.name,
-                    description=text,
-                    created_at=row.created_at,
-                    updated_at=row.updated_at,
-                    steps=saved["steps"],
-                    planning_session_id=row.planning_session_id,
-                    description_source=saved.get("description_source"),
-                    description_updated_at=kept_at if kept else row.updated_at,
-                )
+            workflow = Workflow(
+                id=row.id,
+                user_id=row.user_id,
+                name=row.name,
+                description=text,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                steps=saved["steps"],
+                planning_session_id=row.planning_session_id,
+                description_source=saved.get("description_source"),
+                description_updated_at=kept_at if kept else row.updated_at,
             )
+            workflows.append((workflow, saved))
         return workflows
 
     def create(
@@ -472,7 +477,7 @@ class WorkflowStore:
             ).scalar_one_or_none()
             if row is None:
                 return None
-            current = self._workflows([row])[0]
+            current, current_plan = self._workflows_and_plans([row])[0]
             if expected_steps is not None:
                 # Both in stored form, so an equal plan compares equal however it was sent.
                 _, _, expected = normalize_workflow(
@@ -511,9 +516,15 @@ class WorkflowStore:
                 held = None if was_written_at == now else was_written_at
             else:
                 held = was_held
+            # A time kept for a description an older server has since replaced would count
+            # again if that description came back, so a description write drops it.
+            stale = was_held is None and current_plan.get("description_updated_at") is not None
             # The plan keeps the description's source and time, so a new one rewrites it.
             rewrites_plan = (
-                steps is not None or source != current.description_source or held != was_held
+                steps is not None
+                or source != current.description_source
+                or held != was_held
+                or (describes and stale)
             )
             try:
                 stored = self._stored_texts(

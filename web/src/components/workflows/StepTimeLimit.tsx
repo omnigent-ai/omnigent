@@ -131,9 +131,11 @@ export function StepTimeLimit({
               onChange({ stepId, limit: value === NO_LIMIT ? null : value });
           }}
         >
-          <DropdownMenuRadioItem value={NO_LIMIT}>No limit</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value={NO_LIMIT} disabled={disabled}>
+            No limit
+          </DropdownMenuRadioItem>
           {TIME_LIMIT_CHOICES.map((option) => (
-            <DropdownMenuRadioItem key={option} value={option}>
+            <DropdownMenuRadioItem key={option} value={option} disabled={disabled}>
               {option}
             </DropdownMenuRadioItem>
           ))}
