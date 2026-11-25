@@ -432,7 +432,7 @@ def record(
         # before the idle status catches up.
         queued_behind_turn = not agent_idle or any(
             not earlier.interrupted
-            and (earlier.queued_behind_turn or not _is_slash_command(earlier.content))
+            and (earlier.queued_behind_turn or not is_slash_command(earlier.content))
             for earlier in entries.values()
         )
         entry = _Entry(
@@ -1130,9 +1130,19 @@ def _is_command_entry(entry: _Entry, *, claude_commands: bool) -> bool:
     return claude_commands and (text.startswith("!") or text.lower() in _CLAUDE_EXIT_WORDS)
 
 
-def _is_slash_command(content: list[dict[str, Any]]) -> bool:
-    """Whether queued content is ``/``-led text."""
-    return _collapse_whitespace(_content_text(content)).startswith("/")
+def is_slash_command(content: list[dict[str, Any]]) -> bool:
+    """
+    Whether queued content reaches the agent as a ``/`` command.
+
+    Attachment references are pasted ahead of the text, so ``/``-led text sent
+    with a file arrives as an ordinary prompt.
+
+    :param content: Queued message content, e.g. ``[{"type": "input_text", "text": "/model"}]``.
+    :returns: Whether the content is ``/``-led text with no attachment.
+    """
+    return _attachment_count(content) == 0 and _collapse_whitespace(
+        _content_text(content)
+    ).startswith("/")
 
 
 def _attachment_count(content: list[dict[str, Any]]) -> int:

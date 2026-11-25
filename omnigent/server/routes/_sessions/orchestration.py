@@ -4437,7 +4437,7 @@ def _build_skipped_native_items(
     items: list[NewConversationItem] = []
     for skipped in skipped_entries:
         turn_id = generate_task_id()
-        is_command = (_message_text(skipped.content) or "").lstrip().startswith("/")
+        is_command = pending_inputs.is_slash_command(skipped.content)
         items.append(
             NewConversationItem(
                 type="message",
