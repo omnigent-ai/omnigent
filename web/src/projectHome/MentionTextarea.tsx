@@ -154,7 +154,7 @@ export function MentionTextarea({
           <ul
             id={listId}
             role="listbox"
-            aria-label="Mention a role or person"
+            aria-label="Mention a team member or person"
             data-testid="persona-mention-suggestions"
             style={listPosition(containerRef.current)}
             className="fixed z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"

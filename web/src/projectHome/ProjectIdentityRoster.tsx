@@ -129,7 +129,7 @@ export function ProjectIdentityRoster({
     <div
       className="flex items-center gap-1.5"
       role="group"
-      aria-label="Project roles"
+      aria-label="Team members"
       data-testid="project-identity-roster"
     >
       <div className="flex items-center -space-x-1.5">
@@ -186,7 +186,7 @@ export function ProjectIdentityRoster({
               <Button
                 type="button"
                 variant="ghost"
-                aria-label={`${hidden.length} more roles`}
+                aria-label={`${hidden.length} more team members`}
                 data-testid="project-identity-more"
                 className={cn(
                   avatarButton,
@@ -217,7 +217,7 @@ export function ProjectIdentityRoster({
           <Button
             type="button"
             variant="ghost"
-            aria-label="Add a role"
+            aria-label="Add a team member"
             data-testid="project-edit-team"
             className="size-7 rounded-full border border-dashed border-muted-foreground/50 p-0 text-muted-foreground hover:border-foreground/60 hover:bg-transparent hover:text-foreground"
             onClick={() => setEditing(true)}
@@ -226,7 +226,9 @@ export function ProjectIdentityRoster({
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          {open.error ? `Could not open: ${open.error.message}` : "Add a role or edit the team"}
+          {open.error
+            ? `Could not open: ${open.error.message}`
+            : "Add a team member or edit the team"}
         </TooltipContent>
       </Tooltip>
       {editing && (

@@ -30,9 +30,9 @@ describe("teamCount", () => {
         member("identity", "PM"),
         member("agents", "Other agents"),
       ]),
-    ).toBe("2 people · 2 roles");
+    ).toBe("2 people · 2 team members");
     expect(teamCount([member("human", "a@example.com", "a@example.com")])).toBe(
-      "1 person · 0 roles",
+      "1 person · 0 team members",
     );
   });
 });

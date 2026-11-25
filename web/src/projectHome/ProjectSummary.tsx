@@ -238,7 +238,7 @@ export function teamCount(members: readonly ProjectStatusMember[]): string {
   const roles = members.filter((member) => member.kind === "identity").length;
   const plural = (count: number, one: string, many: string) =>
     `${count} ${count === 1 ? one : many}`;
-  return `${plural(people, "person", "people")} · ${plural(roles, "role", "roles")}`;
+  return `${plural(people, "person", "people")} · ${plural(roles, "team member", "team members")}`;
 }
 
 function StatTile({

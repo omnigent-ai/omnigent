@@ -29,17 +29,17 @@ vi.mock("./IdentityModelEffortFields", () => ({ IdentityModelEffortFields: () =>
 vi.mock("./ProjectRoutingSection", () => ({ ProjectRoutingSection: () => null }));
 
 describe("ProjectTeamDialog", () => {
-  it("adds a role from a template, in role wording throughout", async () => {
+  it("adds a team member from a template, in team-member wording throughout", async () => {
     render(
       <QueryClientProvider client={new QueryClient()}>
         <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
       </QueryClientProvider>,
     );
-    const nav = screen.getByRole("navigation", { name: "Roles" });
-    expect(within(nav).getByRole("button", { name: "New role" })).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Team members" });
+    expect(within(nav).getByRole("button", { name: "New team member" })).toBeInTheDocument();
     expect(screen.getByText("Instructions")).toBeInTheDocument();
     expect(screen.getByTestId("project-team-persona")).toHaveValue("");
-    const templates = screen.getByRole("group", { name: "Role templates" });
+    const templates = screen.getByRole("group", { name: "Team member templates" });
     fireEvent.click(within(templates).getByRole("button", { name: "Designer" }));
     const designer = ROLE_TEMPLATES.find((template) => template.name === "Designer")!;
     expect(screen.getByTestId("project-team-name")).toHaveValue("Designer");
@@ -56,6 +56,6 @@ describe("ProjectTeamDialog", () => {
         }),
       ),
     );
-    expect(screen.queryByRole("group", { name: "Role templates" })).toBeNull();
+    expect(screen.queryByRole("group", { name: "Team member templates" })).toBeNull();
   });
 });

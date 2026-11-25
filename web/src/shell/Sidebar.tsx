@@ -1898,7 +1898,7 @@ function ProjectFolder({
     (row: Conversation) => isProjectAgentRow(row, mainSessionIds),
     [mainSessionIds],
   );
-  // A project with team roles lists them all first, under "Roles"; paging
+  // A project with team roles lists them all first, under "Team"; paging
   // ("Show more") only ever applies to its other sessions.
   const split = useMemo(() => splitAgentRows(conversations, agentRow), [conversations, agentRow]);
   const grouped = !archived && split.agents.length > 0 && split.sessions.length > 0;
@@ -4756,7 +4756,7 @@ function SectionGroup({
   );
 }
 
-/** A project's team role session (the Lead or a persona), listed under "Roles". */
+/** A project's team role session (the Lead or a persona), listed under "Team". */
 function isProjectAgentRow(row: Conversation, mainSessionIds: ReadonlySet<string>): boolean {
   return sidebarPersonaName(row, mainSessionIds) !== null;
 }
@@ -4806,7 +4806,7 @@ export function splitAgentRows(
   return { agents, sessions };
 }
 
-/** A project's rows, as one list or as "Roles" and "Sessions" folders when it has both. */
+/** A project's rows, as one list or as "Team" and "Sessions" folders when it has both. */
 export function SidebarRowGroups({
   rows,
   agentRow,
@@ -4892,7 +4892,7 @@ export function SidebarRowGroups({
   };
   return (
     <div className="flex flex-col gap-1">
-      {group("agents", "Roles", split.agents, false)}
+      {group("agents", "Team", split.agents, false)}
       {group("sessions", "Sessions", split.sessions, true, sessionsAction)}
     </div>
   );
@@ -4941,7 +4941,7 @@ function ConversationSection({
   /** Whole-folder counts for the group headers, when paging hides some sessions. */
   groupCounts?: { agents: number; sessions: number };
   /**
-   * Splits the rows into a "Roles" and a "Sessions" folder when both kinds
+   * Splits the rows into a "Team" and a "Sessions" folder when both kinds
    * are present, e.g. a project's team roles apart from its other sessions.
    */
   agentRow?: (conversation: Conversation) => boolean;

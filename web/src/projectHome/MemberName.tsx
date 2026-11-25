@@ -5,7 +5,7 @@ import { personDisplayName } from "./personaMentions";
 
 /** What the pooled agents row covers, for people who don't know the internals. */
 export const OTHER_AGENTS_EXPLANATION =
-  "Agent sessions that aren't the Lead or a named role, such as workers the Lead starts to handle a ticket.";
+  "Agent sessions that aren't the Lead or a team member, such as workers the Lead starts to handle a ticket.";
 
 /** A person's readable name from their sign-in, e.g. "alice.smith@example.com" → "Alice Smith". */
 export function memberDisplayName(member: {

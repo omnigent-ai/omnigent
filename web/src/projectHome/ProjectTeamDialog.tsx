@@ -48,7 +48,7 @@ const EMPTY_DRAFT: IdentityDraft = {
   effort: "",
 };
 
-/** Starting points for a new role; each prefills its name, instructions and scope. */
+/** Starting points for a new team member; each prefills its name, instructions and scope. */
 export const ROLE_TEMPLATES: readonly Pick<
   IdentityDraft,
   "name" | "instructions" | "owns" | "excludes"
@@ -190,10 +190,10 @@ export function ProjectTeamDialog({
         <DialogHeader>
           <DialogTitle>Team</DialogTitle>
           <DialogDescription>
-            Persistent roles in <span className="font-medium">{projectName}</span> you can talk to,
-            including the built-in Lead, whose charter you can edit. Agents can add roles too. Each
-            works in one session at a time and follows the project mandate. Assign a ticket to a
-            role from the ticket&apos;s Assignee picker.
+            Agent team members in <span className="font-medium">{projectName}</span> you can talk
+            to, including the built-in Lead, whose charter you can edit. Agents can add team members
+            too. Each works in one session at a time and follows the project mandate. Assign a
+            ticket to a team member from the ticket&apos;s Assignee picker.
           </DialogDescription>
         </DialogHeader>
         {identities.isLoading ? (
@@ -201,7 +201,7 @@ export function ProjectTeamDialog({
         ) : (
           <>
             <div className="flex flex-col gap-4 sm:flex-row">
-              <nav className="flex shrink-0 flex-col gap-1 sm:w-44" aria-label="Roles">
+              <nav className="flex shrink-0 flex-col gap-1 sm:w-44" aria-label="Team members">
                 <Button
                   type="button"
                   variant={selected === null ? "secondary" : "ghost"}
@@ -211,7 +211,7 @@ export function ProjectTeamDialog({
                   onClick={() => choose(null)}
                 >
                   <PlusIcon />
-                  New role
+                  New team member
                 </Button>
                 {lead && (
                   <Button
@@ -245,7 +245,7 @@ export function ProjectTeamDialog({
                 {selected === null && (
                   <div
                     role="group"
-                    aria-label="Role templates"
+                    aria-label="Team member templates"
                     className="flex flex-wrap items-center gap-1.5 text-sm"
                   >
                     <span className="text-muted-foreground">Start from a template:</span>
@@ -358,8 +358,8 @@ export function ProjectTeamDialog({
                     className="text-xs text-muted-foreground"
                     data-testid="project-team-agent-made"
                   >
-                    Created by an agent, so agents can also edit it. Roles you create stay yours to
-                    edit.
+                    Created by an agent, so agents can also edit it. Team members you create stay
+                    yours to edit.
                   </p>
                 )}
                 <TicketError error={save.error ?? remove.error ?? identities.error} />

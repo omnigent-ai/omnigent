@@ -1033,6 +1033,11 @@ describe("Project ticket board", () => {
       description: "",
       labels: [{ key: "assignee", value: "Designer" }],
     });
+    // The next new ticket starts with the Lead again.
+    expect(await screen.findByRole("radio", { name: "Lead (default)" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     unmount();
 
     ticket = { ...ticket, labels: [{ key: "assignee", value: "designer" }] };
@@ -1256,7 +1261,7 @@ describe("Project ticket board", () => {
           onCreated={vi.fn()}
         />,
       );
-      const sessions = await screen.findByRole("region", { name: "Roles and sessions" });
+      const sessions = await screen.findByRole("region", { name: "Team members and sessions" });
       expect(
         await within(sessions).findByRole("link", { name: "Open chat with: Codex" }),
       ).toHaveAttribute("href", href);
@@ -1343,7 +1348,7 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    const sessions = await screen.findByRole("region", { name: "Roles and sessions" });
+    const sessions = await screen.findByRole("region", { name: "Team members and sessions" });
     const worker = await within(sessions).findByRole("link", { name: /Session worker/ });
     await waitFor(() => expect(worker).toHaveTextContent("Unavailable"));
     expect(worker).toHaveAttribute("href", "/c/worker");
@@ -1742,7 +1747,9 @@ describe("Project ticket board", () => {
         onExpandedChange: mobile ? undefined : onExpandedChange,
       };
       const { rerender } = renderBoard(<ProjectTicketPanel {...props} />);
-      const agents = await screen.findByRole("list", { name: "Involved roles and sessions" });
+      const agents = await screen.findByRole("list", {
+        name: "Involved team members and sessions",
+      });
       const chat = await within(agents).findByRole("link", {
         name: "Open chat with: Design the board",
       });
@@ -1815,7 +1822,7 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    const agents = await screen.findByRole("region", { name: "Roles and sessions" });
+    const agents = await screen.findByRole("region", { name: "Team members and sessions" });
     expect(await within(agents).findByText("Investigating the approach")).toBeInTheDocument();
     const planner = await within(agents).findByRole("link", {
       name: "Open chat with: Claude Code",
@@ -1838,7 +1845,7 @@ describe("Project ticket board", () => {
     expect(agents).not.toHaveTextContent("claude-native-ui");
     expect(agents).not.toHaveTextContent("codex-native-ui");
     expect(
-      within(screen.getByRole("list", { name: "Involved roles and sessions" })).getAllByRole(
+      within(screen.getByRole("list", { name: "Involved team members and sessions" })).getAllByRole(
         "link",
       ),
     ).toHaveLength(3);
@@ -1960,7 +1967,7 @@ describe("Project ticket board", () => {
           onCreated={vi.fn()}
         />,
       );
-      const agents = await screen.findByRole("region", { name: "Roles and sessions" });
+      const agents = await screen.findByRole("region", { name: "Team members and sessions" });
       const respond = await within(agents).findByRole("link", {
         name: "Respond to: Plan the work",
       });

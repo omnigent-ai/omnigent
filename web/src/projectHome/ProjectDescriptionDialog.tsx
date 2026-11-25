@@ -28,7 +28,7 @@ export const PROJECT_DESCRIPTION_PLACEHOLDER = [
   "Scope: what it covers.",
   "Out of scope: what it won't do.",
   "How we'll know it's working: the signals or numbers to watch.",
-  "Starting roster: the people and agent roles on the team.",
+  "Starting roster: the people and agent team members.",
 ].join("\n");
 
 /** Bytes the server counts against the limit: it stores the trimmed text. */

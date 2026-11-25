@@ -216,6 +216,7 @@ export function ProjectTicketPanel({
         ...(assignee ? { labels: [{ key: ASSIGNEE_LABEL_KEY, value: assignee }] } : {}),
       }),
     onSuccess: (ticket) => {
+      setAssignee(null);
       writeTicketDraft(newTicketDraftKey(projectName, "title"), "");
       writeTicketDraft(newTicketDraftKey(projectName, "description"), "");
       void client.invalidateQueries({ queryKey: ["project-tickets", ticket.project_id] });
@@ -810,7 +811,7 @@ function TicketCommentComposer({
           onPaste={images.onPaste}
           onDragOver={images.onDragOver}
           onDrop={images.onDrop}
-          placeholder="Add a comment… type @ to cc a role or person"
+          placeholder="Add a comment… type @ to cc a team member or person"
         />
         <TicketImagePreviews upload={images} className="px-3" />
         {attaching && (

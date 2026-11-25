@@ -83,7 +83,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   const personaName =
     useProjectIdentities(personaSessionId ? projectId : null).data?.find(
       (identity) => identity.active_session_id === personaSessionId,
-    )?.name ?? "Role";
+    )?.name ?? "Team member";
   const isNewTicket = useNewTicketsOnOpen(projectId, panelTicketId);
   useMarkProjectTicketsSeen(projectId, tickets && !hideBoard);
   const closePanel = useCallback(() => {
