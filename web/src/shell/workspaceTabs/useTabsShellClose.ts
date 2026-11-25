@@ -46,7 +46,7 @@ export function useTabsShellClose({
   deleteTerminal,
 }: {
   /** The session whose shells these are, for asking its runner whether they're idle; none asks. */
-  sessionId?: string | null;
+  sessionId: string | null;
   terminals: readonly TerminalInfo[];
   /** Ends a terminal; rejects when it couldn't, leaving the sidebar to tell the user. */
   deleteTerminal: (terminalId: string) => Promise<unknown>;
