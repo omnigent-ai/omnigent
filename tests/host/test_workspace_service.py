@@ -937,9 +937,9 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    # SearchText is listed exactly where ripgrep is installed. The server's route passes
-    # the host's list on unchanged, optional features included. Only the server's route
-    # serves pull requests, which tests/host/test_workspace_api_pull_requests.py covers.
+    # SearchText is listed exactly where ripgrep is installed, optional features included.
+    # Only the server's route serves pull requests, and it lists only what the caller may
+    # call; tests/host/test_workspace_api_pull_requests.py covers both.
     pull_requests = {name for name, method in WORKSPACE_METHODS.items() if method.pull_request}
     listed = set(response.capabilities) - pull_requests
     assert listed ^ (_RG_METHODS - _WITH_RG) == {

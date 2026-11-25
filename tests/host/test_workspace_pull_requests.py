@@ -41,7 +41,6 @@ def provider_reads(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
 
     def serving_facet(_root: str, reference: Any) -> None:
         reached.append(reference.url if reference is not None else None)
-        return
 
     monkeypatch.setattr(pr_resource, "_serving_facet", serving_facet)
     return reached
@@ -105,19 +104,6 @@ async def test_capabilities_list_pull_requests_only_for_a_call_with_a_session(
     assert not set(_PULL_REQUEST_METHODS) & _capabilities(without)
 
 
-async def test_before_the_server_vouches_the_host_refuses_a_pr_it_never_recorded(
-    tmp_path: Path, provider_reads: list[str | None]
-) -> None:
-    """Without the server's vouch, the host's own record for the session decides."""
-    _messages, code, message = await _answer(
-        _frame(tmp_path, "ListPullRequestFiles", _files_request())
-    )
-
-    assert code == Code.FAILED_PRECONDITION.value
-    assert message == "This pull request is not associated with the session"
-    assert provider_reads == []
-
-
 async def test_the_host_refuses_a_pr_another_session_recorded(
     tmp_path: Path, provider_reads: list[str | None]
 ) -> None:
@@ -165,6 +151,43 @@ async def test_the_servers_default_pr_is_read_when_a_call_names_none(
     assert provider_reads == [_PR]
 
 
+_HEAD, _BASE = "a" * 40, "b" * 40
+
+
+@pytest.mark.parametrize(
+    ("request_message", "refusal"),
+    [
+        (pb.ListPullRequestCommitsRequest(head_sha=_HEAD), "Select a pull request to list"),
+        (pb.GetCommitDiffRequest(commit_sha=_HEAD), "Select a pull request to list"),
+        (
+            pb.ComparePullRequestRangeRequest(head_sha=_HEAD, from_sha=_BASE),
+            "Select a pull request to list",
+        ),
+        (
+            pb.ListReviewThreadsRequest(head_sha=_HEAD, base_sha=_BASE),
+            "Select a pull request to read",
+        ),
+        (
+            pb.ListReviewThreadCommentsRequest(thread_id="thread_1", page_token="cursor_1"),
+            "Select a pull request to read",
+        ),
+    ],
+    ids=["commits", "commit-diff", "range", "threads", "thread-comments"],
+)
+async def test_the_other_reads_need_the_pr_named_as_rest_does(
+    tmp_path: Path, request_message: Any, refusal: str
+) -> None:
+    """Only the overview, files and diff read the session's first PR when none is named."""
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+    method = type(request_message).__name__.removesuffix("Request")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, request_message.SerializeToString(), vouch=vouch)
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message is not None and message.startswith(refusal)
+
+
 @pytest.mark.parametrize(
     "vouch",
     [
@@ -179,13 +202,15 @@ async def test_the_servers_default_pr_is_read_when_a_call_names_none(
 async def test_a_vouch_the_server_did_not_give_serves_no_unrecorded_pr(
     tmp_path: Path, vouch: PullRequestVouch | None, provider_reads: list[str | None]
 ) -> None:
+    """Without the server's vouch, as before it imports, the host's own record decides."""
     # A request message crafted to claim tracking: field 15 is no field of the request.
     crafted = _files_request() + b"\x78\x01"
-    _messages, code, _ = await _answer(
+    _messages, code, message = await _answer(
         _frame(tmp_path, "ListPullRequestFiles", crafted, vouch=vouch)
     )
 
     assert code == Code.FAILED_PRECONDITION.value
+    assert message == "This pull request is not associated with the session"
     assert provider_reads == []
 
 

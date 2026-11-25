@@ -1331,11 +1331,18 @@ async def test_workspace_api_pull_request_reads_keep_their_rest_gates(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["Bogus", "ListDirectory"])
 async def test_workspace_api_refuses_a_method_it_has_no_gate_for(
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, method: str
 ) -> None:
+    """A method the service serves but the gate table leaves out is refused, not served."""
+    from omnigent.server import workspace_access
+
+    gates = {name: gate for name, gate in workspace_access.METHOD_GATES.items() if name != method}
+    monkeypatch.setattr(workspace_access, "METHOD_GATES", gates)
     resp = await client.post(
-        "/v1/sessions/conv_open/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService/Bogus",
+        "/v1/sessions/conv_open/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
         headers={
             "X-Forwarded-Email": "real-owner@example.com",
             "Content-Type": "application/json",
@@ -1344,3 +1351,4 @@ async def test_workspace_api_refuses_a_method_it_has_no_gate_for(
     )
 
     assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Unknown workspace method"
