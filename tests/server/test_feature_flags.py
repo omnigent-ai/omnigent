@@ -58,6 +58,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "workflows": False,
         "session_overview": False,
         "project_kanban": True,
+        "vega_lite_charts": False,
         "project_repository_creation": True,
         "quick_pick_palette": False,
         "workspace_sidebar_v2": False,

@@ -21,6 +21,8 @@ import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
 
@@ -2148,45 +2150,95 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     },
   );
 
-  it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
-    renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
-    expect(viewModeOf()).toBe("source");
-    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
-    expect(viewModeOf()).toBe("preview");
-  });
+  // A chart, like a data table, can't show comment anchors once the chart feature is on.
+  const withCharts = (tree: React.ReactElement) => (
+    <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: true } }}>
+      {tree}
+    </CapabilitiesProvider>
+  );
+  const commentPreviews = [
+    {
+      label: "CSV",
+      path: "results.csv",
+      other: "other.csv",
+      wrap: (tree: React.ReactElement) => tree,
+    },
+    {
+      label: "chart",
+      path: "charts/sales.vl.json",
+      other: "charts/other.vl.json",
+      wrap: withCharts,
+    },
+  ];
 
-  it("switches a CSV opened on its table to source when a comment is picked", () => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
-    renderViewer({ open: true, path: "results.csv" });
-    expect(viewModeOf()).toBe("preview");
+  it.each(commentPreviews)(
+    "opens a ?comment= link to a $label in source, then lets the toggle reach the preview",
+    ({ path, wrap }) => {
+      render(wrap(viewerTree({ open: true, path, initialSearch: "comment=c1" })));
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
 
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
-    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
-    expect(viewModeOf()).toBe("source");
-    // The toggle still returns to the table.
-    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
-    expect(viewModeOf()).toBe("preview");
-  });
+  it.each(commentPreviews)(
+    "switches a $label opened on its preview to source when a comment is picked",
+    ({ path, wrap }) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+      render(wrap(viewerTree({ open: true, path })));
+      expect(viewModeOf()).toBe("preview");
 
-  it("ends a picked comment's pull toward source when another file opens", () => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
-    const view = renderViewer({ open: true, path: "results.csv" });
-    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
-    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
-    expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+      fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+      expect(viewModeOf()).toBe("source");
+      // The toggle still returns to the preview.
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
 
-    view.rerender(viewerTree({ open: true, path: "other.csv" }));
-    view.rerender(viewerTree({ open: true, path: "results.csv" }));
-    expect(viewModeOf()).toBe("preview");
-  });
+  it.each(commentPreviews)(
+    "ends a picked comment's pull toward source on a $label when another file opens",
+    ({ path, other, wrap }) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+      const view = render(wrap(viewerTree({ open: true, path })));
+      fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+      fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+      expect(viewModeOf()).toBe("source");
+
+      view.rerender(wrap(viewerTree({ open: true, path: other })));
+      view.rerender(wrap(viewerTree({ open: true, path })));
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
 
   it("keeps a Markdown comment link's pull toward its editor across a visit elsewhere", () => {
-    // Only a data table's pull ends on leaving; Markdown keeps its deep-link bias.
+    // Only a data table's or chart's pull ends on leaving; Markdown keeps its deep-link bias.
     const view = renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("editor");
     view.rerender(viewerTree({ open: true, path: "other.py", initialSearch: "comment=c1" }));
     view.rerender(viewerTree({ open: true, path: "notes.md", initialSearch: "comment=c1" }));
     expect(viewModeOf()).toBe("editor");
+  });
+
+  it("previews a Vega-Lite file as a chart with a source toggle only when charts are on", () => {
+    const chartViewer = (enabled: boolean) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: enabled } }}
+      >
+        {viewerTree({ open: true, path: "charts/sales.vl.json" })}
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(chartViewer(false));
+    expect(viewModeOf()).toBe("source");
+    expect(screen.queryByRole("button", { name: "View preview" })).toBeNull();
+
+    rerender(chartViewer(true));
+    expect(viewModeOf()).toBe("preview");
+    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
   });
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {

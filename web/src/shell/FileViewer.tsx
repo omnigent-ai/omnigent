@@ -146,6 +146,7 @@ import {
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
 import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
+import { isVegaLitePath } from "@/components/charts/vegaLiteSpec";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -414,6 +415,11 @@ interface FileViewerProps {
    * "X/N" index won't line up with the list. Defaults to the panel's default sort.
    */
   sort?: ChangedSort;
+}
+
+/** The preview can't show comment anchors, so a linked or picked comment opens Source. */
+function previewHidesComments(path: string): boolean {
+  return isDataTablePath(path) || isVegaLitePath(path);
 }
 
 /**
@@ -947,11 +953,14 @@ function FileViewerBody({
       setLargeMarkdownMode(null);
     }
   }
+  // Vega-Lite files preview as a chart, like notebooks: preview or JSON source.
+  const isChartFile = isFeatureEnabled(useServerInfo(), "vega_lite_charts") && isVegaLitePath(path);
   const isPreviewable =
     (lang === "markdown" && !markdownPreviewFallback) ||
     lang === "html" ||
     isNotebookPath(path) ||
-    isDataTablePath(path);
+    isDataTablePath(path) ||
+    isChartFile;
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -1048,13 +1057,15 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
-  // A data table's pull toward Source (from a picked comment) belongs to one
-  // visit: opening another file or conversation ends it, so coming back opens the
-  // table again. Other files keep their deep-link bias as before.
+  // A data table's or chart's pull toward Source (from a picked comment) belongs
+  // to one visit: opening another file or conversation ends it, so coming back
+  // opens the preview again. Other files keep their deep-link bias as before.
   const [biasVisit, setBiasVisit] = useState({ conversationId, path });
   if (biasVisit.conversationId !== conversationId || biasVisit.path !== path) {
     setBiasVisit({ conversationId, path });
-    if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
+    if (deepLinkBiasPath !== null && previewHidesComments(deepLinkBiasPath)) {
+      setDeepLinkBiasPath(null);
+    }
   }
 
   // Switch a markdown file to the rich-text editor — the surface where text-
@@ -1097,7 +1108,7 @@ function FileViewerBody({
     largeMarkdown: markdownSourceFallback ?? false,
     largeMarkdownVisitMode,
     deepLinkedComment: deepLinkBiasPath === path,
-    previewHidesComments: isDataTablePath(path),
+    previewHidesComments: previewHidesComments(path),
     preference: previewableViewMode,
   });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
@@ -1461,11 +1472,11 @@ function FileViewerBody({
       options: modeOptions,
     });
   } else if (
-    (lang === "html" || isNotebookPath(path) || isDataTablePath(path)) &&
+    (lang === "html" || isNotebookPath(path) || isDataTablePath(path) || isChartFile) &&
     viewMode !== "diff"
   ) {
-    // HTML, notebooks and data tables have no rich-text editor — a single toggle
-    // flips preview ↔ source.
+    // HTML, notebooks, data tables and charts have no rich-text editor — a single
+    // toggle flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
       label: viewMode === "preview" ? "View source" : "View preview",
@@ -2217,9 +2228,9 @@ function FileViewerBody({
               sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
-              // A data table can't show comment anchors, so picking a comment
-              // opens Source as a ?comment= link does; the toggle still reaches the table.
-              if (isDataTablePath(path)) setDeepLinkBiasPath(path);
+              // A data table or chart can't show comment anchors, so picking a comment
+              // opens Source as a ?comment= link does; the toggle still reaches the preview.
+              if (previewHidesComments(path)) setDeepLinkBiasPath(path);
               handleSetActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,

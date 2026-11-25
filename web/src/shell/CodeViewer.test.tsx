@@ -1407,6 +1407,53 @@ describe("CodeViewer data-file routing", () => {
   });
 });
 
+describe("CodeViewer Vega-Lite routing", () => {
+  const spec = JSON.stringify({
+    data: { values: [{ day: "Mon", visits: 4 }] },
+    mark: "bar",
+    encoding: {
+      x: { field: "day", type: "nominal" },
+      y: { field: "visits", type: "quantitative" },
+    },
+  });
+
+  it("draws the chart in preview mode and keeps JSON source as the escape hatch", async () => {
+    const { unmount } = renderViewer(spec, true, "charts/visits.vl.json", { viewMode: "preview" });
+    const chart = await screen.findByTestId("vega-lite-chart");
+    await waitFor(() => expect(chart.querySelector("g.mark-rect path")).not.toBeNull());
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    unmount();
+
+    renderViewer(spec, true, "charts/visits.vl.json", { viewMode: "source" });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeDefined();
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+  });
+
+  it("leaves Cmd+F to the browser in chart preview", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    renderViewer(spec, true, "charts/visits.vl.json", { viewMode: "preview" });
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("asks for the source view instead of charting a truncated file", () => {
+    renderViewer(spec.slice(0, 20), true, "visits.vega-lite.json", {
+      viewMode: "preview",
+      truncated: true,
+    });
+    expect(screen.getByText(/too large to draw as a chart/)).toBeDefined();
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+  });
+});
+
 describe("source line navigation", () => {
   it("centers and highlights the requested Markdown source line", () => {
     const scroll = vi.fn();

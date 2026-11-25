@@ -13,6 +13,8 @@ import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import type { AnyBlock } from "@/lib/blocks";
 import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY, readCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { setEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
@@ -468,6 +470,19 @@ describe("a streaming Mermaid fence", () => {
     expect(container.querySelector('svg[id^="mermaid-"]')).toHaveTextContent("Alpha");
   }, 15_000);
 
+  it("still draws an unclosed fence once streaming stops on a chart surface", async () => {
+    const { container, rerender } = render(
+      <MessageResponse allowCharts isStreaming>
+        {open}
+      </MessageResponse>,
+    );
+    rerender(<MessageResponse allowCharts>{open}</MessageResponse>);
+
+    await waitFor(() => expect(container.querySelector('svg[id^="mermaid-"]')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+  }, 15_000);
+
   it("replaces the source of a streamed fence that can't draw with the error card", async () => {
     const invalid = "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n";
     const { container, rerender } = render(
@@ -691,6 +706,128 @@ describe("MessageResponse code-block copy", () => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageResponse vega-lite charts", () => {
+  const spec = JSON.stringify({
+    data: { values: [{ team: "A", wins: 3 }] },
+    mark: "bar",
+    encoding: { x: { field: "team", type: "nominal" }, y: { field: "wins", type: "quantitative" } },
+  });
+  const closed = `Results:\n\n\`\`\`vega-lite\n${spec}\n\`\`\`\n`;
+  const response = (
+    text: string,
+    {
+      allowCharts = true,
+      enabled = true,
+      isStreaming = false,
+      mode = undefined as "static" | "streaming" | undefined,
+    } = {},
+  ) => (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { vega_lite_charts: enabled } }}
+    >
+      <MessageResponse allowCharts={allowCharts} isStreaming={isStreaming} mode={mode}>
+        {text}
+      </MessageResponse>
+    </CapabilitiesProvider>
+  );
+
+  it("draws a closed fence as a chart", async () => {
+    const { container } = render(response(closed));
+
+    const chart = await screen.findByTestId("vega-lite-chart");
+    await waitFor(() => expect(chart.querySelector("g.mark-rect path")).not.toBeNull());
+    expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
+  });
+
+  it.each([
+    ["the feature is off", { enabled: false }],
+    ["the surface doesn't allow charts", { allowCharts: false }],
+  ])("keeps the spec as code when %s", async (_label, options) => {
+    const { container } = render(response(closed, options));
+
+    await waitFor(() =>
+      expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"'),
+    );
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+  });
+
+  it("streams an open fence as code and draws once it closes", async () => {
+    const open = `Results:\n\n\`\`\`vega-lite\n${spec}\n`;
+    const codeBlock = () => container.querySelector('[data-streamdown="code-block"]');
+    const { container, rerender } = render(response(open, { isStreaming: true }));
+    expect(codeBlock()).toHaveTextContent('"team"');
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+
+    // The reply stops before the closing fence: the complete JSON still stays code.
+    rerender(response(open));
+    await waitFor(() => expect(codeBlock()).toHaveTextContent('"team"'));
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+
+    rerender(response(closed));
+
+    expect(await screen.findByTestId("vega-lite-chart")).toBeInTheDocument();
+  });
+
+  it("keeps an unclosed repeat of a closed chart as code in static text", async () => {
+    const repeated = `${closed}\nAgain:\n\n\`\`\`vega-lite\n${spec}\n`;
+    const { container } = render(response(repeated, { mode: "static" }));
+
+    await waitFor(() => expect(screen.getAllByTestId("vega-lite-chart")).toHaveLength(1));
+    expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent('"team"');
+  });
+
+  it.each([
+    ["a tilde fence", `~~~vega-lite\n${spec}\n~~~\n`],
+    ["a fence on a list marker", `1. \`\`\`vega-lite\n   ${spec}\n   \`\`\`\n`],
+    ["a fence in a blockquote", `> \`\`\`vega-lite\n> ${spec}\n> \`\`\`\n`],
+    ["a longer closing fence", `\`\`\`vega-lite\n${spec}\n\`\`\`\`\n`],
+    ["a blockquote in a wide list item", `10. > \`\`\`vega-lite\n    > ${spec}\n    > \`\`\`\n`],
+    ["a task-list fence", `- [ ] todo\n  \`\`\`vega-lite\n  ${spec}\n  \`\`\`\n`],
+  ])("draws %s once it closes", async (_label, text) => {
+    render(response(text, { mode: "static" }));
+
+    expect(await screen.findByTestId("vega-lite-chart")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["a tilde fence", `~~~vega-lite\n${spec}\n`],
+    ["a fence on a list marker", `1. \`\`\`vega-lite\n   ${spec}\n`],
+    ["a fence in a blockquote", `> \`\`\`vega-lite\n> ${spec}\n`],
+    ["an indented fence whose closer is indented 4", ` \`\`\`vega-lite\n${spec}\n    \`\`\`\n`],
+    [
+      "a task-list fence whose closer is 4 past the item",
+      `- [ ] todo\n  \`\`\`vega-lite\n  ${spec}\n      \`\`\`\n`,
+    ],
+    [
+      "a blockquoted fence whose closer follows a tab",
+      `>\t\`\`\`vega-lite\n> ${spec}\n>\t  \`\`\`\n`,
+    ],
+    ["a footnote's fence", `Note[^1]\n\n[^1]: \`\`\`vega-lite\n    ${spec}\n`],
+  ])("keeps %s that never closed as code after streaming stops", async (_label, text) => {
+    const codeBlock = () => document.querySelector('[data-streamdown="code-block"]');
+    const { rerender, unmount } = render(response(text, { isStreaming: true }));
+
+    rerender(response(text));
+    await waitFor(() => expect(codeBlock()).toHaveTextContent('"team"'));
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+    unmount();
+
+    // Finished text renders in static mode, as BlockRenderer does.
+    render(response(text, { mode: "static" }));
+    await waitFor(() => expect(codeBlock()).toHaveTextContent('"team"'));
+    expect(screen.queryByTestId("vega-lite-chart")).toBeNull();
+  });
+
+  it("keeps GitHub-flavored Markdown on chart surfaces", () => {
+    const markdown = "| a |\n| - |\n| 1 |\n\n~~old~~ and https://example.com";
+    const { container } = render(response(markdown, { mode: "static" }));
+
+    expect(container.querySelector("table")).not.toBeNull();
+    expect(container.querySelector("del")).toHaveTextContent("old");
+    expect(container.querySelector("a")).toHaveTextContent("https://example.com");
   });
 });
 
