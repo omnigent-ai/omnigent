@@ -17,7 +17,12 @@ from typing import Any
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.files._files_page import open_workspace, seeded_workspace, session_workspace
+from tests.e2e_ui.files._files_page import (
+    open_workspace,
+    seeded_workspace,
+    session_workspace,
+    set_rail_width,
+)
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _RULE = "config/review/rules/style.md"
@@ -182,8 +187,9 @@ def test_a_deep_long_name_keeps_its_extension_in_a_narrow_files_tree(
     page: Page, tree_session: tuple[str, str]
 ) -> None:
     """Deep in the tree, the file's row keeps its start and extension in a narrow tree."""
-    page.set_viewport_size({"width": 900, "height": 900})
     sidebar = _files_tree(page, tree_session)
+    # A narrow page moves the sidebar into a drawer, so narrow the sidebar itself.
+    set_rail_width(page, sidebar, 320)
     # Each folder lists as it opens, so the chain row grows down to navigation/, then opens.
     for folder in _DEEP_CHAIN:
         chain = sidebar.locator(f'[role="treeitem"][data-item-path="{folder}"]')
