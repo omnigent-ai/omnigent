@@ -9,6 +9,7 @@ approver (the owner, plus the project's ``product_approvers`` config) has added
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from omnigent.server.board_readers import BOARD_READERS_CONFIG_KEY
@@ -132,6 +133,25 @@ def is_plain_ask(
     if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
         return False
     return not owner_sign_off_pending(labels, requested_by)
+
+
+_PRODUCT_OK_ASK = re.compile(r"product[\s-]*ok|product\s+(?:approv|sign[\s-]*off)", re.I)
+
+
+def asks_for_product_ok(*texts: str | None) -> bool:
+    """Whether an ask's question or label asks for product approval, not just a question."""
+    return any(text and _PRODUCT_OK_ASK.search(text) for text in texts)
+
+
+def only_product_ok_owed(labels: list[dict[str, Any]] | None, requested_by: str | None) -> bool:
+    """Whether a feature's missing ``product-ok`` is the only sign-off its ask could be for."""
+    keys = {label.get("key") for label in labels or []}
+    return (
+        ticket_kind(labels) == FEATURE_KIND
+        and PRODUCT_OK_LABEL not in keys
+        and not (RISK_LABEL in keys and RISK_OK_LABEL not in keys)
+        and not owner_sign_off_pending(labels, requested_by)
+    )
 
 
 # The owner's own sign-offs; mirrors the landing gate's labels.

@@ -1877,8 +1877,11 @@ class ProjectTicketStore:
         owner may always answer it.
         """
         from omnigent.server.product_approval import (
+            REQUEST_OWNER,
+            asks_for_product_ok,
             human_request_routing,
             is_plain_ask,
+            only_product_ok_owed,
             owner_sign_off_pending,
         )
 
@@ -1888,16 +1891,35 @@ class ProjectTicketStore:
         owner = routing_project.user_id
         if owner_sign_off_pending(ticket.labels, ticket.requested_by):
             return reason, responders, {owner}
-        if not is_plain_ask(routing_project, ticket.labels, ticket.requested_by):
+        plain = is_plain_ask(routing_project, ticket.labels, ticket.requested_by)
+        context = None
+        if not plain and only_product_ok_owed(ticket.labels, ticket.requested_by):
+            # On a feature still missing product-ok, an agent's question that doesn't ask
+            # for it goes where a plain one would; a bare or a person's ask stays with
+            # the approvers.
+            context = self._open_ask_context(session, ticket)
+            asker, question = context
+            label = next(
+                (lb.get("value") for lb in ticket.labels if lb.get("key") == NEEDS_HUMAN_LABEL),
+                None,
+            )
+            plain = (
+                asker is None
+                and bool(question and question.strip())
+                and not asks_for_product_ok(question, label)
+            )
+            if plain:
+                reason = REQUEST_OWNER
+        if not plain:
             return reason, responders, responders
-        responders = self._plain_ask_responders(session, owner, ticket)
+        asker, question = context or self._open_ask_context(session, ticket)
+        responders = self._plain_ask_responders(session, owner, ticket, asker, question)
         return reason, responders, {*responders, owner}
 
-    def _plain_ask_responders(
-        self, session: Session, owner: str | None, ticket: SqlProjectTicket
-    ) -> set[str | None]:
-        from omnigent.server.persona_mentions import find_mentions, person_aliases, split_mentions
-
+    def _open_ask_context(
+        self, session: Session, ticket: SqlProjectTicket
+    ) -> tuple[str | None, str | None]:
+        """The person who raised the open ask (``None`` for an agent) and its question."""
         asks = self._human_asks(session, ticket)
         ask = asks[-1] if asks and asks[-1].end is None else None
         raised = (
@@ -1912,12 +1934,23 @@ class ProjectTicketStore:
             if ask is not None
             else None
         )
-        # A person who raised the ask is asking someone else.
         asker = (
             raised.user_id
             if raised is not None and raised.session_id is None and raised.agent_id is None
             else None
         )
+        return asker, self._ask_question_text(session, ticket, asks, asker)
+
+    def _plain_ask_responders(
+        self,
+        session: Session,
+        owner: str | None,
+        ticket: SqlProjectTicket,
+        asker: str | None,
+        question: str | None,
+    ) -> set[str | None]:
+        from omnigent.server.persona_mentions import find_mentions, person_aliases, split_mentions
+
         members = {
             *session.scalars(
                 select(SqlProjectShare.user_id).where(
@@ -1927,13 +1960,13 @@ class ProjectTicketStore:
             ),
             *([owner] if owner else []),
         }
-        question = self._ask_question_text(session, ticket, asks, asker)
         if question and "@" in question:
             _, named = split_mentions(
                 find_mentions(question, person_aliases(sorted(members - {asker}), []))
             )
             if named:
                 return {entry["user_id"] for entry in named}
+        # A person who raised the ask is asking someone else.
         requester = ticket.requested_by
         if requester in members and requester != asker:
             return {requester}

@@ -530,3 +530,55 @@ async def test_an_agents_ask_naming_members_reaches_their_inboxes(multi_user_cli
         ("Stories", "owner"),
     ]
     assert await _requests(client, ALICE) == []
+
+
+async def test_a_plain_question_on_a_feature_goes_to_the_requester_not_the_approvers(
+    multi_user_client, db_uri
+):
+    client = multi_user_client
+    carol = "carol@example.com"
+    project = (
+        await client.post("/v1/projects", json={"name": "Whimsy"}, headers=_as_user(ALICE))
+    ).json()
+    for member in (BOB, carol):
+        await client.post(
+            f"/v1/projects/{project['id']}/shares",
+            json={"user_id": member},
+            headers=_as_user(ALICE),
+        )
+    await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [carol]}},
+        headers=_as_user(ALICE),
+    )
+    store = ProjectTicketStore(db_uri)
+    worker = TicketActor(ALICE, uuid4().hex, uuid4().hex)
+    feature = [{"key": "kind", "value": "feature"}]
+    base = f"/v1/projects/{project['id']}/tickets"
+
+    def raise_ask(title: str, question: str) -> str:
+        ticket = store.create(
+            project["id"], CreateTicket(title=title, labels=feature), TicketActor(BOB)
+        )
+        store.update(
+            project["id"],
+            ticket["id"],
+            UpdateTicket(labels=[*feature, {"key": "needs-human"}], comment=question),
+            worker,
+        )
+        return ticket["id"]
+
+    question = raise_ask("Whimsy", "Bob: which whimsy ideas should we build?")
+    approval = raise_ask("Launch", "Carol, can you add product-ok so this can land?")
+
+    async def waiting(ticket_id: str) -> dict:
+        got = await client.get(f"{base}/{ticket_id}", headers=_as_user(ALICE))
+        return got.json()["waiting_on"]
+
+    # A question on a feature waits on its requester; a product-ok ask on approvers.
+    plain = await waiting(question)
+    assert (plain["reason"], plain["responders"]) == ("owner", [BOB])
+    ask = await waiting(approval)
+    assert ask["reason"] == "product-ok" and carol in ask["responders"]
+    assert await _requests(client, BOB) == ["Whimsy"]
+    assert await _requests(client, carol) == ["Launch"]
