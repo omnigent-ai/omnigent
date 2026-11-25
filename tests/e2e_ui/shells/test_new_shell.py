@@ -58,6 +58,7 @@ import httpx
 from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.polling import poll_until
+from tests.e2e_ui._shell_states import wait_until_shells_read
 from tests.e2e_ui.conftest import _server_state, open_right_rail
 
 
@@ -113,8 +114,9 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     )
     expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
-    # The shell sits idle at its prompt, so its x closes it without asking;
+    # Once the runner reads the shell idle at its prompt, its x closes it without asking;
     # its xterm unmounts and the rail returns to its default view.
+    wait_until_shells_read(base_url, session_id, ["idle"])
     close_tab.click()
     expect(terminal_view).to_have_count(0, timeout=30_000)
     expect(page.get_by_role("dialog")).to_have_count(0)
@@ -141,7 +143,7 @@ def test_closing_a_busy_shell_asks_first_naming_its_job(
     page.keyboard.press("Enter")
 
     # Wait until the runner reads the job, so the close can't catch the prompt before it.
-    poll_until(lambda: _shell_states(base_url, session_id) == ["busy"], timeout_s=30)
+    wait_until_shells_read(base_url, session_id, ["busy"])
     dialog = page.get_by_role("dialog")
     close_tab.click()
     expect(dialog).to_contain_text("sleep is running in zsh · u-")
@@ -152,26 +154,6 @@ def test_closing_a_busy_shell_asks_first_naming_its_job(
     expect(dialog).to_contain_text("sleep is running in zsh · u-")
     page.get_by_role("button", name="Close shell").click()
     expect(terminal_view).to_have_count(0, timeout=30_000)
-
-
-def _shell_states(base_url: str, session_id: str) -> list[str]:
-    """What the runner reads in each of the session's user shells, e.g. ``["busy"]``."""
-    terminals = httpx.get(
-        f"{base_url}/v1/sessions/{session_id}/resources/terminals",
-        params={"order": "asc", "limit": 1000},
-        timeout=10.0,
-    )
-    terminals.raise_for_status()
-    states = []
-    for terminal in terminals.json()["data"]:
-        if not terminal["id"].startswith("terminal_zsh"):
-            continue
-        shell = httpx.get(
-            f"{base_url}/v1/sessions/{session_id}/resources/terminals/{terminal['id']}/shell",
-            timeout=10.0,
-        )
-        states.append(shell.json().get("state") if shell.status_code == 200 else "missing")
-    return states
 
 
 def test_new_shell_attaches_while_create_in_flight(
