@@ -174,8 +174,8 @@ function ApprovalRules({ projectId }: { projectId: string }) {
   return (
     <RulesSection title="Who approves what" testId="project-rules-approvals">
       <p className="text-sm text-muted-foreground">
-        A change lands only once it has every sign-off it needs. People add these as labels on the
-        ticket; agents can never add them.
+        A change lands only once it has every sign-off it needs, added as labels on its ticket. The
+        Reviewer sets the review approval; only people can add the others, never agents.
       </p>
       <dl className="divide-y divide-border rounded-md border border-border">
         {SIGN_OFFS.map((signOff) => (

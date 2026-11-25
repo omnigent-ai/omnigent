@@ -125,6 +125,7 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
 /** Project settings, plus an overflow menu to rename or delete the project. */
 function ProjectHomeActions({ projectName }: { projectName: string }) {
   const stagesEnabled = useTicketStagesEnabled();
+  const ticketsEnabled = useProjectTicketsEnabled();
   const info = useServerInfo();
   const mandateEnabled = info !== "loading" && info.project_mandate === true;
   const descriptionEnabled = info !== "loading" && info.project_description === true;
@@ -135,6 +136,10 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
   const { projectId, config } = useProjectHomeConfig(projectName);
+  // The Rules tab needs the board and a real project; a label-only folder keeps the dialog,
+  // whose save creates the project.
+  const rulesPage = ticketsEnabled && projectId !== null;
+  const settingsLabel = rulesPage ? "Project rules and settings" : "Project settings";
   // Members other than the owner and product approvers only read the mandate.
   const viewerId = useViewerId();
   const mandateReadOnly = !canEditMandate(
@@ -167,15 +172,17 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             type="button"
             variant="ghost"
             size="icon-sm"
-            aria-label="Project rules and settings"
+            aria-label={settingsLabel}
             data-testid="project-home-settings"
             className={buttonClass}
-            onClick={() => navigate(projectRulesPath(projectName))}
+            onClick={
+              rulesPage ? () => navigate(projectRulesPath(projectName)) : actions.openSettings
+            }
           >
             <Settings2Icon className={iconClass} />
           </MobileHeaderButton>
         </TooltipTrigger>
-        <TooltipContent side="bottom">Project rules and settings</TooltipContent>
+        <TooltipContent side="bottom">{settingsLabel}</TooltipContent>
       </Tooltip>
       {/* Non-modal on phones, as in the session header: a modal menu leaves itself the only touch target. */}
       <DropdownMenu

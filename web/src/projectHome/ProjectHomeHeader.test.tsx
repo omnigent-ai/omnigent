@@ -192,14 +192,18 @@ afterEach(() => {
 });
 
 describe("ProjectHomeTitle", () => {
-  function renderTitle(stagesEnabled = false) {
+  function renderTitle(stagesEnabled = false, ticketsEnabled = true, projectName = "Payments") {
     render(
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, project_ticket_stages: stagesEnabled }}
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          project_ticket_stages: stagesEnabled,
+          project_tickets: ticketsEnabled,
+        }}
       >
-        <MemoryRouter initialEntries={["/projects/Payments"]}>
+        <MemoryRouter initialEntries={[`/projects/${encodeURIComponent(projectName)}`]}>
           <TooltipProvider>
-            <ProjectHomeTitle projectName="Payments" />
+            <ProjectHomeTitle projectName={projectName} />
           </TooltipProvider>
           <LocationProbe />
         </MemoryRouter>
@@ -263,6 +267,20 @@ describe("ProjectHomeTitle", () => {
     ]);
     fireEvent.click(screen.getByRole("menuitem", { name: "Delete project" }));
     expect(mocks.actions.openDelete).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the settings dialog without the board or for a label-only folder", () => {
+    renderTitle(false, false);
+    fireEvent.click(screen.getByRole("button", { name: "Project settings" }));
+    expect(mocks.actions.openSettings).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("location")).toHaveTextContent("/projects/Payments");
+    expect(screen.getByTestId("location")).not.toHaveTextContent("tab=rules");
+    cleanup();
+
+    renderTitle(false, true, "Ledger");
+    fireEvent.click(screen.getByRole("button", { name: "Project settings" }));
+    expect(mocks.actions.openSettings).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("location")).not.toHaveTextContent("tab=rules");
   });
 
   it("follows a rename to the new project home and leaves after a delete", () => {
@@ -356,7 +374,7 @@ describe("ProjectHomeTitle", () => {
     const actions = screen.getByRole("navigation", { name: "Header actions" });
     expect(
       [...actions.querySelectorAll("button")].map((button) => button.getAttribute("aria-label")),
-    ).toEqual(["New session", "Project rules and settings", "Project actions for Payments"]);
+    ).toEqual(["New session", "Project settings", "Project actions for Payments"]);
   });
 });
 
