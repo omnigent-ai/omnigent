@@ -81,6 +81,7 @@ export type FeatureKey =
   | "workspace_sidebar_v2"
   | "sidebar_saved_views"
   | "floating_panes"
+  | "pull_requests_v2"
   | "shared_session_updates_socket";
 
 /** Deployment-wide release-feature values advertised by the server. */
