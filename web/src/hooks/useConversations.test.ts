@@ -2170,6 +2170,87 @@ it.each(["pin", "reorder"])("refreshes every family list after a %s", async (act
   }
 });
 
+describe("useTogglePinnedConversation nest unpin", () => {
+  const family = { id: "family", representative_id: "head", pinned: true, pinned_at: "1000" };
+  const unpinnedFamily = { ...family, pinned: false, pinned_at: null };
+  const listKey = ["conversations", "", false];
+
+  function seedNest() {
+    const head = conversation({ id: "head", labels: { [PINNED_LABEL_KEY]: "1000" }, family });
+    const member = conversation({ id: "member", family });
+    const ownPin = conversation({ id: "own_pin", labels: { [PINNED_LABEL_KEY]: "500" }, family });
+    const other = conversation({ id: "other", labels: { [PINNED_LABEL_KEY]: "2000" } });
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(listKey, infinitePage([head, member, ownPin]));
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: [other, head, member, ownPin],
+      filterHonored: true,
+    });
+    let settlePatch!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settlePatch = resolve;
+        }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useTogglePinnedConversation(), { wrapper });
+    act(() => result.current.mutate({ id: "head", pinned: false }));
+    const pinnedIds = () =>
+      queryClient
+        .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+        ?.conversations.map((row) => row.id);
+    const listRows = () =>
+      queryClient.getQueryData<ConversationsInfiniteData>(listKey)?.pages.flatMap((p) => p.data);
+    return {
+      queryClient,
+      result,
+      settlePatch: (r: Response) => settlePatch(r),
+      pinnedIds,
+      listRows,
+    };
+  }
+
+  it("leaves the Pinned section while the PATCH is still in flight", async () => {
+    const { queryClient, result, settlePatch, pinnedIds, listRows } = seedNest();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    // A slow PATCH used to leave the nest pinned with no feedback until it returned.
+    expect(pinnedIds()).toEqual(["other", "own_pin"]);
+    expect(listRows()?.map((row) => row.family)).toEqual([
+      unpinnedFamily,
+      unpinnedFamily,
+      unpinnedFamily,
+    ]);
+    expect(listRows()?.[0].labels).toEqual({});
+
+    settlePatch(mockResponse({ id: "head", labels: {}, family: unpinnedFamily }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(queryClient.getQueryState(PINNED_CONVERSATIONS_KEY)?.isInvalidated).toBe(true);
+  });
+
+  it("restores the nest's pin when the PATCH fails", async () => {
+    const toasts: string[] = [];
+    const onToast = (e: Event) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    };
+    window.addEventListener("omnigent:toast", onToast);
+    const { queryClient, result, settlePatch, pinnedIds, listRows } = seedNest();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    settlePatch(mockResponse({}, { ok: false, status: 504 }));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(pinnedIds()).toEqual(["other", "head", "member", "own_pin"]);
+    expect(listRows()?.map((row) => row.family)).toEqual([family, family, family]);
+    expect(listRows()?.[0].labels).toEqual({ [PINNED_LABEL_KEY]: "1000" });
+    expect(queryClient.getQueryState(PINNED_CONVERSATIONS_KEY)?.isInvalidated).toBe(true);
+    expect(toasts).toEqual(["Couldn't unpin the session."]);
+    window.removeEventListener("omnigent:toast", onToast);
+  });
+});
+
 describe("useTogglePinnedConversation failure rollback", () => {
   it.each([
     ["unpin", "3000", false, "Couldn't unpin the session."],
