@@ -27,6 +27,7 @@ from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -1089,6 +1090,33 @@ async def test_list_sessions_filtered_by_project(
     assert resp.status_code == 200
     ids = [s["id"] for s in resp.json()["data"]]
     assert ids == [filed.id]
+
+
+async def test_project_list_paginates_visible_sessions_after_hidden_side_chats(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="project-agent", bundle_location="test:///bundle")
+    archived = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(archived.id, {"omni_project": "X"})
+    conv_store.update_conversation(archived.id, archived=True)
+    for _ in range(20):
+        hidden = conv_store.create_conversation(agent_id=agent_id)
+        conv_store.set_labels(hidden.id, {"omni_project": "X", SIDE_CHAT_LABEL_KEY: "1"})
+    visible = [conv_store.create_conversation(agent_id=agent_id) for _ in range(2)]
+    for session in visible:
+        conv_store.set_labels(session.id, {"omni_project": "X"})
+
+    response = await client.get(
+        "/v1/sessions",
+        params={"project": "X", "visibility": "mine", "limit": 20, "expand_families": "true"},
+    )
+    assert response.status_code == 200
+    assert {item["id"] for item in response.json()["data"]} == {item.id for item in visible}
+    assert response.json()["has_more"] is False
 
 
 async def test_list_sessions_empty_project_returns_unfiled(
