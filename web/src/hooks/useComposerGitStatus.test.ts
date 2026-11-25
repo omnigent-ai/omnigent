@@ -13,6 +13,7 @@ const usePullRequestInfosMock = vi.fn<(id: string | undefined, urls: string[]) =
 );
 const useSessionPullRequestsMock = vi.fn(() => ({ data: undefined as unknown }));
 const refreshPullRequestsMock = vi.fn(() => Promise.resolve());
+const useRefreshPullRequestInfoMock = vi.fn((_id: string | undefined) => refreshPullRequestsMock);
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -25,7 +26,7 @@ vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
   usePullRequestInfos: (id: string | undefined, urls: string[]) =>
     usePullRequestInfosMock(id, urls),
-  useRefreshPullRequestInfo: () => refreshPullRequestsMock,
+  useRefreshPullRequestInfo: (id: string | undefined) => useRefreshPullRequestInfoMock(id),
 }));
 vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => ({
   storedListToShow: (await importOriginal<typeof UseSessionPullRequestsModule>()).storedListToShow,
@@ -79,6 +80,7 @@ afterEach(() => {
   useSessionPullRequestsMock.mockReset();
   useSessionPullRequestsMock.mockReturnValue({ data: undefined });
   refreshPullRequestsMock.mockClear();
+  useRefreshPullRequestInfoMock.mockClear();
 });
 
 const FORGE_DISPLAY = {
@@ -565,6 +567,7 @@ describe("useComposerGitStatus", () => {
     refresh();
     expect(wtRefetch).toHaveBeenCalledTimes(1);
     // PR info is invalidated rather than refetched, so it reads GitHub fresh.
+    expect(useRefreshPullRequestInfoMock).toHaveBeenCalledWith("conv-1");
     expect(refreshPullRequestsMock).toHaveBeenCalledTimes(1);
     expect(ghRefetch).not.toHaveBeenCalled();
     expect(detailRefetch).not.toHaveBeenCalled();
