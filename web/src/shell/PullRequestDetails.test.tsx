@@ -433,13 +433,13 @@ it("keeps no copies of other files and drops the oldest media copies past the ca
   expect(copies.revoked).toEqual(["blob:copy-1"]);
 });
 
-it("renders GitHub :shortcode: emoji, leaving code spans literal", async () => {
+it("renders GitHub :shortcode: emoji alongside the default GFM, leaving code spans literal", async () => {
   render(
     <QueryClientProvider client={new QueryClient()}>
       <PullRequestDescription
         conversationId="conv_1"
         prUrl={PR_URL}
-        body={"Ship it :tada:\n\nKeep `:tada:` as written."}
+        body={"Ship it :tada:\n\nKeep `:tada:` as written, ~~not this~~."}
         editable={false}
         attachments={false}
       />
@@ -447,6 +447,8 @@ it("renders GitHub :shortcode: emoji, leaving code spans literal", async () => {
   );
   expect(await screen.findByText("Ship it 🎉")).toBeInTheDocument();
   expect(screen.getByText(":tada:").tagName).toBe("CODE");
+  // Strikethrough comes from Streamdown's default remark-gfm, which the emoji plugin must extend.
+  expect(screen.getByText("not this").tagName).toBe("DEL");
 });
 
 it("falls back to GitHub, and says so when GitHub can't serve the image", () => {
