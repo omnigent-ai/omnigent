@@ -87,8 +87,24 @@ export async function fetchHosts(
 // manual targets is misleading. Hosts from older servers lack the
 // field and are kept. `includeSandbox` opts a caller (the chat-header
 // HostBadge) back into seeing them so it can label sandbox sessions.
-function withoutSandboxHosts(hosts: Host[], sourceHostId?: string | null): Host[] {
+export function withoutSandboxHosts(hosts: Host[], sourceHostId?: string | null): Host[] {
   return hosts.filter((h) => !h.sandbox_provider || h.host_id === sourceHostId);
+}
+
+/** The one cache entry every `useHosts` consumer reads: the unfiltered host list. */
+const HOSTS_QUERY_KEY = ["hosts", { includeSandbox: true }] as const;
+
+/**
+ * Fetch the host list now and store it where every `useHosts` consumer reads it,
+ * so a host the caller just found shows in the pickers without another poll.
+ * Unfiltered; pass it through `withoutSandboxHosts` for picker semantics.
+ */
+export function fetchHostsNow(queryClient: QueryClient): Promise<Host[]> {
+  return queryClient.fetchQuery({
+    queryKey: HOSTS_QUERY_KEY,
+    queryFn: () => fetchHosts(true),
+    staleTime: 0,
+  });
 }
 
 interface UseHostsOptions {
@@ -114,7 +130,7 @@ export function useHosts(options: UseHostsOptions = {}) {
   return useQuery({
     // Every consumer shares the one unfiltered list, so a page mixing pickers
     // and badges polls /v1/hosts once; pickers filter it in `select`.
-    queryKey: ["hosts", { includeSandbox: true }],
+    queryKey: HOSTS_QUERY_KEY,
     queryFn: () => fetchHosts(true),
     select: includeSandbox ? undefined : select,
     enabled,

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cancelHarnessLogin,
   fetchHarnessLogin,
+  fetchHostsNow,
   installHarnessOnHost,
   logoutHarnessOnHost,
   refreshHarnessAccountsOnHost,
@@ -17,6 +18,7 @@ import {
   useInstallHarness,
   useInstallingHarnesses,
   useStoreCredential,
+  withoutSandboxHosts,
 } from "./useHosts";
 import * as host from "@/lib/host";
 import { ApiError } from "@/lib/sessionsApi";
@@ -408,6 +410,36 @@ describe("useHosts", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("shows a freshly fetched host in the pickers without another poll, sandbox hosts excluded", async () => {
+    // The connect-Arca poll and the harness fix dialog fetch the list on demand
+    // and select a host from it; the picker must list that host right away.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const clientWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const laptop = { host_id: "host_laptop", name: "Laptop", owner: "alice", status: "online" };
+    const arca = { host_id: "host_arca", name: "Arca", owner: "alice", status: "online" };
+    const sandbox = { ...arca, host_id: "host_sandbox", sandbox_provider: "lakebox" };
+    fetchMock.mockResolvedValueOnce(mockResponse({ hosts: [laptop] }));
+    const { result } = renderHook(() => useHosts({ refetchOnFocus: true }), {
+      wrapper: clientWrapper,
+    });
+    await waitFor(() =>
+      expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop"]),
+    );
+
+    fetchMock.mockResolvedValueOnce(mockResponse({ hosts: [laptop, arca, sandbox] }));
+    let fetched: string[] = [];
+    await act(async () => {
+      fetched = withoutSandboxHosts(await fetchHostsNow(client)).map((h) => h.host_id);
+    });
+    expect(fetched).toEqual(["host_laptop", "host_arca"]);
+    await waitFor(() =>
+      expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_arca"]),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("refetches on window focus so a missed readiness push recovers on tab return", async () => {
