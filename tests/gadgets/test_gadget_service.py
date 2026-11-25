@@ -1405,6 +1405,64 @@ def test_rules_published_again_count_the_writes_made_without_them(
             assert run["value"] == {"state": "done"}
 
 
+def test_a_rebuild_over_many_unique_keys_keeps_the_collection_writable(gadgets: Fixture) -> None:
+    # 201 unique keys fit in the rule state, but the old keys plus a rebuild's first page of
+    # new ones would not: a rebuild after a message-only republish must drop the old ones.
+    service = gadgets.service()
+    rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = publish_ruled_board(service, [rule])
+    created = [
+        rpc(
+            service,
+            app,
+            "create",
+            id=f"c{index:063d}",
+            value={"title": f"t{index:03d}", "column": "todo"},
+            operation_id=f"c-{index}",
+        )
+        for index in range(201)
+    ]
+    reworded = ruled_revision(service, app["id"], [{**rule, "message": "Titles are unique"}])
+    app = _republish(service, app, reworded)
+
+    rpc(
+        service,
+        app,
+        "delete",
+        id=created[0]["id"],
+        if_version=created[0]["version"],
+        operation_id="d-0",
+    )
+    replaced = rpc(
+        service,
+        app,
+        "replace",
+        id=created[1]["id"],
+        value={"title": "t001", "column": "doing"},
+        if_version=created[1]["version"],
+        operation_id="r-1",
+    )
+    assert replaced["value"]["column"] == "doing"
+    with pytest.raises(ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "create",
+            id="dup",
+            value={"title": "t002", "column": "todo"},
+            operation_id="c-dup",
+        )
+    # The deleted record's title is free again.
+    rpc(
+        service,
+        app,
+        "create",
+        id="again",
+        value={"title": "t000", "column": "todo"},
+        operation_id="c-again",
+    )
+
+
 def test_deleting_a_referenced_record_reads_only_the_records_that_name_it(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

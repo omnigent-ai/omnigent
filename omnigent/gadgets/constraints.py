@@ -934,7 +934,10 @@ class ConstraintGuard:
         generation = progress["generation"]
         assert isinstance(generation, int)
         if progress["todo"]:
-            updated = {**value, "rebuild": progress, "writes": writes}
+            # The old counts and keys no longer describe the rules being rebuilt, and no write
+            # reads them until the rebuild commits (writes help with it first, and a pending
+            # change was finished before it began), so they make room for the new ones.
+            updated = {**value, "counts": {}, "unique": {}, "rebuild": progress, "writes": writes}
         else:
             updated = {
                 **value,

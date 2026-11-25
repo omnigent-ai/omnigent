@@ -2304,6 +2304,85 @@ def test_a_long_cleanup_backlog_is_read_a_bounded_part_at_a_time(tmp_path, monke
     assert all(worked.count(user) == 1 for user in users[::3])
 
 
+def test_a_head_update_stopped_half_way_leaves_the_queue_readable(tmp_path, monkeypatch) -> None:
+    """A note sent to a later segment, then the queue's head update stops while retiring the
+    emptied first segment: reopened, the queue still finds the note, and only its cleanup
+    runs."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    files = DeletedAccountGadgets._files_of(store)
+    stop = {"heads": False}
+
+    class StoppingFiles:
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(files, name)
+
+        def create_json(self, path: str, value: dict) -> None:
+            if stop["heads"] and path.startswith("queue/head"):
+                raise OSError("stopped writing the head")
+            files.create_json(path, value)
+
+    queue = gadget_accounts._CleanupQueue(StoppingFiles())  # type: ignore[arg-type]
+    queue.add("alice", "r1", 0)
+    name = f"{gadget_accounts._key('alice', 'r1')}.json"
+    queue.to_back(0, name, queue.read(0, name))  # Now in segment 1; segment 0 is empty.
+    stop["heads"] = True
+    with pytest.raises(OSError):
+        queue.front(5)  # Retiring segment 0 stops at the head update.
+
+    worked: list[str | None] = []
+    reopened = DeletedAccountGadgets(LocalGadgetStore(str(tmp_path / "gadgets")), NoGrants())  # type: ignore[arg-type]
+    monkeypatch.setattr(reopened, "_step", lambda user, registration: worked.append(user) or True)
+    reopened.resume()
+    assert worked == ["alice"]
+    assert reopened._queue().front(5) == []
+
+
+def test_a_deletion_whose_queueing_fails_is_cleaned_up_after_a_restart(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    """The queue is busy when the deletion tries to queue its cleanup: the intent it wrote
+    first gets it queued later, so a restarted server finishes it without the name being
+    registered again."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import Conflict as StoreConflict
+
+    monkeypatch.setattr(gadget_accounts, "GADGETS_PER_CLEANUP", 1)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, access, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    boards = [alice.create(f"Synthetic board {n}") for n in range(3)]
+
+    real_add = gadget_accounts._CleanupQueue.add
+    calls = {"n": 0}
+
+    def busy_once(self, user_id, registration, workspace):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StoreConflict("The gadget cleanup queue is busy", reason="busy")
+        return real_add(self, user_id, registration, workspace)
+
+    monkeypatch.setattr(gadget_accounts._CleanupQueue, "add", busy_once)
+    assert accounts.delete_user("alice") is True
+    left = list(store.iter_owned("alice", owner_registration=alice.registration))
+    assert left, "one call deletes one gadget here, so some are left for later"
+
+    restarted = DeletedAccountGadgets(store, access)
+    for _ in range(5):
+        restarted.resume()
+    assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
+    assert all(store.get(board["id"]) is None for board in boards)
+
+
 def test_an_account_named_like_the_cleanup_scope_keeps_the_others_cleanup_notes(
     tmp_path, monkeypatch
 ) -> None:
