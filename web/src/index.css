@@ -35,6 +35,12 @@
   }
 }
 
+/* Trims a label's box to its cap height so it centres optically in a control;
+   the system font's extra ascent otherwise sits the ink about 1px high. */
+@utility text-optical {
+  text-box: trim-both cap alphabetic;
+}
+
 @theme inline {
   --font-heading: var(--font-sans);
   /* Native system UI font stack — defers to whatever the OS ships

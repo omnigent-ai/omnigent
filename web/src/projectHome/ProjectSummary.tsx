@@ -1,6 +1,6 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowDownIcon, ArrowUpIcon, PencilIcon } from "lucide-react";
+import { AlignLeftIcon, ArrowDownIcon, ArrowUpIcon, PencilIcon, SquareKanbanIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -409,53 +409,57 @@ function NumberCell({
   );
 }
 
-/** Switches the project page between its ticket board and its Summary. */
 /**
- * Board / Summary, one row in the same place on both views, with an optional
- * control (the board's ticket filter) at its right end.
+ * The project's view toolbar, in the same place on both views: the Board /
+ * Summary switch, an optional control after it (the board's ticket filter) and
+ * optional tools at the right end.
  */
 export function ProjectHomeTabs({
   summaryOpen,
   onChange,
   className,
   trailing,
+  end,
 }: {
   summaryOpen: boolean;
   onChange: (summary: boolean) => void;
   className?: string;
   trailing?: ReactNode;
+  end?: ReactNode;
 }) {
   return (
     <div
       className={cn(
-        "mx-4 mb-3 flex shrink-0 items-center gap-3 border-b border-border/70",
+        // Named like the top bar so tools moved here collapse at the same widths.
+        "@container/topbar mx-4 mb-3 flex shrink-0 items-center gap-3 border-b border-border/70 pb-2.5",
         className,
       )}
     >
-      <div role="tablist" aria-label="Project views" className="flex gap-4">
+      <div role="tablist" aria-label="Project views" className="flex rounded-[9px] bg-muted p-0.5">
         {[
-          { summary: false, label: "Board" },
-          { summary: true, label: "Summary" },
-        ].map((tab) => (
-          <Button
-            key={tab.label}
-            role="tab"
-            variant="ghost"
-            size="sm"
-            aria-selected={summaryOpen === tab.summary}
-            // One weight for both, so selecting a tab never changes its width.
-            className={cn(
-              // A transparent top border balances the underline, so the label sits centred.
-              "-mb-px inline-flex h-10 items-center rounded-none border-0 border-y-2 border-t-transparent px-0.5 leading-none font-medium hover:bg-transparent",
-              summaryOpen === tab.summary
-                ? "border-b-foreground text-foreground"
-                : "border-b-transparent text-muted-foreground hover:text-foreground",
-            )}
-            onClick={() => onChange(tab.summary)}
-          >
-            {tab.label}
-          </Button>
-        ))}
+          { summary: false, label: "Board", Icon: SquareKanbanIcon },
+          { summary: true, label: "Summary", Icon: AlignLeftIcon },
+        ].map(({ summary, label, Icon }) => {
+          const selected = summaryOpen === summary;
+          return (
+            <button
+              key={label}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              className={cn(
+                "inline-flex h-7 items-center gap-1.5 rounded-[7px] px-2.5 text-[13px] font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                selected
+                  ? "bg-background text-foreground shadow-xs dark:bg-white/12"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              onClick={() => onChange(summary)}
+            >
+              <Icon aria-hidden className="size-3.5" />
+              <span className="text-optical">{label}</span>
+            </button>
+          );
+        })}
       </div>
       {trailing && (
         <>
@@ -463,6 +467,7 @@ export function ProjectHomeTabs({
           <div className="flex items-center">{trailing}</div>
         </>
       )}
+      {end && <div className="ml-auto flex min-w-0 items-center gap-1">{end}</div>}
     </div>
   );
 }

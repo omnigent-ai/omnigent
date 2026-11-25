@@ -31,7 +31,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
 vi.mock("@/projectHome/useProjectTickets", () => ({
   useProjectTicketsEnabled: () => mocks.ticketsEnabled,
   // No project row, so the board's seen marker and file viewer stay idle.
-  useTicketProject: () => ({ projectId: null }),
+  useTicketProject: () => ({ projectId: null, projects: { isLoading: false, isError: false } }),
 }));
 vi.mock("@/projectHome/ProjectOrchestrator", () => ({
   ProjectOrchestrator: ({ onClose }: { onClose?: () => void }) => (

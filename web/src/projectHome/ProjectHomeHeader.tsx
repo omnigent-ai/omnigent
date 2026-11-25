@@ -35,7 +35,6 @@ import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
 import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
 import { ProjectBoardActions } from "./ProjectBoardActions";
-import { ProjectCostBadge } from "./ProjectCost";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { useViewerId } from "@/hooks/useViewerId";
 import { canEditMandate, ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
@@ -92,9 +91,6 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
       />
       {/* The name keeps a readable minimum; the actions to its right collapse first. */}
       <h1 className="min-w-24 truncate text-lg font-medium text-foreground">{projectName}</h1>
-      <div className="shrink-0 @max-[60rem]/topbar:hidden">
-        <ProjectCostBadge projectId={projectId} />
-      </div>
       <div className="flex shrink-0 items-center">
         <ProjectHomeActions projectName={projectName} />
       </div>
@@ -109,7 +105,10 @@ export function ProjectHomeHeaderActions({ projectName }: { projectName: string 
   return (
     <>
       {tickets ? (
-        <ProjectBoardActions projectName={projectName}>
+        <ProjectBoardActions
+          projectName={projectName}
+          newSessionPath={projectNewSessionPath(projectName)}
+        >
           <ProjectNewSessionButton projectName={projectName} />
         </ProjectBoardActions>
       ) : (

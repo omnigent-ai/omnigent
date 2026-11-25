@@ -27,6 +27,7 @@ import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
 import { ProjectOrchestrator, ProjectPersonaChat } from "@/projectHome/ProjectOrchestrator";
 import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
+import { ProjectViewTools } from "@/projectHome/ProjectBoardActions";
 import { ProjectHomeTabs, ProjectSummary } from "@/projectHome/ProjectSummary";
 import {
   TicketBoardRequesterFilter,
@@ -137,6 +138,9 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
     navigate(`${projectHomePath(projectName)}${next.size ? `?${next}` : ""}`);
   };
 
+  // Phones keep these tools in the top bar.
+  const viewTools = isMobile ? undefined : <ProjectViewTools projectName={projectName} />;
+
   if (panelSessionId) return <ProjectSessionPanel sessionId={panelSessionId} />;
   if (tickets && !orchestrator && !panelTicketId && isLegacyOrchestratorLink(searchParams))
     return (
@@ -150,7 +154,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
       <div className="relative flex min-h-0 flex-1 flex-col">
         <ProjectFileViewerHost projectId={projectId} />
         <PageScroll maxWidthClassName="max-w-none" extraTop={isMobile ? "0.25rem" : "0.5rem"}>
-          <ProjectHomeTabs summaryOpen onChange={showTab} />
+          <ProjectHomeTabs summaryOpen onChange={showTab} end={viewTools} />
           <ProjectSummary key={projectName} projectName={projectName} />
         </PageScroll>
       </div>
@@ -172,6 +176,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
           <ProjectHomeTabs
             summaryOpen={false}
             onChange={showTab}
+            end={viewTools}
             trailing={
               <TicketBoardRequesterFilter mine={boardMine} onChange={setBoardMine} compact />
             }

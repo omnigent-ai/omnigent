@@ -166,7 +166,7 @@ function ProjectSourcesControl({ projectId, projectName }: ProjectTicketSourcesP
             ) : (
               <PlugIcon aria-hidden className="size-4 text-muted-foreground" />
             )}
-            <span className="@max-[72rem]/topbar:hidden">
+            <span className="@max-[60rem]/topbar:hidden">
               {sources.length || loading || loadError ? "Sources" : "Connect source"}
             </span>
             {sources.length > 0 && (

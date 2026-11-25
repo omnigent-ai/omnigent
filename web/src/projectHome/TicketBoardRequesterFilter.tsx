@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ButtonGroup } from "@/components/ui/button-group";
+import { useViewerId } from "@/hooks/useViewerId";
+import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 
 function requesterFilterKey(projectId: string) {
@@ -61,34 +63,7 @@ export function TicketBoardRequesterFilter({
     { value: false, label: "All tickets" },
     { value: true, label: "Your tickets" },
   ];
-  if (compact)
-    // A pill switch, unlike the underlined tabs beside it: it filters the board, it isn't a page.
-    return (
-      <div
-        role="group"
-        aria-label="Filter tickets by requester"
-        data-testid="ticket-requester-filter"
-        className="inline-flex rounded-full border border-border bg-background p-0.5"
-      >
-        {options.map((option) => (
-          <button
-            key={option.label}
-            type="button"
-            aria-pressed={mine === option.value}
-            title={option.value ? "Only tickets you requested" : undefined}
-            onClick={() => onChange(option.value)}
-            className={cn(
-              "inline-flex h-7 items-center justify-center rounded-full px-3 text-[13px] leading-none font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-              mine === option.value
-                ? "bg-foreground text-background shadow-xs"
-                : "text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {option.label}
-          </button>
-        ))}
-      </div>
-    );
+  if (compact) return <RequesterFilterChips mine={mine} onChange={onChange} />;
   return (
     <ButtonGroup aria-label="Filter tickets by requester" data-testid="ticket-requester-filter">
       {options.map((option) => (
@@ -105,5 +80,59 @@ export function TicketBoardRequesterFilter({
         </Button>
       ))}
     </ButtonGroup>
+  );
+}
+
+/** The view toolbar's filter chips; the selected chip takes the brand accent. */
+function RequesterFilterChips({
+  mine,
+  onChange,
+}: {
+  mine: boolean;
+  onChange: (mine: boolean) => void;
+}) {
+  const viewerId = useViewerId();
+  const chip = (selected: boolean) =>
+    cn(
+      "inline-flex h-7 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium ring-1 transition-colors ring-inset focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+      selected
+        ? "bg-brand-accent/10 text-brand-accent ring-brand-accent/35"
+        : "text-muted-foreground ring-border hover:bg-accent hover:text-foreground",
+    );
+  return (
+    <div
+      role="group"
+      aria-label="Filter tickets by requester"
+      data-testid="ticket-requester-filter"
+      className="flex items-center gap-1.5"
+    >
+      <button
+        type="button"
+        aria-pressed={!mine}
+        onClick={() => onChange(false)}
+        className={chip(!mine)}
+      >
+        <span className="text-optical">All tickets</span>
+      </button>
+      <button
+        type="button"
+        aria-pressed={mine}
+        aria-label="Your tickets"
+        title="Only tickets you requested"
+        onClick={() => onChange(true)}
+        className={cn(chip(mine), viewerId && "pl-1")}
+      >
+        {viewerId && (
+          <span
+            aria-hidden
+            className="inline-flex size-5 items-center justify-center rounded-full text-[9px] font-semibold text-white"
+            style={{ backgroundColor: userColor(viewerId) }}
+          >
+            <span className="text-optical">{userInitials(viewerId)}</span>
+          </span>
+        )}
+        <span className="text-optical">Yours</span>
+      </button>
+    </div>
   );
 }

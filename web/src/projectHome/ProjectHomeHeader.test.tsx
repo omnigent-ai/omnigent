@@ -9,6 +9,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import * as ticketsApi from "@/lib/projectTicketsApi";
 import type * as ConversationsModule from "@/hooks/useConversations";
+import { ProjectViewTools } from "./ProjectBoardActions";
 import {
   ProjectBoardSearch,
   ProjectHomeHeaderActions,
@@ -137,7 +138,12 @@ function renderButton() {
 
 const clients: QueryClient[] = [];
 
-function renderNavigation(view: "chat" | "board" = "board", stages = true, summary = false) {
+function renderNavigation(
+  view: "chat" | "board" = "board",
+  stages = true,
+  summary = false,
+  viewToolbar = true,
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   clients.push(client);
   const rendered = render(
@@ -156,6 +162,7 @@ function renderNavigation(view: "chat" | "board" = "board", stages = true, summa
               <ProjectHomeTitle projectName="Billing & Payments" />
               <ProjectHomeHeaderActions projectName="Billing & Payments" />
             </header>
+            {viewToolbar && <ProjectViewTools projectName="Billing & Payments" />}
           </TooltipProvider>
           <LocationProbe />
         </MemoryRouter>
@@ -211,9 +218,19 @@ describe("ProjectHomeTitle", () => {
       "href",
       "/projects/Billing%20%26%20Payments/orchestrator",
     );
-    expect(within(actions).getByRole("button", { name: "Connect source" })).toBeVisible();
-    expect(within(actions).getByRole("button", { name: "New session" })).toBeVisible();
+    // Sources sit in the view toolbar on desktop; New session in New ticket's menu.
+    expect(within(actions).queryByRole("button", { name: "Connect source" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Connect source" })).toBeVisible();
+    expect(within(actions).getByRole("button", { name: "More ways to start" })).toBeVisible();
     expect(within(actions).getByRole("link", { name: "New ticket" })).toBeVisible();
+  });
+
+  it("keeps sources and files in the top bar while no view toolbar shows them", () => {
+    renderNavigation("board", true, false, false);
+    const actions = within(screen.getByRole("banner")).getByRole("group", {
+      name: "Project actions",
+    });
+    expect(within(actions).getAllByRole("button", { name: "Connect source" })).toHaveLength(1);
   });
 
   it("keeps all project actions accessible in the phone header", () => {
@@ -361,7 +378,7 @@ describe("ProjectBoardSearch", () => {
 });
 
 describe("ProjectNewSessionButton", () => {
-  it("keeps New session beside New ticket and sends it to the full project composer", () => {
+  it("starts a session from New ticket's menu, in the full project composer", () => {
     renderNavigation();
     expect(screen.getByRole("link", { name: "Lead" })).toHaveAttribute(
       "href",
@@ -374,13 +391,13 @@ describe("ProjectNewSessionButton", () => {
     );
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
-    const button = screen.getByRole("button", { name: "New session" });
     const source = screen.getByRole("button", { name: "Connect source" });
     expect(source).toHaveAttribute("data-project-id", "project-2");
     expect(source).toHaveAttribute("data-project-name", "Billing & Payments");
-    expect(newTicket.previousElementSibling).toBe(button);
-    expect(button).not.toHaveAttribute("aria-expanded");
-    fireEvent.click(button);
+    const menu = screen.getByRole("button", { name: "More ways to start" });
+    expect(newTicket.nextElementSibling).toBe(menu);
+    fireEvent.pointerDown(menu, { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "New session" }));
     expect(screen.getByTestId("location")).toHaveTextContent(
       /^\/\?project=Billing%20%26%20Payments$/,
     );

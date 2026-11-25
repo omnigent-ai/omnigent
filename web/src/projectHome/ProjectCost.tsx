@@ -64,7 +64,14 @@ const COST_PILL_CLASS =
   "shrink-0 rounded-md border border-border/60 px-1.5 py-0.5 text-xs tabular-nums text-muted-foreground";
 
 /** The project header's trailing-7-day agent cost. */
-export function ProjectCostBadge({ projectId }: { projectId: string | null }) {
+export function ProjectCostBadge({
+  projectId,
+  plain = false,
+}: {
+  projectId: string | null;
+  /** Plain text for the view toolbar, instead of a bordered pill. */
+  plain?: boolean;
+}) {
   const query = useQuery({
     queryKey: ["project-cost", projectId, PROJECT_COST_DAYS],
     queryFn: () => getProjectCost(projectId!),
@@ -77,9 +84,18 @@ export function ProjectCostBadge({ projectId }: { projectId: string | null }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span data-testid="project-cost-t7d" className={COST_PILL_CLASS}>
-          {amount} · 7d
-        </span>
+        {plain ? (
+          <span
+            data-testid="project-cost-t7d"
+            className="shrink-0 px-2 text-[13px] whitespace-nowrap text-muted-foreground"
+          >
+            <span className="font-medium text-foreground tabular-nums">{amount}</span> last 7 days
+          </span>
+        ) : (
+          <span data-testid="project-cost-t7d" className={COST_PILL_CLASS}>
+            {amount} · 7d
+          </span>
+        )}
       </TooltipTrigger>
       <TooltipContent side="bottom">
         Agent cost in this project over the last {query.data.days} days (UTC, since{" "}

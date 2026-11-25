@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { UsersIcon } from "lucide-react";
+import { UserPlusIcon, UsersIcon } from "lucide-react";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,8 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { openProjectIdentitySession, type ProjectIdentity } from "@/lib/projectsApi";
-import { useNavigate, useSearchParams } from "@/lib/routing";
+import { Link, useNavigate, useSearchParams } from "@/lib/routing";
+import { cn } from "@/lib/utils";
 import { personaPanelPath } from "./projectHomeNavigation";
 import { ProjectTeamDialog } from "./ProjectTeamDialog";
 import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentities";
@@ -33,7 +34,7 @@ export function ProjectIdentityRoster({
 }: {
   projectId: string | null;
   projectName: string;
-  /** On phones the Lead joins the Team menu; omit when the project has no Lead. */
+  /** The Lead leads the avatar stack (on phones, the Team menu); omit when the project has no Lead. */
   leadPath?: string;
 }) {
   const isMobile = useIsMobileViewport();
@@ -117,97 +118,115 @@ export function ProjectIdentityRoster({
   const limit = VISIBLE_ROSTER_LIMIT;
   const visible = ordered.slice(0, limit);
   const hidden = ordered.slice(limit);
+  const lead = identities.data?.find((identity) => identity.builtin);
+  // Overlapping avatars; a ring in the page color separates neighbours.
+  const avatarButton =
+    "relative size-7 rounded-full p-0 ring-2 ring-background hover:z-10 hover:bg-transparent focus-visible:z-10";
+  const busyMark = (
+    <RunningDot className="absolute -right-0.5 -bottom-0.5 size-3 rounded-full bg-background p-px" />
+  );
   return (
     <div
-      className="flex items-center gap-1"
+      className="flex items-center gap-1.5"
       role="group"
       aria-label="Project identities"
       data-testid="project-identity-roster"
     >
-      {visible.map((identity) => {
-        const busy = identity.active_session_state === "busy";
-        const pending = open.isPending && open.variables?.id === identity.id;
-        return (
-          <Tooltip key={identity.id}>
+      <div className="flex items-center -space-x-1.5">
+        {leadPath !== undefined && (
+          <Tooltip>
             <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size={isMobile ? "icon" : "sm"}
-                // Names show only in a wide header; the avatar and tooltip identify each persona.
-                className="@max-[104rem]/topbar:size-8 @max-[104rem]/topbar:px-0"
-                aria-label={`Talk to ${identity.name}${busy ? " (working)" : ""}`}
-                data-testid="project-identity-button"
-                loading={pending}
-                onClick={() => open.mutate(identity)}
-              >
-                <PersonaAvatar name={identity.name} size="xs" />
-                {!isMobile && (
-                  <span className="max-w-28 truncate @max-[104rem]/topbar:hidden">
-                    {identity.name}
-                  </span>
-                )}
-                {busy && <RunningDot />}
+              <Button asChild variant="ghost" className={avatarButton}>
+                <Link to={leadPath} aria-label="Lead">
+                  <PersonaAvatar name={leadName ?? "Lead"} className="size-7 text-[0.625rem]" />
+                  {lead?.active_session_state === "busy" && busyMark}
+                </Link>
               </Button>
             </TooltipTrigger>
             <TooltipContent side="bottom">
-              <span className="font-medium">{identity.name}</span>
-              {": "}
-              {busy
-                ? `${identity.name} is working; open its session`
-                : identity.active_session_id
-                  ? `Open ${identity.name}'s session`
-                  : `Start a session with ${identity.name}`}
-              {identity.router && ". It receives ticket events and escalations."}
+              <span className="font-medium">{leadName ?? "Lead"}</span>: coordinates the board
             </TooltipContent>
           </Tooltip>
-        );
-      })}
-      {hidden.length > 0 && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label={`${hidden.length} more personas`}
-              data-testid="project-identity-more"
-              className="text-xs text-muted-foreground tabular-nums"
-            >
-              +{hidden.length}
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            {hidden.map((identity) => (
-              <DropdownMenuItem
-                key={identity.id}
-                className="gap-2"
-                onSelect={() => open.mutate(identity)}
+        )}
+        {visible.map((identity) => {
+          const busy = identity.active_session_state === "busy";
+          const pending = open.isPending && open.variables?.id === identity.id;
+          return (
+            <Tooltip key={identity.id}>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className={avatarButton}
+                  aria-label={`Talk to ${identity.name}${busy ? " (working)" : ""}`}
+                  data-testid="project-identity-button"
+                  disabled={pending}
+                  onClick={() => open.mutate(identity)}
+                >
+                  <PersonaAvatar name={identity.name} className="size-7 text-[0.625rem]" />
+                  {(busy || pending) && busyMark}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                <span className="font-medium">{identity.name}</span>
+                {": "}
+                {busy
+                  ? `${identity.name} is working; open its session`
+                  : identity.active_session_id
+                    ? `Open ${identity.name}'s session`
+                    : `Start a session with ${identity.name}`}
+                {identity.router && ". It receives ticket events and escalations."}
+              </TooltipContent>
+            </Tooltip>
+          );
+        })}
+        {hidden.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                aria-label={`${hidden.length} more personas`}
+                data-testid="project-identity-more"
+                className={cn(
+                  avatarButton,
+                  "bg-muted text-[0.625rem] font-semibold text-muted-foreground tabular-nums hover:bg-accent",
+                )}
               >
-                <PersonaAvatar name={identity.name} size="xs" />
-                <span className="max-w-48 truncate">{identity.name}</span>
-                {identity.active_session_state === "busy" && <RunningDot />}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
+                +{hidden.length}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {hidden.map((identity) => (
+                <DropdownMenuItem
+                  key={identity.id}
+                  className="gap-2"
+                  onSelect={() => open.mutate(identity)}
+                >
+                  <PersonaAvatar name={identity.name} size="xs" />
+                  <span className="max-w-48 truncate">{identity.name}</span>
+                  {identity.active_session_state === "busy" && <RunningDot />}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
             type="button"
             variant="ghost"
-            size="icon-sm"
-            aria-label="Edit team"
+            aria-label="Add a role"
             data-testid="project-edit-team"
-            className="text-muted-foreground"
+            className="size-7 rounded-full border border-dashed border-muted-foreground/50 p-0 text-muted-foreground hover:border-foreground/60 hover:bg-transparent hover:text-foreground"
             onClick={() => setEditing(true)}
           >
-            <UsersIcon />
+            <UserPlusIcon className="size-3.5" />
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          {open.error ? `Could not open: ${open.error.message}` : "Team"}
+          {open.error ? `Could not open: ${open.error.message}` : "Add a role or edit the team"}
         </TooltipContent>
       </Tooltip>
       {editing && (
