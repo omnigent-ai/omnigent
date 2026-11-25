@@ -13,6 +13,28 @@ describe("useReplyDraft in single-document mode", () => {
     expect(result.current.fullText).toBe(before);
     expect(result.current.draft.quotes).toHaveLength(1);
   });
+  it("writes only the tail, so a command's text keeps the quotes and the text before them", () => {
+    const { result } = renderHook(() => useReplyDraft(true));
+    act(() => result.current.replaceText("Opener", undefined));
+    act(() => result.current.appendQuote("Quoted"));
+    act(() => result.current.setValue("/side "));
+    expect(result.current.draft.quotes).toHaveLength(1);
+    expect(result.current.draft.quotes[0]!.text).toBe("Quoted");
+    expect(result.current.draft.text).toBe("/side ");
+    act(() => result.current.setValue(""));
+    expect(result.current.draft.quotes).toHaveLength(1);
+    expect(result.current.draft.text).toBe("");
+  });
+
+  it("takes the editor's own document as it stands, keeping the cards it holds", () => {
+    const { result } = renderHook(() => useReplyDraft(true));
+    const card = replyQuoteLine({ id: "kept", text: "Kept" });
+    act(() => result.current.setEditorDocument(`Head\n${card}\nTail`));
+    expect(result.current.draft.quotes).toEqual([{ id: "kept", before: "Head", text: "Kept" }]);
+    expect(result.current.draft.text).toBe("Tail");
+    expect(result.current.replyDocument).toBe(`Head\n${card}\nTail`);
+  });
+
   it("keeps a card when text is appended to a document that ends on one", () => {
     const { result } = renderHook(() => useReplyDraft(true));
     act(() => result.current.appendQuote("Quoted"));

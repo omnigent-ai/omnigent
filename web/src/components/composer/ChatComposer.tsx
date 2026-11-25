@@ -531,6 +531,7 @@ export function ComposerEngineInput({
     mentionTokens,
     commandToken,
     pinnedFirstCard,
+    replyQuotes,
     autoFocus,
     ...rest
   } = input;
@@ -558,6 +559,7 @@ export function ComposerEngineInput({
         mentionTokens={mentionTokens}
         commandToken={commandToken}
         pinnedFirstCard={pinnedFirstCard}
+        replyQuotes={replyQuotes}
         autoFocus={autoFocusOnMount}
         onKeyDown={handleKeyDown}
       />

@@ -27,7 +27,7 @@ import {
   REPLY_QUOTE_MARK,
   withoutReplyQuoteMarks,
 } from "@/lib/replyDraftDocument";
-import { killed } from "./codeMirrorReadline";
+import { killBarriers, killed } from "./codeMirrorReadline";
 
 /** The quote text a card shows before it truncates; the full text stays in its title. */
 const QUOTE_PREVIEW_LENGTH = 120;
@@ -41,6 +41,12 @@ const X_ICON =
 
 /** Marks a transaction that syncs the controlled value in, which isn't a user edit. */
 export const controlledUpdate = Annotation.define<true>();
+
+/**
+ * Marks an edit the app makes on the user's behalf, such as an insert at the caret. It may change
+ * the text around a card, but never removes or alters a card.
+ */
+export const programmaticEdit = Annotation.define<true>();
 
 /** Whether the first card is the side chat's seed, so text typed above it lands below it. */
 export const pinnedFirstCard = Facet.define<boolean, boolean>({
@@ -182,11 +188,13 @@ function keepCardsWhole(transaction: Transaction): boolean | readonly number[] {
     return true;
   const cards = transaction.startState.field(cardField).cards;
   if (cards.length === 0) return true;
+  const programmatic = transaction.annotation(programmaticEdit) === true;
   const partial = new Set<Card>();
   transaction.changes.iterChangedRanges((fromA, toA) => {
     for (const card of cards) {
       const reaches = fromA < card.to && toA > card.from;
-      if (reaches && !(fromA <= card.from && toA >= card.to)) partial.add(card);
+      // Only a user edit may cover a whole card, which is how its removal happens.
+      if (reaches && (programmatic || !(fromA <= card.from && toA >= card.to))) partial.add(card);
     }
   });
   if (partial.size === 0) return true;
@@ -230,10 +238,9 @@ function userSpec(transaction: Transaction): TransactionSpec {
 }
 
 /**
- * The transaction filter. Plain text never carries a token, so tokens in inserted text are
- * stripped. Text left beside a card goes onto its own line; a deletion that joins text onto a card
- * removes the card, as Backspace or Delete at its edge does. The user's transaction comes first,
- * and these fixes follow it as one sequential spec.
+ * The transaction filter. Strip tokens from inserted text and keep surviving cards on separate
+ * lines. Backward/forward deletion of a card-adjacent newline removes that card. The user's
+ * transaction comes first, and these fixes follow it as one sequential spec.
  */
 function normalizeCards(
   transaction: Transaction,
@@ -274,8 +281,7 @@ function normalizeCards(
       })),
   );
 
-  // Backspace at the line after a card removes the card above the break; Delete and ⌃K at the
-  // line before one remove the card below. Any other join keeps every card on its own line.
+  // Backspace after a card or Delete before one removes it; any other join keeps cards on their own lines.
   const startCards = transaction.startState.field(cardField).cards;
   const deleted: { from: number; to: number }[] = [];
   transaction.changes.iterChanges((fromA, toA) => deleted.push({ from: fromA, to: toA }));
@@ -403,6 +409,14 @@ function stepOverCard(view: EditorView, direction: -1 | 1): boolean {
   return true;
 }
 
+/** Each card and the breaks beside it, which a kill can't reach, so no kill removes a card. */
+function cardBarriers(doc: Text): { from: number; to: number }[] {
+  return findCards(doc).map((card) => ({
+    from: Math.max(0, card.from - 1),
+    to: Math.min(doc.length, card.to + 1),
+  }));
+}
+
 /** The card extensions: each card is atomic and paints as a card, and copies as `> ` markdown. */
 export const replyQuoteExtensions: Extension = [
   cardField,
@@ -410,4 +424,5 @@ export const replyQuoteExtensions: Extension = [
   EditorState.changeFilter.of(keepCardsWhole),
   EditorState.transactionFilter.of(normalizeCards),
   EditorView.clipboardOutputFilter.of((text) => replyQuoteClipboardText(text)),
+  killBarriers.of(cardBarriers),
 ];

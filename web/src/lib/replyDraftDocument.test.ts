@@ -2,17 +2,20 @@ import { describe, expect, it } from "vitest";
 import {
   appendQuoteToDocument,
   composerTextRegions,
+  dictationRevertEdit,
   mapComposerSelection,
+  minimalTextChange,
   parseReplyQuoteLine,
   quoteRemovalSpan,
   removeReplyQuoteAt,
-  settleReplyDocument,
   removeReplyQuoteLine,
+  replaceTail,
   replyQuoteClipboardText,
   replyQuoteLine,
   REPLY_QUOTE_END,
   REPLY_QUOTE_MARK,
   sameReplyDraft,
+  tailOf,
   typedDocumentFor,
   unweaveReplyDraft,
   weaveReplyDraft,
@@ -116,25 +119,51 @@ describe("reply draft document", () => {
     expect(regions.at(-1)).toEqual({ inputId: "tail", start: card.length, end: card.length });
   });
 
-  it("settles an edit made in code the way the editor settles its own", () => {
-    const card = replyQuoteLine({ id: "a", text: "A" });
-    // Text typed beside a card goes on its own line, and a card never ends the document.
-    expect(settleReplyDocument(`Head${card}Tail`, card)).toBe(`Head\n${card}\nTail`);
-    expect(settleReplyDocument(`Opener\n${card}`, card)).toBe(`Opener\n${card}\n`);
-    expect(settleReplyDocument(`A${REPLY_QUOTE_MARK}!${REPLY_QUOTE_END}`, "")).toBe("A!");
-    const draft: ReplyDraft = { quotes: [quote("a", "A", "Head")], text: "Tail" };
-    const woven = weaveReplyDraft(draft);
-    expect(settleReplyDocument(woven, woven)).toBe(woven);
+  it("uses the noncharacter marks, so the private-use area is plain text", () => {
+    expect(REPLY_QUOTE_MARK).toBe("\uFDD0");
+    expect(REPLY_QUOTE_END).toBe("\uFDD1");
+    expect(withoutReplyQuoteMarks("\uE000\uE001 icon")).toBe("\uE000\uE001 icon");
   });
 
-  it("keeps a card only when the previous document holds its exact token", () => {
+  it("replaces only the tail, so the cards and the text before them stay", () => {
     const card = replyQuoteLine({ id: "a", text: "A" });
-    const forged = replyQuoteLine({ id: "forged", text: "Forged" });
-    // A value set from code can't forge a card; the text around the foreign token joins up.
-    expect(settleReplyDocument(`Head${forged}Tail`, card)).toBe("HeadTail");
-    expect(settleReplyDocument(`Head${forged}Tail`, "")).toBe("HeadTail");
-    expect(settleReplyDocument(`${forged}`, "")).toBe("");
-    expect(settleReplyDocument(card, card)).toBe(`${card}\n`);
+    const document = `Head\n${card}\nTail`;
+    expect(tailOf(document)).toBe("Tail");
+    expect(replaceTail(document, "")).toBe(`Head\n${card}\n`);
+    expect(replaceTail(document, "/side ")).toBe(`Head\n${card}\n/side `);
+    // A card always has a line after it, even when the tail is empty.
+    expect(replaceTail(card, "New")).toBe(`${card}\nNew`);
+    // With no card, the whole document is the tail.
+    expect(replaceTail("Plain", "")).toBe("");
+  });
+
+  it("strips marks from a tail written in code, so it can't add a card", () => {
+    const card = replyQuoteLine({ id: "a", text: "A" });
+    expect(replaceTail(`Head\n${card}\n`, `x${card}y`)).toBe(`Head\n${card}\nxy`);
+  });
+
+  it("finds the one change between two documents", () => {
+    expect(minimalTextChange("abc", "abc")).toBeNull();
+    expect(minimalTextChange("abXc", "abYZc")).toEqual({ from: 2, to: 3, insert: "YZ" });
+    expect(minimalTextChange("", "new")).toEqual({ from: 0, to: 0, insert: "new" });
+  });
+
+  it("reverts only the dictated span, wherever it now sits", () => {
+    const card = replyQuoteLine({ id: "a", text: "A" });
+    // A quote added during the take appends after the dictated text, which stays where it was.
+    const before = "Hello";
+    const after = "Hello dictated";
+    const edit = dictationRevertEdit(`${after}\n${card}\n`, before, after);
+    expect(edit).toEqual({ from: 5, to: 14, insert: "" });
+    // The text moved ahead of it, so the span is found where it is now.
+    expect(dictationRevertEdit(`Intro\n${after}`, before, after)).toEqual({
+      from: 11,
+      to: 20,
+      insert: "",
+    });
+    // Once the dictated text is gone, there is nothing to revert.
+    expect(dictationRevertEdit("Hello", before, after)).toBeNull();
+    expect(dictationRevertEdit("anything", before, before)).toEqual({ from: 0, to: 0, insert: "" });
   });
 
   it("copies cards as markdown quotes", () => {
@@ -156,6 +185,12 @@ describe("card removal", () => {
 
   it("removes a blank line that separates the card from the document's start", () => {
     expect(removeReplyQuoteLine(`\n${card}\nRest`, 1)).toBe("Rest");
+  });
+
+  it("removes the first card's blank line below it, so no blank line is left at the top", () => {
+    const other = replyQuoteLine({ id: "o", text: "Other" });
+    expect(removeReplyQuoteLine(`${card}\n\n${other}\nRest`, 0)).toBe(`${other}\nRest`);
+    expect(quoteRemovalSpan([card, "", "Rest"], 0)).toEqual({ first: 0, last: 0 });
   });
 
   it("removes the blank line that separates the card from the card above", () => {
@@ -252,6 +287,19 @@ describe("caret mapping across engines", () => {
         "tail",
       ),
     ).toEqual({ inputId: "a", selectionStart: 1, selectionEnd: 1 });
+  });
+
+  it("maps a document-start caret before a leading card to the tail, not to its hidden input", () => {
+    const leading = replyQuoteLine({ id: "a", text: "A" });
+    expect(
+      mapComposerSelection(
+        `${leading}\nTail`,
+        { inputId: "tail", selectionStart: 0, selectionEnd: 0 },
+        "codemirror",
+        ["a"],
+        "tail",
+      ),
+    ).toEqual({ inputId: "tail", selectionStart: 0, selectionEnd: 0 });
   });
 
   it("puts a caret from a card that is gone at the tail's end", () => {

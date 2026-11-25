@@ -12,7 +12,8 @@ import {
 import {
   appendQuoteToDocument,
   removeReplyQuoteAt,
-  settleReplyDocument,
+  replaceTail,
+  tailOf,
   typedDocumentFor,
   unweaveReplyDraft,
 } from "@/lib/replyDraftDocument";
@@ -23,9 +24,15 @@ interface ReplyDraftState {
   typed: string | null;
 }
 
+/** The state for a document the editor holds. Its own rules have already applied to it. */
+function stateOfDocument(document: string): ReplyDraftState {
+  return { draft: unweaveReplyDraft(document), typed: document };
+}
+
 /**
  * The reply draft. With `singleDocument`, the CodeMirror composer shows the whole draft as one
- * document: `value` is that document, and quote operations apply to it.
+ * document, and every text write here addresses the tail: the text after the last card. A write
+ * never removes or moves a card; the document's cards and the text before them stay as they are.
  */
 export function useReplyDraft(singleDocument = false) {
   const [{ draft, typed }, setState] = useState<ReplyDraftState>({
@@ -44,16 +51,11 @@ export function useReplyDraft(singleDocument = false) {
     (id: string | null, next: SetStateAction<string>) => {
       setState((current) => {
         if (singleDocument) {
-          // A quote's own input is gone in this mode; an edit addressed to one would
-          // otherwise replace the whole document.
+          // A quote's own input is gone in this mode, so an edit addressed to one is dropped.
           if (id !== null) return current;
           const document = typedDocumentFor(current.draft, current.typed);
-          // The editor's rules apply to edits made here too, so a card keeps its own line.
-          const edited = settleReplyDocument(
-            typeof next === "function" ? next(document) : next,
-            document,
-          );
-          return { draft: unweaveReplyDraft(edited), typed: edited };
+          const tail = typeof next === "function" ? next(tailOf(document)) : next;
+          return stateOfDocument(replaceTail(document, tail));
         }
         const update = (text: string) => (typeof next === "function" ? next(text) : next);
         const draftNext =
@@ -74,6 +76,10 @@ export function useReplyDraft(singleDocument = false) {
     (next: SetStateAction<string>) => editText(activeTextId, next),
     [activeTextId, editText],
   );
+  // The editor's own edit, as it stands: its rules have already applied to it.
+  const setEditorDocument = useCallback((document: string) => {
+    setState(stateOfDocument(document));
+  }, []);
   const replaceText = useCallback((text: string, saved?: StoredReplyDraft) => {
     setState({ draft: restoreReplyDraft(text, saved), typed: null });
     focusText(null);
@@ -86,7 +92,7 @@ export function useReplyDraft(singleDocument = false) {
             id: nanoid(),
             text: text.replace(/\r\n?/g, "\n"),
           });
-          return { draft: unweaveReplyDraft(edited), typed: edited };
+          return stateOfDocument(edited);
         }
         return { draft: appendReplyQuote(current.draft, text), typed: null };
       });
@@ -101,8 +107,7 @@ export function useReplyDraft(singleDocument = false) {
           const index = current.draft.quotes.findIndex((quote) => quote.id === id);
           if (index < 0) return current;
           const document = typedDocumentFor(current.draft, current.typed);
-          const edited = settleReplyDocument(removeReplyQuoteAt(document, index), document);
-          return { draft: unweaveReplyDraft(edited), typed: edited };
+          return stateOfDocument(removeReplyQuoteAt(document, index));
         }
         return { draft: removeReplyQuote(current.draft, id), typed: null };
       });
@@ -122,6 +127,7 @@ export function useReplyDraft(singleDocument = false) {
     activeTextId,
     focusText,
     editText,
+    setEditorDocument,
     replaceText,
     appendQuote,
     removeQuote,

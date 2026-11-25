@@ -172,6 +172,8 @@ export interface ComposerInputProps {
   mentionTokens?: readonly string[];
   /** The first reply card is the side chat's seed: text typed above it goes below it. */
   pinnedFirstCard?: boolean;
+  /** The draft is a reply's document, so its quote tokens are cards. Other inputs show them as text. */
+  replyQuotes?: boolean;
   /** Leading command to tint, such as "/context"; a `{token, start}` pins it to an offset. */
   commandToken?: string | ComposerTokenAt | null;
   onChange?: (event: ComposerInputEvent) => void;

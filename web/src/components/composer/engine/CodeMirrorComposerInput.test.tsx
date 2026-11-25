@@ -13,7 +13,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import { insertComposerText } from "@/lib/composerText";
-import { replyQuoteLine, settleReplyDocument } from "@/lib/replyDraftDocument";
+import { replyQuoteLine } from "@/lib/replyDraftDocument";
+import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
@@ -669,7 +670,7 @@ describe("CodeMirrorComposerInput reply cards", () => {
 
   const card = (text: string, id = "card") => replyQuoteLine({ id, text });
   const mountDocument = (value: string, props: Partial<Parameters<typeof mount>[0]> = {}) => {
-    const mounted = mount({ value, ...props });
+    const mounted = mount({ value, replyQuotes: true, ...props });
     return { ...mounted, editor: EditorView.findFromDOM(mounted.content)! };
   };
   const caret = (editor: EditorView, offset: number) =>
@@ -758,18 +759,6 @@ describe("CodeMirrorComposerInput reply cards", () => {
     const { editor } = mountDocument(`Opener\nWhy`);
     pasteAt(editor, "Opener\n".length, card("Pasted", "copy"));
     expect(editor.state.doc.toString()).toBe("Opener\nWhy");
-  });
-
-  it.each([
-    ["at a card's start", `Opener\n${card("Quoted")}\nWhy`, 7],
-    ["at a card's end", `Opener\n${card("Quoted")}\nWhy`, 7 + card("Quoted").length],
-    ["above the first card", `${card("Quoted")}\nWhy`, 0],
-  ])("settles typed text %s as settleReplyDocument does", (_name, value, offset) => {
-    const { editor } = mountDocument(value);
-    typeAt(editor, offset, "x");
-    expect(editor.state.doc.toString()).toBe(
-      settleReplyDocument(value.slice(0, offset) + "x" + value.slice(offset), value),
-    );
   });
 
   it("removes a card when typing over it, and keeps the card when typing over the break beside it", () => {
@@ -875,7 +864,7 @@ describe("CodeMirrorComposerInput reply cards", () => {
     expect(editor.state.doc.toString()).toBe("Opener\nWhy");
   });
 
-  it("turns cards into markdown quotes in the text copy, cut and drag take", () => {
+  it("applies the markdown quote output filter that copy, cut and drag use", () => {
     const quoted = card("one\ntwo");
     const value = `Opener\n${quoted}\nWhy`;
     const { editor } = mountDocument(value);
@@ -960,16 +949,102 @@ describe("CodeMirrorComposerInput reply cards", () => {
     expect(editor.state.selection.main.head).toBe(seed.length + 2);
   });
 
-  it("removes the seed card with its X and keeps the text after it", () => {
+  it("removes the seed with its blank separator, so no blank line is left at the top", () => {
     const seed = card("Seed");
-    const onChange = vi.fn();
-    const { container, target } = mountDocument(`${seed}\nRest`, {
+    const next = card("Next", "next");
+    const { container, target } = mountDocument(`${seed}\n\n${next}\nMore`, {
       pinnedFirstCard: true,
-      onChange,
     });
     const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove quote"]')!;
     act(() => void fireEvent.click(remove));
-    expect(target().value).toBe("Rest");
-    expect(onChange).toHaveBeenCalledOnce();
+    expect(target().value).toBe(`${next}\nMore`);
+  });
+
+  it("shows a token in a plain composer as its text, and keeps it literal", () => {
+    const token = card("Quoted");
+    const { container, target } = mount({ value: `Opener\n${token}\nWhy` });
+    expect(container.querySelector('[data-testid="composer-reply-quote"]')).toBeNull();
+    expect(target().value).toBe(`Opener\n${token}\nWhy`);
+    // Typed text in a plain composer keeps the token's marks, which only a reply's owner strips.
+    act(() => void target().setSelectionRange(0, 0));
+    const editor = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-content")!)!;
+    typeAt(editor, 0, token);
+    expect(editor.state.doc.toString()).toBe(`${token}Opener\n${token}\nWhy`);
+  });
+
+  describe("with the reply draft's state in the loop", () => {
+    // The editor's document goes back to the draft state, and the state's document back to the
+    // editor, as ChatPage and SideChatPane do. An undo must survive that round trip.
+    function ReplyDraftEditor({
+      onReady,
+    }: {
+      onReady: (state: ReturnType<typeof useReplyDraft>) => void;
+    }) {
+      const replyDraft = useReplyDraft(true);
+      onReady(replyDraft);
+      return (
+        <CodeMirrorComposerInput
+          aria-label="Message the agent"
+          value={replyDraft.value}
+          replyQuotes
+          ref={() => {}}
+          onChange={(event) => replyDraft.setEditorDocument(event.currentTarget.value)}
+        />
+      );
+    }
+
+    // The draft comes in as the editor's own document, so its card ids are the ones written here.
+    const mountReplyDraft = (initial: string) => {
+      let state!: ReturnType<typeof useReplyDraft>;
+      const mounted = render(<ReplyDraftEditor onReady={(next) => (state = next)} />);
+      act(() => state.setEditorDocument(initial));
+      const content = mounted.container.querySelector<HTMLElement>(".cm-content")!;
+      return { ...mounted, content, editor: EditorView.findFromDOM(content)! };
+    };
+
+    it("restores a card removed by Backspace, exactly, on undo, and its X removes only its card", () => {
+      const first = card("First", "c1");
+      const second = card("Second", "c2");
+      const initial = `Opener\n${first}\n\n${second}\n`;
+      const { editor, container } = mountReplyDraft(initial);
+      expect(editor.state.doc.toString()).toBe(initial);
+
+      caret(editor, editor.state.doc.length);
+      act(() => void deleteCharBackward(editor));
+      expect(editor.state.doc.toString()).toBe(`Opener\n${first}\n`);
+
+      act(() => void undo(editor));
+      expect(editor.state.doc.toString()).toBe(initial);
+
+      const removers = container.querySelectorAll<HTMLButtonElement>(
+        'button[aria-label="Remove quote"]',
+      );
+      act(() => void fireEvent.click(removers[1]!));
+      expect(editor.state.doc.toString()).toBe(`Opener\n${first}\n`);
+    });
+
+    it("restores a card removed by Backspace, exactly, and keeps the text around the others", () => {
+      const first = card("First", "c1");
+      const second = card("Second", "c2");
+      const initial = `T0\n${first}\nT1\n${second}\nT2`;
+      const { editor, container } = mountReplyDraft(initial);
+
+      caret(editor, initial.indexOf("T1"));
+      act(() => void deleteCharBackward(editor));
+      expect(editor.state.doc.toString()).toBe(`T0\nT1\n${second}\nT2`);
+
+      act(() => void undo(editor));
+      expect(editor.state.doc.toString()).toBe(initial);
+      act(() => void redo(editor));
+      expect(editor.state.doc.toString()).toBe(`T0\nT1\n${second}\nT2`);
+      act(() => void undo(editor));
+      expect(editor.state.doc.toString()).toBe(initial);
+
+      const removers = container.querySelectorAll<HTMLButtonElement>(
+        'button[aria-label="Remove quote"]',
+      );
+      act(() => void fireEvent.click(removers[1]!));
+      expect(editor.state.doc.toString()).toBe(`T0\n${first}\nT1\nT2`);
+    });
   });
 });

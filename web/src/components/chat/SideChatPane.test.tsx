@@ -3891,6 +3891,40 @@ describe("side-chat reply in one editor", () => {
     expect(pendingSeed()).toBe("Seed passage");
   });
 
+  it("keeps a transcript dictated above the pinned seed, and the seed stays first", async () => {
+    await renderEditor();
+    const editor = EditorView.findFromDOM(editorInput())!;
+    act(() => editor.focus());
+    act(() => editor.dispatch({ selection: { anchor: 0 } }));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    // Text typed above the seed lands below it, as it does in the textarea.
+    expect(editorText()).toBe(`${seedCard}\nspoken `);
+    expect(storeText()).toBe("spoken ");
+    expect(pendingSeed()).toBe("Seed passage");
+  });
+
+  it("discards only the dictated text, and keeps a quote added during the take", async () => {
+    await renderEditor();
+    const end = editorText().length;
+    typeAt(end, end, "Draft");
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    act(() => {
+      useChatStore.getState().updateSideChatComposer(seeded, (current) => ({
+        ...current,
+        ...appendReplyQuote(current, "Added during take"),
+      }));
+    });
+    act(() => mic.current!.onVoiceDiscard!());
+    // The dictated word goes; the text it was added to and the new quote stay.
+    expect(storeQuotes()).toEqual([
+      { id: storeQuotes()[0]!.id, before: "Draft", text: "Added during take" },
+    ]);
+    expect(storeText()).toBe("");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+  });
+
   it("dictates onto the line after a card that ends the document, and the card stays", async () => {
     await renderEditor();
     // Deleting the final newline: the editor keeps an empty line under a card, so the card is never last.
@@ -3902,7 +3936,7 @@ describe("side-chat reply in one editor", () => {
     // The caret sat at the card's end, so the dictated words land on the line after it.
     expect(editorText()).toBe(`${seedCard}\n spoken\n`);
     expect(storeText()?.trim()).toBe("spoken");
-    expect(storeText()).not.toMatch(/[\uE000\uE001]/);
+    expect(storeText()).not.toMatch(/[\uFDD0\uFDD1]/);
     expect(pendingSeed()).toBe("Seed passage");
     expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
   });

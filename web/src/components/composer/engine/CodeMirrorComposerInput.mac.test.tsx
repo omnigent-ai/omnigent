@@ -19,13 +19,19 @@ vi.hoisted(() => {
   Object.defineProperty(navigator, "userAgent", { configurable: true, get: () => mac });
 });
 
-function mount(value: string, caret: number, mentionTokens?: readonly string[]) {
+function mount(
+  value: string,
+  caret: number,
+  mentionTokens?: readonly string[],
+  replyQuotes = false,
+) {
   const box: { target: ComposerTextTarget | null } = { target: null };
   const { container } = render(
     <CodeMirrorComposerInput
       aria-label="Message the agent"
       defaultValue={value}
       mentionTokens={mentionTokens}
+      replyQuotes={replyQuotes}
       ref={(target) => {
         box.target = target;
       }}
@@ -248,22 +254,44 @@ describe("a locked CodeMirror composer", () => {
 });
 
 describe("CodeMirrorComposerInput reply cards with the macOS readline keys", () => {
+  const quoted = replyQuoteLine({ id: "q1", text: "Quoted line" });
+
   it("removes the card before the caret's line with ⌃H, as Backspace does", () => {
-    const quoted = replyQuoteLine({ id: "q1", text: "Quoted line" });
     const value = `Opener\n${quoted}\nWhy`;
-    const { target, press } = mount(value, value.indexOf("Why"));
+    const { target, press } = mount(value, value.indexOf("Why"), undefined, true);
     press({ key: "h", code: "KeyH", ctrlKey: true });
     expect(target().value).toBe("Opener\nWhy");
   });
 
   it("does nothing on ⌃K at the line before a card, and ⌃Y yanks nothing back", () => {
     // A kill never removes a card: at the boundary it is a no-op, as the textarea's inputs are.
-    const quoted = replyQuoteLine({ id: "q1", text: "Quoted line" });
     const value = `Intro\n${quoted}\nReply`;
-    const { target, press } = mount(value, "Intro".length);
+    const { target, press } = mount(value, "Intro".length, undefined, true);
     press({ key: "k", code: "KeyK", ctrlKey: true });
     expect(target().value).toBe(value);
     press({ key: "y", code: "KeyY", ctrlKey: true });
     expect(target().value).toBe(value);
+  });
+
+  it.each([
+    ["⌃U", { key: "u", code: "KeyU", ctrlKey: true }],
+    ["⌃W", { key: "w", code: "KeyW", ctrlKey: true }],
+  ])("does nothing on %s at the start of the line after a card", (_name, init) => {
+    // The break beside the card is the kill's only reach, so the kill has nowhere to go.
+    const value = `Opener\n${quoted}\nWhy`;
+    const { target, press } = mount(value, value.indexOf("Why"), undefined, true);
+    press(init);
+    expect(target().value).toBe(value);
+  });
+
+  it("keeps a card when ⌃W crosses it from the line after, and kills only the text beside it", () => {
+    const value = `Opener\n${quoted}\nWhy now`;
+    const { target, press } = mount(value, value.length, undefined, true);
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe(`Opener\n${quoted}\nWhy `);
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe(`Opener\n${quoted}\n`);
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe(`Opener\n${quoted}\n`);
   });
 });

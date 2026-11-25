@@ -87,7 +87,7 @@ import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesi
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
-import { insertPastedText } from "@/lib/composerText";
+import { insertComposerText, insertPastedText, replaceComposerDocument } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -128,8 +128,9 @@ import {
   type ReplyQuote,
 } from "@/lib/replyDraft";
 import {
+  dictationRevertEdit,
   mapComposerSelection,
-  settleReplyDocument,
+  replaceTail,
   typedDocumentFor,
   unweaveReplyDraft,
 } from "@/lib/replyDraftDocument";
@@ -1082,12 +1083,8 @@ function SideChatComposer({
     },
     [childId, pending],
   );
-  // The tail's value: the whole document in single-document mode, else the tail text.
-  const tailValueOf = useCallback(
-    (current: SideChatComposerDraft) => (singleDocument ? documentOf(current) : current.text),
-    [documentOf, singleDocument],
-  );
-  // Read the store at call time: the seed is cleared when the document loses it.
+  // Applies the editor's document as the store's draft. Store writes from code go through
+  // `setTailText` or the editor, never here.
   const applyDocument = useCallback(
     (next: string) => {
       typedDocumentRef.current = next;
@@ -1114,32 +1111,53 @@ function SideChatComposer({
   // The text the input shows, in the offsets its selection and edits use: the whole document in
   // single-document mode, where the tail's `text` is only the part after the quotes.
   const editorText = singleDocument ? replyDocument : text;
+  // The editor, which is the one input in single-document mode.
+  const editorSurface = useCallback(() => textareaRef.current ?? tailTextareaRef.current, []);
+  // Caret-relative writes (slash completion, mentions) address the whole document, so the
+  // editor takes them as its own edit and its cards stay whole.
   const setEditorText = useCallback(
+    (next: string) => {
+      if (!singleDocument) return setText(next);
+      const target = editorSurface();
+      if (target) replaceComposerDocument(target, next);
+    },
+    [editorSurface, setText, singleDocument],
+  );
+  // Clears or replaces the text after the quotes, as the textarea's tail input does.
+  const setTailText = useCallback(
     (next: string) => {
       if (!singleDocument) return setText(next);
       const current =
         useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
-      applyDocument(settleReplyDocument(next, tailValueOf(current)));
+      applyDocument(replaceTail(documentOf(current), next));
     },
-    [applyDocument, composerKey, setText, singleDocument, tailValueOf],
+    [applyDocument, composerKey, documentOf, setText, singleDocument],
   );
   const reconcileVoiceEdits = useCallback(
     (current: SideChatComposerDraft) => {
+      if (singleDocument) {
+        // The dictated text owns its undo while it is still in the document; a quote added
+        // meanwhile doesn't release it.
+        const document = documentOf(current);
+        for (const [id, edit] of voiceEditsRef.current) {
+          if (dictationRevertEdit(document, edit.before, edit.after) === null) {
+            voiceEditsRef.current.delete(id);
+          }
+        }
+        return;
+      }
       for (const [id, edit] of voiceEditsRef.current) {
-        // Appending a quote moves the old tail into that quote's preceding text. The single
-        // document has one tail, so its edits stay on it.
-        const targetId = singleDocument
-          ? id
-          : (id ?? current.quotes?.find((item) => !edit.quoteIds.has(item.id))?.id ?? null);
+        const targetId =
+          id ?? current.quotes?.find((item) => !edit.quoteIds.has(item.id))?.id ?? null;
         const value =
           targetId === null
-            ? tailValueOf(current)
+            ? current.text
             : current.quotes?.find((item) => item.id === targetId)?.before;
         if (value !== edit.after || targetId !== id) voiceEditsRef.current.delete(id);
         if (value === edit.after && targetId !== id) voiceEditsRef.current.set(targetId, edit);
       }
     },
-    [singleDocument, tailValueOf],
+    [documentOf, singleDocument],
   );
   // Manual edits and merged reply fields relinquish dictation's undo ownership.
   useLayoutEffect(() => {
@@ -1150,34 +1168,36 @@ function SideChatComposer({
     : (composer?.quotes?.find((item) => item.id === activeTextId)?.before ?? text);
   const setActiveText = useCallback(
     (edited: string) => {
-      // The single document is the tail, so its dictation is recorded and undone as the tail's.
-      const id = singleDocument ? null : activeTextId;
       const current =
         useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
       reconcileVoiceEdits(current);
+      if (singleDocument) {
+        // The editor takes the dictated edit as its own, and the edit is recorded for a discard.
+        const target = editorSurface();
+        if (!target) return;
+        const previous = voiceEditsRef.current.get(null);
+        const before = previous?.before ?? target.value;
+        replaceComposerDocument(target, edited);
+        voiceEditsRef.current.set(null, {
+          before,
+          after: target.value,
+          quoteIds: new Set(),
+        });
+        return;
+      }
+      const id = activeTextId;
       const before =
-        id === null ? tailValueOf(current) : current.quotes?.find((item) => item.id === id)?.before;
+        id === null ? current.text : current.quotes?.find((item) => item.id === id)?.before;
       if (before === undefined) return;
-      // Recorded as the document it becomes, so the dictation's undo still owns it.
-      const next = singleDocument ? settleReplyDocument(edited, before) : edited;
       const previous = voiceEditsRef.current.get(id);
       voiceEditsRef.current.set(id, {
         before: previous?.before ?? before,
-        after: next,
+        after: edited,
         quoteIds: previous?.quoteIds ?? new Set(current.quotes?.map((item) => item.id)),
       });
-      if (singleDocument) applyDocument(next);
-      else editText(id, next);
+      editText(id, edited);
     },
-    [
-      activeTextId,
-      applyDocument,
-      composerKey,
-      editText,
-      reconcileVoiceEdits,
-      singleDocument,
-      tailValueOf,
-    ],
+    [activeTextId, composerKey, editText, editorSurface, reconcileVoiceEdits, singleDocument],
   );
   const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
   // An engine switch replaces every input; keep the active one and its id current.
@@ -1371,7 +1391,7 @@ function SideChatComposer({
   // Insert a chosen skill at the caret; a built-in runs immediately (no args).
   const applyMenuSelection = (cmd: string) => {
     if (Object.hasOwn(sideChatBuiltins, cmd)) {
-      setEditorText("");
+      setTailText("");
       if (cmd === "/help") showHelp();
       return;
     }
@@ -1398,7 +1418,7 @@ function SideChatComposer({
       !carriesMessageContext({ quotes, text }, files, sendContext),
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
-    clearText: () => setEditorText(""),
+    clearText: () => setTailText(""),
   });
   const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
   // Codex forks from a `/side` message, so its pending text never reaches the shell; other
@@ -1700,6 +1720,7 @@ function SideChatComposer({
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           // The seed is the editor's first line, so text typed above it lands below it.
           pinnedFirstCard: quote !== undefined,
+          replyQuotes: true,
           rows: gridComposer ? 1 : undefined,
           heightMode: quotes.length ? "unbounded" : "compact",
           disabled: !ready,
@@ -1821,8 +1842,12 @@ function SideChatComposer({
                   const edits = [...voiceEditsRef.current];
                   voiceEditsRef.current.clear();
                   for (const [id, edit] of edits) {
-                    if (singleDocument && id === null) applyDocument(edit.before);
-                    else editText(id, edit.before);
+                    const target = singleDocument ? editorSurface() : undefined;
+                    if (target) {
+                      // Only the dictated text goes, so a quote added during the take stays.
+                      const revert = dictationRevertEdit(target.value, edit.before, edit.after);
+                      if (revert) insertComposerText(target, revert.insert, revert.from, revert.to);
+                    } else editText(id, edit.before);
                   }
                 }}
                 inputRef={textareaRef}

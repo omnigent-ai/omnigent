@@ -3,10 +3,13 @@
 
 import type { ReplyDraft, ReplyQuote } from "./replyDraft";
 
-/** Opens a token. Typed text never carries it, so a token can only come from a quote. */
-export const REPLY_QUOTE_MARK = "\uE000";
+/**
+ * Opens a token. Typed text never carries it, so a token can only come from a quote. The marks
+ * are noncharacters, which no font or paste uses, unlike the private-use area.
+ */
+export const REPLY_QUOTE_MARK = "\uFDD0";
 /** Closes a token. */
-export const REPLY_QUOTE_END = "\uE001";
+export const REPLY_QUOTE_END = "\uFDD1";
 
 type QuoteFields = Pick<ReplyQuote, "id" | "text">;
 
@@ -159,11 +162,18 @@ export function quoteRemovalSpan(
   lines: readonly string[],
   index: number,
 ): { first: number; last: number } {
-  const separator =
+  const separatorAbove =
     index >= 1 &&
     lines[index - 1] === "" &&
     (index === 1 || parseReplyQuoteLine(lines[index - 2]!) !== null);
-  return { first: separator ? index - 1 : index, last: index };
+  if (separatorAbove) return { first: index - 1, last: index };
+  // The first card's blank line below separates it from the next card. Without it, a blank line
+  // would be left at the top of the document.
+  const separatorBelow =
+    index === 0 &&
+    lines[1] === "" &&
+    (lines.length === 2 || parseReplyQuoteLine(lines[2]!) !== null);
+  return { first: index, last: separatorBelow ? 1 : index };
 }
 
 /** The document without the card on line `lineIndex`, by `quoteRemovalSpan`. */
@@ -186,42 +196,88 @@ export function removeReplyQuoteAt(document: string, index: number): string {
   return lineIndex < 0 ? document : removeReplyQuoteLine(document, lineIndex);
 }
 
-/**
- * A document with the editor's rules applied to an edit made in code. Only a token that `previous`
- * already holds stays a card, so a value from code can't forge one; any other mark is removed with
- * its payload. Text beside a card goes on its own line, and a card is never the last line.
- */
-export function settleReplyDocument(document: string, previous: string): string {
-  const known = new Set(
-    replyQuoteTokenRanges(previous).map((token) => previous.slice(token.start, token.end)),
-  );
-  const lines: string[] = [];
-  const pushText = (segment: string) => {
-    const plain = withoutReplyQuoteMarks(segment);
-    if (plain !== "") lines.push(plain);
-  };
+/** Where the tail starts: just after the last card's line, or 0 when the document has no card. */
+export function tailStartOf(document: string): number {
+  let start = 0;
+  let lineStart = 0;
   for (const line of document.split("\n")) {
-    if (!hasReplyQuoteMark(line)) {
-      lines.push(line);
-      continue;
-    }
-    // Text around a dropped token joins up, so a foreign token leaves its line whole.
-    let text = "";
-    let rest = 0;
-    for (const token of replyQuoteTokenRanges(line)) {
-      text += line.slice(rest, token.start);
-      const card = line.slice(token.start, token.end);
-      if (known.has(card)) {
-        pushText(text);
-        text = "";
-        lines.push(card);
-      }
-      rest = token.end;
-    }
-    pushText(text + line.slice(rest));
+    if (parseReplyQuoteLine(line) !== null)
+      start = Math.min(lineStart + line.length + 1, document.length);
+    lineStart += line.length + 1;
   }
-  if (lines.length > 0 && parseReplyQuoteLine(lines[lines.length - 1]!) !== null) lines.push("");
-  return lines.join("\n");
+  return start;
+}
+
+/** The tail: the text after the last card. */
+export function tailOf(document: string): string {
+  return document.slice(tailStartOf(document));
+}
+
+/**
+ * `document` with its tail replaced by `tail`. The tail is the text after the last card, so cards
+ * and the text before them stay as they are, and a mark in `tail` is removed.
+ */
+export function replaceTail(document: string, tail: string): string {
+  const head = document.slice(0, tailStartOf(document));
+  const separated = head === "" || head.endsWith("\n") ? head : `${head}\n`;
+  return separated + withoutReplyQuoteMarks(tail);
+}
+
+/** A change to a text: replace [from, to) with `insert`. */
+export interface TextEdit {
+  from: number;
+  to: number;
+  insert: string;
+}
+
+/** The one change that turns `before` into `after`, or null when they are equal. */
+export function minimalTextChange(before: string, after: string): TextEdit | null {
+  if (before === after) return null;
+  const limit = Math.min(before.length, after.length);
+  let prefix = 0;
+  while (prefix < limit && before[prefix] === after[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < limit - prefix &&
+    before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  return {
+    from: prefix,
+    to: before.length - suffix,
+    insert: after.slice(prefix, after.length - suffix),
+  };
+}
+
+/** The occurrence of `needle` in `text` that starts nearest `near`, or -1 when there is none. */
+function nearestOccurrence(text: string, needle: string, near: number): number {
+  let best = -1;
+  for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
+    if (best === -1 || Math.abs(at - near) < Math.abs(best - near)) best = at;
+  }
+  return best;
+}
+
+/**
+ * The edit that undoes a dictation which turned `before` into `after`, applied to `document`. It
+ * touches only the dictated span, wherever the span now sits, so a quote added meanwhile stays.
+ * Null when the dictated text is no longer in `document`.
+ */
+export function dictationRevertEdit(
+  document: string,
+  before: string,
+  after: string,
+): TextEdit | null {
+  const dictated = minimalTextChange(before, after);
+  if (dictated === null) return { from: 0, to: 0, insert: "" };
+  const at = nearestOccurrence(document, dictated.insert, dictated.from);
+  if (at === -1) return null;
+  return {
+    from: at,
+    to: at + dictated.insert.length,
+    insert: before.slice(dictated.from, dictated.to),
+  };
 }
 
 /** Where a document's text sits in the composer's inputs: each card's text before it, then the tail. */
@@ -302,6 +358,15 @@ export function mapComposerSelection(
       undefined,
     );
     if (!region) return { inputId: tailId, offset: 0 };
+    // A leading card has no text above it, so its input is never rendered. The tail takes the caret.
+    if (
+      region === regions[0] &&
+      region.start === 0 &&
+      region.end === 0 &&
+      region.inputId !== tailId
+    ) {
+      return { inputId: tailId, offset: 0 };
+    }
     return { inputId: region.inputId, offset: Math.min(offset, region.end) - region.start };
   };
   const start = locate(selection.selectionStart);

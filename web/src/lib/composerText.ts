@@ -4,6 +4,7 @@ import {
   type ComposerPasteEvent,
   type ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
+import { minimalTextChange } from "@/lib/replyDraftDocument";
 import { createTextFieldMirror } from "@/lib/textFieldMirror";
 
 /**
@@ -94,4 +95,13 @@ export function insertPastedText(event: ComposerPasteEvent): boolean {
   }
   event.preventDefault();
   return insertComposerText(event.currentTarget, text);
+}
+
+/**
+ * Make `next` the target's whole text, as the one change between the two as typed input. A
+ * caret-relative write goes through this, so the editor's own rules see it.
+ */
+export function replaceComposerDocument(target: ComposerTextTarget, next: string): boolean {
+  const change = minimalTextChange(target.value, next);
+  return change === null || insertComposerText(target, change.insert, change.from, change.to);
 }

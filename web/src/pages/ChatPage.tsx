@@ -157,7 +157,8 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
-import { mapComposerSelection } from "@/lib/replyDraftDocument";
+import { mapComposerSelection, dictationRevertEdit } from "@/lib/replyDraftDocument";
+import { insertComposerText, replaceComposerDocument } from "@/lib/composerText";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -2390,6 +2391,7 @@ function ComposerImpl(
     replaceText,
     appendQuote,
     removeQuote,
+    setEditorDocument,
   } = useReplyDraft(renderedEngine === "codemirror");
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -2482,7 +2484,19 @@ function ComposerImpl(
   );
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
+  // Writes the text the caret-relative helpers compute. In one document that is the editor's own
+  // edit, so a card it spans is kept; in the textarea it is the active input.
+  const writeDocument = (next: string) => {
+    if (renderedEngine !== "codemirror") setValue(next);
+    else if (textareaRef.current) replaceComposerDocument(textareaRef.current, next);
+  };
+  // The document as the editor shows it after the last dictated edit, for a discard to undo.
+  const voiceAfterRef = useRef("");
+  const writeDictation = (next: string) => {
+    writeDocument(next);
+    voiceAfterRef.current = textareaRef.current?.value ?? next;
+  };
+  const dictation = useDictationInsert(value, writeDictation, textareaRef);
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -3192,7 +3206,7 @@ function ComposerImpl(
     sessionEntries,
     text: value,
     setText: (next) => {
-      setValue(next);
+      writeDocument(next);
       dirtyRef.current = true;
     },
     textareaRef,
@@ -3618,7 +3632,7 @@ function ComposerImpl(
 
   const completeMenuSelection = (cmd: string) => {
     const completion = slashCompletion.complete(cmd);
-    setValue(completion.text);
+    writeDocument(completion.text);
     dirtyRef.current = true;
   };
 
@@ -4384,7 +4398,9 @@ function ComposerImpl(
     const input = e.currentTarget;
     noteMentionTextChange(e);
     slashCompletion.onSelectionChange(input);
-    editText(id, input.value);
+    // The editor's document already has its cards whole, so it is taken as it stands.
+    if (renderedEngine === "codemirror" && id === null) setEditorDocument(input.value);
+    else editText(id, input.value);
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
@@ -4548,6 +4564,7 @@ function ComposerImpl(
         input={{
           ref: bindTailTextarea,
           value: renderedEngine === "codemirror" ? replyDocument : draft.text,
+          replyQuotes: true,
           // Same rules as the textarea mirror: quoted replies get no pills, and files stop the command tint.
           commandToken: highlight.input.commandToken,
           mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
@@ -4863,9 +4880,21 @@ function ComposerImpl(
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
                   voiceSnapshotRef.current = value;
+                  voiceAfterRef.current = value;
                 }}
                 onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
+                  const target = textareaRef.current;
+                  if (renderedEngine !== "codemirror" || !target) {
+                    setValue(voiceSnapshotRef.current);
+                    return;
+                  }
+                  // Only the dictated text goes, so a quote added during the take stays.
+                  const edit = dictationRevertEdit(
+                    target.value,
+                    voiceSnapshotRef.current,
+                    voiceAfterRef.current,
+                  );
+                  if (edit) insertComposerText(target, edit.insert, edit.from, edit.to);
                 }}
                 onListeningChange={setDictating}
                 inputRef={textareaRef}

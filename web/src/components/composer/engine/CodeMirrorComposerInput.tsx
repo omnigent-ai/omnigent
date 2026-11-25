@@ -33,6 +33,7 @@ import {
 } from "react";
 
 import type { ComposerInsert, ComposerInsertAdjustment } from "@/lib/composerMentions";
+import { minimalTextChange } from "@/lib/replyDraftDocument";
 import { cn } from "@/lib/utils";
 
 import type {
@@ -45,7 +46,12 @@ import type {
   ComposerTokenAt,
 } from "./composerInput";
 import { readlineKeys } from "./codeMirrorReadline";
-import { controlledUpdate, pinnedFirstCard, replyQuoteExtensions } from "./codeMirrorReplyQuotes";
+import {
+  controlledUpdate,
+  pinnedFirstCard,
+  programmaticEdit,
+  replyQuoteExtensions,
+} from "./codeMirrorReplyQuotes";
 
 /** What the editor takes from the app, handed in by the loader. */
 export interface CodeMirrorComposerEnvironment {
@@ -357,25 +363,6 @@ function normalizeLineBreaks(text: string): string {
   return text.replace(/\r\n?/g, "\n");
 }
 
-/** The smallest change turning `current` into `next`, so undo history and mapped positions stay stable. */
-function minimalChange(current: string, next: string) {
-  let prefix = 0;
-  const limit = Math.min(current.length, next.length);
-  while (prefix < limit && current[prefix] === next[prefix]) prefix += 1;
-  let suffix = 0;
-  while (
-    suffix < limit - prefix &&
-    current[current.length - 1 - suffix] === next[next.length - 1 - suffix]
-  ) {
-    suffix += 1;
-  }
-  return {
-    from: prefix,
-    to: current.length - suffix,
-    insert: next.slice(prefix, next.length - suffix),
-  };
-}
-
 /** The surface shared composer logic edits, over one live EditorView. */
 function createSurface(view: EditorView): ComposerEditorSurface {
   const clamp = (offset: number) => Math.max(0, Math.min(offset, view.state.doc.length));
@@ -428,7 +415,7 @@ function createSurface(view: EditorView): ComposerEditorSurface {
         selection: { anchor: from + insert.length },
         userEvent: "input",
         // Each programmatic insert is its own undo step, not joined to the typing around it.
-        annotations: isolateHistory.of("full"),
+        annotations: [isolateHistory.of("full"), programmaticEdit.of(true)],
       });
       return true;
     },
@@ -458,7 +445,7 @@ function syncControlledValue(view: EditorView, value: string, historyCompartment
   const current = view.state.doc.toString();
   if (current === next) return;
   view.dispatch({
-    changes: minimalChange(current, next),
+    changes: minimalTextChange(current, next)!,
     // As a textarea's value setter does: a new value puts the caret at its end.
     selection: EditorSelection.cursor(next.length),
     annotations: [controlledUpdate.of(true), Transaction.addToHistory.of(false)],
@@ -494,6 +481,7 @@ function CodeMirrorComposer({
       mentionTokens: new Compartment(),
       commandToken: new Compartment(),
       pinnedCard: new Compartment(),
+      replyQuotes: new Compartment(),
     }),
     [],
   );
@@ -578,7 +566,7 @@ function CodeMirrorComposer({
           compartments.commandToken.of(commandTokenFacet.of(documentCommandToken(initial))),
           commandTokenField(environment),
           compartments.pinnedCard.of(pinnedFirstCard.of(initial.pinnedFirstCard ?? false)),
-          replyQuoteExtensions,
+          compartments.replyQuotes.of(initial.replyQuotes ? replyQuoteExtensions : []),
           EditorView.updateListener.of((update) => {
             const fromUser = !update.transactions.some((transaction) =>
               transaction.annotation(controlledUpdate),
@@ -693,6 +681,13 @@ function CodeMirrorComposer({
       effects: compartments.pinnedCard.reconfigure(pinnedFirstCard.of(pinnedFirst)),
     });
   }, [compartments, pinnedFirst]);
+  // Only a reply's owner reads tokens as cards; other consumers show them as the text they are.
+  const replyQuotes = props.replyQuotes === true;
+  useLayoutEffect(() => {
+    viewRef.current?.dispatch({
+      effects: compartments.replyQuotes.reconfigure(replyQuotes ? replyQuoteExtensions : []),
+    });
+  }, [compartments, replyQuotes]);
   useEffect(() => {
     if (autoFocus) viewRef.current?.focus();
   }, [autoFocus]);

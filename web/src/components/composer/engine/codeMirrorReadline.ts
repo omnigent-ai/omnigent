@@ -2,7 +2,14 @@
 // kill ring in lib/textEditing/readline. Off macOS none of these keys are claimed: Ctrl+W,
 // Ctrl+A and friends keep their platform meaning there.
 
-import { Annotation, StateField, type Extension, type StateCommand } from "@codemirror/state";
+import {
+  Annotation,
+  Facet,
+  StateField,
+  type Extension,
+  type StateCommand,
+  type Text,
+} from "@codemirror/state";
 import { EditorView, keymap, type Command, type KeyBinding } from "@codemirror/view";
 import {
   EMPTY_KILL_RING,
@@ -14,10 +21,20 @@ import {
   yankText,
   type KillRing,
 } from "@/lib/textEditing/readline";
-import { parseReplyQuoteLine } from "@/lib/replyDraftDocument";
 
 /** Marks the text a kill removed, so the kill ring can yank it back. */
 export const killed = Annotation.define<{ text: string; backward: boolean }>();
+
+/** The barriers one extension gives for a document. */
+export type BarrierSource = (doc: Text) => readonly { from: number; to: number }[];
+
+/**
+ * Ranges a kill must not reach into, from each extension's view of the document. A kill is clipped
+ * at the nearest one toward the caret, so an extension can keep its own text whole.
+ */
+export const killBarriers = Facet.define<BarrierSource, readonly BarrierSource[]>({
+  combine: (sources) => sources,
+});
 
 const killRingField = StateField.define<KillRing>({
   create: () => EMPTY_KILL_RING,
@@ -45,6 +62,28 @@ function coverAtomicRanges(view: EditorView, from: number, to: number): [number,
   return [start, end];
 }
 
+/**
+ * The end of a kill from `head` to `end`, clipped before any barrier it would reach into. A
+ * selection that reaches a barrier is not killed at all.
+ */
+function clipKill(
+  barriers: readonly { from: number; to: number }[],
+  head: number,
+  end: number,
+): number {
+  let clipped = end;
+  if (end < head) {
+    for (const barrier of barriers) {
+      if (barrier.from < head) clipped = Math.max(clipped, Math.min(head, barrier.to));
+    }
+  } else if (end > head) {
+    for (const barrier of barriers) {
+      if (barrier.to > head) clipped = Math.min(clipped, Math.max(head, barrier.from));
+    }
+  }
+  return clipped;
+}
+
 /** Kill from the caret to `boundary`, or kill the selection when there is one. */
 function kill(boundary: Boundary): Command {
   return (view) => {
@@ -53,7 +92,9 @@ function kill(boundary: Boundary): Command {
     if (state.readOnly) return false;
     const range = state.selection.main;
     const text = state.doc.toString();
-    const end = range.empty ? boundary(text, range.head) : range.to;
+    const barriers = state.facet(killBarriers).flatMap((source) => source(state.doc));
+    if (!range.empty && barriers.some((b) => b.from < range.to && b.to > range.from)) return true;
+    const end = range.empty ? clipKill(barriers, range.head, boundary(text, range.head)) : range.to;
     const [from, to] = coverAtomicRanges(
       view,
       Math.min(range.empty ? range.head : range.from, end),
@@ -73,18 +114,6 @@ function kill(boundary: Boundary): Command {
     return true;
   };
 }
-
-/** ⌃K at the end of the line before a card does nothing: a kill never removes a card. */
-const killToLineEnd: Command = (view) => {
-  const { state } = view;
-  const range = state.selection.main;
-  const line = state.doc.lineAt(range.head);
-  const next = line.number < state.doc.lines ? state.doc.line(line.number + 1) : null;
-  if (!state.readOnly && range.empty && range.head === line.to && next !== null) {
-    if (parseReplyQuoteLine(next.text) !== null) return true;
-  }
-  return kill(lineEndAfter)(view);
-};
 
 /** ⌃Y: insert the newest kill at the selection. */
 const yank: StateCommand = ({ state, dispatch }) => {
@@ -108,7 +137,7 @@ const yank: StateCommand = ({ state, dispatch }) => {
  * standard keymap; Ctrl-k overrides its line-end delete so the text can be yanked back.
  */
 export const READLINE_BINDINGS: readonly KeyBinding[] = [
-  { key: "Ctrl-k", run: killToLineEnd },
+  { key: "Ctrl-k", run: kill(lineEndAfter) },
   { key: "Ctrl-u", run: kill(lineStartBefore) },
   { key: "Ctrl-w", run: kill(shellWordStartBefore) },
   { key: "Ctrl-y", run: yank },

@@ -39,7 +39,8 @@ import { insertComposerText } from "@/lib/composerText";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import { createElement, createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import type * as ComposerMicButtonModule from "@/components/ComposerMicButton";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setSessionHost } from "@/lib/sessionHost";
@@ -90,6 +91,21 @@ import {
 // to avoid needing a QueryClientProvider around every bare render.
 // Counts renders of the composer's ⌘K settings, which render nothing themselves.
 const composerPaletteSettings = vi.hoisted(() => ({ renders: 0 }));
+// Captures the dictation handlers, which the composer owns, and renders the real button.
+const mic = vi.hoisted(() => ({
+  current: null as ComposerMicButtonModule.ComposerMicButtonProps | null,
+}));
+vi.mock("@/components/ComposerMicButton", async (importOriginal) => {
+  const actual = await importOriginal<typeof ComposerMicButtonModule>();
+  return {
+    ...actual,
+    ComposerMicButton: (props: ComposerMicButtonModule.ComposerMicButtonProps) => {
+      mic.current = props;
+      return createElement(actual.ComposerMicButton, props);
+    },
+  };
+});
+
 vi.mock("@/components/composer/composerSectionSettings", async (importOriginal) => {
   const original = await importOriginal<typeof ComposerSectionSettingsModule>();
   return {
@@ -10707,6 +10723,51 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
+  });
+
+  it("discards only the dictated text, and keeps a quote added during the take", async () => {
+    const finishLoad = deferEditorLoad();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    await finishLoad();
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    act(() => insertComposerText(editorTarget(), "Draft"));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    act(() => ref.current?.appendReplyQuote("Added during take"));
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editorTarget().value.split("\n")[0]).toBe("Draft");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Added during take");
+  });
+
+  it("puts the caret at the tail when the editor hands off with it above a leading card", async () => {
+    const finishLoad = deferEditorLoad();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    // No text before the first quote, so the card opens the draft and has no input of its own.
+    act(() => ref.current?.appendReplyQuote("First point"));
+    fireEvent.change(textarea(), { target: { value: "Tail" } });
+    await finishLoad();
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    act(() => editorTarget().setSelectionRange(0, 0));
+
+    rerender(
+      <CapabilitiesProvider info={plainInfo}>
+        <Composer {...composerProps()} ref={ref} />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.queryByLabelText("Reply text before quote 1")).toBeNull();
+    await waitFor(() => expect(textarea()).toHaveValue("Tail"));
+    expect(composerTargetOf(textarea())!.selectionStart).toBe(0);
   });
 
   it("creates no card from a token typed into the textarea while the editor loads", async () => {

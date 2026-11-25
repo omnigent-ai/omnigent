@@ -38,6 +38,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   above it lands below it. The textarea keeps one input per quote, and a draft
   saved on one engine restores on the other. Limits: a slash menu typed after a
   quote lists only skills, and a reply with quotes shows no `@` mention pills.
+  Removing a card (Backspace, Delete or X) takes its line and its own blank
+  separator, and keeps the text around it, so text above and below a card joins
+  with one line break; the textarea joins them with a blank line, so the sent
+  text can differ between engines. A kill (⌃K, ⌃U, ⌃W) never removes a card; at
+  a card's boundary it does nothing. Writes from code (clears, `/side`,
+  attachments) change only the text after the last card. Caret-relative inserts
+  (dictation, mentions, slash completion) are editor edits, so a card they span
+  stays. Discarding a dictation removes only its own text. Only a reply's
+  composer reads tokens as cards; New Chat and other CodeMirror inputs show them
+  as text.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
