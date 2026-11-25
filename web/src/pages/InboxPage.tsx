@@ -469,6 +469,9 @@ export function InboxPage() {
     visibleAutomations.length +
     unreadSuggestions.length +
     unloadedUnreadSuggestions;
+  // Tabs stay switchable while a click is still marking, but Awaiting response
+  // lists only approvals, so it never offers the action.
+  const showMarkAllRead = filter !== "awaiting" && (markAllReadCount > 0 || markingAll);
   const markSuggestionsRead = async () => {
     // One call covers every page; on the advisor tab, only that agent's items.
     if (proactiveInbox.canMarkAllRead) {
@@ -1184,7 +1187,7 @@ export function InboxPage() {
             <span className="sr-only">{summary}</span>
           </span>
         )}
-        {(markAllReadCount > 0 || markingAll) && (
+        {showMarkAllRead && (
           <Button
             variant="outline"
             size="xs"
