@@ -18,11 +18,13 @@ from connectrpc.code import Code
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import HostWorkspaceCallFrame, PullRequestVouch
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
+from omnigent.host.workspace_payloads import payload_dict
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.runner import pr_resource
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
+from tests.host.test_workspace_methods import _PULL_REQUEST_READS
 
 _SESSION = "conv_prs"
 _PR = "https://github.com/example/app/pull/7"
@@ -258,3 +260,104 @@ async def test_the_direct_socket_serves_no_pull_request_whatever_the_call_claims
 
     assert opened == []
     assert provider_reads == []
+
+
+# Each read: a request, the reader method it runs, and the arguments that method gets.
+_READ_CALLS: dict[str, tuple[Any, str, tuple[Any, ...], dict[str, Any]]] = {
+    "GetPullRequest": (pb.GetPullRequestRequest(pr_url=_PR), "github_info", (_SESSION, _PR), {}),
+    "ListPullRequestFiles": (
+        pb.ListPullRequestFilesRequest(pr_url=_PR, head_sha=_HEAD, base_sha=_BASE),
+        "github_changes",
+        (_SESSION, _PR),
+        {"head_sha": _HEAD, "base_sha": _BASE},
+    ),
+    "GetPullRequestDiff": (
+        pb.GetPullRequestDiffRequest(pr_url=_PR, head_sha=_HEAD),
+        "github_pr_diff",
+        (_SESSION, _PR),
+        {"head_sha": _HEAD, "base_sha": None},
+    ),
+    "GetPullRequestDiff.file": (
+        pb.GetPullRequestDiffRequest(
+            pr_url=_PR,
+            head_sha=_HEAD,
+            base_sha=_BASE,
+            path="src/app.py",
+            previous_path="src/old.py",
+            base="main",
+        ),
+        "github_file_diff",
+        ("main", "src/app.py"),
+        {
+            "session_id": _SESSION,
+            "pr_url": _PR,
+            "previous_path": "src/old.py",
+            "head_sha": _HEAD,
+            "base_sha": _BASE,
+        },
+    ),
+    "ListPullRequestCommits": (
+        pb.ListPullRequestCommitsRequest(pr_url=_PR, head_sha=_HEAD),
+        "github_commits",
+        (_SESSION, _PR),
+        {"head_sha": _HEAD},
+    ),
+    "GetCommitDiff": (
+        pb.GetCommitDiffRequest(pr_url=_PR, commit_sha=_HEAD),
+        "github_commit_diff",
+        (_SESSION, _PR),
+        {"commit_sha": _HEAD},
+    ),
+    "ComparePullRequestRange": (
+        pb.ComparePullRequestRangeRequest(pr_url=_PR, head_sha=_HEAD, from_sha=_BASE),
+        "github_compare_diff",
+        (_SESSION, _PR),
+        {"head_sha": _HEAD, "from_sha": _BASE},
+    ),
+    "ListReviewThreads": (
+        pb.ListReviewThreadsRequest(
+            pr_url=_PR, page_token="cursor_1", head_sha=_HEAD, base_sha=_BASE
+        ),
+        "github_review_threads",
+        (_SESSION, _PR, "cursor_1", _HEAD, _BASE),
+        {},
+    ),
+    "ListReviewThreadComments": (
+        pb.ListReviewThreadCommentsRequest(
+            pr_url=_PR, thread_id="thread_1", page_token="cursor_2"
+        ),
+        "github_review_thread_comments",
+        (_SESSION, _PR, "thread_1", "cursor_2"),
+        {},
+    ),
+}
+
+
+def test_every_read_has_an_argument_case() -> None:
+    assert {case.split(".")[0] for case in _READ_CALLS} == _PULL_REQUEST_READS
+
+
+@pytest.mark.parametrize("case", sorted(_READ_CALLS))
+async def test_a_read_passes_the_requests_fields_to_its_reader_and_its_answer_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    request, reader_method, args, kwargs = _READ_CALLS[case]
+    method = case.split(".")[0]
+    calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+    for name in {reader for _request, reader, _args, _kwargs in _READ_CALLS.values()}:
+
+        def record(_self: Any, *got: Any, _name: str = name, **got_kwargs: Any) -> dict[str, Any]:
+            calls.append((_name, got, got_kwargs))
+            return {"object": "test", "count": 3, "items": [{"line": 4}]}
+
+        monkeypatch.setattr(WorkspaceReader, name, record)
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+
+    messages, code, message = await _answer(
+        _frame(tmp_path, method, request.SerializeToString(), vouch=vouch)
+    )
+
+    assert code is None, message
+    assert calls == [(reader_method, args, kwargs)]
+    payload = payload_dict(WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload)
+    assert payload == {"object": "test", "count": 3, "items": [{"line": 4}]}
