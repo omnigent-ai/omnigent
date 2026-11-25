@@ -31,7 +31,23 @@ describe("replaceEmojiShortcodes", () => {
     ["a fence in a list item", "- ```\n  :rocket:\n  ```\n:tada:", "- ```\n  :rocket:\n  ```\n🎉"],
     ["an indented code block", "    :rocket:\n\nafter :tada:", "    :rocket:\n\nafter 🎉"],
     ["a backtick run with a backtick after it", "```a` :rocket:", "```a` 🚀"],
-  ])("keeps code literal and converts prose around %s", (_label, input, expected) => {
+    [
+      "a bare URL",
+      "see https://example.com/a/:fire:/b :tada:",
+      "see https://example.com/a/:fire:/b 🎉",
+    ],
+    [
+      "a www link",
+      "visit www.example.com/:fire: now :tada:",
+      "visit www.example.com/:fire: now 🎉",
+    ],
+    [
+      "a Markdown link",
+      "[docs](https://example.com/:fire:) :tada:",
+      "[docs](https://example.com/:fire:) 🎉",
+    ],
+    ["an HTML tag", '<span title=":fire:">hot</span> :tada:', '<span title=":fire:">hot</span> 🎉'],
+  ])("keeps %s literal and converts the prose around it", (_label, input, expected) => {
     expect(replaceEmojiShortcodes(input)).toBe(expected);
   });
 
