@@ -110,3 +110,21 @@ def run_palette(page: Page, label: str) -> None:
     expect(option).to_have_count(1)
     option.click()
     expect(palette).to_have_count(0)
+
+
+def set_rail_width(page: Page, rail: Locator, width: int) -> None:
+    """Drag the rail's resize handle until the rail is ``width`` pixels wide."""
+    handle = page.get_by_role("separator", name="Resize panel").first
+    handle_box, rail_box = handle.bounding_box(), rail.bounding_box()
+    assert handle_box is not None and rail_box is not None
+    y = handle_box["y"] + 200
+    page.mouse.move(handle_box["x"] + 2, y)
+    page.mouse.down()
+    page.mouse.move(rail_box["x"] + rail_box["width"] - width, y, steps=8)
+    page.mouse.up()
+    for _ in range(20):
+        box = rail.bounding_box()
+        if box is not None and abs(box["width"] - width) <= 2:
+            return
+        page.wait_for_timeout(100)
+    raise AssertionError(f"the rail didn't settle at {width}px")
