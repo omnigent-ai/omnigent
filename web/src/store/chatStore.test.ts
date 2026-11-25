@@ -127,6 +127,7 @@ import {
   retryConversationLoad,
   SEND_STILL_SENDING_AFTER_MS,
   SESSION_READ_TIMEOUT_MS,
+  SSE_MAX_RESUMED_ROTATIONS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
   isListeningForInitialPrompt,
@@ -16192,6 +16193,55 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         reopen: "rotate",
       });
       expect(reads).toEqual({ snapshots: 0, items: 0 });
+    });
+
+    it("still catches up after the maximum run of skipped rotations", async () => {
+      const id = "conv_rotate_bound";
+      seedSession(id, []);
+      const sinks = routeRotatingStreamOpens("epoch-1");
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(ready(7));
+      await drainAsync(2);
+      // Snapshot reads in the 22 s after each rotation, before the next one.
+      const perRotation: number[] = [];
+      for (let rotation = 1; rotation <= SSE_MAX_RESUMED_ROTATIONS + 1; rotation += 1) {
+        // Run the open stream to 15 s short of its max age; the previous
+        // rotation's window already used 22 s of this stream's life.
+        if (rotation === 1) {
+          // oxlint-disable-next-line no-await-in-loop
+          await advanceWithHeartbeats(sinks[0]!, SSE_MAX_STREAM_AGE_MS - 15_000);
+        } else {
+          // oxlint-disable-next-line no-await-in-loop
+          await advanceWithHeartbeats(sinks[rotation - 1]!, SSE_MAX_STREAM_AGE_MS - 45_000);
+          // oxlint-disable-next-line no-await-in-loop
+          await vi.advanceTimersByTimeAsync(8_000);
+        }
+        const before = fetchMock.mock.calls.length;
+        // oxlint-disable-next-line no-await-in-loop
+        await vi.advanceTimersByTimeAsync(15_001);
+        expect(sinks).toHaveLength(rotation + 1);
+        sinks[rotation]!.push(ready(7));
+        // oxlint-disable-next-line no-await-in-loop
+        await drainAsync(2);
+        // oxlint-disable-next-line no-await-in-loop
+        await advanceWithHeartbeats(sinks[rotation]!, 15_000);
+        // oxlint-disable-next-line no-await-in-loop
+        await vi.advanceTimersByTimeAsync(7_000);
+        perRotation.push(
+          fetchMock.mock.calls
+            .slice(before)
+            .filter(([input]) => String(input).includes(`/v1/sessions/${id}/items`)).length,
+        );
+      }
+      expect(perRotation).toEqual([
+        ...Array.from({ length: SSE_MAX_RESUMED_ROTATIONS }, () => 0),
+        1,
+      ]);
+      controller.abort();
+      await loop;
     });
 
     it.each([

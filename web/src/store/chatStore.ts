@@ -7175,6 +7175,12 @@ export const SSE_STALE_RECYCLE_MS = 35_000;
 // up to `SSE_STALL_TIMEOUT_MS` to notice, leaving the transcript stale.
 export const SSE_MAX_STREAM_AGE_MS = 270_000;
 
+// A planned rotation the server proves gap-free skips its catch-up reads, but
+// the proof covers only this server process: an event published on another
+// replica never reaches this stream at all, and the catch-up is what repairs it.
+// Catch up anyway after this many consecutive skips (~18 min of rotations).
+export const SSE_MAX_RESUMED_ROTATIONS = 3;
+
 /**
  * Recycle every live stream attempt that looks dead — no bytes for
  * `SSE_STALE_RECYCLE_MS` while its connection is supposedly up.
@@ -7316,6 +7322,7 @@ export async function startStreamPump(
   // server process missed nothing, so it skips the reconnect catch-up reads.
   let previousPublishCursor: number | null = null;
   let plannedRotation = false;
+  let resumedRotations = 0;
   const nativePreviewBaselines = new Map<string, string>();
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
@@ -7470,7 +7477,8 @@ export async function startStreamPump(
           streamEpoch !== null &&
           streamEpoch === previousStreamEpoch &&
           previousPublishCursor !== null &&
-          !missedEventRecovery.backfillOwed;
+          !missedEventRecovery.backfillOwed &&
+          resumedRotations < SSE_MAX_RESUMED_ROTATIONS;
         if (!hasConnected) clearSseLog(id);
         hasConnected = true;
         if (!resumable) {
@@ -7557,6 +7565,7 @@ export async function startStreamPump(
           streamOpened = true;
           noteSessionStreamOpen(id, true, resumed);
         }
+        if (reconnecting) resumedRotations = resumed ? resumedRotations + 1 : 0;
         // A resumed rotation missed nothing, so it has no snapshot, items or status to catch up.
         if (reconnecting && !resumed) {
           await missedEventRecovery.backfill(true);
