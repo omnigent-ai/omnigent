@@ -6,6 +6,8 @@ import asyncio
 import base64
 import functools
 import json
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1211,6 +1213,84 @@ async def test_a_panel_merge_shows_on_the_next_panel_read(
     assert before.json()["pr"]["state"] == "OPEN"
     assert merged.status_code == 200, merged.text
     assert after.json()["pr"]["state"] == "MERGED"
+
+
+async def test_a_panel_merge_answers_and_shows_when_its_write_cannot_be_recorded(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that can't leave its cross-process record still succeeds, and polls still see it."""
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    monkeypatch.setattr(github, "_run_pr_merge", lambda *_a, **_kw: forge.update(value="MERGED"))
+    # A directory where the write record would go makes recording it fail.
+    SessionPrRegistry("session").path.with_suffix(".panel-writes").mkdir(parents=True)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    poll = {"pr_url": B, "allow_cached": "true"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = [await client.get(path, params=poll) for _ in range(2)]
+        merged = await client.post(
+            f"{path}/merge",
+            json={"pr_url": B, "merge_method": "squash", "expected_head": "a" * 40},
+        )
+        after = await client.get(path, params=poll)
+    assert [response.json()["pr"]["state"] for response in before] == ["OPEN", "OPEN"]
+    assert merged.status_code == 200, merged.text
+    assert after.json()["pr"]["state"] == "MERGED"
+
+
+_PANEL_COMMENT_IN_ANOTHER_PROCESS = """
+import sys
+from omnigent.runner import github_resource, pr_resource
+github_resource._gh = lambda *_args, **_kwargs: (0, "{}", "")
+try:
+    pr_resource.create_pr_comment(sys.argv[1], session_id="session", pr_url=sys.argv[2], body="Hi")
+except Exception:
+    pass  # A failed write may still have changed the PR.
+"""
+
+
+async def test_a_poll_reads_the_forge_after_another_process_writes_through_the_panel(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host serves panel edits while the runner is offline, in its own process."""
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    poll = {"pr_url": B, "allow_cached": "true"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        await client.get(path, params=poll)
+        other_process = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-c", _PANEL_COMMENT_IN_ANOTHER_PROCESS, tracked, B],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=budget(60),
+        )
+        reads_before = len(views)
+        after = await client.get(path, params=poll)
+    assert other_process.returncode == 0, other_process.stderr
+    assert after.status_code == 200, after.text
+    assert len(views) == reads_before + 1
 
 
 async def test_panel_reads_answer_for_their_own_session_and_selected_pr(
