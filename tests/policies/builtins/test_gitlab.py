@@ -265,6 +265,8 @@ def test_glab_target_branch_gated() -> None:
     policy = gitlab_policy(write_repos=[_PROJECT], write_branches=["main"])
     assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b main"))) == "ALLOW"
     assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b release"))) == "DENY"
+    # glab uses the last repeated flag, so an earlier allowed value cannot mask it.
+    assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b main -b release"))) == "DENY"
 
 
 @pytest.mark.parametrize(

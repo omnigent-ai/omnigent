@@ -67,7 +67,6 @@ from omnigent.policies.builtins.github import (
     _ask,
     _classify_git,
     _deny,
-    _flag_value,
     _git_subcommand_index,
     _normalize_branches,
     _worse,
@@ -591,6 +590,12 @@ def _flag_values(args: list[str], names: frozenset[str]) -> list[str]:
             index += 1
         index += 1
     return values
+
+
+def _flag_value(args: list[str], names: frozenset[str]) -> str | None:
+    """Return the value of *names* that glab uses: the last one given, else ``None``."""
+    values = _flag_values(args, names)
+    return values[-1] if values else None
 
 
 def _glab_host_override(
