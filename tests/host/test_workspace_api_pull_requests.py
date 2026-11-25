@@ -19,6 +19,7 @@ import pytest
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from connectrpc.protocol import ProtocolType
+from connectrpc.server import DEFAULT_READ_MAX_BYTES
 
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host import workspace_service
@@ -364,6 +365,108 @@ async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(
         await getattr(client, WORKSPACE_METHODS[method].python_name)(request_message)
 
     assert (refused.value.code, refused.value.message) == (Code.INVALID_ARGUMENT, refusal)
+    assert store.reads == 0
+    assert host_calls == []
+
+
+# -- An upload reads past connectrpc's 4 MB default only for the session's owner. ---------
+
+_OVER_DEFAULT_READ = 5 * 1024 * 1024
+
+
+@pytest.fixture
+def read_limits(monkeypatch: pytest.MonkeyPatch) -> list[int | None]:
+    """The read limit of each Connect app the route built, one per call that passed its gates."""
+    from omnigent.api.workspace.v1alpha1 import workspace_connect
+
+    built: list[int | None] = []
+    real = workspace_connect.WorkspaceServiceASGIApplication
+
+    def recording(service: Any, *, read_max_bytes: int | None) -> Any:
+        built.append(read_max_bytes)
+        return real(service, read_max_bytes=read_max_bytes)
+
+    monkeypatch.setattr(workspace_connect, "WorkspaceServiceASGIApplication", recording)
+    return built
+
+
+async def test_an_owners_upload_larger_than_the_default_read_limit_reaches_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+    read_limits: list[int | None],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    content = b"\x89PNG" + b"\0" * _OVER_DEFAULT_READ
+
+    response = await client.upload_attachment(
+        pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png", content=content)
+    )
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [call.method for call in host_calls] == ["UploadAttachment"]
+    assert [(call[0], call[2]["content"] == content) for call in owner_calls] == [
+        ("upload_pr_attachment", True)
+    ]
+    assert read_limits == [MAX_ATTACHMENT_BYTES + 64 * 1024]
+
+
+async def test_a_non_owners_upload_is_refused_before_any_body_is_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    read_limits: list[int | None],
+) -> None:
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(routes_resources, "_is_session_owner", lambda *_args, **_kwargs: False)
+    app = service_tests._server_app(tmp_path, monkeypatch)
+    monkeypatch.setattr(server_prs, "open_store", lambda _conversations: _Store(_linked(_PR)))
+    request = pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png", content=b"png")
+    headers = {"Content-Type": "application/proto"}
+
+    response = await _post(app, "UploadAttachment", request.SerializeToString(), headers)
+
+    assert response.status_code == 403, response.text
+    assert read_limits == []
+    assert host_calls == []
+
+
+async def test_any_other_call_keeps_the_default_read_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    read_limits: list[int | None],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(
+            pb.CreateCommentRequest(pr_url=_PR, body="x" * _OVER_DEFAULT_READ)
+        )
+
+    assert refused.value.code == Code.RESOURCE_EXHAUSTED
+    assert read_limits == [DEFAULT_READ_MAX_BYTES]
+    assert host_calls == []
+
+
+async def test_an_upload_larger_than_an_attachment_is_refused_before_the_vouch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+    content = b"\0" * (MAX_ATTACHMENT_BYTES + 1)
+
+    with pytest.raises(ConnectError) as refused:
+        await client.upload_attachment(
+            pb.UploadAttachmentRequest(pr_url=_PR, name="clip.mp4", content=content)
+        )
+
+    assert (refused.value.code, refused.value.message) == (
+        Code.INVALID_ARGUMENT,
+        "The attachment is larger than 70 MB",
+    )
     assert store.reads == 0
     assert host_calls == []
 
