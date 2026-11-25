@@ -1,5 +1,7 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import userEvent from "@testing-library/user-event";
+import { type ComponentProps, type ReactNode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -80,6 +82,18 @@ vi.mock("@/shell/fileTree/FilesTree", () => ({
   },
 }));
 
+/** The folder's file actions read the session's hosts, so the tree needs a query client. */
+function TestProviders({ children }: { children: ReactNode }) {
+  const [client] = useState(
+    () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  );
+  return (
+    <QueryClientProvider client={client}>
+      <TooltipProvider>{children}</TooltipProvider>
+    </QueryClientProvider>
+  );
+}
+
 function entry(path: string): WorkspaceFile {
   return { path, name: path.split("/").pop()!, type: "file", bytes: 1, modified_at: null };
 }
@@ -101,29 +115,32 @@ function renderTree(
 ) {
   vi.mocked(useWorkspaceAllFiles).mockReturnValue(files as FilesResult);
   const onFileSelect = vi.fn();
-  const onShowHidden = vi.fn();
-  const onShowIgnored = vi.fn();
+  const onShowHiddenChange = vi.fn();
+  const onShowIgnoredChange = vi.fn();
+  const onSortChange = vi.fn();
   const tree = (ignored: boolean) => (
-    <TooltipProvider>
+    <TestProviders>
       <FilesPageTree
         conversationId="conv_1"
         active={active}
         commandsActive={active}
         activePath="src/a.ts"
         sort="alpha"
+        onSortChange={onSortChange}
         showHidden={showHidden}
-        onShowHidden={onShowHidden}
+        onShowHiddenChange={onShowHiddenChange}
         showIgnored={ignored}
-        onShowIgnored={onShowIgnored}
+        onShowIgnoredChange={onShowIgnoredChange}
         onFileSelect={onFileSelect}
       />
-    </TooltipProvider>
+    </TestProviders>
   );
   const view = render(tree(showIgnored));
   return {
     onFileSelect,
-    onShowHidden,
-    onShowIgnored,
+    onShowHiddenChange,
+    onShowIgnoredChange,
+    onSortChange,
     /** Switch ignored files, with `next` as the listing that answers then. */
     setShowIgnored: (ignored: boolean, next: Partial<FilesResult>) => {
       vi.mocked(useWorkspaceAllFiles).mockReturnValue(next as FilesResult);
@@ -181,10 +198,10 @@ describe("FilesPageTree", () => {
     renderTree(listed([]));
     expect(screen.getByRole("status")).toHaveTextContent("No files in the workspace.");
     cleanup();
-    const { onShowHidden } = renderTree(listed([entry(".env")]));
+    const { onShowHiddenChange } = renderTree(listed([entry(".env")]));
     expect(screen.getByRole("status")).toHaveTextContent("Every file here is hidden.");
     fireEvent.click(screen.getByRole("button", { name: "Show hidden files" }));
-    expect(onShowHidden).toHaveBeenCalledTimes(1);
+    expect(onShowHiddenChange).toHaveBeenCalledExactlyOnceWith(true);
     cleanup();
     renderTree(listed([entry(".env")]), true);
     expect(screen.getByTestId("files-tree")).toBeInTheDocument();
@@ -207,13 +224,13 @@ describe("FilesPageTree", () => {
     expect(captured.tree?.showIgnored).toBe(false);
     cleanup();
 
-    const { onShowIgnored } = renderTree(listed([], true), false, { showIgnored: false });
+    const { onShowIgnoredChange } = renderTree(listed([], true), false, { showIgnored: false });
     expect(screen.getByRole("status")).toHaveTextContent(
       "No files here, apart from any that Git ignores.",
     );
     expect(screen.queryByRole("button", { name: "Show hidden files" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Show git-ignored files" }));
-    expect(onShowIgnored).toHaveBeenCalledTimes(1);
+    expect(onShowIgnoredChange).toHaveBeenCalledExactlyOnceWith(true);
     cleanup();
 
     // A host that couldn't leave anything out listed everything there is.
@@ -231,8 +248,8 @@ describe("FilesPageTree", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Show hidden files" }));
     fireEvent.click(screen.getByRole("button", { name: "Show git-ignored files" }));
-    expect(both.onShowHidden).toHaveBeenCalledTimes(1);
-    expect(both.onShowIgnored).toHaveBeenCalledTimes(1);
+    expect(both.onShowHiddenChange).toHaveBeenCalledExactlyOnceWith(true);
+    expect(both.onShowIgnoredChange).toHaveBeenCalledExactlyOnceWith(true);
     cleanup();
 
     renderTree(listed([entry("README.md")]), false, { showIgnored: true });
@@ -286,6 +303,85 @@ describe("FilesPageTree", () => {
     expect(rememberedBrowseLocation("conv_1")).toBeNull();
   });
 
+  it("keeps sort, hidden files, the name filter and the folder's actions in its ⋯", async () => {
+    rememberBrowseLocation("conv_1", "/work/repo/src/lib");
+    const refetch = vi.fn();
+    const refetchChanges = vi.fn();
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: { available: true, data: [] },
+      refetch: refetchChanges,
+    } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
+    const { onSortChange, onShowHiddenChange } = renderTree({
+      ...listed([entry("src/lib/a.ts")]),
+      refetch,
+    } as never);
+    // The tree's header holds no separate filter button; the ⋯ offers the filter.
+    expect(screen.queryByRole("button", { name: "Filter Files Tree by Name" })).toBeNull();
+    const options = () => screen.getByRole("button", { name: "Tree options" });
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemradio", { name: "Filename" })).toBeChecked();
+    await userEvent.click(screen.getByRole("menuitemradio", { name: "Size" }));
+    expect(onSortChange).toHaveBeenCalledExactlyOnceWith("size");
+    await userEvent.click(options());
+    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" }));
+    expect(onShowHiddenChange).toHaveBeenCalledExactlyOnceWith(true);
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitem", { name: "Filter by name" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("menuitem", { name: "Refresh files" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+    expect(refetchChanges).toHaveBeenCalledTimes(1);
+    // The folders opened under the root reload too, through the tree's refresh token.
+    expect(captured.tree?.refreshToken).toBe(1);
+    await userEvent.click(options());
+    await userEvent.click(screen.getByRole("menuitem", { name: "Go to parent folder" }));
+    expect(rememberedBrowseLocation("conv_1")).toBe("/work/repo/src");
+  });
+
+  it("refreshes the filter's matches along with the listing", () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const refetchSearch = vi.fn();
+    vi.mocked(useWorkspaceFileSearch).mockReturnValue({
+      data: { files: [entry("lib/button.ts")], truncated: false, hasMore: false },
+      refetch: refetchSearch,
+    } as never);
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: { available: true, data: [] },
+      refetch: vi.fn(),
+    } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderTree({ ...listed([entry("src")]), refetch: vi.fn() } as never);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Tree options" }), { key: "Enter" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Filter by name" }));
+    act(() => vi.advanceTimersByTime(1));
+    fireEvent.change(screen.getByRole("textbox", { name: "Name contains" }), {
+      target: { value: "button" },
+    });
+    act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+    // While a filter narrows the tree, the ⋯ says so.
+    const options = screen.getByRole("button", { name: "Tree options, filter on" });
+    expect(within(options).getByTestId("tree-filter-dot")).toBeInTheDocument();
+    fireEvent.keyDown(options, { key: "Enter" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Refresh files" }));
+    expect(refetchSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers the folder's actions on a right-click of its name, which stops at the workspace", async () => {
+    rememberBrowseLocation("conv_1", "/work/repo/src");
+    renderTree(listed([entry("src/a.ts")]));
+    fireEvent.contextMenu(screen.getByTestId("browse-location-menu-trigger"));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Go to parent folder" }));
+    // The parent is the workspace root, so the tree goes back to the working folder.
+    expect(rememberedBrowseLocation("conv_1")).toBeNull();
+    cleanup();
+    renderTree(listed([entry("README.md")]));
+    fireEvent.contextMenu(screen.getByTestId("browse-location-menu-trigger"));
+    // The workspace's parent is outside it, which a session without host reach can't browse.
+    expect(await screen.findByRole("menuitem", { name: "Go to parent folder" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.queryByRole("menuitem", { name: "Back to working folder" })).toBeNull();
+  });
+
   it("says a rooted folder is empty rather than the workspace", () => {
     rememberBrowseLocation("conv_1", "/work/repo/empty");
     renderTree(listed([]));
@@ -330,18 +426,21 @@ describe("FilesPageTree", () => {
   it("says why it can't reveal a hidden file", () => {
     vi.mocked(useWorkspaceAllFiles).mockReturnValue(listed([entry("src")]));
     render(
-      <TooltipProvider>
+      <TestProviders>
         <FilesPageTree
           conversationId="conv_1"
           active
           commandsActive
           activePath=".github/ci.yml"
           sort="alpha"
+          onSortChange={vi.fn()}
           showHidden={false}
+          onShowHiddenChange={vi.fn()}
           showIgnored
+          onShowIgnoredChange={vi.fn()}
           onFileSelect={vi.fn()}
         />
-      </TooltipProvider>,
+      </TestProviders>,
     );
     const button = screen.getByRole("button", { name: "Reveal Active File" });
     expect(button).toHaveAttribute("aria-disabled", "true");
@@ -351,24 +450,32 @@ describe("FilesPageTree", () => {
 
   it("says why a reveal found nothing in a folder whose every entry Git ignores", () => {
     vi.mocked(toast.info).mockClear();
-    const { onShowIgnored } = renderTree(listed([], true), false, { showIgnored: false });
+    const { onShowIgnoredChange } = renderTree(listed([], true), false, { showIgnored: false });
     fireEvent.click(screen.getByRole("button", { name: "Reveal Active File" }));
     expect(toast.info).toHaveBeenCalledExactlyOnceWith(
       "a.ts isn’t in the Files tree. Git may ignore it, and ignored files are hidden.",
-      { action: { label: "Show git-ignored files", onClick: onShowIgnored } },
+      { action: { label: "Show git-ignored files", onClick: expect.any(Function) } },
     );
+    (
+      vi.mocked(toast.info).mock.calls[0]![1]!.action as unknown as { onClick: () => void }
+    ).onClick();
+    expect(onShowIgnoredChange).toHaveBeenCalledExactlyOnceWith(true);
   });
 
   it("says why a reveal found nothing, and offers ignored files while they're off", () => {
     vi.mocked(toast.info).mockClear();
-    const { onShowIgnored } = renderTree(listed([entry("README.md")]), false, {
+    const { onShowIgnoredChange } = renderTree(listed([entry("README.md")]), false, {
       showIgnored: false,
     });
     act(() => captured.tree?.onActiveRevealMissed?.("artifact.log"));
     expect(toast.info).toHaveBeenCalledExactlyOnceWith(
       "artifact.log isn’t in the Files tree. Git may ignore it, and ignored files are hidden.",
-      { action: { label: "Show git-ignored files", onClick: onShowIgnored } },
+      { action: { label: "Show git-ignored files", onClick: expect.any(Function) } },
     );
+    (
+      vi.mocked(toast.info).mock.calls[0]![1]!.action as unknown as { onClick: () => void }
+    ).onClick();
+    expect(onShowIgnoredChange).toHaveBeenCalledExactlyOnceWith(true);
     cleanup();
 
     vi.mocked(toast.info).mockClear();
@@ -381,7 +488,15 @@ describe("FilesPageTree", () => {
   });
 
   describe("name filter", () => {
-    const filterButton = () => screen.getByRole("button", { name: "Filter Files Tree by Name" });
+    const optionsButton = () => screen.getByRole("button", { name: /^Tree options/ });
+    const openFilter = () => {
+      fireEvent.keyDown(optionsButton(), { key: "Enter" });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Filter by name" }));
+      // The closed menu hands focus on to the filter's field.
+      act(() => {
+        if (vi.isFakeTimers()) vi.advanceTimersByTime(1);
+      });
+    };
     const nameField = () => screen.getByRole("textbox", { name: "Name contains" });
     const typeName = (name: string) => {
       fireEvent.change(nameField(), { target: { value: name } });
@@ -404,8 +519,7 @@ describe("FilesPageTree", () => {
         },
       } as never);
       const { onFileSelect } = renderTree(listed([entry("src/a.ts")]));
-      fireEvent.click(filterButton());
-      expect(filterButton()).toHaveAttribute("aria-pressed", "true");
+      openFilter();
       expect(nameField()).toHaveFocus();
       typeName("button");
       expect(searches().at(-1)).toEqual([
@@ -440,7 +554,7 @@ describe("FilesPageTree", () => {
     it("searches without what Git ignores while ignored files are off, as the tree lists", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("README.md")], true), false, { showIgnored: false });
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("artifact");
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
     });
@@ -454,7 +568,7 @@ describe("FilesPageTree", () => {
           showIgnored: false,
         },
       );
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("artifact");
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: true });
     });
@@ -464,7 +578,7 @@ describe("FilesPageTree", () => {
       const withIgnored = { files: [entry("build/out.o")], truncated: false, hasMore: false };
       vi.mocked(useWorkspaceFileSearch).mockReturnValue({ data: withIgnored } as never);
       const { setShowIgnored } = renderTree(listed([entry("README.md")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("out");
       expect(screen.getByRole("button", { name: "build/out.o" })).toBeInTheDocument();
 
@@ -485,7 +599,7 @@ describe("FilesPageTree", () => {
     it("searches everything on a host whose listing can't leave ignored files out", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("README.md")]), false, { showIgnored: false });
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("artifact");
       expect(searches().at(-1)?.[4]).toEqual({ enabled: true, hideIgnored: false });
     });
@@ -500,10 +614,10 @@ describe("FilesPageTree", () => {
         error: new IgnoredFilesSearchError(),
         refetch,
       } as never);
-      const { onShowIgnored } = renderTree(listed([entry("README.md")], true), false, {
+      const { onShowIgnoredChange } = renderTree(listed([entry("README.md")], true), false, {
         showIgnored: false,
       });
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("artifact");
       expect(
         screen.getByText("The files can’t be searched without what Git ignores right now."),
@@ -511,7 +625,7 @@ describe("FilesPageTree", () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       expect(refetch).toHaveBeenCalledTimes(1);
       fireEvent.click(screen.getByRole("button", { name: "Show git-ignored files" }));
-      expect(onShowIgnored).toHaveBeenCalledTimes(1);
+      expect(onShowIgnoredChange).toHaveBeenCalledExactlyOnceWith(true);
     });
 
     it("ends the filter for the header's Reveal, so the whole tree shows the viewed file", () => {
@@ -520,7 +634,7 @@ describe("FilesPageTree", () => {
         data: { files: [entry("src/a.ts")], truncated: false, hasMore: false },
       } as never);
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("a.ts");
       expect(screen.getByTestId("files-tree-matches")).toBeInTheDocument();
 
@@ -536,7 +650,7 @@ describe("FilesPageTree", () => {
         data: { files: [entry("src/a.ts")], truncated: false, hasMore: false },
       } as never);
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       fireEvent.change(nameField(), { target: { value: "a.ts" } });
       act(() => {
         requestActiveFileReveal("conv_1", "src/a.ts");
@@ -555,7 +669,7 @@ describe("FilesPageTree", () => {
       } as never);
       // No tree mounts to take the reveal up, so it stays pending.
       fireEvent.click(screen.getByRole("button", { name: "Reveal Active File" }));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("button");
       expect(nameField()).toHaveValue("button");
       expect(searches().at(-1)).toEqual([
@@ -571,7 +685,7 @@ describe("FilesPageTree", () => {
     it("narrows the search with globs, which do nothing until a name is set", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       fireEvent.click(screen.getByRole("button", { name: "Files to include or exclude" }));
       fireEvent.change(screen.getByRole("textbox", { name: "Files to include" }), {
         target: { value: "*.ts" },
@@ -589,7 +703,7 @@ describe("FilesPageTree", () => {
     it("says what it's doing while it searches, finds nothing, or fails", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("zzz");
       expect(screen.getByText("Searching…")).toBeInTheDocument();
       cleanup();
@@ -622,7 +736,7 @@ describe("FilesPageTree", () => {
         vi.useFakeTimers();
         vi.mocked(useWorkspaceFileSearch).mockReturnValue(search as never);
         renderTree(listed([entry("src")]));
-        fireEvent.click(filterButton());
+        openFilter();
         typeName("zzz");
         expect(screen.getByTestId("tree-filter-strip").nextElementSibling).toHaveTextContent(
           "The files can’t be searched right now. Send a message to reconnect the session’s machine.",
@@ -643,7 +757,7 @@ describe("FilesPageTree", () => {
         },
       } as never);
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("app");
       expect(screen.getByText(/^The first matches are all hidden files/)).toBeInTheDocument();
       expect(screen.queryByText("No files match “app”.")).toBeNull();
@@ -655,7 +769,7 @@ describe("FilesPageTree", () => {
         data: { files: [], truncated: true, hasMore: false, unavailable: false },
       } as never);
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("zzz");
       expect(screen.getByText(/^No matches in the files searched so far\./)).toBeInTheDocument();
       expect(screen.queryByText("No files match “zzz”.")).toBeNull();
@@ -671,21 +785,26 @@ describe("FilesPageTree", () => {
           commandsActive={active}
           activePath="src/a.ts"
           sort="alpha"
+          onSortChange={vi.fn()}
           showHidden={false}
+          onShowHiddenChange={vi.fn()}
           showIgnored
+          onShowIgnoredChange={vi.fn()}
           onFileSelect={vi.fn()}
         />
       );
       const tabs = (firstActive: boolean, firstMounted = true) => (
-        <TooltipProvider>
+        <TestProviders>
           {firstMounted ? <div key="first">{tab(firstActive)}</div> : null}
           <div key="second">{tab(!firstActive)}</div>
-        </TooltipProvider>
+        </TestProviders>
       );
       const view = render(tabs(true));
       // Both tabs filter their trees.
-      for (const button of screen.getAllByRole("button", { name: "Filter Files Tree by Name" })) {
-        fireEvent.click(button);
+      for (const button of screen.getAllByRole("button", { name: /^Tree options/ })) {
+        fireEvent.keyDown(button, { key: "Enter" });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Filter by name" }));
+        act(() => vi.advanceTimersByTime(1));
       }
       for (const field of screen.getAllByRole("textbox", { name: "Name contains" })) {
         fireEvent.change(field, { target: { value: "app" } });
@@ -713,22 +832,27 @@ describe("FilesPageTree", () => {
             commandsActive={keyboardTarget}
             activePath="src/a.ts"
             sort="alpha"
+            onSortChange={vi.fn()}
             showHidden={false}
+            onShowHiddenChange={vi.fn()}
             showIgnored
+            onShowIgnoredChange={vi.fn()}
             onFileSelect={vi.fn()}
           />
         </div>
       );
       // Two sessions' panes on screen; only the one without the keyboard filters its tree.
       const panes = (firstOwnsKeyboard: boolean) => (
-        <TooltipProvider>
+        <TestProviders>
           {pane("conv_first", firstOwnsKeyboard)}
           {pane("conv_second", !firstOwnsKeyboard)}
-        </TooltipProvider>
+        </TestProviders>
       );
       const view = render(panes(true));
       const second = within(screen.getByTestId("conv_second"));
-      fireEvent.click(second.getByRole("button", { name: "Filter Files Tree by Name" }));
+      fireEvent.keyDown(second.getByRole("button", { name: /^Tree options/ }), { key: "Enter" });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Filter by name" }));
+      act(() => vi.advanceTimersByTime(1));
       fireEvent.change(second.getByRole("textbox", { name: "Name contains" }), {
         target: { value: "app" },
       });
@@ -749,7 +873,7 @@ describe("FilesPageTree", () => {
     it("keeps the filter across a remount, and clears it from the strip", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("app");
       cleanup();
       renderTree(listed([entry("src")]));
@@ -764,19 +888,18 @@ describe("FilesPageTree", () => {
     it("empties the name on Escape, then closes the filter", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("app");
       fireEvent.keyDown(nameField(), { key: "Escape" });
       expect(nameField()).toHaveValue("");
       fireEvent.keyDown(nameField(), { key: "Escape" });
       expect(screen.queryByRole("textbox", { name: "Name contains" })).toBeNull();
-      expect(filterButton()).toHaveAttribute("aria-pressed", "false");
-      // The field that had focus is gone, so focus lands on the filter's button.
-      expect(filterButton()).toHaveFocus();
-      fireEvent.click(filterButton());
+      // The field that had focus is gone, so focus lands on the ⋯ that opened it.
+      expect(optionsButton()).toHaveFocus();
+      openFilter();
       expect(nameField()).toHaveFocus();
       fireEvent.click(screen.getByRole("button", { name: "Close filter" }));
-      expect(filterButton()).toHaveFocus();
+      expect(optionsButton()).toHaveFocus();
     });
 
     it("shows no matches from the folder it browsed before a root change", () => {
@@ -787,7 +910,7 @@ describe("FilesPageTree", () => {
         isPlaceholderData: false,
       } as never);
       renderTree(listed([entry("button.ts")]));
-      fireEvent.click(filterButton());
+      openFilter();
       typeName("button");
       expect(screen.getByRole("button", { name: "button.ts" })).toBeInTheDocument();
       expect(screen.getByText(/Showing the first matches/)).toBeInTheDocument();

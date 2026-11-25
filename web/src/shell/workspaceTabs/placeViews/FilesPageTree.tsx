@@ -1,9 +1,16 @@
-// Shows the browsed folder, or name-filter matches, with root and reveal controls.
+// Shows the browsed folder, or name-filter matches, with root and reveal controls and
+// the tree's ⋯ menu.
 
 import { FolderDotIcon, ListFilterIcon, LocateFixedIcon } from "lucide-react";
 import { type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChangedSort } from "@/lib/changedSort";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -41,12 +48,13 @@ import {
 } from "@/shell/fileTree/treeRoot";
 import {
   CLEAR_TREE_FILTER_LABEL,
-  FILTER_TREE_BY_NAME_LABEL,
   useTreeNameFilterRequests,
 } from "@/shell/fileTree/treeNameFilter";
 import { useTreeActiveReveal } from "@/shell/fileTree/useTreeActiveReveal";
 
 import { FilesTreeFilterBar } from "./FilesTreeFilterBar";
+import { FilesTreeOptionsMenu } from "./filesTreeOptions";
+import { useTreeFolderActions } from "./useTreeFolderActions";
 
 export interface FilesPageTreeProps {
   conversationId: string;
@@ -57,13 +65,12 @@ export interface FilesPageTreeProps {
   /** The file the page shows, which the tree opens down to. */
   activePath: string | undefined;
   sort: ChangedSort;
+  onSortChange: (sort: ChangedSort) => void;
   showHidden: boolean;
-  /** Shows hidden files, for a workspace whose every file is hidden. */
-  onShowHidden?: () => void;
+  onShowHiddenChange: (showHidden: boolean) => void;
   /** List what Git ignores, marked as ignored; otherwise leave it out. */
   showIgnored: boolean;
-  /** Shows ignored files, for a workspace where Git ignores every file. */
-  onShowIgnored?: () => void;
+  onShowIgnoredChange: (showIgnored: boolean) => void;
   /**
    * A file picked in the tree, workspace-relative or absolute outside it. `newTab` for
    * a ⌘-click (Ctrl-click off macOS) or a middle click, which want it in its own tab.
@@ -100,18 +107,12 @@ function HeaderButton({
   label,
   tooltip,
   disabled = false,
-  pressed,
-  marked = false,
   onClick,
   children,
 }: {
   label: string;
   tooltip: string;
   disabled?: boolean;
-  /** A toggle's state, for a button that opens and closes something. */
-  pressed?: boolean;
-  /** Shows a dot, as while a filter narrows the tree. */
-  marked?: boolean;
   onClick: () => void;
   children: React.ReactNode;
 }) {
@@ -125,24 +126,12 @@ function HeaderButton({
           size="icon-xs"
           aria-label={label}
           aria-disabled={disabled || undefined}
-          aria-pressed={pressed}
-          data-tree-filter-toggle={pressed === undefined ? undefined : ""}
-          className={cn(
-            "relative shrink-0 text-muted-foreground hover:text-foreground aria-disabled:opacity-50 aria-disabled:hover:text-muted-foreground",
-            (pressed || marked) && "text-foreground",
-          )}
+          className="shrink-0 text-muted-foreground hover:text-foreground aria-disabled:opacity-50 aria-disabled:hover:text-muted-foreground"
           onClick={() => {
             if (!disabled) onClick();
           }}
         >
           {children}
-          {marked ? (
-            <span
-              aria-hidden
-              data-testid="tree-filter-dot"
-              className="absolute top-0.5 right-0.5 size-1.5 rounded-full bg-primary"
-            />
-          ) : null}
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">{tooltip}</TooltipContent>
@@ -156,12 +145,15 @@ export function FilesPageTree({
   commandsActive,
   activePath,
   sort,
+  onSortChange,
   showHidden,
-  onShowHidden,
+  onShowHiddenChange,
   showIgnored,
-  onShowIgnored,
+  onShowIgnoredChange,
   onFileSelect,
 }: FilesPageTreeProps) {
+  const onShowHidden = () => onShowHiddenChange(true);
+  const onShowIgnored = () => onShowIgnoredChange(true);
   const environment = useWorkspaceEnvironment(conversationId);
   const workspaceRoot = environment.data?.root ?? null;
   const browsed = useRememberedBrowseLocation(conversationId);
@@ -189,6 +181,7 @@ export function FilesPageTree({
     browsed === null
       ? workspaceFolderName(workspaceRoot)
       : (breadcrumbSegments(browsed).at(-1)?.label ?? browsed);
+  const folder = browsed ?? workspaceRoot;
 
   // The name filter, remembered per session so a popover closing after a pick keeps it.
   const filters = useTreeFilters(conversationId);
@@ -205,12 +198,12 @@ export function FilesPageTree({
   useEffect(() => {
     if (focusFilterToken > 0) filterInput.current?.focus();
   }, [focusFilterToken]);
-  // Closing the filter takes away the field that had focus, so focus goes to its button.
+  // Closing the filter takes away the field that had focus, so focus goes to the ⋯ it came from.
   const root = useRef<HTMLDivElement>(null);
   const [focusToggleToken, setFocusToggleToken] = useState(0);
   useEffect(() => {
     if (focusToggleToken === 0) return;
-    root.current?.querySelector<HTMLElement>("[data-tree-filter-toggle]")?.focus();
+    root.current?.querySelector<HTMLElement>("[data-tree-options-trigger]")?.focus();
   }, [focusToggleToken]);
   const closeFilter = () => {
     filters.clear();
@@ -259,6 +252,24 @@ export function FilesPageTree({
     { enabled: summary.active, hideIgnored: searchHidesIgnored },
     location,
   );
+  // Refresh reloads what the tree shows: the root, its changes, the filter's matches and,
+  // through the token, every folder opened under the root.
+  const [refreshToken, setRefreshToken] = useState(0);
+  const folderActions = useTreeFolderActions({
+    folder,
+    workspaceRoot,
+    hostId: session?.hostId ?? null,
+    canBrowseOutside,
+    reach: environment.data?.reachable ?? null,
+    onNavigate: (treeRoot) => showTreeRoot(conversationId, treeRoot),
+    refreshing: files.isFetching || changes.isFetching || (summary.active && search.isFetching),
+    onRefresh: () => {
+      setRefreshToken((token) => token + 1);
+      void files.refetch();
+      void changes.refetch();
+      if (summary.active) void search.refetch();
+    },
+  });
   // Typing keeps the previous matches in view, but a new root's search starts from none:
   // matches from the old folder would open the wrong paths. Switching ignored files off
   // starts from none too, so the old search's ignored matches don't linger.
@@ -291,24 +302,29 @@ export function FilesPageTree({
       className="flex h-8 shrink-0 items-center gap-0.5 border-b border-border pr-1 pl-3"
       data-testid="files-page-tree-header"
     >
-      <span
-        className={cn(
-          "min-w-0 flex-1 truncate text-ui",
-          away ? "text-foreground" : "text-muted-foreground",
-        )}
-        title={browsed ?? workspaceRoot ?? undefined}
-      >
-        {folderName}
-      </span>
-      <HeaderButton
-        label={FILTER_TREE_BY_NAME_LABEL}
-        tooltip={summary.active ? `${FILTER_TREE_BY_NAME_LABEL}: on` : FILTER_TREE_BY_NAME_LABEL}
-        pressed={filterOpen}
-        marked={summary.active}
-        onClick={() => (filterOpen ? closeFilter() : openFilter())}
-      >
-        <ListFilterIcon />
-      </HeaderButton>
+      {/* A right-click on the folder's name offers the same folder actions as the ⋯. */}
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <span
+            className={cn(
+              "min-w-0 flex-1 truncate text-ui",
+              away ? "text-foreground" : "text-muted-foreground",
+            )}
+            title={folder ?? undefined}
+            data-testid="browse-location-menu-trigger"
+          >
+            {folderName}
+          </span>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          {folderActions.map((action) => (
+            <ContextMenuItem key={action.key} disabled={action.disabled} onSelect={action.onSelect}>
+              {action.icon}
+              {action.label}
+            </ContextMenuItem>
+          ))}
+        </ContextMenuContent>
+      </ContextMenu>
       {away ? (
         <HeaderButton
           label={BACK_TO_WORKING_FOLDER_LABEL}
@@ -330,6 +346,17 @@ export function FilesPageTree({
       >
         <LocateFixedIcon />
       </HeaderButton>
+      <FilesTreeOptionsMenu
+        sort={sort}
+        onSortChange={onSortChange}
+        showHidden={showHidden}
+        onShowHiddenChange={onShowHiddenChange}
+        showIgnored={showIgnored}
+        onShowIgnoredChange={onShowIgnoredChange}
+        filtering={summary.active}
+        onFilter={() => (filterOpen ? filterInput.current?.focus() : openFilter())}
+        folderActions={folderActions}
+      />
     </div>
   );
 
@@ -370,11 +397,9 @@ export function FilesPageTree({
             >
               Try again
             </Button>
-            {onShowIgnored ? (
-              <Button type="button" variant="outline" size="sm" onClick={onShowIgnored}>
-                Show git-ignored files
-              </Button>
-            ) : null}
+            <Button type="button" variant="outline" size="sm" onClick={onShowIgnored}>
+              Show git-ignored files
+            </Button>
           </div>
         </div>
       );
@@ -459,12 +484,12 @@ export function FilesPageTree({
         <div className="flex flex-col items-start gap-2 pb-2">
           <TreeMessage>{hiddenListingMessage(entries, ignoredHidden)}</TreeMessage>
           <div className="mx-3 flex flex-wrap gap-2">
-            {entries.length > 0 && onShowHidden ? (
+            {entries.length > 0 ? (
               <Button type="button" variant="outline" size="sm" onClick={onShowHidden}>
                 Show hidden files
               </Button>
             ) : null}
-            {ignoredHidden && onShowIgnored ? (
+            {ignoredHidden ? (
               <Button type="button" variant="outline" size="sm" onClick={onShowIgnored}>
                 Show git-ignored files
               </Button>
@@ -487,7 +512,7 @@ export function FilesPageTree({
         sort={sort}
         showHidden={showHidden}
         showIgnored={showIgnored}
-        refreshToken={0}
+        refreshToken={refreshToken}
         onFileSelect={(path, options) => onFileSelect(joinBrowseLocation(location, path), options)}
         // Double-clicking a folder, or its menu's Open folder as root, roots the tree there.
         onNavigateDir={(path) => {

@@ -1,6 +1,6 @@
 """E2E: the tabs sidebar's Files tree sorts and shows hidden files from its menu and ⌘K.
 
-With ``workspace_sidebar_v2`` on, the Files page's "Files tree options" menu and ⌘K's
+With ``workspace_sidebar_v2`` on, the Files tree header's "Tree options" menu and ⌘K's
 "Sort Files Tree by …" and "Show Hidden Files" / "Hide Hidden Files" rows run the same
 actions. Hidden files show until they're hidden. Seeded via the filesystem PUT endpoint
 (no agent run); the menu and the rows' availability are in the unit tests
@@ -58,7 +58,9 @@ def test_the_tree_sorts_and_shows_hidden_files_from_its_menu_and_the_palette(
     expect(hidden).to_be_visible()
 
     # The menu sorts by size, largest first, and hides hidden files.
-    options = sidebar.get_by_role("button", name="Files tree options")
+    options = sidebar.get_by_test_id("files-page-tree-header").get_by_role(
+        "button", name="Tree options"
+    )
     options.click()
     page.get_by_role("menuitemradio", name="Size").click()
     _expect_order(sidebar, "zulu.txt", "alpha.txt")
