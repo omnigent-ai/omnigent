@@ -919,10 +919,11 @@ def resolve_matching_text(
         # Typed text can read exactly like what the server typed for a named entry, so
         # a fit with both a named and an unnamed entry does not show whose echo this is.
         tied = {*exact, *marked}
+        unproven_from = match_index
         if len({ordered[index][1].named_sender is None for index in tied}) > 1:
             match_method = AMBIGUOUS_MATCH
-        else:
-            tied = set()
+            # From the earliest tied entry on, a jumped-over entry may still be waiting.
+            unproven_from = min(tied)
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an
@@ -939,15 +940,15 @@ def resolve_matching_text(
         if not entries:
             _pending.pop(conversation_id, None)
         # An entry a positional drain may have settled, that the person cancelled
-        # with Stop, or that ties with the match, is drained without an undelivered
-        # record.
+        # with Stop, or that a tied match may have jumped over, is drained without
+        # an undelivered record.
         lost: list[DrainedInput] = []
         uncertain: list[DrainedInput] = []
         for index, (_pending_id, entry) in enumerate(skipped_entries):
             if (
                 entry.uncertain
                 or entry.interrupted
-                or index in tied
+                or index >= unproven_from
                 or _is_command_entry(entry, claude_commands=claude_commands)
             ):
                 uncertain.append(_drained_input(entry))

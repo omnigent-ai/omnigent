@@ -1,5 +1,6 @@
 """Native provenance distinguishes internal deliveries from human-authored agent markup."""
 
+import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,9 @@ import pytest
 from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
 from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
 from omnigent.inner.claude_native_executor import _content_to_text
+from omnigent.inner.codex_native_executor import (
+    _content_to_input_items as _codex_content_to_input_items,
+)
 from omnigent.runtime import pending_inputs
 from omnigent.runtime.message_sender import with_message_sender
 from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
@@ -182,3 +186,45 @@ async def test_tied_echo_keeps_its_text_and_proves_no_author(
     assert item.data.content == typed
     assert item.data.sender_in_context is False
     assert item.created_by is None
+
+
+@pytest.mark.asyncio
+async def test_codex_disk_attachment_echo_is_stored_as_typed(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex keeps block order; its echo puts the file reference ahead of the sender line."""
+    zip_bytes = base64.b64encode(b"PK\x05\x06" + b"\x00" * 18).decode()
+    typed = [
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": f"data:application/zip;base64,{zip_bytes}",
+        },
+        _text("inspect this"),
+    ]
+    items = _codex_content_to_input_items(with_message_sender(typed, "bob@example.com"), tmp_path)
+    mirrored = [_text(str(item["text"])) for item in items if item.get("type") == "text"]
+    assert mirrored[0]["text"].startswith("[Attached: ")
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": mirrored},
+            "response_id": "codex:turn-1",
+            "source_id": "codex:turn-1:0",
+        },
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Review")
+    pending_inputs.record(
+        conv.id, typed, created_by="bob@example.com", named_sender="bob@example.com"
+    )
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+
+    await _persist_external_conversation_item(conv.id, conv, body, store)
+
+    [item] = store.list_items(conv.id, type="message").data
+    assert item.data.content == typed
+    assert item.data.sender_in_context is True
+    assert item.created_by == "bob@example.com"
+    assert pending_inputs.snapshot_for(conv.id) == []

@@ -23,3 +23,12 @@ def test_sender_line_leads_the_content_without_changing_it() -> None:
     ]
     assert with_message_sender(content, None) is content
     assert with_message_sender([], _BOB) == []
+
+
+def test_sender_line_follows_leading_attachments() -> None:
+    image = {"type": "input_image", "url": "x"}
+    text = {"type": "input_text", "text": "Review this"}
+    named = {"type": "input_text", "text": _LINE}
+
+    assert with_message_sender([image, text], _BOB) == [image, named, text]
+    assert with_message_sender([image], _BOB) == [image, named]

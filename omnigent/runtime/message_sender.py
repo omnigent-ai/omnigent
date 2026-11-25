@@ -22,18 +22,29 @@ def message_sender_line(sender: str | None) -> str:
 
 def with_message_sender(content: list[dict[str, Any]], sender: str | None) -> list[dict[str, Any]]:
     """
-    Prepend the line naming *sender* to message content sent to the model.
+    Insert the line naming *sender* ahead of the message's text for the model.
+
+    The line goes after any leading attachments, so a native terminal types it
+    where its generated attachment markers end, whichever order it keeps.
 
     :param content: Message content blocks, e.g.
         ``[{"type": "input_text", "text": "Hi"}]``. Not mutated.
     :param sender: Identity the server chose to name, or ``None`` to return
         *content* unchanged.
-    :returns: The content, with a leading ``input_text`` block naming the sender.
+    :returns: The content with an ``input_text`` block naming the sender.
     """
     line = message_sender_line(sender)
     if not line or not content:
         return content
-    return [{"type": "input_text", "text": line}, *content]
+    first_text = next(
+        (
+            index
+            for index, block in enumerate(content)
+            if isinstance(block, dict) and block.get("type") in ("input_text", "text")
+        ),
+        len(content),
+    )
+    return [*content[:first_text], {"type": "input_text", "text": line}, *content[first_text:]]
 
 
 def replayed_content(item: Mapping[str, object]) -> object:
