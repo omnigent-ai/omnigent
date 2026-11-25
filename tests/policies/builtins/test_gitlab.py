@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.policies.builtins.github import github_policy
-from omnigent.policies.builtins.gitlab import _GLAB_ACTIONS, gitlab_policy
+from omnigent.policies.builtins.gitlab import gitlab_policy
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.registry import get_registry, load_registry, validate_factory_params
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
@@ -243,9 +243,10 @@ def test_composes_with_github_policy() -> None:
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
-        (f"glab mr create -R {_PROJECT} --fill", "ALLOW"),
-        (f"glab mr create --repo {_URL} -b main --fill", "ALLOW"),
-        (f"glab mr create -R gitlab.com/{_PROJECT} --fill", "ALLOW"),
+        (f"glab mr create -R {_PROJECT} --title docs", "ALLOW"),
+        (f"glab mr create -R {_PROJECT} --fill", "ASK"),
+        (f"glab mr create --repo {_URL} -b main --title docs", "ALLOW"),
+        (f"glab mr create -R gitlab.com/{_PROJECT} --title docs", "ALLOW"),
         ("glab mr create -R grp/other --fill", "DENY"),
         ("glab mr merge 12", "ASK"),
         (f"glab issue board create -R {_PROJECT}", "ALLOW"),
@@ -267,6 +268,10 @@ def test_glab_target_branch_gated() -> None:
     assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b release"))) == "DENY"
     # glab uses the last repeated flag, so an earlier allowed value cannot mask it.
     assert _result(policy(_sh(f"glab mr create -R {_PROJECT} -b main -b release"))) == "DENY"
+    for action in ("merge", "accept", "rebase"):
+        command = f"glab mr {action} 12 -R {_PROJECT}"
+        assert _result(policy(_sh(command))) == "ASK"
+        assert _result(gitlab_policy(write_repos=[_PROJECT])(_sh(command))) == "ALLOW"
 
 
 @pytest.mark.parametrize(
@@ -276,6 +281,9 @@ def test_glab_target_branch_gated() -> None:
         f"glab release delete v1 -R {_PROJECT}",
         f"glab variable delete TOKEN -R {_PROJECT}",
         f"glab mr merge 12 -d -R {_PROJECT}",
+        f"glab mr accept 12 -d -R {_PROJECT}",
+        f"glab mr accept 12 --remove-source-branch -R {_PROJECT}",
+        f"glab mr accept 12 -sd -R {_PROJECT}",
         f"glab container-registry tag delete -R {_PROJECT}",
     ],
 )
@@ -286,69 +294,130 @@ def test_glab_destructive_denied_by_default(command: str) -> None:
     assert _result(allowed(_sh(command))) == "ALLOW"
 
 
-_GLAB_ACTIONS_BY_KIND = {
-    kind: [
-        f"glab {group} {action}"
-        for group, actions in _GLAB_ACTIONS.items()
-        for action, action_kind in actions.items()
-        if action_kind == kind
-    ]
-    for kind in ("write", "destructive")
-}
-
-
-# Written from glab's help, not from the table, so a wrong table row fails here.
-_EXPECTED_GLAB_DECISIONS = {"read": ("ALLOW", "ALLOW"), "write": ("ALLOW", "DENY")}
-_EXPECTED_GLAB_DECISIONS["destructive"] = ("DENY", "DENY")
+# Expected effects are independent of the production dispatch table.
+_EXPECTED_ACTIONS = [
+    ("mr", "read", "approvers,checkout,diff,issues,list,ls,show,view,note list"),
+    (
+        "mr",
+        "write",
+        "accept,approve,close,comment,create,for,merge,new,note,rebase,reopen,revoke,"
+        "sub,subscribe,todo,unsub,unsubscribe,update,note create,note draft,"
+        "note reopen,note resolve,note update",
+    ),
+    ("mr", "destructive", "del,delete,note delete"),
+    ("issue", "read", "list,ls,show,view,board view"),
+    (
+        "issue",
+        "write",
+        "board create,close,comment,create,new,note,reopen,sub,subscribe,unsub,unsubscribe,update",
+    ),
+    ("issue", "destructive", "del,delete"),
+    ("incident", "read", "list,ls,show,view"),
+    ("incident", "write", "close,comment,note,reopen,sub,subscribe,unsub,unsubscribe"),
+    ("work-items", "read", "list,ls"),
+    ("work-items", "write", "create,update"),
+    ("work-items", "destructive", "delete"),
+    ("repo", "read", "archive,clone,contributors,list,ls,prune,search,view,remote add"),
+    (
+        "repo",
+        "write",
+        "create,fork,mirror,transfer,update,members add,members remove,publish catalog",
+    ),
+    ("repo", "destructive", "delete"),
+    ("release", "read", "download,list,ls,view"),
+    ("release", "write", "create,upload"),
+    ("release", "destructive", "delete"),
+    ("ci", "read", "artifact,config,get,lint,list,ls,status,trace,view,config compile"),
+    ("ci", "write", "cancel,create,retry,run,run-trig,trigger"),
+    ("ci", "destructive", "delete"),
+    ("schedule", "read", "list"),
+    ("schedule", "write", "create,run,update"),
+    ("schedule", "destructive", "delete"),
+    ("variable", "read", "export,get,list,ls"),
+    ("variable", "write", "create,import,new,set,update"),
+    ("variable", "destructive", "delete,remove"),
+    ("label", "read", "get,list,ls"),
+    ("label", "write", "create,edit,new"),
+    ("label", "destructive", "delete"),
+    ("milestone", "read", "get,list"),
+    ("milestone", "write", "create,edit"),
+    ("milestone", "destructive", "delete"),
+    ("snippet", "write", "create,new"),
+    ("securefile", "read", "download,get,list,ls,show"),
+    ("securefile", "write", "create,update,upload"),
+    ("securefile", "destructive", "delete,remove,rm"),
+    ("packages", "read", "download,list,ls"),
+    ("packages", "write", "upload"),
+    ("packages", "destructive", "delete,rm"),
+    ("deploy-key", "read", "get,list"),
+    ("deploy-key", "write", "add"),
+    ("deploy-key", "destructive", "delete"),
+    ("ssh-key", "read", "get,list"),
+    ("ssh-key", "write", "add"),
+    ("ssh-key", "destructive", "delete"),
+    ("gpg-key", "read", "get,list"),
+    ("gpg-key", "write", "add"),
+    ("gpg-key", "destructive", "delete"),
+    ("token", "read", "list,ls"),
+    ("token", "write", "create,new,rotate"),
+    ("token", "destructive", "revoke,rm"),
+    ("runner", "read", "jobs,list,ls,managers"),
+    ("runner", "write", "assign,unassign,update"),
+    ("runner", "destructive", "delete"),
+    ("runner-controller", "read", "get,list,scope list,token list"),
+    ("runner-controller", "write", "create,update,scope create,token create,token rotate"),
+    ("runner-controller", "destructive", "delete,scope delete,token revoke"),
+    ("container-registry", "read", "repository list,repository view,tag list,tag view"),
+    ("container-registry", "destructive", "repository delete,tag delete"),
+    ("opentofu", "read", "state download,state list"),
+    ("opentofu", "write", "state lock,state unlock"),
+    ("opentofu", "destructive", "state delete"),
+    ("cluster", "read", "agent check-manifest-usage,agent list"),
+    ("cluster", "write", "agent bootstrap,agent get-token"),
+    ("security", "read", "config status"),
+    ("security", "write", "config disable,config enable"),
+    (
+        "stack",
+        "read",
+        "amend,create,delete,first,infer,last,list,ls,move,new,next,prev,reorder,save,switch",
+    ),
+    ("stack", "write", "sync"),
+    ("todo", "read", "list,ls"),
+    ("todo", "write", "done"),
+    ("job", "read", "artifact"),
+    ("iteration", "read", "list,ls"),
+    ("user", "read", "events"),
+    ("changelog", "read", "generate"),
+    ("search", "read", "semantic"),
+    ("attestation", "read", "verify"),
+]
 
 
 @pytest.mark.parametrize(
     ("command", "kind"),
     [
-        ("glab mr list", "read"),
-        ("glab mr view 1", "read"),
-        ("glab mr approve 1", "write"),
-        ("glab mr note create 1", "write"),
-        ("glab mr delete 1", "destructive"),
-        ("glab issue create", "write"),
-        ("glab issue delete 1", "destructive"),
-        ("glab ci status", "read"),
-        ("glab ci retry 1", "write"),
-        ("glab ci delete 1", "destructive"),
-        ("glab variable get TOKEN", "read"),
-        ("glab variable set TOKEN x", "write"),
-        ("glab release create v1", "write"),
-        ("glab token revoke bot", "destructive"),
-        ("glab label delete bug", "destructive"),
+        (f"glab {group} {action}", kind)
+        for group, kind, actions in _EXPECTED_ACTIONS
+        for action in actions.split(",")
     ],
 )
 def test_glab_actions_match_expected_kind(command: str, kind: str) -> None:
-    """Each action has the kind glab's help gives it: (allowed project, other project)."""
-    policy = gitlab_policy(write_repos=[_PROJECT])
-    decisions = (
-        _result(policy(_sh(f"{command} -R {_PROJECT}"))),
-        _result(policy(_sh(f"{command} -R grp/other"))),
-    )
-    assert decisions == _EXPECTED_GLAB_DECISIONS[kind]
-
-
-@pytest.mark.parametrize("command", _GLAB_ACTIONS_BY_KIND["write"])
-def test_every_glab_write_is_project_gated(command: str) -> None:
-    """Each listed write passes on an allowed project and is denied on another."""
-    policy = gitlab_policy(write_repos=[_PROJECT])
+    """Every documented action has independent read, write, and deletion expectations."""
     if command == "glab stack sync":
-        command += " --skip-push"  # Without it, the sync force-pushes.
-    assert _result(policy(_sh(f"{command} -R {_PROJECT}"))) == "ALLOW"
+        command += " --skip-push"
+    policy = gitlab_policy(read_all=False, read_repos=[_PROJECT], write_repos=[_PROJECT])
+    assert _result(policy(_sh(f"{command} -R {_PROJECT}"))) == (
+        "DENY" if kind == "destructive" else "ALLOW"
+    )
     assert _result(policy(_sh(f"{command} -R grp/other"))) == "DENY"
-
-
-@pytest.mark.parametrize("command", _GLAB_ACTIONS_BY_KIND["destructive"])
-def test_every_glab_delete_needs_allow_destructive(command: str) -> None:
-    """Each listed delete is denied on an allowed project unless allow_destructive."""
-    command = f"{command} -R {_PROJECT}"
-    assert _result(gitlab_policy(write_repos=[_PROJECT])(_sh(command))) == "DENY"
-    allowed = gitlab_policy(write_repos=[_PROJECT], allow_destructive=True)
-    assert _result(allowed(_sh(command))) == "ALLOW"
+    unrestricted_reads = gitlab_policy(write_repos=[_PROJECT])
+    assert _result(unrestricted_reads(_sh(f"{command} -R grp/other"))) == (
+        "ALLOW" if kind == "read" else "DENY"
+    )
+    if kind == "destructive":
+        permitted = gitlab_policy(write_repos=[_PROJECT], allow_destructive=True)
+        assert _result(permitted(_sh(f"{command} -R {_PROJECT}"))) == "ALLOW"
+        assert _result(permitted(_sh(f"{command} -R grp/other"))) == "DENY"
 
 
 @pytest.mark.parametrize(
@@ -377,6 +446,23 @@ def test_every_glab_delete_needs_allow_destructive(command: str) -> None:
         (f"glab mr create -R {_PROJECT} -R grp/other", "ASK"),
         (f"glab mr create -R {_PROJECT} -Rgrp/other", "ASK"),
         ("glab mr create -Rgrp/other", "DENY"),
+        (f"glab mr merge 12 --message '-d' -R {_PROJECT}", "ALLOW"),
+        (f"glab mr accept 12 --remove-source-branch=false -R {_PROJECT}", "ALLOW"),
+        (f"glab mr accept 12 -sd=false -R {_PROJECT}", "ALLOW"),
+        (f"glab mr merge 12 --remove-source-branch=false -d -R {_PROJECT}", "DENY"),
+        (f"glab mr create --title '-R grp/other' -R {_PROJECT}", "ALLOW"),
+        (f"glab mr create --description '--help' -R {_PROJECT}", "ALLOW"),
+        (f"glab mr create --future-option value -R {_PROJECT}", "ASK"),
+        (f"glab mr create --title -R {_PROJECT}", "ASK"),
+        (f"glab mr create -R {_PROJECT} --title", "ASK"),
+        (f"glab mr create -R {_PROJECT} -- --title docs", "ALLOW"),
+        (f"glab mr create -R {_PROJECT} --push", "ASK"),
+        (f"glab mr create -R {_PROJECT} --fill --remove-source-branch", "DENY"),
+        (f"glab mr create -R {_PROJECT} --recover", "ASK"),
+        (f"glab mr create -R {_PROJECT} --head grp/other", "ASK"),
+        (f"glab repo delete grp/other -R {_PROJECT}", "ASK"),
+        (f"glab mr merge https://gitlab.com/grp/other/-/merge_requests/12 -R {_PROJECT}", "ASK"),
+        (f"glab mr view https://gitlab.com/grp/other/-/merge_requests/12 -R {_PROJECT}", "ASK"),
     ],
 )
 def test_glab_dispatch(command: str, expected: str) -> None:
@@ -405,12 +491,37 @@ def test_glab_dispatch(command: str, expected: str) -> None:
         ("glab api projects/grp%2Fother/issues -Fconfidential=true", "DENY"),
         ("glab api projects/grp%2Fsub%2Fapp/issues -ftitle=x", "ALLOW"),
         ("glab api -X GET -X DELETE projects/grp%2Fsub%2Fapp/issues/1", "ASK"),
+        ("glab api --input body.json projects/grp%2Fother/issues", "DENY"),
+        ("glab api --input -XGET projects/grp%2Fother/issues", "DENY"),
+        ("glab api --input -XHEAD projects/grp%2Fother/issues", "DENY"),
+        ("glab api -H '-XGET' -X POST projects/grp%2Fother/issues", "DENY"),
+        ("glab api -X POST projects/grp%2Fsub%2Fapp/issues --unknown value", "ASK"),
+        ("glab api -X POST projects/grp%2Fsub%2Fapp/issues -f", "ASK"),
+        ("glab api -X POST -- projects/grp%2Fsub%2Fapp/issues", "ALLOW"),
+        ("glab api -X DELETE projects/grp%2Fsub%2Fapp/unmodelled", "DENY"),
     ],
 )
 def test_glab_api_method(command: str, expected: str) -> None:
     """glab api is a read unless it sets a write method or field flags."""
     policy = gitlab_policy(write_repos=[_PROJECT])
     assert _result(policy(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("projects/123/issues?note=/projects/grp%2Fsub%2Fapp", "ASK"),
+        ("projects/grp%2Fother/issues?note=/projects/grp%2Fsub%2Fapp", "DENY"),
+        ("projects/grp%2Fsub%2Fapp/issues?note=/projects/grp%2Fother", "ALLOW"),
+        ("other/projects/grp%2Fsub%2Fapp/issues", "ASK"),
+    ],
+)
+def test_glab_api_project_is_only_from_the_route(
+    method: str, endpoint: str, expected: str
+) -> None:
+    policy = gitlab_policy(read_all=False, read_repos=[_PROJECT], write_repos=[_PROJECT])
+    assert _result(policy(_sh(f"glab api -X {method} '{endpoint}'"))) == expected
 
 
 _FILES_API = "glab api -X PUT projects/grp%2Fsub%2Fapp/repository/files/a.txt -f content=x"
@@ -430,11 +541,41 @@ _FILES_API = "glab api -X PUT projects/grp%2Fsub%2Fapp/repository/files/a.txt -f
         # Reads and non-branch writes are not branch-gated.
         ("glab api projects/grp%2Fsub%2Fapp/repository/files/a.txt?ref=release", "ALLOW"),
         ("glab api projects/grp%2Fsub%2Fapp/issues -f title=x", "ALLOW"),
+        ("glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12/merge", "ASK"),
+        ("glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12/rebase", "ASK"),
+        ("glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12/merge/", "ASK"),
+        ("glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12/%6derge", "ASK"),
+        (f"{_FILES_API} -f branch=", "ASK"),
+        (
+            "glab api -X POST 'projects/grp%2Fsub%2Fapp/issues?note=repository/files' -f title=x",
+            "ALLOW",
+        ),
     ],
 )
 def test_glab_api_branch_writes(command: str, expected: str) -> None:
     """API routes that write branch content are held to write_branches."""
     policy = gitlab_policy(write_repos=[_PROJECT], write_branches=["main"])
+    assert _result(policy(_sh(command))) == expected
+
+
+@pytest.mark.parametrize("action", ["merge", "rebase"])
+def test_glab_api_merge_without_branch_restrictions(action: str) -> None:
+    policy = gitlab_policy(write_repos=[_PROJECT])
+    command = f"glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12/{action}"
+    assert _result(policy(_sh(command))) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ("--input body.json", "ASK"),
+        ("-f should_remove_source_branch=true", "DENY"),
+        ("-f should_remove_source_branch=false", "ALLOW"),
+    ],
+)
+def test_glab_api_merge_effects(arguments: str, expected: str) -> None:
+    policy = gitlab_policy(write_repos=[_PROJECT])
+    command = f"glab api -X PUT projects/grp%2Fsub%2Fapp/merge_requests/12/merge {arguments}"
     assert _result(policy(_sh(command))) == expected
 
 
@@ -460,6 +601,10 @@ def test_wrapped_and_chained_commands_are_gated() -> None:
     policy = gitlab_policy(write_repos=[_PROJECT])
     assert _result(policy(_sh(f"bash -c 'glab repo delete {_PROJECT}'"))) == "DENY"
     assert _result(policy(_sh(f"git add . && git push --force {_URL} main"))) == "DENY"
+    for prefix in ("/usr/bin/", "./bin/", "command /usr/bin/"):
+        assert _result(policy(_sh(f"{prefix}git push --force {_URL} main"))) == "DENY"
+        assert _result(policy(_sh(f"{prefix}glab repo delete {_PROJECT} --yes"))) == "DENY"
+        assert _result(policy(_sh(f"{prefix}glab mr view 12 -R {_PROJECT}"))) == "ALLOW"
 
 
 def test_ignores_non_shell_tools() -> None:

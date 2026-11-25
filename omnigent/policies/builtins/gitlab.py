@@ -39,7 +39,6 @@ YAML usage::
 
 from __future__ import annotations
 
-import itertools
 import re
 import shlex
 from collections.abc import Callable
@@ -78,12 +77,16 @@ _Project = tuple[str | None, str]
 
 _SCP_REMOTE = re.compile(r"^[\w.-]+@([^:/]+):(.+)$")
 # ``projects/<url-encoded path>`` in a ``glab api`` endpoint; numeric IDs don't match.
-_API_PROJECT_PATH = re.compile(r"(?:^|/)projects/([^/?#]*%2[Ff][^/?#]*)")
+_API_PROJECT_PATH = re.compile(r"/?projects/([^/]+)(?:/(.*))?$")
 # ``url.<base>.insteadOf`` / ``pushInsteadOf`` rewrite a remote URL after it is parsed.
 _URL_REWRITE_KEY = re.compile(r"url\..+\.(?:push)?insteadof", re.IGNORECASE)
 # API routes that write branch content; the destination is the ``branch`` parameter.
-_API_BRANCH_WRITE = re.compile(r"/repository/(?:files|commits|branches)(?:[/?]|$)")
-_GLAB_API_FIELD_FLAGS: frozenset[str] = frozenset({"-f", "--raw-field", "-F", "--field", "--form"})
+_API_BRANCH_WRITE = re.compile(r"repository/(?:files|commits|branches)(?:/|$)")
+_API_MERGE_WRITE = re.compile(r"merge_requests/[0-9]+/(?:merge|rebase)$")
+_API_METADATA_WRITE = re.compile(
+    r"(?:issues|merge_requests|labels|milestones|variables|releases|pipelines|jobs)"
+    r"(?:/[^/]+)?$"
+)
 # Variables that point glab at another host or config (see ``glab config --help``).
 _HOST_ENV_VARS: frozenset[str] = frozenset(
     {"GITLAB_HOST", "GITLAB_URI", "GL_HOST", "GITLAB_API_HOST", "GLAB_CONFIG_DIR"}
@@ -277,29 +280,85 @@ _GLAB_IGNORE_GROUPS: frozenset[str] = frozenset(
     }
 )
 
-_GLAB_REPO_FLAGS: frozenset[str] = frozenset({"-R", "--repo"})
-_GLAB_TARGET_BRANCH_FLAGS: frozenset[str] = frozenset({"-b", "--target-branch"})
-# Flags whose value is a separate token, so it is not mistaken for an action.
-_GLAB_VALUE_FLAGS: frozenset[str] = _GLAB_REPO_FLAGS | frozenset({"--hostname", "-g", "--group"})
-_GLAB_HELP_FLAGS: frozenset[str] = frozenset({"-h", "--help", "-v", "--version"})
-# ``glab api --help``: every flag that takes a value.
-_GLAB_API_VALUE_FLAGS: frozenset[str] = frozenset(
-    [
-        "--hostname",
-        "-X",
-        "--method",
-        "-H",
-        "--header",
-        "-f",
-        "--raw-field",
-        "-F",
-        "--field",
-        "--form",
-        "--input",
-        "--placeholder",
-        "--output",
-    ]
+_GLAB_ACTION_ALIASES = {
+    "accept": "merge",
+    "ls": "list",
+    "show": "view",
+    "new": "create",
+    "del": "delete",
+    "rm": "delete",
+    "remove": "delete",
+    "comment": "note",
+    "sub": "subscribe",
+    "unsub": "unsubscribe",
+}
+
+
+def _option_spec(values: str = "", switches: str = "") -> dict[str, tuple[str, bool]]:
+    """Declare canonical long names and optional short aliases, e.g. ``repo:R``."""
+    options: dict[str, tuple[str, bool]] = {}
+    for names, takes_value in ((values, True), (switches, False)):
+        for declaration in names.split():
+            name, _, short = declaration.partition(":")
+            options[f"--{name}"] = (name, takes_value)
+            if short:
+                options[f"-{short}"] = (name, takes_value)
+    return options
+
+
+# Unknown options ASK; short aliases are specific to their command.
+_GLAB_COMMON_OPTIONS = _option_spec("repo:R hostname", "help:h")
+_GLAB_API_OPTIONS = _option_spec(
+    "hostname method:X header:H raw-field:f field:F form input placeholder output",
+    "help:h include:i paginate silent",
 )
+_GLAB_COMMAND_OPTIONS = {
+    ("mr", "merge"): _option_spec(
+        "message:m sha squash-message", "auto-merge rebase:r remove-source-branch:d squash:s yes:y"
+    ),
+    ("mr", "create"): _option_spec(
+        "assignee:a attach description:d description-file head:H label:l milestone:m "
+        "related-issue:i reviewer source-branch:s target-branch:b template title:t",
+        "allow-collaboration auto-merge copy-issue-labels create-source-branch draft fill:f "
+        "fill-commit-body no-editor push recover remove-source-branch signoff "
+        "squash-before-merge web:w wip yes:y",
+    ),
+    ("mr", "update"): _option_spec(
+        "assignee:a attach description:d description-file label:l milestone:m reviewer "
+        "target-branch title:t unlabel:u",
+        "draft fill:f fill-commit-body lock-discussion ready:r remove-source-branch "
+        "squash-before-merge unassign unlock-discussion wip yes:y",
+    ),
+    ("mr", "view"): _option_spec("output:F", "comments:c system-logs:s web:w"),
+    ("mr", "list"): _option_spec(
+        "assignee:a author label:l milestone:m page:p per-page:P", "all:A closed:c merged:M"
+    ),
+    ("mr", "note"): _option_spec("message:m", "unique"),
+    ("issue", "create"): _option_spec(
+        "assignee:a description:d label:l milestone:m title:t", "confidential:c yes:y web:w"
+    ),
+    ("issue", "note"): _option_spec("message:m", "unique"),
+    ("repo", "delete"): _option_spec(switches="yes:y"),
+    ("stack", "sync"): _option_spec(switches="skip-push"),
+}
+
+
+@dataclass(frozen=True)
+class _GlabArguments:
+    """Options retain their values; operands can never become options later."""
+
+    options: tuple[tuple[str, str], ...]
+    operands: tuple[str, ...]
+
+    def values(self, name: str) -> list[str]:
+        return [value for option, value in self.options if option == name]
+
+    def last(self, name: str) -> str | None:
+        values = self.values(name)
+        return values[-1] if values else None
+
+    def enabled(self, name: str) -> bool:
+        return self.last(name) == "true"
 
 
 @dataclass(frozen=True)
@@ -310,22 +369,22 @@ class _GitLabOp:
     :param kind: ``"read"``, ``"write"``, or ``"unparseable"`` (needs approval).
     :param project: Target project, or ``None`` when it relies on a local
         remote alias, the working directory's remote, or an unknown host.
-    :param branches: Destination branches of a write (empty when unknown).
-    :param branch_targeted: Whether the op writes branch content (``git push``).
+    :param branches: ``None`` if inapplicable, empty if unknown, else destinations.
     :param detail: Short description for the decision reason, e.g. ``"glab mr merge"``.
     :param destructive: Whether the op is an irreversible delete.
     :param tag_push: Whether a ``git push`` includes tags.
     :param force_push: Whether a push forces.
+    :param uncertain_effects: Whether additional targets or effects require approval.
     """
 
     kind: str
     project: _Project | None
-    branches: frozenset[str] = frozenset()
-    branch_targeted: bool = False
+    branches: frozenset[str] | None = None
     detail: str = ""
     destructive: bool = False
     tag_push: bool = False
     force_push: bool = False
+    uncertain_effects: bool = False
 
 
 def _unparseable(detail: str) -> _GitLabOp:
@@ -510,8 +569,7 @@ def _classify_git_command(
     return _GitLabOp(
         kind=op.kind,
         project=project,
-        branches=op.branches,
-        branch_targeted=op.branch_targeted,
+        branches=op.branches if op.branch_targeted else None,
         detail=op.detail,
         # ``--mirror`` force-updates and deletes remote refs; ``--prune`` deletes them.
         destructive=op.destructive
@@ -540,232 +598,231 @@ def _rewrites_remote_urls(tokens: list[str]) -> bool:
     )
 
 
-def _glab_positionals(args: list[str], value_flags: frozenset[str]) -> list[str]:
-    """Return non-flag tokens, skipping the values of *value_flags*."""
-    positionals: list[str] = []
-    skip_next = False
-    for token in args:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in value_flags:
-            skip_next = True
-            continue
-        if not token.startswith("-"):
-            positionals.append(token)
-    return positionals
-
-
-def _expand_short_flags(args: list[str], value_letters: str) -> list[str]:
-    """
-    Split short-flag bundles the way glab's flag parser reads them.
-
-    ``-XDELETE`` and ``-X=DELETE`` become ``-X DELETE``; ``-iXDELETE`` becomes
-    ``-i -X DELETE``. A value letter takes the rest of its token as its value.
-    """
-    expanded: list[str] = []
-    for token in args:
-        if not token.startswith("-") or token.startswith("--") or len(token) <= 2:
-            expanded.append(token)
-            continue
-        for position, letter in enumerate(token[1:], start=1):
-            expanded.append(f"-{letter}")
-            if letter in value_letters:
-                if rest := token[position + 1 :]:
-                    expanded.append(rest.removeprefix("="))
-                break
-    return expanded
-
-
-def _flag_values(args: list[str], names: frozenset[str]) -> list[str]:
-    """Return every value of *names*, given as ``--flag value`` or ``--flag=value``."""
-    values: list[str] = []
+def _parse_glab_arguments(
+    args: list[str], options: dict[str, tuple[str, bool]]
+) -> _GlabArguments | None:
+    """Consume argv once, following pflag value ownership and short clusters."""
+    parsed: list[tuple[str, str]] = []
+    operands: list[str] = []
     index = 0
     while index < len(args):
-        name, has_value, value = args[index].partition("=")
-        if has_value and name in names:
-            values.append(value)
-        elif args[index] in names and index + 1 < len(args):
-            values.append(args[index + 1])
-            index += 1
+        token = args[index]
         index += 1
-    return values
-
-
-def _flag_value(args: list[str], names: frozenset[str]) -> str | None:
-    """Return the value of *names* that glab uses: the last one given, else ``None``."""
-    values = _flag_values(args, names)
-    return values[-1] if values else None
+        if token == "--":
+            operands.extend(args[index:])
+            break
+        if not token.startswith("-") or token == "-":
+            operands.append(token)
+            continue
+        long_option = token.startswith("--")
+        remainder = token if long_option else token[1:]
+        while remainder:
+            if long_option:
+                flag, equal, value = remainder.partition("=")
+                remainder = ""
+            else:
+                flag, remainder = "-" + remainder[0], remainder[1:]
+                equal = "=" if remainder.startswith("=") else ""
+                value = remainder[1:] if equal else remainder
+            spec = options.get(flag)
+            if spec is None:
+                return None
+            name, takes_value = spec
+            if takes_value:
+                if not equal and (long_option or not remainder):
+                    if index >= len(args):
+                        return None
+                    value = args[index]
+                    index += 1
+                remainder = ""
+            elif equal:
+                if value.lower() not in {"true", "false", "t", "f", "1", "0"}:
+                    return None
+                value = "true" if value.lower() in {"true", "t", "1"} else "false"
+                remainder = ""
+            else:
+                value = "true"
+            parsed.append((name, value))
+    return _GlabArguments(tuple(parsed), tuple(operands))
 
 
 def _glab_host_override(
-    env_tokens: list[str], args: list[str], hosts: frozenset[str]
+    env_tokens: list[str], args: _GlabArguments, hosts: frozenset[str]
 ) -> str | None:
-    """
-    Return the host a ``glab`` call is redirected to, if any.
-
-    :param env_tokens: Tokens before ``glab`` (``GITLAB_HOST=…`` assignments).
-    :param args: Tokens after the group.
-    :returns: The normalized authority, ``""`` for an override to a host this
-        policy does not own, or ``None`` when there is no override.
-    """
-    value = _flag_value(args, frozenset({"--hostname"}))
+    """Resolve explicit hosts; conflicting or unowned authorities are uncertain."""
+    values = args.values("hostname")
     for token in env_tokens:
-        name, _, assigned = token.partition("=")
-        if name in _HOST_ENV_VARS:
-            value = assigned
-    if value is None:
+        name, equal, assigned = token.partition("=")
+        if equal and name in _HOST_ENV_VARS:
+            if name == "GLAB_CONFIG_DIR":
+                return ""
+            values.append(assigned)
+    if not values:
         return None
-    authority = instance_authority(value)
+    authorities = {instance_authority(value) for value in values}
+    if len(authorities) != 1:
+        return ""
+    authority = authorities.pop()
     return authority if authority in hosts else ""
 
 
-def _repo_positional(positionals: list[str], hosts: frozenset[str]) -> _Project | None:
-    """Return the one project among ``glab repo`` arguments, else ``None`` (ambiguous)."""
-    candidates = {
-        project for value in positionals if (project := _parse_project_ref(value, hosts))
-    }
-    return candidates.pop() if len(candidates) == 1 else None
+def _canonical_glab_action(group: str, action: str) -> str:
+    """Resolve aliases before choosing an action's options and effects."""
+    words = action.split()
+    words[-1] = _GLAB_ACTION_ALIASES.get(words[-1], words[-1])
+    canonical = " ".join(words)
+    return canonical if canonical in _GLAB_ACTIONS[group] else action
 
 
 def _classify_glab(
     tokens: list[str], env_tokens: list[str], hosts: frozenset[str]
 ) -> _GitLabOp | None:
-    """
-    Classify a ``glab`` invocation.
-
-    :param tokens: Tokens starting at ``glab``, e.g. ``["glab", "mr", "merge", "12"]``.
-    :param env_tokens: Tokens before ``glab`` in the segment.
-    :param hosts: Configured GitLab authorities.
-    :returns: An op, or ``None`` for ignored groups (auth), help, and bare ``glab``.
-    """
-    if len(tokens) < 2 or tokens[1] in _GLAB_IGNORE_GROUPS or tokens[1] in _GLAB_HELP_FLAGS:
+    """Parse a supported command, then classify its target and effects."""
+    if len(tokens) < 2 or tokens[1] in {"-h", "--help", "-v", "--version"}:
         return None
-    if tokens[1].startswith("-"):
-        # glab's only root flags are help and version; anything else hides the group.
-        return _unparseable(f"glab {tokens[1]}")
-    group, args = _GLAB_GROUP_ALIASES.get(tokens[1], tokens[1]), tokens[2:]
-    override = _glab_host_override(env_tokens, args, hosts)
-    if override == "":
-        return _unparseable(f"glab {group} against a host outside the GitLab policy")
-    if group == "config":
-        positionals = _glab_positionals(args, frozenset({"--host", "-h"}))
-        changes_host = positionals[:1] == ["edit"] or (
-            positionals[:1] == ["set"]
-            and len(positionals) > 1
-            and positionals[1].lower() in _HOST_CONFIG_KEYS
-        )
-        return _unparseable("glab config changing the GitLab host") if changes_host else None
+    group = _GLAB_GROUP_ALIASES.get(tokens[1], tokens[1])
+    if group in _GLAB_IGNORE_GROUPS:
+        return None
+    rest = tokens[2:]
     if group == "api":
-        return _classify_glab_api(_expand_short_flags(args, "XHfF"), override)
-
-    args = _expand_short_flags(args, "Rbg")
-    repo_flags = _flag_values(args, _GLAB_REPO_FLAGS)
-    if len(set(repo_flags)) > 1:
-        return _unparseable(f"glab {group} with several -R values")
-    repo_flag = repo_flags[0] if repo_flags else None
-    positionals = _glab_positionals(args, _GLAB_VALUE_FLAGS)
-    if repo_flag:
-        project = _parse_project_ref(repo_flag, hosts)
-        if project is None:
-            return _unparseable(f"glab {group} -R {repo_flag}")
-    elif group == "repo":
-        project = _repo_positional(positionals[1:], hosts)
-    else:
-        project = None
-    if project is not None and override and project[0] is None:
-        project = (override, project[1])
-
-    if not args or args[0] in _GLAB_HELP_FLAGS:
-        return None  # ``glab <group>`` with no action prints help.
+        args = _parse_glab_arguments(rest, _GLAB_API_OPTIONS)
+        if args is None:
+            return _unparseable("glab api options")
+        override = _glab_host_override(env_tokens, args, hosts)
+        if override == "":
+            return _unparseable("glab api with an uncertain host")
+        return None if args.enabled("help") else _classify_glab_api(args, override)
+    if group == "config":
+        # Editing CLI configuration can redirect later commands.
+        if rest[:1] in (["get"], ["path"]):
+            return None
+        return _unparseable("glab config changing CLI configuration")
     actions = _GLAB_ACTIONS.get(group)
     if actions is None:
         return _unparseable(f"glab {group}")
-    # The action words come first; a flag before them may take one of them as its value.
-    leading = list(itertools.takewhile(lambda token: not token.startswith("-"), args))
-    if not leading:
-        return _unparseable(f"glab {group} {args[0]}")
-    action = " ".join(leading[:2])
+    if not rest or rest == ["--help"] or rest == ["-h"]:
+        return None
+    action = " ".join(rest[:2])
+    count = 2
     if action not in actions:
-        action = leading[0]
-    kind = actions.get(action)
+        action, count = rest[0], 1
+    if action not in actions:
+        return _unparseable(f"glab {group} {action}")
+    action = _canonical_glab_action(group, action)
     detail = f"glab {group} {action}"
-    if kind is None:
-        return _unparseable(detail)
+    args = _parse_glab_arguments(
+        rest[count:], _GLAB_COMMON_OPTIONS | _GLAB_COMMAND_OPTIONS.get((group, action), {})
+    )
+    if args is None:
+        return _unparseable(f"{detail} options")
+    if args.enabled("help"):
+        return None
+    override = _glab_host_override(env_tokens, args, hosts)
+    if override == "":
+        return _unparseable(f"{detail} with an uncertain host")
+    if group in {"mr", "issue", "incident"} and any("://" in operand for operand in args.operands):
+        return _unparseable(f"{detail} with a positional URL selecting another target")
+    selectors = args.values("repo")
+    # repo commands take their target as an operand, even when -R is present.
+    if group == "repo" and action in {"clone", "delete", "view", "archive", "fork"}:
+        selectors.extend(args.operands[:1])
+    if len(set(selectors)) > 1:
+        return _unparseable(f"{detail} with conflicting project selectors")
+    project = _parse_project_ref(selectors[0], hosts) if selectors else None
+    if selectors and project is None:
+        return _unparseable(f"{detail} with an unknown project")
+    if project is not None and override:
+        if project[0] is not None and project[0] != override:
+            return _unparseable(f"{detail} with conflicting hosts")
+        project = (override, project[1])
+    kind = actions[action]
     if kind == "read":
         return _GitLabOp(kind="read", project=project, detail=detail)
-    target = _flag_value(args, _GLAB_TARGET_BRANCH_FLAGS)
-    # ``mr merge -d`` (also bundled, as in ``-sd``) deletes the source branch.
-    removes_branch = (group, action) == ("mr", "merge") and any(
-        (token.startswith("-") and not token.startswith("--") and "d" in token)
-        or (token.startswith("--remove-source-branch") and token != "--remove-source-branch=false")
-        for token in args
+    uncertain_effects = args.enabled("recover") or args.last("head") is not None
+    uncertain_effects = uncertain_effects or (
+        (group, action) == ("mr", "create")
+        and any(args.enabled(name) for name in ("fill", "push", "create-source-branch"))
     )
+    branches = None
+    if target := args.last("target-branch"):
+        branches = frozenset(_normalize_branches([target]))
+    if (group == "mr" and (action in {"merge", "rebase"} or args.enabled("auto-merge"))) or (
+        (group, action) == ("stack", "sync") and not args.enabled("skip-push")
+    ):
+        branches = frozenset()
     return _GitLabOp(
         kind="write",
         project=project,
-        branches=frozenset(_normalize_branches([target] if target else None)),
+        branches=branches,
         detail=detail,
-        destructive=kind == "destructive" or removes_branch,
-        # ``stack sync`` force-pushes the stack's branches unless --skip-push.
-        force_push=(group, action) == ("stack", "sync") and "--skip-push" not in args,
+        destructive=kind == "destructive" or args.enabled("remove-source-branch"),
+        force_push=(group, action) == ("stack", "sync") and not args.enabled("skip-push"),
+        uncertain_effects=uncertain_effects,
     )
 
 
-def _classify_glab_api(args: list[str], override: str | None) -> _GitLabOp:
-    """
-    Classify ``glab api``: GET by default, POST once any field flag is given.
-
-    :param args: Tokens after ``glab api``, short-flag bundles already split;
-        the first positional is the endpoint.
-    :param override: Host from ``--hostname`` / ``GITLAB_HOST``, if any.
-    :returns: A read or write op; ``DELETE`` requests are destructive.
-    """
-    methods = {value.upper() for value in _flag_values(args, frozenset({"-X", "--method"}))}
-    if len(methods) > 1:
-        return _unparseable("glab api with several methods")
+def _classify_glab_api(args: _GlabArguments, override: str | None) -> _GitLabOp:
+    """Use only parsed options and the API path to identify a request's effects."""
+    methods = {value.upper() for value in args.values("method")}
+    if len(methods) > 1 or len(args.operands) != 1:
+        return _unparseable("glab api with an ambiguous method or endpoint")
     method = methods.pop() if methods else ""
-    fields = _flag_values(args, _GLAB_API_FIELD_FLAGS)
-    has_input = bool(_flag_values(args, frozenset({"--input"})))
+    fields = [value for name, value in args.options if name in {"field", "raw-field", "form"}]
+    has_input = args.last("input") is not None
     is_write = method not in {"", "GET", "HEAD"} or (not method and bool(fields or has_input))
-    positionals = _glab_positionals(args, _GLAB_API_VALUE_FLAGS)
-    endpoint = positionals[0] if positionals else ""
-    if "://" in endpoint:
-        return _unparseable("glab api with an absolute URL")
+    try:
+        endpoint = urlsplit(args.operands[0])
+    except ValueError:
+        return _unparseable("glab api with an invalid endpoint")
+    if endpoint.scheme or endpoint.netloc or endpoint.fragment:
+        return _unparseable("glab api with an absolute URL or fragment")
+    if {".", ".."} & set(unquote(endpoint.path).split("/")):
+        return _unparseable("glab api with an uncertain project path")
+    match = _API_PROJECT_PATH.fullmatch(endpoint.path)
     project = None
-    matches = _API_PROJECT_PATH.findall(endpoint)
-    # A ``..`` segment could step from the matched project into another one.
-    if len(matches) == 1 and ".." not in unquote(endpoint).split("/"):
-        path = _project_path(unquote(matches[0]))
-        project = (override or None, path) if path else None
-    branch_targeted = is_write and bool(_API_BRANCH_WRITE.search(endpoint))
+    route = ""
+    if match:
+        path = unquote(match[1])
+        project = (override or None, path.lower()) if _valid_project(path) else None
+        route = unquote(match[2] or "").rstrip("/")
+    branches = None
+    uncertain_effects = False
+    if is_write:
+        if _API_BRANCH_WRITE.match(route):
+            branches = _api_branches(endpoint.query, fields, has_input)
+        elif _API_MERGE_WRITE.fullmatch(route):
+            branches = frozenset()
+        elif not _API_METADATA_WRITE.fullmatch(route):
+            uncertain_effects = True
+    removes_branch = any(
+        key == "should_remove_source_branch" and value.lower() not in {"false", "0"}
+        for key, _, value in (field.partition("=") for field in fields)
+    )
+    removes_branch = removes_branch or any(
+        key == "should_remove_source_branch" and value.lower() not in {"false", "0"}
+        for key, value in parse_qsl(endpoint.query, keep_blank_values=True)
+    )
+    if is_write and _API_MERGE_WRITE.fullmatch(route) and has_input:
+        uncertain_effects = True
     return _GitLabOp(
         kind="write" if is_write else "read",
         project=project,
-        branches=_api_branches(endpoint, fields, has_input) if branch_targeted else frozenset(),
-        branch_targeted=branch_targeted,
+        branches=branches,
         detail="glab api",
-        destructive=method == "DELETE",
+        destructive=method == "DELETE" or (is_write and removes_branch),
+        uncertain_effects=uncertain_effects,
     )
 
 
-def _api_branches(endpoint: str, fields: list[str], has_input: bool) -> frozenset[str]:
-    """
-    Return the ``branch`` a ``glab api`` write targets, or none when it can't be known.
-
-    :param endpoint: The API endpoint, which may carry a query string.
-    :param fields: ``key=value`` values of the field flags.
-    :param has_input: Whether ``--input`` supplies a request body.
-    """
+def _api_branches(query: str, fields: list[str], has_input: bool) -> frozenset[str]:
+    """Identify explicit branch destinations; opaque bodies and values stay unknown."""
     if has_input:
         return frozenset()
-    query = parse_qsl(urlsplit(endpoint).query)
-    values = [value for key, value in query if key == "branch"]
+    values = [value for key, value in parse_qsl(query, keep_blank_values=True) if key == "branch"]
     values += [
         value for key, _, value in (field.partition("=") for field in fields) if key == "branch"
     ]
-    # ``@file`` reads the value from a file; ``:name`` is a placeholder glab fills in.
-    if any(value.startswith(("@", ":")) for value in values):
+    if any(not value or value.startswith(("@", ":", "[", "{")) for value in values):
         return frozenset()
     return frozenset(_normalize_branches(values))
 
@@ -832,9 +889,10 @@ def _classify_shell_command(
         if is_shell_interpreter(tokens):
             ops.append(_unparseable(segment[:60]))
             continue
-        if tokens[0] == "git":
+        executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".exe")
+        if executable == "git":
             op = _classify_git_command(tokens, hosts, other_forge_hosts)
-        elif tokens[0] == "glab":
+        elif executable == "glab":
             env_tokens = raw_tokens[: len(raw_tokens) - len(tokens)]
             op = _classify_glab(tokens, env_tokens, hosts)
         else:
@@ -982,14 +1040,18 @@ def gitlab_policy(
                 f"{deny_reason} Write is restricted to the configured projects; "
                 f"this call targets {_describe(op.project)!r}."
             )
-        if allowed_branches:
+        if op.uncertain_effects:
+            return _ask(
+                f"The additional targets or effects of `{op.detail}` are unknown. Approve?"
+            )
+        if allowed_branches and op.branches is not None:
             bad = set(op.branches) - allowed_branches
             if bad:
                 return _deny(
                     f"{deny_reason} Write is restricted to branches "
                     f"{sorted(allowed_branches)}; this call targets {sorted(bad)}."
                 )
-            if op.branch_targeted and not op.branches:
+            if not op.branches:
                 return _ask(
                     f"`{op.detail}` writes to an allowed project but its target branch "
                     f"could not be determined, and writes are branch-restricted. Approve?"
