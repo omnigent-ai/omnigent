@@ -41,6 +41,11 @@ Filename search remains in Files.
   from the strip or tab search. The Workspace panel's **Cmd+Shift+F** isn't
   bound while the tabs show.
   **Ctrl+Cmd+O** on macOS (**Ctrl+Alt+O** on Windows/Linux) opens the same search.
+- File viewer menu: in the tabs sidebar's file viewer, select text and
+  right-click it (or press **Shift+F10** or the Menu key), then choose **Search
+  Text in Workspace…** to search for the selection's first non-blank line. The
+  row shows only where the session's file finder is available and that line is
+  at most 4,096 characters.
 
 ## Driving it with the repro environment
 
