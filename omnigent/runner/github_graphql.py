@@ -16,29 +16,6 @@ _LOAD_FAILED = "GitHub could not load this pull request. Refresh to retry."
 AUTHENTICATION_TIMED_OUT = "GitHub authentication timed out. Nothing was sent; try again."
 
 
-def write_token(root: str, reference: PullRequestRef) -> str | None:
-    """The token a write runs with, or a refusal before it's sent as another account.
-
-    Call it inside the write's deadline scope. Without the token of the login chosen for the
-    repository, ``gh`` would run as whichever account is active on the host.
-    """
-    # Read the login before the lookup, so clearing it mid-write can't let this one through.
-    login = (
-        None
-        if github._in_sandbox()
-        else github._config.github_account_preference(github._repo_argument(reference))
-    )
-    token = github._pr_token(root, reference)
-    if github._gh_timed_out.get():
-        raise ValueError(AUTHENTICATION_TIMED_OUT)
-    if login and token is None:
-        raise ValueError(
-            f"The selected GitHub account {login} isn't signed in on the host. "
-            "Sign in with gh or choose another account."
-        )
-    return token
-
-
 def pull_request_node(root: str, reference: PullRequestRef, selection: str) -> dict[str, Any]:
     """Read the pull request's ``selection`` fields, e.g. ``"id headRefOid"``."""
     owner, name = reference.repository.split("/", 1)
@@ -102,7 +79,7 @@ def mutate(
     """
     with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
         host = github._host_args(root, reference)
-        token = write_token(root, reference)
+        token = github._write_token(root, reference, timed_out=AUTHENTICATION_TIMED_OUT)
         rc, output, err = github._pr_json_write(
             root,
             host=host,
