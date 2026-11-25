@@ -8,6 +8,7 @@ import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
 import { useTabStripWidth } from "./useTabStripWidth";
+import { settingsPagePlace, useWorkspaceTabSettings } from "./workspaceTabSettings";
 import { tabGroup as tabGroupDefinition, tabGroupOf, tabPullRequestUrl } from "./tabGroups";
 import {
   type TabSearchClosing,
@@ -141,7 +142,7 @@ import { shellLabelList } from "./useTabsShellClose";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
 import { WorkspaceHistoryChevrons } from "./WorkspaceHistoryChevrons";
 import { LOCAL_CHANGES_LABEL, type PlaceIcon, placeTitle, truncateMiddle } from "./placeTitle";
-import type { TabId, WorkspacePlace } from "./workspacePlace";
+import type { TabId } from "./workspacePlace";
 import { isUnknownTab, type WorkspaceTab, type WorkspaceTabRecord } from "./workspaceTab";
 import { isOnlyEmptyNewTab, LAST_NEW_TAB_REASON, type RecentPlace } from "./workspaceTabsStore";
 import {
@@ -153,7 +154,6 @@ import {
   type WorkspaceTabsSession,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
-import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { TasksPanel } from "../TasksPanel";
@@ -905,6 +905,16 @@ function WorkspaceTabsPanelImpl({
       tab,
       label: tab === "changes" ? LOCAL_CHANGES_LABEL : WORKSPACE_PANEL_TABS[tab].label,
     }));
+  // The Workspace settings' pinned pages and first page, as far as this session can show them.
+  const tabSettings = useWorkspaceTabSettings();
+  const openablePages = openablePanels.map((panel) => panel.tab).join(",");
+  // A tab closing makes room for a pinned page that didn't fit; an unchanged apply does nothing.
+  const tabCount = tabs.length;
+  useEffect(() => {
+    if (pending) return;
+    const pages = new Set(openablePages.split(","));
+    store.applyTabSettings(tabSettings, (page) => pages.has(page));
+  }, [store, tabSettings, openablePages, pending, tabCount]);
   const facts: WorkspaceCommandFacts = {
     openablePanels,
     browser: showBrowserTab,
@@ -998,7 +1008,7 @@ function WorkspaceTabsPanelImpl({
     switch (command.kind) {
       case "panel":
         if (fromNewTab) {
-          store.fillNewTab(fromNewTab, pagePlace(command.tab));
+          store.fillNewTab(fromNewTab, settingsPagePlace(command.tab));
           return;
         }
         void openWorkspacePage(conversationId, command.tab).then(reportRefusal);
@@ -1596,21 +1606,6 @@ function WorkspaceTabsPanelImpl({
       )}
     </>
   );
-}
-
-function pagePlace(page: DefaultWorkspaceTab): WorkspacePlace {
-  switch (page) {
-    case "files":
-      return { kind: "files" };
-    case "changes":
-      return { kind: "changes" };
-    case "github":
-      return { kind: "pulls" };
-    case "subagents":
-      return { kind: "agents" };
-    case "tasks":
-      return { kind: "tasks" };
-  }
 }
 
 function AttentionBar({
