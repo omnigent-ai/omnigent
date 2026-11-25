@@ -1338,6 +1338,21 @@ def _default_gadget_location() -> str:
     return str(_local_data_dir() / "gadgets")
 
 
+def _gadget_location(cfg: dict[str, Any], config_path: str | None) -> str:  # type: ignore[explicit-any]
+    """Where ``omnigent server`` keeps gadgets for this config.
+
+    The config's ``gadget_location``, relative to the config file, or the default.
+
+    :param cfg: The server config, as :func:`_load_config` reads it.
+    :param config_path: The config file it came from, or ``None``.
+    :returns: e.g. ``"/srv/omnigent/gadgets"``.
+    """
+    location = cfg.get("gadget_location") or _default_gadget_location()
+    if config_path and not Path(location).is_absolute():
+        location = str(Path(config_path).parent / location)
+    return location
+
+
 def _default_artifact_location() -> str:
     """Default artifact dir for ``omnigent server`` — ``<data_dir>/artifacts``.
 
@@ -5040,9 +5055,7 @@ def server(
     artifact_store = _create_artifact_store(art_loc)
     from omnigent.stores.gadget_store.local import LocalGadgetStore
 
-    gadget_location = cfg.get("gadget_location") or _default_gadget_location()
-    if config_path and not Path(gadget_location).is_absolute():
-        gadget_location = str(Path(config_path).parent / gadget_location)
+    gadget_location = _gadget_location(cfg, config_path)
     # With gadgets off the store does no cleanup and touches nothing until a deleted account
     # notes its gadgets' cleanup, which waits until gadgets are on again.
     from omnigent.server.feature_flags import Feature, resolve_feature_flags
@@ -13219,6 +13232,42 @@ def debug_db_upgrade(url: str) -> None:
     click.echo("Upgrade complete.")
 
 
+def _migration_gadget_location(
+    gadget_dir: str | None, config_path: str | None, no_gadgets: bool
+) -> str | None:
+    """The gadget directory ``migrate-accounts-to-oidc`` checks, or ``None`` for none.
+
+    The server's own location, as ``omnigent server`` resolves it from its config. A
+    guess would be unsafe: a server configured elsewhere leaves the default directory
+    empty or absent, and remapping one of its gadget owners cuts them off from their
+    gadgets, so without --config, --gadget-dir or --no-gadgets the command stops.
+
+    :param gadget_dir: ``--gadget-dir``, which must exist.
+    :param config_path: ``--config``, the server's config file.
+    :param no_gadgets: ``--no-gadgets``: the server never kept gadgets.
+    :returns: The directory to check; ``None`` with ``--no-gadgets``. A configured
+        location that doesn't exist holds no gadgets, so the caller skips it.
+    :raises click.UsageError: When the location can't be established.
+    """
+    if no_gadgets and (gadget_dir is not None or config_path is not None):
+        raise click.UsageError("--no-gadgets can't be combined with --config or --gadget-dir")
+    if no_gadgets:
+        return None
+    if gadget_dir is not None:
+        # A typo would otherwise skip the gadget check.
+        if not Path(gadget_dir).is_dir():
+            raise click.BadParameter(
+                f"{gadget_dir!r} is not a directory", param_hint="'--gadget-dir'"
+            )
+        return gadget_dir
+    if config_path is not None:
+        return _gadget_location(_load_config(config_path), config_path)
+    raise click.UsageError(
+        "can't tell where the server keeps gadgets: pass --config with the server's config "
+        "file, --gadget-dir with its gadget directory, or --no-gadgets if it never kept any"
+    )
+
+
 @debug.command("migrate-accounts-to-oidc")
 @click.argument("url")
 @click.option(
@@ -13252,12 +13301,27 @@ def debug_db_upgrade(url: str) -> None:
     "accidental privilege merges.",
 )
 @click.option(
+    "--config",
+    "-c",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="The config file the server runs with (`omnigent server --config`). Its "
+    "gadget_location, or the default <data dir>/gadgets without one, is where the server's "
+    "gadgets are checked, so users with gadgets are refused rather than cut off from them.",
+)
+@click.option(
     "--gadget-dir",
     default=None,
     metavar="DIR",
-    help="The server's gadget directory (its config's gadget_location), checked so users "
-    "with gadgets are refused rather than cut off from them. Defaults to <data dir>/gadgets, "
-    "skipped when that doesn't exist; a directory given here must exist.",
+    help="The server's gadget directory, overriding --config. It must exist.",
+)
+@click.option(
+    "--no-gadgets",
+    is_flag=True,
+    default=False,
+    help="The server never kept gadgets, so there is no gadget directory to check. "
+    "Gadget grants in the database are still checked.",
 )
 def debug_migrate_accounts_to_oidc(
     url: str,
@@ -13265,7 +13329,9 @@ def debug_migrate_accounts_to_oidc(
     domain: str | None,
     commit: bool,
     force: bool,
+    config_path: str | None,
     gadget_dir: str | None,
+    no_gadgets: bool,
 ) -> None:
     """Remap user identities when switching the accounts provider to OIDC.
 
@@ -13283,15 +13349,21 @@ def debug_migrate_accounts_to_oidc(
     \b
     Examples:
       # Dry run: append the org domain to every username
-      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com
+      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com \\
+        --config /data/config.yaml
       # Apply it
-      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com --commit
+      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com \\
+        --config /data/config.yaml --commit
       # Explicit per-user mapping (add --commit to apply)
-      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --map alice=alice@corp.com
+      omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --map alice=alice@corp.com \\
+        --config /data/config.yaml
 
     Gadgets are not moved: a user who owns gadgets, has pinned ones, or has
     been granted access to someone's is refused, and their rows stay as
     they are. Delete or hand off those gadgets first, then run it again.
+    Say where the server keeps them with --config (or --gadget-dir), or
+    pass --no-gadgets for a server that never kept any; with none of
+    these the command stops before changing anything.
 
     \b
     IMPORTANT: always back up your database before running with
@@ -13319,16 +13391,9 @@ def debug_migrate_accounts_to_oidc(
         if not mapping:
             raise click.UsageError("nothing to migrate: pass --domain DOMAIN and/or --map OLD=NEW")
 
-        # A directory named on purpose must be one: a typo would otherwise skip the
-        # gadget check and cut its users off from their gadgets. The default may be absent
-        # on a server that never kept gadgets.
-        if gadget_dir is not None and not Path(gadget_dir).is_dir():
-            raise click.BadParameter(
-                f"{gadget_dir!r} is not a directory", param_hint="'--gadget-dir'"
-            )
-        gadget_location = gadget_dir or _default_gadget_location()
+        gadget_location = _migration_gadget_location(gadget_dir, config_path, no_gadgets)
         gadget_store = None
-        if Path(gadget_location).is_dir():
+        if gadget_location is not None and Path(gadget_location).is_dir():
             from omnigent.stores.gadget_store.local import LocalGadgetStore
 
             # Read only: no cleanup step, no directories made and no index repairs.

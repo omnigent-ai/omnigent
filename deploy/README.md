@@ -639,8 +639,13 @@ admins: [you@yourcompany.com]         # who can manage members
 across when you switch, so they keep their sessions and admin rights:
 
 ```bash
-omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com
+omnigent debug migrate-accounts-to-oidc <database-url> --domain yourcompany.com \
+  --config /data/config.yaml
 ```
+
+`--config` is the server's config file, so the command can check the
+server's gadgets; pass `--no-gadgets` instead for a server that never kept
+any.
 
 For the provider-specific walkthroughs (GitHub OAuth, Google Workspace,
 generic OIDC), see

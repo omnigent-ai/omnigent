@@ -426,7 +426,7 @@ def test_cli_dry_run_by_default(db_uri: str) -> None:
 
     result = CliRunner().invoke(
         cli,
-        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com"],
+        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com", "--no-gadgets"],
     )
 
     assert result.exit_code == 0, result.output
@@ -447,7 +447,15 @@ def test_cli_commit_applies(db_uri: str) -> None:
 
     result = CliRunner().invoke(
         cli,
-        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com", "--commit"],
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--commit",
+            "--no-gadgets",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -560,6 +568,86 @@ def test_cli_dry_run_writes_nothing_in_the_gadget_dir(db_uri: str, tmp_path) -> 
     assert snapshot() == before
 
 
+def test_cli_finds_the_gadgets_where_the_servers_config_keeps_them(db_uri: str, tmp_path) -> None:
+    """``--config`` checks the gadget location the server itself uses, so a gadget owner
+    on a server whose gadgets live outside the default directory is refused."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    config = tmp_path / "server" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text("gadget_location: custom-gadgets\n")
+    store = LocalGadgetStore(str(config.parent / "custom-gadgets"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--config",
+            str(config),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "REFUSED (has gadgets" in result.output
+    assert account_store.get_user("alice") is not None
+    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+
+
+def test_cli_stops_when_it_cant_tell_where_the_server_keeps_gadgets(
+    db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without --config, --gadget-dir or --no-gadgets the command changes nothing: the
+    default directory may be absent because the server keeps its gadgets elsewhere."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    store = LocalGadgetStore(str(tmp_path / "elsewhere"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+    assert not (tmp_path / "data" / "gadgets").exists()
+
+    result = CliRunner().invoke(
+        cli,
+        ["debug", "migrate-accounts-to-oidc", db_uri, "--domain", "example.com", "--commit"],
+    )
+
+    assert result.exit_code != 0
+    assert "where the server keeps gadgets" in result.output
+    assert account_store.get_user("alice") is not None
+    assert account_store.get_user("alice@example.com") is None
+    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+
+
+def test_cli_refuses_no_gadgets_with_a_gadget_location(db_uri: str, tmp_path) -> None:
+    """--no-gadgets can't be combined with a location: one of them would be ignored."""
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--no-gadgets",
+            "--gadget-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--no-gadgets" in result.output
+
+
 def test_cli_requires_a_mapping(db_uri: str) -> None:
     """With neither --domain nor --map, the command errors (nothing to do)."""
     result = CliRunner().invoke(cli, ["debug", "migrate-accounts-to-oidc", db_uri])
@@ -582,6 +670,7 @@ def test_cli_map_overrides_domain(db_uri: str) -> None:
             "example.com",
             "--map",
             "alice=alice@corp.com",
+            "--no-gadgets",
             "--commit",
         ],
     )
