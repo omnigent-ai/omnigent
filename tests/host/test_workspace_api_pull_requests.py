@@ -626,6 +626,22 @@ async def test_a_change_whose_answer_times_out_is_unconfirmed(
     assert len(tunnel.sent) == 1
 
 
+async def test_a_frame_over_the_tunnels_cap_is_never_sent_and_the_host_stays_connected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A message over the cap would close the host's connection, for every session on it."""
+    monkeypatch.setattr(workspace_api, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 4096)
+    tunnel = _tunnel(tmp_path)
+
+    with pytest.raises(ConnectError) as refused:
+        await tunnel.call("CreateComment", pb.CreateCommentRequest(pr_url=_PR, body="x" * 4096))
+
+    assert refused.value.code == Code.RESOURCE_EXHAUSTED
+    assert tunnel.sent == []
+    assert tunnel.registry.get("host_ws") is tunnel.host
+    assert not tunnel.host.pending_workspace_calls
+
+
 async def test_a_change_that_was_never_sent_is_safe_to_retry(tmp_path: Path) -> None:
     tunnel = _tunnel(tmp_path, refuse_send=True)
 

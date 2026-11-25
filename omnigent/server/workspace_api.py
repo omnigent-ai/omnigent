@@ -51,6 +51,7 @@ from omnigent.server.pull_request_viewers import (
     review_comments_for_viewer,
     review_threads_for_viewer,
 )
+from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 # Each reply must arrive within this; a whole ReadFile can take longer.
 _REPLY_TIMEOUT_S = 30.0
@@ -291,8 +292,14 @@ class HostWorkspaceService(WorkspaceServiceMethods):
                 vouch=vouch,
                 account_rights=account_rights,
             )
+            frame = encode_host_frame(call)
+            # A message over the tunnel's cap would close the host's whole connection. The
+            # frame is ASCII JSON, so its length is its size in bytes.
+            if len(frame) > RUNNER_TUNNEL_MAX_MESSAGE_BYTES:
+                too_large = "The request is too large to send to the session's host"
+                raise ConnectError(Code.RESOURCE_EXHAUSTED, too_large)
             try:
-                target.registry.send_text(target.host, encode_host_frame(call))
+                target.registry.send_text(target.host, frame)
             except ConnectionError as exc:
                 raise ConnectError(Code.UNAVAILABLE, "The session's host disconnected") from exc
             while True:
