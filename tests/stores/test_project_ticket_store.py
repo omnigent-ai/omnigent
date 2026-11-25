@@ -1239,9 +1239,22 @@ def test_a_ticket_says_who_its_open_ask_waits_on_until_it_is_answered(board):
     worker = TicketActor("alice", uuid4().hex, uuid4().hex)
     ticket = tickets.create(project.id, CreateTicket(title="Decide"), worker)
     assert tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"] is None
-    tickets.update(project.id, ticket["id"], UpdateTicket(labels=[{"key": "needs-human"}]), worker)
-    waiting = {"reason": "owner", "responders": ["alice"], "raised_by_user_id": None}
-    assert tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"] == waiting
+    tickets.update(
+        project.id,
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "needs-human"}], comment="Weekly digest, yes or no?"),
+        worker,
+    )
+    waiting = tickets.get(project.id, ticket["id"], user_id="alice")["waiting_on"]
+    assert {key: waiting[key] for key in ("reason", "responders", "raised_by_user_id")} == {
+        "reason": "owner",
+        "responders": ["alice"],
+        "raised_by_user_id": None,
+    }
+    # What the ticket's decision box shows: the asker's question, where and when it was raised.
+    assert waiting["question"] == "Weekly digest, yes or no?"
+    assert waiting["raised_by_session_id"] == worker.session_id
+    assert isinstance(waiting["ask_position"], int) and waiting["raised_at"] > 0
     assert tickets.list(project.id, user_id="alice")["data"][0]["waiting_on"] == waiting
 
     tickets.comment(project.id, ticket["id"], CommentOnTicket(text="B"), TicketActor("alice"))

@@ -120,6 +120,14 @@ export interface TicketWaitingOn {
   responders: string[];
   /** The person who raised the ask, when a person did; it isn't waiting on them. */
   raised_by_user_id: string | null;
+  /** The agent session that raised it, when an agent did. Absent from older servers. */
+  raised_by_session_id?: string | null;
+  /** Unix seconds when the ask was raised. */
+  raised_at?: number | null;
+  /** The activity position of the comment that states the question. */
+  ask_position?: number | null;
+  /** The question, from the asker's comment (up to 500 characters). */
+  question?: string | null;
 }
 export interface TicketFinalUpdate {
   event_id: string;

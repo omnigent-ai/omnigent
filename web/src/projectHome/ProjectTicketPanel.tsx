@@ -1,4 +1,12 @@
-import { Fragment, useRef, useState, type KeyboardEvent, type ReactNode, type Ref } from "react";
+import {
+  Fragment,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+  type Ref,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
@@ -69,6 +77,8 @@ import { TicketCostBadge } from "./ProjectCost";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { SessionImage } from "@/components/SessionImage";
 import { MentionTextarea } from "./MentionTextarea";
+import { TicketDecisionBox } from "./TicketDecisionBox";
+import { needsWhom } from "./ticketWaitingOn";
 import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessions";
 import { payloadCc, payloadMentions, type PersonaMention } from "./personaMentions";
 import { TicketCommentBody } from "./TicketCommentBody";
@@ -435,6 +445,10 @@ function TicketDetails({
   // File paths in text without an authoring session resolve against the project's agent.
   const projectSessionId = useProjectAgentSession(projectId).sessionId;
   const { update, comment } = useTicketActions(projectId);
+  const viewerId = useViewerId();
+  const personaLookup = useProjectPersonaLookup(projectId);
+  // "Answer in a comment" puts the asker's mention in the composer and focuses it.
+  const [composerPrefill, setComposerPrefill] = useState<ComposerPrefill | null>(null);
   // Title and description edit separately, each in place.
   const [editing, setEditing] = useState<"title" | "description" | null>(null);
   const lifecycle = useTicketLifecycleEnabled();
@@ -485,7 +499,12 @@ function TicketDetails({
           expanded={expanded}
           onExpandedChange={onExpandedChange}
           footer={
-            <TicketCommentComposer projectId={projectId} ticketId={ticketId} comment={comment} />
+            <TicketCommentComposer
+              projectId={projectId}
+              ticketId={ticketId}
+              comment={comment}
+              prefill={composerPrefill}
+            />
           }
         >
           <div className="space-y-4">
@@ -611,6 +630,28 @@ function TicketDetails({
               />
             </div>
             <TicketError error={configuration.error} />
+            {ticket.waiting_on && (
+              <TicketDecisionBox
+                projectId={projectId}
+                ticketId={ticketId}
+                waitingOn={ticket.waiting_on}
+                viewerId={viewerId}
+                personaLookup={personaLookup}
+                answering={comment.isPending}
+                onAnswer={(text) => comment.mutate({ id: ticketId, body: { text, outputs: [] } })}
+                onAnswerInComment={(mention) =>
+                  setComposerPrefill((previous) => ({
+                    text: mention,
+                    nonce: (previous?.nonce ?? 0) + 1,
+                  }))
+                }
+                onShowAsk={(position) =>
+                  document
+                    .querySelector(`[data-ticket-event-position="${position}"]`)
+                    ?.scrollIntoView({ block: "center", behavior: "smooth" })
+                }
+              />
+            )}
             {ticket.requested_by && (
               <p className="text-sm text-muted-foreground" data-testid="ticket-panel-requester">
                 Requested by {requesterLabel(ticket.requested_by, getCurrentUserId())}
@@ -742,17 +783,35 @@ function TicketSignOffs({
   );
 }
 
+/** Text to put at the start of the comment box; a new ``nonce`` applies it again. */
+interface ComposerPrefill {
+  text: string;
+  nonce: number;
+}
+
 function TicketCommentComposer({
   projectId,
   ticketId,
   comment,
+  prefill,
 }: {
   projectId: string;
   ticketId: string;
   comment: ReturnType<typeof useTicketActions>["comment"];
+  prefill?: ComposerPrefill | null;
 }) {
   const draftKey = ticketCommentDraftKey(projectId, ticketId);
   const [text, setText] = useTicketDraft(draftKey);
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    if (!prefill) return;
+    const lead = prefill.text;
+    if (lead) setText((current) => (current.startsWith(lead) ? current : `${lead}${current}`));
+    const box = formRef.current?.querySelector<HTMLTextAreaElement>('textarea[name="comment"]');
+    box?.focus();
+    box?.scrollIntoView({ block: "nearest" });
+    // Each click makes a new prefill, so it applies once per click.
+  }, [prefill, setText]);
   const [attaching, setAttaching] = useState(false);
   const [outputUrl, setOutputUrl] = useState("");
   const [outputType, setOutputType] = useState<TicketOutput["type"]>("pull_request");
@@ -761,6 +820,7 @@ function TicketCommentComposer({
   const hasContent = Boolean(text.trim()) || images.images.length > 0;
   return (
     <form
+      ref={formRef}
       className="space-y-2"
       onKeyDown={submitOnCommandEnter}
       onSubmit={(event) => {
@@ -859,8 +919,8 @@ function TicketCommentComposer({
             </Button>
           </div>
         )}
-        <div className="flex items-center justify-between gap-2 p-2 pt-0">
-          <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center justify-between gap-2 p-2 pt-0">
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
             <Button
               type="button"
               variant="ghost"
@@ -878,6 +938,7 @@ function TicketCommentComposer({
           <Button
             type="submit"
             size="sm"
+            className="ml-auto"
             loading={comment.isPending}
             disabled={!hasContent || images.uploading}
           >
@@ -1260,6 +1321,8 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
   const [searchParams] = useSearchParams();
   // Read once: the question the viewer came from the Inbox to answer.
   const [askPosition] = useState(() => parseAskPosition(searchParams.get(TICKET_ASK_PARAM)));
+  const decisionForViewer =
+    !!ticket.waiting_on?.question && needsWhom(ticket.waiting_on, viewerId)?.kind === "you";
   const activityRef = useRef<HTMLElement | null>(null);
   const { dividerPosition, dividerRef } = useTicketSeen({
     projectId,
@@ -1268,7 +1331,8 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
     hasNextPage: query.hasNextPage,
     isFetching: query.isFetching,
     fetchNextPage: query.fetchNextPage,
-    scrollToNew: askPosition === null,
+    // The decision box at the top is what the viewer came to answer; stay there.
+    scrollToNew: askPosition === null && !decisionForViewer,
   });
   const askTarget = useTicketAsk({
     askPosition,

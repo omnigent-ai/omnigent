@@ -1306,6 +1306,8 @@ class ProjectTicketStore:
     ) -> dict[str, Any] | None:
         """Who a ticket's open ``needs-human`` ask waits on, routed as in the Inbox.
 
+        Also what it asks: the ``question`` (the asker's comment, up to 500 characters),
+        its ``ask_position`` in the activity, ``raised_at`` and ``raised_by_session_id``.
         ``None`` when there is no ask or anyone it was routed to has answered it.
         """
         if not _has_needs_human(ticket.labels):
@@ -1320,6 +1322,10 @@ class ProjectTicketStore:
             "reason": reason,
             "responders": sorted(r for r in responders if r is not None),
             "raised_by_user_id": request["raised_by_user_id"],
+            "raised_by_session_id": request["raised_by_session_id"],
+            "raised_at": request["raised_at"],
+            "ask_position": request["ask_position"],
+            "question": request["question"],
         }
 
     def _open_human_request(
