@@ -8158,7 +8158,11 @@ describe("settings-based remote previews", () => {
     h.api.createBrowserRegistryForWindow(h.win);
     const deps = h.browserIpcDeps();
     const event = { sender: h.webContents, senderFrame: { url: server } };
-    const opts = { sourceHostId: host, sessionHostProtocol: 1, trustedRemotePreviewProtocol: 1 };
+    const opts = {
+      sourceHostId: host.toUpperCase(),
+      sessionHostProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
+    };
     let prompts = 0;
     h.electron.dialog.showMessageBox = async (_win, options) => {
       prompts += 1;
@@ -8187,6 +8191,14 @@ describe("settings-based remote previews", () => {
       false,
     );
     assert.equal(prompts, 2);
+    const settingsRetry = await h.ipc.get("omnigent:add-trusted-remote-host")(
+      event,
+      server,
+      "other-host",
+    );
+    assert.equal(settingsRetry.ok, false);
+    assert.match(settingsRetry.error, /restart Omnigent/);
+    assert.equal(prompts, 2, "Settings IPC must not bypass a native decline");
     assert.match(
       deps.getAgentNavigationHintForEvent(
         event,

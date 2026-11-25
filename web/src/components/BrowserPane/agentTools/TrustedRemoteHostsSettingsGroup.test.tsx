@@ -64,6 +64,7 @@ describe("TrustedRemoteHostsSettingsGroup", () => {
     renderInRouter(<TrustedRemoteHostsSettingsGroup />);
     await screen.findByText(/No remote hosts trusted yet/);
     expect(screen.getByLabelText("Server URL")).toHaveValue("https://server.example.com/");
+    expect(screen.getByLabelText("Server URL")).toHaveAttribute("readonly");
     fireEvent.change(screen.getByLabelText("Host ID"), { target: { value: "def456" } });
     fireEvent.click(screen.getByRole("button", { name: "Trust host" }));
     await waitFor(() =>
@@ -81,12 +82,11 @@ describe("TrustedRemoteHostsSettingsGroup", () => {
     "shows a rejected %s request and keeps the form usable",
     async (operation) => {
       const bridge = installBridge();
-      const method =
-        operation === "list"
-          ? bridge.getTrustedRemoteHosts
-          : operation === "add"
-            ? bridge.addTrustedRemoteHost
-            : bridge.removeTrustedRemoteHost;
+      const method = {
+        list: bridge.getTrustedRemoteHosts,
+        add: bridge.addTrustedRemoteHost,
+        remove: bridge.removeTrustedRemoteHost,
+      }[operation];
       method.mockRejectedValueOnce(new Error("IPC failed"));
       renderInRouter(<TrustedRemoteHostsSettingsGroup />);
       if (operation !== "list") {
@@ -99,12 +99,25 @@ describe("TrustedRemoteHostsSettingsGroup", () => {
         }
       }
       expect(await screen.findByRole("alert")).toHaveTextContent(/Could not/);
+      if (operation === "list") {
+        expect(screen.queryByText(/No remote hosts trusted yet/)).not.toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Trust host" })).not.toBeInTheDocument();
+      }
       if (operation === "add")
         expect(screen.getByRole("button", { name: "Trust host" })).toBeEnabled();
       if (operation === "remove")
         expect(screen.getByRole("button", { name: /Remove trusted host/ })).toBeEnabled();
     },
   );
+
+  it("hides the empty list and form when listing is refused", async () => {
+    const bridge = installBridge();
+    bridge.getTrustedRemoteHosts.mockResolvedValueOnce({ ok: false, error: "Not connected" });
+    renderInRouter(<TrustedRemoteHostsSettingsGroup />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Not connected");
+    expect(screen.queryByText(/No remote hosts trusted yet/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Trust host" })).not.toBeInTheDocument();
+  });
 
   it("renders nothing outside the desktop app", () => {
     const { container } = renderInRouter(<TrustedRemoteHostsSettingsGroup />);

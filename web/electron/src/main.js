@@ -454,8 +454,10 @@ const trustedRemoteHostRequests = createTrustedRemoteHostRequests({
   add: (serverUrl, hostId) => {
     const settings = loadSettings();
     const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
-    settings.trusted_remote_hosts = result.entries;
-    saveSettings(settings);
+    if (result.added) {
+      settings.trusted_remote_hosts = result.entries;
+      saveSettings(settings);
+    }
     return result.added;
   },
 });
@@ -6557,7 +6559,7 @@ function registerIpc() {
     },
     requestTrustedRemoteHostForEvent: async (event, url, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
-      const sourceHostId = opts?.sourceHostId;
+      const sourceHostId = normalizeTrustedHostId(opts?.sourceHostId);
       if (
         !win ||
         opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||

@@ -37,7 +37,7 @@ function createTrustedRemoteHostRequests({ isTrusted, add } = {}) {
           if (answer === false) declined.add(key);
           if (answer !== true) return false;
           try {
-            return add?.(serverUrl, hostId) === true;
+            return add?.(serverUrl, hostId) === true || isTrusted?.(serverUrl, hostId) === true;
           } catch {
             return false;
           }

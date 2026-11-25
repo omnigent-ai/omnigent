@@ -62,14 +62,42 @@ describe("trusted remote host requests", () => {
     );
   });
 
-  it("a failed persist does not grant trust", async () => {
+  it("accepts trust added while the native dialog is open", async () => {
+    let trusted = false;
+    const consent = Promise.withResolvers();
     const requests = createTrustedRemoteHostRequests({
-      isTrusted: () => false,
+      isTrusted: () => trusted,
       add: () => false,
     });
-    assert.equal(await requests.request(SERVER, HOST, async () => true), false);
-    assert.equal(requests.hint(SERVER, HOST), null);
+    const pending = requests.request(SERVER, HOST, () => consent.promise);
+    trusted = true;
+    consent.resolve(true);
+    assert.equal(await pending, true);
   });
+
+  for (const fault of ["cancelled", "dialog threw", "save failed", "save threw"]) {
+    it(`allows another attempt after ${fault}`, async () => {
+      let fail = true;
+      let prompts = 0;
+      const requests = createTrustedRemoteHostRequests({
+        isTrusted: () => false,
+        add: () => {
+          if (fail && fault === "save threw") throw new Error("save failed");
+          return !(fail && fault === "save failed");
+        },
+      });
+      const approve = async () => {
+        prompts++;
+        if (fail && fault === "dialog threw") throw new Error("dialog closed");
+        return fail && fault === "cancelled" ? null : true;
+      };
+      assert.equal(await requests.request(SERVER, HOST, approve), false);
+      assert.equal(requests.hint(SERVER, HOST), null);
+      fail = false;
+      assert.equal(await requests.request(SERVER, HOST, approve), true);
+      assert.equal(prompts, 2);
+    });
+  }
 
   it("refuses malformed server and host values without asking", async () => {
     const requests = createTrustedRemoteHostRequests({

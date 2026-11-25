@@ -406,16 +406,22 @@ describe("trustedRemoteHostsBridge", () => {
 
   it("exposes list, add, and remove when the shell offers them", async () => {
     const list = vi.fn().mockResolvedValue({ ok: true, hosts: [] });
+    const add = vi.fn();
+    const remove = vi.fn();
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
       getTrustedRemoteHosts: list,
-      addTrustedRemoteHost: vi.fn(),
-      removeTrustedRemoteHost: vi.fn(),
+      addTrustedRemoteHost: add,
+      removeTrustedRemoteHost: remove,
     };
     const bridge = trustedRemoteHostsBridge();
     expect(bridge).not.toBeNull();
     await bridge!.list();
     expect(list).toHaveBeenCalledOnce();
+    await bridge!.add("https://server.example.com/", "example-host");
+    expect(add).toHaveBeenCalledWith("https://server.example.com/", "example-host");
+    await bridge!.remove("https://server.example.com/", "example-host");
+    expect(remove).toHaveBeenCalledWith("https://server.example.com/", "example-host");
   });
 });
 

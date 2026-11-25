@@ -22,7 +22,7 @@ import { UPDATE_DESKTOP_NOTE } from "./BrowserAgentToolsSettingsGroup";
 export function TrustedRemoteHostsSettingsGroup() {
   const [bridge] = useState(trustedRemoteHostsBridge);
   const [supported, setSupported] = useState<boolean | null>(null);
-  const [hosts, setHosts] = useState<TrustedRemoteHost[]>([]);
+  const [hosts, setHosts] = useState<TrustedRemoteHost[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [serverUrl, setServerUrl] = useState("");
   const [hostId, setHostId] = useState("");
@@ -106,10 +106,10 @@ export function TrustedRemoteHostsSettingsGroup() {
           description={
             supported === false
               ? UPDATE_DESKTOP_NOTE
-              : "Manage hosts for this server. Trust lets their sessions and agents access this computer's localhost pages across ports, including forwarded services. The desktop asks you to confirm each new grant. Trust stays until removed; forwarding must already be established."
+              : "Manage hosts for this server. Trust lets their sessions and agents access this computer's localhost pages across ports, including forwarded services. The desktop asks you to confirm each new grant. After declining, restart the desktop before trying again. Trust stays until removed; forwarding must already be established."
           }
         />
-        {supported === true && (
+        {supported === true && hosts !== null && (
           <div className="mt-4 flex flex-col gap-4">
             {hosts.length === 0 ? (
               <p className="text-sm text-muted-foreground">
@@ -151,12 +151,11 @@ export function TrustedRemoteHostsSettingsGroup() {
               <div className="flex flex-col gap-2 sm:flex-row">
                 <Input
                   type="url"
-                  placeholder="Server URL, e.g. https://server.example.com"
+                  readOnly
                   {...settingsControlProps(TRUSTED_REMOTE_HOSTS_ENTRY, "serverUrl")}
                   data-testid="trusted-remote-host-server-url"
                   className="min-w-0 flex-1"
                   value={serverUrl}
-                  onChange={(event) => setServerUrl(event.target.value)}
                 />
                 <Input
                   placeholder="Host ID"
