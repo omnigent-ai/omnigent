@@ -140,6 +140,13 @@ _PANEL_READS: OrderedDict[tuple[object, ...], _PanelRead] = OrderedDict()
 _RUNNING_PANEL_READS: dict[tuple[object, ...], _PanelRead] = {}
 
 
+def drop_panel_reads() -> None:
+    """Make every panel request wait for a read that starts later, e.g. after a reconnect."""
+    global _panel_read_generation
+    with _PANEL_READ_LOCK:
+        _panel_read_generation += 1
+
+
 def _invalidates_panel_reads(function: Callable[_P, _T]) -> Callable[_P, _T]:
     """Make panel requests after ``function`` returns, in any process, wait for a newer read."""
     signature = inspect.signature(function)

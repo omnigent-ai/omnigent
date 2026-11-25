@@ -174,6 +174,10 @@ describe("usePullRequestInfo turn-end invalidate", () => {
       expect(fetchMock).toHaveBeenCalledTimes(4);
       await act(() => vi.advanceTimersByTimeAsync(90_000));
       expect(fetchMock).toHaveBeenCalledTimes(4);
+      // The composer's 30 s polls match the stale time, so each one reads GitHub fresh.
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes("allow_cached"))).toBe(
+        false,
+      );
     },
   );
 });

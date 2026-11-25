@@ -1137,6 +1137,50 @@ def test_an_unreadable_panel_write_marker_makes_every_poll_read_the_forge(
     assert len(views) == 2
 
 
+async def test_a_reconnected_runner_reads_the_forge_after_an_edit_it_could_not_see(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host serves panel edits while this runner is offline, even if it can't record them."""
+    from omnigent.runner._entry import _on_tunnel_reconnect
+
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    poll()
+    poll()
+    assert len(views) == 1
+    # The host's edit left the marker unchanged, as when it can't be written.
+    caught_up: list[bool] = []
+
+    async def catch_up_scan() -> None:
+        caught_up.append(True)
+
+    await _on_tunnel_reconnect(catch_up_scan)()
+    poll()
+    assert len(views) == 2
+    assert caught_up == [True]
+    await _on_tunnel_reconnect(None)()
+
+
+def test_a_read_only_panel_write_marker_is_still_replaced(tracked: str) -> None:
+    registry = SessionPrRegistry("session")
+    registry.note_panel_write()
+    before = registry.panel_write_marker()
+    marker = registry.path.with_suffix(".panel-writes")
+    marker.chmod(0o444)
+    registry.note_panel_write()
+    assert registry.panel_write_marker() not in (None, before)
+
+
 def test_a_read_without_allow_cached_reads_the_forge_even_while_a_poll_runs(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

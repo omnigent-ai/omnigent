@@ -160,7 +160,13 @@ class SessionPrRegistry:
     def note_panel_write(self) -> None:
         """Record a PR panel write, so every process serving the session drops older reads."""
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._panel_writes_path.write_text(uuid.uuid4().hex, encoding="utf-8")
+        fd, temporary = tempfile.mkstemp(prefix=".panel-writes-", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(uuid.uuid4().hex)
+            os.replace(temporary, self._panel_writes_path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def _write(self, state: _Registry, *, legacy_first: bool = False) -> None:
         # Old hosts may rewrite this file; keep foreign associations out of it.
