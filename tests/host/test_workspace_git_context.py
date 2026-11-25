@@ -170,6 +170,9 @@ async def test_branch_tracking_its_upstream_reports_the_push_target(tmp_path: Pa
     assert [
         (remote.name, remote.host, remote.owner, remote.repo) for remote in response.remotes
     ] == [("origin", "github.com", "acme", "app")]
+    # The repository's root is the workspace: present, and empty.
+    assert response.HasField("workspace_prefix")
+    assert response.workspace_prefix == ""
 
 
 async def test_triangular_workflow_pushes_to_the_fork(tmp_path: Path) -> None:
@@ -429,6 +432,7 @@ async def test_directory_outside_any_repository_is_not_a_repository(tmp_path: Pa
     response = await _resolve(plain)
 
     assert response.problem == REPOSITORY_CONTEXT_PROBLEM_NOT_A_REPOSITORY
+    assert not response.HasField("workspace_prefix")
 
 
 async def test_linked_worktree_reads_the_shared_remotes(tmp_path: Path) -> None:
@@ -462,6 +466,7 @@ async def test_subdirectory_of_a_repository_reads_the_repository_wide_context(
 
     assert response.problem == REPOSITORY_CONTEXT_PROBLEM_UNSPECIFIED
     assert response.branch == "feature"
+    assert response.workspace_prefix == "packages/inner/"
     assert _push_of(response) == ("origin", "feature", "github.com/acme/app", _head(root))
 
 

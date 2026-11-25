@@ -816,6 +816,11 @@ message ResolveRepositoryContextResponse {
   repeated RepositoryRemote remotes = 7;
   uint32 unsupported_remote_count = 8;
   bool truncated_remotes = 9;
+
+  // The workspace directory below the repository's root, "/"-separated and
+  // ending in "/" unless empty, so a workspace path names a repository path.
+  // Absent from older hosts and when there is a problem.
+  optional string workspace_prefix = 10;
 }
 
 message GetPullRequestRequest {

@@ -228,6 +228,16 @@ import {
   writeFileViewPreferences,
 } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
+import {
+  PushUnresolved,
+  RepositoryContextProblem,
+  type ResolveRepositoryContextResponse,
+} from "@/lib/workspaceSidebarApi";
+import {
+  DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+  setWorkspaceSidebarSourceForTests,
+} from "@/lib/workspaceSidebarSource";
+import { repositoryContextKey } from "@/hooks/useRepositoryContext";
 
 const useCommentsMock = vi.mocked(useComments);
 const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
@@ -293,6 +303,8 @@ interface RenderProps {
   linkedCommentId?: string;
   comparisonDiff?: ComponentProps<typeof FileViewer>["comparisonDiff"];
   onShowChanges?: () => void;
+  /** The client the tree reads through, so a test can wait for a query to settle. */
+  queryClient?: QueryClient;
 }
 
 /**
@@ -327,9 +339,9 @@ function viewerTree({
   linkedCommentId,
   comparisonDiff,
   onShowChanges,
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[url]}>
@@ -2481,6 +2493,126 @@ describe("FileViewer view-settings menu", () => {
     expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
     // Hiding whitespace changes only means something in the diff view.
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  describe("Open in GitHub", () => {
+    const pushed = "c".repeat(40);
+    const pushTarget = {
+      remoteName: "origin",
+      branch: "feature",
+      host: "github.com",
+      owner: "acme",
+      repo: "app",
+      trackingSha: pushed,
+    };
+    const repositoryContext = (
+      overrides: Partial<ResolveRepositoryContextResponse> = {},
+    ): ResolveRepositoryContextResponse => ({
+      problem: RepositoryContextProblem.UNSPECIFIED,
+      branch: "feature",
+      headSha: pushed,
+      push: pushTarget,
+      pushUnresolved: PushUnresolved.UNSPECIFIED,
+      upstreamRef: "refs/remotes/origin/feature",
+      remotes: [{ name: "origin", host: "github.com", owner: "acme", repo: "app" }],
+      unsupportedRemoteCount: 0,
+      truncatedRemotes: false,
+      workspacePrefix: "web/",
+      ...overrides,
+    });
+    const answering = (response: ResolveRepositoryContextResponse) => {
+      const resolve = vi.fn(() => Promise.resolve(response));
+      setWorkspaceSidebarSourceForTests({
+        ...DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+        resolveRepositoryContext: resolve,
+      });
+      return resolve;
+    };
+
+    afterEach(() => setWorkspaceSidebarSourceForTests(null));
+
+    it("links the file at its pushed commit, below the workspace's place in the repository", async () => {
+      answering(repositoryContext());
+      const fileUrl = `https://github.com/acme/app/blob/${pushed}/web/file1.py`;
+      // An embedding pane that withholds popups: the row must still navigate.
+      vi.spyOn(window, "open").mockReturnValue(null);
+      const followed: HTMLAnchorElement[] = [];
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+        this: HTMLAnchorElement,
+      ) {
+        followed.push(this);
+      });
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      const item = await screen.findByRole("menuitem", { name: "Open in GitHub" });
+      expect(item).toHaveAttribute("href", fileUrl);
+      fireEvent.click(item);
+      expect(followed.map((link) => [link.href, link.target])).toEqual([[fileUrl, "_self"]]);
+    });
+
+    it("shows the item disabled, with why, while the branch isn't pushed", async () => {
+      answering(repositoryContext({ push: { ...pushTarget, trackingSha: "" } }));
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      const item = await screen.findByRole("menuitem", { name: "Open in GitHub" });
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      expect(item).toHaveAccessibleDescription("Push this branch to open the file in GitHub.");
+      expect(item).not.toHaveAttribute("href");
+    });
+
+    it("reads the context again when the menu reopens, so a push made meanwhile links", async () => {
+      let current = repositoryContext({ push: { ...pushTarget, trackingSha: "" } });
+      const resolve = vi.fn(() => Promise.resolve(current));
+      setWorkspaceSidebarSourceForTests({
+        ...DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+        resolveRepositoryContext: resolve,
+      });
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      expect(await screen.findByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+      // The agent pushes while the viewer stays mounted and the page keeps focus.
+      current = repositoryContext();
+      const reads = resolve.mock.calls.length;
+      openSettingsMenu();
+      expect(resolve.mock.calls.length).toBeGreaterThan(reads);
+      await waitFor(() =>
+        expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+          "href",
+          `https://github.com/acme/app/blob/${pushed}/web/file1.py`,
+        ),
+      );
+    });
+
+    it("leaves the item out of a workspace that isn't a repository", async () => {
+      answering(
+        repositoryContext({
+          problem: RepositoryContextProblem.NOT_A_REPOSITORY,
+          push: undefined,
+          remotes: [],
+          workspacePrefix: undefined,
+        }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(viewerTree({ open: true, queryClient }));
+      await waitFor(() =>
+        expect(queryClient.getQueryState(repositoryContextKey("conv_1"))?.status).toBe("success"),
+      );
+      // Let the viewer render the settled answer before checking what it left out.
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 0);
+          }),
+      );
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: /Open in GitHub/ })).toBeNull();
+    });
   });
 
   it("toggling Wrap lines in a code file flips the code viewer's wrapLines prop", () => {
