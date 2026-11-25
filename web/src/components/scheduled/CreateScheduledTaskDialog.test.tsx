@@ -3188,6 +3188,23 @@ describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", ()
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 
+  it("keeps typed instructions open on a backdrop click until the X closes the dialog", async () => {
+    const onOpenChange = vi.fn();
+    const view = renderDialog(onOpenChange);
+    await userEvent.type(screen.getByTestId("task-prompt-input"), "Summarize new issues");
+    await userEvent.click(document.querySelector('[data-slot="dialog-overlay"]')!);
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("Summarize new issues");
+
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={onOpenChange} />);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    onOpenChange.mockClear();
+    await userEvent.click(document.querySelector('[data-slot="dialog-overlay"]')!);
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+  });
+
   it.each(["host", "model", "effort", "permission", "project"])(
     "Escape closes only the %s menu and keeps unsaved fields",
     (field) => {

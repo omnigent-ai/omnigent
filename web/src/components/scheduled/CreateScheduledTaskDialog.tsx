@@ -498,16 +498,18 @@ export function CreateScheduledTaskDialog({
     nestedMenuClosedAtRef.current = 0;
     selectClosedAtRef.current = 0;
   }
-  /** preventDefault the Dialog's outside-dismiss ONLY for the narrow nested-Select
-   * cases — a click inside portalled dropdown content (path a) or while a dropdown
-   * is open (path b),
+  // Set by any typing since the dialog opened, so a stray click can't discard it.
+  const typedSinceOpenRef = useRef(false);
+  /** preventDefault the Dialog's outside-dismiss once the user has typed, and
+   * otherwise ONLY for the narrow nested-Select cases — a click inside portalled
+   * dropdown content (path a) or while a dropdown is open (path b),
    * plus a short grace window for the trailing focus-outside a dropdown emits as
-   * it unmounts. A genuine click on the backdrop OVERLAY always dismisses: its target
-   * is the overlay itself (never a popper), so we let it through even inside the
-   * grace window — this is the fix for backdrop-click-to-close being swallowed.
-   * Escape + Cancel are unaffected (they don't route through this guard). */
+   * it unmounts. Before any typing, a genuine click on the backdrop OVERLAY dismisses:
+   * its target is the overlay itself (never a popper), so we let it through even
+   * inside the grace window.
+   * X, Escape and Cancel are unaffected (they don't route through this guard). */
   function guardDialogDismiss(event: { target: EventTarget | null; preventDefault: () => void }) {
-    if (workspaceBrowserOpen) {
+    if (workspaceBrowserOpen || typedSinceOpenRef.current) {
       event.preventDefault();
       return;
     }
@@ -624,6 +626,7 @@ export function CreateScheduledTaskDialog({
   const wasOpen = useRef(false);
   useEffect(() => {
     if (open && !wasOpen.current) {
+      typedSinceOpenRef.current = false;
       typeDrafts.current = {};
       setSourceSwitch(null);
       editSourceDrafts.current = {};
@@ -1883,10 +1886,14 @@ export function CreateScheduledTaskDialog({
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
         // body / trigger while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss` — it covers both the popper-target path and the
-        // Select-open + focus-outside path, while leaving real backdrop clicks
-        // and Escape to close as normal.
+        // Select-open + focus-outside path, and keeps typed input open on a
+        // backdrop click. Escape still closes as normal.
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
+        // Bubbles from every text field, including portalled picker searches.
+        onInputCapture={() => {
+          typedSinceOpenRef.current = true;
+        }}
       >
         {/* The right padding keeps the bordered name field clear of the close button. */}
         <DialogHeader className="shrink-0 pt-5 pr-[4.5rem] pb-0 pl-6">
