@@ -1059,6 +1059,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        exclude_label: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1178,6 +1179,8 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param exclude_label: When set, exclude conversations carrying
+            this label key before pagination. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

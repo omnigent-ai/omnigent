@@ -40,6 +40,7 @@ from omnigent.session_import import (
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
     ConversationUpdateResult,
 )
 from omnigent.stores.conversation_store.activity_error import (
@@ -2814,6 +2815,23 @@ def test_list_conversations_pagination(
     page2 = conversation_store.list_conversations(limit=2, after=page1.last_id)
     assert len(page2.data) == 2
     assert page2.has_more is False
+
+
+def test_list_conversations_excludes_labels_before_pagination(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Hidden rows do not push visible sessions onto a later page."""
+    visible_ids = {conversation_store.create_conversation().id for _ in range(14)}
+    for _ in range(17):
+        conversation_store.create_conversation(labels={SIDE_CHAT_LABEL_KEY: "1"})
+
+    page = conversation_store.list_conversations(
+        limit=30,
+        exclude_label=SIDE_CHAT_LABEL_KEY,
+    )
+
+    assert {row.id for row in page.data} == visible_ids
+    assert page.has_more is False
 
 
 @pytest.mark.asyncio
