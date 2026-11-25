@@ -84,21 +84,20 @@ export interface TabSettingsStrip {
   canOpen: (page: DefaultWorkspaceTab) => boolean;
   /** The strip shows only its empty New tab, so nothing was chosen yet. */
   untouched: boolean;
-  /** The user opened, moved or selected something since the settings last arranged the strip. */
-  choseSince: boolean;
 }
 
 /**
  * How a strip that last took `applied` (none for a new or older strip) follows `settings`.
- * A page the session can't show or open yet is left out of `applied`, so it comes later. A
- * strip that never took the settings but already shows something, such as a file a link
- * opened, keeps it: the first page is only taken. So does one whose user picked a tab while
- * the first page waited: it doesn't take the selection from them later.
+ * A pinned page the session can't show or open yet is left out of `applied`, so it's pinned
+ * later. The first page is selected only as the strip opens or when the setting changes,
+ * and only if the session can show it then; otherwise the selection stays, and the page
+ * never takes it later. A strip that already shows something, such as a file a link opened,
+ * keeps it.
  */
 export function tabSettingsChange(
   settings: WorkspaceTabSettings,
   applied: AppliedTabSettings | undefined,
-  { canShow, canOpen, untouched, choseSince }: TabSettingsStrip,
+  { canShow, canOpen, untouched }: TabSettingsStrip,
 ): TabSettingsChange {
   const before = applied?.pinned ?? [];
   const pin = settings.pinned.filter(
@@ -106,8 +105,7 @@ export function tabSettingsChange(
   );
   const unpin = before.filter((page) => !settings.pinned.includes(page));
   const initialChanged = applied === undefined || applied.initial !== settings.initial;
-  const waiting = applied !== undefined && applied.initial === null;
-  const keepsSelection = !untouched && (applied === undefined || (waiting && choseSince));
+  const keepsSelection = applied === undefined && !untouched;
   const select =
     initialChanged &&
     !keepsSelection &&
@@ -116,15 +114,13 @@ export function tabSettingsChange(
     canOpen(settings.initial)
       ? settings.initial
       : null;
-  const initialTaken =
-    !initialChanged || keepsSelection || select !== null || settings.initial === null;
   return {
     pin,
     unpin,
     select,
     applied: {
       pinned: settings.pinned.filter((page) => before.includes(page) || pin.includes(page)),
-      initial: initialTaken ? settings.initial : (applied?.initial ?? null),
+      initial: settings.initial,
     },
   };
 }

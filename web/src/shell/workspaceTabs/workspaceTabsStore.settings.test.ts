@@ -111,61 +111,27 @@ describe("a strip following the Workspace settings", () => {
     expect(selectedKind(store)).toBe("pulls");
   });
 
-  it("adds a page once the session can show it", () => {
+  it("pins a first page the session couldn't show once it can, without switching to it", () => {
     const { store } = makeStore();
     let pullRequests = false;
     const canShow = (page: DefaultWorkspaceTab) => page !== "github" || pullRequests;
     store.applyTabSettings(settings(["github", "tasks"], "github"), canShow);
     expect(strip(store)).toEqual(["tasks (pinned)"]);
+    expect(selectedKind(store)).toBe("tasks");
     pullRequests = true;
     store.applyTabSettings(settings(["github", "tasks"], "github"), canShow);
     expect(strip(store)).toEqual(["tasks (pinned)", "pulls (pinned)"]);
-    expect(selectedKind(store)).toBe("pulls");
+    expect(selectedKind(store)).toBe("tasks");
   });
 
-  it("doesn't take the selection for a waiting first page from a tab the user picked", async () => {
+  it("selects a first page chosen while another waited, after the user opened a file", async () => {
     const { store } = makeStore();
-    let pullRequests = false;
-    const canShow = (page: DefaultWorkspaceTab) => page !== "github" || pullRequests;
-    store.applyTabSettings(settings(["github", "tasks"], "github"), canShow);
-    await store.open(
-      { place: { kind: "files", path: "README.md" } },
-      { opener: "user", disposition: "new" },
-    );
-    pullRequests = true;
-    store.applyTabSettings(settings(["github", "tasks"], "github"), canShow);
-    expect(strip(store)).toContain("pulls (pinned)");
-    expect(selectedKind(store)).toBe("files");
-    expect(store.applyTabSettings(settings(["github", "tasks"], "github"), canShow)).toBe(false);
-  });
-
-  it("doesn't take the selection for a waiting first page after the user opens a file in the Files tab", async () => {
-    const { store } = makeStore();
-    let pullRequests = false;
-    const canShow = (page: DefaultWorkspaceTab) => page !== "github" || pullRequests;
-    store.applyTabSettings(settings(["files", "github"], "github"), canShow);
+    const canShow = (page: DefaultWorkspaceTab) => page !== "github";
+    store.applyTabSettings(settings(["files", "tasks", "github"], "github"), canShow);
     const filesTab = store.selectedTab()!;
-    expect(filesTab.place.kind).toBe("files");
     await store.navigate(filesTab.id, { kind: "files", path: "README.md" });
-    pullRequests = true;
-    store.applyTabSettings(settings(["files", "github"], "github"), canShow);
-    expect(strip(store)).toContain("pulls (pinned)");
-    expect(store.selectedTab()?.place).toMatchObject({ kind: "files", path: "README.md" });
-  });
-
-  it("doesn't take the selection for a waiting first page after the user switches away and back", () => {
-    const { store } = makeStore();
-    let pullRequests = false;
-    const canShow = (page: DefaultWorkspaceTab) => page !== "github" || pullRequests;
-    store.applyTabSettings(settings(["files", "tasks", "github"], "github"), canShow);
-    const [filesTab, tasksTab] = store.tabs();
-    expect(store.selectedTab()?.id).toBe(filesTab.id);
-    store.select(tasksTab.id);
-    store.select(filesTab.id);
-    pullRequests = true;
-    store.applyTabSettings(settings(["files", "tasks", "github"], "github"), canShow);
-    expect(strip(store)).toContain("pulls (pinned)");
-    expect(selectedKind(store)).toBe("files");
+    store.applyTabSettings(settings(["files", "tasks", "github"], "tasks"), canShow);
+    expect(selectedKind(store)).toBe("tasks");
   });
 
   it("saves what it took with the strip, and a reloaded strip doesn't take it again", () => {

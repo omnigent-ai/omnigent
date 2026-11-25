@@ -242,14 +242,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   let selectedTabId: TabId | null = options.initial.selectedTabId;
   let closed: ClosedTab[] = [...options.initial.closed];
   let tabSettings: AppliedTabSettings | undefined = options.initial.tabSettings;
-  // What the user did in the strip: opens, steps, selections and moves, counted. A default
-  // page that waits doesn't take the selection once this moved past what settings last saw.
-  let userIntents = 0;
-  // Unknown after a reload, which counts as the user having acted.
-  let intentsSettingsSaw: number | undefined;
-  const noteUserIntent = () => {
-    userIntents += 1;
-  };
   let revision = 0;
   // Dirty-state changes bump the revision too. One made by answering the very
   // question being asked (discarding the edits) is excused, so it isn't "newer".
@@ -567,7 +559,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     openOptions: OpenOptions & { draftKey?: string },
   ): Promise<OpenResult> {
     const { draftKey, ...planOptions } = openOptions;
-    if (openOptions.opener === "user" || openOptions.opener === "link") noteUserIntent();
     const planned = planOpen(openState(), link, planOptions);
     if (!planned.ok) return planned;
     const { plan } = planned;
@@ -589,7 +580,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     viewKey: string,
     openOptions: { select: boolean; opener: TabOpener },
   ): TabId | null {
-    if (openOptions.opener === "user" || openOptions.opener === "link") noteUserIntent();
     const existing = knownTabs().find(
       (tab) => tab.binding?.kind === "browser-view" && tab.binding.viewKey === viewKey,
     );
@@ -626,7 +616,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     place: WorkspacePlace,
     navigateOptions: { replace?: boolean } = {},
   ): Promise<GuardedResult> {
-    noteUserIntent();
     const tab = findTab(tabId);
     if (!tab) return { ok: false, reason: MISSING_TAB_REASON };
     if (!canShow(planTab(tab), place)) return { ok: false, reason: refusalForTab(tab) };
@@ -717,7 +706,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     direction: "back" | "forward",
     moveOptions?: HistoryMoveOptions,
   ): Promise<GuardedResult> {
-    noteUserIntent();
     const stepOptions = stepOptionsFor(moveOptions);
     const target =
       direction === "back" ? history.backTarget(stepOptions) : history.forwardTarget(stepOptions);
@@ -744,7 +732,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
 
   /** Select a tab; never asks about unsaved edits, the other tab stays mounted. */
   function select(tabId: TabId): boolean {
-    noteUserIntent();
     if (tabId === selectedTabId) return true;
     if (!tabs.some((tab) => tab.id === tabId)) return false;
     markSelected(tabId);
@@ -763,7 +750,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
    * the selected tab isn't one of `together`, so a selection made meanwhile stands.
    */
   function selectAmong(tabId: TabId, together: readonly TabId[]): boolean {
-    noteUserIntent();
     if (tabId === selectedTabId) return true;
     if (selectedTabId === null || !together.includes(selectedTabId) || !together.includes(tabId))
       return false;
@@ -847,7 +833,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       release?: () => Promise<boolean>;
     } = {},
   ): Promise<GuardedResult> {
-    noteUserIntent();
     if (!tabs.some((tab) => tab.id === tabId)) return { ok: false, reason: MISSING_TAB_REASON };
     if (isOnlyEmptyNewTab(tabs, tabId)) return { ok: false, reason: LAST_NEW_TAB_REASON };
     const planned = stamp();
@@ -891,7 +876,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       teardownFor: (terminalKey: string) => Promise<boolean>;
     },
   ): Promise<GuardedResult | { ok: false; failed: string[]; stale?: true }> {
-    noteUserIntent();
     const keyOf = (tabId: TabId) => {
       const binding = findTab(tabId)?.binding;
       return binding?.kind === "terminal" ? binding.key : null;
@@ -990,7 +974,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     tabIds: readonly TabId[],
     releaseFor: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined,
   ): Promise<GuardedResult> {
-    noteUserIntent();
     const wanted = new Set(tabIds);
     const targetIds = tabs
       .filter((tab) => wanted.has(tab.id) && isBatchClosable(tab))
@@ -1007,7 +990,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     keepTabId: TabId,
     releaseFor: (tab: WorkspaceTab) => (() => Promise<boolean>) | undefined,
   ): Promise<GuardedResult> {
-    noteUserIntent();
     if (!tabs.some((tab) => tab.id === keepTabId)) return { ok: false, reason: MISSING_TAB_REASON };
     const targetIds = tabs
       .filter((tab) => tab.id !== keepTabId && isBatchClosable(tab))
@@ -1050,7 +1032,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
 
   /** Put closed entry `index` back at its position and select it; the caller checked it can. */
   function reopenClosedEntry(index: number): TabId {
-    noteUserIntent();
     const entry = closed[index];
     const binding = entry.tab.binding;
     closed = closed.filter((_, position) => position !== index);
@@ -1165,7 +1146,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   }
 
   function move(tabId: TabId, index: number) {
-    noteUserIntent();
     const from = indexOf(tabId);
     if (from === -1) return;
     const to = Math.max(0, Math.min(index, tabs.length - 1));
@@ -1223,7 +1203,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       // The first page, unpinned, opens after the pins when there is room for it too.
       canOpen: (page) => openable.has(page) || settingsPageTab(page) !== undefined || room > 0,
       untouched: empty,
-      choseSince: intentsSettingsSaw !== userIntents,
     });
     const nothingToDo =
       change.pin.length === 0 && change.unpin.length === 0 && change.select === null;
@@ -1252,7 +1231,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       }
     }
     commit();
-    intentsSettingsSaw = userIntents;
     return true;
   }
 
@@ -1276,7 +1254,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
    * the open tabs applies; one that a tab opened or closed meanwhile does nothing.
    */
   function reorder(order: readonly TabId[]): boolean {
-    noteUserIntent();
     if (order.length !== tabs.length || new Set(order).size !== order.length) return false;
     const byId = new Map(tabs.map((tab) => [tab.id, tab]));
     const next = order.map((tabId) => byId.get(tabId));
@@ -1381,7 +1358,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
 
   /** Show what an agent opened in the tab: a user navigation, through the guard. */
   async function showAttention(tabId: TabId): Promise<GuardedResult> {
-    noteUserIntent();
     const tab = findTab(tabId);
     if (!tab?.attention) return { ok: false, reason: MISSING_TAB_REASON };
     const place = tab.attention.place;
@@ -1421,7 +1397,6 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
    * Back never returns to the new-tab page.
    */
   function fillNewTab(tabId: TabId, place: WorkspacePlace, viewKey?: string): TabId | null {
-    noteUserIntent();
     const tab = findTab(tabId);
     if (!tab || tab.place.kind !== "new") return null;
     const binding = newBinding(place, viewKey);

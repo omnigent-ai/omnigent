@@ -6,7 +6,7 @@ import { parseAppliedTabSettings, tabSettingsChange } from "./workspaceTabSettin
 
 const showsAll = () => true;
 /** A strip on its empty New tab, with room for every page. */
-const fresh = { canShow: showsAll, canOpen: showsAll, untouched: true, choseSince: false };
+const fresh = { canShow: showsAll, canOpen: showsAll, untouched: true };
 const settings = (pinned: DefaultWorkspaceTab[], initial: DefaultWorkspaceTab | null) => ({
   pinned,
   initial,
@@ -62,7 +62,7 @@ describe("tabSettingsChange", () => {
     ).toBeNull();
   });
 
-  it("leaves a page the session can't show for later, and takes it once the session can", () => {
+  it("pins a page the session can't show once it can, but never selects it later", () => {
     const noPullRequests = (page: DefaultWorkspaceTab) => page !== "github";
     const first = tabSettingsChange(settings(["github", "tasks"], "github"), undefined, {
       ...fresh,
@@ -72,21 +72,23 @@ describe("tabSettingsChange", () => {
       pin: ["tasks"],
       unpin: [],
       select: null,
-      applied: { pinned: ["tasks"], initial: null },
+      applied: { pinned: ["tasks"], initial: "github" },
     });
     expect(
       tabSettingsChange(settings(["github", "tasks"], "github"), first.applied, fresh),
-    ).toMatchObject({ pin: ["github"], select: "github" });
+    ).toMatchObject({ pin: ["github"], select: null });
   });
 
-  it("drops a waiting first page once someone picked a tab, and selects a changed one", () => {
-    const waiting = { pinned: ["tasks"] as DefaultWorkspaceTab[], initial: null };
-    const picked = { ...fresh, untouched: false, choseSince: true };
-    const change = tabSettingsChange(settings(["github", "tasks"], "github"), waiting, picked);
-    expect(change).toMatchObject({ pin: ["github"], select: null });
-    expect(change.applied.initial).toBe("github");
-    const taken = { pinned: ["tasks"] as DefaultWorkspaceTab[], initial: "tasks" as const };
-    expect(tabSettingsChange(settings(["tasks"], "files"), taken, picked).select).toBe("files");
+  it("takes a changed first page the session can't show without selecting it", () => {
+    const applied = { pinned: ["tasks"] as DefaultWorkspaceTab[], initial: "tasks" as const };
+    const change = tabSettingsChange(settings(["tasks"], "github"), applied, {
+      ...fresh,
+      canShow: (page) => page !== "github",
+    });
+    expect(change).toMatchObject({ select: null, applied: { initial: "github" } });
+    expect(
+      tabSettingsChange(settings(["tasks"], "github"), change.applied, fresh).select,
+    ).toBeNull();
   });
 
   it("keeps what a strip shows when it first takes the settings, taking the first page", () => {
@@ -98,7 +100,7 @@ describe("tabSettingsChange", () => {
     expect(change.applied.initial).toBe("tasks");
   });
 
-  it("leaves a page with no room to open for later", () => {
+  it("leaves a pinned page with no room to open for later", () => {
     const change = tabSettingsChange(settings(["files", "tasks"], "tasks"), undefined, {
       ...fresh,
       canOpen: (page) => page === "files",
@@ -107,7 +109,7 @@ describe("tabSettingsChange", () => {
       pin: ["files"],
       unpin: [],
       select: null,
-      applied: { pinned: ["files"], initial: null },
+      applied: { pinned: ["files"], initial: "tasks" },
     });
   });
 
