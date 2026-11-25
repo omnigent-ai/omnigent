@@ -16,7 +16,7 @@ from omnigent.runner.mcp_execution_registry import (
 )
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes.sessions import _handle_mcp_tools_call
-from omnigent.spec.types import PolicyAction
+from omnigent.spec.types import AgentSpec, PolicyAction
 
 _SESSION_ID = "conv_mcp_detach"
 
@@ -57,7 +57,7 @@ async def test_tunnel_disconnect_marks_retained_execution_as_detached(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: object(),
+        lambda conv, agent_store: AgentSpec(spec_version=1, name="fake"),
     )
     monkeypatch.setattr(
         sessions_mod,

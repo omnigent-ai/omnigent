@@ -1198,6 +1198,22 @@ tools:
       Authorization: Bearer ${TOKEN}
 ```
 
+To tell policies which of the server's tools have no side effects, declare
+them on the block:
+
+```yaml
+tools:
+  docs:
+    type: mcp
+    url: https://example.com/mcp
+    read_only_tools: [search, get_page]  # bare tool names, always read-only
+    trust_annotations: true              # also honor the server's readOnlyHint
+```
+
+`trust_annotations` defaults to `false`, because MCP annotations are untrusted
+hints. Set it only for a server you control. A name in `read_only_tools` wins
+over a hint. See [Tool read-only declarations](POLICIES.md#tool-read-only-declarations).
+
 ### Python function tool
 
 ```yaml
@@ -1215,6 +1231,10 @@ tools:
 ```
 
 For client-provided tools, use `runtime: client` and do not set `callable`.
+
+Set `read_only: true` on a function tool that has no side effects, or
+`read_only: false` to state that it writes. Policies receive the value on the
+`tool_call` event. Leave it out when you do not want to declare it.
 
 ### Linux desktop keyrings
 

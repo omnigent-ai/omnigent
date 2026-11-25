@@ -100,6 +100,7 @@ from omnigent.native.permission_modes import (
     inherited_permission_mode,
 )
 from omnigent.native.session_todos import validate_session_todos
+from omnigent.policies.tool_read_only import tool_call_context
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
@@ -263,6 +264,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_mcp_read_only_hints,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -10249,14 +10251,17 @@ def _build_evaluation_context(
     event: dict[str, Any],
     *,
     actor: dict[str, str] | None = None,
+    spec: AgentSpec | None = None,
+    sub_agent_name: str | None = None,
+    session_id: str | None = None,
 ) -> EvaluationContext:
     """
     Build an :class:`EvaluationContext` from a proto-style event dict.
 
     Maps the proto ``Event.data`` shape to the internal convention:
 
-    - ``TOOL_CALL``: ``content = {"name": name, "arguments": args}``,
-      ``tool_name = name``.
+    - ``TOOL_CALL``: ``content = {"name": name, "arguments": args,
+      "read_only": declared}``, ``tool_name = name``.
     - ``TOOL_RESULT``: ``content = {"result": result_str}``, plus
       ``"is_error": True`` when the producer reported the call failed,
       ``tool_name`` from ``request_data.name``,
@@ -10269,6 +10274,13 @@ def _build_evaluation_context(
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
+    :param spec: The session's agent spec, used to resolve the tool's
+        read-only declaration on ``TOOL_CALL``. Any ``read_only`` the
+        caller put in ``data`` is ignored.
+    :param sub_agent_name: The session's ``sub_agent_name``; see
+        :func:`omnigent.policies.tool_read_only.tool_call_context`.
+    :param session_id: The session whose cached MCP ``readOnlyHint`` values
+        apply on ``TOOL_CALL``; ``None`` or a cache miss means no hints.
     :returns: Ready-to-evaluate context.
     """
     # A native hook may stamp the session's live model into the event context
@@ -10294,10 +10306,12 @@ def _build_evaluation_context(
         tool_name = raw_tool_name if isinstance(raw_tool_name, str) else ""
         raw_args = structured_data.get("arguments")
         args = raw_args if isinstance(raw_args, dict) else {}
-        return EvaluationContext(
-            phase=phase,
-            content={"name": tool_name, "arguments": args},
-            tool_name=tool_name or None,
+        return tool_call_context(
+            spec,
+            tool_name,
+            args,
+            sub_agent_name=sub_agent_name,
+            mcp_hints=_session_mcp_read_only_hints.get(session_id) if session_id else None,
             actor=actor,
             model=hook_model,
             harness=hook_harness,
@@ -12827,6 +12841,19 @@ async def _handle_mcp_tools_list(
                 "inputSchema": schema.get("parameters") or {"type": "object", "properties": {}},
             }
         )
+
+    # Cache the runner's hints for server policy. They come only from this
+    # trusted runner result, never from a tool-call payload.
+    hints_raw = result.get("read_only_hints")
+    hints = (
+        {k: v for k, v in hints_raw.items() if isinstance(k, str) and isinstance(v, bool)}
+        if isinstance(hints_raw, dict)
+        else {}
+    )
+    if hints:
+        _session_mcp_read_only_hints[session_id] = hints
+    else:
+        _session_mcp_read_only_hints.pop(session_id, None)
 
     failures: dict[str, str] = result.get("failures", {})
     for srv, msg in failures.items():

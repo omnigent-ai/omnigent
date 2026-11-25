@@ -301,6 +301,7 @@ def _translate_tools_to_omnigent(spec: AgentSpec) -> dict[str, Tool]:
                 name=tool_info.name,
                 input_schema=tool_info.parameters,
                 runtime="client",
+                read_only=tool_info.read_only,
             )
             continue
         # UC function tools have a catalog_path and no server-side
@@ -313,6 +314,7 @@ def _translate_tools_to_omnigent(spec: AgentSpec) -> dict[str, Tool]:
                 catalog_path=tool_info.catalog_path,
                 input_schema=tool_info.parameters,
                 warehouse_id=tool_info.warehouse_id,
+                read_only=tool_info.read_only,
             )
             continue
         # Step (c): every ``LocalToolInfo`` resolves to a plain
@@ -347,6 +349,7 @@ def _translate_tools_to_omnigent(spec: AgentSpec) -> dict[str, Tool]:
             name=tool_info.name,
             callable=resolved,
             input_schema=tool_info.parameters,
+            read_only=tool_info.read_only,
         )
     # Sub-agents named in tools.agents get an AgentTool entry so the
     # inner harness surfaces them as callable tools to the LLM.
@@ -395,7 +398,12 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
         construction path that bypassed the validator).
     """
     if config.transport == "registry":
-        return MCPTool(registry=True, tools=config.tools)
+        return MCPTool(
+            registry=True,
+            tools=config.tools,
+            read_only_tools=list(config.read_only_tools) if config.read_only_tools else None,
+            trust_annotations=config.trust_annotations,
+        )
     if config.transport == "stdio":
         if config.command is None:
             raise OmnigentError(
@@ -408,6 +416,8 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
             args=list(config.args) if config.args else None,
             env=dict(config.env) if config.env else None,
             tools=list(config.tools) if config.tools else None,
+            read_only_tools=list(config.read_only_tools) if config.read_only_tools else None,
+            trust_annotations=config.trust_annotations,
         )
     if config.url is None:
         raise OmnigentError(
@@ -419,6 +429,8 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
         url=config.url,
         headers=dict(config.headers) if config.headers else None,
         tools=list(config.tools) if config.tools else None,
+        read_only_tools=list(config.read_only_tools) if config.read_only_tools else None,
+        trust_annotations=config.trust_annotations,
     )
 
 
@@ -1875,7 +1887,13 @@ def _translate_mcp_tool_from_def(
                 "registry MCP tools cannot override server connection settings",
                 code=ErrorCode.INVALID_INPUT,
             )
-        return MCPServerConfig(name=tool_name, transport="registry", tools=tool.tools)
+        return MCPServerConfig(
+            name=tool_name,
+            transport="registry",
+            tools=tool.tools,
+            read_only_tools=list(tool.read_only_tools) if tool.read_only_tools else None,
+            trust_annotations=tool.trust_annotations,
+        )
     if tool.url is not None:
         return MCPServerConfig(
             name=tool_name,
@@ -1884,6 +1902,8 @@ def _translate_mcp_tool_from_def(
             headers=dict(tool.headers) if tool.headers else {},
             databricks_profile=tool.profile,
             tools=list(tool.tools) if tool.tools else None,
+            read_only_tools=list(tool.read_only_tools) if tool.read_only_tools else None,
+            trust_annotations=tool.trust_annotations,
         )
     if tool.command is not None:
         return MCPServerConfig(
@@ -1893,6 +1913,8 @@ def _translate_mcp_tool_from_def(
             args=list(tool.args) if tool.args else [],
             env=dict(tool.env) if tool.env else {},
             tools=list(tool.tools) if tool.tools else None,
+            read_only_tools=list(tool.read_only_tools) if tool.read_only_tools else None,
+            trust_annotations=tool.trust_annotations,
         )
     raise OmnigentError(
         f"omnigent MCP tool {tool_name!r} has neither 'url' nor "
@@ -1959,6 +1981,7 @@ def _translate_function_tool_from_def(
             language=OMNIGENT_TOOL_LANGUAGE,
             parameters=dict(tool.input_schema) if tool.input_schema else None,
             runtime=ToolRuntime.CLIENT,
+            read_only=tool.read_only,
         )
     # Unity Catalog tools declare ``catalog_path:`` instead of
     # ``callable:``. They are executed at tool-call time via
@@ -1978,6 +2001,7 @@ def _translate_function_tool_from_def(
             catalog_path=catalog_path,
             warehouse_id=getattr(tool, "warehouse_id", None),
             description=tool.description,
+            read_only=tool.read_only,
         )
     callable_path = _recover_callable_path(tool_name, tool)
     # Mirror the legacy ``Tool.tool_schema()`` precedence: an
@@ -2005,6 +2029,7 @@ def _translate_function_tool_from_def(
         language=OMNIGENT_TOOL_LANGUAGE,
         parameters=parameters,
         runtime=ToolRuntime.SERVER,
+        read_only=tool.read_only,
     )
 
 

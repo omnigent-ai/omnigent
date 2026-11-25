@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 from mcp.types import Tool as McpToolDef
+from mcp.types import ToolAnnotations as McpToolAnnotations
 
 from omnigent.runner import mcp_manager as _mcp_manager_module
 from omnigent.runner.mcp_manager import (
@@ -868,3 +869,38 @@ def test_strip_mcp_tool_prefix_preserves_bare_double_underscore() -> None:
     assert _strip_mcp_tool_prefix("bare_name") == "bare_name"
     # Looks-like-prefix but only two parts: preserved.
     assert _strip_mcp_tool_prefix("mcp__missing_third") == "mcp__missing_third"
+
+
+@pytest.mark.asyncio
+async def test_schemas_result_carries_read_only_hints(
+    patch_connection: dict[str, Any],
+) -> None:
+    """``read_only_hints`` maps namespaced tool names to ``annotations.readOnlyHint``.
+
+    Tools with no hint are absent so the consumer resolves them to ``None``.
+    """
+    patch_connection["__tools_for__"]["srv"] = [
+        McpToolDef(
+            name="read",
+            inputSchema={"type": "object", "properties": {}},
+            annotations=McpToolAnnotations(readOnlyHint=True),
+        ),
+        McpToolDef(
+            name="write",
+            inputSchema={"type": "object", "properties": {}},
+            annotations=McpToolAnnotations(readOnlyHint=False),
+        ),
+        McpToolDef(
+            name="unannotated",
+            inputSchema={"type": "object", "properties": {}},
+            annotations=McpToolAnnotations(title="x"),
+        ),
+        _make_tool_def("bare"),
+    ]
+    manager = RunnerMcpManager()
+    try:
+        result = await manager.schemas_for(_make_spec(_make_config("srv")))
+    finally:
+        await manager.shutdown()
+
+    assert result.read_only_hints == {"srv__read": True, "srv__write": False}

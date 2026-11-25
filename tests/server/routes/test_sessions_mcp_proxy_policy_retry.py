@@ -29,8 +29,18 @@ from omnigent.server.routes.sessions import (
     _pending_policy_ask_writes,
     _PendingPolicyAskWrites,
 )
-from omnigent.spec.types import LabelDef, Phase, PolicyAction, StateUpdate, StateUpdateAction
+from omnigent.spec.types import (
+    AgentSpec,
+    LabelDef,
+    Phase,
+    PolicyAction,
+    StateUpdate,
+    StateUpdateAction,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+# Real (empty) spec: the handler resolves tool read-only declarations from it.
+_FAKE_SPEC = AgentSpec(spec_version=1, name="fake")
 
 # ---------------------------------------------------------------------------
 # Stubs — real types, no MagicMock
@@ -254,7 +264,7 @@ async def test_forged_retry_with_deny_policy_is_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -303,7 +313,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -355,7 +365,7 @@ async def test_retry_with_allow_policy_falls_through(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -416,7 +426,7 @@ async def test_retry_session_mismatch_still_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -474,7 +484,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -571,7 +581,7 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -634,7 +644,7 @@ async def test_duplicate_accept_verdicts_apply_relay_writes_once(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -722,7 +732,7 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     monkeypatch.setattr(
         sessions_mod,
         "_load_agent_spec_for_session",
-        lambda conv, agent_store: "fake_spec",
+        lambda conv, agent_store: _FAKE_SPEC,
     )
     monkeypatch.setattr(
         sessions_mod,
@@ -770,7 +780,7 @@ async def test_unbound_pending_entry_is_rejected_before_policy_or_dispatch(
 ) -> None:
     """An approval entry without a call identity or reviewed arguments is never honored."""
     allow_engine = _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
-    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "fake_spec")
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: _FAKE_SPEC)
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
@@ -860,7 +870,7 @@ async def test_retry_dispatches_policy_owned_arguments(
         dispatched.append(json.loads(request.content))
         return httpx.Response(200, json={"result": {"output": "ok"}})
 
-    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "spec")
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: _FAKE_SPEC)
     monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", evaluate)
     monkeypatch.setattr(orchestration, "_register_policy_elicitation", register)
 

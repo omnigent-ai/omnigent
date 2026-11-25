@@ -193,6 +193,7 @@ from omnigent.server.routes._sessions.common import (
     _logger,
     _pushed_model_options_cache,
     _session_active_response_cache,
+    _session_mcp_read_only_hints,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -4561,6 +4562,9 @@ def register_events_routes(
         # for reload visibility while the session exists, so a session
         # whose MCP startup never settled clean would leak its entry.
         _session_mcp_startup_cache.pop(session_id, None)
+        # Cached MCP read-only hints die with the session (and its sub-agents).
+        for _hinted_id in (session_id, *descendant_ids):
+            _session_mcp_read_only_hints.pop(_hinted_id, None)
         # Same for the extension-pushed model catalog: kept across reloads
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.

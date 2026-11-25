@@ -1077,7 +1077,13 @@ def register_hooks_routes(
         # built from, so it is necessarily read first.)
         turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
         ctx = _build_evaluation_context(
-            phase, data, event, actor=_build_actor(turn_actor or user_id)
+            phase,
+            data,
+            event,
+            actor=_build_actor(turn_actor or user_id),
+            spec=loaded.spec,
+            sub_agent_name=conv.sub_agent_name,
+            session_id=session_id,
         )
         result = await engine.evaluate(ctx, read_only=is_read_only)
 

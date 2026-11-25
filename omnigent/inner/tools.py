@@ -203,6 +203,9 @@ class FunctionTool(Tool):
     catalog_path: str | None = None
     runtime: Literal["server", "client"] = "server"
     warehouse_id: str | None = None
+    # Author-declared "has no side effects", surfaced to TOOL_CALL policies
+    # as ``data.read_only``. ``None`` = undeclared.
+    read_only: bool | None = None
 
 
 @dataclass
@@ -263,6 +266,10 @@ class MCPTool(Tool):
     profile: str | None = None
     databricks_server: str | None = None
     headers: dict[str, str] | None = None
+    # Read-only declaration for TOOL_CALL policies: bare tool names the author
+    # declares read-only, and whether the server's ``readOnlyHint`` is trusted.
+    read_only_tools: list[str] | None = None
+    trust_annotations: bool = False
 
 
 @dataclass

@@ -168,6 +168,46 @@ async def test_event_tool_call_carries_target(
 
 
 @pytest.mark.asyncio
+async def test_tool_call_event_carries_read_only_declaration(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A function policy reads the tool's declaration as ``event["data"]["read_only"]``.
+
+    The value comes from the agent spec through ``tool_call_context``. Without it
+    an approval policy can only tell reads from writes by tool name.
+    """
+    from omnigent.policies.tool_read_only import tool_call_context
+    from omnigent.spec.types import AgentSpec, LocalToolInfo
+
+    agent = AgentSpec(
+        spec_version=1,
+        name="ro-agent",
+        local_tools=[
+            LocalToolInfo(name="lookup", path="m.lookup", language="python", read_only=True),
+            LocalToolInfo(name="store", path="m.store", language="python"),
+        ],
+    )
+    bucket: dict[str, Any] = {}
+
+    def _evaluate(event: dict[str, Any]) -> dict[str, Any]:
+        bucket[event["target"]] = event["data"]["read_only"]
+        return {"result": "ALLOW" if event["data"]["read_only"] is True else "ASK"}
+
+    spec = FunctionPolicySpec(
+        name="ask_unless_read_only",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL)],
+        function=FunctionRef(path="test.not.used"),
+    )
+    engine = _build(conversation_store, [FunctionPolicy(spec, _evaluate)])
+    read = await engine.evaluate(tool_call_context(agent, "lookup", {"q": "x"}))
+    write = await engine.evaluate(tool_call_context(agent, "store", {"q": "x"}))
+
+    assert bucket == {"lookup": True, "store": None}
+    assert read.action == PolicyAction.ALLOW
+    assert write.action == PolicyAction.ASK
+
+
+@pytest.mark.asyncio
 async def test_event_context_carries_labels_snapshot(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -44,6 +44,7 @@ from typing import Literal
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.policies import FunctionPolicy, resolve_function_policy
+from omnigent.policies.tool_read_only import tool_call_context
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
     AgentSpec,
@@ -174,9 +175,14 @@ class RunnerToolPolicyGate:
     Constructed once per spec_hash and reused across conversations.
     """
 
-    def __init__(self, policies: list[_GatedPolicy]) -> None:
-        """Construct from pre-resolved policies. Use :meth:`from_spec` for normal callers."""
+    def __init__(self, policies: list[_GatedPolicy], spec: AgentSpec | None = None) -> None:
+        """Construct from pre-resolved policies. Use :meth:`from_spec` for normal callers.
+
+        :param spec: Source spec, used to resolve tool read-only declarations.
+            ``None`` resolves every tool as undeclared.
+        """
         self._policies = policies
+        self._spec = spec
 
     @classmethod
     def from_spec(cls, spec: AgentSpec) -> RunnerToolPolicyGate:
@@ -188,7 +194,7 @@ class RunnerToolPolicyGate:
         """
         guard = getattr(spec, "guardrails", None)
         if guard is None or not guard.policies:
-            return cls([])
+            return cls([], spec)
         out: list[_GatedPolicy] = []
         for ps in guard.policies:
             if not isinstance(ps, FunctionPolicySpec):
@@ -225,7 +231,7 @@ class RunnerToolPolicyGate:
                     start_gated=start_gated,
                 )
             )
-        return cls(out)
+        return cls(out, spec)
 
     def reset_turn(self) -> None:
         """Forward per-turn reset to stateful policy callables."""
@@ -255,11 +261,7 @@ class RunnerToolPolicyGate:
         """
         if not self._policies:
             return _ALLOW
-        ctx = EvaluationContext(
-            phase=Phase.TOOL_CALL,
-            content={"name": tool_name, "arguments": arguments},
-            tool_name=tool_name,
-        )
+        ctx = tool_call_context(self._spec, tool_name, arguments)
         return await self._evaluate_policies(ctx, Phase.TOOL_CALL)
 
     async def evaluate_agent_start(
@@ -297,11 +299,7 @@ class RunnerToolPolicyGate:
             to resolve, or returned a malformed start transform while
             evaluating the probe.
         """
-        ctx = EvaluationContext(
-            phase=Phase.TOOL_CALL,
-            content={"name": AGENT_START_TOOL, "arguments": arguments},
-            tool_name=AGENT_START_TOOL,
-        )
+        ctx = tool_call_context(self._spec, AGENT_START_TOOL, arguments)
         composed_data: Mapping[str, object] | None = None
         for gated in self._policies:
             if Phase.TOOL_CALL not in gated.phases:

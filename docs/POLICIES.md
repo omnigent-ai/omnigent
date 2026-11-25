@@ -601,7 +601,8 @@ def block_domains(blocked_domains: list[str]) -> callable:
   "target": "sys_os_shell",
   "data": {
     "name": "sys_os_shell",
-    "arguments": {"command": "rm -rf /tmp/data"}
+    "arguments": {"command": "rm -rf /tmp/data"},
+    "read_only": null
   },
   "context": {
     "actor": {"run_as": "alice@example.com", "client_id": "oauth_abc"},
@@ -632,6 +633,40 @@ def block_domains(blocked_domains: list[str]) -> callable:
 `result` is the only required field. Valid values: `"ALLOW"`, `"DENY"`, `"ASK"`. Return `None` to abstain.
 
 `state_updates` supports four actions: `"set"`, `"increment"`, `"delete"`, `"append"`.
+
+### Tool read-only declarations
+
+Every `tool_call` event carries `data.read_only`, so a policy can tell reads
+from writes without matching tool names:
+
+| Value | Meaning |
+|-------|---------|
+| `true` | The tool is declared read-only |
+| `false` | The tool is declared to have side effects |
+| `null` | Nothing is declared. Treat it as not read-only |
+
+The server resolves the value from the agent spec. It never takes it from the
+event a harness sends, so a sandboxed harness cannot mark its own call
+read-only. Sources, highest precedence first:
+
+1. The agent spec: `read_only:` on a `type: function` tool, or a name in
+   `read_only_tools:` on a `type: mcp` block.
+2. The MCP server's `readOnlyHint` annotation, only when the block sets
+   `trust_annotations: true`.
+3. Otherwise `null`.
+
+A policy that asks for approval before writes then needs no tool names:
+
+```python
+def ask_before_writes(event):
+    if event["type"] != "tool_call" or event["data"]["read_only"] is True:
+        return None
+    return {"result": "ASK", "reason": f"{event['target']} is not declared read-only."}
+```
+
+Hints from MCP servers are collected when the runner lists a session's tools.
+Until that list exists for a session, a tool that depends on a hint resolves
+to `null`.
 
 ### Making policies discoverable
 
