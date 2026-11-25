@@ -20,8 +20,9 @@ export interface WorkflowDetail extends SavedWorkflow {
    */
   description_source?: string | null;
   /**
-   * Epoch seconds when the description was last written; a write to the steps alone keeps it,
-   * and another write can move it to that write's time. A server from before it sends none.
+   * Epoch seconds when the description was last written; a write to the steps alone keeps it
+   * while the plan has room for it, and another write can move it to that write's time. A
+   * server from before it sends none.
    */
   description_updated_at?: number | null;
 }
@@ -227,27 +228,18 @@ export function useSaveWorkflowPlan(workflowId: string) {
 
 /**
  * Set a step's time limit, or clear it for null, from the step's menu. Only that step changes,
- * in the plan as saved when the write is made, so steps saved elsewhere stay. A description goes
- * as in {@link useSaveWorkflowPlan}, but only while the stored description's source is still
- * `sourceAsSeen`, the one the page went by.
+ * in the plan as saved when the write is made, so steps saved elsewhere stay. The write leaves
+ * the description and its source alone, and the server keeps the description's time through it.
  */
 export function useSaveStepTimeLimit(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   const onError = useWorkflowReread(workflowId);
   return useMutation({
-    mutationFn: ({
-      stepId,
-      limit,
-      sourceAsSeen = null,
-      ...description
-    }: DescriptionSave & { stepId: string; limit: string | null; sourceAsSeen?: string | null }) =>
+    mutationFn: ({ stepId, limit }: { stepId: string; limit: string | null }) =>
       saveOverStoredSteps(workflowId, (stored) => {
         if (!stored.steps.some((step) => step.id === stepId))
           throw new Error("The step is no longer in the saved plan.");
-        // A source recorded elsewhere since, such as a proposal kept over there, stays.
-        const sourceMoved = (stored.description_source ?? null) !== sourceAsSeen;
         return {
-          ...(sourceMoved ? {} : description),
           steps: stored.steps.map((step) =>
             step.id === stepId ? { ...step, goal: withChosenTimeLimit(step.goal, limit) } : step,
           ),

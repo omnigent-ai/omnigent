@@ -319,6 +319,14 @@ describe("splitTimeLimit", () => {
     const spaces = " ".repeat(200_000);
     const example = `Copy this example:\n\n${spaces}x`;
     expect(splitTimeLimit(example)).toEqual([example, null]);
+    // With a limit to find, every line goes through the Time limit and Details patterns.
+    expect(splitTimeLimit(`**Time limit:** 1 hour\n\n${spaces}x`)).toEqual([
+      `${spaces}x`,
+      "1 hour",
+    ]);
+    expect(withStepTimeLimit(`Fix it.\n${spaces}\n**Details:** x`, "1 hour")).toBe(
+      `Fix it.\n${spaces}\n**Time limit:** 1 hour\n\n**Details:** x`,
+    );
     expect(stepTimeLimit(`**Time limit:** a${spaces}b`)).toBe(`a${spaces}b`);
     expect(timeLimitMinutes(`1h${spaces}30m`)).toBe(90);
   });

@@ -518,13 +518,15 @@ class WorkflowStore:
                 held = was_held
             # A time kept for a description an older server has since replaced would count
             # again if that description came back, so a description write drops it.
-            stale = was_held is None and current_plan.get("description_updated_at") is not None
+            orphaned_time = (
+                was_held is None and current_plan.get("description_updated_at") is not None
+            )
             # The plan keeps the description's source and time, so a new one rewrites it.
             rewrites_plan = (
                 steps is not None
                 or source != current.description_source
                 or held != was_held
-                or (describes and stale)
+                or (describes and orphaned_time)
             )
             try:
                 stored = self._stored_texts(

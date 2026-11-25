@@ -473,7 +473,8 @@ it ran.
   workflow returns it until the description is written without one or another
   planning chat is attached. The workflow's `description_updated_at` is when
   the description was last written; a write to the steps alone, such as a time
-  limit's, keeps it, and another write can move it to that write's time.
+  limit's, keeps it while the plan has room for it, and another write can move
+  it to that write's time.
 - `DELETE /v1/workflows/{id}`: deletes it, then who it was shared with.
 
 ### Sharing a workflow

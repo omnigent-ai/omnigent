@@ -287,24 +287,13 @@ describe("useSaveStepTimeLimit", () => {
     expect(patchCount()).toBe(0);
   });
 
-  it("leaves the description alone once its source moved since the page read it", async () => {
+  it("writes the steps alone, so a description decision made elsewhere stays", async () => {
     vi.mocked(authenticatedFetch).mockImplementation(async () =>
       Response.json({ ...saved, description_source: "kept-elsewhere" }),
     );
-    const client = new QueryClient();
-    const wrapper = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    );
-    const { result } = renderHook(() => useSaveStepTimeLimit("workflow"), { wrapper });
+    const save = renderSave();
     await act(async () => {
-      await result.current.mutateAsync({
-        stepId: "review",
-        limit: "1 hour",
-        sourceAsSeen: null,
-        description: "Review changes.",
-        expected_description: "Review changes.",
-        description_source: "older",
-      });
+      await save();
     });
     const [body] = vi
       .mocked(authenticatedFetch)

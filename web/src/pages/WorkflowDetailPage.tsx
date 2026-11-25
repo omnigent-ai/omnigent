@@ -219,34 +219,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     : workflow.shareable === false
       ? UNSHAREABLE_WORKFLOW_MESSAGE
       : undefined;
-  // A save records which proposal the description stands over, so the menus wait until the page
-  // knows: the planning session, its journal and where the description's source sits. A planning
-  // session that fails to load has no proposal to record.
-  const planningLoading =
-    !!workflow.planning_session_id &&
-    !planningSessionGone &&
-    !planningSessionError &&
-    (!planningSession || journal.isLoading || sourcePosition.isLoading);
-  // A time limit is a line in the step's description, saved with the workflow's steps.
-  const changeTimeLimit = ({ stepId, limit }: StepTimeLimitChange) =>
-    saveTimeLimit.mutate(
-      {
-        stepId,
-        limit,
-        sourceAsSeen: source ?? null,
-        // Record the current proposal as the description's source (none is offered while the
-        // menu shows), unless the source recorded is as new or can't be placed yet.
-        ...(proposal &&
-        (!source || sourceAt === null || (sourceAt !== undefined && proposal.position > sourceAt))
-          ? {
-              description: workflow.description,
-              expected_description: workflow.description,
-              description_source: proposal.id,
-            }
-          : {}),
-      },
-      { onError: (saveError) => showToast(`Couldn’t save the time limit. ${saveError.message}`) },
-    );
+  // A time limit is a line in the step's description, saved with the workflow's steps alone, so
+  // the description and the proposal it stands over stay as they are.
+  const changeTimeLimit = (change: StepTimeLimitChange) =>
+    saveTimeLimit.mutate(change, {
+      onError: (saveError) => showToast(`Couldn’t save the time limit. ${saveError.message}`),
+    });
   const clone = () =>
     cloneWorkflow.mutate(workflow.id, {
       onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
@@ -460,7 +438,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
               steps={proposedSteps ?? workflow.steps}
               title={workflow.name}
               onTimeLimitChange={!isViewer && !hasChanges ? changeTimeLimit : undefined}
-              timeLimitPaused={saveTimeLimit.isPending || savePlan.isPending || planningLoading}
+              timeLimitPaused={saveTimeLimit.isPending || savePlan.isPending}
             />
           ) : (
             <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">

@@ -570,10 +570,10 @@ describe("WorkflowDetailPage", () => {
     // A menu pick changes only the length.
     const fourHours = "The suite passes\n\n**Time limit:** 4 hours. Tell me if it runs longer.";
     await waitFor(() => expect(graphGoals()).toEqual([null, fourHours]));
-    expect(patches.at(-1)).toMatchObject({
+    // The steps alone, so the description and the proposal it stands over stay as they are.
+    expect(patches.at(-1)).toEqual({
       steps: [WORKFLOW.steps[0], { ...WORKFLOW.steps[1], goal: fourHours }],
-      description: WORKFLOW.description,
-      description_source: "proposal-5",
+      expected_steps: saved,
     });
     expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
     expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
@@ -586,95 +586,15 @@ describe("WorkflowDetailPage", () => {
     expect(runButton()).toBeEnabled();
   });
 
-  it("pauses the time limit menus while the planning chat's journal loads", async () => {
-    await workflowWithProposals(WORKFLOW.steps, [plan(5, WORKFLOW.steps)]);
+  it("lets the time limit menus work while the planning chat loads", async () => {
+    const { patches } = await workflowWithProposals(WORKFLOW.steps, []);
     mockJournal([], { isLoading: true });
-    const view = renderPage();
-    expect(
-      await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }),
-    ).toBeDisabled();
-
-    mockJournal([plan(5, WORKFLOW.steps)]);
-    view.rerender(<WorkflowDetailPage />);
-    expect(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeEnabled();
-  });
-
-  it("pauses the time limit menus until it knows which proposal the description stands over", async () => {
-    // The description stands over a proposal the loaded journal page doesn't hold.
-    const { server } = await workflowWithProposals(
-      WORKFLOW.steps,
-      [
-        plan(5, WORKFLOW.steps),
-        plan(15, WORKFLOW.steps, "Finds flaky tests and fixes the worst one."),
-      ],
-      { description_source: "f".repeat(32) },
-    );
-    const storeFetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
-    let place: () => void = () => {};
-    const placed = new Promise<void>((resolve) => {
-      place = resolve;
-    });
-    vi.mocked(authenticatedFetch).mockImplementation(async (path, options) => {
-      if (!String(path).includes("/journal?")) return storeFetch(path, options);
-      await placed;
-      const page = { object: "list", data: [{ position: 0 }], has_more: true };
-      return new Response(JSON.stringify(page));
-    });
     renderPage();
-    expect(
-      await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }),
-    ).toBeDisabled();
-
-    await act(async () => place());
-    // The newer proposal's description is offered, so the menus give way to Save plan.
-    expect(await screen.findByRole("button", { name: "Save plan" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeNull();
-    expect(server.patches).toEqual([]);
-  });
-
-  it("records no description source when it can't place the current one", async () => {
-    // The description stands over a proposal the loaded journal page doesn't hold, and the
-    // lookup of where it sits fails.
-    const newer = "Finds flaky tests and fixes the worst one.";
-    const entries = [plan(5, WORKFLOW.steps), plan(15, WORKFLOW.steps, newer)];
-    const { server } = await workflowWithProposals(WORKFLOW.steps, entries, {
-      description_source: "f".repeat(32),
-    });
-    const storeFetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
-    let lookupFails = true;
-    vi.mocked(authenticatedFetch).mockImplementation(async (path, options) => {
-      if (!String(path).includes("/journal?")) return storeFetch(path, options);
-      if (lookupFails) return new Response("{}", { status: 500 });
-      const page = { object: "list", data: [{ position: 0 }], has_more: true };
-      return new Response(JSON.stringify(page));
-    });
-    renderPage(new QueryClient({ defaultOptions: { queries: { retry: false } } }));
-
     const limit = await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" });
-    await waitFor(() => expect(limit).toBeEnabled());
+    expect(limit).toBeEnabled();
     fireEvent.click(limit);
-    await waitFor(() => expect(server.patches).toHaveLength(1));
-    expect(server.patches[0]).not.toHaveProperty("description_source");
-
-    // Once the lookup works, the newer description is still offered.
-    lookupFails = false;
-    cleanup();
-    renderPage();
-    expect(await screen.findByRole("button", { name: "Save plan" })).toBeInTheDocument();
-    expect(screen.getByText(newer)).toBeInTheDocument();
-  });
-
-  it("keeps the time limit menus usable when the planning session can't load", async () => {
-    await workflowWithProposals(WORKFLOW.steps, []);
-    vi.mocked(useSession).mockImplementation((id) => ({
-      session: null,
-      isLoading: false,
-      error: id ? new ApiError("Server error", 500, null) : null,
-    }));
-    renderPage();
-    expect(
-      await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }),
-    ).toBeEnabled();
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(Object.keys(patches[0]!).sort()).toEqual(["expected_steps", "steps"]);
   });
 
   it("gives a proposal's new step its limit, and leaves a saved step's limit to the menu", async () => {
