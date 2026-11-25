@@ -610,7 +610,7 @@ class PushTarget(_message.Message):
     def __init__(self, remote_name: _Optional[str] = ..., branch: _Optional[str] = ..., host: _Optional[str] = ..., owner: _Optional[str] = ..., repo: _Optional[str] = ..., tracking_sha: _Optional[str] = ...) -> None: ...
 
 class ResolveRepositoryContextResponse(_message.Message):
-    __slots__ = ("problem", "branch", "head_sha", "push", "push_unresolved", "upstream_ref", "remotes", "unsupported_remote_count", "truncated_remotes")
+    __slots__ = ("problem", "branch", "head_sha", "push", "push_unresolved", "upstream_ref", "remotes", "unsupported_remote_count", "truncated_remotes", "workspace_prefix")
     PROBLEM_FIELD_NUMBER: _ClassVar[int]
     BRANCH_FIELD_NUMBER: _ClassVar[int]
     HEAD_SHA_FIELD_NUMBER: _ClassVar[int]
@@ -620,6 +620,7 @@ class ResolveRepositoryContextResponse(_message.Message):
     REMOTES_FIELD_NUMBER: _ClassVar[int]
     UNSUPPORTED_REMOTE_COUNT_FIELD_NUMBER: _ClassVar[int]
     TRUNCATED_REMOTES_FIELD_NUMBER: _ClassVar[int]
+    WORKSPACE_PREFIX_FIELD_NUMBER: _ClassVar[int]
     problem: RepositoryContextProblem
     branch: str
     head_sha: str
@@ -629,7 +630,8 @@ class ResolveRepositoryContextResponse(_message.Message):
     remotes: _containers.RepeatedCompositeFieldContainer[RepositoryRemote]
     unsupported_remote_count: int
     truncated_remotes: bool
-    def __init__(self, problem: _Optional[_Union[RepositoryContextProblem, str]] = ..., branch: _Optional[str] = ..., head_sha: _Optional[str] = ..., push: _Optional[_Union[PushTarget, _Mapping]] = ..., push_unresolved: _Optional[_Union[PushUnresolved, str]] = ..., upstream_ref: _Optional[str] = ..., remotes: _Optional[_Iterable[_Union[RepositoryRemote, _Mapping]]] = ..., unsupported_remote_count: _Optional[int] = ..., truncated_remotes: _Optional[bool] = ...) -> None: ...
+    workspace_prefix: str
+    def __init__(self, problem: _Optional[_Union[RepositoryContextProblem, str]] = ..., branch: _Optional[str] = ..., head_sha: _Optional[str] = ..., push: _Optional[_Union[PushTarget, _Mapping]] = ..., push_unresolved: _Optional[_Union[PushUnresolved, str]] = ..., upstream_ref: _Optional[str] = ..., remotes: _Optional[_Iterable[_Union[RepositoryRemote, _Mapping]]] = ..., unsupported_remote_count: _Optional[int] = ..., truncated_remotes: _Optional[bool] = ..., workspace_prefix: _Optional[str] = ...) -> None: ...
 
 class GetPullRequestRequest(_message.Message):
     __slots__ = ("pr_url",)

@@ -1177,6 +1177,29 @@ def _pr_token(root: str, reference: PullRequestRef) -> str | None:
     return None
 
 
+def _signed_out_account(login: str) -> str:
+    return (
+        f"The selected GitHub account {login} isn't signed in on the host. "
+        "Sign in with gh or choose another account."
+    )
+
+
+def _write_token(root: str, reference: PullRequestRef, *, timed_out: str) -> str | None:
+    """The token a write runs with; refuses before the send rather than run as another account.
+
+    Call it inside the write's deadline scope. Without the token of the login chosen for the
+    repository, ``gh`` would run as whichever account is active on the host.
+    """
+    # Read the login before the lookup, so clearing it mid-write can't let this one through.
+    login = None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        raise ValueError(timed_out)
+    if login and token is None:
+        raise ValueError(_signed_out_account(login))
+    return token
+
+
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
     if reference.host != "github.com" and not _gh_signed_in_to_host(root, reference.host):
         return None
@@ -2052,10 +2075,7 @@ def _apply_label_edit(
     A final read supplies the labels when every removed label was already absent.
     """
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        # The selected account's token is unknown, so the edit must not run as another.
-        raise ValueError(_LABEL_EDIT_TIMED_OUT)
+    token = _write_token(root, reference, timed_out=_LABEL_EDIT_TIMED_OUT)
     endpoint = f"repos/{reference.repository}/issues/{reference.number}/labels"
     labels: list[Any] | None = None
     for name in remove:
@@ -2188,10 +2208,7 @@ def _run_pr_merge(
                 + (f", {sandbox_login}." if sandbox_login else ".")
             )
         if login and token is None:
-            raise ValueError(
-                f"The selected GitHub account {login} isn't signed in on the host. "
-                "Sign in with gh or choose another account."
-            )
+            raise ValueError(_signed_out_account(login))
         rc, _, err = _gh(
             ["pr", "merge", str(reference.number), "-R", _repo_argument(reference), *flags],
             cwd=root,
@@ -2427,10 +2444,7 @@ def _apply_reviewer_edit(
 ) -> dict[str, Any]:
     """Make the edit's requests, then read the PR's reviewers with their review states."""
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        # The selected account's token is unknown, so the edit must not run as another.
-        raise ValueError(_REVIEWER_EDIT_TIMED_OUT)
+    token = _write_token(root, reference, timed_out=_REVIEWER_EDIT_TIMED_OUT)
     endpoint = f"repos/{reference.repository}/pulls/{reference.number}/requested_reviewers"
     if remove:
         _reviewers_api(root, host, token, ["-X", "DELETE", endpoint, *_reviewer_fields(remove)])
@@ -2456,6 +2470,7 @@ _DETAILS_EDIT_TIMED_OUT = (
 # so a video has time to reach GitHub.
 _ATTACHMENT_REQUEST_SECONDS = 110.0
 _ATTACHMENT_TIMED_OUT = "GitHub took too long to upload the file. Try again."
+COMMENT_AUTHENTICATION_TIMED_OUT = "GitHub authentication timed out. Your comment was not sent."
 
 
 def _pr_json_write(
@@ -2507,9 +2522,7 @@ def _post_comment(
     """Publish once within the caller's deadline; preserve uncertainty after dispatch."""
     uncertain = "Could not confirm comment posting. Check GitHub before retrying."
     host = _host_args(root, reference)
-    token = _pr_token(root, reference)
-    if _gh_timed_out.get():
-        raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+    token = _write_token(root, reference, timed_out=COMMENT_AUTHENTICATION_TIMED_OUT)
     rc, out, err = _pr_json_write(
         root,
         host=host,
@@ -2545,10 +2558,7 @@ def _edit_details(
     """
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         host = _host_args(root, reference)
-        token = _pr_token(root, reference)
-        if _gh_timed_out.get():
-            # The selected account's token is unknown, so the edit must not run as another.
-            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+        token = _write_token(root, reference, timed_out=_DETAILS_EDIT_TIMED_OUT)
         fields = {
             key: value for key, value in (("title", title), ("body", body)) if value is not None
         }
@@ -2605,10 +2615,7 @@ def _upload_attachment(
     """
     with _gh_deadline_scope(time.monotonic() + _ATTACHMENT_REQUEST_SECONDS):
         host = _host_args(root, reference)
-        token = _pr_token(root, reference)
-        if _gh_timed_out.get():
-            # The selected account's token is unknown, so the upload must not run as another.
-            raise ValueError(_ATTACHMENT_TIMED_OUT)
+        token = _write_token(root, reference, timed_out=_ATTACHMENT_TIMED_OUT)
         rc, out, _ = _gh(
             ["api", *host, f"repos/{reference.repository}", "--jq", ".id"],
             cwd=root,

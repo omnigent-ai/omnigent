@@ -1,12 +1,17 @@
-// Where a pull request's file lives on its code host, so a diff review's header
-// menu and ⌘K can open it there. Plain facts in, no React. Working-copy files
-// get no link: the page can't map their workspace paths to repository paths.
+// Where a file lives on its code host, so a diff review's header menu, ⌘K and
+// the file viewer can open it there. Plain facts in, no React. A working-copy
+// file links through its workspace's repository context, where its branch is pushed.
 
 import type { SelectedLineRange } from "@pierre/diffs";
 
 import type { DiffReviewChange } from "@/components/diff-review/diffReviewModel";
-import { parseCodeHostPullRequestUrl } from "@/lib/codeHosts";
+import { codeHostProvider, parseCodeHostPullRequestUrl } from "@/lib/codeHosts";
 import { gitProviderCopy } from "@/lib/gitProviders";
+import {
+  PushUnresolved,
+  RepositoryContextProblem,
+  type ResolveRepositoryContextResponse,
+} from "@/lib/workspaceSidebarApi";
 
 /**
  * The "Open in GitHub" action for one file: where it opens, or why it can't, such as a
@@ -92,16 +97,27 @@ interface BlobLocation {
   host: string;
   owner: string;
   repo: string;
-  sha: string;
+  /** A commit, or a branch name such as `feature/x`. */
+  revision: string;
   path: string;
-  /** The lines to highlight, already on the side `sha` shows. */
+  /** The lines to highlight, already on the side `revision` shows. */
   lines?: { start: number; end: number } | null;
 }
 
-/** `https://<host>/<owner>/<repo>/blob/<sha>/<path>#L<a>-L<b>`, as GitHub links a file. */
-export function codeHostBlobUrl({ host, owner, repo, sha, path, lines }: BlobLocation): string {
-  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  const base = `https://${host}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/blob/${sha}/${encodedPath}`;
+function encodeSegments(value: string): string {
+  return value.split("/").map(encodeURIComponent).join("/");
+}
+
+/** `https://<host>/<owner>/<repo>/blob/<revision>/<path>#L<a>-L<b>`, as GitHub links a file. */
+export function codeHostBlobUrl({
+  host,
+  owner,
+  repo,
+  revision,
+  path,
+  lines,
+}: BlobLocation): string {
+  const base = `https://${host}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/blob/${encodeSegments(revision)}/${encodeSegments(path)}`;
   if (!lines) return base;
   const start = Math.min(lines.start, lines.end);
   const end = Math.max(lines.start, lines.end);
@@ -174,7 +190,7 @@ export function pullRequestFileLink(facts: PullRequestFileLinkFacts): CodeHostFi
       host: pullRequest.host,
       owner,
       repo,
-      sha: facts.headSha,
+      revision: facts.headSha,
       path: facts.path,
       lines: newSideLines(facts.selection),
     }),
@@ -241,9 +257,88 @@ export function stackComparisonFileLink(
       host: pullRequest.host,
       owner,
       repo,
-      sha: side === "deletions" ? facts.parentHead : facts.childHead,
+      revision: side === "deletions" ? facts.parentHead : facts.childHead,
       path: side === "deletions" ? (facts.previousPath ?? facts.path) : facts.path,
       lines,
     }),
   };
+}
+
+/** What `workspaceFileLink` reads from the host's repository context for the workspace. */
+export type WorkspaceRepositoryContext = Pick<
+  ResolveRepositoryContextResponse,
+  "problem" | "branch" | "headSha" | "push" | "pushUnresolved" | "remotes" | "workspacePrefix"
+>;
+
+export interface WorkspaceFileLinkFacts {
+  context: WorkspaceRepositoryContext | null | undefined;
+  /** The file's path in the workspace, as the viewer names it. */
+  path: string;
+  lines?: { start: number; end: number } | null;
+  /** Hosts known to serve GitHub Enterprise. */
+  githubHosts?: Iterable<string>;
+}
+
+const PUSH_BRANCH_FIRST = "Push this branch to open the file in GitHub.";
+
+/** `path` below the repository's root, or null for a path outside the workspace. */
+function repositoryPathOf(workspacePrefix: string, path: string): string | null {
+  if (path.startsWith("/") || path.startsWith("~") || /^[A-Za-z]:[\\/]/.test(path)) return null;
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    return null;
+  }
+  return `${workspacePrefix}${path}`;
+}
+
+/**
+ * "Open in GitHub" for a workspace file, in the repository its branch pushes to: at HEAD
+ * when the push remote has it, so line anchors match, otherwise at the pushed branch without
+ * them. Null
+ * when the workspace isn't a GitHub repository, the path is outside it, or the host is too
+ * old to say where the workspace sits in its repository.
+ */
+export function workspaceFileLink(facts: WorkspaceFileLinkFacts): CodeHostFileLink | null {
+  const { context } = facts;
+  if (!context || context.problem !== RepositoryContextProblem.UNSPECIFIED) return null;
+  if (context.workspacePrefix === undefined) return null;
+  const path = repositoryPathOf(context.workspacePrefix, facts.path);
+  if (path === null) return null;
+  const onGitHub = (host: string) => codeHostProvider(host, facts.githubHosts) === "github";
+  const label = `Open in ${providerLabel("github")}`;
+  const { push } = context;
+  if (push) {
+    if (!onGitHub(push.host)) return null;
+    // No tracking commit: the push remote may not have the branch yet.
+    if (!push.trackingSha) return { label, url: null, unavailableReason: PUSH_BRANCH_FIRST };
+    const atHead = push.trackingSha === context.headSha;
+    return {
+      label,
+      url: codeHostBlobUrl({
+        host: push.host,
+        owner: push.owner,
+        repo: push.repo,
+        revision: atHead ? context.headSha : push.branch,
+        path,
+        // Line numbers only match the remote's copy at HEAD.
+        lines: atHead ? facts.lines : null,
+      }),
+    };
+  }
+  if (!context.remotes.some((remote) => onGitHub(remote.host))) return null;
+  if (!context.branch) {
+    return {
+      label,
+      url: null,
+      unavailableReason: "Check out a branch to open the file in GitHub.",
+    };
+  }
+  if (context.pushUnresolved !== PushUnresolved.UNSPECIFIED) {
+    return {
+      label,
+      url: null,
+      unavailableReason: "This branch doesn't push to one GitHub repository.",
+    };
+  }
+  return { label, url: null, unavailableReason: PUSH_BRANCH_FIRST };
 }

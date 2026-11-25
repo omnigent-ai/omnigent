@@ -47,6 +47,7 @@ import {
   CodeIcon,
   Columns2Icon,
   DownloadIcon,
+  ExternalLinkIcon,
   EyeIcon,
   EyeOffIcon,
   FileDiffIcon,
@@ -96,6 +97,11 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useHostSshTarget } from "@/hooks/useHostSshTarget";
+import { useRepositoryContext } from "@/hooks/useRepositoryContext";
+import { useSessionPullRequests } from "@/hooks/useSessionPullRequests";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { workspaceFileLink } from "./fileCommands/codeHostFileLink";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { workspaceSocketBridge } from "@/lib/nativeBridge";
@@ -1007,6 +1013,20 @@ function FileViewerBody({
       : (changedFiles.data?.data.some((f) => f.path === path) ?? false));
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
+  const repositoryContext = useRepositoryContext(conversationId, open && !isDeletedFile);
+  const sessionPullRequests = useSessionPullRequests(conversationId);
+  const codeHostLink = useMemo(
+    () =>
+      workspaceFileLink({
+        context: repositoryContext.data,
+        path,
+        // A session PR on a host is evidence that it serves GitHub Enterprise.
+        githubHosts: sessionPullRequests.data?.prs
+          .filter((pr) => !pr.provider || pr.provider === "github")
+          .map((pr) => pr.host),
+      }),
+    [repositoryContext.data, path, sessionPullRequests.data],
+  );
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -1380,6 +1400,10 @@ function FileViewerBody({
     noActiveCheck?: boolean;
     /** Chord shown beside the item; omit when the viewer surface doesn't bind it. */
     shortcut?: readonly string[];
+    /** Shown, but not selectable, with this reason as its tooltip. */
+    disabledReason?: string;
+    /** Makes the row a link that opens `href` itself, in place of `onSelect`. */
+    link?: { href: string; follow: (event: MouseEvent) => void };
   }
   interface ToolbarAction {
     key: string;
@@ -1401,6 +1425,8 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
+    /** Called when `menu` opens, inline or in the collapsed "⋯" overflow. */
+    onMenuOpen?: () => void;
     /** Keep the default action directly available beside its app picker. */
     splitMenu?: boolean;
   }
@@ -1579,8 +1605,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
-  // whitespace toggle to save toolbar width; toggles keep the menu open.
+  // One "⋯" menu holds Find, Download, Open in GitHub, Wrap lines (Monaco views) and
+  // the diff-only whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1609,6 +1635,24 @@ function FileViewerBody({
       icon: <DownloadIcon className="size-4" />,
       active: false,
       onSelect: downloadFile,
+    });
+  }
+  if (codeHostLink && !isDeletedFile) {
+    const { url, unavailableReason } = codeHostLink;
+    settingsMenu.push({
+      key: "open-on-code-host",
+      label: codeHostLink.label,
+      icon: <ExternalLinkIcon className="size-4" />,
+      active: false,
+      disabledReason: unavailableReason,
+      link: url
+        ? {
+            href: url,
+            follow: (event) => followLinkWithPopupFallback(event, url, conversationId),
+          }
+        : undefined,
+      // The link row opens it; a disabled row ignores selection.
+      onSelect: () => {},
     });
   }
   // One wrap preference covers the source editor and the diff. Other views
@@ -1642,6 +1686,8 @@ function FileViewerBody({
     tooltip: "View settings",
     icon: <MoreHorizontalIcon className="size-4" />,
     menu: settingsMenu,
+    // A push, commit or checkout since the last read changes where Open in GitHub goes.
+    onMenuOpen: repositoryContext.refresh,
   });
   toolbarActions.push({
     key: "copy-link",
@@ -1700,6 +1746,20 @@ function FileViewerBody({
     ].join("|"),
   );
 
+  // A link row opens with the popup fallback; a disabled row keeps its reason readable.
+  const renderLinkOrDisabledMenuItem = (item: ToolbarOption) => (
+    <SessionActionMenuItem
+      key={item.key}
+      className="whitespace-nowrap"
+      disabledReason={item.disabledReason}
+      link={item.link}
+      onSelect={item.onSelect}
+    >
+      {item.icon}
+      {item.label}
+    </SessionActionMenuItem>
+  );
+
   const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
     const button = (
       <Button
@@ -1728,7 +1788,12 @@ function FileViewerBody({
         // A settings menu: one trigger opening a list of independent items
         // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
         // as the user flips them; actions close it on select.
-        <DropdownMenu key={action.key}>
+        <DropdownMenu
+          key={action.key}
+          onOpenChange={(isOpen) => {
+            if (isOpen) action.onMenuOpen?.();
+          }}
+        >
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -1748,27 +1813,31 @@ function FileViewerBody({
             </Tooltip>
           </TooltipProvider>
           <DropdownMenuContent align="end" className="w-auto min-w-40">
-            {action.menu.map((item) => (
-              <DropdownMenuItem
-                key={item.key}
-                className="whitespace-nowrap"
-                onSelect={
-                  interactive
-                    ? (e) => {
-                        if (item.keepOpen) e.preventDefault();
-                        item.onSelect();
-                      }
-                    : undefined
-                }
-              >
-                {item.icon}
-                {item.label}
-                {item.shortcut && (
-                  <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
-                )}
-                {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
-              </DropdownMenuItem>
-            ))}
+            {action.menu.map((item) =>
+              item.link || item.disabledReason ? (
+                renderLinkOrDisabledMenuItem(item)
+              ) : (
+                <DropdownMenuItem
+                  key={item.key}
+                  className="whitespace-nowrap"
+                  onSelect={
+                    interactive
+                      ? (e) => {
+                          if (item.keepOpen) e.preventDefault();
+                          item.onSelect();
+                        }
+                      : undefined
+                  }
+                >
+                  {item.icon}
+                  {item.label}
+                  {item.shortcut && (
+                    <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
+                  )}
+                  {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
+                </DropdownMenuItem>
+              ),
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       ) : action.options ? (
@@ -1939,7 +2008,12 @@ function FileViewerBody({
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
               <>
-                <DropdownMenu>
+                <DropdownMenu
+                  onOpenChange={(isOpen) => {
+                    // The overflow shows every menu's items, so each one opening applies.
+                    if (isOpen) for (const action of toolbarActions) action.onMenuOpen?.();
+                  }}
+                >
                   <DropdownMenuTrigger asChild>
                     <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
                       <MoreHorizontalIcon className="size-4" />
@@ -1982,22 +2056,26 @@ function FileViewerBody({
                           // The settings menu's items are already independent
                           // toggles/actions, so flatten them straight into this "⋯"
                           // overflow rather than nesting a "⋯"-in-"⋯" submenu.
-                          action.menu.map((option) => (
-                            <DropdownMenuItem
-                              key={option.key}
-                              className="whitespace-nowrap"
-                              onSelect={(e) => {
-                                if (option.keepOpen) e.preventDefault();
-                                option.onSelect();
-                              }}
-                            >
-                              {option.icon}
-                              {option.label}
-                              {option.active && !option.noActiveCheck && (
-                                <CheckIcon className="ml-auto size-4" />
-                              )}
-                            </DropdownMenuItem>
-                          ))
+                          action.menu.map((option) =>
+                            option.link || option.disabledReason ? (
+                              renderLinkOrDisabledMenuItem(option)
+                            ) : (
+                              <DropdownMenuItem
+                                key={option.key}
+                                className="whitespace-nowrap"
+                                onSelect={(e) => {
+                                  if (option.keepOpen) e.preventDefault();
+                                  option.onSelect();
+                                }}
+                              >
+                                {option.icon}
+                                {option.label}
+                                {option.active && !option.noActiveCheck && (
+                                  <CheckIcon className="ml-auto size-4" />
+                                )}
+                              </DropdownMenuItem>
+                            ),
+                          )
                         ) : action.disabled ? (
                           <TooltipProvider key={action.key}>
                             <Tooltip>
