@@ -14,6 +14,7 @@ import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { resetAppPanes, setAppPaneTabActions, setAppPaneTitle } from "./appPanes";
 import { ChatPaneBody } from "./ChatPaneBody";
+import { useSplitBesideChat, useSplitOnScreen } from "./chatPaneToolbarHost";
 import { readPaneSplit, resetPaneSplitsCache, updatePaneSplit } from "./paneSplitStore";
 import { SidebarTerminalPanes } from "./SidebarTerminalPanes";
 import { SplitPanesMainView, type SplitPanesMainViewProps } from "./SplitPanesMainView";
@@ -143,6 +144,37 @@ describe("SplitPanesMainView", () => {
     render(<View conversationId={conversationId} {...props} />);
     expect(screen.getByTestId("main-terminal-view").dataset.splittable).toBe("false");
     expect(screen.queryByTestId("split-panes-main-view")).toBeNull();
+  });
+
+  it("reports its split on screen only while it shows, though a hidden one keeps it beside the chat", async () => {
+    const conversationId = nextConversation();
+    updatePaneSplit(conversationId, () => SIDE_BY_SIDE);
+    function SplitState() {
+      const beside = useSplitBesideChat(conversationId);
+      const onScreen = useSplitOnScreen(conversationId);
+      return <output data-testid="split-state">{`${beside}:${onScreen}`}</output>;
+    }
+    const state = () => screen.getByTestId("split-state").textContent;
+    const { rerender, unmount } = render(
+      <>
+        <View conversationId={conversationId} chatShown />
+        <SplitState />
+      </>,
+    );
+    await screen.findByTestId(`terminal-${AGENT_ID}`);
+    expect(state()).toBe("true:true");
+
+    // Chat hides the view, as when the agent's terminal goes: the split stays saved beside it.
+    rerender(
+      <>
+        <View conversationId={conversationId} visible={false} chatShown />
+        <SplitState />
+      </>,
+    );
+    expect(state()).toBe("true:false");
+    unmount();
+    render(<SplitState />);
+    expect(state()).toBe("false:false");
   });
 
   it("keeps the Chat/Terminal switch in the header until a split puts the chat in a pane", async () => {

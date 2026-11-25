@@ -192,7 +192,7 @@ import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { AppShell } from "./AppShell";
-import { setSplitBesideChat } from "./chatPaneToolbarHost";
+import { setSplitOnScreen } from "./chatPaneToolbarHost";
 import { FileViewerContext, useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
 import * as workspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
@@ -509,31 +509,27 @@ describe("workspace_sidebar_v2", () => {
     expect(document.querySelector("[data-main-view]")).toHaveAttribute("data-main-view", "chat");
   });
 
-  it("leaves the column uncarded while a split beside the chat floats as its own cards", () => {
-    setViewport(DESKTOP);
-    renderShell({
-      ...withFlag(true),
-      features: { ...withFlag(true).features, floating_panes: true },
-    });
-    const column = () => document.querySelector("[data-main-view]");
-    expect(column()).toHaveAttribute("data-main-view", "chat");
+  // Only floating panes draw a split as cards of its own; without them the chat keeps its card.
+  it.each([
+    ["floats as its own cards", true, "terminal"],
+    ["shows without floating panes", false, "chat"],
+  ] as const)(
+    "gives the column the view it has while a split on screen beside the chat %s",
+    (_case, floating, splitView) => {
+      setViewport(DESKTOP);
+      renderShell({
+        ...withFlag(true),
+        features: { ...withFlag(true).features, floating_panes: floating },
+      });
+      const column = () => document.querySelector("[data-main-view]");
+      expect(column()).toHaveAttribute("data-main-view", "chat");
 
-    act(() => setSplitBesideChat("conv_ws", true));
-    expect(column()).toHaveAttribute("data-main-view", "terminal");
-    act(() => setSplitBesideChat("conv_ws", false));
-    expect(column()).toHaveAttribute("data-main-view", "chat");
-  });
-
-  it("keeps the column the chat's card when a split shows beside the chat without floating panes", () => {
-    setViewport(DESKTOP);
-    renderShell(withFlag(true));
-    const column = () => document.querySelector("[data-main-view]");
-    expect(column()).toHaveAttribute("data-main-view", "chat");
-
-    act(() => setSplitBesideChat("conv_ws", true));
-    expect(column()).toHaveAttribute("data-main-view", "chat");
-    act(() => setSplitBesideChat("conv_ws", false));
-  });
+      act(() => setSplitOnScreen("conv_ws", true));
+      expect(column()).toHaveAttribute("data-main-view", splitView);
+      act(() => setSplitOnScreen("conv_ws", false));
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+    },
+  );
 
   it("reserves the header's room for the rail only while the rail sits inline", async () => {
     setViewport(1000);

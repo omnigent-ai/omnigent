@@ -106,6 +106,22 @@ export function setSplitBesideChat(conversationId: string, shown: boolean): void
 export const useSplitBesideChat = (conversationId: string | null | undefined) =>
   useSyncExternalStore(subscribe, () => !!conversationId && besideSplit.has(conversationId));
 
+const splitOnScreen = new Set<string>();
+
+/**
+ * Whether `conversationId`'s split beside the chat is on screen now, its panes view showing. A
+ * saved split stays beside the chat while that view hides, as when the agent's terminal goes.
+ */
+export function setSplitOnScreen(conversationId: string, shown: boolean): void {
+  if (splitOnScreen.has(conversationId) === shown) return;
+  if (shown) splitOnScreen.add(conversationId);
+  else splitOnScreen.delete(conversationId);
+  for (const listener of listeners) listener();
+}
+
+export const useSplitOnScreen = (conversationId: string | null | undefined) =>
+  useSyncExternalStore(subscribe, () => !!conversationId && splitOnScreen.has(conversationId));
+
 const otherPaneMaximized = new Set<string>();
 
 /** Whether `conversationId` shows a pane other than the chat maximized, which hides the chat. */

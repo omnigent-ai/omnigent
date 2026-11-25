@@ -29,7 +29,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
-import { useSplitBesideChat } from "./chatPaneToolbarHost";
+import { useSplitOnScreen } from "./chatPaneToolbarHost";
 import { ChatPaneStrip } from "./ChatPaneStrip";
 import { usePanesView } from "./panesViewGate";
 import { useFloatingPanes, useFloatingPanesShown } from "./useFloatingPanes";
@@ -433,7 +433,7 @@ function AppShellImpl() {
   const floatingPanes = useFloatingPanes();
   const floatingPanesShown = useFloatingPanesShown();
   const panesView = usePanesView();
-  const splitBesideChat = useSplitBesideChat(conversationId);
+  const splitOnScreen = useSplitOnScreen(conversationId);
   const tabsModeRef = useRef(false);
   tabsModeRef.current = tabsSidebar;
   const tabsSessionRef = useRef<string | null>(null);
@@ -3175,9 +3175,9 @@ function AppShellImpl() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
-  // With floating panes a split draws cards of its own, so the session's column is no card then;
-  // marking it "terminal" takes the chat card's styling off, as the Terminal view's does.
-  const panesDrawCards = floatingPanesShown && panesView && splitBesideChat;
+  // With floating panes a split on screen draws cards of its own, so the session's column is no
+  // card then; marking it "terminal" takes the chat card's styling off, as the Terminal view's does.
+  const panesDrawCards = floatingPanesShown && panesView && splitOnScreen;
   let mainColumnView: "chat" | "terminal" | undefined;
   if (conversationId) mainColumnView = panesDrawCards ? "terminal" : "chat";
   // A terminal-first chat's card has a row of its own, which takes the Chat/Terminal switch
