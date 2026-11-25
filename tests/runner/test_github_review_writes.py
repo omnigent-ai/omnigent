@@ -26,6 +26,8 @@ from omnigent.runner.pull_request_errors import (
 from omnigent.runner.session_prs import PullRequestRef
 
 TOKEN = "ghp_example_token_value"
+# The token lookup FakeGitHub replaces, for tests of how an action picks its account.
+_REAL_PR_TOKEN = github._pr_token
 HEAD = "66331978a046d81e2f1a6772e6354f9ae43b734b"
 MOVED = "1" * 40
 BASE = "2" * 40
@@ -982,6 +984,55 @@ def test_a_login_cleared_during_the_token_lookup_still_refuses_the_mutation(
     with pytest.raises(ValueError, match="octocat isn't signed in on the host"):
         _resolve()
     assert fake.mutations("resolveReviewThread") == []
+
+
+def _lookups_answer(monkeypatch: pytest.MonkeyPatch, *tokens: str | None) -> list[str]:
+    """octocat is chosen, and each ``gh auth token`` lookup answers the next of ``tokens``."""
+    lookups: list[str] = []
+    monkeypatch.setattr(github, "_pr_token", _REAL_PR_TOKEN)
+    monkeypatch.setattr(github, "_in_sandbox", lambda: False)
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repository: "octocat")
+
+    def lookup(_root: str, login: str, _host: str = "github.com") -> str | None:
+        lookups.append(login)
+        return tokens[min(len(lookups), len(tokens)) - 1]
+
+    monkeypatch.setattr(github, "_gh_auth_token", lookup)
+    return lookups
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_comment_change_whose_login_signs_in_midway_reads_nothing_as_another_account(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    """The authorship check must not run as the active account while the write runs as octocat."""
+    lookups = _lookups_answer(monkeypatch, None, TOKEN)
+    with pytest.raises(ValueError, match="octocat isn't signed in on the host"):
+        _change_comment(action)
+    assert lookups == ["octocat"]
+    assert fake.gh_calls == [] and fake.json_calls == []
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_comment_changes_checks_and_write_run_with_the_one_token_looked_up(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    """A later lookup answering another account changes nothing: there's only the first."""
+    lookups = _lookups_answer(monkeypatch, TOKEN, "ghp_other_account")
+    _change_comment(action)
+    assert lookups == ["octocat"]
+    assert fake.json_calls and {token for _argv, token in fake.gh_calls} == {TOKEN}
+
+
+def test_a_pending_review_read_for_a_signed_out_chosen_login_is_refused(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drafts are the account's own; the active account's must not stand in for them."""
+    fake.pending = _own_pending(_DRAFT)
+    _lookups_answer(monkeypatch, None)
+    with pytest.raises(ValueError, match="octocat isn't signed in on the host"):
+        pr_actions.get_pending_review("/workspace", session_id=SESSION, pr_url=PR_URL)
+    assert fake.json_calls == []
 
 
 def test_a_mutation_for_a_signed_out_chosen_login_is_never_sent(

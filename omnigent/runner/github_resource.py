@@ -102,6 +102,10 @@ _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
 # The host the current panel step's ``gh`` calls are for, set by the provider facet.
 _gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
+# The token one pull request action resolved up front, by the PR's URL (see _one_pr_account).
+_bound_pr_token: ContextVar[tuple[str, str | None] | None] = ContextVar(
+    "bound_pr_token", default=None
+)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
 # reviews, labels, and the merge fields feed the Summary and Comments tabs.
@@ -1169,6 +1173,9 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        return bound[1]
     if _in_sandbox():
         return None
     login = _config.github_account_preference(_repo_argument(reference))
@@ -1198,6 +1205,26 @@ def _write_token(root: str, reference: PullRequestRef, *, timed_out: str) -> str
     if login and token is None:
         raise ValueError(_signed_out_account(login))
     return token
+
+
+@contextmanager
+def _one_pr_account(root: str, reference: PullRequestRef, *, timed_out: str) -> Iterator[None]:
+    """Run every read and write in the block as one account: the one chosen at its start.
+
+    The token is looked up once, and a chosen login without one refuses before anything is
+    read, so a check can't run as one account and the write it guards as another.
+    """
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        yield
+        return
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        token = _write_token(root, reference, timed_out=timed_out)
+    binding = _bound_pr_token.set((reference.url, token))
+    try:
+        yield
+    finally:
+        _bound_pr_token.reset(binding)
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:

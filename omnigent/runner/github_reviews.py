@@ -7,10 +7,12 @@ outcome (see :mod:`omnigent.runner.github_failures`), never a refusal.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import time
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 from omnigent.runner import github_failures
@@ -39,6 +41,20 @@ from omnigent.runner.pull_request_errors import (
 )
 from omnigent.runner.session_prs import PullRequestRef
 
+_Action = TypeVar("_Action", bound=Callable[..., dict[str, Any]])
+
+
+def _as_one_account(action: _Action) -> _Action:
+    """Run the action's reads and its write as the one account chosen when it starts."""
+
+    @functools.wraps(action)
+    def run(root: str, reference: PullRequestRef, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        with github._one_pr_account(root, reference, timed_out=AUTHENTICATION_TIMED_OUT):
+            return action(root, reference, *args, **kwargs)
+
+    return cast("_Action", run)
+
+
 _REVIEW_MUTATION = """mutation($input: AddPullRequestReviewInput!) {
   addPullRequestReview(input: $input) { pullRequestReview { id state } }
 }"""
@@ -46,6 +62,7 @@ _REVIEW_MUTATION = """mutation($input: AddPullRequestReviewInput!) {
 _SUBMITTED_STATES = {"COMMENT": "COMMENTED", **VERDICT_STATES}
 
 
+@_as_one_account
 def submit_review(
     root: str, reference: PullRequestRef, *, event: str, body: str, commit_oid: str
 ) -> dict[str, Any]:
@@ -89,6 +106,7 @@ def _confirm_review(payload: dict[str, Any], review_id: str) -> None:
         raise github_failures.unknown_outcome()
 
 
+@_as_one_account
 def get_pending_review(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """The viewer's pending review and its drafts, in the page's shape; see the module."""
     return pending_reviews.get_pending_review(root, reference)
@@ -101,6 +119,7 @@ _START_MUTATION = """mutation($input: AddPullRequestReviewInput!) {
 }"""
 
 
+@_as_one_account
 def start_pending_review(
     root: str, reference: PullRequestRef, *, commit_oid: str
 ) -> dict[str, Any]:
@@ -173,6 +192,7 @@ def _same_pending_review(
     return review
 
 
+@_as_one_account
 def add_pending_review_comment(
     root: str,
     reference: PullRequestRef,
@@ -227,6 +247,7 @@ _ADD_REPLY_MUTATION = (
 )
 
 
+@_as_one_account
 def add_pending_review_reply(
     root: str,
     reference: PullRequestRef,
@@ -314,6 +335,7 @@ _UPDATE_DRAFT_MUTATION = """mutation($input: UpdatePullRequestReviewCommentInput
 }"""
 
 
+@_as_one_account
 def update_pending_review_comment(
     root: str,
     reference: PullRequestRef,
@@ -354,6 +376,7 @@ _DELETE_DRAFT_MUTATION = """mutation($input: DeletePullRequestReviewCommentInput
 }"""
 
 
+@_as_one_account
 def delete_pending_review_comment(
     root: str, reference: PullRequestRef, *, comment_node_id: str, pending_review_id: str
 ) -> dict[str, Any]:
@@ -382,6 +405,7 @@ _SUBMIT_PENDING_MUTATION = """mutation($input: SubmitPullRequestReviewInput!) {
 }"""
 
 
+@_as_one_account
 def submit_pending_review(
     root: str,
     reference: PullRequestRef,
@@ -427,6 +451,7 @@ _DISCARD_MUTATION = """mutation($input: DeletePullRequestReviewInput!) {
 }"""
 
 
+@_as_one_account
 def discard_pending_review(
     root: str, reference: PullRequestRef, *, pending_review_id: str
 ) -> dict[str, Any]:
@@ -486,6 +511,7 @@ def _require_thread_on_pull_request(root: str, reference: PullRequestRef, thread
         raise PullRequestError(_NOT_ON_PULL_REQUEST)
 
 
+@_as_one_account
 def set_thread_resolved(
     root: str, reference: PullRequestRef, *, thread_id: str, resolved: bool
 ) -> dict[str, Any]:
@@ -621,6 +647,7 @@ def _rest_write(
     return output
 
 
+@_as_one_account
 def edit_comment(
     root: str,
     reference: PullRequestRef,
@@ -661,6 +688,7 @@ def edit_comment(
     }
 
 
+@_as_one_account
 def delete_comment(
     root: str, reference: PullRequestRef, *, kind: str, comment_id: int
 ) -> dict[str, Any]:
@@ -771,11 +799,13 @@ def _reactions_after(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_as_one_account
 def add_reaction(root: str, reference: PullRequestRef, **fields: Any) -> dict[str, Any]:
     """Add the session user's reaction to a comment."""
     return _set_reaction(root, reference, verb="add", **fields)
 
 
+@_as_one_account
 def remove_reaction(root: str, reference: PullRequestRef, **fields: Any) -> dict[str, Any]:
     """Remove the session user's reaction from a comment."""
     return _set_reaction(root, reference, verb="remove", **fields)
