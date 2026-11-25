@@ -99,6 +99,9 @@ def mutate(
     payload = (
         (response.get("data") or {}).get(payload_name) if isinstance(response, dict) else None
     )
+    if rc != 0 and github_failures.server_failed(err or "", reference):
+        # A 5xx with an error body still leaves the mutation's outcome unknown.
+        raise github_failures.unknown_outcome()
     if isinstance(response, dict) and response.get("errors"):
         if payload is not None:
             # The mutation ran; an error in a field it selected leaves its answer unreliable.

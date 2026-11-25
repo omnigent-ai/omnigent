@@ -657,6 +657,26 @@ def test_a_comment_change_that_fails_after_the_send_is_an_unknown_outcome(
         _change_comment(action)
 
 
+def test_a_5xx_with_graphql_errors_is_an_unknown_outcome_not_a_refusal(
+    fake: FakeGitHub,
+) -> None:
+    """A 502 with an error body doesn't show GitHub refused the mutation."""
+    answer = {"data": {"resolveReviewThread": None}, "errors": [{"message": "Not resolved"}]}
+    fake.graphql_failure = (1, json.dumps(answer), "gh: Bad Gateway (HTTP 502)")
+    with pytest.raises(UnknownOutcomeError):
+        _resolve()
+    assert len(fake.mutations("resolveReviewThread")) == 1
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_5xx_with_a_refusals_wording_is_an_unknown_outcome(
+    fake: FakeGitHub, action: str
+) -> None:
+    fake.rest_failure = (1, "", "gh: Bad credentials or API rate limit exceeded (HTTP 503)")
+    with pytest.raises(UnknownOutcomeError):
+        _change_comment(action)
+
+
 @pytest.mark.parametrize("stderr", list(_REFUSED_STDERR.values()), ids=list(_REFUSED_STDERR))
 def test_a_write_github_definitely_refused_is_a_refusal(fake: FakeGitHub, stderr: str) -> None:
     fake.graphql_failure = (1, "", stderr)

@@ -33,6 +33,8 @@ _SIGNED_OUT = re.compile(
 _REFUSED_STATUS = re.compile(r"\(HTTP (?:401|403|404|422)\)")
 # GraphQL errors GitHub reports when it may have stopped partway, e.g. a timeout.
 _GRAPHQL_INTERRUPTED = re.compile(r"timeout|timed out|Something went wrong", re.I)
+# A 5xx: GitHub may have stopped partway, whatever body or wording came with it.
+_SERVER_ERROR = re.compile(r"\bHTTP 5\d\d\b")
 # GraphQL error types that say GitHub failed on its side, whatever the message.
 _INTERRUPTED_TYPES = frozenset({"INTERNAL", "TIMEOUT", "SERVICE_UNAVAILABLE"})
 # URLs, paths and host names: a repository or host named like ``sso`` must not read as a refusal.
@@ -80,8 +82,15 @@ def definitely_refused(stderr: str, reference: PullRequestRef) -> bool:
     )
 
 
+def server_failed(stderr: str, reference: PullRequestRef) -> bool:
+    """Whether a sent write's ``gh`` stderr reports a 5xx, which never settles the outcome."""
+    return bool(_SERVER_ERROR.search(_diagnostic(stderr, reference)))
+
+
 def write_failure(stderr: str, *, reference: PullRequestRef, action: str) -> ValueError:
     """The error for a sent write that failed: a refusal only when GitHub definitely refused."""
+    if server_failed(stderr, reference):
+        return unknown_outcome()
     if definitely_refused(stderr, reference):
         return refusal(stderr, reference=reference, action=action)
     return unknown_outcome()
