@@ -97,6 +97,12 @@ import type {
  */
 export interface SseStreamResult {
   sawDone: boolean;
+  /**
+   * Called once with the stream's first event: the `publish_cursor` of the
+   * session stream's subscription heartbeat, or `null` when the first event
+   * carries none (an older server, or another stream).
+   */
+  onFirstEvent?: (publishCursor: number | null) => void;
 }
 
 // The server heartbeats the session live-tail every 15 s of queue idleness
@@ -211,6 +217,7 @@ export async function* parseSseStream(
   const decoder = new TextDecoder("utf-8");
   let buf = "";
   let currentEvent: string | null = null;
+  let sawEvent = false;
   const reader = byteStream.getReader();
 
   try {
@@ -249,6 +256,13 @@ export async function* parseSseStream(
             } catch {
               currentEvent = null;
               continue;
+            }
+            if (!sawEvent) {
+              sawEvent = true;
+              const cursor = data.publish_cursor;
+              result?.onFirstEvent?.(
+                currentEvent === "session.heartbeat" && typeof cursor === "number" ? cursor : null,
+              );
             }
             const event = parseEvent(currentEvent, data);
             if (event !== null) yield event;

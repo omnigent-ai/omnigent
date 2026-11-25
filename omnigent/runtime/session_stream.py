@@ -36,6 +36,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from cachetools import LRUCache
+
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
     audit_event_logger,
@@ -101,6 +103,23 @@ class _Subscriber:
 
 
 _subscribers: WorkspaceScopedCache[str, set[_Subscriber]] = WorkspaceScopedCache()
+
+# Publish cursors, under ``_lock``: a process-wide counter bumped by every
+# publish that reaches fan-out (with or without subscribers), and each
+# conversation's value of it at its newest publish. Two opens
+# reading the same cursor (with the same stream epoch) prove nothing was
+# published to the conversation in between, so a client rotating its stream
+# can skip the reconnect reconcile. An evicted entry restarts at the current
+# counter, which can only make the next comparison miss, never falsely match.
+_publish_seq = 0
+_publish_cursors: WorkspaceScopedCache[str, int] = WorkspaceScopedCache(
+    lambda: LRUCache(maxsize=32_768)
+)
+
+
+def _publish_cursor_locked(conversation_id: str) -> int:
+    """Return the conversation's publish cursor; caller holds ``_lock``."""
+    return _publish_cursors.setdefault(conversation_id, _publish_seq)
 
 
 def _schedule_delivery(
@@ -398,7 +417,12 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     pending_elicitations.record_publish(conversation_id, event)
     if live_event is None:
         return 0
+    global _publish_seq
     with _lock:
+        # Same lock as subscribe's registration, so an open's cursor and its
+        # live tail partition exactly against this publish.
+        _publish_seq += 1
+        _publish_cursors[conversation_id] = _publish_seq
         subs = list(_subscribers.get(conversation_id, ()))
     scheduled = 0
     for subscriber in subs:
@@ -469,6 +493,7 @@ async def subscribe(
     *,
     heartbeat_interval_s: float | None = None,
     ready_event: dict[str, Any] | None = None,
+    ready_publish_cursor: bool = False,
     pre_ready_snapshot: Callable[[], Iterable[dict[str, Any]]] | None = None,
     on_subscribed: Callable[[], Awaitable[Iterable[dict[str, Any]]]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
@@ -517,6 +542,11 @@ async def subscribe(
         clients a subscription acknowledgment before an expensive
         snapshot hook runs, while still registering the live-tail
         queue before any producer can publish a turn event.
+    :param ready_publish_cursor: When ``True``, ``ready_event`` is
+        yielded with an added ``publish_cursor``: the conversation's
+        publish cursor, read atomically with registration. An equal
+        cursor on a later open in the same process means nothing was
+        published to the conversation between the two registrations.
     :param pre_ready_snapshot: Optional SYNC hook run once, immediately
         after slot registration and before any ``yield``/``await``. Its
         events are yielded ahead of the live tail. Unlike ``on_subscribed``
@@ -545,6 +575,7 @@ async def subscribe(
     entry = _Subscriber(asyncio.get_running_loop())
     with _lock:
         _subscribers.setdefault(conversation_id, set()).add(entry)
+        publish_cursor = _publish_cursor_locked(conversation_id) if ready_publish_cursor else None
     # Read the pre-ready snapshot synchronously here — after slot
     # registration, before the ``yield`` below suspends. On the Omnigent event
     # loop (where the relay calls ``publish``) nothing runs in between, so
@@ -565,7 +596,11 @@ async def subscribe(
         pre_ready_events = []
     try:
         if ready_event is not None:
-            yield ready_event
+            yield (
+                {**ready_event, "publish_cursor": publish_cursor}
+                if ready_publish_cursor
+                else ready_event
+            )
         for pre_ready_event in pre_ready_events:
             yield pre_ready_event
         if on_subscribed is not None:

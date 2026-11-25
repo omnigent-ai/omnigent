@@ -577,6 +577,93 @@ async def test_ready_event_emits_after_registration_before_snapshot() -> None:
         await gen.aclose()
 
 
+async def _ready_cursor(conv_id: str) -> int:
+    """
+    Open one subscription the way the ``/stream`` route does and close it.
+
+    :param conv_id: Conversation to subscribe to, e.g. ``"conv_cursor"``.
+    :returns: The ``publish_cursor`` its ready event carried.
+    """
+    gen = session_stream.subscribe(
+        conv_id,
+        ready_event={"type": "session.heartbeat"},
+        ready_publish_cursor=True,
+    )
+    try:
+        ready = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+    finally:
+        await gen.aclose()
+    assert ready["type"] == "session.heartbeat"
+    cursor = ready["publish_cursor"]
+    assert isinstance(cursor, int)
+    return cursor
+
+
+@pytest.mark.asyncio
+async def test_ready_publish_cursor_matches_only_when_nothing_was_published() -> None:
+    """
+    Two opens read the same cursor exactly when nothing was published between them.
+
+    Production breakage that causes this test to fail: the web client skips its
+    reconnect catch-up reads when a planned stream rotation reads an unchanged
+    cursor. A cursor that stays equal across a publish (here one sent while no
+    subscriber was connected, as in the rotation gap) would make the client miss
+    that event until a page reload; one that changes without a publish (or after
+    a publish to another conversation) just costs the catch-up reads again.
+    """
+    first = await _ready_cursor("conv_cursor")
+    assert await _ready_cursor("conv_cursor") == first
+
+    session_stream.publish("conv_cursor_other", {"type": "session.status", "status": "idle"})
+    assert await _ready_cursor("conv_cursor") == first
+
+    session_stream.publish("conv_cursor", {"type": "session.status", "status": "idle"})
+    second = await _ready_cursor("conv_cursor")
+    assert second != first
+    assert await _ready_cursor("conv_cursor") == second
+
+
+@pytest.mark.asyncio
+async def test_evicted_publish_cursor_never_matches_a_stale_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cursor evicted from the bounded index cannot falsely equal an old one.
+
+    Production breakage that causes this test to fail: with more active
+    conversations than the index holds, an evicted conversation restarting its
+    cursor from a fixed value could read the same number after a publish it
+    missed, and the client would skip catching up on that publish.
+    """
+    from cachetools import LRUCache
+
+    from omnigent.db.workspace_cache import WorkspaceScopedCache
+
+    monkeypatch.setattr(
+        session_stream, "_publish_cursors", WorkspaceScopedCache(lambda: LRUCache(maxsize=1))
+    )
+    first = await _ready_cursor("conv_evicted")
+    session_stream.publish("conv_evicted", {"type": "session.status", "status": "idle"})
+    # Evict conv_evicted's entry, as a busy server would.
+    session_stream.publish("conv_busy", {"type": "session.status", "status": "idle"})
+    assert await _ready_cursor("conv_evicted") != first
+
+
+@pytest.mark.asyncio
+async def test_ready_event_is_unchanged_without_publish_cursor_opt_in() -> None:
+    """
+    Callers that don't ask for the cursor get their ready event verbatim.
+
+    Production breakage that causes this test to fail: harness-internal
+    subscribers comparing or forwarding the ready event would see a new field.
+    """
+    gen = session_stream.subscribe("conv_plain", ready_event={"type": "test.ready"})
+    try:
+        assert await asyncio.wait_for(gen.__anext__(), timeout=1.0) == {"type": "test.ready"}
+    finally:
+        await gen.aclose()
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_interleaves_with_published_events() -> None:
     """

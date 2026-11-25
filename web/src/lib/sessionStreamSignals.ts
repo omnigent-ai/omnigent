@@ -2,15 +2,23 @@
 // transient events: the stream never replays, so they catch up from REST
 // when it reopens and poll only while it's down.
 
-type Listener = (conversationId: string, reopened: boolean) => void;
+type Listener = (conversationId: string, reopened: boolean, resumed: boolean) => void;
 
 const openStreams = new Map<string, number>();
 const listeners = new Set<Listener>();
 
-/** Record that a session's stream opened; ``reopened`` after a drop or reconnect. */
-export function noteSessionStreamOpen(conversationId: string, reopened: boolean): void {
+/**
+ * Record that a session's stream opened; ``reopened`` after a drop or reconnect.
+ * ``resumed`` marks a reopen the server proved missed no events, so there is
+ * nothing to catch up on.
+ */
+export function noteSessionStreamOpen(
+  conversationId: string,
+  reopened: boolean,
+  resumed = false,
+): void {
   openStreams.set(conversationId, (openStreams.get(conversationId) ?? 0) + 1);
-  for (const listener of listeners) listener(conversationId, reopened);
+  for (const listener of listeners) listener(conversationId, reopened, resumed);
 }
 
 /** Record that one of a session's stream connections closed. */
@@ -18,7 +26,7 @@ export function noteSessionStreamClosed(conversationId: string): void {
   const count = (openStreams.get(conversationId) ?? 0) - 1;
   if (count > 0) openStreams.set(conversationId, count);
   else openStreams.delete(conversationId);
-  for (const listener of listeners) listener(conversationId, false);
+  for (const listener of listeners) listener(conversationId, false, false);
 }
 
 export function isSessionStreamOpen(conversationId: string): boolean {

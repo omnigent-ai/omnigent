@@ -10477,6 +10477,20 @@
       "SessionHeartbeatEvent": {
         "description": "Idle-stream keepalive on `GET /v1/sessions/{id}/stream`.\n\nEmitted by the session-stream route on a fixed cadence whenever\nthe underlying publish queue has been quiet (no turn in flight,\nno resource events). Distinct from `HeartbeatEvent`\n(`response.heartbeat`), which is per-turn and is driven by\nthe runtime workflow while a response is producing output.\n\nWhy this exists: the session stream stays open across many turns\nand through idle periods (waiting for the user to type). Without\na periodic emit, intermediate proxies, OS-level sockets, and the\nclient's SSE read-timeout can leave a half-open stream\nundetected for minutes after a network event (laptop sleep,\nWi-Fi handoff). The heartbeat puts a regular byte on the wire\nso the client's read-timeout and the server's\n`request.is_disconnected()` check both fire promptly.\n\nConsumers MAY ignore the payload entirely (the bytes crossing\nthe wire are sufficient). The optional `server_time` mirrors\n`HeartbeatEvent` for symmetry and debugging.",
         "properties": {
+          "publish_cursor": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set only on the heartbeat that acknowledges the subscription, e.g. `42`: the conversation's publish cursor at registration. Two opens with the same cursor and the same `X-Omnigent-Stream-Epoch` header had nothing published to the conversation between them, so a client rotating its stream can skip catching up. `None` on interval heartbeats.",
+            "title": "Publish Cursor"
+          },
           "sequence_number": {
             "anyOf": [
               {

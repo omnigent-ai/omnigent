@@ -10754,6 +10754,8 @@ async def _stream_live_events(
                 session_id,
                 heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
                 ready_event={"type": "session.heartbeat"},
+                # Lets a client's planned stream rotation prove it missed nothing.
+                ready_publish_cursor=True,
                 # In-flight text replay must be captured synchronously at slot
                 # registration (before ``ready_event`` suspends), not in the
                 # async ``on_subscribed`` hook, or window deltas double-render.

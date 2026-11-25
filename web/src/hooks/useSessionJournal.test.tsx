@@ -327,6 +327,23 @@ describe("useSessionJournal", () => {
     },
   );
 
+  it.each([
+    [1, "resumed", true],
+    [2, "reopened", false],
+  ])("reads the journal %i time(s) across a %s stream reopen", async (reads, _label, resumed) => {
+    noteSessionStreamOpen(SESSION, false);
+    respond(journalPage([journalEntry(0)]));
+    const { result } = renderHook(() => useSessionJournal(SESSION, true), { wrapper });
+    await waitFor(() => expect(result.current.entries).toHaveLength(1));
+
+    act(() => noteSessionStreamClosed(SESSION));
+    respond(journalPage([journalEntry(1)]));
+    act(() => noteSessionStreamOpen(SESSION, true, resumed));
+    if (!resumed) await waitFor(() => expect(result.current.entries).toHaveLength(2));
+    await act(async () => {});
+    expect(authenticatedFetch).toHaveBeenCalledTimes(reads);
+  });
+
   it("reads nothing while disabled or for a provisional session", () => {
     renderHook(() => useSessionJournal(SESSION, false), { wrapper });
     renderHook(() => useSessionJournal("temp:pending", true), { wrapper });

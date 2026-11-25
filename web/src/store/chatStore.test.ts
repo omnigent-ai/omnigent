@@ -16112,6 +16112,100 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  describe("planned rotation catch-up", () => {
+    /** Open `/stream` into abortable sinks stamped with one stream epoch. */
+    function routeRotatingStreamOpens(epoch: string): StreamSink[] {
+      const sinks: StreamSink[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+          const sink = pushableStream();
+          sinks.push(sink);
+          // Like the real fetch, aborting the attempt severs the body read.
+          init?.signal?.addEventListener("abort", () =>
+            sink.error(new DOMException("aborted", "AbortError")),
+          );
+          const response = mockResponse(null, { bodyStream: sink.stream });
+          response.headers.set("x-omnigent-stream-epoch", epoch);
+          return response;
+        }
+        return defaultFetchHandler(input, init);
+      });
+      return sinks;
+    }
+
+    /** The subscription heartbeat a stream opens with; `null` mimics an older server. */
+    function ready(cursor: number | null): string {
+      return sse("session.heartbeat", cursor === null ? {} : { publish_cursor: cursor });
+    }
+
+    /**
+     * Run one stream past its max age (or drop it), reopen it, and count the
+     * snapshot and items reads issued over the next 22 s (the catch-up burst),
+     * ending before the 60 s periodic status reconcile ticks at 300 s.
+     */
+    async function readsAfterReopen(
+      id: string,
+      opts: { first: number | null; second: number | null; reopen: "rotate" | "drop" },
+    ): Promise<{ snapshots: number; items: number }> {
+      seedSession(id, []);
+      const sinks = routeRotatingStreamOpens("epoch-1");
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(ready(opts.first));
+      await drainAsync(2);
+      if (opts.reopen === "rotate") {
+        await advanceWithHeartbeats(sinks[0]!, SSE_MAX_STREAM_AGE_MS - 15_000);
+      } else {
+        await advanceWithHeartbeats(sinks[0]!, 60_000);
+      }
+      const before = fetchMock.mock.calls.length;
+      if (opts.reopen === "rotate") {
+        await vi.advanceTimersByTimeAsync(15_001);
+      } else {
+        sinks[0]!.error();
+        await vi.advanceTimersByTimeAsync(20);
+      }
+      expect(sinks).toHaveLength(2);
+      sinks[1]!.push(ready(opts.second));
+      await drainAsync(2);
+      await advanceWithHeartbeats(sinks[1]!, 15_000);
+      await vi.advanceTimersByTimeAsync(7_000);
+      const after = fetchMock.mock.calls.slice(before).map(([input]) => String(input));
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+      controller.abort();
+      await loop;
+      return {
+        snapshots: after.filter((url) => url.includes(`/v1/sessions/${id}?`)).length,
+        items: after.filter((url) => url.includes(`/v1/sessions/${id}/items`)).length,
+      };
+    }
+
+    it("skips the catch-up reads when the server proves nothing was published", async () => {
+      const reads = await readsAfterReopen("conv_rotate_quiet", {
+        first: 7,
+        second: 7,
+        reopen: "rotate",
+      });
+      expect(reads).toEqual({ snapshots: 0, items: 0 });
+    });
+
+    it.each([
+      ["the cursor advanced", { first: 7, second: 8, reopen: "rotate" }],
+      ["the server sends no cursor", { first: null, second: null, reopen: "rotate" }],
+      ["the stream dropped", { first: 7, second: 7, reopen: "drop" }],
+    ] as const)("still catches up a reopen when %s", async (_label, opts) => {
+      const reads = await readsAfterReopen(`conv_catchup_${_label.replaceAll(" ", "_")}`, opts);
+      expect(reads.items).toBeGreaterThanOrEqual(1);
+      // The reconcile snapshot plus the 3 s / 8 s / 20 s status catch-ups.
+      expect(reads.snapshots).toBeGreaterThanOrEqual(4);
+    });
+  });
+
   it("reopens after a clean server-shutdown EOF without [DONE]", async () => {
     seedSession("conv_server_restart", []);
     const sinks = routeStreamOpens();

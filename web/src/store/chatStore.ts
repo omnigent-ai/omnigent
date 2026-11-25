@@ -7311,6 +7311,11 @@ export async function startStreamPump(
   // When login-page answers began, since the last successful stream open.
   let nonSseAnswersSince: number | null = null;
   let previousStreamEpoch: string | null = null;
+  // The last attempt's subscription `publish_cursor`, and whether its max-age
+  // timer ended it: a planned reopen that reads the same cursor from the same
+  // server process missed nothing, so it skips the reconnect catch-up reads.
+  let previousPublishCursor: number | null = null;
+  let plannedRotation = false;
   const nativePreviewBaselines = new Map<string, string>();
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
@@ -7361,6 +7366,9 @@ export async function startStreamPump(
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
       // Whether this attempt opened, so its close is signaled exactly once.
       let streamOpened = false;
+      const rotating = plannedRotation;
+      plannedRotation = false;
+      let attemptPublishCursor: number | null = null;
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -7454,17 +7462,31 @@ export async function startStreamPump(
 
         const reconnecting = hasConnected || hostReaddressed;
         const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
+        // Only a planned rotation back onto the same server process can prove
+        // it missed nothing; every other reopen catches up as before.
+        const resumable =
+          rotating &&
+          !hostReaddressed &&
+          streamEpoch !== null &&
+          streamEpoch === previousStreamEpoch &&
+          previousPublishCursor !== null &&
+          !missedEventRecovery.backfillOwed;
         if (!hasConnected) clearSseLog(id);
         hasConnected = true;
-        streamOpened = true;
-        noteSessionStreamOpen(id, reconnecting);
+        if (!resumable) {
+          streamOpened = true;
+          noteSessionStreamOpen(id, reconnecting);
+        }
         hostReaddressed = false;
         failedOpens = 0;
         consecutive404s = 0;
         nonSseAnswersSince = null;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
-        maxAgeTimer = setTimeout(() => attempt.abort(), SSE_MAX_STREAM_AGE_MS);
+        maxAgeTimer = setTimeout(() => {
+          plannedRotation = true;
+          attempt.abort();
+        }, SSE_MAX_STREAM_AGE_MS);
         if (reconnecting) {
           if (previousStreamEpoch === null || streamEpoch === null) {
             nativePreviewBaselines.clear();
@@ -7507,6 +7529,11 @@ export async function startStreamPump(
               `Session ${id}: no stream bytes in ${SSE_STALL_TIMEOUT_MS} ms; reconnecting`,
             ),
         });
+        // The subscription heartbeat's cursor, or null once the stream ends without one.
+        let resolveFirstCursor: (cursor: number | null) => void = () => {};
+        const firstCursor = new Promise<number | null>((resolve) => {
+          resolveFirstCursor = resolve;
+        });
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
         const pumpPromise = pumpStreamEvents(
@@ -7517,8 +7544,21 @@ export async function startStreamPump(
           get,
           undefined,
           ignoredNativeMessageIds,
+          (cursor) => {
+            attemptPublishCursor = cursor;
+            resolveFirstCursor(cursor);
+          },
         );
-        if (reconnecting) {
+        let resumed = false;
+        if (resumable) {
+          const unresolved = () => resolveFirstCursor(null);
+          void pumpPromise.then(unresolved, unresolved);
+          resumed = (await firstCursor) === previousPublishCursor;
+          streamOpened = true;
+          noteSessionStreamOpen(id, true, resumed);
+        }
+        // A resumed rotation missed nothing, so it has no snapshot, items or status to catch up.
+        if (reconnecting && !resumed) {
           await missedEventRecovery.backfill(true);
           // reconcileOnReconnect can read a stale "running" when the server
           // just restarted and hasn't reprocessed the turn's completion yet,
@@ -7528,7 +7568,7 @@ export async function startStreamPump(
           // idempotent, and scoped to the active conversation by
           // reconcileActiveSessionStatus itself.
           scheduleStatusCatchup(true);
-        } else {
+        } else if (!reconnecting) {
           // A launch's `ready` sent before this first open subscribed is in no snapshot
           // read yet, so re-read its stage over the next ~20 s while it still shows.
           scheduleStatusCatchup(false);
@@ -7546,6 +7586,7 @@ export async function startStreamPump(
           markLivePreviewsInterrupted(id, set);
         }
       } finally {
+        previousPublishCursor = attemptPublishCursor;
         if (streamOpened) noteSessionStreamClosed(id);
         if (maxAgeTimer !== null) clearTimeout(maxAgeTimer);
         liveAttempt = null;
@@ -8185,9 +8226,10 @@ export async function pumpStreamEvents(
   get: Getter,
   scheduler: FrameScheduler = createRafScheduler(),
   ignoredMessages: Set<string> = new Set<string>(),
+  onFirstEvent?: (publishCursor: number | null) => void,
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
-  const sseResult: SseStreamResult = { sawDone: false };
+  const sseResult: SseStreamResult = { sawDone: false, onFirstEvent };
   const rawEvents = parseSseStream(body, sseResult);
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream

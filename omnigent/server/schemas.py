@@ -5397,10 +5397,17 @@ class SessionHeartbeatEvent(_SSEEventBase):
     :param server_time: ISO 8601 UTC timestamp at emission, e.g.
         ``"2026-05-25T10:30:00Z"``. ``None`` when the producer
         chose not to populate it.
+    :param publish_cursor: Set only on the heartbeat that acknowledges
+        the subscription, e.g. ``42``: the conversation's publish cursor
+        at registration. Two opens with the same cursor and the same
+        ``X-Omnigent-Stream-Epoch`` header had nothing published to the
+        conversation between them, so a client rotating its stream can
+        skip catching up. ``None`` on interval heartbeats.
     """
 
     type: Literal["session.heartbeat"]
     server_time: str | None = None
+    publish_cursor: int | None = None
 
 
 class PresenceViewer(BaseModel):

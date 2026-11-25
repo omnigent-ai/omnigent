@@ -207,8 +207,8 @@ export function useSessionJournal(
       }
     };
     synchronizeCached();
-    return subscribeSessionStreams((id) => {
-      if (id === conversationId && isSessionStreamOpen(id)) synchronizeCached();
+    return subscribeSessionStreams((id, _reopened, resumed) => {
+      if (!resumed && id === conversationId && isSessionStreamOpen(id)) synchronizeCached();
     });
   }, [active, conversationId, queryClient, catchUp]);
   useEffect(() => {
