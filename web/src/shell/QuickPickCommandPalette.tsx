@@ -54,6 +54,16 @@ const CHILD_PAGE_COPY = {
     placeholder: "Choose one…",
     empty: "Nothing to choose from.",
   },
+  "pick-session": {
+    label: "Pick a session",
+    placeholder: "Pick a session, or paste a pull request link…",
+    empty: "No matching sessions.",
+  },
+  "session-actions": {
+    label: "Session actions",
+    placeholder: "Choose an action…",
+    empty: "No actions for this session.",
+  },
 } as const;
 
 /** The footer's line for what a page waits on, or why a choice didn't apply. */
@@ -282,6 +292,8 @@ export function QuickPickCommandPalette({
     }
     if (row.kind === "setting-choice") return settingPage.acceptChoice(row.value);
     if (row.kind === "command-option") return optionsPage.acceptOption(row.optionId);
+    // No page lists a session's actions yet.
+    if (row.kind === "session-action") return "keepOpen";
     if (row.kind === "command") {
       const command = currentCommand(item);
       // A row withdrawn or built for another target since stays open, now showing what applies.
