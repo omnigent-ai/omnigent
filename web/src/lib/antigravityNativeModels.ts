@@ -1,7 +1,8 @@
+import { normalizeEffortLabel } from "./composerModelLabel";
 import type { ModelConfigurationSource, NativeModelOption } from "./types";
 
-/** Effort suffixes which agy encodes into otherwise-flat launch model ids. */
-const AGY_EFFORTS = ["low", "medium", "high"] as const;
+/** Effort suffixes agy encodes into flat launch model ids, in ascending order (`agy --effort`). */
+const AGY_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 type AntigravityEffort = (typeof AGY_EFFORTS)[number];
 
@@ -51,10 +52,12 @@ export function antigravityModelGroups(
     entries.push(option);
     siblings.set(parsed.familyId, entries);
   }
+  // A family whose bare id is also advertised stays ungrouped so row ids stay unique.
+  const advertisedIds = new Set(options.map((option) => option.id));
   const groupedFamilies = new Set(
-    Array.from(siblings, ([familyId, entries]) => (entries.length > 1 ? familyId : null)).filter(
-      (familyId): familyId is string => familyId !== null,
-    ),
+    Array.from(siblings, ([familyId, entries]) =>
+      entries.length > 1 && !advertisedIds.has(familyId) ? familyId : null,
+    ).filter((familyId): familyId is string => familyId !== null),
   );
   const seenFamilies = new Set<string>();
 
@@ -96,7 +99,7 @@ export function antigravityModelGroups(
             : [
                 {
                   value: effort,
-                  label: effort.charAt(0).toUpperCase() + effort.slice(1),
+                  label: normalizeEffortLabel(effort),
                   modelId: entry.id,
                 },
               ];

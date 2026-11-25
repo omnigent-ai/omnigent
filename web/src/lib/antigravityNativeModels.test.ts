@@ -66,6 +66,84 @@ describe("antigravityModelGroups", () => {
     expect(groups.at(-1)?.efforts).toEqual([]);
   });
 
+  it("groups xHigh and Max siblings in ascending effort order", () => {
+    const groups = antigravityModelGroups([
+      { id: "gemini-4-neon-xhigh", displayName: "Gemini 4 Neon (XHigh)" },
+      { id: "gemini-4-neon-high", displayName: "Gemini 4 Neon (High)" },
+      { id: "gemini-4-neon-max", displayName: "Gemini 4 Neon (Max)" },
+      { id: "gemini-4-neon-low", displayName: "Gemini 4 Neon (Low)" },
+      { id: "gemini-4-neon-medium", displayName: "Gemini 4 Neon (Medium)" },
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.id).toBe("gemini-4-neon");
+    expect(groups[0]?.displayName).toBe("Gemini 4 Neon");
+    expect(groups[0]?.efforts).toEqual([
+      { value: "low", label: "Low", modelId: "gemini-4-neon-low" },
+      { value: "medium", label: "Medium", modelId: "gemini-4-neon-medium" },
+      { value: "high", label: "High", modelId: "gemini-4-neon-high" },
+      { value: "xhigh", label: "xHigh", modelId: "gemini-4-neon-xhigh" },
+      { value: "max", label: "Max", modelId: "gemini-4-neon-max" },
+    ]);
+  });
+
+  it("groups a model whose only variants are High and xHigh", () => {
+    const groups = antigravityModelGroups([
+      { id: "gemini-4-neon-xhigh", displayName: "Gemini 4 Neon XHigh", isDefault: true },
+      { id: "gemini-4-neon-high", displayName: "Gemini 4 Neon High" },
+    ]);
+
+    expect(groups).toEqual([
+      {
+        id: "gemini-4-neon",
+        displayName: "Gemini 4 Neon",
+        isDefault: true,
+        source: undefined,
+        defaultModelId: "gemini-4-neon-xhigh",
+        efforts: [
+          { value: "high", label: "High", modelId: "gemini-4-neon-high" },
+          { value: "xhigh", label: "xHigh", modelId: "gemini-4-neon-xhigh" },
+        ],
+      },
+    ]);
+  });
+
+  it("splits only the final effort token and keeps non-effort endings intact", () => {
+    const groups = antigravityModelGroups([
+      { id: "gemini-3-flash-lite-high", displayName: "Gemini 3 Flash Lite (High)" },
+      { id: "gemini-3-flash-lite-xhigh", displayName: "Gemini 3 Flash Lite (XHigh)" },
+      { id: "gemini-4-neon-preview", displayName: "Gemini 4 Neon Preview" },
+      // A lone `-max` id is a model name, not an effort choice.
+      { id: "gemini-2-ultra-max", displayName: "Gemini 2 Ultra Max" },
+    ]);
+
+    expect(groups.map((group) => [group.id, group.displayName])).toEqual([
+      ["gemini-3-flash-lite", "Gemini 3 Flash Lite"],
+      ["gemini-4-neon-preview", "Gemini 4 Neon Preview"],
+      ["gemini-2-ultra-max", "Gemini 2 Ultra Max"],
+    ]);
+    expect(groups[0]?.efforts.map((effort) => effort.modelId)).toEqual([
+      "gemini-3-flash-lite-high",
+      "gemini-3-flash-lite-xhigh",
+    ]);
+    expect(groups[2]?.efforts).toEqual([]);
+  });
+
+  it("keeps siblings standalone when the bare family id is also advertised", () => {
+    const options: NativeModelOption[] = [
+      { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
+      { id: "gemini-4-neon-high", displayName: "Gemini 4 Neon (High)" },
+      { id: "gemini-4-neon-xhigh", displayName: "Gemini 4 Neon (XHigh)" },
+    ];
+    const groups = antigravityModelGroups(options);
+
+    expect(groups.map((group) => group.id)).toEqual(options.map((option) => option.id));
+    expect(groups.every((group) => group.efforts.length === 0)).toBe(true);
+    expect(antigravityModelGroupForModel(groups, "gemini-4-neon")?.defaultModelId).toBe(
+      "gemini-4-neon",
+    );
+  });
+
   it("resolves a selected effort back to its exact CLI launch id", () => {
     const groups = antigravityModelGroups(LIVE_AGY_MODELS);
     const selected = antigravityModelGroupForModel(groups, "gemini-3.8-flash-high");

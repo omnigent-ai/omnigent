@@ -6885,6 +6885,53 @@ describe("NewChatLandingScreen", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  it("offers agy xHigh and Max as effort choices of their base model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "antigravity-native"
+          ? {
+              ...SUCCESS_QUERY_STATE,
+              data: [
+                { id: "gemini-4-neon-max", displayName: "Gemini 4 Neon (Max)" },
+                { id: "gemini-4-neon-xhigh", displayName: "Gemini 4 Neon (XHigh)" },
+                { id: "gemini-4-neon-high", displayName: "Gemini 4 Neon (High)" },
+                { id: "gemini-4-neon-low", displayName: "Gemini 4 Neon (Low)" },
+              ],
+            }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    mockAgents([
+      {
+        id: "a_agy",
+        name: "antigravity-native-ui",
+        display_name: "Antigravity",
+        description: null,
+        harness: "antigravity-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    openAgentModels("a_agy");
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Gemini 4 Neon (XHigh)" })).toBeNull();
+    pickPrimaryOption("model", "Gemini 4 Neon");
+    const efforts = within(screen.getByTestId("new-chat-landing-agent-efforts"))
+      .getAllByRole("menuitemcheckbox")
+      .map((item) => item.textContent);
+    expect(efforts).toEqual(["Low", "High", "xHigh", "Max"]);
+    pickPrimaryOption("effort", "xHigh");
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("xHigh");
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("gemini-4-neon-xhigh");
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("restores Antigravity permissions alongside models and clears remembered skip", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
