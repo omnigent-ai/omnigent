@@ -419,10 +419,10 @@ function AgentsTable({
           {rows.map((member) => (
             <tr key={member.key}>
               <th scope="row" className="px-3 py-2 text-left font-normal">
-                <span className="flex items-center gap-2">
+                <span className="flex items-center">
                   <MemberName member={member} />
                   {member.kind === "human" && (
-                    <span className="text-muted-foreground">&rsquo;s own chats</span>
+                    <span className="shrink-0 text-muted-foreground">&rsquo;s own chats</span>
                   )}
                 </span>
               </th>
