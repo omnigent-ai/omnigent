@@ -2893,7 +2893,7 @@ def register_resources_routes(
         )
         if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
             raise OmnigentError(
-                "Only the session's owner can read this through the workspace API",
+                "Only the session's owner can use this through the workspace API",
                 code=ErrorCode.FORBIDDEN,
             )
         _host_id, host, workspace = await _session_host(conv, request)

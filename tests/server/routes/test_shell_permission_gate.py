@@ -1383,6 +1383,8 @@ async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
     )
 
     assert resp.status_code == _pull_request_call_passes(method, caller, session), resp.text
+    if resp.status_code == 403:
+        assert "Only the session's owner can use this" in resp.text
     if resp.status_code == 503:
         assert b"unavailable" in resp.content
 
