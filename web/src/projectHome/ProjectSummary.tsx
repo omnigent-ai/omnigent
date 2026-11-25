@@ -18,6 +18,7 @@ import {
 } from "@/lib/projectStatusApi";
 import { cn } from "@/lib/utils";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
+import { ProjectKpiTiles } from "./ProjectKpis";
 import { useProjectMandate } from "./ProjectMandateDialog";
 import { TicketError } from "./TicketControls";
 import { TicketMarkdown } from "./ticketImages";
@@ -64,7 +65,7 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
           </>
         )}
       </section>
-      <ProjectKpiSlot projectId={projectId} statusWindow={statusWindow} />
+      <ProjectKpiTiles projectId={projectId} />
       <section aria-label="Members" className="space-y-3">
         <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Members</h2>
         {summary.isPending ? (
@@ -181,18 +182,6 @@ function StatTile({ label, value, note }: { label: string; value: string; note?:
   );
 }
 
-/** Where the project's KPI tiles go; empty until KPIs are defined for the project. */
-export function ProjectKpiSlot(_props: { projectId: string; statusWindow: ProjectStatusWindow }) {
-  return (
-    <section aria-label="KPIs" className="space-y-3" data-testid="project-kpi-slot">
-      <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">KPIs</h2>
-      <p className="rounded-lg border border-dashed border-border/70 p-4 text-sm text-muted-foreground">
-        No KPIs yet. Key numbers for this project will appear here.
-      </p>
-    </section>
-  );
-}
-
 const COLUMNS: { key: ProjectStatusSortKey; label: string; numeric: boolean }[] = [
   { key: "name", label: "Member", numeric: false },
   { key: "tickets_done", label: "Tickets done", numeric: true },
@@ -223,7 +212,10 @@ function MembersTable({ members }: { members: ProjectStatusMember[] }) {
                   aria-sort={
                     active ? (sort.direction === "asc" ? "ascending" : "descending") : undefined
                   }
-                  className={cn("px-3 py-2 font-medium", column.numeric ? "text-right" : "text-left")}
+                  className={cn(
+                    "px-3 py-2 font-medium",
+                    column.numeric ? "text-right" : "text-left",
+                  )}
                 >
                   <button
                     type="button"
@@ -267,7 +259,9 @@ function MembersTable({ members }: { members: ProjectStatusMember[] }) {
                 </span>
               </th>
               <NumberCell>{String(member.tickets_done)}</NumberCell>
-              <NumberCell>{member.prs_merged === null ? "—" : String(member.prs_merged)}</NumberCell>
+              <NumberCell>
+                {member.prs_merged === null ? "—" : String(member.prs_merged)}
+              </NumberCell>
               <NumberCell>{formatCents(member.spend_cents)}</NumberCell>
               <NumberCell>{formatCents(member.cost_per_merged_pr_cents)}</NumberCell>
             </tr>

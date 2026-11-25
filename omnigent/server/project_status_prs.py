@@ -211,12 +211,15 @@ class ProjectPrsMergedSource:
         )
 
     def prs_merged(self, project: Project, period: StatusPeriod) -> MemberTotals:
-        items = combine(
+        return totals(self.merged_items(project), period)
+
+    def merged_items(self, project: Project) -> list[MergedItem]:
+        """Every counted merge with its date and member, for per-day series."""
+        return combine(
             self._session_prs(project),
             self._merged_tickets(project),
             self._member_resolver(project),
         )
-        return totals(items, period)
 
     def _session_prs(self, project: Project) -> list[SessionMergedPr]:
         with self._session_db("list_project_session_ids_for_status") as session:

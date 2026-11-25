@@ -21,7 +21,7 @@ from omnigent.entities.project_kpi import (
     SetProjectKpis,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.project_kpis import KpiInputs, KpiStatus, compute_metrics, kpi_rows
+from omnigent.server.project_kpis import KpiInputs, KpiStatus, kpi_rows, load_series
 from omnigent.server.project_status import (
     StatusSources,
     StatusWindow,
@@ -45,8 +45,29 @@ WindowParam = Annotated[
 ]
 
 
+class ProjectKpiDay(BaseModel):
+    day_utc: str
+    value: float | None = Field(description="The day's value; null without data or a source.")
+
+
+class ProjectKpiTrend(BaseModel):
+    """The KPI over the 7 full UTC days ending yesterday, plus today so far."""
+
+    since_day_utc: str
+    until_day_utc: str = Field(description="Yesterday (UTC), the last full day checked.")
+    days: list[ProjectKpiDay] = Field(
+        description="One entry per day from since_day_utc through today; today is last."
+    )
+    last_7_days: float | None
+    last_7_days_sample_size: int | None = Field(
+        description="Tickets behind a time-to-merged value; null for other metrics."
+    )
+    today: float | None = Field(description="Today so far (UTC).")
+    status: KpiStatus = Field(description="The target check over the 7 full days.")
+
+
 class ProjectKpiValue(BaseModel):
-    """One KPI with its value for the window."""
+    """One KPI with its value for the window and its 7-day trend."""
 
     position: int
     name: str
@@ -69,6 +90,7 @@ class ProjectKpiValue(BaseModel):
             "unavailable when the metric's source isn't on this server; not_measured for 'none'."
         )
     )
+    trend: ProjectKpiTrend | None = Field(description="Null for a KPI with metric 'none'.")
 
 
 class ProjectKpis(BaseModel):
@@ -132,11 +154,6 @@ def create_project_kpis_router(
             project=project,
             period=period,
             sources=sources(request),
-            completed_moves=functools.cache(
-                lambda: ticket_store.completed_moves(
-                    project.id, user_id=user_id, since_epoch=period.since_epoch
-                )
-            ),
             stage_histories=functools.cache(
                 lambda: ticket_store.stage_histories(project.id, user_id=user_id)
             ),
@@ -144,7 +161,7 @@ def create_project_kpis_router(
                 lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
             ),
         )
-        values = compute_metrics((kpi.metric for kpi in kpis), inputs)
+        series = load_series((kpi.metric for kpi in kpis), inputs)
         return {
             "object": "project.kpis",
             "project_id": project.id,
@@ -157,7 +174,7 @@ def create_project_kpis_router(
             "updated_by_user_id": current.created_by_user_id if current else None,
             "updated_by_session_id": current.created_by_session_id if current else None,
             "can_edit": project.user_id == user_id,
-            "kpis": kpi_rows(kpis, values),
+            "kpis": kpi_rows(kpis, series, period),
             "metrics": [metric.model_dump() for metric in KPI_METRICS],
         }
 

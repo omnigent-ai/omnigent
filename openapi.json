@@ -7006,6 +7006,33 @@
         "title": "ProjectKpi",
         "type": "object"
       },
+      "ProjectKpiDay": {
+        "properties": {
+          "day_utc": {
+            "title": "Day Utc",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The day's value; null without data or a source.",
+            "title": "Value"
+          }
+        },
+        "required": [
+          "day_utc",
+          "value"
+        ],
+        "title": "ProjectKpiDay",
+        "type": "object"
+      },
       "ProjectKpiRevision": {
         "description": "A stored revision of the KPI set: the set itself and who wrote it, when.",
         "properties": {
@@ -7086,8 +7113,91 @@
         "title": "ProjectKpiRevisionPage",
         "type": "object"
       },
+      "ProjectKpiTrend": {
+        "description": "The KPI over the 7 full UTC days ending yesterday, plus today so far.",
+        "properties": {
+          "days": {
+            "description": "One entry per day from since_day_utc through today; today is last.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectKpiDay"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "last_7_days": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last 7 Days"
+          },
+          "last_7_days_sample_size": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Tickets behind a time-to-merged value; null for other metrics.",
+            "title": "Last 7 Days Sample Size"
+          },
+          "since_day_utc": {
+            "title": "Since Day Utc",
+            "type": "string"
+          },
+          "status": {
+            "description": "The target check over the 7 full days.",
+            "enum": [
+              "met",
+              "missed",
+              "no_data",
+              "unavailable",
+              "not_measured"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "today": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Today so far (UTC).",
+            "title": "Today"
+          },
+          "until_day_utc": {
+            "description": "Yesterday (UTC), the last full day checked.",
+            "title": "Until Day Utc",
+            "type": "string"
+          }
+        },
+        "required": [
+          "since_day_utc",
+          "until_day_utc",
+          "days",
+          "last_7_days",
+          "last_7_days_sample_size",
+          "today",
+          "status"
+        ],
+        "title": "ProjectKpiTrend",
+        "type": "object"
+      },
       "ProjectKpiValue": {
-        "description": "One KPI with its value for the window.",
+        "description": "One KPI with its value for the window and its 7-day trend.",
         "properties": {
           "direction": {
             "anyOf": [
@@ -7186,6 +7296,17 @@
             ],
             "title": "Target"
           },
+          "trend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProjectKpiTrend"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null for a KPI with metric 'none'."
+          },
           "unit": {
             "anyOf": [
               {
@@ -7233,7 +7354,8 @@
           "not_measured_reason",
           "value",
           "sample_size",
-          "status"
+          "status",
+          "trend"
         ],
         "title": "ProjectKpiValue",
         "type": "object"

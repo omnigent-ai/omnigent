@@ -12,13 +12,18 @@ from pydantic import ValidationError
 from omnigent.entities.project_kpi import ProjectKpi
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.project_kpis import (
+    DAY,
     KpiInputs,
+    MetricSeries,
     MetricValue,
     compute_metrics,
     hours_to_final_stage,
+    kpi_rows,
     kpi_status,
+    load_series,
     nearest_rank,
-    rework_count,
+    rework_events,
+    series_value,
 )
 from omnigent.server.project_status import MemberTotals, StatusSources, status_period
 from tests.server.routes.test_projects_crud import (  # noqa: F401 - pytest fixtures
@@ -47,6 +52,10 @@ OLD = _epoch("2026-01-01T00:00:00")
 ORDER = ["open", "in_progress", "code_review", "merged"]
 
 
+def _window(series: MetricSeries, period) -> float | None:
+    return series_value(series, period.since_epoch, period.until_epoch + 1).value
+
+
 def test_rework_counts_backward_moves_and_reopens_in_the_window() -> None:
     period = status_period("7d", NOW)
     recent = NOW - HOUR
@@ -62,9 +71,10 @@ def test_rework_counts_backward_moves_and_reopens_in_the_window() -> None:
         "forward-only": [_entry("open", recent, created=True), _entry("merged", recent + 5)],
         "long-ago": [_entry("code_review", OLD), _entry("open", OLD + 1)],
     }
+    rework = MetricSeries("distinct", events=rework_events(histories, ORDER))
     # A ticket sent back twice counts once.
-    assert rework_count(histories, ORDER, period) == 2
-    assert rework_count(histories, ORDER, status_period("all", NOW)) == 3
+    assert _window(rework, period) == 2
+    assert _window(rework, status_period("all", NOW)) == 3
 
 
 def test_time_to_merged_uses_tickets_now_in_the_final_stage() -> None:
@@ -84,50 +94,114 @@ def test_time_to_merged_uses_tickets_now_in_the_final_stage() -> None:
         # No recorded creation: its age is unknown.
         "legacy": [_entry("open", created), _entry("merged", created + HOUR)],
     }
-    assert sorted(hours_to_final_stage(histories, "merged", period)) == [2, 8]
-    assert hours_to_final_stage(histories, None, period) == []
+    samples = hours_to_final_stage(histories, "merged")
+    median = series_value(MetricSeries("median", samples=samples), period.since_epoch, NOW + 1)
+    assert (median.value, median.sample_size) == (5.0, 2)
+    assert hours_to_final_stage(histories, None) == []
     assert nearest_rank([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9) == 9
     assert nearest_rank([4], 0.9) == 4
 
 
+def _inputs(spend, prs, histories, stages=None) -> KpiInputs:
+    return KpiInputs(
+        project=SimpleNamespace(id="p"),
+        period=status_period("7d", NOW),
+        sources=StatusSources(spend=spend, prs_merged=prs),
+        stage_histories=histories,
+        stages=stages or (lambda: [{"id": s, "is_complete": s == "merged"} for s in ORDER]),
+    )
+
+
 def test_compute_reads_only_what_the_kpis_need() -> None:
-    project = SimpleNamespace(id="p")
-    period = status_period("7d", NOW)
     created = NOW - 10 * HOUR
 
     def must_not_run():
         raise AssertionError("read data no KPI needs")
 
     spend = SimpleNamespace(spend=lambda project, period: MemberTotals(total=12345))
-    inputs = KpiInputs(
-        project=project,
-        period=period,
-        sources=StatusSources(spend=spend, prs_merged=None),
-        completed_moves=lambda: [{"ticket_id": "a"}, {"ticket_id": "a"}, {"ticket_id": "b"}],
-        stage_histories=lambda: {
-            "a": [_entry("open", created, created=True), _entry("merged", created + 3 * HOUR)]
-        },
-        stages=lambda: [{"id": stage, "is_complete": stage == "merged"} for stage in ORDER],
-    )
+    histories = {
+        "a": [
+            _entry("open", created, created=True),
+            _entry("merged", created + 3 * HOUR, complete=True),
+        ],
+        "b": [
+            _entry("open", created, created=True),
+            _entry("merged", created + HOUR, complete=True),
+        ],
+    }
     values = compute_metrics(
         ["spend_usd", "merged_prs", "tickets_shipped", "time_to_merged_p90_hours", "none"],
-        inputs,
+        _inputs(spend, None, lambda: histories),
     )
     assert values["spend_usd"] == MetricValue(123.45)
     # No PRs source on this server: unavailable, not zero.
     assert not values["merged_prs"].available
     assert values["tickets_shipped"] == MetricValue(2)
-    assert values["time_to_merged_p90_hours"] == MetricValue(3.0, sample_size=1)
+    assert values["time_to_merged_p90_hours"] == MetricValue(3.0, sample_size=2)
     assert "none" not in values
-    lazy = KpiInputs(
-        project=project,
-        period=period,
-        sources=StatusSources(spend=spend, prs_merged=None),
-        completed_moves=must_not_run,
-        stage_histories=must_not_run,
-        stages=must_not_run,
-    )
+    lazy = _inputs(spend, None, must_not_run, must_not_run)
     assert set(compute_metrics(["spend_usd"], lazy)) == {"spend_usd"}
+
+
+def test_trend_covers_seven_full_days_and_today() -> None:
+    """The target check uses the 7 full days ending yesterday; today is shown separately."""
+    today = _epoch("2026-03-10T00:00:00")
+    yesterday = today - DAY
+    eight_days_ago = today - 8 * DAY
+    histories = {
+        "y": [
+            _entry("open", OLD, created=True),
+            _entry("merged", yesterday + HOUR, complete=True),
+        ],
+        "t": [_entry("open", OLD, created=True), _entry("merged", NOW - HOUR, complete=True)],
+        "o": [_entry("open", OLD, created=True), _entry("merged", eight_days_ago, complete=True)],
+    }
+    by_day = {"2026-03-03": 100, "2026-03-09": 250, "2026-03-10": 999, "2026-03-01": 5000}
+    spend = SimpleNamespace(
+        spend=lambda project, period: MemberTotals(total=1349),
+        breakdown=lambda project, period: SimpleNamespace(by_day=by_day),
+    )
+    merged = [
+        SimpleNamespace(key="pr1", merged_at=yesterday + 5),
+        SimpleNamespace(key="pr2", merged_at=None),
+    ]
+    prs = SimpleNamespace(merged_items=lambda project: merged)
+    inputs = _inputs(spend, prs, lambda: histories)
+    shipped = ProjectKpi(
+        name="S", metric="tickets_shipped", why="w", target=2, direction="at_least"
+    )
+    budget = ProjectKpi(name="B", metric="spend_usd", why="w", target=3, direction="at_most")
+    prs_kpi = ProjectKpi(name="P", metric="merged_prs", why="w", target=1, direction="at_least")
+    rows = kpi_rows(
+        [shipped, budget, prs_kpi],
+        load_series(["tickets_shipped", "spend_usd", "merged_prs"], inputs),
+        inputs.period,
+    )
+    trend = rows[0]["trend"]
+    assert (trend["since_day_utc"], trend["until_day_utc"]) == ("2026-03-03", "2026-03-09")
+    assert [day["day_utc"] for day in trend["days"]][-1] == "2026-03-10"
+    assert len(trend["days"]) == 8
+    assert (trend["last_7_days"], trend["today"], trend["status"]) == (1, 1, "missed")
+    # The 7d window includes today, so it sees both tickets.
+    assert rows[0]["value"] == 2
+    spend_trend = rows[1]["trend"]
+    assert (spend_trend["last_7_days"], spend_trend["today"]) == (3.5, 9.99)
+    assert spend_trend["status"] == "missed"
+    assert rows[1]["value"] == 13.49
+    # Undated merges count only without a lower bound, so not in the trend.
+    assert (rows[2]["trend"]["last_7_days"], rows[2]["trend"]["status"]) == (1, "met")
+    unmeasured = ProjectKpi(name="N", metric="none", why="w", not_measured_reason="Later.")
+    assert kpi_rows([unmeasured], {}, inputs.period)[0]["trend"] is None
+
+
+def test_trend_is_unavailable_when_a_source_has_only_totals() -> None:
+    spend = SimpleNamespace(spend=lambda project, period: MemberTotals(total=500))
+    inputs = _inputs(spend, None, dict)
+    kpi = ProjectKpi(name="B", metric="spend_usd", why="w", target=3, direction="at_most")
+    row = kpi_rows([kpi], load_series(["spend_usd"], inputs), inputs.period)[0]
+    assert (row["value"], row["status"]) == (5.0, "missed")
+    assert row["trend"]["status"] == "unavailable"
+    assert {day["value"] for day in row["trend"]["days"]} == {None}
 
 
 def test_status_compares_against_the_target_in_its_direction() -> None:
