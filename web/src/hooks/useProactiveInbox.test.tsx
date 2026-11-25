@@ -277,6 +277,43 @@ it("stops after the batch cap and reports it as partial", async () => {
   expect(markAllSuggestionsRead).toHaveBeenCalledTimes(MARK_ALL_READ_BATCHES);
 });
 
+it("picks a capped run up where it stopped on the next run with the same filter", async () => {
+  // WHY: an agent's run leaves other agents' unread items unread, so restarting
+  // from the newest would read the same batches on every click and never get past them.
+  markAllAvailable = true;
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(1));
+  const mark = vi.mocked(markAllSuggestionsRead);
+  let served = 0;
+  mark.mockImplementation(async () => batch([], `c${(served += 1)}`, 1));
+  const run = (agentId: string | null) => {
+    let outcome: Promise<string> = Promise.resolve("");
+    act(() => {
+      outcome = result.current.markAllRead(agentId);
+    });
+    return outcome;
+  };
+
+  await expect(run("agent")).resolves.toBe("partial");
+  expect(mark.mock.calls[0]).toEqual(["agent", null]);
+  // A run for every agent has its own place.
+  mark.mockClear();
+  mark.mockResolvedValueOnce(batch([], null, 1));
+  await expect(run(null)).resolves.toBe("done");
+  expect(mark.mock.calls).toEqual([[null, null]]);
+
+  mark.mockClear();
+  mark.mockResolvedValueOnce(batch(["sug"], null, 0));
+  await expect(run("agent")).resolves.toBe("done");
+  expect(mark.mock.calls).toEqual([["agent", `c${MARK_ALL_READ_BATCHES}`]]);
+
+  // A run that reached the end starts from the newest again.
+  mark.mockClear();
+  mark.mockResolvedValueOnce(batch([], null, 0));
+  await expect(run("agent")).resolves.toBe("done");
+  expect(mark.mock.calls).toEqual([["agent", null]]);
+});
+
 it("leaves a failed mark-all to the caller and reloads the list", async () => {
   markAllAvailable = true;
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });

@@ -68,6 +68,13 @@ interface ScopeState {
    * until the PATCH settles and writes the server's count. Cards are unaffected.
    */
   started: Map<string, Map<string, number>>;
+  /**
+   * Where a Mark all as read left off, keyed by its agent filter ("" for every
+   * agent), when it stopped before the end. An agent's run skips other agents'
+   * unread items without marking them, so restarting from the newest would read
+   * the same batches again on every click.
+   */
+  markAllCursors: Map<string, string>;
   /** Instances to re-render when the overlay changes. */
   listeners: Set<() => void>;
 }
@@ -95,6 +102,7 @@ function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState 
       resolved: new Set(),
       confirmed: new Map(),
       started: new Map(),
+      markAllCursors: new Map(),
       listeners: new Set(),
     };
     byKey.set(scopeKeyText, state);
@@ -271,6 +279,8 @@ export function useProactiveInbox(
    * batch at a time. It waits behind any update in flight, like they wait for
    * each other. Resolves to `"done"`, `"partial"` when it stopped after
    * {@link MARK_ALL_READ_BATCHES} batches, or `"failed"`; the caller reports it.
+   * A run that stops early leaves its cursor for the next run with the same
+   * filter to pick up from.
    */
   const markAllRead = useCallback(
     (agentId: string | null): Promise<MarkAllReadOutcome> => {
@@ -292,7 +302,8 @@ export function useProactiveInbox(
       };
       const request: Promise<MarkAllReadOutcome> = scope.chain
         .then(async () => {
-          let cursor: string | null = null;
+          const resumeKey = agentId ?? "";
+          let cursor = scope.markAllCursors.get(resumeKey) ?? null;
           for (let batch = 0; batch < MARK_ALL_READ_BATCHES; batch += 1) {
             let reply: MarkReadBatchResult;
             try {
@@ -306,7 +317,11 @@ export function useProactiveInbox(
             await queryClient.cancelQueries({ queryKey: key });
             applyBatch(reply);
             cursor = reply.nextCursor;
-            if (cursor === null) return "done";
+            if (cursor === null) {
+              scope.markAllCursors.delete(resumeKey);
+              return "done";
+            }
+            scope.markAllCursors.set(resumeKey, cursor);
           }
           return "partial";
         })
