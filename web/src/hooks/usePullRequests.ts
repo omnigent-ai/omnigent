@@ -39,6 +39,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 // same way as the workspace filesystem hooks — reusing their helpers.
 
 import {
+  type Query,
   queryOptions,
   skipToken,
   useMutation,
@@ -46,7 +47,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -446,9 +447,13 @@ export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
   signal?: AbortSignal,
+  allowCached = false,
 ): Promise<PullRequestInfo> {
+  const params = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
+  if (allowCached) params.set("allow_cached", "true");
+  const search = params.toString();
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${search ? `?${search}` : ""}`,
     { signal },
   );
   if (res.status === 404) {
@@ -483,6 +488,37 @@ export async function fetchPullRequestInfo(
  *  `gh` API call but only while the panel is actually focused. */
 const PULL_REQUEST_POLL_MS = 5_000;
 const PULL_REQUEST_LIST_POLL_MS = 30_000;
+
+/**
+ * Whether a fetch of `query` is an interval poll, which may take the runner's
+ * previous read: the answer is at most one read old, and the next poll corrects it.
+ *
+ * Mount, focus and reopen refetches run only once data is stale, and Refresh, turn
+ * end and edits invalidate first, so a fetch of valid data that is still fresh for
+ * an active polling observer is that observer's timer. Polls slower than the stale
+ * time, such as list rows, read the forge every time. A user refresh must invalidate
+ * too ({@link useRefreshPullRequestInfo}); a plain `refetch()` would count as a poll.
+ */
+export function pollAcceptsCachedAnswer(
+  query: Query<PullRequestInfo> | undefined,
+  now = Date.now(),
+): boolean {
+  if (!query || query.state.data === undefined || query.state.isInvalidated) return false;
+  const age = now - query.state.dataUpdatedAt;
+  return query.observers.some(({ options }) => {
+    const interval =
+      typeof options.refetchInterval === "function"
+        ? options.refetchInterval(query)
+        : options.refetchInterval;
+    return (
+      options.enabled !== false &&
+      typeof interval === "number" &&
+      interval > 0 &&
+      typeof options.staleTime === "number" &&
+      age < options.staleTime
+    );
+  });
+}
 
 /**
  * The panel's poll interval for the current GitHub info, or `false` to stop.
@@ -678,12 +714,15 @@ function pullRequestInfoQueryOptions(
   const prUrl = options?.prUrl;
   return queryOptions({
     queryKey: pullRequestInfoQueryKey(conversationId, prUrl),
-    queryFn: prUrl
-      ? ({ signal }) =>
-          pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
-            fetchPullRequestInfo(conversationId!, prUrl, signal),
+    queryFn: ({ client, queryKey, signal }) => {
+      const query = client.getQueryCache().find<PullRequestInfo>({ queryKey, exact: true });
+      const allowCached = pollAcceptsCachedAnswer(query);
+      return prUrl
+        ? pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
+            fetchPullRequestInfo(conversationId!, prUrl, signal, allowCached),
           )
-      : () => fetchPullRequestInfo(conversationId!),
+        : fetchPullRequestInfo(conversationId!, undefined, undefined, allowCached);
+    },
     enabled,
     retry,
     retryDelay: runnerOfflineRetryDelay,
@@ -748,6 +787,22 @@ export function usePullRequestInfoSnapshot(rawConversationId: string | undefined
     retryOnMount: false,
     refetchOnWindowFocus: false,
   });
+}
+
+/**
+ * Read a session's PR info again from GitHub, as the panel's Refresh does. The
+ * queries are invalidated first, so none of these reads takes the runner's previous answer.
+ */
+export function useRefreshPullRequestInfo(rawConversationId: string | undefined) {
+  const queryClient = useQueryClient();
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  return useCallback(
+    () =>
+      conversationId
+        ? queryClient.invalidateQueries({ queryKey: pullRequestInfoQueryKey(conversationId) })
+        : Promise.resolve(),
+    [queryClient, conversationId],
+  );
 }
 
 /** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */

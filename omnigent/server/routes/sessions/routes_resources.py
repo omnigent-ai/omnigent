@@ -3621,9 +3621,21 @@ def register_resources_routes(
         session_id: str,
         conv: Conversation,
         pr_url: str | None = None,
+        *,
+        allow_cached: bool = False,
     ) -> dict[str, Any]:
-        """Read PR context through the runner or host and store what it reports."""
-        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        """Read PR context through the runner or host and store what it reports.
+
+        :param allow_cached: The client polls again soon, so the runner may answer
+            from its previous read.
+        """
+        params = await _github_params(
+            session_id,
+            {
+                **({"pr_url": pr_url} if pr_url else {}),
+                **({"allow_cached": True} if allow_cached else {}),
+            },
+        )
         requested_at = time.time()
         info = await _fs_get_with_host_fallback(
             session_id,
@@ -3633,6 +3645,10 @@ def register_resources_routes(
             runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github",
         )
+        # A runner or host may answer from a read that began before this request.
+        age = info.pop("cache_age_s", 0)
+        if isinstance(age, int | float) and age > 0:
+            requested_at -= age
         return await _with_server_pull_requests(session_id, info, requested_at)
 
     async def _update_host_pull_requests(
@@ -3874,6 +3890,7 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
+        allow_cached: bool = False,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -3884,10 +3901,12 @@ def register_resources_routes(
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
+        :param allow_cached: Set by a client that polls again soon: the answer may
+            come from the runner's previous read, at most a minute old.
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _github_info(session_id, conv, pr_url)
+        return await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",
