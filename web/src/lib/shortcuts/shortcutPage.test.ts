@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { describe, expect, it } from "vitest";
 
 import { SHORTCUT_GROUPS, shortcutBinding } from "./registry";
@@ -37,6 +39,24 @@ function everyContext(): ShortcutPageContext[] {
   ) as unknown as ShortcutPageContext[];
 }
 
+const pagesByPlatform = new Map<
+  boolean,
+  { context: ShortcutPageContext; groups: ShortcutPageGroup[] }[]
+>();
+
+/** Every context with the page it lists on this platform, built once for the whole file. */
+function everyPage(mac: boolean) {
+  let pages = pagesByPlatform.get(mac);
+  if (!pages) {
+    pages = everyContext().map((context) => ({
+      context,
+      groups: shortcutPageGroups(context, mac),
+    }));
+    pagesByPlatform.set(mac, pages);
+  }
+  return pages;
+}
+
 /** A page group as recorded, before rows named their registry binding. */
 type RecordedGroup = Omit<ShortcutPageGroup, "items"> & {
   items: Omit<ShortcutPageRow, "shortcutId">[];
@@ -50,14 +70,18 @@ function withoutShortcutIds(groups: ShortcutPageGroup[]): RecordedGroup[] {
   }));
 }
 
-/** The recorded groups for `context`, assembled as the page would list them. */
-function goldenGroupsFor(context: ShortcutPageContext, mac: boolean): RecordedGroup[] {
+/** The recorded groups for `context`, as the page would list them; adds unrecorded keys to `missingKeys`. */
+function goldenGroupsFor(
+  context: ShortcutPageContext,
+  mac: boolean,
+  missingKeys = new Set<string>(),
+): RecordedGroup[] {
   const platform = mac ? 0 : 1;
   const caps = (keys: GoldenRow["keys"]) => keys[platform].split(" ");
   return Object.entries(GOLDEN_GROUP_FLAGS).flatMap(([title, flags]) => {
     const on = flags.filter((flag) => context[flag]);
     const key = `${title}: ${on.length > 0 ? on.join("+") : "-"}`;
-    expect(key in GOLDEN_GROUPS, key).toBe(true);
+    if (!(key in GOLDEN_GROUPS)) missingKeys.add(key);
     const group = GOLDEN_GROUPS[key];
     if (!group) return [];
     return [
@@ -85,14 +109,21 @@ describe("shortcutPageGroups against the recorded rows", () => {
     { platform: "macOS", mac: true },
     { platform: "other platforms", mac: false },
   ])("lists exactly the recorded rows in every context on $platform", ({ mac }) => {
-    const contexts = everyContext();
-    expect(contexts).toHaveLength(4096);
-    for (const context of contexts) {
-      expect(
-        withoutShortcutIds(shortcutPageGroups(context, mac)),
-        JSON.stringify(context),
-      ).toStrictEqual(goldenGroupsFor(context, mac));
+    const pages = everyPage(mac);
+    expect(pages).toHaveLength(4096);
+    // One assertion per kind of failure: per-context expects dominate the run time.
+    const missingKeys = new Set<string>();
+    const differing = pages.flatMap(({ context, groups }) => {
+      const listed = withoutShortcutIds(groups);
+      const recorded = goldenGroupsFor(context, mac, missingKeys);
+      return isDeepStrictEqual(listed, recorded) ? [] : [{ context, listed, recorded }];
+    });
+    expect([...missingKeys]).toEqual([]);
+    const first = differing[0];
+    if (first) {
+      expect(first.listed, JSON.stringify(first.context)).toStrictEqual(first.recorded);
     }
+    expect(differing.length).toBe(0);
   });
 });
 
@@ -165,16 +196,22 @@ describe("shortcutPageGroups", () => {
 
 describe("rows the registry binds", () => {
   it("are every row, each under its binding's group with its label here", () => {
-    for (const context of everyContext()) {
-      for (const group of shortcutPageGroups(context, true)) {
+    const titles = new Map(SHORTCUT_GROUPS.map((group) => [group.id, group.title]));
+    // One assertion at the end: per-row expects across 4,096 contexts dominate the run time.
+    const mismatches = new Set<string>();
+    for (const { context, groups } of everyPage(true)) {
+      for (const group of groups) {
         for (const row of group.items) {
           const binding = shortcutBinding(row.shortcutId);
-          const { title } = SHORTCUT_GROUPS.find((candidate) => candidate.id === binding.group)!;
-          expect(group.title, row.shortcutId).toBe(title);
-          expect(row.label, row.shortcutId).toBe(binding.rowLabel?.(context) ?? binding.label);
+          if (group.title !== titles.get(binding.group)) {
+            mismatches.add(`${row.shortcutId} listed under ${group.title}`);
+          }
+          const label = binding.rowLabel?.(context) ?? binding.label;
+          if (row.label !== label) mismatches.add(`${row.shortcutId} labelled ${row.label}`);
         }
       }
     }
+    expect([...mismatches]).toEqual([]);
   });
 
   it("show the desktop menu's chord where the menu owns it, and the page's elsewhere", () => {
