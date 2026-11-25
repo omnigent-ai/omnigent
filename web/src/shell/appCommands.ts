@@ -132,7 +132,7 @@ export function useAppCommands({
               ],
               searchOnly: true,
               run: () => {
-                if (writeUiFeatureOverride("quick_pick_palette", true)) window.location.reload();
+                if (writeUiFeatureOverride("quick_pick_palette", true)) location.reload();
                 else toast.error("Couldn't save the feature preview on this device.");
               },
             },

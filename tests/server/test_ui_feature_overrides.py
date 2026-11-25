@@ -71,6 +71,22 @@ def test_each_listed_feature_is_visible_to_the_frontend(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", _overridable_features())
+def test_no_server_features_follow_a_listed_feature(name: str) -> None:
+    followers = [
+        definition.feature.value
+        for definition in FEATURE_DEFINITIONS
+        if definition.follows == Feature(name)
+    ]
+    assert not followers, f"{followers} follow {name} on the server, so it can't be overridden"
+
+
+@pytest.mark.parametrize("name", _overridable_features())
+def test_listed_feature_does_not_follow_another_feature(name: str) -> None:
+    follows = _definition(name).follows
+    assert follows is None, f"{name} follows {follows} on the server, so it can't be overridden"
+
+
+@pytest.mark.parametrize("name", _overridable_features())
 def test_no_server_code_reads_a_listed_feature(name: str) -> None:
     enum_reference = re.compile(rf"\bFeature\.{Feature(name).name}\b")
     quoted = re.compile(rf"[\"']{name}[\"']")

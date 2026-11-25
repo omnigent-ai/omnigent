@@ -14,11 +14,6 @@ export const OVERRIDABLE_UI_FEATURES: readonly OverridableUiFeature[] = [
     description: "Write chat messages in a CodeMirror editor that scrolls long drafts.",
   },
   {
-    feature: "workspace_sidebar_v2",
-    label: "Workspace tabs sidebar",
-    description: "Show the workspace sidebar as tabs: Files, Changes and pull request pages.",
-  },
-  {
     feature: "quick_pick_palette",
     label: "QuickPick command palette",
     description: "Run ⌘K and the session switcher on the fuzzy-matching QuickPick list.",

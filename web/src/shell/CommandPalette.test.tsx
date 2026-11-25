@@ -1258,31 +1258,22 @@ describe("CommandPalette — actions", () => {
 
 describe("CommandPalette — QuickPick preview bootstrap", () => {
   const label = "Enable feature preview: new QuickPick command palette";
-  const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(window.location.origin)}`;
+  const origin = window.location.origin;
+  const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(origin)}`;
   const isQuickPick = "QUICK_PICK_PALETTE" in commandPaletteModule;
 
   function searchPreview() {
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "preview" } });
   }
 
-  function mockReload() {
-    const reload = vi.fn();
-    const actualWindow = window;
-    vi.stubGlobal(
-      "window",
-      new Proxy(actualWindow, {
-        get(target, property) {
-          return property === "location"
-            ? { origin: target.location.origin, reload }
-            : Reflect.get(target, property, target);
-        },
-      }),
-    );
-    onTestFinished(() => {
-      vi.unstubAllGlobals();
-    });
-    return reload;
-  }
+  const reload = vi.fn();
+  beforeEach(() => {
+    reload.mockReset();
+    vi.stubGlobal("location", { origin, reload });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it.skipIf(isQuickPick)(
     "offers the command only in search and saves the opt-in before reloading",
@@ -1295,7 +1286,6 @@ describe("CommandPalette — QuickPick preview bootstrap", () => {
       expect(screen.queryByRole("option", { name: label })).toBeNull();
       searchPreview();
       const command = screen.getByRole("option", { name: label });
-      const reload = mockReload();
       fireEvent.click(command);
       expect(localStorage.getItem(key)).toBe('{"quick_pick_palette":true}');
       expect(reload).toHaveBeenCalledOnce();
@@ -1320,7 +1310,6 @@ describe("CommandPalette — QuickPick preview bootstrap", () => {
     });
     renderPalette();
     searchPreview();
-    const reload = mockReload();
     const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("denied");
     });

@@ -97,17 +97,24 @@ describe("UI feature overrides", () => {
   it("ignores overrides for removed sidebar flags", () => {
     localStorage.setItem(
       key,
-      JSON.stringify({ sidebar_saved_views: true, sidebar_windowed_rows: false }),
+      JSON.stringify({
+        sidebar_saved_views: true,
+        sidebar_windowed_rows: false,
+        workspace_sidebar_v2: true,
+      }),
     );
     expect(readUiFeatureOverrides()).toEqual({});
     const reported = info({
       quick_pick_palette: true,
       sidebar_saved_views: false,
       sidebar_windowed_rows: true,
+      workspace_sidebar_v2: false,
     });
+    expect(isFeatureEnabled(reported, "workspace_sidebar_v2")).toBe(false);
     expect(isFeatureEnabled(reported, "sidebar_saved_views")).toBe(false);
     expect(isFeatureEnabled(reported, "sidebar_windowed_rows")).toBe(true);
     expect(activeUiFeatureOverrides(reported)).toEqual([]);
+    expect(writeUiFeatureOverride("workspace_sidebar_v2", true)).toBe(false);
     expect(writeUiFeatureOverride("sidebar_saved_views", true)).toBe(false);
     expect(writeUiFeatureOverride("sidebar_windowed_rows", false)).toBe(false);
   });

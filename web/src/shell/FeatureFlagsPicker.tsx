@@ -113,7 +113,7 @@ export function FeatureFlagsPicker() {
         return "keepOpen" as const;
       }
       if (writeUiFeatureOverride(setting.id, choice === "automatic" ? null : choice === "on")) {
-        window.location.reload();
+        location.reload();
       } else {
         setStatus(settingFailedStatus(setting));
       }

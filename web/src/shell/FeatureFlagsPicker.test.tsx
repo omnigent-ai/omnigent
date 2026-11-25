@@ -1,14 +1,20 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { resetUiFeatureOverridesForTests } from "@/lib/uiFeatureOverrides";
-import { openFeatureFlagsPicker, useFeatureFlagsPickerStore } from "@/store/featureFlagsPicker";
+import {
+  closeFeatureFlagsPicker,
+  openFeatureFlagsPicker,
+  replaceFeatureFlagsPicker,
+  useFeatureFlagsPickerStore,
+} from "@/store/featureFlagsPicker";
 import { FeatureFlagsPicker } from "./FeatureFlagsPicker";
 
-const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(window.location.origin)}`;
+const origin = window.location.origin;
+const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(origin)}`;
 
 function renderPicker(quickPick = true) {
   render(
@@ -34,23 +40,11 @@ function openCanvas() {
   return screen.getByRole("combobox", { name: "Choose a value" });
 }
 
-function mockReload() {
-  const reload = vi.fn();
-  const realWindow = window;
-  vi.stubGlobal(
-    "window",
-    new Proxy(realWindow, {
-      get(target, property) {
-        return property === "location"
-          ? { origin: target.location.origin, reload }
-          : Reflect.get(target, property, target);
-      },
-    }),
-  );
-  return reload;
-}
+const reload = vi.fn();
 
 beforeEach(() => {
+  reload.mockReset();
+  vi.stubGlobal("location", { origin, reload });
   localStorage.clear();
   resetUiFeatureOverridesForTests();
 });
@@ -88,7 +82,6 @@ describe("FeatureFlagsPicker", () => {
     localStorage.setItem(key, '{"quick_pick_palette":true}');
     renderPicker(false);
     fireEvent.click(screen.getByRole("option", { name: /QuickPick command palette/ }));
-    const reload = mockReload();
     fireEvent.click(screen.getByRole("option", { name: label }));
     expect(localStorage.getItem(key)).toBe(stored);
     expect(reload).toHaveBeenCalledOnce();
@@ -103,7 +96,6 @@ describe("FeatureFlagsPicker", () => {
     ({ stored, label }) => {
       if (stored !== null) localStorage.setItem(key, stored);
       openCanvas();
-      const reload = mockReload();
       const write = vi.spyOn(Storage.prototype, "setItem");
       const remove = vi.spyOn(Storage.prototype, "removeItem");
       fireEvent.click(screen.getByRole("option", { name: label }));
@@ -120,7 +112,6 @@ describe("FeatureFlagsPicker", () => {
     expect(screen.getByRole("option", { name: /Automatic \(Off\)/ })).toHaveTextContent(
       "A Canvas page",
     );
-    const reload = mockReload();
     fireEvent.change(input, { target: { value: "on" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(localStorage.getItem(key)).toBe('{"canvas":true}');
@@ -134,15 +125,41 @@ describe("FeatureFlagsPicker", () => {
     localStorage.setItem(key, '{"canvas":true}');
     openCanvas();
     expect(screen.getByRole("option", { name: /^On/ })).toHaveTextContent("Current");
-    const reload = mockReload();
     fireEvent.click(screen.getByRole("option", { name: label }));
     expect(localStorage.getItem(key)).toBe(stored);
     expect(reload).toHaveBeenCalledOnce();
   });
 
+  it("reopens on the flags page after closing from a choices page", async () => {
+    openCanvas();
+    const write = vi.spyOn(Storage.prototype, "setItem");
+    const remove = vi.spyOn(Storage.prototype, "removeItem");
+    act(() => closeFeatureFlagsPicker());
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(write).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+    expect(localStorage.getItem(key)).toBeNull();
+    act(() => openFeatureFlagsPicker());
+    expect(screen.getByRole("combobox", { name: "UI feature flags" })).toBeInTheDocument();
+  });
+
+  it("disappears immediately when replaced and reopens on the flags page", () => {
+    openCanvas();
+    const write = vi.spyOn(Storage.prototype, "setItem");
+    const remove = vi.spyOn(Storage.prototype, "removeItem");
+    act(() => replaceFeatureFlagsPicker());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(write).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+    expect(localStorage.getItem(key)).toBeNull();
+    act(() => openFeatureFlagsPicker());
+    expect(screen.getByRole("combobox", { name: "UI feature flags" })).toBeInTheDocument();
+  });
+
   it("shows a failure and does not reload if storage refuses the write", () => {
     const input = openCanvas();
-    const reload = mockReload();
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("denied");
     });
