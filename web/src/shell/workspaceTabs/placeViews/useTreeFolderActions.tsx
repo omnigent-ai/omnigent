@@ -27,6 +27,8 @@ export const COPY_FOLDER_PATH_LABEL = "Copy folder path";
 const FOLDER_COMMANDS = ["copy-path", "open-in-vscode", "open-in-cursor", "reveal"] as const;
 
 export interface TreeFolderActionsInput {
+  /** The session the tree shows, which may not be the one the app has focused. */
+  conversationId: string;
   /** The absolute folder the tree shows, or null before the workspace is known. */
   folder: string | null;
   workspaceRoot: string | null;
@@ -40,6 +42,7 @@ export interface TreeFolderActionsInput {
 }
 
 export function useTreeFolderActions({
+  conversationId,
   folder,
   workspaceRoot,
   hostId,
@@ -49,7 +52,7 @@ export function useTreeFolderActions({
   refreshing,
   onRefresh,
 }: TreeFolderActionsInput): TreeFolderAction[] {
-  const folderCommands = useFileCommands(folder, { directory: true });
+  const folderCommands = useFileCommands(folder, { directory: true, conversationId });
   const actions: TreeFolderAction[] = [];
   if (folder && workspaceRoot) {
     const { parent, workspaceRoot: away } = browseNavigation({

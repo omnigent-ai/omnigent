@@ -181,6 +181,9 @@ function ParentFolderButton({
   );
 }
 
+/** A path as `/`-separated, without a trailing `/`, so two spellings of one folder compare equal. */
+const normalizePath = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/, "");
+
 /**
  * Where the files header can step from ``current``: its parent, while moving up stays
  * inside the workspace or this viewer may roam the host, and back to the workspace root.
@@ -200,7 +203,8 @@ export function browseNavigation({
   return {
     canRoam,
     parent: parent !== null && (canRoam || pathIsWithin(parent, workspace)) ? parent : null,
-    workspaceRoot: current === workspace ? null : workspace,
+    // "/repo/" and "C:\repo" name the same folder as "/repo" and "C:/repo".
+    workspaceRoot: normalizePath(current) === normalizePath(workspace) ? null : workspace,
   };
 }
 
@@ -246,8 +250,7 @@ function parentPath(absolutePath: string): string | null {
 }
 
 function pathIsWithin(path: string, root: string): boolean {
-  const normalize = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/, "");
-  const normalizedPath = normalize(path);
-  const normalizedRoot = normalize(root);
+  const normalizedPath = normalizePath(path);
+  const normalizedRoot = normalizePath(root);
   return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
 }

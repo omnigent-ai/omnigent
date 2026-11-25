@@ -33,6 +33,8 @@ import {
   TREE_FILTER_DEBOUNCE_MS,
   forgetTreeFiltersForTests,
 } from "@/shell/filesPane/useTreeFilters";
+import { useFileActionStore } from "@/shell/fileCommands/fileActionStore";
+import { FileViewerContext } from "@/shell/FileViewerContext";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
 import { toast } from "sonner";
@@ -93,6 +95,16 @@ function TestProviders({ children }: { children: ReactNode }) {
     </QueryClientProvider>
   );
 }
+
+/** The app's focused session, which a second session's pane must not act for. */
+const FOCUSED_VIEWER = {
+  openFile: vi.fn(),
+  openGithubTab: vi.fn(),
+  isChangedPath: () => false,
+  conversationId: "conv_focused",
+  workspaceRoot: "/work/repo",
+  workspaceHome: null,
+};
 
 function entry(path: string): WorkspaceFile {
   return { path, name: path.split("/").pop()!, type: "file", bytes: 1, modified_at: null };
@@ -362,6 +374,36 @@ describe("FilesPageTree", () => {
     fireEvent.keyDown(options, { key: "Enter" });
     fireEvent.click(screen.getByRole("menuitem", { name: "Refresh files" }));
     expect(refetchSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the folder's actions for its own session, not the one the app has focused", async () => {
+    rememberBrowseLocation("conv_1", "/work/repo/src");
+    vi.mocked(useWorkspaceAllFiles).mockReturnValue(listed([entry("src/a.ts")]));
+    useFileActionStore.setState({ pending: [] });
+    render(
+      <TestProviders>
+        <FileViewerContext.Provider value={FOCUSED_VIEWER}>
+          <FilesPageTree
+            conversationId="conv_1"
+            active
+            commandsActive
+            activePath="src/a.ts"
+            sort="alpha"
+            onSortChange={vi.fn()}
+            showHidden={false}
+            onShowHiddenChange={vi.fn()}
+            showIgnored
+            onShowIgnoredChange={vi.fn()}
+            onFileSelect={vi.fn()}
+          />
+        </FileViewerContext.Provider>
+      </TestProviders>,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Tree options" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Copy folder path" }));
+    const [request] = useFileActionStore.getState().pending;
+    expect(request?.command).toBe("copy-path");
+    expect(request?.target.conversationId).toBe("conv_1");
   });
 
   it("offers the folder's actions on a right-click of its name, which stops at the workspace", async () => {

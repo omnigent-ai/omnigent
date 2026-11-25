@@ -278,6 +278,7 @@ export function FilesPageTree({
   // through the token, every folder opened under the root.
   const [refreshToken, setRefreshToken] = useState(0);
   const folderActions = useTreeFolderActions({
+    conversationId,
     folder,
     workspaceRoot,
     hostId: session?.hostId ?? null,
@@ -301,10 +302,7 @@ export function FilesPageTree({
     if (search.data && !search.isPlaceholderData) settledSearch.current = searchScope;
   });
   const matchesFromOtherSearch = search.isPlaceholderData && settledSearch.current !== searchScope;
-  // A listing with nothing to show mounts no tree, so a reveal it holds is missed here.
-  // A reveal the globs would hide ends them instead, so the file can show.
-  // What the tree would list at its top, deleted files included; a listing that is all
-  // hidden says so instead, and one the globs leave empty says that.
+  // Git-only paths count when deciding whether the globs leave the tree empty.
   const listing = files.data?.available ? files.data.data : null;
   const folderChanges = useMemo(
     () =>
@@ -316,10 +314,15 @@ export function FilesPageTree({
     [changes.data, location, workspaceRoot],
   );
   const allHidden = listing !== null && visibleEntries(listing, showHidden).length === 0;
-  const filteredOut =
+  const filteredOutText =
+    summary.active &&
     listing !== null &&
     patterns !== undefined &&
-    treeRootEntries(listing, folderChanges, showHidden, patterns).length === 0;
+    treeRootEntries(listing, folderChanges, showHidden, patterns).length === 0
+      ? summary.emptyText
+      : null;
+  const filteredOut = filteredOutText !== null;
+  // A listing with nothing to show mounts no tree, so a reveal it holds is missed here.
   const emptyListing = !searching && !revealFiltered && (allHidden || filteredOut);
   const pendingReveal = reveal.activeReveal;
   useEffect(() => {
@@ -535,9 +538,7 @@ export function FilesPageTree({
         </div>
       );
     }
-    if (filteredOut) {
-      return summary.active ? <TreeMessage>{summary.emptyText}</TreeMessage> : null;
-    }
+    if (filteredOutText !== null) return <TreeMessage>{filteredOutText}</TreeMessage>;
     return (
       <FilesTree
         key={`${conversationId}\0${location}`}
