@@ -316,7 +316,7 @@ describe("omnigent SDK runtime", () => {
       const action = client.agent.request("run_card", { cardId: "c1" });
       expect(lastFrameMessage(hostPort)).toMatchObject({
         method: "agent.v1.request",
-        params: { action: "run_card", params: { cardId: "c1" } },
+        params: { action: "run_card", params: { cardId: "c1" }, operationId: expect.any(String) },
       });
       respond(hostPort, {
         id: lastRequestId(hostPort),
@@ -770,6 +770,32 @@ describe("omnigent SDK runtime", () => {
       watch.dispose();
     });
 
+    it("sends one key per logical request, and the caller's key on a retry", async () => {
+      const sentKey = () =>
+        (lastFrameMessage(hostPort) as { params: { operationId?: unknown } }).params.operationId;
+      const first = client.agent.request("run_card", {});
+      const firstKey = sentKey();
+      respond(hostPort, { id: lastRequestId(hostPort), ok: true, result: { actionId: "a1" } });
+      await first;
+      const second = client.agent.request("run_card", {});
+      const secondKey = sentKey();
+      respond(hostPort, { id: lastRequestId(hostPort), ok: true, result: { actionId: "a2" } });
+      await second;
+      expect(typeof firstKey).toBe("string");
+      expect(secondKey).not.toBe(firstKey);
+
+      // A timed-out request names its key, so asking again with it is the same request.
+      const timedOut = client.agent.request("run_card", {}, { timeoutMs: 100 });
+      const key = sentKey();
+      const failure = timedOut.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(await failure).toMatchObject({ code: "DEADLINE_EXCEEDED", operationId: key });
+      const retry = client.agent.request("run_card", {}, { idempotencyKey: String(key) });
+      expect(sentKey()).toBe(key);
+      respond(hostPort, { id: lastRequestId(hostPort), ok: true, result: { actionId: "a3" } });
+      await retry;
+    });
+
     it("explains the call and snapshot shape when watch is used without a listener", () => {
       expect(() => callUntyped(client.agent.watch, client.agent, ["a1"])).toThrow(
         /client\.agent\.watch\(function \(snapshot\).*actionIds.*items holds one/,
@@ -840,6 +866,25 @@ describe("omnigent SDK permission guards", () => {
     card.addEventListener("click", clicked);
     card.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     expect(clicked).not.toHaveBeenCalled();
+  });
+
+  it("reports an empty selection once, however many clicks select nothing", async () => {
+    const { doc, runtime } = page("<p>Nothing to select</p>");
+    const { hostPort } = await connected(runtime);
+    const selections = () =>
+      (hostPort.peer?.posted ?? []).filter(
+        (message) => (message as { method?: string }).method === "ui.v1.selection",
+      ).length;
+
+    // Each click's report runs before the next click, as with a person clicking.
+    doc.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    await observed();
+    doc.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    await observed();
+    doc.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    await observed();
+
+    expect(selections()).toBe(1);
   });
 
   it("keeps controls blocked when the page re-enables them or adds new ones", async () => {

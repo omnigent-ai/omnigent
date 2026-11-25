@@ -245,14 +245,17 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       return;
     }
     // A new mouse or keyboard selection is reported even when it matches the last one, so the
-    // host shows its buttons again after it dismissed them.
+    // host shows its buttons again after it dismissed them; "nothing selected" is not repeated.
+    function forgetSelection() {
+      if (lastSelection !== 'null') lastSelection = null;
+    }
     document.addEventListener('mouseup', function () {
-      lastSelection = null;
+      forgetSelection();
       scheduleSelectionReport(0);
     });
     document.addEventListener('keyup', function (event) {
       if (event.shiftKey || event.key === 'Shift') {
-        lastSelection = null;
+        forgetSelection();
         scheduleSelectionReport(0);
       }
     });
@@ -926,7 +929,10 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       }),
       agent: Object.freeze({
         request: function (action, params, options) {
-          return call('agent.v1.request', { action: action, params: params || {} }, options).then(function (receipt) {
+          // A retry passes the failed call's key (error.operationId, or its own
+          // idempotencyKey) and gets the first request's receipt, never a second action.
+          var operationId = operationIdFrom(options);
+          return call('agent.v1.request', { action: action, params: params || {}, operationId: operationId }, options, operationId).then(function (receipt) {
             if (!receipt || typeof receipt.actionId !== 'string') {
               return receipt;
             }

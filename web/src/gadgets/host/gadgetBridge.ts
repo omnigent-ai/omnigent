@@ -43,6 +43,8 @@ export type GadgetBridgeCloseReason = "disposed" | "protocol_violations" | "revi
 export interface GadgetActionRequest {
   action: string;
   params: Record<string, unknown>;
+  /** The call's idempotency key: asking again with it answers from the first request. */
+  operationId?: string;
 }
 
 /** An Omnigent page a navigation call asks the host to open. */
@@ -79,7 +81,11 @@ export interface StartGadgetBridgeOptions {
    * Hands an `agent.v1.request` to the viewer's gadget session and resolves with what the frame
    * receives. Throw a `BridgeError` to refuse it. Without it, action requests are refused.
    */
-  requestAction?: (request: GadgetActionRequest) => Promise<Record<string, unknown>>;
+  /** `signal` aborts when the frame cancels the call, so work not yet sent can stop. */
+  requestAction?: (
+    request: GadgetActionRequest,
+    signal: AbortSignal,
+  ) => Promise<Record<string, unknown>>;
   /** Receives what the viewer selected in the gadget, or null once the selection is gone. */
   onSelection?: (selection: GadgetSelection | null) => void;
   /** Reads action progress for `agent.v1.progress`: the given IDs, or the viewer's tracked actions. */
@@ -196,11 +202,13 @@ function requireDisplay<T extends GadgetNavigationDisplay>(
 }
 
 const ACTION_NAME = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+// The server's operation ID pattern.
+const OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 const MAX_ACTION_PARAMS_BYTES = 8 * 1024;
 
 /** Validates an `agent.v1.request` call; the server checks it against the gadget's declared actions. */
 export function toActionRequest(params: Record<string, unknown>): GadgetActionRequest {
-  requireKeys(params, ["action"], ["params"]);
+  requireKeys(params, ["action"], ["params", "operationId"]);
   const action = params.action;
   if (typeof action !== "string" || !ACTION_NAME.test(action)) {
     throw new BridgeError(
@@ -218,7 +226,15 @@ export function toActionRequest(params: Record<string, unknown>): GadgetActionRe
       `"params" must be at most ${MAX_ACTION_PARAMS_BYTES / 1024} KiB`,
     );
   }
-  return { action, params: actionParams };
+  if (params.operationId === undefined) return { action, params: actionParams };
+  const operationId = requireString(params, "operationId", GADGET_LIMITS.maxOperationIdLength);
+  if (!OPERATION_ID.test(operationId)) {
+    throw new BridgeError(
+      "INVALID_ARGUMENT",
+      '"operationId" must be letters, digits and _ . : - starting with a letter or digit',
+    );
+  }
+  return { action, params: actionParams, operationId };
 }
 
 /** What the viewer selected in a gadget; `rect` is in the frame's viewport. */
@@ -671,7 +687,7 @@ export function startGadgetBridge(options: StartGadgetBridgeOptions): GadgetBrid
         if (!requestAction) {
           throw new BridgeError("UNSUPPORTED", "This host cannot run gadget actions.");
         }
-        const outcome = await requestAction(actionRequest);
+        const outcome = await requestAction(actionRequest, controller.signal);
         if (stillCurrent()) {
           respond({
             v: GADGET_PROTOCOL_VERSION,

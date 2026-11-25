@@ -491,6 +491,7 @@ export async function requestGadgetAction(
   request: GadgetActionRequest,
   navigate: GadgetNavigate,
   railSessionId?: string,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   if (!app.permissions.publish) {
     throw new BridgeError(
@@ -499,9 +500,11 @@ export async function requestGadgetAction(
     );
   }
   // Server refusals (an undeclared action, params that do not match) reach the frame with their code.
+  // The caller's key makes a retry (after a timeout, say) the same request, answered from the
+  // first one even once it finished.
   const entry = await queueGadgetAction(app.id, {
     ...request,
-    operationId: randomUUID(),
+    operationId: request.operationId ?? randomUUID(),
   });
   if (entry.delivered) {
     // The same request is still open in a session (or this is a retry of one that reached it),
@@ -515,6 +518,8 @@ export async function requestGadgetAction(
     await recordUnrecordedDeliveries(gotIt);
     return { actionId: entry.id, delivery: entry.merged ? "merged" : "sent" };
   }
+  // Cancelled before its message left: it stays queued, and asking again with its key sends it.
+  if (signal?.aborted) throw new BridgeError("CANCELLED", "The call was cancelled.");
   // A new entry, or an open one that never reached a session (for example its New session was
   // abandoned): send its message, so the session that starts or gets it can carry it out.
   // The session works without the viewer watching; the page marks where it can be opened instead.

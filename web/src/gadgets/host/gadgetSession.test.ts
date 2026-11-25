@@ -415,6 +415,27 @@ describe("gadget session", () => {
     },
   );
 
+  it("asks with the caller's key, and sends nothing for a request cancelled before its message left", async () => {
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) => res(ctx.status(201), ctx.json(ENTRY))),
+    );
+    const queued = waitForRequest("post", `${API}/app-1/actions`);
+    const controller = new AbortController();
+    controller.abort();
+
+    const request = requestGadgetAction(
+      EDITOR,
+      { action: "run_card", params: { cardId: "c1" }, operationId: "req-1" },
+      navigate,
+      undefined,
+      controller.signal,
+    );
+
+    await expect(request).rejects.toMatchObject({ code: "CANCELLED" });
+    expect(await (await queued).json()).toMatchObject({ operation_id: "req-1" });
+    expect(sendUserMessage).not.toHaveBeenCalled();
+  });
+
   it("still takes a message the session answers without queueing it", async () => {
     server.use(
       rest.get(`${API}/app-1/session`, (_req, res, ctx) =>

@@ -248,11 +248,14 @@ export interface OmnigentAgent {
    * one of the gadget's declared actions. Needs a click inside the app and edit access to the
    * gadget (`PERMISSION_DENIED` otherwise). The session records progress in the gadget's
    * action ledger and, as the action's description says, in the gadget's records.
+   * `idempotencyKey` names one logical request: after an unknown outcome (a timeout), asking
+   * again with it, or with the error's `operationId`, returns the first receipt, even once that
+   * action finished, instead of running it again.
    */
   request: (
     action: string,
     params?: { [key: string]: JsonValue },
-    options?: OmnigentCallOptions,
+    options?: OmnigentMutationOptions,
   ) => Promise<OmnigentActionReceipt>;
   /** Progress of up to 20 actions, or of the viewer's recent actions (at most 10) when none are given. */
   progress: (

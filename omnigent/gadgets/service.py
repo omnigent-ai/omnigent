@@ -225,6 +225,11 @@ def _identifier(value: Any, label: str) -> str:
     return value
 
 
+def _reached_a_session(action: dict) -> bool:
+    """Whether a session took this ledger entry: it left ``queued`` or names its session."""
+    return action.get("state") != "queued" or bool(action.get("session_id"))
+
+
 def _operation_id(value: Any) -> str:
     if not isinstance(value, str) or _OPERATION_ID.fullmatch(value) is None:
         raise InvalidInput("Invalid operation ID")
@@ -1287,7 +1292,12 @@ class GadgetService:
             document = ledger.create(
                 "actions", record_id, value, operation_id, self.viewer.user_id
             )
-        if not any(record.get("id") == document.id for record in open_records):
+        tracked = any(record.get("id") == document.id for record in open_records)
+        if existing is not None and not tracked and _reached_a_session(existing.value):
+            # A retry of a request whose action a session took and that has since finished
+            # (finished actions leave the viewer record): the first receipt, sent nowhere again.
+            return {**document.to_dict(), "merged": False, "delivered": True}
+        if not tracked:
             record = {"id": document.id, "digest": digest, "requested_at": int(time.time())}
             self._save_viewer(gadget, viewer, [*still_open, record], "open-" + operation_id)
             delivered = False

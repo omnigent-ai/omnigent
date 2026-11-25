@@ -249,7 +249,9 @@ interface Doc {
 
 interface Agent {
   // Call from a click handler inside the page; needs Can edit access.
-  request(action: string, params?: object):
+  // Retry an unknown outcome with { idempotencyKey: error.operationId }: it answers from
+  // the first request instead of running the action twice.
+  request(action: string, params?: object, options?: { idempotencyKey?: string }):
     Promise<{ actionId: string; delivery: "sent" | "starting" | "merged" }>;
   progress(actionIds?: string[]): Promise<{ items: ActionProgress[] }>;
   // The listener comes first and the IDs go in options. Each snapshot lists every
@@ -287,7 +289,7 @@ interface OmnigentError extends Error {
   code: string; // CONFLICT, CONSTRAINT_VIOLATION, NOT_FOUND, PERMISSION_DENIED,
                 // INVALID_ARGUMENT, UNAVAILABLE, REVISION_CHANGED, ...
   retryable: boolean;
-  operationId?: string; // for a write: pass it back as idempotencyKey to retry
+  operationId?: string; // for a write or action request: pass it back as idempotencyKey
   requestId?: string; // for logs; keep it out of messages
 }
 ```

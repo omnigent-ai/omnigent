@@ -311,14 +311,20 @@ export function GadgetFrame({
   );
 
   const requestAction = useCallback(
-    async (request: GadgetActionRequest) => {
+    async (request: GadgetActionRequest, signal: AbortSignal) => {
       if (!claimGesture()) {
         throw new BridgeError(
           "PERMISSION_DENIED",
           "Omnigent runs an action only right after a click in the gadget.",
         );
       }
-      return requestGadgetAction(latestRef.current.app, request, goTo, latestRef.current.sessionId);
+      return requestGadgetAction(
+        latestRef.current.app,
+        request,
+        goTo,
+        latestRef.current.sessionId,
+        signal,
+      );
     },
     [claimGesture, goTo],
   );

@@ -506,7 +506,7 @@ describe("startGadgetBridge", () => {
 
   describe("actions", () => {
     it("hands a declared action to the host and answers with its receipt, without any capability", async () => {
-      const requestAction = vi.fn((_request: GadgetActionRequest) =>
+      const requestAction = vi.fn((_request: GadgetActionRequest, _signal: AbortSignal) =>
         Promise.resolve({ actionId: "a1", delivery: "sent" }),
       );
       const { port, callRpc } = start({ context: { ...CONTEXT, capabilities: [] }, requestAction });
@@ -516,7 +516,10 @@ describe("startGadgetBridge", () => {
       );
 
       await waitFor(() => expect(port.responseFor("r1")).toBeDefined());
-      expect(requestAction).toHaveBeenCalledWith({ action: "run_card", params: { cardId: "c1" } });
+      expect(requestAction).toHaveBeenCalledWith(
+        { action: "run_card", params: { cardId: "c1" } },
+        expect.any(AbortSignal),
+      );
       expect(port.responseFor("r1")).toEqual({
         v: 1,
         kind: "response",
@@ -554,6 +557,11 @@ describe("startGadgetBridge", () => {
       ["an action name that is not an identifier", { action: "Run Card" }],
       ["params that are not an object", { action: "run_card", params: ["c1"] }],
       ["an extra parameter", { action: "run_card", session: "s1" }],
+      ["an operation ID with a space", { action: "run_card", operationId: "req 1" }],
+      [
+        "an operation ID over the length limit",
+        { action: "run_card", operationId: "r".repeat(129) },
+      ],
       ["params over the size limit", { action: "run_card", params: { notes: "x".repeat(9000) } }],
       // Fewer characters than the limit, but more UTF-8 bytes.
       [
@@ -572,6 +580,29 @@ describe("startGadgetBridge", () => {
         error: { code: "INVALID_ARGUMENT" },
       });
       expect(requestAction).not.toHaveBeenCalled();
+    });
+
+    it("passes the frame's idempotency key to the host, and aborts it when the frame cancels", async () => {
+      let signal: AbortSignal | undefined;
+      const requestAction = vi.fn((_request: GadgetActionRequest, given: AbortSignal) => {
+        signal = given;
+        return new Promise<Record<string, unknown>>(() => {});
+      });
+      const { port } = start({ requestAction });
+
+      port.fromFrame(
+        request("r1", "agent.v1.request", { action: "run_card", operationId: "req-1" }),
+      );
+      await waitFor(() => expect(requestAction).toHaveBeenCalled());
+      expect(requestAction.mock.calls[0][0]).toEqual({
+        action: "run_card",
+        params: {},
+        operationId: "req-1",
+      });
+      expect(signal?.aborted).toBe(false);
+
+      port.fromFrame({ v: 1, kind: "cancel", id: "r1" });
+      await waitFor(() => expect(signal?.aborted).toBe(true));
     });
 
     it("answers UNSUPPORTED when the host cannot run actions", async () => {

@@ -1186,8 +1186,8 @@ def test_a_late_rule_update_leaves_a_dependent_created_again_alone(
                 operation_id=f"d-edit-{edit}",
             )
         resume.set()
-        with contextlib.suppress(Exception):
-            stopped.result(10)
+        # The late worker finishes without an error: it leaves the record alone.
+        stopped.result(10)
     after = _run(service, app, "d")
     assert after is not None
     assert after["value"]["cardId"] == "x"
@@ -1964,6 +1964,37 @@ def test_an_identical_action_retry_after_a_republish_gets_its_first_receipt(
     with pytest.raises(Conflict) as reused:
         service.request_action(app["id"], {**request, "params": {"cardId": "c2"}})
     assert reused.value.reason == "operation_reuse"
+
+
+def test_retrying_an_action_that_already_finished_returns_its_receipt_without_a_new_one(
+    gadgets: Fixture,
+) -> None:
+    service = gadgets.service()
+    app = publish_actions_board(service)
+    request = {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "req-1"}
+    first = service.request_action(app["id"], request)
+
+    def update(version: str, operation_id: str, **changes):
+        return service.update_action(
+            app["id"],
+            {"id": first["id"], "if_version": version, "operation_id": operation_id, **changes},
+        )
+
+    running = update(first["version"], "u-1", state="running", session_id="child_1")
+    update(running["version"], "u-2", state="done", summary="Ran.")
+    # Another request moves the finished action out of the viewer's open list.
+    service.request_action(
+        app["id"], {"action": "run_card", "params": {"cardId": "c2"}, "operation_id": "req-2"}
+    )
+
+    retry = service.request_action(app["id"], request)
+
+    assert retry["id"] == first["id"]
+    assert retry["delivered"] is True
+    assert [item["id"] for item in service.list_actions(app["id"])["items"]].count(
+        first["id"]
+    ) == 1
+    assert len(service.list_actions(app["id"])["items"]) == 2
 
 
 def test_an_action_past_the_open_limit_is_refused_before_it_is_accepted(
