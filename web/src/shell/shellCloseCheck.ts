@@ -273,16 +273,13 @@ export function useShellCloseRequest<Item>(
   confirm: () => void;
   cancel: () => void;
 } {
-  // Held with its session: a dialog about another session's shells doesn't show.
-  const [asked, setAsked] = useState<{
-    sessionId: string | null | undefined;
-    pending: PendingShellClose<Item>;
-  } | null>(null);
-  const pending = asked && asked.sessionId === sessionId ? asked.pending : null;
-  const setPending = useCallback(
-    (next: PendingShellClose<Item> | null) => setAsked(next && { sessionId, pending: next }),
-    [sessionId],
-  );
+  const [pending, setPending] = useState<PendingShellClose<Item> | null>(null);
+  // Another session discards the question, so returning can't show it or close its shells.
+  const [askedSessionId, setAskedSessionId] = useState(sessionId);
+  if (askedSessionId !== sessionId) {
+    setAskedSessionId(sessionId);
+    setPending(null);
+  }
   const latestClose = useRef(close);
   latestClose.current = close;
   const latestPending = useRef(pending);

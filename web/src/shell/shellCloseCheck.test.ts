@@ -333,6 +333,11 @@ describe("useShellCloseRequest", () => {
     act(() => result.current.request("tab-1", null));
     rerender({ sessionId: "conv_b" });
     expect(result.current.pending).toBeNull();
+    // Back on the first session, the question is gone, and confirming closes nothing.
+    rerender({ sessionId: "conv_a" });
+    expect(result.current.pending).toBeNull();
+    act(() => result.current.confirm());
+    expect(close).not.toHaveBeenCalled();
 
     runnerSays({ terminal_one: async () => new Promise<Response>(() => {}) });
     act(() => result.current.request("tab-b", ["terminal_one"]));
