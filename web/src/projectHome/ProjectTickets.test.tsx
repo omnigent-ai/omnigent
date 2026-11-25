@@ -1223,6 +1223,19 @@ describe("Project ticket board", () => {
       expect(activity).not.toHaveTextContent("response contact");
       expect(activity).not.toHaveTextContent("lead session id");
       expect(within(activity).getAllByRole("listitem")).toHaveLength(5);
+      // Agent entries show their harness's own icon instead of the generic robot.
+      const commentItem = within(activity).getByText("The panel is ready.").closest("li")!;
+      await waitFor(() =>
+        expect(
+          commentItem.querySelector(
+            '[data-testid="ticket-session-avatar"] [data-harness-icon="codex"]',
+          ),
+        ).not.toBeNull(),
+      );
+      const labelItem = within(activity)
+        .getByText(/updated labels/)
+        .closest("li")!;
+      expect(labelItem.querySelector('[data-testid="ticket-session-avatar"]')).not.toBeNull();
       expect(within(activity).getAllByRole("link", { name: "Build ticket panel" })).toHaveLength(2);
       for (const link of within(activity).getAllByRole("link", { name: "Build ticket panel" })) {
         expect(link).toHaveAttribute("href", href);

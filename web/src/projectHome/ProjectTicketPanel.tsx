@@ -72,7 +72,7 @@ import {
   TicketMarkdown,
   useTicketImageUpload,
 } from "./ticketImages";
-import { TicketSessionLink } from "./TicketSessionLink";
+import { TicketSessionAvatar, TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketRelatedTickets } from "./TicketRelatedTickets";
 import { parseAskPosition, useTicketAsk } from "./useTicketAsk";
@@ -1275,7 +1275,11 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
               {!Array.isArray(entry) || showAgentNotes ? (
                 group.map(renderItem)
               ) : (
-                <TicketAgentNotesFold notes={entry} renderItem={renderItem} />
+                <TicketAgentNotesFold
+                  notes={entry}
+                  personaLookup={personaLookup}
+                  renderItem={renderItem}
+                />
               )}
             </Fragment>
           );
@@ -1316,18 +1320,28 @@ function groupAgentNotes(events: TicketEvent[]): (TicketEvent | TicketEvent[])[]
 
 function TicketAgentNotesFold({
   notes,
+  personaLookup,
   renderItem,
 }: {
   notes: TicketEvent[];
+  personaLookup: ReturnType<typeof useProjectPersonaLookup>;
   renderItem: (event: TicketEvent) => ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  // Notes from a single session show that session's avatar; a mix keeps the generic one.
+  const sessions = new Set(notes.map((note) => note.session_id));
+  const onlySession = sessions.size === 1 ? (notes[0]?.session_id ?? null) : null;
+  const persona = usePersonaForSession(onlySession, personaLookup);
   const label = `${notes.length} agent ${notes.length === 1 ? "note" : "notes"}`;
   return (
     <>
       <li className="relative flex min-w-0 gap-3 pb-4 last:pb-0 before:absolute before:top-6 before:bottom-0 before:left-3 before:w-px before:bg-border/60 last:before:hidden">
         <span className="relative flex size-6 shrink-0 items-center justify-center bg-background text-muted-foreground">
-          <BotIcon aria-hidden className="size-3.5" />
+          {onlySession ? (
+            <TicketSessionAvatar sessionId={onlySession} persona={persona} />
+          ) : (
+            <BotIcon aria-hidden className="size-3.5" />
+          )}
         </span>
         <Button
           type="button"
@@ -1445,7 +1459,9 @@ function TicketActivityItem({
           note && "rounded-full bg-muted",
         )}
       >
-        {note && personaName ? (
+        {note && event.session_id ? (
+          <TicketSessionAvatar sessionId={event.session_id} persona={personaName} />
+        ) : note && personaName ? (
           <PersonaAvatar name={personaName} size="md" />
         ) : note ? (
           agent ? (
@@ -1467,6 +1483,8 @@ function TicketActivityItem({
           ) : (
             <LinkIcon aria-hidden className="size-3.5" />
           )
+        ) : event.session_id ? (
+          <TicketSessionAvatar sessionId={event.session_id} persona={personaName} />
         ) : (
           <span aria-hidden className="size-1.5 rounded-full bg-muted-foreground/50" />
         )}

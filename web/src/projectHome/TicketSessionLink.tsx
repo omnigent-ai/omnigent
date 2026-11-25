@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { BotIcon, ChevronRightIcon } from "lucide-react";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
@@ -124,5 +125,44 @@ export function TicketSessionLink({
         )}
       </span>
     </Link>
+  );
+}
+
+/**
+ * A session's avatar in the ticket timeline: its harness logo (e.g. Claude Code), or for a
+ * team role its avatar with that logo as a small badge, as in the chat orb. An agent whose
+ * harness the app doesn't know keeps the generic robot.
+ */
+export function TicketSessionAvatar({
+  sessionId,
+  persona,
+}: {
+  sessionId: string;
+  persona?: string | null;
+}) {
+  const { query } = useTicketSessionMetadata(sessionId, false);
+  const session = query.data;
+  const agent = session
+    ? sessionAgentIdentity({
+        agentName: session.agent_name,
+        harness: session.harness,
+        labels: session.labels,
+      })
+    : null;
+  const logo = agent ? (
+    <ComposerAgentIcon agent={agent} className="size-3.5" />
+  ) : (
+    <BotIcon aria-hidden className="size-3.5" />
+  );
+  if (!persona) return <span data-testid="ticket-session-avatar">{logo}</span>;
+  return (
+    <span data-testid="ticket-session-avatar" className="relative inline-flex">
+      <PersonaAvatar name={persona} size="md" />
+      {agent && (
+        <span className="absolute -right-1 -bottom-1 grid size-3.5 place-items-center rounded-full border border-border/70 bg-background">
+          <ComposerAgentIcon agent={agent} className="size-2.5" />
+        </span>
+      )}
+    </span>
   );
 }
