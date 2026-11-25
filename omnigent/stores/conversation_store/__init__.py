@@ -201,6 +201,12 @@ def muted_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# Who archived the session. Written only by the inactive-session retention
+# policy (value ``retention``) in the same transaction as ``archived_at``,
+# and deleted on unarchive. Manual archives leave the key absent.
+ARCHIVED_BY_LABEL_KEY = "omnigent.archived_by"
+ARCHIVED_BY_RETENTION_VALUE = "retention"
+
 # Server-owned origin, retained when a schedule's run history is deleted.
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_source_sha256"
@@ -289,6 +295,7 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    ARCHIVED_BY_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
     # Nor is a fork of a session a run launched; the automation doesn't share it.
@@ -384,6 +391,39 @@ class SessionConnectivity:
     needs_workspace: bool
     imported: bool = False
     runner_last_seen: int | None = None
+
+
+@dataclass(frozen=True)
+class RetentionCandidate:
+    """One inactive top-level session the archive-retention policy may select.
+
+    ``updated_at`` is the persisted last-activity timestamp. Tree fields cover
+    this session and every conversation that shares its root, so a running or
+    waiting child counts as active work or pending input on the parent.
+
+    :param id: Conversation id, e.g. ``"conv_abc123"``.
+    :param title: Session title, or ``None`` when untitled.
+    :param updated_at: Unix epoch seconds of the last persisted activity.
+    :param project_id: First-class project id, or ``None`` when unfiled.
+    :param label_keys: Label keys on the session, sorted.
+    :param pinned: Whether ``owner_user_id`` has a per-user pin label.
+    :param shared: Whether a grant exists for someone other than the owner.
+    :param tree_live_statuses: Decoded live statuses in the spawn tree.
+    :param tree_pending_elicitation_count: Sum of outstanding approval prompts
+        across the tree.
+    :param tree_ids: Conversation ids in the tree, including this session.
+    """
+
+    id: str
+    title: str | None
+    updated_at: int
+    project_id: str | None
+    label_keys: tuple[str, ...]
+    pinned: bool
+    shared: bool
+    tree_live_statuses: tuple[str, ...]
+    tree_pending_elicitation_count: int
+    tree_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1331,6 +1371,32 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_retention_candidates(
+        self,
+        *,
+        owner_user_id: str,
+        cutoff: int,
+        enforce_ownership: bool,
+        limit: int = 200,
+        after: tuple[int, str] | None = None,
+    ) -> list[RetentionCandidate]:
+        """List inactive top-level sessions the retention policy may archive.
+
+        A session is inactive when ``updated_at <= cutoff``. Archived rows and
+        sub-agent children are omitted. When ``enforce_ownership`` is true,
+        only sessions with an owner-level grant for ``owner_user_id`` match.
+
+        :param owner_user_id: User whose pins and ownership apply.
+        :param cutoff: Epoch seconds; sessions touched after this are active.
+        :param enforce_ownership: Require an owner grant. False on a
+            single-user server that does not persist grants.
+        :param limit: Maximum rows in this page.
+        :param after: Exclusive keyset cursor ``(updated_at, id)``.
+        :returns: Inactive sessions ordered by ``(updated_at, id)`` ascending.
+        """
+        ...
+
+    @abstractmethod
     def restore_session_settings_if_matches(
         self,
         conversation_id: str,
@@ -1352,6 +1418,29 @@ class ConversationStore(ABC):
         :param restore_effort: Whether the refused effort needs rollback; false when
             a newer write already replaced it.
         :param restore_model: Whether the unforwarded model change also needs rollback.
+        """
+        ...
+
+    @abstractmethod
+    def claim_retention_archive(
+        self,
+        conversation_id: str,
+        *,
+        cutoff: int,
+        now: int,
+    ) -> bool:
+        """Archive one session if it is still inactive and not busy.
+
+        The false→true transition writes ``omnigent.archived_at`` and
+        ``omnigent.archived_by=retention`` and leaves transcript, grants, and
+        every other label in place. A second call, a session that became
+        active, or a running/waiting tree returns ``False`` without resetting
+        the archive clock.
+
+        :param conversation_id: Session to archive.
+        :param cutoff: Epoch seconds the session's ``updated_at`` must not exceed.
+        :param now: Epoch seconds recorded as the archive time.
+        :returns: ``True`` when this call performed the archive transition.
         """
         ...
 
