@@ -479,11 +479,9 @@ describe("Keyboard shortcuts page metadata", () => {
     expect(shortcutRowKeys("workspace.tab", mac, { contentSearch: true })).toEqual(["⌃", "1…5"]);
   });
 
-  it("shows any other binding's row with its first chord's keys", () => {
-    for (const binding of SHORTCUT_BINDINGS.filter((candidate) => !candidate.rowKeys)) {
-      expect(shortcutRowKeys(binding.id, mac, { contentSearch: false }), binding.id).toEqual(
-        shortcutKeys(binding.id, mac),
-      );
-    }
+  it("gives a range row only to the numbered bindings, and others their chord's keys", () => {
+    const ranged = SHORTCUT_BINDINGS.filter((binding) => binding.rowKeys !== undefined);
+    expect(ranged.map((binding) => binding.id)).toEqual(["session.number", "workspace.tab"]);
+    expect(shortcutRowKeys("palette.commands", mac, { contentSearch: false })).toEqual(["⌘", "K"]);
   });
 });
