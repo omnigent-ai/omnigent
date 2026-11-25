@@ -44,6 +44,7 @@ const MARKDOWN = "Intro\n\n```mermaid\ngraph TD\nAlpha-->Beta\n```\n\nOutro";
 async function mount(
   searchState: { current: SearchDecorationState | null },
   commentState: { current: CommentDecorationState | null } = { current: null },
+  markdown = MARKDOWN,
 ) {
   editor = new Editor({
     extensions: [
@@ -53,7 +54,7 @@ async function mount(
       createCommentDecorationExtension(commentState),
       Markdown,
     ],
-    content: MARKDOWN,
+    content: markdown,
     contentType: "markdown",
   });
   await act(async () => {
@@ -90,12 +91,33 @@ it("moves the caret out of the source when switching back to the diagram", async
   await act(async () => {
     instance.commands.setTextSelection(mermaidSourceStart(instance) + 2);
   });
+  const document = instance.getJSON();
 
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Source" }));
+  });
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Diagram" }));
   });
   expect(mermaidSource()).not.toBeVisible();
   expect(instance.state.selection.$from.parent.textContent).toBe("Outro");
+  // The toggle is view state only.
+  expect(instance.getJSON()).toEqual(document);
+});
+
+it("moves the caret out of a file that holds only the diagram", async () => {
+  // StarterKit's TrailingNode keeps a paragraph after the block to land on.
+  const instance = await mount({ current: null }, undefined, "```mermaid\ngraph TD\nA-->B\n```");
+  await act(async () => {
+    instance.commands.setTextSelection(mermaidSourceStart(instance) + 2);
+  });
+  expect(mermaidSource()).toBeVisible();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Diagram" }));
+  });
+  expect(mermaidSource()).not.toBeVisible();
+  expect(instance.state.selection.$from.parent.type.name).toBe("paragraph");
 });
 
 function rebuildSearch(instance: Editor) {

@@ -39,9 +39,17 @@ export function TipTapCodeBlockView({
   }, [source]);
 
   const [mermaidView, setMermaidView] = useState<MermaidView>("diagram");
-  // Wait for the debounced preview, or text that arrives without the caret (undo,
-  // a remote edit) would hide the source before its diagram draws.
-  const canShowDiagram = isMermaid && source.trim() !== "" && previewSource.trim() !== "";
+  // A block that just gained diagram source (undo, a remote edit, a language
+  // change) keeps it shown until the diagram draws, so it never goes blank.
+  const hasDiagramSource = isMermaid && source.trim() !== "";
+  const [hadDiagramSource, setHadDiagramSource] = useState(hasDiagramSource);
+  const [awaitingFirstDraw, setAwaitingFirstDraw] = useState(false);
+  if (hadDiagramSource !== hasDiagramSource) {
+    setHadDiagramSource(hasDiagramSource);
+    setAwaitingFirstDraw(hasDiagramSource);
+  }
+  const onDiagramDrawn = useCallback(() => setAwaitingFirstDraw(false), []);
+  const canShowDiagram = hasDiagramSource && previewSource.trim() !== "";
   // Choosing Diagram hides the current find match or active comment until it moves.
   const revealKey = revealDecorationKey(innerDecorations);
   const [dismissedRevealKey, setDismissedRevealKey] = useState("");
@@ -50,6 +58,7 @@ export function TipTapCodeBlockView({
   // active comment is in it, so nobody edits or navigates to hidden text.
   const showSource =
     !canShowDiagram ||
+    awaitingFirstDraw ||
     mermaidView === "source" ||
     selectionInside === true ||
     (revealKey !== "" && revealKey !== dismissedRevealKey);
@@ -184,7 +193,7 @@ export function TipTapCodeBlockView({
       {canShowDiagram && (
         // The diagram stays under the source as a live preview while editing.
         <div contentEditable={false} className="tiptap-mermaid-preview">
-          <MermaidPreview source={previewSource} />
+          <MermaidPreview source={previewSource} onDrawn={onDiagramDrawn} />
         </div>
       )}
     </NodeViewWrapper>

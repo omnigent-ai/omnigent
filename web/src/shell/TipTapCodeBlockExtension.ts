@@ -1,7 +1,6 @@
 // CodeBlock with a React node view (language selector + mermaid diagram/source),
-// registered in place of StarterKit's built-in codeBlock. Extending the base
-// keeps its `language` attribute and markdown handlers, so the fence language
-// still round-trips through markdown unchanged.
+// registered in place of StarterKit's codeBlock. Extending the base keeps its
+// `language` attribute and markdown handlers, so fences round-trip unchanged.
 
 import { InputRule } from "@tiptap/core";
 import { CodeBlock } from "@tiptap/extension-code-block";

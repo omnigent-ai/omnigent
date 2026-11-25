@@ -23,10 +23,13 @@ vi.mock("@tiptap/react", () => ({
   NodeViewContent: () => <pre data-testid="node-content" />,
 }));
 
+// The real preview reports its first draw asynchronously; tests trigger it.
+const drawLatestDiagram = vi.hoisted(() => ({ current: undefined as (() => void) | undefined }));
 vi.mock("./MermaidPreview", () => ({
-  MermaidPreview: ({ source }: { source: string }) => (
-    <div data-testid="mermaid-preview">{source}</div>
-  ),
+  MermaidPreview: ({ source, onDrawn }: { source: string; onDrawn?: () => void }) => {
+    drawLatestDiagram.current = onDrawn;
+    return <div data-testid="mermaid-preview">{source}</div>;
+  },
 }));
 
 afterEach(() => vi.clearAllMocks());
@@ -124,20 +127,29 @@ describe("TipTapCodeBlockView", () => {
     expect(screen.queryByRole("group", { name: "Mermaid view" })).toBeNull();
   });
 
-  it("keeps new source visible until its diagram is ready to draw", () => {
+  it("keeps new source visible until its first diagram draws", () => {
     vi.useFakeTimers();
     try {
       // Text arriving without the caret (undo, a remote edit) must not hide the
-      // source during the preview's debounce.
+      // source while the preview debounces or Mermaid is still drawing.
       const { rerender } = render(<TipTapCodeBlockView {...viewProps("")} />);
       rerender(<TipTapCodeBlockView {...viewProps("graph TD")} />);
       expect(screen.getByTestId("node-content")).toBeVisible();
       act(() => vi.advanceTimersByTime(300));
-      expect(screen.getByTestId("node-content")).not.toBeVisible();
       expect(screen.getByTestId("mermaid-preview").textContent).toBe("graph TD");
+      expect(screen.getByTestId("node-content")).toBeVisible();
+
+      act(() => drawLatestDiagram.current?.());
+      expect(screen.getByTestId("node-content")).not.toBeVisible();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("opens an existing diagram without waiting for it to draw", () => {
+    // A file that loads with diagram source hides it at once, so nothing jumps.
+    render(<TipTapCodeBlockView {...viewProps("graph TD")} />);
+    expect(screen.getByTestId("node-content")).not.toBeVisible();
   });
 
   it("shows the source while the caret is inside the block", () => {
