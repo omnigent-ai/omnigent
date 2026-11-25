@@ -746,6 +746,11 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
     label: "Expand selection to line",
     chords: () => [mod({ code: "KeyL" })],
   },
+  // ⇧⌥⌘ and an arrow belong to workspace history and line moves, so these stay unbound.
+  "file.columnSelectUp": { group: "files", label: "Column select up", chords: () => [] },
+  "file.columnSelectDown": { group: "files", label: "Column select down", chords: () => [] },
+  "file.columnSelectLeft": { group: "files", label: "Column select left", chords: () => [] },
+  "file.columnSelectRight": { group: "files", label: "Column select right", chords: () => [] },
   "file.goToBracket": {
     group: "files",
     label: "Go to matching bracket",

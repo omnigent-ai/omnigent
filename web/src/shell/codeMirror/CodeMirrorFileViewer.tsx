@@ -84,6 +84,8 @@ import {
 } from "./useCodeMirrorCommentLayer";
 import { shikiDecorations } from "./shikiDecorations";
 import { viewportHighlighting } from "./viewportHighlighting";
+import { columnSelection } from "./columnSelection";
+import { matchingBrackets } from "./codeMirrorBracketMatching";
 
 export const FIND_IN_FILE_LABEL = "Find in file";
 export const FIND_AND_REPLACE_LABEL = "Find and replace in file";
@@ -334,8 +336,10 @@ export function CodeMirrorFileViewer({
           }),
           highlightSelectionMatches({ highlightWordAroundCursor: true, minSelectionLength: 1 }),
           EditorState.allowMultipleSelections.of(true),
-          // Alt-click adds a cursor, as in other code editors.
+          // Alt-click adds a cursor and Alt-drag selects a box, as in other code editors.
           EditorView.clickAddsSelectionRange.of((event) => event.altKey),
+          columnSelection,
+          matchingBrackets,
           keymap.of([
             // Control+G is Go to line everywhere; on Windows and Linux it wins over find next.
             ...codeMirrorKeys("file.goToLine").map((key) => ({
