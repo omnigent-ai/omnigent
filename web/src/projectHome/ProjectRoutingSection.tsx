@@ -75,7 +75,7 @@ export function ProjectRoutingSection({
           disabled={routing.isPending}
           onValueChange={choose}
         >
-          <SelectTrigger aria-label="Router persona" className="w-48" size="sm">
+          <SelectTrigger aria-label="Router role" className="w-48" size="sm">
             <SelectValue />
           </SelectTrigger>
           <SelectContent position="popper">
@@ -104,7 +104,7 @@ export function ProjectRoutingSection({
           disabled={!leadRemoved && personas.length === 0}
           title={
             !leadRemoved && personas.length === 0
-              ? "Add another persona before removing the Lead"
+              ? "Add another role before removing the Lead"
               : undefined
           }
           onClick={toggleLead}
@@ -116,7 +116,7 @@ export function ProjectRoutingSection({
         {routerName ? `Now: ${routerName}. ` : ""}
         {leadRemoved
           ? "The Lead is removed. Messages to it reach the router instead."
-          : "The Lead coordinates the board unless you pick another persona."}
+          : "The Lead coordinates the board unless you pick another role."}
       </p>
       <TicketError error={routing.error} />
     </section>

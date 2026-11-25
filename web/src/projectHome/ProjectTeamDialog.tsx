@@ -48,6 +48,41 @@ const EMPTY_DRAFT: IdentityDraft = {
   effort: "",
 };
 
+/** Starting points for a new role; each prefills its name, instructions and scope. */
+export const ROLE_TEMPLATES: readonly Pick<
+  IdentityDraft,
+  "name" | "instructions" | "owns" | "excludes"
+>[] = [
+  {
+    name: "Reviewer",
+    instructions:
+      "You are the code reviewer. Review each change for correctness, regressions and missing tests before it lands. Lead every comment with the exact commit you reviewed, separate blocking findings from suggestions, and approve only what you checked yourself.",
+    owns: "Code review\nApproving commits",
+    excludes: "Writing features\nProduct decisions",
+  },
+  {
+    name: "Designer",
+    instructions:
+      "You are the product designer. Own how the product looks and feels: layouts, wording, states and accessibility. Turn requests into clear UI decisions, show before and after, and keep new screens consistent with the existing ones.",
+    owns: "Visual design\nUX copy\nAccessibility",
+    excludes: "Backend changes\nThe roadmap",
+  },
+  {
+    name: "PM",
+    instructions:
+      "You are the product manager. Own scope, priorities and acceptance criteria. Turn requests into small, well-defined tickets with a clear done-when, keep the board ordered, and ask people for decisions only when they're really theirs to make. Write tickets, not code.",
+    owns: "Priorities\nTicket scope\nAcceptance criteria",
+    excludes: "Writing code\nCode review",
+  },
+  {
+    name: "Engineer",
+    instructions:
+      "You are a software engineer. Take assigned tickets from plan to a tested, reviewable commit. Keep changes focused, run the relevant tests, and explain what changed and how you checked it when you hand off for review.",
+    owns: "Implementation\nTests for your changes",
+    excludes: "Approving your own work\nProduct decisions",
+  },
+];
+
 function draftOf(identity: ProjectIdentity): IdentityDraft {
   return {
     name: identity.name,
@@ -157,8 +192,8 @@ export function ProjectTeamDialog({
           <DialogDescription>
             Persistent roles in <span className="font-medium">{projectName}</span> you can talk to,
             including the built-in Lead, whose charter you can edit. Agents can add roles too. Each
-            works in one session at a time and follows the project mandate. Assign a ticket with the
-            label <span className="font-mono">assignee: Name</span>.
+            works in one session at a time and follows the project mandate. Assign a ticket to a
+            role from the ticket&apos;s Assignee picker.
           </DialogDescription>
         </DialogHeader>
         {identities.isLoading ? (
@@ -166,7 +201,7 @@ export function ProjectTeamDialog({
         ) : (
           <>
             <div className="flex flex-col gap-4 sm:flex-row">
-              <nav className="flex shrink-0 flex-col gap-1 sm:w-44" aria-label="Identities">
+              <nav className="flex shrink-0 flex-col gap-1 sm:w-44" aria-label="Roles">
                 <Button
                   type="button"
                   variant={selected === null ? "secondary" : "ghost"}
@@ -176,7 +211,7 @@ export function ProjectTeamDialog({
                   onClick={() => choose(null)}
                 >
                   <PlusIcon />
-                  New identity
+                  New role
                 </Button>
                 {lead && (
                   <Button
@@ -207,6 +242,27 @@ export function ProjectTeamDialog({
                 ))}
               </nav>
               <form onSubmit={onSubmit} className="flex min-w-0 flex-1 flex-col gap-3">
+                {selected === null && (
+                  <div
+                    role="group"
+                    aria-label="Role templates"
+                    className="flex flex-wrap items-center gap-1.5 text-sm"
+                  >
+                    <span className="text-muted-foreground">Start from a template:</span>
+                    {ROLE_TEMPLATES.map((template) => (
+                      <Button
+                        key={template.name}
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        disabled={busy}
+                        onClick={() => setDraft({ ...draft, ...template })}
+                      >
+                        {template.name}
+                      </Button>
+                    ))}
+                  </div>
+                )}
                 <label className="flex flex-col gap-1 text-sm">
                   Name
                   <Input
@@ -219,7 +275,7 @@ export function ProjectTeamDialog({
                   />
                 </label>
                 <label className="flex flex-col gap-1 text-sm">
-                  {isLead ? "Charter" : "Persona"}
+                  {isLead ? "Charter" : "Instructions"}
                   <Textarea
                     data-testid="project-team-persona"
                     value={draft.instructions}
@@ -302,8 +358,8 @@ export function ProjectTeamDialog({
                     className="text-xs text-muted-foreground"
                     data-testid="project-team-agent-made"
                   >
-                    Created by an agent, so agents can also edit it. Identities you create stay
-                    yours to edit.
+                    Created by an agent, so agents can also edit it. Roles you create stay yours to
+                    edit.
                   </p>
                 )}
                 <TicketError error={save.error ?? remove.error ?? identities.error} />

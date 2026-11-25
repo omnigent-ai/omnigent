@@ -63,11 +63,11 @@ export function TicketAgents({
     ]),
   });
   return (
-    <section aria-label="Agents" className="space-y-2">
-      <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Agents</h3>
+    <section aria-label="Roles and sessions" className="space-y-2">
+      <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Roles and sessions</h3>
       <TicketError error={project.error ?? query.error} />
       <ul
-        aria-label="Involved agents"
+        aria-label="Involved roles and sessions"
         className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60"
       >
         <li>

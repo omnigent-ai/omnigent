@@ -129,7 +129,7 @@ export function ProjectIdentityRoster({
     <div
       className="flex items-center gap-1.5"
       role="group"
-      aria-label="Project identities"
+      aria-label="Project roles"
       data-testid="project-identity-roster"
     >
       <div className="flex items-center -space-x-1.5">
@@ -186,7 +186,7 @@ export function ProjectIdentityRoster({
               <Button
                 type="button"
                 variant="ghost"
-                aria-label={`${hidden.length} more personas`}
+                aria-label={`${hidden.length} more roles`}
                 data-testid="project-identity-more"
                 className={cn(
                   avatarButton,

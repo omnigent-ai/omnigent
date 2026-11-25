@@ -11,6 +11,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
 import { conversation } from "@/test/sidebarMockHelpers";
 import type { ProjectTicket, TicketChanges, TicketEvent } from "@/lib/projectTicketsApi";
+import type { ProjectIdentity } from "@/lib/projectsApi";
 import * as api from "@/lib/projectTicketsApi";
 import * as projectsApi from "@/lib/projectsApi";
 import { getSessionSlim } from "@/lib/sessionsApi";
@@ -62,6 +63,7 @@ vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
 vi.mock("@/lib/projectsApi", () => ({
   getProject: vi.fn(),
   createProject: vi.fn(),
+  listProjectIdentities: vi.fn(),
 }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsModule>()),
@@ -134,6 +136,7 @@ beforeEach(() => {
     main_session_id: "orchestrator",
     main_session_state: "active",
   });
+  vi.mocked(projectsApi.listProjectIdentities).mockResolvedValue([]);
   vi.mocked(getSessionSlim).mockImplementation(
     async (id) =>
       ({
@@ -1003,6 +1006,56 @@ describe("Project ticket board", () => {
     },
   );
 
+  it("assigns a new ticket and reassigns it from the panel without label syntax", async () => {
+    const role = (id: string, name: string, builtin = false) =>
+      ({ id, name, builtin, instructions: "" }) as ProjectIdentity;
+    vi.mocked(projectsApi.listProjectIdentities).mockResolvedValue([
+      role("designer", "Designer"),
+      role("lead", "Lead", true),
+    ]);
+    const onCreated = vi.fn();
+    const { unmount } = renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="new"
+        onClose={vi.fn()}
+        onCreated={onCreated}
+      />,
+    );
+    const lead = await screen.findByRole("radio", { name: "Lead (default)" });
+    expect(lead).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByRole("radio", { name: "Designer" }));
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Polish the header" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create ticket" }));
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("ticket"));
+    expect(api.createTicket).toHaveBeenCalledWith("project", {
+      title: "Polish the header",
+      description: "",
+      labels: [{ key: "assignee", value: "Designer" }],
+    });
+    unmount();
+
+    ticket = { ...ticket, labels: [{ key: "assignee", value: "designer" }] };
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    expect(await screen.findByRole("radio", { name: "Designer" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "Lead" }));
+    await waitFor(() =>
+      expect(api.updateTicket).toHaveBeenCalledWith("project", "ticket", {
+        remove_labels: ["assignee"],
+      }),
+    );
+  });
+
   it("edits key/value labels without changing ticket status", async () => {
     renderBoard(
       <ProjectTicketPanel
@@ -1203,7 +1256,7 @@ describe("Project ticket board", () => {
           onCreated={vi.fn()}
         />,
       );
-      const sessions = await screen.findByRole("region", { name: "Agents" });
+      const sessions = await screen.findByRole("region", { name: "Roles and sessions" });
       expect(
         await within(sessions).findByRole("link", { name: "Open chat with: Codex" }),
       ).toHaveAttribute("href", href);
@@ -1290,7 +1343,7 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    const sessions = await screen.findByRole("region", { name: "Agents" });
+    const sessions = await screen.findByRole("region", { name: "Roles and sessions" });
     const worker = await within(sessions).findByRole("link", { name: /Session worker/ });
     await waitFor(() => expect(worker).toHaveTextContent("Unavailable"));
     expect(worker).toHaveAttribute("href", "/c/worker");
@@ -1689,7 +1742,7 @@ describe("Project ticket board", () => {
         onExpandedChange: mobile ? undefined : onExpandedChange,
       };
       const { rerender } = renderBoard(<ProjectTicketPanel {...props} />);
-      const agents = await screen.findByRole("list", { name: "Involved agents" });
+      const agents = await screen.findByRole("list", { name: "Involved roles and sessions" });
       const chat = await within(agents).findByRole("link", {
         name: "Open chat with: Design the board",
       });
@@ -1762,7 +1815,7 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    const agents = await screen.findByRole("region", { name: "Agents" });
+    const agents = await screen.findByRole("region", { name: "Roles and sessions" });
     expect(await within(agents).findByText("Investigating the approach")).toBeInTheDocument();
     const planner = await within(agents).findByRole("link", {
       name: "Open chat with: Claude Code",
@@ -1785,7 +1838,9 @@ describe("Project ticket board", () => {
     expect(agents).not.toHaveTextContent("claude-native-ui");
     expect(agents).not.toHaveTextContent("codex-native-ui");
     expect(
-      within(screen.getByRole("list", { name: "Involved agents" })).getAllByRole("link"),
+      within(screen.getByRole("list", { name: "Involved roles and sessions" })).getAllByRole(
+        "link",
+      ),
     ).toHaveLength(3);
     expect(screen.queryByRole("button", { name: "More agents" })).toBeNull();
     expect(screen.queryByRole("region", { name: "Responsible agent" })).toBeNull();
@@ -1905,7 +1960,7 @@ describe("Project ticket board", () => {
           onCreated={vi.fn()}
         />,
       );
-      const agents = await screen.findByRole("region", { name: "Agents" });
+      const agents = await screen.findByRole("region", { name: "Roles and sessions" });
       const respond = await within(agents).findByRole("link", {
         name: "Respond to: Plan the work",
       });

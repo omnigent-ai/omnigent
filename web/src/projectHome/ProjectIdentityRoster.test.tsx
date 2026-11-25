@@ -52,7 +52,7 @@ describe("ProjectIdentityRoster", () => {
     const shown = screen.getAllByTestId("project-identity-button");
     expect(shown).toHaveLength(VISIBLE_ROSTER_LIMIT);
     expect(shown[0]).toHaveAccessibleName("Talk to Docs Writer (working)");
-    const more = screen.getByRole("button", { name: "2 more personas" });
+    const more = screen.getByRole("button", { name: "2 more roles" });
     expect(more).toHaveTextContent("+2");
     fireEvent.pointerDown(more, { button: 0, ctrlKey: false });
     const menu = screen.getByRole("menu");

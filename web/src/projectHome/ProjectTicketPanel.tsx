@@ -58,6 +58,12 @@ import { getCurrentUserId } from "@/lib/identity";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
 import { TICKET_ASK_PARAM, ticketPanelSearch } from "./projectHomeNavigation";
 import { TicketAgents } from "./TicketAgents";
+import {
+  ASSIGNEE_LABEL_KEY,
+  assigneeChanges,
+  TicketAssigneePicker,
+  ticketAssignee,
+} from "./TicketAssigneePicker";
 import { TicketCopyLinkButton } from "./TicketCopyLinkButton";
 import { TicketCostBadge } from "./ProjectCost";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
@@ -202,9 +208,13 @@ export function ProjectTicketPanel({
 } & TicketExpansionProps) {
   const { projectId, projects, ensure } = useTicketProject(projectName);
   const client = useQueryClient();
+  const [assignee, setAssignee] = useState<string | null>(null);
   const create = useMutation({
     mutationFn: async (body: { title: string; description: string }) =>
-      createTicket(await ensure.mutateAsync(), body),
+      createTicket(await ensure.mutateAsync(), {
+        ...body,
+        ...(assignee ? { labels: [{ key: ASSIGNEE_LABEL_KEY, value: assignee }] } : {}),
+      }),
     onSuccess: (ticket) => {
       writeTicketDraft(newTicketDraftKey(projectName, "title"), "");
       writeTicketDraft(newTicketDraftKey(projectName, "description"), "");
@@ -231,6 +241,14 @@ export function ProjectTicketPanel({
           pending={create.isPending}
           error={create.error}
           disabled={projects.isLoading || projects.isError}
+          extraFields={
+            <TicketAssigneePicker
+              projectId={projectId}
+              value={assignee}
+              onChange={setAssignee}
+              disabled={create.isPending}
+            />
+          }
         />
         <TicketError error={projects.error} />
       </Panel>
@@ -282,7 +300,10 @@ function TicketEditor({
   resolveProjectId,
   draftProjectName,
   fields = "all",
+  extraFields,
 }: {
+  /** Shown under the description, e.g. the new ticket's assignee. */
+  extraFields?: ReactNode;
   resolveProjectId: () => Promise<string>;
   /** Which fields the form edits; an existing ticket's title and description edit separately. */
   fields?: "all" | "title" | "description";
@@ -371,6 +392,7 @@ function TicketEditor({
         </label>
       )}
       {images.uploading && <p className="text-xs text-muted-foreground">Uploading image…</p>}
+      {extraFields}
       <TicketError error={images.error} />
       <TicketError error={tooLong} />
       <TicketError error={error} />
@@ -592,6 +614,15 @@ function TicketDetails({
                 Requested by {requesterLabel(ticket.requested_by, getCurrentUserId())}
               </p>
             )}
+            <TicketAssigneePicker
+              projectId={projectId}
+              value={ticketAssignee(ticket.labels)}
+              disabled={update.isPending}
+              onChange={(name) => {
+                update.reset();
+                update.mutate({ id: ticketId, changes: assigneeChanges(name) });
+              }}
+            />
             <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
             <section aria-label="Description" className="space-y-2">
               <div className="flex items-center gap-2">
@@ -779,7 +810,7 @@ function TicketCommentComposer({
           onPaste={images.onPaste}
           onDragOver={images.onDragOver}
           onDrop={images.onDrop}
-          placeholder="Add a comment… type @ to cc a persona or person"
+          placeholder="Add a comment… type @ to cc a role or person"
         />
         <TicketImagePreviews upload={images} className="px-3" />
         {attaching && (
