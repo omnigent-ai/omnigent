@@ -30,11 +30,12 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
-from omnigent.host.workspace_payloads import payload_dict
+from omnigent.host.workspace_payloads import payload_dict, payload_struct
 from omnigent.runner import pr_resource
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
+from omnigent.server.pull_request_viewers import PullRequestViewer
 from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callable_methods
 from omnigent.stores.session_pull_request_store import SessionPullRequests
 from omnigent.workspace_fs import WorkspaceReader
@@ -483,7 +484,12 @@ class _Tunnel:
         await poll_until_async(lambda: self.host.pending_workspace_calls, timeout_s=5)
 
 
-def _tunnel(tmp_path: Path, *, refuse_send: bool = False) -> _Tunnel:
+def _tunnel(
+    tmp_path: Path,
+    *,
+    refuse_send: bool = False,
+    viewer: PullRequestViewer = PullRequestViewer.VIEWER,
+) -> _Tunnel:
     registry = HostRegistry()
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
     host = registry.register("host_ws", object(), hello, owner=None)  # type: ignore[arg-type]
@@ -501,7 +507,7 @@ def _tunnel(tmp_path: Path, *, refuse_send: bool = False) -> _Tunnel:
         workspace_api.HostTarget(registry, host, str(tmp_path)),
         content_search=False,
         pull_requests=workspace_api.PullRequestRoute(
-            _SESSION, vouch=_no_vouch, overview=_as_reported
+            _SESSION, vouch=_no_vouch, overview=_as_reported, viewer=viewer
         ),
     )
     return _Tunnel(registry, host, service, sent)
@@ -1023,3 +1029,72 @@ async def test_the_pending_review_read_cut_off_by_the_host_stays_safe_to_retry(
         await call
 
     assert cut_off.value.code == Code.UNAVAILABLE
+
+
+_HOST_THREADS = {
+    "data": [
+        {
+            "id": "PRRT_1",
+            "can_reply": True,
+            "comments": {"data": [{"id": "PRRC_1", "database_id": 5, "can_update": True}]},
+        }
+    ]
+}
+
+
+async def _threads_through(tmp_path: Path, viewer: PullRequestViewer) -> dict[str, Any]:
+    tunnel = _tunnel(tmp_path, viewer=viewer)
+    call = asyncio.create_task(
+        tunnel.call("ListReviewThreads", pb.ListReviewThreadsRequest(pr_url=_PR))
+    )
+    await tunnel.frame_sent()
+    answer = pb.ListReviewThreadsResponse(payload=payload_struct(_HOST_THREADS))
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id,
+            message=answer.SerializeToString(),
+            done=True,
+        ),
+    )
+    return payload_dict((await call).payload)
+
+
+async def test_the_owner_reads_threads_with_the_host_accounts_rights(tmp_path: Path) -> None:
+    assert await _threads_through(tmp_path, PullRequestViewer.OWNER) == _HOST_THREADS
+
+
+async def test_anyone_else_reads_threads_through_the_api_without_the_rights(
+    tmp_path: Path,
+) -> None:
+    [thread] = (await _threads_through(tmp_path, PullRequestViewer.VIEWER))["data"]
+    [comment] = thread["comments"]["data"]
+    assert (thread["id"], thread["can_reply"]) == ("PRRT_1", False)
+    assert (comment["database_id"], comment["can_update"]) == (5, False)
+
+
+def test_the_route_takes_the_reader_to_be_the_least_trusted_unless_told() -> None:
+    route = workspace_api.PullRequestRoute(_SESSION, vouch=_no_vouch, overview=_as_reported)
+    assert route.viewer is PullRequestViewer.VIEWER
+    assert {"ListReviewThreads", "ListReviewThreadComments"} == workspace_api.VIEWER_SHAPED_METHODS
+
+
+@pytest.mark.parametrize("owner", [True, False], ids=["owner", "non-owner"])
+async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner: bool,
+) -> None:
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(routes_resources, "_is_session_owner", lambda *_a, **_k: owner)
+    monkeypatch.setattr(
+        WorkspaceReader, "github_review_threads", lambda _self, *_args: _HOST_THREADS
+    )
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    response = await client.list_review_threads(pb.ListReviewThreadsRequest(pr_url=_PR))
+
+    [thread] = payload_dict(response.payload)["data"]
+    assert thread["can_reply"] is owner
+    assert thread["comments"]["data"][0]["can_update"] is owner

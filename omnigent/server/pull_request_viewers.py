@@ -76,3 +76,60 @@ def _read_only_capabilities(capabilities: object) -> dict[str, bool]:
     return {
         name: name in READ_CAPABILITIES and reported.get(name) is True for name in sorted(names)
     }
+
+
+# What the host's account may do in a review conversation, and with each comment in it.
+_THREAD_RIGHTS = ("can_reply", "can_resolve", "can_unresolve")
+_COMMENT_RIGHTS = ("can_react", "can_update", "can_delete", "viewer_did_author")
+
+
+def review_threads_for_viewer(
+    payload: dict[str, Any], viewer: PullRequestViewer
+) -> dict[str, Any]:
+    """A review-threads page as ``viewer`` may see it; the owner's is unchanged.
+
+    :param payload: The host's page, e.g. ``{"data": [{"id": "T_1", "comments": {...}}]}``.
+    :returns: For anyone but the owner, a copy whose threads and comments keep their IDs and
+        reaction counts but say the host's account may do nothing with them.
+    """
+    if viewer is PullRequestViewer.OWNER:
+        return payload
+    return {**payload, "data": [_thread_for_others(item) for item in _items(payload)]}
+
+
+def review_comments_for_viewer(
+    payload: dict[str, Any], viewer: PullRequestViewer
+) -> dict[str, Any]:
+    """A page of one conversation's comments as ``viewer`` may see it; see above."""
+    if viewer is PullRequestViewer.OWNER:
+        return payload
+    return {**payload, "data": [_comment_for_others(item) for item in _items(payload)]}
+
+
+def _items(payload: dict[str, Any]) -> list[Any]:
+    data = payload.get("data")
+    return data if isinstance(data, list) else []
+
+
+def _thread_for_others(thread: Any) -> Any:
+    if not isinstance(thread, dict):
+        return thread
+    shown = {**thread, **dict.fromkeys(_THREAD_RIGHTS, False)}
+    comments = thread.get("comments")
+    if isinstance(comments, dict):
+        shown["comments"] = review_comments_for_viewer(comments, PullRequestViewer.VIEWER)
+    return shown
+
+
+def _comment_for_others(comment: Any) -> Any:
+    if not isinstance(comment, dict):
+        return comment
+    shown = {**comment, **dict.fromkeys(_COMMENT_RIGHTS, False)}
+    reactions = comment.get("reactions")
+    if isinstance(reactions, list):
+        # The counts are everyone's; whether "you" reacted is the host account's.
+        shown["reactions"] = [
+            {**reaction, "viewer_reacted": False} if isinstance(reaction, dict) else reaction
+            for reaction in reactions
+        ]
+    return shown

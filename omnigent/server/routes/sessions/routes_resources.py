@@ -68,6 +68,8 @@ from omnigent.server.pull_request_viewers import (
     OWNER_ONLY_CHANGES_MESSAGE,
     PullRequestViewer,
     info_for_viewer,
+    review_comments_for_viewer,
+    review_threads_for_viewer,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -2910,6 +2912,7 @@ def register_resources_routes(
         from omnigent.host.workspace_methods import WORKSPACE_METHODS
         from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
         from omnigent.server.workspace_api import (
+            VIEWER_SHAPED_METHODS,
             ConnectCallResponse,
             HostTarget,
             HostWorkspaceService,
@@ -2928,9 +2931,12 @@ def register_resources_routes(
         else:
             conv = await _validate_session(session_id, request, LEVEL_READ)
         # The owner grant itself, with no admin pass: only the owner acts as the host's account.
-        # Only an owner-gated method and GetCapabilities, which lists them, need it.
+        # Only an owner-gated method, GetCapabilities, which lists them, and the thread reads,
+        # which show the host account's rights to the owner alone, need it.
         session_owner = (
-            gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities"
+            gate is WorkspaceGate.SESSION_OWNER
+            or method == "GetCapabilities"
+            or method in VIEWER_SHAPED_METHODS
         ) and await asyncio.to_thread(
             _is_session_owner,
             _get_user_id(request, auth_provider),
@@ -2966,6 +2972,7 @@ def register_resources_routes(
                 overview=lambda payload, sent_at: _with_server_pull_requests(
                     session_id, payload, sent_at
                 ),
+                viewer=PullRequestViewer.OWNER if session_owner else PullRequestViewer.VIEWER,
             ),
             # Only GetCapabilities lists methods, and it needs the browse gate.
             callable_methods=callable_methods(
@@ -4491,7 +4498,7 @@ def register_resources_routes(
                 "base_sha": base_sha,
             },
         )
-        return await _fs_get_with_host_fallback(
+        threads = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_threads",
@@ -4499,6 +4506,8 @@ def register_resources_routes(
             runner_params=params,
             runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
         )
+        # The host account's rights in each conversation are the owner's to see.
+        return review_threads_for_viewer(threads, await _pull_request_viewer(conv, request))
 
     @router.get(
         "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
@@ -4514,7 +4523,7 @@ def register_resources_routes(
         """Load additional replies in a published PR review conversation."""
         conv = await _validate_session(session_id, request, LEVEL_READ)
         params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
-        return await _fs_get_with_host_fallback(
+        comments = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_thread_comments",
@@ -4525,6 +4534,7 @@ def register_resources_routes(
                 f"{urllib.parse.quote(thread_id, safe='')}/comments"
             ),
         )
+        return review_comments_for_viewer(comments, await _pull_request_viewer(conv, request))
 
     @router.post(
         "/sessions/{session_id}/resources/github/review-threads",

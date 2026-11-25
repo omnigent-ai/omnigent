@@ -126,6 +126,35 @@ _HOST_INFO: dict[str, Any] = {
     "capabilities": {"account_switching": True, "merging": True, "line_counts": True},
     "pr": {"number": 42, "title": "Ship it", "state": "OPEN", "url": _PR},
 }
+# A comment as the host reads it: its rights are the host account's.
+_THREAD_COMMENT: dict[str, Any] = {
+    "id": "PRRC_1",
+    "database_id": 5,
+    "body": "Why this?",
+    "reactions": [{"content": "HEART", "count": 2, "viewer_reacted": True}],
+    "can_react": True,
+    "can_update": True,
+    "can_delete": True,
+    "viewer_did_author": True,
+}
+_HOST_THREADS: dict[str, Any] = {
+    "data": [
+        {
+            "id": "PRRT_1",
+            "can_reply": True,
+            "can_resolve": True,
+            "can_unresolve": False,
+            "comments": {"data": [_THREAD_COMMENT], "has_more": False},
+        }
+    ],
+    "has_more": False,
+}
+_HOST_THREAD_COMMENTS: dict[str, Any] = {"data": [_THREAD_COMMENT], "has_more": False}
+_HOST_READS: dict[str, dict[str, Any]] = {
+    "github_info": _HOST_INFO,
+    "github_review_threads": _HOST_THREADS,
+    "github_review_thread_comments": _HOST_THREAD_COMMENTS,
+}
 _ROUTE_IDS = [f"{method} {path} {sorted(options)}" for method, path, options in _OWNER_ONLY_ROUTES]
 
 
@@ -152,7 +181,7 @@ class _RecordingHost:
 
     async def read(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
         self.reads.append(f"{session_id}:{op}")
-        return copy.deepcopy(_HOST_INFO) if op == "github_info" else {"object": "x"}
+        return copy.deepcopy(_HOST_READS.get(op, {"object": "x"}))
 
     async def write(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
         self.writes.append(f"{session_id}:{op}")
@@ -490,3 +519,73 @@ async def test_with_permissions_off_the_info_is_unchanged(
     assert response.status_code == 200, response.text
     assert response.json()["accounts"] == _ACCOUNTS
     assert host.reads == [f"{_ROOT}:github_info"]
+
+
+_THREADS_PATH = "/resources/github/review-threads"
+_COMMENTS_PATH = "/resources/github/review-threads/PRRT_1/comments"
+_RIGHTS_OFF = {"can_react": False, "can_update": False, "can_delete": False}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [_OWNER, _ADMIN_OWNER])
+async def test_the_owner_reads_threads_with_the_host_accounts_rights(
+    client: httpx.AsyncClient, caller: str
+) -> None:
+    threads = await _call(client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=caller)
+    comments = await _call(
+        client, "GET", _COMMENTS_PATH, {"params": {"pr_url": _PR, "after": "c"}}, caller=caller
+    )
+
+    assert threads.status_code == 200, threads.text
+    assert threads.json() == _HOST_THREADS
+    assert comments.status_code == 200, comments.text
+    assert comments.json() == _HOST_THREAD_COMMENTS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [_EDITOR, _MANAGER, _ADMIN])
+async def test_anyone_else_reads_threads_with_ids_and_counts_but_no_rights(
+    client: httpx.AsyncClient, caller: str
+) -> None:
+    """The edit, delete, reply and resolve controls act as the owner's account."""
+    response = await _call(
+        client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=caller
+    )
+
+    assert response.status_code == 200, response.text
+    [thread] = response.json()["data"]
+    assert (thread["id"], thread["can_reply"], thread["can_resolve"]) == ("PRRT_1", False, False)
+    [comment] = thread["comments"]["data"]
+    assert (comment["id"], comment["database_id"]) == ("PRRC_1", 5)
+    assert comment["reactions"] == [{"content": "HEART", "count": 2, "viewer_reacted": False}]
+    assert {name: comment[name] for name in _RIGHTS_OFF} == _RIGHTS_OFF
+    assert comment["viewer_did_author"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [_EDITOR, _VIEWER])
+async def test_anyone_else_reads_a_threads_comments_without_the_rights(
+    client: httpx.AsyncClient, caller: str
+) -> None:
+    response = await _call(
+        client, "GET", _COMMENTS_PATH, {"params": {"pr_url": _PR, "after": "c"}}, caller=caller
+    )
+
+    assert response.status_code == 200, response.text
+    [comment] = response.json()["data"]
+    assert comment["database_id"] == 5
+    assert {name: comment[name] for name in _RIGHTS_OFF} == _RIGHTS_OFF
+    assert comment["reactions"][0]["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_unsure_who_reads_the_threads_the_server_shows_no_rights(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(routes_resources, "_is_session_owner", _lookup_fails)
+    response = await _call(
+        client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=_OWNER
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"][0]["can_reply"] is False
