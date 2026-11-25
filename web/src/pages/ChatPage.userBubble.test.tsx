@@ -178,6 +178,7 @@ function renderWithSessionRepo(children: ReactNode) {
     available: true,
     repo: { name_with_owner: "acme/app", host: "github.com" },
     workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+    prs: [{ url: "https://github.com/acme/app/pull/4242", host: "github.com", number: 4242 }],
   });
   render(
     <QueryClientProvider client={queryClient}>
@@ -187,7 +188,7 @@ function renderWithSessionRepo(children: ReactNode) {
 }
 
 describe("UserBubble pull request references", () => {
-  it("links a PR reference to the session repo", () => {
+  it("links a PR reference to the PR the session links", () => {
     renderWithSessionRepo(<BubbleView bubble={userBubble("See #4242 and acme/lib#7")} />);
     expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
       "href",
@@ -201,7 +202,7 @@ describe("UserBubble pull request references", () => {
 });
 
 describe("/btw answer pull request references", () => {
-  it("links a PR reference to the session repo", () => {
+  it("links a PR reference to the PR the session links", () => {
     renderWithSessionRepo(<BtwSidechatAnswer answer="Fixed in #4242." />);
     expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
       "href",
@@ -953,6 +954,7 @@ describe("UserBubble command tint", () => {
       available: true,
       repo: { name_with_owner: "acme/app", host: "github.com" },
       workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+      prs: [{ url: "https://github.com/acme/app/pull/4242", host: "github.com", number: 4242 }],
     });
     renderScoped(userBubble("/team review #4242"), <PublishCommands />);
     expect(screen.getByText("/team")).toHaveClass("text-brand-accent");

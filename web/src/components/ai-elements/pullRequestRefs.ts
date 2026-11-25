@@ -17,7 +17,7 @@ export interface PullRequestRef {
 
 // Unicode letters, digits and marks on either side block a reference, as does an
 // extension (`#4242.md`); Han, kana and Hangul may border one outside a path segment.
-// Bare numbers need 4+ digits. A captured prefix replaces lookbehind for Safari < 16.4.
+// A captured prefix replaces lookbehind for Safari < 16.4.
 const UNSPACED_SCRIPT = "\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}";
 export const PULL_REQUEST_REF = new RegExp(
   `(^|[^\\p{L}\\p{N}\\p{M}_&/#.-]|[${UNSPACED_SCRIPT}])` +
@@ -27,8 +27,7 @@ export const PULL_REQUEST_REF = new RegExp(
 );
 const UNSPACED_CHAR = new RegExp(`^[${UNSPACED_SCRIPT}]$`, "u");
 const PATH_SEPARATOR = /[/\\]/;
-const BARE_NUMBER = /^[1-9]\d{3,9}$/;
-const EXPLICIT_NUMBER = /^[1-9]\d{0,9}$/;
+const PULL_REQUEST_NUMBER = /^[1-9]\d{0,9}$/;
 // GitHub owners can't end in `-`.
 const GITHUB_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
@@ -40,9 +39,6 @@ const FILE_EXTENSION = /[^.]\.[A-Za-z0-9]+$/;
 // paths (`docs/README#1`) that read as `owner/repo`.
 const NON_OWNER =
   /^(\d+|origin|upstream|and|or|src|lib|docs?|tests?|feature|fix|bugfix|hotfix|release|chore)$/i;
-
-/** Repo for bare references when the session's repo is unknown; null leaves them as text. */
-const FALLBACK_PULL_REQUEST_REPO: string | null = null;
 
 interface MarkdownNode {
   type: string;
@@ -134,11 +130,11 @@ export function splitPullRequestRefs(
     const start = match.index + prefix.length;
     const explicit = owner !== undefined;
     const valid = explicit
-      ? EXPLICIT_NUMBER.test(number) &&
+      ? PULL_REQUEST_NUMBER.test(number) &&
         isGitHubRepo(`${owner}/${repo}`) &&
         !FILE_EXTENSION.test(repo) &&
         !NON_OWNER.test(owner)
-      : BARE_NUMBER.test(number);
+      : PULL_REQUEST_NUMBER.test(number);
     if (!valid || followsPathSegment(text, match.index, prefix)) continue;
     if (escaped) {
       const hash = start + token.indexOf("#");
@@ -187,9 +183,11 @@ function followsPathSegment(text: string, index: number, prefix: string): boolea
 export function parsePullRequestRefHref(href: string | undefined): PullRequestRef | null {
   if (!href?.startsWith(PULL_REQUEST_REF_HREF_PREFIX)) return null;
   const rest = href.slice(PULL_REQUEST_REF_HREF_PREFIX.length);
-  if (BARE_NUMBER.test(rest)) return { repo: null, number: rest };
+  if (PULL_REQUEST_NUMBER.test(rest)) return { repo: null, number: rest };
   const explicit = rest.match(/^([^/]+\/[^/]+)\/(\d+)$/);
-  if (!explicit || !EXPLICIT_NUMBER.test(explicit[2]) || !isGitHubRepo(explicit[1])) return null;
+  if (!explicit || !PULL_REQUEST_NUMBER.test(explicit[2]) || !isGitHubRepo(explicit[1])) {
+    return null;
+  }
   return { repo: explicit[1], number: explicit[2] };
 }
 
@@ -205,43 +203,51 @@ function isGitHubRepo(nameWithOwner: string): boolean {
   );
 }
 
-/** The github.com repo whose numbers `nameWithOwner`'s references use. */
-function canonicalRepo(nameWithOwner: string): string | null {
-  return nameWithOwner;
+function isGitHubWorkspace(info: PullRequestInfo | undefined): boolean {
+  return info?.workspace_repo?.host === "github.com";
 }
 
 /**
- * The workspace's github.com repo for bare references; null leaves them as text
- * (Enterprise, other forges, older runners).
+ * The one PR the session links with `number`, by its stored URL; null when none does or when
+ * PRs in two repos share it, so a guess never names the wrong repo.
  */
-export function sessionPullRequestRepo(
+export function linkedPullRequestUrl(
   info: PullRequestInfo | undefined,
-  fallback: string | null = FALLBACK_PULL_REQUEST_REPO,
+  number: string,
 ): string | null {
-  if (!isGitHubWorkspace(info)) return null;
-  const own = info?.workspace_repo?.name_with_owner;
-  if (own) return isGitHubRepo(own) ? canonicalRepo(own) : null;
-  return fallback;
+  if (!PULL_REQUEST_NUMBER.test(number)) return null;
+  const urls = new Map<string, string>();
+  for (const pr of info?.prs ?? []) {
+    if (pr.number !== Number(number) || !isWebUrl(pr.url)) continue;
+    const key = pr.url.toLowerCase();
+    if (!urls.has(key)) urls.set(key, pr.url);
+  }
+  return urls.size === 1 ? [...urls.values()][0]! : null;
 }
 
-function isGitHubWorkspace(info: PullRequestInfo | undefined): boolean {
-  return info?.workspace_repo?.host === "github.com";
+function isWebUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
 }
 
 /** Where `ref` links in this session, or null when it should stay text. */
 export function pullRequestRefUrl(
   ref: PullRequestRef,
   info: PullRequestInfo | undefined,
-  fallback: string | null = FALLBACK_PULL_REQUEST_REPO,
 ): string | null {
-  if (ref.repo !== null && !isGitHubWorkspace(info)) return null;
-  const repo = ref.repo !== null ? canonicalRepo(ref.repo) : sessionPullRequestRepo(info, fallback);
-  return repo ? gitHubPullRequestUrl(repo, ref.number) : null;
+  // A bare `#1234` names a PR only through the session's own links; it could be any repo's.
+  if (ref.repo === null) return linkedPullRequestUrl(info, ref.number);
+  if (!isGitHubWorkspace(info)) return null;
+  return gitHubPullRequestUrl(ref.repo, ref.number);
 }
 
 /** `https://github.com/<owner>/<repo>/pull/<n>`, or null unless every part is well-formed. */
 export function gitHubPullRequestUrl(nameWithOwner: string, number: string): string | null {
-  if (!isGitHubRepo(nameWithOwner) || !EXPLICIT_NUMBER.test(number)) return null;
+  if (!isGitHubRepo(nameWithOwner) || !PULL_REQUEST_NUMBER.test(number)) return null;
   const path = `/${nameWithOwner}/pull/${number}`;
   try {
     const url = new URL(`https://github.com${path}`);
