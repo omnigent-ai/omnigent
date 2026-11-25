@@ -30,6 +30,7 @@ import {
 } from "./commandContext";
 import { useCommandOptionsPage } from "./commandOptionsPage";
 import {
+  leavePaletteChildPage,
   type PaletteParentPlace,
   paletteChildPageStore,
   resetPaletteToRoot,
@@ -53,6 +54,16 @@ const CHILD_PAGE_COPY = {
     label: "Choose one",
     placeholder: "Choose one…",
     empty: "Nothing to choose from.",
+  },
+  "pick-session": {
+    label: "Pick a session",
+    placeholder: "Pick a session, or paste a pull request link…",
+    empty: "No matching sessions.",
+  },
+  "session-actions": {
+    label: "Session actions",
+    placeholder: "Choose an action…",
+    empty: "No actions for this session.",
   },
 } as const;
 
@@ -141,9 +152,10 @@ export function QuickPickCommandPalette({
   }, [open]);
   const childPage = useStore(paletteChildPageStore, (state) => state.page);
   // Back on the row that opened the page, once a choice applies or its setting goes away.
+  // A parent that is itself a page gets its own filter back; the root keeps its query.
   const restoreParent = (parent: PaletteParentPlace | null) => {
-    setPageQuery("");
-    if (parent && parent.query !== query) search.setQuery(parent.query);
+    setPageQuery(parent?.page ? parent.query : "");
+    if (parent && !parent.page && parent.query !== query) search.setQuery(parent.query);
     setParkedId(parent?.activeId ?? null);
   };
   const settingPage = useSettingChoicesPage(commandItems, targetKey, restoreParent);
@@ -204,8 +216,17 @@ export function QuickPickCommandPalette({
       : [];
 
   const { visibleSessions, contentSessions, searching } = search;
-  const activePage =
-    childPage?.kind === "setting-choices" ? settingPage : childPage ? optionsPage : null;
+  // Picked by kind, so a page kind nothing builds yet lists no rows instead of another page's.
+  const activePage = (() => {
+    switch (childPage?.kind) {
+      case "setting-choices":
+        return settingPage;
+      case "command-options":
+        return optionsPage;
+      default:
+        return null;
+    }
+  })();
   const pageItems = activePage?.items ?? null;
   const rootSegments: QuickPickSegment<PaletteRow>[] = [
     {
@@ -265,9 +286,12 @@ export function QuickPickCommandPalette({
             .map((item) => ({ ...item, matchHighlight: "underline" })),
     },
   ];
-  const segments: QuickPickSegment<PaletteRow>[] = pageItems
-    ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems }]
-    : rootSegments;
+  // A page kind nothing builds yet lists nothing, rather than the root's rows.
+  const unbuiltPage = childPage !== null && activePage === null;
+  const segments: QuickPickSegment<PaletteRow>[] =
+    pageItems || unbuiltPage
+      ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems ?? [] }]
+      : rootSegments;
 
   const accept = (item: QuickPickItem<PaletteRow>): QuickPickAcceptResult | QuickPickHandOff => {
     const row = item.value;
@@ -282,6 +306,8 @@ export function QuickPickCommandPalette({
     }
     if (row.kind === "setting-choice") return settingPage.acceptChoice(row.value);
     if (row.kind === "command-option") return optionsPage.acceptOption(row.optionId);
+    // No page lists a session's actions yet.
+    if (row.kind === "session-action") return "keepOpen";
     if (row.kind === "command") {
       const command = currentCommand(item);
       // A row withdrawn or built for another target since stays open, now showing what applies.
@@ -381,7 +407,7 @@ export function QuickPickCommandPalette({
     : optionsPage.open
       ? optionsPage.status
       : settingPage.notice;
-  const back = () => restoreParent(settingPage.open ? settingPage.back() : optionsPage.back());
+  const back = () => restoreParent(activePage ? activePage.back() : leavePaletteChildPage());
   const pageHeading = settingPage.heading ?? optionsPage.heading;
 
   return (
