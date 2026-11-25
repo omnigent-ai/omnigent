@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -86,19 +87,38 @@ def test_listed_feature_does_not_follow_another_feature(name: str) -> None:
     assert follows is None, f"{name} follows {follows} on the server, so it can't be overridden"
 
 
-@pytest.mark.parametrize("name", _overridable_features())
-def test_no_server_code_reads_a_listed_feature(name: str) -> None:
-    enum_reference = re.compile(rf"\bFeature\.{Feature(name).name}\b")
-    quoted = re.compile(rf"[\"']{name}[\"']")
-    readers = []
+@cache
+def _server_readers() -> dict[str, list[str]]:
+    patterns = {
+        name: (
+            re.compile(rf"\bFeature\.{Feature(name).name}\b"),
+            re.compile(rf"[\"']{name}[\"']"),
+        )
+        for name in _overridable_features()
+    }
+    readers: dict[str, list[str]] = {name: [] for name in patterns}
     for path in sorted(_SERVER_SOURCE.rglob("*.py")):
         if path == _DEFINITIONS_FILE:
             continue
         relative = path.relative_to(_SERVER_SOURCE).as_posix()
         for line in path.read_text(encoding="utf-8").splitlines():
-            if not (enum_reference.search(line) or quoted.search(line)):
-                continue
-            if (name, relative, line.strip()) in _NOT_GATES:
-                continue
-            readers.append(f"{relative}: {line.strip()}")
+            for name, (enum_reference, quoted) in patterns.items():
+                if not (enum_reference.search(line) or quoted.search(line)):
+                    continue
+                if (name, relative, line.strip()) in _NOT_GATES:
+                    continue
+                readers[name].append(f"{relative}: {line.strip()}")
+    return readers
+
+
+def test_server_readers_are_cached_for_all_listed_features() -> None:
+    readers = _server_readers()
+    assert set(readers) == set(_overridable_features())
+    assert _server_readers() is readers
+    assert _server_readers.cache_info().misses == 1
+
+
+@pytest.mark.parametrize("name", _overridable_features())
+def test_no_server_code_reads_a_listed_feature(name: str) -> None:
+    readers = _server_readers()[name]
     assert readers == [], f"server code reads {name}, so it can't be overridden: {readers}"

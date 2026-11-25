@@ -1,5 +1,5 @@
 import { FlagIcon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { type QuickPickItem, QuickPickDialog, useQuickPickPages } from "@/components/ui/quick-pick";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -71,13 +71,14 @@ export function FeatureFlagsPicker() {
 
   const setting = settings.find((entry) => entry.id === opened);
   const onChoices = pages.page.id === "choices";
+  const backToFlags = useCallback(() => {
+    setOpened(null);
+    setStatus(null);
+    pop();
+  }, [pop]);
   useEffect(() => {
-    if (onChoices && !setting) {
-      setOpened(null);
-      setStatus(null);
-      pop();
-    }
-  }, [onChoices, setting, pop]);
+    if (onChoices && !setting) backToFlags();
+  }, [onChoices, setting, backToFlags]);
 
   let items: QuickPickItem<PickerValue>[];
   if (onChoices) {
@@ -107,9 +108,7 @@ export function FeatureFlagsPicker() {
       const choice = value.value;
       if (choice !== "automatic" && choice !== "on" && choice !== "off") return "keepOpen" as const;
       if (choice === setting.current) {
-        setOpened(null);
-        setStatus(null);
-        pop();
+        backToFlags();
         return "keepOpen" as const;
       }
       if (writeUiFeatureOverride(setting.id, choice === "automatic" ? null : choice === "on")) {
@@ -137,15 +136,7 @@ export function FeatureFlagsPicker() {
       heading={setting ? { label: setting.label } : undefined}
       segments={[{ sourceId: "flags", ranking: "client", items }]}
       {...pages.pickerProps}
-      onBack={
-        onChoices
-          ? () => {
-              setStatus(null);
-              setOpened(null);
-              pop();
-            }
-          : undefined
-      }
+      onBack={onChoices ? backToFlags : undefined}
       summary={status ? pageStatusSummary(status) : undefined}
       emptyMessage={onChoices ? "No matching values." : "No matching features."}
       acceptLabel={onChoices ? "Choose" : "Open"}

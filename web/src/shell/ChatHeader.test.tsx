@@ -12,7 +12,7 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ServerInfo } from "@/lib/capabilities";
-import { resetUiFeatureOverridesForTests } from "@/lib/uiFeatureOverrides";
+import { resetUiFeatureOverridesForTests, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
 import { useFeatureFlagsPickerStore } from "@/store/featureFlagsPicker";
 import { ChatHeader } from "./ChatHeader";
 import { claimChatPaneViewToggleHost, releaseChatPaneViewToggleHost } from "./chatPaneToolbarHost";
@@ -1277,10 +1277,9 @@ describe("ChatHeader — UI feature overrides", () => {
 
   it.each([false, true])("names overrides and opens the picker (mobile: %s)", async (mobile) => {
     isMobileMock.mockReturnValue(mobile);
-    localStorage.setItem(
-      `omnigent:ui-feature-overrides:v1:${JSON.stringify(window.location.origin)}`,
-      JSON.stringify({ canvas: false, session_overview: false }),
-    );
+    expect(writeUiFeatureOverride("canvas", false)).toBe(true);
+    expect(writeUiFeatureOverride("session_overview", false)).toBe(true);
+    resetUiFeatureOverridesForTests();
     renderHeader({ sidebarOpen: true, serverInfo });
     const label = "UI feature flags overridden: Canvas Off, Session cost sidebar Off";
     const button = screen.getByRole("button", { name: label });
@@ -1295,10 +1294,8 @@ describe("ChatHeader — UI feature overrides", () => {
     { quick_pick_palette: false, canvas: false },
     { quick_pick_palette: true },
   ])("hides stored decisions when the gate is disabled or flags are unreported", (features) => {
-    localStorage.setItem(
-      `omnigent:ui-feature-overrides:v1:${JSON.stringify(window.location.origin)}`,
-      '{"canvas":true}',
-    );
+    expect(writeUiFeatureOverride("canvas", true)).toBe(true);
+    resetUiFeatureOverridesForTests();
     renderHeader({
       sidebarOpen: true,
       serverInfo: { ...serverInfo, features },
