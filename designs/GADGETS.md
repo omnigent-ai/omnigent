@@ -74,7 +74,8 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
   `if_version` replaces, `operation_id` retries, tombstones that keep history, and
   digest-chained revisions that fail closed on damage need no transactions or locks, and the
   interface a deployment implements is four calls (`read_json`, `create_json`, `list_paths`,
-  `mkdirs`, plus an optional `delete_tree`).
+  `mkdirs`, plus an optional `delete_tree`; a store that deletes must also supply
+  `exclusive`, a lock shared by every process using the storage).
 - **Deployments replace it whole.** The default keeps files under `<data_dir>/gadgets`; a
   deployment that stores user content elsewhere (for example in a workspace file system,
   where gadgets inherit that system's permissions and quotas) implements `GadgetStore` without
