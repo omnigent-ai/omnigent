@@ -52,7 +52,8 @@ no Chat/Terminal switcher. Open the parent session to use its terminal. Children
 with their own terminal retain the switcher.
 
 - Use the Chat/Terminal switcher in the session header. With `floating_panes` on, a
-  terminal-first session's chat card shows it in the card's top row instead.
+  terminal-first session's chat card shows it in the card's top row instead. While a
+  split floats beside the chat as separate cards, it sits in the agent pane's row.
 - Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
   off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.

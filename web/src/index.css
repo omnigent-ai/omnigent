@@ -1379,15 +1379,9 @@ aside[aria-label="Workspace"][data-maximized] {
   .app-shell[data-floating-panes] [data-main-view] .chat-conversation-content.pt-20 {
     padding-top: 1.5rem;
   }
-  .app-shell[data-floating-panes] [data-main-view="chat"] .main-terminal-view {
+  .app-shell[data-floating-panes] [data-main-view="chat"] .main-terminal-view,
+  .app-shell[data-floating-panes] [data-main-view="chat"] .split-panes-main-view {
     padding-top: 0;
-  }
-  /* A terminal-first chat's own row tops its card, over the terminal, which starts below it. */
-  .app-shell[data-floating-panes]
-    [data-main-view="chat"]
-    > main[data-chat-pane-strip]
-    .main-terminal-view {
-    padding-top: 1.75rem;
   }
   /* The chat pane's Chat/Terminal switch: a recessed track with a raised, lit active segment. */
   .app-shell[data-floating-panes] .view-mode-track {

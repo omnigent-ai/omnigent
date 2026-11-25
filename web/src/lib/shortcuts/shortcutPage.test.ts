@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { SHORTCUT_GROUPS, shortcutBinding } from "./registry";
 import {
   type ShortcutPageContext,
   type ShortcutPageGroup,
@@ -155,5 +156,21 @@ describe("shortcutPageGroups", () => {
     expect(labelsIn({ ...BROWSER_TAB, contentSearch: true }, "View")).toContain(
       "Search workspace contents",
     );
+  });
+});
+
+describe("rows the registry binds", () => {
+  it("sit under their binding's group", () => {
+    for (const context of everyContext()) {
+      for (const group of shortcutPageGroups(context, true)) {
+        for (const row of group.items) {
+          if (row.shortcutId === undefined) continue;
+          const { title } = SHORTCUT_GROUPS.find(
+            (candidate) => candidate.id === shortcutBinding(row.shortcutId!).group,
+          )!;
+          expect(group.title, row.shortcutId).toBe(title);
+        }
+      }
+    }
   });
 });

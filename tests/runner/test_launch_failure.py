@@ -433,6 +433,8 @@ def test_sized_request_size_rejection_keeps_its_text() -> None:
         ),
         # Minimal form — just the key phrase.
         "Budget X has reached its limit of $0.",
+        # Claude Code's retry row, cut to an 80-column pane before the key phrase.
+        'API Error: 403 Budget "example-budget" (00000000-0000-…',
         # Disabled per-user rate limit (rate limit is set to 0).
         (
             'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED",'

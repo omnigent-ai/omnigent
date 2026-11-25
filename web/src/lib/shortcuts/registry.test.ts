@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { WORKSPACE_SIDEBAR_BINDINGS } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import type { KeyChordInput } from "./chord";
 import {
   activeShortcutChords,
@@ -7,8 +8,10 @@ import {
   matchedShortcutChordIndex,
   matchesShortcut,
   SHORTCUT_BINDINGS,
+  SHORTCUT_GROUPS,
   shortcutBinding,
   shortcutKeys,
+  shortcutRowKeys,
 } from "./registry";
 
 function press(init: Partial<KeyChordInput> & { key: string }): KeyChordInput {
@@ -454,5 +457,31 @@ describe("currentShortcutEnvironment", () => {
     expect(platform).toHaveBeenCalledTimes(1);
     // A resolved environment passes through unchanged.
     expect(currentShortcutEnvironment(environment)).toBe(environment);
+  });
+});
+
+describe("Keyboard shortcuts page metadata", () => {
+  it("lists every binding, the sidebar's too, under one of the page's groups", () => {
+    const groups = new Set(SHORTCUT_GROUPS.map((group) => group.id));
+    expect(groups.size).toBe(SHORTCUT_GROUPS.length);
+    for (const binding of [...SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS]) {
+      expect(groups.has(binding.group), binding.id).toBe(true);
+    }
+  });
+
+  it("shows a numbered binding's row as a range of digits", () => {
+    const native = { mac: true, native: true, desktopMenu: false };
+    expect(shortcutRowKeys("session.number", native, { contentSearch: false })).toEqual([
+      "⌘",
+      "1…0",
+    ]);
+    expect(shortcutRowKeys("workspace.tab", mac, { contentSearch: false })).toEqual(["⌃", "1…4"]);
+    expect(shortcutRowKeys("workspace.tab", mac, { contentSearch: true })).toEqual(["⌃", "1…5"]);
+  });
+
+  it("gives a range row only to the numbered bindings, and others their chord's keys", () => {
+    const ranged = SHORTCUT_BINDINGS.filter((binding) => binding.rowKeys !== undefined);
+    expect(ranged.map((binding) => binding.id)).toEqual(["session.number", "workspace.tab"]);
+    expect(shortcutRowKeys("palette.commands", mac, { contentSearch: false })).toEqual(["⌘", "K"]);
   });
 });
