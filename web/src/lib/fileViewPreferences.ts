@@ -23,6 +23,8 @@ export interface FileViewPreferences {
   hideWhitespace: boolean;
   /** Whether long lines soft-wrap in the code editor and diff view (no horizontal scroll). */
   wrapLines: boolean;
+  /** Whether the code viewer pins the lines opening the scopes around the top of the view. */
+  stickyScroll: boolean;
 }
 
 const STORAGE_KEY = "omnigent:file-view-preferences";
@@ -33,6 +35,7 @@ export const DEFAULT_FILE_VIEW_PREFERENCES: FileViewPreferences = {
   previewableViewMode: "editor",
   hideWhitespace: false,
   wrapLines: false,
+  stickyScroll: true,
 };
 
 /**
@@ -66,6 +69,10 @@ export function readFileViewPreferences(): FileViewPreferences {
           : DEFAULT_FILE_VIEW_PREFERENCES.hideWhitespace,
       wrapLines:
         typeof p.wrapLines === "boolean" ? p.wrapLines : DEFAULT_FILE_VIEW_PREFERENCES.wrapLines,
+      stickyScroll:
+        typeof p.stickyScroll === "boolean"
+          ? p.stickyScroll
+          : DEFAULT_FILE_VIEW_PREFERENCES.stickyScroll,
     };
   } catch {
     return DEFAULT_FILE_VIEW_PREFERENCES;

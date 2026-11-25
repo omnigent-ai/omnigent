@@ -1120,9 +1120,11 @@ function FileViewerBody({
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
-  // preference. Idempotent on mount (writes back the seeded values).
+  // preference. Idempotent on mount (writes back the seeded values). Fields this viewer
+  // doesn't show, such as the CodeMirror viewer's sticky scroll, keep their saved value.
   useEffect(() => {
     writeFileViewPreferences({
+      ...readFileViewPreferences(),
       diffActive,
       diffLayout,
       previewableViewMode,
