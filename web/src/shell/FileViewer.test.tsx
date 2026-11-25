@@ -265,6 +265,8 @@ interface RenderProps {
   registerLeaveGuard?: ComponentProps<typeof FileViewer>["registerLeaveGuard"];
   syncUrl?: boolean;
   frameless?: boolean;
+  besideSidebar?: boolean;
+  toolbarLeading?: React.ReactNode;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
   open?: boolean;
@@ -290,6 +292,7 @@ interface RenderProps {
   shareDisabledReason?: string;
   linkedCommentId?: string;
   comparisonDiff?: ComponentProps<typeof FileViewer>["comparisonDiff"];
+  onShowChanges?: () => void;
 }
 
 /**
@@ -303,6 +306,8 @@ interface RenderProps {
 function viewerTree({
   syncUrl,
   frameless,
+  besideSidebar,
+  toolbarLeading,
   mobileOverlay,
   position,
   open = false,
@@ -321,6 +326,7 @@ function viewerTree({
   registerLeaveGuard,
   linkedCommentId,
   comparisonDiff,
+  onShowChanges,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -331,6 +337,8 @@ function viewerTree({
         <FileViewer
           syncUrl={syncUrl}
           frameless={frameless}
+          besideSidebar={besideSidebar}
+          toolbarLeading={toolbarLeading}
           mobileOverlay={mobileOverlay}
           position={position}
           open={open}
@@ -348,6 +356,7 @@ function viewerTree({
           registerLeaveGuard={registerLeaveGuard}
           linkedCommentId={linkedCommentId}
           comparisonDiff={comparisonDiff}
+          onShowChanges={onShowChanges}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -546,6 +555,33 @@ describe("FileViewer mobile keyboard inset", () => {
       expect(screen.getByTestId("file-viewer")).toHaveStyle({ paddingBottom: "300px" });
     },
   );
+
+  it("keeps the frameless layout, with no sidebar cell, when it isn't beside a sidebar", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, frameless: true });
+    const root = screen.getByTestId("file-viewer");
+    expect(root).toHaveClass("flex", "flex-col", "bg-card");
+    expect(root.firstElementChild).toHaveClass("border-b", "px-4", "py-3");
+    expect(root.querySelector(".col-start-2")).toBeNull();
+  });
+
+  it("beside a sidebar, spans the toolbar over the page with its leading control first", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({
+      open: true,
+      frameless: true,
+      besideSidebar: true,
+      toolbarLeading: <button type="button">Show tree</button>,
+    });
+    const root = screen.getByTestId("file-viewer");
+    expect(root).toHaveClass("grid-cols-subgrid", "bg-background");
+    const toolbar = root.firstElementChild as HTMLElement;
+    expect(toolbar).toHaveClass("col-span-full", "row-start-1");
+    const leading = within(toolbar).getByRole("button", { name: "Show tree" });
+    expect(toolbar.querySelector("button")).toBe(leading);
+    // The banner and content sit in the cell beside the sidebar.
+    expect(root.children[1]).toHaveClass("col-start-2", "row-start-2");
+  });
 
   it("does not pad the desktop rail for the iOS keyboard", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
@@ -1049,6 +1085,25 @@ describe("FileViewer URL sync — diff param", () => {
     // Failure: diff sync useEffect did not call setSearchParams after diffActive changed.
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.getByTestId("url-params").textContent).toContain("diff=1");
+  });
+
+  it("sends Show changes to the page's Changes review, and Open file leaves a diff", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onShowChanges = vi.fn();
+    renderViewer({ open: true, path: "file1.py", onShowChanges });
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show changes" }));
+    expect(onShowChanges).toHaveBeenCalledTimes(1);
+    // The review shows the diff, so the file stays in its own view.
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    cleanup();
+
+    // A file that opens in a diff, as from a ?diff=1 link, leaves it with Open file.
+    renderViewer({ open: true, path: "file1.py", onShowChanges, initialSearch: "diff=1" });
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open file" }));
+    expect(await screen.findByTestId("code-viewer")).toBeInTheDocument();
+    expect(onShowChanges).toHaveBeenCalledTimes(1);
   });
 
   it("removes ?diff from the URL when diff is toggled off", async () => {
