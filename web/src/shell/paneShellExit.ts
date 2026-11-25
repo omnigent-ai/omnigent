@@ -17,18 +17,38 @@ const TERMINAL_GONE_CODE = 4404;
  */
 const SESSION_ENDED_REASON = "terminal session ended";
 
-const endedShells = new Map<string, Set<string>>();
+/**
+ * How long an ended shell counts as ended: past the seconds the terminals list takes to drop it.
+ * A shell relaunched later under the same name gets the same key, and must be asked about again.
+ */
+export const ENDED_SHELL_MEMORY_MS = 10_000;
+
+/** When each pane's shell ended, by conversation and pane key. */
+const endedShells = new Map<string, Map<string, number>>();
 
 /** Record that the shell in ``conversationId``'s pane ``key`` has ended. */
 export function markPaneShellEnded(conversationId: string, key: string): void {
-  const keys = endedShells.get(conversationId) ?? new Set<string>();
-  keys.add(key);
+  const now = performance.now();
+  for (const [conversation, keys] of endedShells) {
+    for (const [endedKey, endedAt] of keys) {
+      if (now - endedAt >= ENDED_SHELL_MEMORY_MS) keys.delete(endedKey);
+    }
+    if (keys.size === 0) endedShells.delete(conversation);
+  }
+  const keys = endedShells.get(conversationId) ?? new Map<string, number>();
+  keys.set(key, now);
   endedShells.set(conversationId, keys);
 }
 
-/** Whether the shell in ``conversationId``'s pane ``key`` has ended, so closing it ends nothing. */
+/** Forget an ended shell once its pane connects again, to a shell that is running. */
+export function forgetPaneShellEnded(conversationId: string, key: string): void {
+  endedShells.get(conversationId)?.delete(key);
+}
+
+/** Whether the shell in ``conversationId``'s pane ``key`` just ended, so closing it ends nothing. */
 export function isPaneShellEnded(conversationId: string, key: string): boolean {
-  return endedShells.get(conversationId)?.has(key) ?? false;
+  const endedAt = endedShells.get(conversationId)?.get(key);
+  return endedAt !== undefined && performance.now() - endedAt < ENDED_SHELL_MEMORY_MS;
 }
 
 export function resetEndedPaneShellsForTests(): void {
@@ -63,6 +83,7 @@ export function usePaneShellExit(
   return useCallback((paneKey, state) => {
     if (state?.kind === "connected") {
       connected.current.add(paneKey);
+      forgetPaneShellEnded(latestTarget.current.conversationId, paneKey);
       return;
     }
     if (!shellEndedOnClose(state, connected.current.has(paneKey))) return;

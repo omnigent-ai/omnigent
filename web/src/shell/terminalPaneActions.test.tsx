@@ -12,7 +12,12 @@ import {
   recordPaneStartFailure,
   resetPaneStartFailuresForTests,
 } from "./paneStartFailures";
-import { markPaneShellEnded, resetEndedPaneShellsForTests } from "./paneShellExit";
+import {
+  ENDED_SHELL_MEMORY_MS,
+  forgetPaneShellEnded,
+  markPaneShellEnded,
+  resetEndedPaneShellsForTests,
+} from "./paneShellExit";
 import { PREFERRED_SHELL_KEY, readPreferredShell } from "./preferredShell";
 import type { ShellCloseCheck } from "./shellCloseCheck";
 import { PANE_CLOSED_MESSAGE } from "./splitTargetActions";
@@ -29,7 +34,7 @@ const fixture = vi.hoisted(() => ({
   endShell: vi.fn<(terminalId: string) => void>(),
   toast: vi.fn<(message: string) => void>(),
   declaredShells: ["zsh", "bash"],
-  // What the runner says about the shell being closed; asking is today's answer.
+  // The runner's close check; asks before closing unless a test says otherwise.
   shellCheck: { close: "confirm", busy: null } as ShellCloseCheck,
   checkedTerminals: [] as string[][],
 }));
@@ -226,6 +231,31 @@ describe("useTerminalPaneActions", () => {
     expect(result.current.pendingClose).toBeNull();
     expect(read()).toBeUndefined();
     expect(fixture.endShell).not.toHaveBeenCalled();
+  });
+
+  it("asks again about a shell relaunched under an ended one's key", () => {
+    vi.useFakeTimers();
+    const { target } = memoryTarget(SIDE_BY_SIDE);
+    markPaneShellEnded(target.conversationId, ZSH_KEY);
+    // The same name and session key relaunched, its pane connected again.
+    forgetPaneShellEnded(target.conversationId, ZSH_KEY);
+    const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose?.terminal).toEqual(ZSH);
+    act(() => result.current.confirmClose());
+    expect(fixture.endShell).toHaveBeenCalledWith(ZSH.id);
+
+    // Unconnected, the mark lasts only past the list's lag.
+    fixture.endShell.mockClear();
+    const later = memoryTarget(SIDE_BY_SIDE);
+    markPaneShellEnded(later.target.conversationId, ZSH_KEY);
+    vi.advanceTimersByTime(ENDED_SHELL_MEMORY_MS);
+    const { result: relaunched } = renderHook(() =>
+      useTerminalPaneActions(later.target, [AGENT, ZSH]),
+    );
+    act(() => relaunched.current.closePane(ZSH_KEY));
+    expect(relaunched.current.pendingClose?.terminal).toEqual(ZSH);
+    vi.useRealTimers();
   });
 
   it("closes a pane whose shell didn't start without asking, since it ends nothing", () => {

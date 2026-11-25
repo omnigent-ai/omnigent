@@ -88,6 +88,9 @@ describe("usePaneShellExit", () => {
     expect(panesOf(read())).toEqual([AGENT_KEY, BASH_KEY]);
     expect(read()?.focusedKey).not.toBe(ZSH_KEY);
     expect(isPaneShellEnded(target.conversationId, ZSH_KEY)).toBe(true);
+    // A shell relaunched under the same key connects again, and is no longer taken as ended.
+    act(() => result.current(ZSH_KEY, CONNECTED));
+    expect(isPaneShellEnded(target.conversationId, ZSH_KEY)).toBe(false);
   });
 
   it("keeps a pane closed before it ever connected, or dropped by the transport", () => {
