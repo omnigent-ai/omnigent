@@ -14,6 +14,7 @@ import {
 } from "./paneStartFailures";
 import { markPaneShellEnded, resetEndedPaneShellsForTests } from "./paneShellExit";
 import { PREFERRED_SHELL_KEY, readPreferredShell } from "./preferredShell";
+import type { ShellCloseCheck } from "./shellCloseCheck";
 import { PANE_CLOSED_MESSAGE } from "./splitTargetActions";
 import { resetPendingPaneClosesForTests, useTerminalPaneActions } from "./terminalPaneActions";
 import type { TerminalSplitTarget } from "./terminalSplitTarget";
@@ -28,6 +29,9 @@ const fixture = vi.hoisted(() => ({
   endShell: vi.fn<(terminalId: string) => void>(),
   toast: vi.fn<(message: string) => void>(),
   declaredShells: ["zsh", "bash"],
+  // What the runner says about the shell being closed; asking is today's answer.
+  shellCheck: { close: "confirm", busy: null } as ShellCloseCheck,
+  checkedTerminals: [] as string[][],
 }));
 
 vi.mock("@/hooks/useAgents", () => ({
@@ -39,6 +43,13 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useDeleteTerminal: () => ({ mutate: fixture.endShell, isPending: false }),
 }));
 vi.mock("@/components/ui/toast", () => ({ showToast: fixture.toast }));
+vi.mock("./shellCloseCheck", () => ({
+  useShellCloseCheck:
+    () => (terminalIds: string[], _trigger: string, decide: (check: ShellCloseCheck) => void) => {
+      fixture.checkedTerminals.push(terminalIds);
+      decide(fixture.shellCheck);
+    },
+}));
 
 let session = 0;
 
@@ -70,6 +81,8 @@ beforeEach(() => {
   fixture.endShell.mockReset();
   fixture.toast.mockReset();
   fixture.declaredShells = ["zsh", "bash"];
+  fixture.shellCheck = { close: "confirm", busy: null };
+  fixture.checkedTerminals = [];
 });
 afterEach(() => {
   resetPaneStartFailuresForTests();
@@ -178,7 +191,7 @@ describe("useTerminalPaneActions", () => {
     const { target, read } = memoryTarget(SIDE_BY_SIDE);
     const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
     act(() => result.current.closePane(ZSH_KEY));
-    expect(result.current.pendingClose).toEqual({ key: ZSH_KEY, terminal: ZSH });
+    expect(result.current.pendingClose).toEqual({ key: ZSH_KEY, terminal: ZSH, busy: null });
     act(() => result.current.cancelClose());
     expect(result.current.pendingClose).toBeNull();
     expect(read()).toEqual(SIDE_BY_SIDE);
@@ -187,6 +200,22 @@ describe("useTerminalPaneActions", () => {
     act(() => result.current.confirmClose());
     expect(read()).toBeUndefined();
     expect(fixture.endShell).toHaveBeenCalledExactlyOnceWith(ZSH.id);
+  });
+
+  it("closes a pane whose shell is idle without asking, and asks naming a busy one's job", () => {
+    const { target, read } = memoryTarget(SIDE_BY_SIDE);
+    const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
+    fixture.shellCheck = { close: "confirm", busy: { foreground: "vim", backgroundJobs: 0 } };
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose?.busy).toEqual({ foreground: "vim", backgroundJobs: 0 });
+    act(() => result.current.cancelClose());
+
+    fixture.shellCheck = { close: "now" };
+    act(() => result.current.closePane(ZSH_KEY));
+    expect(result.current.pendingClose).toBeNull();
+    expect(read()).toBeUndefined();
+    expect(fixture.endShell).toHaveBeenCalledExactlyOnceWith(ZSH.id);
+    expect(fixture.checkedTerminals).toEqual([[ZSH.id], [ZSH.id]]);
   });
 
   it("closes a pane whose shell already exited without asking, while it's still listed", () => {

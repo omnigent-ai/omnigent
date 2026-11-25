@@ -48,6 +48,7 @@ import {
   withAttachParams,
 } from "@/lib/terminals";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
+import { noteTerminalInput } from "@/lib/terminalInputTimes";
 import {
   TerminalClipboardPrompt,
   type TerminalClipboardDecision,
@@ -368,7 +369,11 @@ export function TerminalView({
     onActivityRef.current?.();
   }, []);
 
+  const inputTerminalRef = useRef({ sessionId, terminalId });
+  inputTerminalRef.current = { sessionId, terminalId };
   const notifyInput = useCallback(() => {
+    // Typing makes an earlier "is this shell idle?" reading out of date.
+    noteTerminalInput(inputTerminalRef.current.sessionId, inputTerminalRef.current.terminalId);
     onInputRef.current?.();
   }, []);
 
