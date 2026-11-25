@@ -224,11 +224,35 @@ async function deliverMessage(
   }
 }
 
-function deliveryError(prefix: string, error: unknown): BridgeError {
-  if (error instanceof DeliveryRefused) return new BridgeError("PERMISSION_DENIED", error.message);
-  return new BridgeError(
+/**
+ * A request that failed on its way to a session. `notSent` when it is known not to have
+ * reached it: refused, or answered with a 4xx before it was taken. Otherwise (no answer, a
+ * 5xx) the session may have it and act on it.
+ */
+export class DeliveryFailed extends BridgeError {
+  readonly notSent: boolean;
+  constructor(code: BridgeError["code"], message: string, notSent: boolean) {
+    super(code, message);
+    this.notSent = notSent;
+  }
+}
+
+/** Whether a failed `openGadgetSession` may still have got its message to the session. */
+export function mayHaveBeenDelivered(error: unknown): boolean {
+  return !(error instanceof DeliveryFailed && error.notSent);
+}
+
+function deliveryError(target: string, error: unknown): DeliveryFailed {
+  if (error instanceof DeliveryRefused) {
+    return new DeliveryFailed("PERMISSION_DENIED", error.message, true);
+  }
+  const status = (error as { status?: unknown })?.status;
+  const notSent = typeof status === "number" && status >= 400 && status < 500;
+  const detail = error instanceof Error ? error.message : String(error);
+  return new DeliveryFailed(
     "UNAVAILABLE",
-    `${prefix}: ${error instanceof Error ? error.message : String(error)}`,
+    `${target} ${notSent ? "did not get" : "may not have got"} the request: ${detail}`,
+    notSent,
   );
 }
 
@@ -410,9 +434,10 @@ export async function openGadgetSession(
     try {
       registered = await getGadgetGadgetSession(app.id);
     } catch (error) {
-      throw new BridgeError(
+      throw new DeliveryFailed(
         "UNAVAILABLE",
         `Couldn't find your gadget session: ${error instanceof Error ? error.message : String(error)}`,
+        true,
       );
     }
     if (registered !== target) {
@@ -425,7 +450,7 @@ export async function openGadgetSession(
       try {
         await deliverMessage(app.id, target, message, actionId);
       } catch (error) {
-        throw deliveryError("This session did not get the request", error);
+        throw deliveryError("This session", error);
       }
     }
     return "sent";
@@ -442,7 +467,7 @@ export async function openGadgetSession(
       return "sent";
     } catch (error) {
       if (!sessionGone(error)) {
-        throw deliveryError("Your gadget session did not get the request", error);
+        throw deliveryError("Your gadget session", error);
       }
     }
   }

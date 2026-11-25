@@ -35,6 +35,7 @@ import {
 import { composeGadgetBuildPrompt, gadgetNameFrom } from "@/gadgets/host/gadgetBuild";
 import { GADGET_START_PARAM, sessionIdFromPath } from "@/gadgets/host/gadgetPages";
 import {
+  mayHaveBeenDelivered,
   openGadgetSession,
   gadgetIdFromRailKey,
   gadgetRailKey,
@@ -199,15 +200,22 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
   // taken back, so that step finishes and shows the gadget the session is building.
   const operation = useRef(0);
   const delivering = useRef(false);
+  // Forgets the failed build, deleting its gadget unless its build message may have reached
+  // the session: then the session may be building it, so it stays in the viewer's gadgets.
+  const dropUnfinished = () => {
+    const abandoned = unfinished.current;
+    unfinished.current = null;
+    if (abandoned && !abandoned.maybeDelivered) {
+      void deleteGadget(abandoned.gadget.id).catch(() => undefined);
+    }
+  };
   const build = async (description: string) => {
     const run = ++operation.current;
     const cancelled = () => run !== operation.current;
     let gadget = unfinished.current?.description === description ? unfinished.current.gadget : null;
     if (gadget === null) {
       // The description changed since the failed try: its gadget is not this one.
-      const abandoned = unfinished.current?.gadget;
-      unfinished.current = null;
-      if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
+      dropUnfinished();
       const created = await createGadget(gadgetNameFrom(description));
       if (cancelled()) {
         void deleteGadget(created.id).catch(() => undefined);
@@ -226,6 +234,10 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
         reveal: false,
         railSessionId: sessionId,
       });
+    } catch (error) {
+      if (!mayHaveBeenDelivered(error)) throw error;
+      unfinished.current = { description, gadget, maybeDelivered: true };
+      throw error;
     } finally {
       delivering.current = false;
     }
@@ -235,11 +247,7 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
   // Cancel leaves no half-made gadget behind, except one already being built.
   const cancel = () => {
     operation.current += 1;
-    if (!delivering.current) {
-      const abandoned = unfinished.current?.gadget;
-      unfinished.current = null;
-      if (abandoned) void deleteGadget(abandoned.id).catch(() => undefined);
-    }
+    if (!delivering.current) dropUnfinished();
   };
   const cancelRef = useRef(cancel);
   cancelRef.current = cancel;

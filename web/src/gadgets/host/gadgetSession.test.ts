@@ -17,6 +17,7 @@ import {
   quoteInGadgetSession,
   requestGadgetAction,
   gadgetSelectionQuote,
+  mayHaveBeenDelivered,
 } from "./gadgetSession";
 
 // The message posted to the session, the side panel and composer requests, and the requests to
@@ -390,6 +391,29 @@ describe("gadget session", () => {
     ).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
     expect(onDelivered).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["a 4xx answer", Object.assign(new Error("Bad request"), { status: 400 }), false],
+    ["no answer", new TypeError("Failed to fetch"), true],
+    ["a 5xx answer", Object.assign(new Error("Bad gateway"), { status: 502 }), true],
+  ])(
+    "says whether a message that failed with %s may still have reached the session",
+    async (_label, failure, maybe) => {
+      server.use(
+        rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+          res(ctx.json({ session_id: "s_1", version: "v" })),
+        ),
+      );
+      sendUserMessage.mockRejectedValueOnce(failure);
+
+      const error = await openGadgetSession(EDITOR, "Build it", navigate, {
+        deliver: true,
+        reveal: false,
+      }).catch((caught: unknown) => caught);
+
+      expect(mayHaveBeenDelivered(error)).toBe(maybe);
+    },
+  );
 
   it("still takes a message the session answers without queueing it", async () => {
     server.use(

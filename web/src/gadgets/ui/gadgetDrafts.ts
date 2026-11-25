@@ -83,6 +83,11 @@ export function setGadgetDraftText(sessionId: string, text: string): void {
 export interface UnfinishedGadgetBuild {
   description: string;
   gadget: Gadget;
+  /**
+   * Its build message may have reached the session (sent, but no answer came back), so the
+   * session may be building it: it is kept rather than deleted when the draft is dropped.
+   */
+  maybeDelivered?: boolean;
 }
 
 // Per session, in memory: switching sessions and back keeps it, so Try again reuses the gadget

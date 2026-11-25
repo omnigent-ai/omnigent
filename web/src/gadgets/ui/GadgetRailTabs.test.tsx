@@ -411,6 +411,72 @@ describe("New gadget tab", () => {
     await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("3"));
   });
 
+  it.each([
+    ["Cancel", "cancel"],
+    ["a build with a changed description", "rebuild"],
+  ])(
+    "keeps a gadget whose build message may have reached the session on %s",
+    async (_label, step) => {
+      const created = gadgetFixture({
+        id: "3",
+        name: "Incident tracker",
+        published_revision: null,
+      });
+      const next = gadgetFixture({ id: "4", name: "Release tracker", published_revision: null });
+      vi.mocked(createGadget).mockResolvedValueOnce(created);
+      vi.mocked(deleteGadget).mockResolvedValue(undefined);
+      vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+      // Sent, but the answer was lost: the session may be building it.
+      const { DeliveryFailed } = await vi.importActual<typeof GadgetSessionModule>(
+        "@/gadgets/host/gadgetSession",
+      );
+      vi.mocked(openGadgetSession).mockRejectedValueOnce(
+        new DeliveryFailed("UNAVAILABLE", "This session may not have got the request", false),
+      );
+      renderWithGadgets(<Rail conversationId="conv_1" />);
+      fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+      const content = await screen.findByRole("region", { name: "content" });
+      const box = within(content).getByRole("textbox", { name: "Describe the gadget" });
+      fireEvent.change(box, { target: { value: "An incident tracker for my team" } });
+      fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+      expect(await within(content).findByText(/may not have got the request/)).toBeVisible();
+      if (step === "cancel") {
+        fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+      } else {
+        vi.mocked(createGadget).mockResolvedValueOnce(next);
+        vi.mocked(openGadgetSession).mockResolvedValueOnce("sent");
+        fireEvent.change(box, { target: { value: "A release tracker" } });
+        fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+        await waitFor(() => expect(createGadget).toHaveBeenCalledTimes(2));
+      }
+      await act(async () => {});
+      expect(deleteGadget).not.toHaveBeenCalledWith("3");
+    },
+  );
+
+  it("still deletes a gadget whose build message the session refused", async () => {
+    const created = gadgetFixture({ id: "3", name: "Incident tracker", published_revision: null });
+    vi.mocked(createGadget).mockResolvedValue(created);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+    const { DeliveryFailed } = await vi.importActual<typeof GadgetSessionModule>(
+      "@/gadgets/host/gadgetSession",
+    );
+    vi.mocked(openGadgetSession).mockRejectedValueOnce(
+      new DeliveryFailed("UNAVAILABLE", "This session did not get the request", true),
+    );
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    const content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "An incident tracker for my team" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    expect(await within(content).findByText(/did not get the request/)).toBeVisible();
+    fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("3"));
+  });
+
   it("keeps each session's draft and unfinished build its own", async () => {
     const madeInA = gadgetFixture({ id: "3", name: "Tracker A", published_revision: null });
     const madeInB = gadgetFixture({ id: "4", name: "Tracker B", published_revision: null });
