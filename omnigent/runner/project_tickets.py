@@ -147,11 +147,14 @@ async def execute_ticket_tool(
                 "sys_ticket_stages_update": ("PUT", "/stages"),
                 "sys_ticket_comment": ("POST", "/comments"),
                 "sys_ticket_land": ("POST", "/land"),
+                "sys_ticket_push_prefix": ("GET", "/push-prefix"),
+                "sys_ticket_revert_draft": ("POST", "/revert-draft"),
                 "sys_ticket_import_pr": ("POST", "/import-pr"),
                 "sys_session_link_ticket": ("POST", "/sessions"),
                 "sys_ticket_link": ("POST", "/related"),
             }[name]
-            result = await request(method, path + suffix, json=body)
+            payload = {"params": body} if method == "GET" else {"json": body}
+            result = await request(method, path + suffix, **payload)
         return json.dumps(result, ensure_ascii=False)
     except httpx.HTTPStatusError as exc:
         return json.dumps(

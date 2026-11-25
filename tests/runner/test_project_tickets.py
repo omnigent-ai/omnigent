@@ -59,6 +59,7 @@ TICKET = "c" * 32
             f"/{TICKET}/sessions",
             {"session_id": SOURCE, "action": "attach", "involvement": ""},
         ),
+        ("sys_ticket_revert_draft", {"ticket_id": TICKET}, "POST", f"/{TICKET}/revert-draft", {}),
         (
             "sys_ticket_link",
             {"ticket_id": TICKET, "related_ticket_id": SOURCE},
@@ -372,6 +373,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id, nam
     [
         ("sys_ticket_list", {}),
         ("sys_ticket_get", {"ticket_id": TICKET}),
+        ("sys_ticket_push_prefix", {}),
         ("sys_project_identity_list", {}),
         (
             "sys_project_file_view",
@@ -385,6 +387,7 @@ async def test_read_only_tools_only_send_gets(name, args):
     assert READ_ONLY_TICKET_TOOLS == (
         "sys_ticket_list",
         "sys_ticket_get",
+        "sys_ticket_push_prefix",
         "sys_project_identity_list",
         "sys_project_file_view",
         "sys_project_kpis_get",
@@ -406,7 +409,7 @@ async def test_read_only_tools_only_send_gets(name, args):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 19
+    assert len(TICKET_TOOLS) == 21
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert (

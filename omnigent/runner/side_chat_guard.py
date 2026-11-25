@@ -24,6 +24,7 @@ ROLE_SIDE_CHAT_BLOCKED_TOOLS = frozenset(
         "sys_ticket_create",
         "sys_ticket_import_pr",
         "sys_ticket_land",
+        "sys_ticket_revert_draft",
         "sys_ticket_link",
         "sys_ticket_stages_update",
         "sys_scheduled_task_create",

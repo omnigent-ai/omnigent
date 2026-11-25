@@ -24,6 +24,7 @@ from omnigent.entities.project_ticket import (
     LinkRelatedTicket,
     LinkTicketSession,
     MarkTicketSeen,
+    RevertDraftRequest,
     TicketActor,
     TicketEventKind,
     TicketLabel,
@@ -39,7 +40,7 @@ from omnigent.runtime.project_ticket_instructions import (
     FINAL_UPDATE_REMINDER,
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
-from omnigent.server import github_pr_intake, product_approval
+from omnigent.server import github_pr_intake, product_approval, project_release
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
 from omnigent.server.persona_mentions import (
     Mention,
@@ -833,6 +834,14 @@ def create_project_tickets_router(
         )
         return {"cost_usd": cents / 100, "days": days, "since_day_utc": since}
 
+    @router.get("/push-prefix")
+    async def push_prefix(request: Request, project_id: str) -> dict[str, Any]:
+        """The longest pushable prefix of the landing branch's unpushed commits, by ticket."""
+        who = await actor(request, project_id)
+        project = await load_project(request, project_id, who)
+        with _storage_errors():
+            return await project_release.project_push_prefix(project, store, who.user_id)
+
     @router.get("/{ticket_id}")
     async def get_ticket(
         request: Request, project_id: str, ticket_id: str, include_guidance: bool = False
@@ -937,6 +946,20 @@ def create_project_tickets_router(
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         with _storage_errors():
             return await queue.submit(project, ticket_id, body.sha, who, dry_run=body.dry_run)
+
+    @router.post("/{ticket_id}/revert-draft", include_in_schema=False)
+    async def revert_draft(
+        request: Request, project_id: str, ticket_id: str, body: RevertDraftRequest
+    ) -> dict[str, Any]:
+        """Draft revert commits for a landed ticket on a new branch; never moves a branch."""
+        who = await actor(request, project_id, "Drafting a revert")
+        project = await load_project(request, project_id, who)
+        found = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        ticket = found.get("ticket", found)
+        with _storage_errors():
+            return await project_release.project_revert_draft(
+                project, store, who.user_id, ticket["id"], body.shas
+            )
 
     @router.post("/{ticket_id}/comments", status_code=201)
     async def comment(

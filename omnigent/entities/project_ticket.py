@@ -396,6 +396,17 @@ class ImportPullRequest(BaseModel):
     )
 
 
+class RevertDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shas: list[str] | None = Field(
+        default=None,
+        max_length=50,
+        description="Full SHAs of the landed commits to revert. Omit to revert the "
+        "ticket's commits in the unpushed range, as the push prefix maps them.",
+    )
+
+
 class LandTicketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

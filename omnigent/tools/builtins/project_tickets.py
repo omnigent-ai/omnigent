@@ -16,6 +16,7 @@ from omnigent.entities.project_ticket import (
     ImportPullRequest,
     LandTicketRequest,
     LinkRelatedTicket,
+    RevertDraftRequest,
     TicketEventKind,
     TicketSessionLinkOptions,
     TicketStageDefinition,
@@ -345,6 +346,43 @@ class SysTicketLandTool(_TicketTool):
     arguments = LandTicket
 
 
+class PushPrefix(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SysTicketPushPrefixTool(_TicketTool):
+    tool_name = "sys_ticket_push_prefix"
+    read_only = True
+    help_text = (
+        "Report the longest prefix of the landing branch's unpushed commits (since the "
+        "remote-tracking branch; fetch first) that may be pushed. Each commit maps to the "
+        "ticket whose approved or verified SHA is the first at or after it. The prefix holds "
+        "only tickets in Verified or later with all their unpushed commits, or tickets whose "
+        "commits a later Verified revert named in their `reverted-by` label fully undoes. "
+        "Returns pushable_sha, the stop commit with its ticket and reason, the Verified "
+        "tickets held behind it, and every commit's status. Never pushes."
+    )
+    arguments = PushPrefix
+
+
+class RevertDraft(RevertDraftRequest):
+    ticket_id: str
+
+
+class SysTicketRevertDraftTool(_TicketTool):
+    tool_name = "sys_ticket_revert_draft"
+    help_text = (
+        'Draft `Revert "<subject>"` commits for a landed ticket, newest first, on top of the '
+        "integration tip, and create them on a new `ptb/revert-...` branch. By default it "
+        "reverts the ticket's unpushed commits; pass shas for others. Built with `git "
+        "merge-tree` and `git commit-tree`: no worktree is written and no existing branch "
+        "moves. On a conflict it creates nothing and reports the files and the later commits "
+        "that touched them. The revert is a normal change: check it out in a worktree, "
+        "verify it and send it for review."
+    )
+    arguments = RevertDraft
+
+
 class SysTicketImportPrTool(_TicketTool):
     tool_name = "sys_ticket_import_pr"
     help_text = (
@@ -553,6 +591,8 @@ TICKET_TOOL_CLASSES = (
     SysTicketStagesUpdateTool,
     SysTicketCommentTool,
     SysTicketLandTool,
+    SysTicketPushPrefixTool,
+    SysTicketRevertDraftTool,
     SysTicketImportPrTool,
     SysSessionLinkTicketTool,
     SysTicketLinkTool,

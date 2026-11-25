@@ -24558,6 +24558,51 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/tickets/push-prefix": {
+      "get": {
+        "description": "The longest pushable prefix of the landing branch's unpushed commits, by ticket.",
+        "operationId": "push_prefix_v1_projects__project_id__tickets_push_prefix_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Push Prefix V1 Projects  Project Id  Tickets Push Prefix Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Push Prefix",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/tickets/stages": {
       "get": {
         "operationId": "ticket_stages_v1_projects__project_id__tickets_stages_get",
