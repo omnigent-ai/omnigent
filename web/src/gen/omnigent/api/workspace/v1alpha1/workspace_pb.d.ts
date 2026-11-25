@@ -1466,6 +1466,15 @@ export declare type ResolveRepositoryContextResponse = Message<"omnigent.api.wor
    * @generated from field: bool truncated_remotes = 9;
    */
   truncatedRemotes: boolean;
+
+  /**
+   * The workspace directory below the repository's root, "/"-separated and
+   * ending in "/" unless empty, so a workspace path names a repository path.
+   * Absent from older hosts and when there is a problem.
+   *
+   * @generated from field: optional string workspace_prefix = 10;
+   */
+  workspacePrefix?: string | undefined;
 };
 
 /**
