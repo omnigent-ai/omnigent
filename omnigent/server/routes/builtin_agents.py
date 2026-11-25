@@ -44,6 +44,7 @@ from omnigent.server.proactive_agent import PROACTIVE_AGENT_IDS
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.routes._session_create_validation import agent_owner_id
 from omnigent.server.schemas import (
     AgentConfigObject,
     AgentConfigPatch,
@@ -57,6 +58,7 @@ from omnigent.server.schemas import (
 from omnigent.spec import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -153,6 +155,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # by a same-named ``omnigent run`` upload, but lets a newer
         # upload supersede the latter.
         builtin=agent.session_id is None and agent.id == builtin_agent_id(agent.name),
+        project_id=agent.project_id,
     )
 
 
@@ -309,6 +312,7 @@ def create_builtin_agents_router(
     artifact_store: ArtifactStore | None = None,
     conversation_store: ConversationStore | None = None,
     auth_provider: AuthProvider | None = None,
+    project_store: ProjectStore | None = None,
 ) -> APIRouter:
     """Build the ``/v1/agents`` router (server agent list, user agents).
 
@@ -469,7 +473,8 @@ def create_builtin_agents_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-        scope: str | None = Query(default=None, pattern="^user$"),
+        scope: str | None = Query(default=None, pattern="^(user|project)$"),
+        project_id: str | None = Query(default=None),
     ) -> AgentList:
         """List server agents, or with ``scope=user`` the caller's own agents.
 
@@ -498,6 +503,8 @@ def create_builtin_agents_router(
             the packaged built-ins the deployment suppressed.
         """
         user_id = _require_user(request, auth_provider)
+        if scope == "project":
+            return await _list_project_agents(user_id, project_id, limit, after)
         if scope != "user":
             page = agent_store.list(limit=limit, after=after, before=before, order=order)
             # Written at lifespan startup; absent when the app never seeded.
@@ -535,6 +542,34 @@ def create_builtin_agents_router(
             data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
         )
 
+    async def _project_of(project_id: str, user_id: str | None) -> Any:
+        """The project if the caller owns or was shared it, else ``None``."""
+        if project_store is None:
+            return None
+        return await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+
+    async def _list_project_agents(
+        user_id: str | None, project_id: str | None, limit: int, after: str | None
+    ) -> AgentList:
+        """A project's role agents, for anyone with access to the project."""
+        require_user_agents()
+        project = await _project_of(project_id, user_id) if project_id else None
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        page = await asyncio.to_thread(
+            agent_store.list_project_agents,
+            agent_owner_id(project.user_id),
+            project.id,
+            limit=min(limit, _USER_AGENTS_PAGE_LIMIT),
+            after=after,
+        )
+        data = await asyncio.to_thread(
+            lambda: [_to_agent_object(a, agent_cache) for a in page.data]
+        )
+        return AgentList(
+            data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
+        )
+
     @router.get("/agents/{agent_id}")
     async def get_agent(request: Request, agent_id: str) -> AgentDetailObject:
         """Return the list summary for a server agent or the caller's own user agent.
@@ -548,17 +583,22 @@ def create_builtin_agents_router(
         """
         user_id = _require_user(request, auth_provider)
         agent = await asyncio.to_thread(agent_store.get, agent_id)
-        if agent is None or not (
-            agent.operator_authored
-            or (
-                agent_store.supports_user_agents
-                and agent.kind == "user"
-                and agent.created_by == user_id
-            )
-        ):
+        owned = (
+            agent is not None
+            and agent_store.supports_user_agents
+            and agent.kind == "user"
+            and agent.created_by == user_id
+        )
+        # A role's agent is readable by everyone in its project, never editable by them.
+        project_member = (
+            agent is not None
+            and agent.project_id is not None
+            and await _project_of(agent.project_id, user_id) is not None
+        )
+        if agent is None or not (agent.operator_authored or owned or project_member):
             raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
         summary = await asyncio.to_thread(_to_agent_object, agent, agent_cache)
-        return AgentDetailObject(**summary.model_dump(), user_owned=agent.kind == "user")
+        return AgentDetailObject(**summary.model_dump(), user_owned=owned)
 
     # Multipart is CORS-safelisted, so a cross-site form post needs the Origin check.
     @router.post("/agents", dependencies=[Depends(require_trusted_origin)])

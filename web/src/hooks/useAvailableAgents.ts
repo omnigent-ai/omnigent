@@ -1,3 +1,4 @@
+import { PROJECT_IDENTITY_LABEL_KEY } from "@/shell/sidebarNav";
 import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import { useOptionalMineSessions, useSidebarData } from "./useSidebarData";
@@ -273,6 +274,8 @@ function discoverSessionAgents(mineData: NonNullable<MineSessions["data"]>): Ava
   const agents = new Map<string, AvailableAgent>();
   for (const row of mineData.pages.flatMap((page) => page.data).slice(0, 30)) {
     if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
+    // A project role's session runs the role's own agent, which belongs to the role.
+    if (row.labels?.[PROJECT_IDENTITY_LABEL_KEY]) continue;
     agents.set(row.agent_id, {
       id: row.agent_id,
       name: row.agent_name,

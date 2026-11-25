@@ -4481,6 +4481,7 @@ def create_app(
             artifact_store=artifact_store,
             conversation_store=conversation_store,
             auth_provider=auth_provider,
+            project_store=project_store,
         ),
         prefix="/v1",
         tags=["agents"],

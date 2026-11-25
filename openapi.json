@@ -401,6 +401,18 @@
             "title": "Policies",
             "type": "array"
           },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project a role's agent belongs to; null for every other agent.",
+            "title": "Project Id"
+          },
           "skills": {
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
@@ -663,6 +675,18 @@
             },
             "title": "Policies",
             "type": "array"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project a role's agent belongs to; null for every other agent.",
+            "title": "Project Id"
           },
           "skills": {
             "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session exists. `GET /skills` discovers host skills and, when given `session_id`, merges the session's bundled skills. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
@@ -20156,7 +20180,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "pattern": "^user$",
+                  "pattern": "^(user|project)$",
                   "type": "string"
                 },
                 {
@@ -20164,6 +20188,22 @@
                 }
               ],
               "title": "Scope"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
             }
           }
         ],

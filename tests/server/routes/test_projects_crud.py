@@ -1848,3 +1848,49 @@ async def test_project_agents_stay_with_their_role_and_owner(
 
     deleted = await multi_user_client.delete(f"{path}/identities/{pm['id']}", headers=owner)
     assert deleted.status_code == 200, deleted.text
+
+
+async def test_project_members_list_and_read_role_agents_but_outsiders_cannot(
+    multi_user_client: httpx.AsyncClient, project_agents: SqlAlchemyAgentStore
+) -> None:
+    """scope=project lists a project's role agents for its people; nobody else sees them."""
+    owner, member, outsider = _as_user(ALICE), _as_user(BOB), _as_user("eve@example.com")
+    created = (
+        await multi_user_client.post("/v1/projects", json={"name": "Roles"}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    await multi_user_client.post(f"{path}/shares", json={"user_id": BOB}, headers=owner)
+    claude = project_agents.get_by_name("claude-native-ui")
+    assert claude is not None
+    pm = (
+        await multi_user_client.post(
+            f"{path}/identities",
+            json={"name": "PM", "instructions": "Plan.", "agent_id": claude.id},
+            headers=owner,
+        )
+    ).json()
+    role_agent_id = pm["project_agent_id"]
+
+    for headers in (owner, member):
+        listed = await multi_user_client.get(
+            "/v1/agents", params={"scope": "project", "project_id": created["id"]}, headers=headers
+        )
+        assert listed.status_code == 200, listed.text
+        assert [(a["id"], a["project_id"]) for a in listed.json()["data"]] == [
+            (role_agent_id, created["id"])
+        ]
+    read = (await multi_user_client.get(f"/v1/agents/{role_agent_id}", headers=member)).json()
+    assert (read["project_id"], read["user_owned"]) == (created["id"], False)
+    owned = (await multi_user_client.get(f"/v1/agents/{role_agent_id}", headers=owner)).json()
+    assert owned["user_owned"] is True
+    hidden = await multi_user_client.get(
+        "/v1/agents", params={"scope": "project", "project_id": created["id"]}, headers=outsider
+    )
+    assert hidden.status_code == 404
+    assert (
+        await multi_user_client.get(f"/v1/agents/{role_agent_id}", headers=outsider)
+    ).status_code == 404
+    mine = (
+        await multi_user_client.get("/v1/agents", params={"scope": "user"}, headers=owner)
+    ).json()
+    assert role_agent_id not in {a["id"] for a in mine["data"]}

@@ -460,6 +460,10 @@ class AgentObject(BaseModel):
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
     builtin: bool = False
+    project_id: str | None = Field(
+        default=None,
+        description="The project a role's agent belongs to; null for every other agent.",
+    )
 
 
 class AgentDetailObject(AgentObject):
