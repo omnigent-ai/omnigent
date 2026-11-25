@@ -1,17 +1,4 @@
-"""E2E: the tabs sidebar's CodeMirror file viewer and editor.
-
-With ``workspace_sidebar_v2`` on, the Files page shows a file in CodeMirror. ⌥-drag
-selects a column, one cursor per line, and ⌘K's Column select commands grow the box from
-the keyboard. A read-only file highlights matching brackets, which only an editable file
-did before. Indented lines show a guide at each level, with the cursor's block drawn
-stronger. Seeded via the filesystem PUT endpoint (no agent run); the edge cases are in
-the unit tests (``columnSelection``, ``codeMirrorBracketMatching``, ``indentGuides``).
-Scrolled into a nested block, the lines opening its scopes stay pinned at the top, and
-clicking one scrolls back to it (``indentationScopes``, ``codeMirrorStickyScroll``).
-Right-click opens the editor's own menu of the ⌘K commands (``EditorContextMenu``).
-Replace all can give each replacement its match's case (``preserveCase``), and find can
-search only inside a selection (``findScope``).
-"""
+"""E2E: browser journeys for the tabs sidebar's CodeMirror viewer."""
 
 from __future__ import annotations
 
@@ -232,35 +219,10 @@ def test_a_nested_block_pins_its_scopes_and_a_click_scrolls_back_to_one(
     page.wait_for_function("(node) => node.scrollTop < 10", arg=scroller.element_handle())
 
 
-def test_sticky_scroll_follows_the_saved_choice(page: Page, code_session: tuple[str, str]) -> None:
-    """A device that turned sticky scroll off pins nothing, however deep the text scrolls."""
-    base_url, session_id = code_session
-    page.add_init_script(
-        "localStorage.setItem('omnigent:file-view-preferences',"
-        " JSON.stringify({ stickyScroll: false }))"
-    )
-    editor = _open_file(page, base_url, session_id, _NESTED_PATH)
-    expect(editor.locator(".cm-line").first).to_have_text("class Inventory:", timeout=30_000)
-    # Scrolled as deep as the pinned journey, and given the frames its pins take to appear:
-    # the line at the top of the view is inside the loop's body.
-    top_line = editor.locator(".cm-scroller").evaluate(
-        """async (node) => {
-            node.scrollTop = 1500;
-            for (let frame = 0; frame < 5; frame++) await new Promise(requestAnimationFrame);
-            const box = node.querySelector(".cm-content").getBoundingClientRect();
-            const top = node.getBoundingClientRect().top;
-            const at = document.elementFromPoint(box.left + 40, top + 4);
-            return at?.closest(".cm-line")?.textContent ?? "";
-        }"""
-    )
-    assert "self.count[item] +=" in top_line, top_line
-    expect(editor.locator(".cm-stickyScroll-line")).to_have_count(0)
-
-
 def test_sticky_scroll_turns_off_from_the_palette_while_the_file_is_open(
     page: Page, code_session: tuple[str, str]
 ) -> None:
-    """⌘K's Sticky scroll setting unpins the scopes in the open file, and the choice is saved."""
+    """⌘K's Sticky scroll setting unpins the open file's scopes, and stays off after a reload."""
     base_url, session_id = code_session
     editor = _open_file(page, base_url, session_id, _NESTED_PATH, quick_pick=True)
     expect(editor.locator(".cm-line").first).to_have_text("class Inventory:", timeout=30_000)
@@ -273,6 +235,23 @@ def test_sticky_scroll_turns_off_from_the_palette_while_the_file_is_open(
     expect(pinned).to_have_count(0)
     saved = page.evaluate("localStorage.getItem('omnigent:file-view-preferences')")
     assert '"stickyScroll":false' in saved, saved
+
+    # After a reload the saved choice pins nothing, however deep the text scrolls: the line
+    # at the top of the view is inside the loop's body, given the frames pins take to appear.
+    page.reload()
+    expect(editor.locator(".cm-line").first).to_have_text("class Inventory:", timeout=30_000)
+    top_line = editor.locator(".cm-scroller").evaluate(
+        """async (node) => {
+            node.scrollTop = 1500;
+            for (let frame = 0; frame < 5; frame++) await new Promise(requestAnimationFrame);
+            const box = node.querySelector(".cm-content").getBoundingClientRect();
+            const top = node.getBoundingClientRect().top;
+            const at = document.elementFromPoint(box.left + 40, top + 4);
+            return at?.closest(".cm-line")?.textContent ?? "";
+        }"""
+    )
+    assert "self.count[item] +=" in top_line, top_line
+    expect(pinned).to_have_count(0)
 
 
 def test_right_click_lists_the_editors_commands(page: Page, code_session: tuple[str, str]) -> None:
