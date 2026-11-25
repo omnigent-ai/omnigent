@@ -320,23 +320,31 @@ describe("FilesTree", () => {
   });
 
   it("hides what an exclude matches, in the root and in an opened folder, until it clears", async () => {
+    // Only `web` lists; every other folder's listing fails, so no listing can tidy the chain.
     serveListings({ web: [file("web/pnpm.lock"), file("web/app.ts")] });
-    const entries = [folder("web"), file("Cargo.lock"), file("README.md")];
+    const chain = { ...folder("com"), leaf_directory_path: "com/app/generated/v1" };
+    const entries = [folder("web"), chain, file("Cargo.lock"), file("README.md")];
     const tree = renderTree(entries);
     fireEvent.click(await screen.findByRole("treeitem", { name: "web" }));
     await screen.findByRole("treeitem", { name: "pnpm.lock" });
+    const generatedRows = () => document.querySelectorAll('[data-item-path^="com/app/generated"]');
+    expect(generatedRows().length).toBeGreaterThan(0);
 
-    await act(async () => tree.filter(entries, { include: "", exclude: "*.lock" }));
+    await act(async () => tree.filter(entries, { include: "", exclude: "*.lock, generated" }));
     await waitFor(() =>
       expect(screen.queryByRole("treeitem", { name: "pnpm.lock" })).not.toBeInTheDocument(),
     );
     expect(screen.queryByRole("treeitem", { name: "Cargo.lock" })).not.toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: "app.ts" })).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: "README.md" })).toBeInTheDocument();
+    // The chain the tree already drew loses its excluded folder, though `com/app` can't be listed.
+    await waitFor(() => expect(generatedRows()).toHaveLength(0));
+    expect(document.querySelector('[data-item-path="com/app/"]')).not.toBeNull();
 
     await act(async () => tree.filter(entries));
     expect(await screen.findByRole("treeitem", { name: "pnpm.lock" })).toBeInTheDocument();
     expect(screen.getByRole("treeitem", { name: "Cargo.lock" })).toBeInTheDocument();
+    await waitFor(() => expect(generatedRows().length).toBeGreaterThan(0));
   });
 
   it("keeps a deleted file the exclude lets through, though no file on disk passes", async () => {

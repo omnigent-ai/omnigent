@@ -7,7 +7,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FileTreeModel } from "@/components/file-tree/vendored";
 import { folderTreePath } from "../breadcrumbPaths";
-import { type FolderListing, type FolderTreeSync, syncFolderListings } from "../folderTreeSync";
+import {
+  type FolderListing,
+  type FolderTreeSync,
+  type TreePathShows,
+  syncFolderListings,
+} from "../folderTreeSync";
 
 export interface LazyFolderTreeState {
   /** Folders the tree needs listed beyond the caller's own: expanded or no longer chained. */
@@ -34,6 +39,8 @@ export const BULK_SYNC_OPERATIONS = 500;
 export interface LazyFolderTreeOptions {
   /** Rebuilds the tree to hold `paths`, for a sync of at least {@link BULK_SYNC_OPERATIONS}. */
   rebuild?: (paths: ReadonlySet<string>) => void;
+  /** The filter the tree shows through; what it turns down leaves the tree at the next sync. */
+  shows?: TreePathShows;
 }
 
 /** The model's starting state for `listings`, before any sync. */
@@ -52,7 +59,7 @@ export function useLazyFolderTree(
   listings: readonly FolderListing[],
   listingVersion: string,
   required: readonly string[],
-  { rebuild }: LazyFolderTreeOptions = {},
+  { rebuild, shows }: LazyFolderTreeOptions = {},
 ): LazyFolderTreeState {
   const present = useRef<Set<string>>(initial.present);
   const loadedFolders = useRef<Set<string>>(initial.loadedFolders);
@@ -63,12 +70,17 @@ export function useLazyFolderTree(
     loadedFolders: initial.loadedFolders as ReadonlySet<string>,
     present: initial.present as ReadonlySet<string>,
   });
-  const latest = useRef({ listings, required, rebuild });
-  latest.current = { listings, required, rebuild };
+  const latest = useRef({ listings, required, rebuild, shows });
+  latest.current = { listings, required, rebuild, shows };
 
   useEffect(() => {
-    const { listings: listingsNow, required: requiredNow, rebuild: rebuildNow } = latest.current;
-    const sync = syncFolderListings(present.current, listingsNow);
+    const {
+      listings: listingsNow,
+      required: requiredNow,
+      rebuild: rebuildNow,
+      shows: showsNow,
+    } = latest.current;
+    const sync = syncFolderListings(present.current, listingsNow, showsNow);
     if (rebuildNow && sync.operations.length >= BULK_SYNC_OPERATIONS) rebuildNow(sync.present);
     else if (sync.operations.length > 0) model.batch(sync.operations);
     // A folder a chain hint no longer describes may have gained entries: list it.

@@ -39,8 +39,10 @@ import type { FolderListing } from "../folderTreeSync";
 import {
   type TreeChange,
   type TreePatterns,
+  hasTreePatterns,
   listingsVersion,
   treeMetadata,
+  treePathFilter,
   visibleChangedFiles,
   visibleEntries,
   withChangedFiles,
@@ -247,8 +249,15 @@ function FilesTreeRows(props: FilesTreeProps) {
   const orderSignature = treeOrderSignature(props.sort, meta);
   const appliedOrder = useRef(orderSignature);
   const containerRef = useRef<HTMLDivElement>(null);
+  // While a filter is on, what it hides leaves the tree, even rows a chain hint once added.
+  const treeShows = useMemo(
+    () =>
+      showHidden && !hasTreePatterns(patterns) ? undefined : treePathFilter(showHidden, patterns),
+    [showHidden, patterns],
+  );
   const { wantedFolders, isEmpty, present, loadedFolders, currentPresent, synced } =
     useLazyFolderTree(model, initial, listings, listingsVersion(listings), [""], {
+      shows: treeShows,
       // A folder adding hundreds of entries rebuilds once, in this render's order.
       rebuild: (paths) => {
         rebuildTreeInPlace(model, paths, {
