@@ -349,6 +349,49 @@ describe("FilesPageTree", () => {
     expect(rememberedBrowseLocation("conv_1")).toBe("/work/repo/src");
   });
 
+  it("checks the tree options it's given, and follows each change the ⋯ makes", async () => {
+    vi.mocked(useWorkspaceAllFiles).mockReturnValue(listed([entry("a.ts")]) as FilesResult);
+    function ControlledTree() {
+      const [sort, setSort] = useState<ComponentProps<typeof FilesPageTree>["sort"]>("alpha");
+      const [showHidden, setShowHidden] = useState(false);
+      const [showIgnored, setShowIgnored] = useState(false);
+      return (
+        <TestProviders>
+          <FilesPageTree
+            conversationId="conv_1"
+            active
+            commandsActive
+            activePath="src/a.ts"
+            sort={sort}
+            onSortChange={setSort}
+            showHidden={showHidden}
+            onShowHiddenChange={setShowHidden}
+            showIgnored={showIgnored}
+            onShowIgnoredChange={setShowIgnored}
+            onFileSelect={vi.fn()}
+          />
+        </TestProviders>
+      );
+    }
+    render(<ControlledTree />);
+    const options = () => screen.getByRole("button", { name: "Tree options" });
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" })).not.toBeChecked();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Show git-ignored files" }),
+    ).not.toBeChecked();
+    await userEvent.click(screen.getByRole("menuitemradio", { name: "Size" }));
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemradio", { name: "Size" })).toBeChecked();
+    expect(screen.getByRole("menuitemradio", { name: "Filename" })).not.toBeChecked();
+    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" }));
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" })).toBeChecked();
+    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Show git-ignored files" }));
+    await userEvent.click(options());
+    expect(screen.getByRole("menuitemcheckbox", { name: "Show git-ignored files" })).toBeChecked();
+  });
+
   it("refreshes the filter's matches along with the listing", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const refetchSearch = vi.fn();
