@@ -35,6 +35,8 @@ vi.mock("@/lib/hotkeys", async (importOriginal) => ({
   ...(await importOriginal<typeof HotkeysModule>()),
   isMacPlatform: () => true,
 }));
+// Browser loads go to the session's host; these sessions have none.
+vi.mock("@/lib/fetchSessionHostId", () => ({ fetchSessionHostId: async () => null }));
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useDeleteTerminal: (_conversationId: string, options?: { reportsFailure?: boolean }) => {
@@ -230,5 +232,91 @@ describe("WorkspaceTabsHost", () => {
     host({ bindsHistory: false });
     expect(captured.panel?.onHistoryGo).toBeUndefined();
     expect(registeredPaletteCommands().some((row) => row.id.includes("history"))).toBe(false);
+  });
+});
+
+/** A desktop shell with the embedded browser: each load commits and reports its URL. */
+function installBrowserShell() {
+  const pages = new Map<string, string>();
+  const loads: { view: string; url: string }[] = [];
+  let reportUrl: ((payload: { conversationId: string; url: string }) => void) | null = null;
+  (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
+    kind: "electron",
+    browserOpenOrNavigate: vi.fn(async (view: string, url: string) => {
+      loads.push({ view, url });
+      pages.set(view, url);
+      queueMicrotask(() => reportUrl?.({ conversationId: view, url }));
+      return { ok: true };
+    }),
+    browserHasView: vi.fn(async (view: string) => {
+      const url = pages.get(view);
+      return url === undefined ? { exists: false } : { exists: true, url };
+    }),
+    onBrowserUrlChanged: (listener: typeof reportUrl) => {
+      reportUrl = listener;
+      return () => {
+        reportUrl = null;
+      };
+    },
+  };
+  return {
+    loads,
+    /** The page moved on its own, such as by a link. */
+    follow(view: string, url: string) {
+      pages.set(view, url);
+      reportUrl?.({ conversationId: view, url });
+    },
+  };
+}
+
+/** Lets the loads, URL reports and view probes queued so far run. */
+async function settle() {
+  await act(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
+describe("WorkspaceTabsHost browser tabs", () => {
+  it("loads a browser tab's page when it opens, steps Back and Forward, and reopens", async () => {
+    const shell = installBrowserShell();
+    host({ conversationId: "conv_browser", showBrowserTab: true });
+    const { store } = workspaceTabsSession("conv_browser");
+    const first = "https://first.example/";
+    const linked = "https://first.example/linked";
+    await act(async () => {
+      await store.open({ place: { kind: "web", url: first } }, { opener: "user" });
+    });
+    await settle();
+    expect(shell.loads.map((load) => load.url)).toEqual([first]);
+    const view = shell.loads[0].view;
+    // A link inside the page is a step, and Back and Forward load each page again.
+    await act(async () => shell.follow(view, linked));
+    await settle();
+    await act(async () => {
+      await store.go("back");
+    });
+    await settle();
+    await act(async () => {
+      await store.go("forward");
+    });
+    await settle();
+    expect(shell.loads.slice(1)).toEqual([
+      { view, url: first },
+      { view, url: linked },
+    ]);
+    // Reopening a closed tab loads its last page in a new view.
+    const tabId = store.selectedTabId()!;
+    await act(async () => {
+      await store.close(tabId);
+    });
+    await act(async () => {
+      store.reopenClosed();
+    });
+    await settle();
+    const reopened = shell.loads.at(-1)!;
+    expect(reopened.url).toBe(linked);
+    expect(reopened.view).not.toBe(view);
   });
 });
