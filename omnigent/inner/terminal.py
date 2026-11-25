@@ -41,6 +41,7 @@ from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
+    from omnigent.terminals.shell_inspection import ShellInspection
 
 from . import _proc
 from ._subprocess_lifecycle import await_cleanup_task
@@ -2918,6 +2919,18 @@ class TerminalInstance:
             return int(first[0])
         except ValueError:
             return None
+
+    async def inspect_shell(self) -> ShellInspection:
+        """Whether this terminal's shell is idle, busy with a named job, or unknown.
+
+        Reads only this instance's own pane through its own tmux socket; see
+        :func:`omnigent.terminals.shell_inspection.read_pane_shell`.
+
+        :returns: The inspection, never a pid or another process's row.
+        """
+        from omnigent.terminals.shell_inspection import read_pane_shell
+
+        return await read_pane_shell(self._tmux_base_cmd(), self.tmux_target, self.command)
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
