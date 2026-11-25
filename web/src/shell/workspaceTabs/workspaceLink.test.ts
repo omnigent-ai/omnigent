@@ -88,6 +88,10 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
       },
     ],
     [
+      `omnigent://pull?url=${encodeURIComponent(PR)}&view=changes&list=1`,
+      { place: { kind: "pull", url: PR, view: "changes", list: true } },
+    ],
+    [
       `omnigent://pull?url=${encodeURIComponent(PR)}&focus=checks`,
       { place: { kind: "pull", url: PR, view: "summary", focus: "checks" } },
     ],
