@@ -3126,6 +3126,69 @@ def test_workspace_call_and_reply_frames_round_trip_bytes() -> None:
     assert decode_host_frame(encode_host_frame(end)) == end
 
 
+def test_a_pull_request_call_carries_its_session_and_the_servers_vouch() -> None:
+    from omnigent.host.frames import HostWorkspaceCallFrame, PullRequestVouch
+
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url="https://example.com/a/b/pull/7")
+    call = HostWorkspaceCallFrame("req1", "~/project", "GetPullRequest", b"", "conv_1", vouch)
+    assert decode_host_frame(encode_host_frame(call)) == call
+    # A call without them encodes as before, so an older host reads it unchanged.
+    plain = json.loads(encode_host_frame(HostWorkspaceCallFrame("req1", "~/p", "ReadFile")))
+    assert "session_id" not in plain and "vouch" not in plain
+
+
+def test_a_workspace_call_from_an_older_server_has_no_session_or_vouch() -> None:
+    from omnigent.host.frames import HostWorkspaceCallFrame
+
+    decoded = decode_host_frame(
+        json.dumps(
+            {"kind": "host.workspace_call", "request_id": "r", "workspace": "~/p", "method": "X"}
+        )
+    )
+    assert isinstance(decoded, HostWorkspaceCallFrame)
+    assert decoded.session_id is None and decoded.vouch is None
+
+
+@pytest.mark.parametrize(
+    "vouch",
+    [
+        "server_tracked",
+        ["server_tracked"],
+        {"server_tracked": "1"},
+        {"server_tracked": "true"},
+        {"server_tracked": 1},
+        {"server_tracked": True, "default_pr_url": 7},
+    ],
+)
+def test_a_workspace_call_whose_vouch_is_mistyped_is_refused(vouch: object) -> None:
+    """Only a boolean tracks a PR the host never recorded; the REST query strings don't."""
+    frame = {
+        "kind": "host.workspace_call",
+        "request_id": "r",
+        "workspace": "~/p",
+        "method": "GetPullRequest",
+        "session_id": "conv_1",
+        "vouch": vouch,
+    }
+    with pytest.raises(ValueError, match="vouch"):
+        decode_host_frame(json.dumps(frame))
+
+
+def test_a_workspace_calls_vouch_ignores_keys_it_does_not_know() -> None:
+    from omnigent.host.frames import PullRequestVouch
+
+    frame = {
+        "kind": "host.workspace_call",
+        "request_id": "r",
+        "workspace": "~/p",
+        "method": "GetPullRequest",
+        "session_id": "conv_1",
+        "vouch": {"server_tracked": True, "later": ["x"]},
+    }
+    decoded = decode_host_frame(json.dumps(frame))
+    assert decoded.vouch == PullRequestVouch(server_tracked=True)
+
+
 def test_recovery_request_round_trip_and_legacy_hello_default() -> None:
     frame = HostRecoverSessionsFrame(runners=["alive-runner"])
     assert decode_host_frame(encode_host_frame(frame)) == frame

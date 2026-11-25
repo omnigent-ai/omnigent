@@ -5,7 +5,10 @@ one pane, ⌘D splits it with a shell, the pane keys move between panes, ⌘K li
 commands, and a pane's title strip has a menu that closes it. With a split shown, Chat keeps
 the panes on screen and the web chat is the agent's pane. A shell tab in the workspace sidebar
 splits the same way, and its split shows as one strip entry that closes whole. With the flag
-off, the same session keeps the classic Terminal view.
+off, the same session keeps the classic Terminal view. A divider drag saves its size on
+release, also when the macOS app drops the divider's pointer capture just before it. With
+floating panes, each pane is a card whose move handle shows on hover and lifts it as it's
+dragged.
 
 The session is terminal-first (``omnigent.ui = terminal``), so the runner starts the agent's
 own terminal, and its agent declares a ``zsh`` shell, running ``bash``, for splits. The flag is
@@ -17,6 +20,7 @@ are in the component tests (``useTerminalPaneHotkeys``, ``terminalPaneActions``,
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterator
 
@@ -91,21 +95,27 @@ def panes_session(
             respawned_runner.wait(timeout=10)
 
 
-def _set_flag(page: Page, enabled: bool) -> None:
-    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``."""
+def _set_flag(page: Page, enabled: bool, *, floating: bool = False) -> None:
+    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``; with
+    ``floating``, the ``floating_panes`` policy on too."""
 
     def answer(route: Route) -> None:
         response = route.fetch()
         info = response.json()
-        info["features"] = {**(info.get("features") or {}), "workspace_sidebar_v2": enabled}
+        features = {**(info.get("features") or {}), "workspace_sidebar_v2": enabled}
+        if floating:
+            features["floating_panes"] = True
+        info["features"] = features
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", answer)
 
 
-def _open(page: Page, base_url: str, session_id: str, *, flag: bool = True) -> None:
+def _open(
+    page: Page, base_url: str, session_id: str, *, flag: bool = True, floating: bool = False
+) -> None:
     page.add_init_script(_REPORT_MAC)
-    _set_flag(page, flag)
+    _set_flag(page, flag, floating=floating)
     page.set_viewport_size(_DESKTOP)
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -134,6 +144,10 @@ def _split_from(page: Page, panes: Locator, keyboard: Locator) -> Locator:
     """Split with ⌘D from ``keyboard``, and return the new pane's terminal input once it has it."""
     before = panes.get_by_test_id("terminal-view").count()
     keyboard.focus()
+    # ⌘D splits once the pane has the keyboard and its agent's shells have loaded; its row's
+    # Split Right shows then.
+    expect(keyboard).to_be_focused()
+    expect(panes.get_by_test_id("pane-strip-split-right").first).to_be_attached(timeout=60_000)
     page.keyboard.press("Meta+d")
     terminals = panes.get_by_test_id("terminal-view")
     expect(terminals).to_have_count(before + 1, timeout=60_000)
@@ -203,6 +217,30 @@ def test_chat_keeps_a_split_on_screen_and_splits_from_its_composer(
     )
 
 
+@pytest.mark.parametrize("chord", ["Meta+d", "Meta+Shift+d"])
+def test_a_lone_chat_splits_with_cmd_d(
+    page: Page, panes_session: tuple[str, str], chord: str
+) -> None:
+    """In Chat, before any split, ⌘D and ⇧⌘D from the composer open a shell beside the chat."""
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    _select_view(page, "chat")
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_visible(timeout=30_000)
+    # The agent's terminal, hidden under the chat, is the pane a first split divides.
+    agent = page.get_by_test_id("split-panes-main-view").locator(_AGENT_PANE)
+    expect(agent.get_by_test_id("terminal-view")).to_have_attribute(
+        "data-state", "connected", timeout=60_000
+    )
+    composer.focus()
+    page.keyboard.press(chord)
+    panes = _main_panes(page)
+    expect(panes.locator("[data-chat-pane-body]")).to_be_visible(timeout=60_000)
+    expect(panes.get_by_role("toolbar", name=re.compile(r"^zsh · .* pane$"))).to_have_count(
+        1, timeout=60_000
+    )
+
+
 def test_a_tabs_sidebar_shell_splits_keeps_both_shells_through_a_reload_and_closes_whole(
     page: Page, panes_session: tuple[str, str]
 ) -> None:
@@ -251,3 +289,139 @@ def test_flag_off_keeps_the_classic_terminal_view(
     _connected(page.locator(".main-terminal-view").get_by_test_id("terminal-view").first)
     expect(page.get_by_test_id("split-panes-main-view")).to_have_count(0)
     expect(page.locator("[data-pane-strip]")).to_have_count(0)
+
+
+def test_a_floating_pane_shows_its_handle_on_hover_and_lifts_when_pressed(
+    page: Page, panes_session: tuple[str, str]
+) -> None:
+    """Between floating panes the gap draws no resize line, only the cursor. A pane's move handle
+    shows while the pointer is over its row; pressing the row lifts the pane, through the drag,
+    and the drop sets it down on the other side."""
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    expect(page.locator(".app-shell[data-floating-panes]")).to_have_count(1)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    _split_from(page, panes, agent)
+    # The panes are the cards: the session's column draws no card of its own around them.
+    expect(page.locator('[data-main-view="terminal"]')).to_have_count(1)
+    shell_pane = panes.locator(f"[data-terminal-pane]:not({_AGENT_PANE})").first
+    agent_pane = panes.locator(_AGENT_PANE).first
+    strip = shell_pane.locator("[data-pane-strip]")
+    handle = strip.locator("[data-pane-strip-drag-handle]")
+    held = panes.locator("[data-pane-held]")
+    page.mouse.move(5, 5)
+    expect(handle).to_have_css("opacity", "0")
+
+    # The gap between the cards resizes by its cursor alone, as the sidebars' edges do.
+    divider = page.get_by_test_id("terminal-split-divider")
+    divider.hover()
+    expect(divider).to_have_css("cursor", "col-resize")
+    expect(divider.locator("> div")).to_have_css("background-color", "rgba(0, 0, 0, 0)")
+
+    box = strip.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + 10, box["y"] + box["height"] / 2)
+    expect(handle).to_have_css("opacity", "1")
+    expect(held).to_have_count(0)
+
+    # Pressed, not yet moved: the pane lifts.
+    page.mouse.down()
+    expect(held).to_have_count(1)
+    expect(held).not_to_have_css("box-shadow", "none")
+    agent_box = agent_pane.bounding_box()
+    assert agent_box is not None
+    page.mouse.move(box["x"] + 30, box["y"] + box["height"] / 2, steps=4)
+    page.mouse.move(agent_box["x"] + 20, agent_box["y"] + agent_box["height"] / 2, steps=8)
+    expect(page.locator("[data-pane-drop]")).to_have_count(1)
+    expect(held).to_have_count(1)
+    page.mouse.up()
+    expect(held).to_have_count(0)
+    # The shell now takes the left half.
+    page.wait_for_function(
+        "el => parseFloat(el.style.left) === 0", arg=shell_pane.element_handle(), timeout=15_000
+    )
+
+
+# Records the page's pointer releases and each pointer capture it loses, in order.
+_WATCH_CAPTURE = """
+window.__pointerEnds = [];
+for (const type of ["lostpointercapture", "pointerup", "pointercancel"]) {
+  document.addEventListener(type, (event) => {
+    const target = event.target;
+    const name = target instanceof Element ? target.getAttribute("aria-label") : null;
+    window.__pointerEnds.push(`${type}:${name ?? "other"}`);
+  }, true);
+}
+"""
+
+
+@pytest.mark.parametrize("view", ["chat", "terminal"])
+@pytest.mark.parametrize("capture", ["kept", "dropped"])
+def test_a_split_resizes_through_a_whole_drag(
+    page: Page, panes_session: tuple[str, str], view: str, capture: str
+) -> None:
+    """Dragging the divider beside a shell that has the keyboard saves the new size on release.
+    That holds when the macOS app drops the divider's pointer capture just before the release,
+    which then lands on the pane under the pointer."""
+    base_url, session_id = panes_session
+    page.add_init_script(_WATCH_CAPTURE)
+    unsaved: list[str] = []
+    page.on(
+        "console",
+        lambda message: (
+            unsaved.append(message.text) if "drag ended unsaved" in message.text else None
+        ),
+    )
+    _open(page, base_url, session_id)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    _split_from(page, panes, agent)
+    if view == "chat":
+        _select_view(page, "chat")
+        expect(panes.locator("[data-chat-pane-body]")).to_be_visible(timeout=30_000)
+    shell = _connected(panes.get_by_test_id("terminal-view").last)
+    shell.focus()
+    expect(shell).to_be_focused()
+
+    divider = panes.get_by_test_id("terminal-split-divider")
+    expect(divider).to_have_attribute("aria-valuenow", "50")
+    box = divider.bounding_box()
+    assert box is not None
+    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.evaluate("window.__pointerEnds = []")
+    page.mouse.down()
+    # A person's drag: small moves across most of a second, past the panes' resize settling.
+    for step in range(1, 21):
+        page.mouse.move(x - step * 8, y)
+        page.wait_for_timeout(40)  # custom-lint: disable=sleep-then-assert -- paces the drag
+    if capture == "dropped":
+        # As the macOS app does: the capture ends as the release comes, not before.
+        divider.evaluate("el => el.releasePointerCapture(1)")
+    page.mouse.up()
+
+    page.wait_for_function("window.__pointerEnds.some(end => end.startsWith('lost'))")
+    ends = page.evaluate("window.__pointerEnds")
+    if capture == "kept":
+        # The divider keeps the pointer until its release, which then lets it go.
+        assert ends[0] == "pointerup:Resize terminal panes", ends
+    else:
+        assert ends[0] == "lostpointercapture:Resize terminal panes", ends
+        assert ends[1] != "pointerup:Resize terminal panes", ends
+    expect(divider).not_to_have_attribute("aria-valuenow", "50")
+    assert unsaved == []
+    # The release saved the size, rather than leaving a preview: the session's stored split
+    # holds the ratio the divider shows.
+    saved = page.wait_for_function(
+        """id => {
+            const stored = JSON.parse(localStorage.getItem("omnigent:pane-splits") ?? "{}");
+            const ratio = stored.sessions?.[id]?.layout?.ratio;
+            return typeof ratio === "number" && ratio !== 0.5 ? ratio : null;
+        }""",
+        arg=session_id,
+    ).json_value()
+    # As the divider rounds it: Math.round, halves up.
+    expect(divider).to_have_attribute("aria-valuenow", str(math.floor(saved * 100 + 0.5)))

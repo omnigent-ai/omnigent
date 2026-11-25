@@ -1342,7 +1342,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # below anyway.  With ``-uall`` git otherwise stat's every file in them,
         # which dominates the runtime on big repos.  These mirror the
         # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
+        # Exclude-only pathspecs still scan the whole repo, so also scope to the workspace.
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
+        argv.extend(self._workspace_pathspecs())
         argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
         try:
@@ -1558,6 +1560,22 @@ class GitFilesystemRegistry(FilesystemRegistry):
         base = "" if prefix_posix == "." else f"{prefix_posix}/"
         return [f":(exclude){base}{name}" for name in sorted(_SKIP_DIRS)]
 
+    def _workspace_pathspecs(self) -> list[str]:
+        """Return a pathspec limiting a git read to the workspace's subtree.
+
+        ``:(literal)`` keeps glob characters in a directory name from
+        widening the match, as in :meth:`list_tracked_files`.
+
+        :returns: ``[":(literal)<prefix>"]`` for a workspace below the git
+            root, e.g. ``[":(literal)sub/ws"]``; ``[]`` when the workspace is
+            the git root or escapes it.
+        """
+        try:
+            prefix = self._cwd.relative_to(self._git_root).as_posix()
+        except ValueError:
+            return []
+        return [] if prefix == "." else [f":(literal){prefix}"]
+
     def _git_to_rel(self, git_path: str) -> str | None:
         """Convert a git-root-relative path to a cwd-relative path.
 
@@ -1624,6 +1642,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
         :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
         """
         argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
+        workspace = self._workspace_pathspecs()
+        if workspace:
+            argv += ["--", *workspace]
         try:
             result = self._run_git(argv)
         except (subprocess.TimeoutExpired, OSError):

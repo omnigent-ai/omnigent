@@ -15,13 +15,14 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import pytest
 from PIL import Image
 from playwright.sync_api import Locator, Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail
 from tests.e2e_ui.desktop._mac_shell import MAC_SHELL_INIT_SCRIPT, WINDOW_CONTROLS_STRIP
 
 _VIEWPORT = {"width": 1440, "height": 900}
@@ -68,6 +69,18 @@ def _settle(page: Page) -> None:
     page.evaluate(_SETTLE_JS)
 
 
+_HIDE_SIDEBAR_CONTENTS_JS = """() => {
+  for (const child of document.querySelector(".conversations-sidebar").children) {
+    child.style.visibility = "hidden";
+  }
+}"""
+
+
+def _hide_sidebar_contents(page: Page) -> None:
+    """Leave only the sidebar's surface: sessions other journeys made may fill its rows."""
+    page.evaluate(_HIDE_SIDEBAR_CONTENTS_JS)
+
+
 def _set_features(
     page: Page, floating: bool, *, tabs_sidebar: bool = True, extra: dict[str, bool] | None = None
 ) -> None:
@@ -86,6 +99,28 @@ def _set_features(
         route.fulfill(response=response, json=info)
 
     page.route("**/v1/info", answer)
+
+
+def _list_only(page: Page, session_id: str) -> None:
+    """Answer the sidebar's session list with this test's session alone.
+
+    The shard shares one server, so sessions other tests created would otherwise fill the
+    sidebar, and the pixel checks would compare rows a layout change moved, not its surface.
+    """
+
+    def answer(route: Route) -> None:
+        # Only the list endpoint, not /v1/sessions/{id} or its sub-resources.
+        if route.request.method != "GET" or urlparse(route.request.url).path != "/v1/sessions":
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        payload["data"] = [
+            session for session in payload.get("data", []) if session.get("id") == session_id
+        ]
+        route.fulfill(response=response, json=payload)
+
+    page.route("**/v1/sessions?*", answer)
 
 
 def _open(
@@ -178,6 +213,8 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
     """With the flag off the chat has no card and the dark sidebar keeps its edge; the
     sidebar's own surface is the same either way, so its rows keep their contrast."""
     base_url, session_id = seeded_session
+    # The region compared below must be the sidebar's empty surface in both layouts.
+    _list_only(page, session_id)
     regions: list[Image.Image] = []
     for floating in (True, False):
         _open(page, base_url, session_id, scheme=scheme, floating=floating)
@@ -187,10 +224,11 @@ def test_without_floating_panes_the_layout_stays_edge_to_edge_and_the_sidebar_pa
             assert geometry["chatBorder"] == "0px"
             assert geometry["sidebarBorder"] == ("1px" if scheme == "dark" else "0px")
         sidebar_right = round(geometry["sidebarRight"])
+        _hide_sidebar_contents(page)
         image = _capture(
             page, f"sidebar-{scheme}-floating" if floating else f"edge-to-edge-{scheme}"
         )
-        # The empty lower part of the sidebar, clear of its rows and its edge.
+        # The lower part of the sidebar's bare surface, clear of its edge.
         regions.append(image.crop((16, 760, sidebar_right - 16, 860)))
     floating_region, flat_region = regions
     worst = max(
@@ -544,7 +582,9 @@ def test_a_terminal_first_chat_switches_views_from_its_own_row(
         content_top = terminal_box["y"] + float(
             terminal_view.evaluate("(el) => parseFloat(getComputedStyle(el).paddingTop)")
         )
-        assert content_top >= strip_box["y"] + strip_box["height"] - 0.5, (strip_box, content_top)
+        # Right below it, with no band between the row and the terminal.
+        strip_bottom = strip_box["y"] + strip_box["height"]
+        assert strip_bottom - 0.5 <= content_top <= strip_bottom + 1.5, (strip_box, content_top)
     _capture(page, f"{name}-terminal")
 
     view_switch.get_by_role("button", name="Chat view").click()

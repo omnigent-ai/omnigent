@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef } from "react";
+import { useCallback } from "react";
 
 import {
   type PullRequest,
@@ -6,6 +6,7 @@ import {
   type PullRequestInfo,
   usePullRequestInfo,
   usePullRequestInfos,
+  useRefreshPullRequestInfo,
 } from "@/hooks/usePullRequests";
 import {
   storedListToShow,
@@ -233,16 +234,11 @@ export function useComposerGitStatus({
   ).prNumberPrefix;
 
   const worktreeRefetch = worktrees.refetch;
-  const githubRefetch = github.refetch;
-  const detailQueriesRef = useRef(details);
-  useLayoutEffect(() => {
-    detailQueriesRef.current = details;
-  }, [details]);
+  const refreshPullRequests = useRefreshPullRequestInfo(sessionId ?? undefined);
   const refresh = useCallback(() => {
     void worktreeRefetch();
-    void githubRefetch();
-    for (const detail of detailQueriesRef.current) void detail.refetch();
-  }, [worktreeRefetch, githubRefetch]);
+    void refreshPullRequests();
+  }, [worktreeRefetch, refreshPullRequests]);
 
   return {
     branch,

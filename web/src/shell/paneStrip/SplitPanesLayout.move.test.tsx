@@ -137,6 +137,7 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
   });
 
   it("lifts the pane from the press, before it drags, until the drag ends", () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
     const { onMovePane } = setup();
     const card = (key: string) => row(key).parentElement!;
     const handle = () => row("a").querySelector<HTMLElement>("[data-pane-strip-drag-handle]")!;
@@ -172,9 +173,12 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
     release(200, 10);
     expect(lifted("a")).toBe(false);
 
-    // Escape mid-drag, or a cancelled pointer, sets it down unmoved.
+    // Escape mid-drag, or a cancelled pointer, sets it down unmoved. Well after the click, so
+    // the press isn't taken as a double-click's second.
+    now.mockReturnValue(3000);
     press("a", 200);
     moveTo(780, 300);
+    expect(lifted("a")).toBe(true);
     act(() => void fireEvent.keyDown(window, { key: "Escape" }));
     expect(lifted("a")).toBe(false);
     press("a", 200);

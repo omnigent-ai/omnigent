@@ -31,6 +31,11 @@ const { isDesktopOpenRequest } = require("./desktopOpenServer");
 const { createAgentNavigation } = require("./agentNavigation");
 const { hasHostLocalAccess } = require("./hostIdentity");
 const { agentInputInFlight } = require("./browserInput");
+const {
+  forwardedKeydown,
+  matchesForwardedChord,
+  normalizeForwardedChords,
+} = require("./browserForwardedChords");
 
 // Each view is a separate renderer process; the cap bounds memory per window.
 const DEFAULT_CAP = 20;
@@ -88,6 +93,10 @@ function createBrowserViewRegistry({
   getHostZoomFactor = () => 1,
   getHostDisplayScaleFactor = () => null,
   isHostFocused = () => true,
+  // Give the shell window keyboard focus, for a chord forwarded from a page.
+  focusHost = () => {},
+  // Which keys write text depends on the OS (AltGr arrives as Ctrl+Alt off the Mac).
+  platform = process.platform,
   // Desktop affordances for the pane's context menu; injected so the registry
   // stays Electron-free. No-op defaults keep tests and non-menu hosts simple.
   openUrlExternal = () => {}, // (url) => shell.openExternal(url)
@@ -155,6 +164,10 @@ function createBrowserViewRegistry({
   // across attaches: a view that becomes active while suppressed stays hidden.
   let overlaySuppressed = false;
   let recentSessionSwitchSupported = false;
+  // The app chords the renderer handles itself; none until a renderer that handles them asks.
+  let forwardedChords = [];
+  // The list a started host navigation set aside, until a new document commits or the old one stays.
+  let heldForwardedChords = null;
   // Set by an SPA that opens `browser-open-tab` requests as new tabs; an older
   // SPA would drop them, so modifier-clicks navigate in place until declared.
   let openTabSupported = false;
@@ -394,6 +407,38 @@ function createBrowserViewRegistry({
     return { ok: true };
   }
 
+  // During a host navigation an update waits with the held list: the old renderer that sent it
+  // may stay, and a replacement document asks for its own keys.
+  function setForwardedChords(chords) {
+    const chordList = normalizeForwardedChords(chords);
+    if (heldForwardedChords !== null) heldForwardedChords = chordList;
+    else forwardedChords = chordList;
+    return { ok: true, count: chordList.length };
+  }
+
+  // A navigation may replace the renderer with a bundle that never asks, so pages keep their
+  // keys until it ends; a navigation that supersedes another keeps the list already held.
+  function holdForwardedChords() {
+    if (heldForwardedChords === null) heldForwardedChords = forwardedChords;
+    forwardedChords = [];
+  }
+
+  // The navigation ended: `restore` when the old renderer stayed, so its keys work again.
+  function releaseForwardedChords(restore) {
+    if (heldForwardedChords === null) return;
+    if (restore) forwardedChords = heldForwardedChords;
+    heldForwardedChords = null;
+  }
+
+  // Hand the renderer's app chords to it, focused, so ⌘K acts as if the page weren't there.
+  function forwardAppChord(event, input) {
+    if (!matchesForwardedChord(forwardedChords, input, platform)) return false;
+    event.preventDefault();
+    focusHost();
+    sendToRenderer("browser-forwarded-input", forwardedKeydown(input));
+    return true;
+  }
+
   function attachRecentSessionInput(entry) {
     // Another view taking keys for the page (the design tools' overlay) forwards them too.
     entry.forwardRecentSessionInput = (wc) => forwardRecentSessionInputFrom(entry, wc);
@@ -403,9 +448,10 @@ function createBrowserViewRegistry({
   function forwardRecentSessionInputFrom(entry, wc) {
     if (!wc || typeof wc.on !== "function") return;
     wc.on("before-input-event", (event, input) => {
-      if (!recentSessionSwitchSupported) return;
       // An agent's key presses are for the page, never the shell.
       if (agentInputInFlight(wc)) return;
+      if (forwardAppChord(event, input)) return;
+      if (!recentSessionSwitchSupported) return;
       const type =
         input && input.type === "keyDown"
           ? "keydown"
@@ -806,6 +852,9 @@ function createBrowserViewRegistry({
     setSuppressed,
     cancelRecentSessionSwitch,
     setRecentSessionSwitchSupported,
+    setForwardedChords,
+    holdForwardedChords,
+    releaseForwardedChords,
     setOpenTabSupported,
     close,
     closeAll,

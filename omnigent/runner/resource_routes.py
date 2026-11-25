@@ -77,6 +77,7 @@ from omnigent.runner.slow_io import run_provider_cli, run_slow_io
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
+from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -1293,6 +1294,10 @@ def register_resource_routes(
             )
         return registry
 
+    # A browser abandons a slow listing but its git status keeps running, so
+    # refetches would pile up on the slow-IO pool; concurrent ones share a scan.
+    changes_scans: FreshCallCoalescer[tuple[str, str], list[dict[str, Any]]] = FreshCallCoalescer()
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
@@ -1302,19 +1307,19 @@ def register_resource_routes(
 
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
-        try:
+
+        async def scan() -> list[dict[str, Any]]:
+            # Resolved when the scan starts, so a multi-repository Git budget
+            # does not run down while the request waits its turn.
+            session_registry = await _changes_registry(session_id, environment_id, agent_spec)
+            if session_registry is None:
+                return []
             # git status can take seconds; keep it off the loop (relay probes)
             # and off the default pool (native message delivery).
-            raw_changes = (
-                await run_slow_io(
-                    session_registry.list_changed_files,
-                    session_id,
-                    limit=10_000,
-                )
-                if session_registry is not None
-                else []
-            )
+            return await run_slow_io(session_registry.list_changed_files, session_id, limit=10_000)
+
+        try:
+            raw_changes = await changes_scans.run((session_id, environment_id), scan)
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -1505,11 +1510,13 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        allow_cached: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
-            "pr_info",
+            "cached_pr_info",
             pr_url=pr_url,
+            allow_cached=allow_cached,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )

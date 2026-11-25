@@ -334,6 +334,9 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+# Claude Code's retry row can cut that message to the pane width, e.g.
+# '403 Budget "example" (00000000-…', before any fragment above.
+_CLAUDE_BUDGET_REJECTION = re.compile(r'\b403 Budget "')
 # Match Claude Code's raw output limit, the bridge's guidance, or the forwarder's fallback.
 # Anchor CLI forms so assistant explanations quoting them stay generic.
 _OUTPUT_LIMIT_ERROR = re.compile(
@@ -411,7 +414,9 @@ def classify_native_turn_error(code: str, message: str) -> str:
     ):
         return CODEX_PROVIDER_AUTH_FAILED
     lowered = message.lower()
-    if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
+    if any(
+        fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS
+    ) or _CLAUDE_BUDGET_REJECTION.search(message):
         return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code

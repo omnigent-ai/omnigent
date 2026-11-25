@@ -12,27 +12,14 @@ import re
 
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.e2e_ui._settings_search import expect_settings_row_revealed, settings_search_field
 from tests.e2e_ui.conftest import fetch_with_retry
-
-_HIGHLIGHT = "data-settings-highlight"
-
-
-def _search_field(page: Page):
-    return page.get_by_role("combobox", name="Search settings")
-
-
-def _expect_revealed(page: Page, row_id: str) -> None:
-    """The row is on screen and highlighted, and the highlight then fades."""
-    row = page.locator(f'[data-settings-item="{row_id}"]')
-    expect(row).to_be_in_viewport()
-    expect(row).to_have_attribute(_HIGHLIGHT, "")
-    expect(row).not_to_have_attribute(_HIGHLIGHT, "", timeout=5_000)
 
 
 def test_settings_search_reveals_the_picked_row(page: Page, live_server: str) -> None:
     page.set_viewport_size({"width": 1280, "height": 640})
     page.goto(f"{live_server}/settings/general")
-    field = _search_field(page)
+    field = settings_search_field(page)
     expect(field).to_be_visible(timeout=30_000)
     nav_link = page.get_by_test_id("settings-nav-appearance")
     expect(nav_link).to_be_visible()
@@ -47,7 +34,7 @@ def test_settings_search_reveals_the_picked_row(page: Page, live_server: str) ->
 
     page.keyboard.press("Enter")
     expect(page).to_have_url(re.compile(r"/settings/appearance#code-font-weight$"))
-    _expect_revealed(page, "code-font-weight")
+    expect_settings_row_revealed(page, "code-font-weight")
     row = page.locator('[data-settings-item="code-font-weight"]')
     expect(row.get_by_role("switch", name="Use heavier code text")).to_be_focused()
     # The query stays for the next pick; Escape clears it and the nav comes back.
@@ -77,7 +64,7 @@ def test_settings_search_lists_its_best_matches_without_scrolling(
     keeping the selected result in view."""
     page.set_viewport_size({"width": 1280, "height": 800})
     page.goto(f"{live_server}/settings/general")
-    field = _search_field(page)
+    field = settings_search_field(page)
     expect(field).to_be_visible(timeout=30_000)
     field.fill("theme")
     options = page.get_by_role("option")
@@ -177,12 +164,12 @@ def test_search_settings_from_the_command_palette(page: Page, live_server: str) 
     _run_command(page, "Search settings…")
 
     expect(page).to_have_url(re.compile(r"/settings/general$"))
-    field = _search_field(page)
+    field = settings_search_field(page)
     expect(field).to_be_focused()
     page.keyboard.type("terminal theme")
     page.get_by_role("option", name=re.compile(r"^Terminal theme")).click()
     expect(page).to_have_url(re.compile(r"/settings/appearance#terminal-theme$"))
-    _expect_revealed(page, "terminal-theme")
+    expect_settings_row_revealed(page, "terminal-theme")
 
     page.get_by_role("link", name="Back").click()
     expect(page).not_to_have_url(re.compile(r"/settings"))

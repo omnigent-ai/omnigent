@@ -2823,7 +2823,7 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
             )
         return httpx.Response(200, json={})
 
-    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
     server_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler), base_url="http://server"
     )
@@ -2833,9 +2833,10 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://runner"
         ) as client:
-            # As many stuck listings as the default executor has workers.
+            # Concurrent listings share one scan, so one stuck git status
+            # would fill the one-worker default executor if it ran there.
             listings = [asyncio.create_task(client.get(path)) for _ in range(2)]
-            await poll_until_async(lambda: len(listing_threads) == 2, timeout_s=budget(5))
+            await poll_until_async(lambda: len(listing_threads) >= 1, timeout_s=budget(5))
 
             quick = asyncio.to_thread(lambda: "done")
             assert await asyncio.wait_for(quick, timeout=budget(2)) == "done"
@@ -2848,6 +2849,94 @@ async def test_slow_changed_files_listing_leaves_the_default_executor_free(
         await server_client.aclose()
 
     assert [response.status_code for response in responses] == [200, 200]
+
+
+@pytest.mark.asyncio
+async def test_listings_arriving_mid_scan_share_the_next_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent changes listings share git status runs instead of each queuing one.
+
+    Refetches the browser abandons would otherwise stack full scans on the slow-IO
+    pool. A listing that arrives mid-scan gets the next scan, never the running one,
+    so its answer is no older than the request.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+    from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
+
+    conv = "conv_shared_changes"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scans_started: list[int] = []
+    releases = [threading.Event() for _ in range(4)]
+
+    class _GatedGitRegistry:
+        """Each git status blocks until the test releases it, then names itself."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            scan = len(scans_started)
+            scans_started.append(scan)
+            releases[scan].wait(budget(10))
+            return [{"path": f"scan-{scan}.txt", "status": "modified"}]
+
+    monkeypatch.setattr(
+        filesystem_registry_mod,
+        "create_filesystem_registry",
+        lambda *, watch_path=None: _GatedGitRegistry(watch_path),
+    )
+    arrivals: list[object] = []
+    coalesced_run = FreshCallCoalescer.run
+
+    async def _observed_run(self: Any, key: Any, call: Any) -> Any:
+        arrivals.append(key)
+        return await coalesced_run(self, key, call)
+
+    monkeypatch.setattr(FreshCallCoalescer, "run", _observed_run)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200, json={"id": conv, "agent_id": None, "workspace": str(workspace)}
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    )
+    app = create_runner_app(runner_workspace=workspace, server_client=server_client)
+    path = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            first = asyncio.create_task(client.get(path))
+            await poll_until_async(lambda: scans_started == [0], timeout_s=budget(5))
+            late = [asyncio.create_task(client.get(path)) for _ in range(3)]
+            await poll_until_async(lambda: len(arrivals) == 4, timeout_s=budget(5))
+
+            releases[0].set()
+            first_response = await first
+            await poll_until_async(lambda: len(scans_started) == 2, timeout_s=budget(5))
+            releases[1].set()
+            late_responses = await asyncio.gather(*late)
+    finally:
+        for release in releases:
+            release.set()
+        await server_client.aclose()
+
+    assert scans_started == [0, 1]
+    assert first_response.status_code == 200, first_response.text
+    assert [entry["path"] for entry in first_response.json()["data"]] == ["scan-0.txt"]
+    for response in late_responses:
+        assert response.status_code == 200, response.text
+        assert [entry["path"] for entry in response.json()["data"]] == ["scan-1.txt"]
 
 
 @pytest.mark.asyncio

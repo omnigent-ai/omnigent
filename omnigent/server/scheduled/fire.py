@@ -105,6 +105,7 @@ from omnigent.server.managed_hosts import (
     managed_repo_labels,
     parse_repo_workspace,
     read_managed_repo_workspaces,
+    read_provider_recovery_hint,
 )
 from omnigent.server.permissions import check_session_access
 from omnigent.server.proactive_agent import fire_skip_reason, is_proactive_task
@@ -261,7 +262,6 @@ _STAGED_LAUNCH_ERRORS = _LaunchErrorCodes("sandbox_create_failed", "runner_start
 SANDBOX_REGISTRATION_TIMEOUT_S = 12 * 60
 # How long an abandoned launch gets to stop before its sandbox is torn down.
 _ABANDONED_LAUNCH_SETTLE_S = 30.0
-_REGISTRATION_HINT_TIMEOUT_S = 1.0
 
 # ``launch_start(conv, task, host_id, error_codes)`` — start provisioning a sandbox
 # in the background once the managed fire's prompt is saved. ``host_id`` is the
@@ -3151,15 +3151,8 @@ class _ClaimedRunRecorder:
         hint_callback = launch.host_online_failure_hint if launch is not None else None
 
         async def failure_reason() -> str:
-            if hint_callback is not None:
-                try:
-                    async with asyncio.timeout(_REGISTRATION_HINT_TIMEOUT_S):
-                        hint = await asyncio.to_thread(hint_callback)
-                    if hint:
-                        return f"{reason} — {hint}"
-                except Exception:
-                    _logger.warning("Could not build the sandbox registration hint", exc_info=True)
-            return reason
+            hint = await read_provider_recovery_hint(hint_callback)
+            return f"{reason} — {hint}" if hint else reason
 
         # Fence queued inputs before diagnostics yield; late registration cannot deliver them.
         reason = await self._fail_saved_prompt(conversation_id, failure_reason)

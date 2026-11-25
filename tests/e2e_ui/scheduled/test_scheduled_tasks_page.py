@@ -419,14 +419,26 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.fill("9:45 AM")
     time_input.blur()
     expect(time_input).to_have_value("09:45 AM")
-    _close_schedule_popover(page)
+    # Pick an hour in the nested picker, then click the prompt: one click
+    # outside both popovers closes the picker and the schedule popover together.
+    time_input.click()
+    picker = page.get_by_test_id("schedule-time-picker")
+    expect(picker).to_be_visible()
+    picker.get_by_role("listbox", name="Hours").get_by_role("option", name="10").click()
+    expect(time_input).to_have_value("10:45 AM")
+    expect(picker).to_be_visible()
+    prompt_input = page.get_by_test_id("task-prompt-input")
+    prompt_input.click()
+    expect(picker).to_have_count(0)
+    expect(page.get_by_test_id("schedule-fields")).to_have_count(0)
+    expect(prompt_input).to_be_focused()
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     created_row = _row_by_name(page, typed_name)
     expect(created_row).to_be_visible(timeout=30_000)
     # `to_contain_text`: the line may also carry the server next-run suffix.
     expect(created_row.get_by_test_id("task-schedule-line")).to_contain_text(
-        "Every day at 9:45 AM",
+        "Every day at 10:45 AM",
         timeout=30_000,
     )
 

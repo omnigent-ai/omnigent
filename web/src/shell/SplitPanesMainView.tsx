@@ -48,6 +48,7 @@ import {
   setChatPaneBodyHost,
   setOtherPaneMaximized,
   setSplitBesideChat,
+  setSplitOnScreen,
   useChatPaneViewToggleHostRef,
 } from "./chatPaneToolbarHost";
 import { FileTypeIcon } from "./FileTypeIcon";
@@ -193,6 +194,12 @@ function MainSplitPanes({
     setSplitBesideChat(conversationId, splitBesideChat);
     return () => setSplitBesideChat(conversationId, false);
   }, [conversationId, splitBesideChat]);
+  // Only a split this view shows takes the session's card; a hidden one keeps its layout.
+  const splitShown = visible && splitBesideChat;
+  useEffect(() => {
+    setSplitOnScreen(conversationId, splitShown);
+    return () => setSplitOnScreen(conversationId, false);
+  }, [conversationId, splitShown]);
   const chatInPane = visible && chatShown && splitBesideChat;
   const split = visible ? savedSplit : undefined;
 
