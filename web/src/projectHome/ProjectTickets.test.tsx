@@ -1056,6 +1056,37 @@ describe("Project ticket board", () => {
     },
   );
 
+  it("offers @mentions in a new ticket's description and files them", async () => {
+    vi.mocked(projectsApi.listProjectIdentities).mockResolvedValue([
+      {
+        id: "designer",
+        name: "Product Designer",
+        builtin: false,
+        instructions: "",
+      } as ProjectIdentity,
+    ]);
+    const onCreated = vi.fn();
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="new"
+        onClose={vi.fn()}
+        onCreated={onCreated}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Stories" } });
+    const description = screen.getByRole("combobox", { name: /Description/ });
+    fireEvent.change(description, { target: { value: "Ask @Prod", selectionStart: 9 } });
+    const option = await screen.findByRole("option", { name: /Product Designer/ });
+    fireEvent.mouseDown(option);
+    expect(description).toHaveValue("Ask @Product Designer ");
+    fireEvent.click(screen.getByRole("button", { name: "Create ticket" }));
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(vi.mocked(api.createTicket).mock.calls.at(-1)?.[1]).toMatchObject({
+      description: "Ask @Product Designer ",
+    });
+  });
+
   it("assigns a new ticket and reassigns it from the panel without label syntax", async () => {
     const role = (id: string, name: string, builtin = false) =>
       ({ id, name, builtin, instructions: "" }) as ProjectIdentity;

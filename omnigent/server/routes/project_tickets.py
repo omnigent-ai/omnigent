@@ -758,6 +758,25 @@ def create_project_tickets_router(
         await enrich(project_id, page["data"], who)
         return page
 
+    async def text_mentions(
+        targets: PersonaMentionTargets, project_id: str, who: TicketActor, text: str
+    ) -> tuple[Any, list[Mention], list[dict[str, str]]]:
+        """The personas *text* @mentions and the people it cc's, with the project."""
+        project = await targets.project(project_id, who.user_id)
+        personas = await targets.personas(project)
+        # Only people cc people; agents ask a person with needs-human instead.
+        people = (
+            await targets.people(project)
+            if targets.people is not None and who.session_id is None and who.agent_id is None
+            else []
+        )
+        candidates = [
+            *personas,
+            *person_aliases([p for p in people if p != who.user_id], personas),
+        ]
+        mentions, cc = split_mentions(find_mentions(text, candidates))
+        return project, mentions, cc
+
     @router.post("", status_code=201)
     async def create_ticket(
         request: Request, project_id: str, body: CreateTicket
@@ -771,8 +790,23 @@ def create_project_tickets_router(
             who,
             who.user_id,
         )
+        targets: PersonaMentionTargets | None = getattr(
+            request.app.state, "persona_mention_targets", None
+        )
+        project = None
+        mentions: list[Mention] = []
+        cc: list[dict[str, str]] = []
+        if targets is not None and "@" in body.description:
+            project, mentions, cc = await text_mentions(targets, project_id, who, body.description)
         with _storage_errors():
-            ticket = await asyncio.to_thread(store.create, project_id, body, who)
+            ticket = await asyncio.to_thread(
+                store.create,
+                project_id,
+                body,
+                who,
+                mentions=[{"id": entry.id, "name": entry.name} for entry in mentions],
+                cc=cc,
+            )
         await record_usage_event(
             request.app,
             "ticket.filed",
@@ -783,6 +817,10 @@ def create_project_tickets_router(
             subject_id=ticket["id"],
         )
         wake(request)
+        if targets is not None and project is not None and mentions:
+            _spawn_mention_delivery(
+                request, targets, project, ticket, body.description, mentions, who
+            )
         return ticket
 
     @router.post("/intake", status_code=201)
@@ -1229,19 +1267,7 @@ def create_project_tickets_router(
         project = mentions = None
         cc: list[dict[str, str]] = []
         if targets is not None and body.kind == "comment" and "@" in body.text:
-            project = await targets.project(project_id, who.user_id)
-            personas = await targets.personas(project)
-            # Only people cc people; agents ask a person with needs-human instead.
-            people = (
-                await targets.people(project)
-                if targets.people is not None and who.session_id is None and who.agent_id is None
-                else []
-            )
-            candidates = [
-                *personas,
-                *person_aliases([p for p in people if p != who.user_id], personas),
-            ]
-            mentions, cc = split_mentions(find_mentions(body.text, candidates))
+            project, mentions, cc = await text_mentions(targets, project_id, who, body.text)
         with _storage_errors():
             ticket = await asyncio.to_thread(
                 store.comment,

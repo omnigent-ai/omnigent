@@ -331,6 +331,34 @@ async def test_a_persons_cc_lists_the_ticket_in_a_members_inbox_until_read(
     assert await _requests(client, BOB) == []
 
 
+async def test_a_new_tickets_description_ccs_the_people_it_names(multi_user_client):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Filed"}, headers=_as_user(ALICE))
+    ).json()
+    shared = await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=_as_user(ALICE)
+    )
+    assert shared.status_code == 200, shared.text
+    created = await client.post(
+        f"/v1/projects/{project['id']}/tickets",
+        json={"title": "Stories", "description": "Make sure @Bob reviews these. @Lead, plan it."},
+        headers=_as_user(ALICE),
+    )
+    assert created.status_code == 201, created.text
+
+    [entry] = (await client.get(PATH, headers=_as_user(BOB))).json()["data"]
+    assert entry["reason"] == "cc" and entry["title"] == "Stories"
+    assert entry["question"] == "Make sure @Bob reviews these. @Lead, plan it."
+    assert await _requests(client, ALICE) == []
+    path = f"/v1/projects/{project['id']}/tickets/{created.json()['id']}"
+    [event] = (await client.get(f"{path}/events", headers=_as_user(BOB))).json()["data"]
+    assert event["kind"] == "created"
+    assert event["payload"]["cc"] == [{"user_id": BOB, "name": "Bob"}]
+    # Team members it names are recorded and woken, as on a comment.
+    assert [mention["name"] for mention in event["payload"]["mentions"]] == ["Lead"]
+
+
 async def test_an_approver_gives_risk_ok_on_others_tickets_only(multi_user_client, db_uri):
     client = multi_user_client
     project = (

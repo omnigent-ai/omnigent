@@ -18,7 +18,8 @@ import { useProjectPeople } from "./useProjectPeople";
 const MAX_SUGGESTIONS = 8;
 
 type MentionTextareaProps = Omit<ComponentProps<typeof Textarea>, "value" | "onChange"> & {
-  projectId: string;
+  /** Null while the project doesn't exist yet; nothing is offered then. */
+  projectId: string | null;
   value: string;
   onValueChange: (value: string) => void;
 };

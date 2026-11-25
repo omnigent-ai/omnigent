@@ -797,11 +797,15 @@ class ProjectTicketStore:
         *,
         requested_by: str | None = None,
         source: dict[str, Any] | None = None,
+        mentions: builtins.list[dict[str, str]] | None = None,
+        cc: builtins.list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Create a ticket; ``requested_by`` defaults to the creating user and never changes.
 
         :param source: Where an intake ticket from another project came from, recorded on
             its created event: ``project_id``, ``project_name`` and ``session_id``.
+        :param mentions: The personas the description @mentions, as on a comment.
+        :param cc: The people the description cc's, listed in their Inbox as on a comment.
         """
 
         def write(session: Session) -> dict[str, Any]:
@@ -836,6 +840,8 @@ class ProjectTicketStore:
                     **body.model_dump(exclude_none=True),
                     "stage": _stage_snapshot(stage),
                     **({"source": source} if source else {}),
+                    **({"mentions": mentions} if mentions else {}),
+                    **({"cc": cc} if cc else {}),
                 },
             )
             return {**_ticket(row), "waiting_on": self._waiting_on(session, project, row)}
@@ -1245,7 +1251,8 @@ class ProjectTicketStore:
                     .where(
                         event.workspace_id == project.workspace_id,
                         event.project_id == project.id,
-                        event.kind == EVENT_CODES["comment"],
+                        # A new ticket's description can cc people too.
+                        event.kind.in_((EVENT_CODES["comment"], EVENT_CODES["created"])),
                         event.session_id.is_(None),
                         event.agent_id.is_(None),
                         event.user_id != user_id,
@@ -1277,7 +1284,9 @@ class ProjectTicketStore:
                         "raised_at": row.created_at,
                         "raised_by_session_id": None,
                         "raised_by_user_id": row.user_id,
-                        "question": (row.payload.get("text") or "")[:500],
+                        "question": (
+                            row.payload.get("text") or row.payload.get("description") or ""
+                        )[:500],
                     }
         return builtins.list(entries.values())
 

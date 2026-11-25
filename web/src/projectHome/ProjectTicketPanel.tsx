@@ -251,6 +251,7 @@ export function ProjectTicketPanel({
           key={projectName}
           draftProjectName={projectName}
           resolveProjectId={async () => projectId ?? (await ensure.mutateAsync())}
+          mentionProjectId={projectId ?? null}
           // The full form always sends both fields.
           onSave={(body) =>
             create.mutate({ title: body.title ?? "", description: body.description ?? "" })
@@ -318,7 +319,13 @@ function TicketEditor({
   draftProjectName,
   fields = "all",
   extraFields,
+  mentionProjectId,
 }: {
+  /**
+   * Offer @mentions of the project's team members and people in the description. Only a
+   * new ticket's description delivers them; null while the project doesn't exist yet.
+   */
+  mentionProjectId?: string | null;
   /** Shown under the description, e.g. the new ticket's assignee. */
   extraFields?: ReactNode;
   resolveProjectId: () => Promise<string>;
@@ -391,20 +398,37 @@ function TicketEditor({
           <span className={fields === "description" ? "sr-only" : undefined}>
             Description <span className="text-muted-foreground">(optional)</span>
           </span>
-          <Textarea
-            autoFocus={fields === "description" && !mobile}
-            name="description"
-            className="focus-visible:ring-0"
-            rows={6}
-            maxLength={TICKET_DESCRIPTION_MAX_CHARS}
-            value={description}
-            onChange={(event) => setDescription(event.target.value)}
-            onPaste={images.onPaste}
-            onDragOver={images.onDragOver}
-            onDrop={images.onDrop}
-            placeholder="What should change? Done when…"
-            disabled={pending}
-          />
+          {mentionProjectId !== undefined ? (
+            <MentionTextarea
+              projectId={mentionProjectId}
+              name="description"
+              className="focus-visible:ring-0"
+              rows={6}
+              maxLength={TICKET_DESCRIPTION_MAX_CHARS}
+              value={description}
+              onValueChange={setDescription}
+              onPaste={images.onPaste}
+              onDragOver={images.onDragOver}
+              onDrop={images.onDrop}
+              placeholder="What should change? Done when… type @ to cc a team member or person"
+              disabled={pending}
+            />
+          ) : (
+            <Textarea
+              autoFocus={fields === "description" && !mobile}
+              name="description"
+              className="focus-visible:ring-0"
+              rows={6}
+              maxLength={TICKET_DESCRIPTION_MAX_CHARS}
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              onPaste={images.onPaste}
+              onDragOver={images.onDragOver}
+              onDrop={images.onDrop}
+              placeholder="What should change? Done when…"
+              disabled={pending}
+            />
+          )}
           <TicketImagePreviews upload={images} className="px-0 pb-0" />
         </label>
       )}
