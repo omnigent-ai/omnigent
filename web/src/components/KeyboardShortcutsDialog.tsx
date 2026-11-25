@@ -2,7 +2,7 @@
 // It binds only its own opener (⌘/Ctrl + /) and the menu event that opens it.
 // Mount it once near the app shell.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { Kbd } from "@/components/KeyboardShortcut";
 import {
@@ -65,9 +65,14 @@ export function useShortcutPageContext(): ShortcutPageContext {
   };
 }
 
-/** The Keyboard shortcuts page's groups here. */
+/** The Keyboard shortcuts page's groups here, rebuilt only when a field of the context changes. */
 export function useShortcutPageGroups(): ShortcutPageGroup[] {
-  return shortcutPageGroups(useShortcutPageContext());
+  // A string, since every render makes a new context object.
+  const contextKey = JSON.stringify(useShortcutPageContext());
+  return useMemo(
+    () => shortcutPageGroups(JSON.parse(contextKey) as ShortcutPageContext),
+    [contextKey],
+  );
 }
 
 /**
@@ -84,8 +89,7 @@ export function KeyboardShortcutsList({
   groups?: readonly ShortcutPageGroup[];
 }) {
   const context = useShortcutPageContext();
-  const allGroups = shortcutPageGroups(context);
-  const groups = shownGroups ?? allGroups;
+  const groups = shownGroups ?? shortcutPageGroups(context);
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>
