@@ -44,7 +44,6 @@ import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  CloudOffIcon,
   CodeIcon,
   Columns2Icon,
   DownloadIcon,
@@ -54,7 +53,6 @@ import {
   FolderOpenIcon,
   Link2Icon,
   ListIcon,
-  Loader2Icon,
   MessageSquareTextIcon,
   MoreHorizontalIcon,
   PencilLineIcon,
@@ -121,6 +119,7 @@ import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { SaveStatusChip } from "./SaveStatusChip";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { isFileComment } from "@/lib/localReviewComments";
@@ -1891,52 +1890,7 @@ function FileViewerBody({
           {/* Auto-save status chip (replaces the editor's old Save button).
               Non-idle implies an editable Monaco buffer, so no extra gating.
               Kept outside the responsive switcher — always inline. */}
-          {saveStatus !== "idle" && (
-            <span
-              ref={toolbarChipRef}
-              aria-live="polite"
-              title={
-                saveStatus === "offline"
-                  ? "Runner offline — your changes will save when it reconnects"
-                  : undefined
-              }
-              className={cn(
-                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-sm",
-                saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
-              )}
-            >
-              {saveStatus === "unsaved" && (
-                <>
-                  <span className="size-1.5 rounded-full bg-muted-foreground/70" />
-                  Unsaved
-                </>
-              )}
-              {saveStatus === "saving" && (
-                <>
-                  <Loader2Icon className="size-3 animate-spin" />
-                  Saving…
-                </>
-              )}
-              {saveStatus === "saved" && (
-                <>
-                  <CheckIcon className="size-3 text-green-500" />
-                  Saved
-                </>
-              )}
-              {saveStatus === "error" && (
-                <>
-                  <AlertTriangleIcon className="size-3" />
-                  Save failed
-                </>
-              )}
-              {saveStatus === "offline" && (
-                <>
-                  <CloudOffIcon className="size-3" />
-                  Unsaved
-                </>
-              )}
-            </span>
-          )}
+          <SaveStatusChip status={saveStatus} chipRef={toolbarChipRef} />
           {/* Collapse overflowing actions into "⋯", keeping the Open in split
               button visible. The offscreen clone measures the full row. */}
           <div className="flex items-center justify-end gap-1">
