@@ -7770,6 +7770,12 @@ function makeLiveTextBlock(
   };
 }
 
+/** One native live-stream chunk awaiting its frame's commit. */
+interface LiveDeltaChunk {
+  delta: string;
+  index?: number;
+}
+
 /**
  * Fold one streamed chunk into its in-flight preview block in `blocks`.
  *
@@ -7781,45 +7787,118 @@ function makeLiveTextBlock(
  * The server reconciles and deduplicates chunks, so each received delta is
  * appended directly.
  *
+ * :param blocks: the current blocks.
+ * :param activeResponse: the live turn, whose id a new preview joins.
+ * :param itemId: the provisional id, e.g. ``"live:2ca51d97-..."``.
+ * :param chunk: incremental text for this chunk and its stream index.
+ * :returns: the new blocks, or `blocks` itself when the chunk is ignored.
+ */
+function foldLiveDelta(
+  blocks: AnyBlock[],
+  activeResponse: ActiveResponse | null,
+  itemId: string,
+  { delta, index }: LiveDeltaChunk,
+): AnyBlock[] {
+  const at = blocks.findIndex((b) => b.ctx.itemId === itemId);
+  if (at === -1) {
+    const responseId = activeResponse?.state === "streaming" ? activeResponse.responseId : itemId;
+    return [...blocks, makeLiveTextBlock(itemId, delta, responseId, index)];
+  }
+  const existing = blocks[at]!;
+  if (existing.type !== "text_done") return blocks;
+  const fullText = existing.fullText + delta;
+  const next = blocks.slice();
+  const missedChunk =
+    index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
+  next[at] = {
+    ...existing,
+    fullText,
+    hasCodeBlocks: fullText.includes("```"),
+    ...(index !== undefined ? { streamIndex: index } : {}),
+    ...(missedChunk ? { previewInterrupted: true } : {}),
+  };
+  return next;
+}
+
+/**
+ * Fold a message's buffered chunks into its preview in one store commit.
+ *
  * :param set: store setter.
  * :param messageId: vendor's stable per-message id.
- * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
+ * :param chunks: the message's chunks in arrival order.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: number): void {
+function applyLiveDeltas(set: Setter, messageId: string, chunks: LiveDeltaChunk[]): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
-    const startupPatch =
-      delta.length > 0
-        ? {
-            mcpStartup: null,
-            mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
-          }
-        : {};
-    const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
-    if (at === -1) {
-      const live = s.activeResponse;
-      const responseId = live?.state === "streaming" ? live.responseId : itemId;
-      return {
-        ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
-      };
-    }
-    const existing = s.blocks[at]!;
-    if (existing.type !== "text_done") return {};
-    const fullText = existing.fullText + delta;
-    const next = s.blocks.slice();
-    const missedChunk =
-      index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
-    next[at] = {
-      ...existing,
-      fullText,
-      hasCodeBlocks: fullText.includes("```"),
-      ...(index !== undefined ? { streamIndex: index } : {}),
-      ...(missedChunk ? { previewInterrupted: true } : {}),
-    };
-    return { ...startupPatch, blocks: next };
+    const blocks = chunks.reduce(
+      (acc, chunk) => foldLiveDelta(acc, s.activeResponse, itemId, chunk),
+      s.blocks,
+    );
+    if (blocks === s.blocks) return {};
+    const startupPatch = chunks.some((chunk) => chunk.delta.length > 0)
+      ? {
+          mcpStartup: null,
+          mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
+        }
+      : {};
+    return { ...startupPatch, blocks };
   });
+}
+
+/**
+ * Per-stream buffer that coalesces native live deltas into one commit.
+ *
+ * `queue` holds a chunk until `drain` folds every buffered message into
+ * `blocks`, and reports a message's first chunk so its preview can paint
+ * without waiting a frame. A drain skips messages ignored or conversations
+ * disposed since their chunks arrived, so a late frame cannot recreate a
+ * removed preview. `close` drains one last time and ignores later drains; it
+ * runs when the stream's binding is aborted, before e.g. a retry drops its
+ * previews, so the replaced pump cannot recreate one from its buffered tail.
+ */
+interface LiveDeltaBuffer {
+  queue: (messageId: string, chunk: LiveDeltaChunk) => boolean;
+  drain: () => void;
+  close: () => void;
+}
+
+function createLiveDeltaBuffer(
+  id: string,
+  ignored: Set<string>,
+  set: Setter,
+  signal: AbortSignal,
+): LiveDeltaBuffer {
+  const pending = new Map<string, LiveDeltaChunk[]>();
+  const seen = new Set<string>();
+  let closed = false;
+  const drain = (): void => {
+    if (closed || pending.size === 0) return;
+    const batch = [...pending];
+    pending.clear();
+    if (isConversationDisposed(id)) return;
+    for (const [messageId, chunks] of batch) {
+      if (!ignored.has(messageId)) applyLiveDeltas(set, messageId, chunks);
+    }
+  };
+  const close = (): void => {
+    drain();
+    closed = true;
+    signal.removeEventListener("abort", close);
+  };
+  signal.addEventListener("abort", close);
+  return {
+    queue(messageId, chunk) {
+      const chunks = pending.get(messageId);
+      if (chunks) chunks.push(chunk);
+      else pending.set(messageId, [chunk]);
+      if (seen.has(messageId)) return false;
+      seen.add(messageId);
+      return true;
+    },
+    drain,
+    close,
+  };
 }
 
 /** Append live output to the matching in-progress tool execution. */
@@ -7864,12 +7943,27 @@ export function reviveStrayCompletedResponse(set: Setter): void {
 }
 
 /**
+ * Commit buffered native live deltas before any other event takes effect,
+ * so session edges and items see the preview text that arrived before them.
+ */
+async function* drainLiveDeltasBeforeOtherEvents(
+  events: AsyncIterable<StreamEvent>,
+  live: LiveDeltaBuffer,
+): AsyncIterable<StreamEvent> {
+  for await (const ev of events) {
+    if (ev.type !== "text_delta" || ev.messageId === undefined) live.drain();
+    yield ev;
+  }
+}
+
+/**
  * Wrap a parsed event stream, diverting terminal-observed live deltas.
  *
  * A `text_delta` carrying a `messageId` is native live streaming:
- * it is folded into its provisional preview block in `blocks` (see
- * `applyLiveDelta`) and NOT yielded downstream, because the `BlockStream`
- * reducer's response-scoped text path would otherwise emit a stray bubble
+ * it is queued in `live` for the next frame's commit into its provisional
+ * preview block in `blocks` (see `foldLiveDelta`) and NOT yielded
+ * downstream, because the `BlockStream` reducer's response-scoped text
+ * path would otherwise emit a stray bubble
  * (these deltas carry no response id and their authoritative text arrives
  * as a separate committed item). Every other event passes through
  * untouched.
@@ -7881,6 +7975,8 @@ export function reviveStrayCompletedResponse(set: Setter): void {
  *     deltas arrived before the new turn was named.
  * :param set: store setter.
  * :param get: store getter.
+ * :param live: buffer the deltas wait in until `requestFrame`'s commit.
+ * :param requestFrame: schedules the frame that drains `live`.
  * :returns: events with native live deltas removed.
  */
 async function* tapLiveDeltas(
@@ -7889,6 +7985,8 @@ async function* tapLiveDeltas(
   ignored: Set<string>,
   set: Setter,
   get: Getter,
+  live: LiveDeltaBuffer,
+  requestFrame: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
     if (ev.type === "message_done" && ev.messageId !== undefined) {
@@ -7903,7 +8001,10 @@ async function* tapLiveDeltas(
           ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.delta, ev.index);
+        // A message's first and final chunks paint at once; the rest batch per frame.
+        const first = live.queue(ev.messageId, { delta: ev.delta, index: ev.index });
+        if (first || ev.final === true) live.drain();
+        else requestFrame();
       }
       continue;
     }
@@ -8188,7 +8289,9 @@ export async function pumpStreamEvents(
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
-  const rawEvents = parseSseStream(body, sseResult);
+  // Native live deltas commit once per frame with the buffered blocks below.
+  const live = createLiveDeltaBuffer(id, ignoredMessages, set, controller.signal);
+  const rawEvents = drainLiveDeltasBeforeOtherEvents(parseSseStream(body, sseResult), live);
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
   // (one SSE connection); bounded by item count like `blocks` itself.
@@ -8234,6 +8337,8 @@ export async function pumpStreamEvents(
     ignoredMessages,
     set,
     get,
+    live,
+    () => scheduler.schedule(() => flush()),
   );
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
@@ -8243,6 +8348,8 @@ export async function pumpStreamEvents(
   // applying any sidecar state in the same commit. No-ops if switched away.
   const flush = (trailing?: AnyBlock, extra?: Partial<ChatState>): void => {
     scheduler.cancel();
+    // Buffered live previews commit ahead of the buffered blocks.
+    live.drain();
     if (isConversationDisposed(id)) {
       buffer.length = 0;
       return;
@@ -8554,6 +8661,8 @@ export async function pumpStreamEvents(
     flush();
     return "dropped";
   } finally {
+    // Commit buffered live text, including after a reconnect's attempt abort.
+    live.close();
     // Drop any pending frame + its buffered blocks so a queued flush
     // can't apply this stream's blocks after switchTo bound another.
     // `abortController` lifecycle is owned by `startStreamPump`'s loop,
