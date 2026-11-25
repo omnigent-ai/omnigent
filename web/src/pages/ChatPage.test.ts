@@ -1525,20 +1525,19 @@ describe("composer /loop gating", () => {
     ["openai-agents", false],
     [null, false],
   ] as const)(
-    "offers /loop for %s when the server saves and lists session timers",
+    "offers /loop for %s when the server saves timers and manages loops",
     (harness, offered) => {
-      const saves = info({ session_timers: true, session_timer_list: true });
+      const saves = info({ session_timers: true, session_loops: true });
       expect(composerOffersLoop(harness, saves, topLevel)).toBe(offered);
-      // Saving alone is not enough: without the listing route, /loop could not
-      // find the loop it replaces or stops.
+      // Saving alone is not enough: an older server would not replace or stop a loop.
       expect(composerOffersLoop(harness, info({ session_timers: true }), topLevel)).toBe(false);
-      expect(composerOffersLoop(harness, info({ session_timer_list: true }), topLevel)).toBe(false);
+      expect(composerOffersLoop(harness, info({ session_loops: true }), topLevel)).toBe(false);
       expect(composerOffersLoop(harness, "loading", topLevel)).toBe(false);
     },
   );
 
   it("withholds /loop from a sub-agent's session and a side chat, whose timers aren't saved", () => {
-    const saves = info({ session_timers: true, session_timer_list: true });
+    const saves = info({ session_timers: true, session_loops: true });
     expect(composerOffersLoop("claude-sdk", saves, { parentSessionId: "conv_parent" })).toBe(false);
     expect(composerOffersLoop("claude-sdk", saves, { labels: { "omnigent.side_chat": "1" } })).toBe(
       false,

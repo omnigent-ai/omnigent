@@ -138,12 +138,12 @@ import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
 import { formatLoopInterval, looksLikeCommand, parseLoopCommand } from "@/lib/loopCommand";
 import {
   cancelSessionTimer,
-  listSessionLoops,
   LOOP_TIMER_ORIGIN,
   runSessionTimerMutation,
   sendLoopPrompt,
   sessionTakesSavedTimers,
   setSessionTimer,
+  stopSessionLoop,
 } from "@/lib/sessionTimersApi";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
@@ -2220,14 +2220,7 @@ const LOOP_HARNESSES: ReadonlySet<string> = new Set([
   "codex",
 ]);
 
-/**
- * Whether the composer offers ``/loop`` for *session* on *harness*: the server
- * saves and lists session timers (``session_timers`` and ``session_timer_list``,
- * the listing being outside the automations gate), the harness is one the loop
- * was verified on, and the session is top-level, since a sub-agent's or side
- * chat's timers are not saved. Elsewhere a typed /loop stays plaintext, so
- * Claude Code's own ``/loop`` still runs on claude-native.
- */
+/** Offer saved loops on supported top-level sessions when the server saves timers and manages loops. */
 export function composerOffersLoop(
   harness: string | null,
   info: ServerInfo | "loading",
@@ -2235,7 +2228,7 @@ export function composerOffersLoop(
     { parentSessionId?: string | null; labels?: Record<string, string> | null } | null | undefined,
 ): boolean {
   if (info === "loading") return false;
-  if (info.session_timers !== true || info.session_timer_list !== true) return false;
+  if (info.session_timers !== true || info.session_loops !== true) return false;
   if (harness === null || !LOOP_HARNESSES.has(harness)) return false;
   return sessionTakesSavedTimers(session);
 }
@@ -3615,35 +3608,40 @@ function ComposerImpl(
         const report = (hint: string) => {
           if (composerSessionIdRef.current === loopSessionId) setCommandError(hint);
         };
-        // Starts and stops queue per session, so two submissions can't both see
-        // no loop and arm two, and a stop waits for an arm still in flight.
+        // Starts and stops queue per session, so a stop waits for an arm still in flight.
         void runSessionTimerMutation(loopSessionId, async () => {
-          // One loop per session: a new /loop cancels the one it replaces. Only the
-          // loops /loop tagged are touched; the agent's own timers are left alone.
-          const existing = await listSessionLoops(loopSessionId);
-          await Promise.all(
-            existing.map((loop) => cancelSessionTimer(loopSessionId, loop.timerId)),
-          );
           if (command.kind === "stop") {
-            report(existing.length === 0 ? "No loop is running in this session." : "Loop stopped.");
+            const stopped = await stopSessionLoop(loopSessionId);
+            report(stopped === null ? "No loop is running in this session." : "Loop stopped.");
             return;
           }
+          // The server replaces the caller's running loop in this session, so one
+          // runs per user per session however many tabs arm one.
           const timer = await setSessionTimer(loopSessionId, {
             seconds: command.seconds,
             repeat: true,
             note: command.prompt,
             origin: LOOP_TIMER_ORIGIN,
           });
-          // Like Claude Code's /loop, run the prompt now rather than waiting for the
-          // first tick: the same tagged message every tick sends.
           appendEntry(typed);
-          await sendLoopPrompt(loopSessionId, command.prompt);
+          try {
+            // Like Claude Code's /loop, run the prompt now rather than waiting for the
+            // first tick: the same tagged message every tick sends.
+            await sendLoopPrompt(loopSessionId, command.prompt);
+          } catch (err: unknown) {
+            // Every tick would meet the same refusal, so arm nothing.
+            await cancelSessionTimer(loopSessionId, timer.timerId).catch(() => undefined);
+            const reason = err instanceof Error ? err.message : "The first run failed";
+            throw new Error(`${reason.replace(/\.$/, "")}. The loop was not armed.`, {
+              cause: err,
+            });
+          }
           const every = formatLoopInterval(timer.intervalSeconds ?? command.seconds);
           const nextRun = new Date(timer.fireAt);
           const nextRunLabel = Number.isNaN(nextRun.getTime())
             ? ""
             : `, next run at ${nextRun.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-          const replaced = existing.length > 0 ? ", replacing the previous loop" : "";
+          const replaced = timer.replacedTimerId !== null ? ", replacing the previous loop" : "";
           const asText = looksLikeCommand(command.prompt)
             ? " The prompt looks like a command; the loop sends it as a message, so it may not run as one."
             : "";
@@ -3652,9 +3650,15 @@ function ComposerImpl(
               `it repeats until /loop stop and survives runner restarts.${asText}`,
           );
         }).catch((err: unknown) => {
-          // Give the command back to fix, unless the user has typed since.
-          if (draftRef.current === "" && composerSessionIdRef.current === loopSessionId) {
-            setValue(typed);
+          // Give the command back to fix: into the composer while its session is still
+          // open, else into that session's saved draft, unless something newer is there.
+          if (composerSessionIdRef.current === loopSessionId) {
+            if (draftRef.current === "") setValue(typed);
+          } else {
+            const saved = getSessionDraft(loopSessionId);
+            if (!saved?.text && !saved?.files.length) {
+              setSessionDraft(loopSessionId, { text: typed, files: [] });
+            }
           }
           report(err instanceof Error ? err.message : "Loop failed");
         });

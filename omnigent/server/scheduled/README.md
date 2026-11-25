@@ -464,7 +464,8 @@ instead of saving.
   (`next_timer_time`), skipping missed ones, and timers are exempt from the automation
   minimum interval. A firing comes up to one poll (15 seconds by default) late.
 - **Delivery.** The executor skips budgets, sharing and run labels, and sends the
-  hidden (`is_meta`) wake through the continued-session dispatch, in the session's
+  hidden (`is_meta`) wake, or a `/loop` timer's prompt as a visible message tagged
+  `origin: "loop"`, through the continued-session dispatch, in the session's
   current permission mode. A session that was deleted, archived or closed, or that
   the owner can no longer send to, stops the timer (`timer_session_unavailable`).
   The wake meets the session's REQUEST-phase input policies first: a deny, or an ASK

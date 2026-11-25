@@ -3688,6 +3688,16 @@ async def _persist_external_conversation_item_unlocked(
                 and match_method != "fifo_fallback"
             ):
                 item = item.model_copy(update={"created_by": drained.created_by})
+            # A text match also keeps what sent the message, e.g. a /loop run's origin.
+            if (
+                drained.origin is not None
+                and isinstance(item.data, MessageData)
+                and item.data.origin is None
+                and match_method != "fifo_fallback"
+            ):
+                item = item.model_copy(
+                    update={"data": item.data.model_copy(update={"origin": drained.origin})}
+                )
             # A web client that sends stable_id gets store-level idempotency:
             # use it directly as the item id so the append is a no-op on retry.
             # source_id from the forwarder takes precedence when both are set.
@@ -9379,6 +9389,10 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
+        # What sent the message when no human typed it (a /loop run), restored onto
+        # the mirror the transcript sends back, as created_by is.
+        raw_origin = body.data.get("origin")
+        message_origin = raw_origin if isinstance(raw_origin, str) else None
         raw_stable_id = body.data.get("stable_id")
         web_stable_id = (
             raw_stable_id
@@ -9451,6 +9465,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                origin=message_origin,
             )
             if queues_message
             else None

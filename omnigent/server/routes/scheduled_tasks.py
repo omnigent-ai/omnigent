@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import math
 import time
@@ -92,7 +93,6 @@ from omnigent.server.scheduled.schedule import (
     LOOP_TIMER_NAME,
     continued_sandbox_host_id,
     is_trigger_automation,
-    timer_interval,
     timer_origin,
     timer_rule,
 )
@@ -2542,6 +2542,44 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
         return (None if user_id == RESERVED_USER_LOCAL else user_id), conv
 
+    # The caller's running /loop in a session is remembered on the session, one label
+    # per user, so a new loop replaces it and a stop finds it without listing timers.
+    _LOOP_LABEL_PREFIX = "omnigent.loop_timer."
+    _loop_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    def _loop_label(user_id: str | None) -> str:
+        user_key = (user_id or RESERVED_USER_LOCAL).encode()
+        return _LOOP_LABEL_PREFIX + hashlib.sha256(user_key).hexdigest()[:16]
+
+    def _loop_lock(conversation_id: str, user_id: str | None) -> asyncio.Lock:
+        """Serialize one caller's loop changes in one session within this process."""
+        key = (conversation_id, user_id or RESERVED_USER_LOCAL)
+        return _loop_locks.setdefault(key, asyncio.Lock())
+
+    async def _caller_loop(conv: Conversation, user_id: str | None) -> ScheduledTask | None:
+        """The caller's loop in *conv* that the session remembers, if it still runs."""
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        timer_id = (fresh or conv).labels.get(_loop_label(user_id))
+        if not timer_id:
+            return None
+        task = await asyncio.to_thread(store.get, timer_id)
+        if (
+            task is None
+            or task.kind != "timer"
+            or task.state != "active"
+            or task.session_id != conv.id
+            or task.user_id != user_id
+            or timer_origin(task.name) != "loop"
+        ):
+            return None
+        return task
+
+    async def _point_loop(conv: Conversation, user_id: str | None, timer_id: str | None) -> None:
+        """Remember *timer_id* as the caller's loop in *conv*; ``None`` forgets it."""
+        await asyncio.to_thread(
+            conversation_store.set_labels, conv.id, {_loop_label(user_id): timer_id or ""}
+        )
+
     # Called by the runner's timer tools, so hidden from the public API reference.
     @timers.post(
         "/sessions/{session_id}/timers",
@@ -2566,14 +2604,15 @@ def create_scheduled_tasks_router(
         :param body: ``{"seconds": number, "repeat": bool, "note": str | null}``, checked
             like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``, plus an
             optional ``origin``: ``"loop"`` marks a timer the web composer's ``/loop`` set,
-            saved under the name ``Loop: <note>`` rather than ``Timer: <note>`` so the
-            listing can tell it from the agent's own; anything else is refused. A loop's
-            firings send its ``note`` (required) as a message the transcript shows,
-            tagged ``origin: "loop"``, where an agent's timer sends a hidden wake.
+            saved as ``Loop: <note>`` with the ``note`` (required) as the prompt its
+            firings send visibly; anything else is refused. A loop replaces the caller's
+            running loop in this session, which the session remembers for them, so one
+            runs per user per session; ``DELETE .../timers?origin=loop`` stops it.
+            Replacement is serialized within one server process.
         :returns: ``durable`` true, ``timer_id``, ``status`` ``"scheduled"``, the UTC
             ``fire_at`` of the first firing, ``interval_seconds`` for a repeating timer
-            (else ``None``), and the ``seconds``, ``repeat``, ``note`` and ``origin`` it
-            was set with.
+            (else ``None``), the ``seconds``, ``repeat``, ``note`` and ``origin`` it was
+            set with, and for a loop the ``replaced_timer_id`` it replaced (or ``None``).
         :raises OmnigentError: 400 for bad arguments, a delay under
             ``DURABLE_TIMER_MIN_SECONDS``, an archived or closed session, or a server with
             timers off (no database scheduler, or the ``session_timers`` feature off);
@@ -2632,35 +2671,54 @@ def create_scheduled_tasks_router(
         agent_id = conv.agent_id
         interval = max(1, math.ceil(seconds))
         fire_at = math.ceil(time.time() + seconds)
-        async with _allocated_task_id(user_id, "Timer") as task_id:
-            # Synchronous, so a cancel can't land after the save and release the saved ID.
-            task = store.create(
-                scheduled_task_id=task_id,
-                name=(
-                    f"{LOOP_TIMER_NAME if origin else 'Timer'}: {note}"[:256]
-                    if note
-                    else (LOOP_TIMER_NAME if origin else "Timer")
-                ),
-                # What each firing sends the session: a loop's prompt as a message the
-                # transcript shows; an agent timer's hidden wake.
-                prompt=(
-                    note
-                    if origin and note
-                    else f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else "")
-                ),
-                rrule=timer_rule(interval, repeat=repeat),
-                user_id=user_id,
-                agent_id=agent_id,
-                timezone="UTC",
-                session_mode="continue",
-                session_id=conv.id,
-                # Runs route to the replica holding the session's host.
-                host_id=conv.host_id,
-                first_run_at=fire_at,
-                kind="timer",
-                # Firings fall at the anchor plus whole intervals, the first at fire_at.
-                schedule_anchor=fire_at - interval,
-            )
+
+        async def save() -> ScheduledTask:
+            async with _allocated_task_id(user_id, "Timer") as task_id:
+                # Synchronous, so a cancel can't land after the save and release the saved ID.
+                return store.create(
+                    scheduled_task_id=task_id,
+                    name=(
+                        f"{LOOP_TIMER_NAME if origin else 'Timer'}: {note}"[:256]
+                        if note
+                        else (LOOP_TIMER_NAME if origin else "Timer")
+                    ),
+                    # What each firing sends the session: a loop's prompt as a message the
+                    # transcript shows; an agent timer's hidden wake.
+                    prompt=(
+                        note
+                        if origin and note
+                        else f"[System: timer {task_id} fired]"
+                        + (f"\nnote: {note!r}" if note else "")
+                    ),
+                    rrule=timer_rule(interval, repeat=repeat),
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    timezone="UTC",
+                    session_mode="continue",
+                    session_id=conv.id,
+                    # Runs route to the replica holding the session's host.
+                    host_id=conv.host_id,
+                    first_run_at=fire_at,
+                    kind="timer",
+                    # Firings fall at the anchor plus whole intervals, the first at fire_at.
+                    schedule_anchor=fire_at - interval,
+                )
+
+        replaced: ScheduledTask | None = None
+        if origin is None:
+            task = await save()
+        else:
+            async with _loop_lock(conv.id, user_id):
+                replaced = await _caller_loop(conv, user_id)
+                if replaced is not None:
+                    await asyncio.to_thread(store.delete, replaced.id)
+                task = await save()
+                try:
+                    await _point_loop(conv, user_id, task.id)
+                except BaseException:
+                    # A loop the session can't find could never be stopped.
+                    await asyncio.to_thread(store.delete, task.id)
+                    raise
         return {
             "durable": True,
             "timer_id": task.id,
@@ -2671,44 +2729,38 @@ def create_scheduled_tasks_router(
             "repeat": repeat,
             "note": note,
             "origin": origin,
+            **(
+                {"replaced_timer_id": replaced.id if replaced is not None else None}
+                if origin
+                else {}
+            ),
         }
 
-    @timers.get("/sessions/{session_id}/timers", include_in_schema=False)
-    async def list_session_timers(request: Request, session_id: str) -> dict[str, Any]:
-        """List the caller's saved timers in this session, oldest first.
+    @timers.delete("/sessions/{session_id}/timers", include_in_schema=False)
+    async def cancel_session_loop(
+        request: Request, session_id: str, origin: str | None = None
+    ) -> dict[str, Any]:
+        """Stop the caller's ``/loop`` in this session, if one runs.
 
-        The automations listing hides timers unless asked for every kind and sits
-        behind the automations gate; this route doesn't, so a client that sets
-        timers (the composer's ``/loop``) can find its own without either. Like the
-        cancel route, it shows only timers the caller set in this session; a
-        collaborator's are not listed.
+        Only ``origin=loop`` is accepted: the loop is the timer the session remembers
+        for the caller, so the agent's own timers are never touched. Repeating is safe.
 
-        :returns: ``{"timers": [...]}``, each with ``timer_id``, ``origin`` (``"loop"``
-            for the composer's ``/loop``, else ``"agent"``), ``name``, ``repeat``,
-            ``interval_seconds`` and the UTC ``next_run_at`` (``None`` once a one-shot
-            has fired).
+        :returns: ``{"timer_id": "...", "status": "cancelled"}``, or ``status``
+            ``"none"`` with a ``None`` ``timer_id`` when no loop was running.
+        :raises OmnigentError: 400 for any other ``origin``; 403/404 as for posting a
+            message.
         """
+        if origin != "loop":
+            raise OmnigentError("origin must be 'loop'", code=ErrorCode.INVALID_INPUT)
         user_id, conv = await _timer_session(request, session_id)
-        tasks = await asyncio.to_thread(store.list, owner_user_id=user_id, kinds=("timer",))
-        timers_out: list[dict[str, Any]] = []
-        for task in sorted(tasks, key=lambda t: (t.created_at, t.id)):
-            if task.session_id != conv.id or task.user_id != user_id or task.state != "active":
-                continue
-            timers_out.append(
-                {
-                    "timer_id": task.id,
-                    "origin": timer_origin(task.name),
-                    "name": task.name,
-                    "repeat": not is_one_time_rule(task.rrule),
-                    "interval_seconds": timer_interval(task.rrule),
-                    "next_run_at": (
-                        datetime.fromtimestamp(task.next_run_at, UTC).isoformat()
-                        if task.next_run_at is not None
-                        else None
-                    ),
-                }
-            )
-        return {"timers": timers_out}
+        async with _loop_lock(conv.id, user_id):
+            running = await _caller_loop(conv, user_id)
+            if running is not None:
+                await asyncio.to_thread(store.delete, running.id)
+                await _point_loop(conv, user_id, None)
+        if running is None:
+            return {"timer_id": None, "status": "none"}
+        return {"timer_id": running.id, "status": "cancelled"}
 
     @timers.delete("/sessions/{session_id}/timers/{timer_id}", include_in_schema=False)
     async def cancel_session_timer(

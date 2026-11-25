@@ -239,25 +239,27 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   with `origin: "loop"`, named `Loop: <prompt>`), so it survives runner and server
   restarts. The prompt is sent once right away and again on every tick, each
   time as a user message tagged `origin: "loop"`, which the transcript shows as
-  a user bubble with a "Loop" label beside it. A tick starts or joins a turn
-  like a typed message, so a task that outlasts its interval accumulates
-  ticks. One loop per session: a new `/loop`
-  cancels the running one first and `/loop stop` (no arguments) cancels it; only
-  loop-tagged timers are touched, never the agent's own `sys_timer_set` timers.
-  Starts and stops queue per session, so overlapping submissions can't arm two.
-  Intervals are a leading `5m`, `2h` or `1d` token, from 2 minutes (the server's
-  saved-timer floor) to 7 days. A prompt starting with `/` or `$` is sent as a
-  message like any other, so the hint warns it may not run as a command. Offered
-  in Claude Code native, claude-sdk,
+  a user bubble with a "Loop" label beside it. The first run and every tick
+  start or join a turn like a typed message, steering a running one, so a task
+  that outlasts its interval accumulates ticks. One loop per user per session,
+  kept by the server: a new `/loop` replaces the caller's running loop in that
+  session however many tabs arm one, and `/loop stop` (no arguments) stops it
+  (`DELETE /v1/sessions/{id}/timers?origin=loop`); the agent's own
+  `sys_timer_set` timers are never touched, and in a shared session each
+  collaborator's loop is their own. Intervals are a leading `5m`, `2h` or `1d`
+  token, from 2 minutes (the server's saved-timer floor) to 7 days. A prompt
+  starting with `/` or `$` is sent as a message like any other, so the hint
+  warns it may not run as a command. Offered in Claude Code native, claude-sdk,
   Codex native and codex sessions, top-level only (a sub-agent's or side chat's
   timers aren't saved), when `/v1/info` reports both `session_timers` and
-  `session_timer_list`; otherwise a typed `/loop` is sent as text, so Claude
-  Code's own `/loop` runs in a native session. Selecting **/loop** in Commands
-  fills `/loop ` to complete. States: "Loop armed: every 5m, next run at …",
-  "Loop stopped.", "No loop is running in this session.", usage and interval
-  errors under the composer with the text kept, a server refusal with the text
-  restored. Timers belong to the user who set them, so in a shared session a
-  collaborator's `/loop stop` doesn't see the owner's loop.
+  `session_loops`; otherwise a typed `/loop` is sent as text, so Claude Code's
+  own `/loop` runs in a native session. Selecting **/loop** in Commands fills
+  `/loop ` to complete. States: "Loop armed: every 5m, next run at …", "Loop
+  stopped.", "No loop is running in this session.", usage and interval errors
+  under the composer with the text kept, a server refusal with the text
+  restored (to the session's saved draft if the user has switched away), and a
+  refused first run ("… The loop was not armed."), which cancels the timer just
+  saved.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

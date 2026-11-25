@@ -228,6 +228,8 @@ class DrainedInput:
         so ``session.input.consumed`` carries the correct author on
         all clients (including collaborators who never saw the
         optimistic bubble).
+    :param origin: What sent the message when no human typed it, e.g. ``"loop"``
+        for a ``/loop`` run; ``None`` for typed input.
     :param interrupted: Whether the person interrupted the turn while this
         entry was queued. Preserved when the entry is restored so it remains
         hidden and settles quietly as an uncertain entry.
@@ -238,6 +240,7 @@ class DrainedInput:
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
+    origin: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
@@ -293,6 +296,8 @@ class _Entry:
         e.g. ``"alice@example.com"``. ``None`` when unknown. Persisted
         through to the committed item so ``session.input.consumed``
         carries the correct author on all clients.
+    :param origin: What sent the message when no human typed it, e.g. ``"loop"``
+        for a ``/loop`` run. Restored onto the committed item like ``created_by``.
     :param created_at: ``time.monotonic()`` timestamp at record time,
         used only for TTL eviction.
     :param held: ``True`` while a persist in progress has drained this entry
@@ -312,6 +317,7 @@ class _Entry:
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
+    origin: str | None = None
     stable_id: str | None = None
     background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
@@ -376,6 +382,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    origin: str | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -399,6 +406,8 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param origin: What sent the message when no human typed it, e.g. ``"loop"``
+        for a ``/loop`` run, kept so the committed item carries it.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -420,6 +429,7 @@ def record(
             pending_id=pending_id,
             content=copy.deepcopy(content),
             created_by=created_by,
+            origin=origin,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
         )
@@ -996,6 +1006,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "pending_id": entry.pending_id,
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
+                **({"origin": entry.origin} if entry.origin is not None else {}),
             }
             for entry in entries.values()
             if not entry.interrupted
@@ -1008,6 +1019,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         pending_id=entry.pending_id,
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
+        origin=entry.origin,
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,

@@ -416,7 +416,7 @@ describe.each([
   "session_claude_sdk_clear",
   "session_rewind",
   "session_timers",
-  "session_timer_list",
+  "session_loops",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

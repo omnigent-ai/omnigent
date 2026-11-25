@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import json
 import threading
 import time
@@ -38,7 +39,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import SharingMode
+from omnigent.server.auth import LEVEL_EDIT, SharingMode
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
@@ -8152,64 +8153,91 @@ async def test_turning_timers_off_stops_new_ones_but_still_cancels_existing_ones
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
-async def test_a_session_lists_the_callers_own_timers_with_their_origin(
+async def test_a_loop_replaces_the_callers_loop_and_stops_on_request(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     session_id = _owned_session(db_uri)
-    other_session = _owned_session(db_uri)
     _make_user(db_uri, "bob@example.com")
+    SqlAlchemyPermissionStore(db_uri).grant("bob@example.com", session_id, LEVEL_EDIT)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
 
-    async def saved(body: dict[str, object]) -> str:
+    async def saved(body: dict[str, object], email: str = "alice@example.com") -> dict[str, Any]:
         resp = await auth_client.post(
-            f"/v1/sessions/{session_id}/timers", json=body, headers=_headers()
+            f"/v1/sessions/{session_id}/timers", json=body, headers=_headers(email)
         )
         assert resp.status_code == 201, resp.text
-        return resp.json()["timer_id"]
+        return resp.json()
 
-    # A tagged repeating timer (the composer's /loop) beside an agent's own timers.
-    loop_id = await saved({"seconds": 300, "repeat": True, "note": "check CI", "origin": "loop"})
-    agent_repeating = await saved({"seconds": 600, "repeat": True})
-    agent_once = await saved({"seconds": 300})
-    store = SqlAlchemyScheduledTaskStore(db_uri)
-    # The name carries the origin. A loop's firing sends the prompt itself, shown in
-    # the transcript; an agent's timer sends its hidden wake.
-    assert (store.get(loop_id).name, store.get(agent_repeating).name) == (
-        "Loop: check CI",
-        "Timer",
-    )
-    assert (store.get(loop_id).prompt, store.get(agent_repeating).prompt) == (
+    async def stop(email: str = "alice@example.com", **params: str) -> httpx.Response:
+        return await auth_client.delete(
+            f"/v1/sessions/{session_id}/timers", params=params, headers=_headers(email)
+        )
+
+    # The composer's loop beside an agent's own timer: the name carries the origin, and a
+    # loop's prompt is what its firing sends visibly, where an agent's timer sends a hidden wake.
+    first = await saved({"seconds": 300, "repeat": True, "note": "check CI", "origin": "loop"})
+    agent_timer = await saved({"seconds": 600, "repeat": True})
+    assert first["replaced_timer_id"] is None
+    assert "replaced_timer_id" not in agent_timer
+    loop_task, agent_task = store.get(first["timer_id"]), store.get(agent_timer["timer_id"])
+    assert (loop_task.name, agent_task.name) == ("Loop: check CI", "Timer")
+    assert (loop_task.prompt, agent_task.prompt) == (
         "check CI",
-        f"[System: timer {agent_repeating} fired]",
+        f"[System: timer {agent_timer['timer_id']} fired]",
     )
-
-    listed = await auth_client.get(f"/v1/sessions/{session_id}/timers", headers=_headers())
-    assert listed.status_code == 200, listed.text
-    timers = {t["timer_id"]: t for t in listed.json()["timers"]}
-    # Three timers saved within the same second, so no order is assumed.
-    assert {
-        (t["timer_id"], t["origin"], t["repeat"], t["interval_seconds"]) for t in timers.values()
-    } == {
-        (loop_id, "loop", True, 300),
-        (agent_repeating, "agent", True, 600),
-        (agent_once, "agent", False, 300),
+    # One loop per user per session: a new loop replaces the caller's, which the
+    # session remembers for them, and a collaborator's loop is their own.
+    second = await saved({"seconds": 120, "repeat": True, "note": "again", "origin": "loop"})
+    assert second["replaced_timer_id"] == first["timer_id"]
+    # The store hides a deleted task.
+    assert store.get(first["timer_id"]) is None
+    assert store.get(second["timer_id"]).state == "active"
+    label = "omnigent.loop_timer." + hashlib.sha256(b"alice@example.com").hexdigest()[:16]
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None and conv.labels[label] == second["timer_id"]
+    bobs = await saved(
+        {"seconds": 300, "repeat": True, "note": "mine", "origin": "loop"}, "bob@example.com"
+    )
+    assert bobs["replaced_timer_id"] is None
+    assert store.get(second["timer_id"]).state == "active"
+    # Stopping takes only the loop and only the caller's; the agent's timer stays. Any
+    # other origin is refused, and repeating is safe.
+    assert (await stop(origin="cron")).status_code == 400
+    assert (await stop()).status_code == 400
+    stopped = await stop(origin="loop")
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json() == {"timer_id": second["timer_id"], "status": "cancelled"}
+    assert (await stop(origin="loop")).json() == {"timer_id": None, "status": "none"}
+    assert {task.id for task in store.list(kinds=("timer",))} == {
+        agent_timer["timer_id"],
+        bobs["timer_id"],
     }
-    assert timers[loop_id]["name"] == "Loop: check CI"
-    assert timers[loop_id]["next_run_at"] is not None
-    # Only the caller's timers in this session: another session lists none, and
-    # another user is refused as for every timer call.
-    empty = await auth_client.get(f"/v1/sessions/{other_session}/timers", headers=_headers())
-    assert empty.json() == {"timers": []}
-    outsider = await auth_client.get(
-        f"/v1/sessions/{session_id}/timers", headers=_headers("bob@example.com")
+    # A user without access to the session is refused as for every timer call.
+    _make_user(db_uri, "carol@example.com")
+    assert (await stop("carol@example.com", origin="loop")).status_code == 404
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_loops_armed_at_once_in_one_session_leave_one_running(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Two tabs arming together end with one loop: whichever saved second replaced the first."""
+    session_id = _owned_session(db_uri)
+    responses = await asyncio.gather(
+        *(
+            auth_client.post(
+                f"/v1/sessions/{session_id}/timers",
+                json={"seconds": 300, "repeat": True, "note": note, "origin": "loop"},
+                headers=_headers(),
+            )
+            for note in ("a", "b")
+        )
     )
-    assert outsider.status_code == 404, outsider.text
-    # Cancelling the tagged one leaves the agent's untouched.
-    cancelled = await auth_client.delete(
-        f"/v1/sessions/{session_id}/timers/{loop_id}", headers=_headers()
-    )
-    assert cancelled.status_code == 200, cancelled.text
-    after = await auth_client.get(f"/v1/sessions/{session_id}/timers", headers=_headers())
-    assert {t["timer_id"] for t in after.json()["timers"]} == {agent_repeating, agent_once}
+    assert [resp.status_code for resp in responses] == [201, 201]
+    ids = {resp.json()["timer_id"] for resp in responses}
+    running = {task.id for task in SqlAlchemyScheduledTaskStore(db_uri).list(kinds=("timer",))}
+    assert len(running) == 1 and running < ids
+    assert {resp.json()["replaced_timer_id"] for resp in responses} == {None, *(ids - running)}
 
 
 async def test_the_automations_gate_does_not_hide_timers(
@@ -8225,9 +8253,16 @@ async def test_the_automations_gate_does_not_hide_timers(
             f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
         )
         assert created.status_code == 201, created.text
-        listed = await client.get(f"/v1/sessions/{session_id}/timers", headers=_headers())
-        assert listed.status_code == 200, listed.text
-        assert [t["timer_id"] for t in listed.json()["timers"]] == [created.json()["timer_id"]]
+        looped = await client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 300, "repeat": True, "note": "check CI", "origin": "loop"},
+            headers=_headers(),
+        )
+        assert looped.status_code == 201, looped.text
+        stopped = await client.delete(
+            f"/v1/sessions/{session_id}/timers", params={"origin": "loop"}, headers=_headers()
+        )
+        assert stopped.json() == {"timer_id": looped.json()["timer_id"], "status": "cancelled"}
         cancelled = await client.delete(
             f"/v1/sessions/{session_id}/timers/{created.json()['timer_id']}", headers=_headers()
         )

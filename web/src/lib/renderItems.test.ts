@@ -3924,6 +3924,24 @@ describe("bubblesEqual — React.memo comparator", () => {
     expect(bubblesEqual(none, alice)).toBe(false);
     expect(bubblesEqual(alice, alice)).toBe(true);
   });
+
+  it("carries a user block's origin onto its bubble and compares it", () => {
+    // A /loop run's label is drawn from the bubble, so the origin must reach it
+    // and a change in it alone must repaint.
+    const content: MessageContentBlock[] = [{ type: "input_text", text: "check CI" }];
+    const block = (origin?: string): AnyBlock => ({
+      type: "user_message",
+      ctx: ctx({ itemId: "u1", responseId: "u1" }),
+      content,
+      ...(origin !== undefined ? { origin } : {}),
+    });
+    const [loop] = buildBubbles([block("loop")], null);
+    const [typed] = buildBubbles([block()], null);
+    expect(loop).toMatchObject({ kind: "user", origin: "loop" });
+    expect(typed).not.toHaveProperty("origin");
+    expect(bubblesEqual(loop!, typed!)).toBe(false);
+    expect(bubblesEqual(loop!, buildBubbles([block("loop")], null)[0]!)).toBe(true);
+  });
 });
 
 describe("buildBubbles — incremental reuse cache", () => {
