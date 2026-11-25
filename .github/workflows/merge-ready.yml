@@ -166,6 +166,7 @@ jobs:
     permissions:
       contents: write       # merge PRs with durable automerge intent
       pull-requests: write  # enable auto-merge
+      issues: write         # close linked issues
       checks: read
       actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
       statuses: write
