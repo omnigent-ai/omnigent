@@ -83,6 +83,8 @@ class FakeGitHub:
         # A failed send: (exit code, stdout, stderr) for the next write to that endpoint kind.
         self.graphql_failure: tuple[int, str, str] | None = None
         self.rest_failure: tuple[int, str, str] | None = None
+        # Mutations GitHub runs but answers with errors in a field they selected.
+        self.errors_with_payload: set[str] = set()
         monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: TOKEN)
         monkeypatch.setattr(github, "_host_args", lambda _root, ref: ["--hostname", ref.host])
         monkeypatch.setattr(github, "_gh", self._gh)
@@ -232,6 +234,9 @@ class FakeGitHub:
             if is_write and self.graphql_failure is not None:
                 return self.graphql_failure
             body = self._graphql(fields["query"], fields["variables"])
+            if is_write and any(name in fields["query"] for name in self.errors_with_payload):
+                body["errors"] = [{"message": "Field 'reactionGroups' failed", "path": ["x"]}]
+                return 1, json.dumps(body), "gh: Field 'reactionGroups' failed"
             return 0, json.dumps(body), ""
         if self.rest_failure is not None:
             return self.rest_failure
@@ -637,6 +642,38 @@ def test_graphql_errors_in_an_answer_that_parsed_are_a_refusal(fake: FakeGitHub)
     with pytest.raises(ValueError) as refused:
         _resolve()
     assert not isinstance(refused.value, UnknownOutcomeError)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["resolveReviewThread", "addReaction", "addPullRequestReview"]
+)
+def test_errors_beside_a_mutations_result_are_an_unknown_outcome_not_a_refusal(
+    fake: FakeGitHub, mutation: str
+) -> None:
+    """GitHub made the change; a failed nested field mustn't make a client repeat it."""
+    fake.errors_with_payload.add(mutation)
+    with pytest.raises(UnknownOutcomeError):
+        if mutation == "resolveReviewThread":
+            _resolve()
+        elif mutation == "addReaction":
+            pr_actions.add_reaction(
+                "/workspace",
+                session_id=SESSION,
+                pr_url=PR_URL,
+                kind="issue",
+                comment_id=5,
+                content="THUMBS_UP",
+            )
+        else:
+            pr_actions.submit_review_verdict(
+                "/workspace",
+                session_id=SESSION,
+                pr_url=PR_URL,
+                event="APPROVE",
+                body="Ship it",
+                commit_oid=HEAD,
+            )
+    assert len(fake.mutations(mutation)) == 1
 
 
 def test_a_graphql_timeout_error_is_an_unknown_outcome(fake: FakeGitHub) -> None:

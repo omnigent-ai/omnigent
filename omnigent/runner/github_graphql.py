@@ -70,10 +70,11 @@ def mutate(
 ) -> dict[str, Any]:
     """Run one GraphQL mutation and return its named payload.
 
-    A clean answer with the payload is success. GraphQL errors in an answer that parsed,
-    or a definite HTTP refusal, are a refusal, or a moved head when ``expected_head_oid``
-    no longer heads the pull request. Anything else, such as a timeout, a 5xx, a reset
-    connection or an unreadable answer, is an unknown outcome: the write is never retried.
+    A clean answer with the payload is success. GraphQL errors in an answer that parsed and
+    has no payload, or a definite HTTP refusal, are a refusal, or a moved head when
+    ``expected_head_oid`` no longer heads the pull request. Errors beside a payload, a
+    timeout, a 5xx, a reset connection or an unreadable answer are an unknown outcome: the
+    write is never retried.
     """
     host = github._host_args(root, reference)
     token = github._pr_token(root, reference)
@@ -97,14 +98,17 @@ def mutate(
         response = json.loads(output)
     except ValueError:
         response = None
+    payload = (
+        (response.get("data") or {}).get(payload_name) if isinstance(response, dict) else None
+    )
     if isinstance(response, dict) and response.get("errors"):
+        if payload is not None:
+            # The mutation ran; an error in a field it selected leaves its answer unreliable.
+            raise github_failures.unknown_outcome()
         refused = github_failures.graphql_refusal(
             response["errors"], host=reference.host, action=action
         )
         raise refusal_or_moved_head(root, reference, expected_head_oid, refused)
-    payload = (
-        (response.get("data") or {}).get(payload_name) if isinstance(response, dict) else None
-    )
     if rc == 0 and isinstance(payload, dict):
         return payload
     if rc != 0 and err:
