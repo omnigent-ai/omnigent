@@ -241,6 +241,18 @@ describe("a new view whose first page hasn't loaded", () => {
     expect(incoherent).toEqual([]);
   });
 
+  it("reopens its saved page when closed before that page loads", async () => {
+    const { store, shell } = setup({ views: { [W_VIEW]: { exists: true, url: "" } } });
+    await tick();
+    await store.close("W");
+    store.reopenClosed();
+    await tick();
+    expect(shell.openOrNavigateCalls.at(-1)).toEqual({
+      viewKey: browserViewId(SESSION, "v1"),
+      url: A,
+    });
+  });
+
   it("never stores an empty URL: an event with one is the canonical blank page", async () => {
     const { store, shell } = setup(liveOn(A));
     await tick();

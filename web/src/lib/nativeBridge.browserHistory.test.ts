@@ -34,6 +34,19 @@ describe("probing a view", () => {
     await expect(probeBrowserView("conv_1")).resolves.toEqual({ exists: false });
   });
 
+  it.each(["about:blank", ""])(
+    "reads a view still loading its first page (%j) as having committed nothing",
+    async (url) => {
+      setBridge(bridgeWith({ exists: true, url, pendingUrl: "https://x.test/first" }));
+      await expect(probeBrowserView("conv_1")).resolves.toEqual({ exists: true, url: "" });
+    },
+  );
+
+  it("keeps a blank page that isn't loading anything, as an older shell reports it", async () => {
+    setBridge(bridgeWith({ exists: true, url: "about:blank" }));
+    await expect(probeBrowserView("conv_1")).resolves.toEqual({ exists: true, url: "about:blank" });
+  });
+
   it("can't say for a live view without a URL", async () => {
     setBridge(bridgeWith({ exists: true }));
     await expect(probeBrowserView("conv_1")).resolves.toBeNull();

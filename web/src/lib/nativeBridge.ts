@@ -311,7 +311,9 @@ interface ElectronDesktopApi extends NativeShellApi {
    */
   browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
   /** Whether a view exists and what it shows. */
-  browserHasView?: (conversationId: string) => Promise<{ exists: boolean; url?: string } | null>;
+  browserHasView?: (
+    conversationId: string,
+  ) => Promise<{ exists: boolean; url?: string; pendingUrl?: string } | null>;
   /** A view's page URL changed: every shell with the embedded browser sends it. */
   onBrowserUrlChanged?: (
     callback: (payload: { conversationId: string; url: string }) => void,
@@ -974,7 +976,9 @@ export async function probeBrowserView(viewId: string): Promise<BrowserViewProbe
     if (!view) return null;
     if (!view.exists) return { exists: false };
     if (typeof view.url !== "string") return null;
-    return { exists: true, url: view.url };
+    // Loading its first page, a view reports a blank URL beside the pending one: none committed.
+    const firstLoad = Boolean(view.pendingUrl) && (view.url === "" || view.url === "about:blank");
+    return { exists: true, url: firstLoad ? "" : view.url };
   } catch (err) {
     console.warn("[nativeBridge] browser view probe failed:", err);
     return null;
