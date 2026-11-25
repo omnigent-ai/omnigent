@@ -276,7 +276,7 @@ function OpenGoToFileDialog({
         text ? () => ({ afterClose: () => openInSearch(input, textSearchRun.result) }) : undefined
       }
       alternateLabel={text ? "Open in Search" : undefined}
-      // Beside the list on a desktop window; a phone has no room for it.
+      // Beside the list in a wide window; a narrow one has no room for it.
       renderPreview={
         isMobile
           ? undefined

@@ -3377,10 +3377,10 @@ function AppShellImpl() {
           />
         </Suspense>
       )}
-      {/* The finder serves a desktop window with the tabs sidebar: Go to File and Search Text
-        for its session, Sessions on any page. Its code, with the preview's editor, loads only
+      {/* The finder serves every window with the tabs sidebar, at any width: Go to File and Search
+        Text for its session, Sessions on any page. Its code, with the preview's editor, loads only
         then. */}
-      {tabsSidebar && !mobileViewport && (
+      {tabsSidebar && (
         <Suspense fallback={null}>
           <LazyGoToFileHost
             key={serverConversationId ?? "no-session"}

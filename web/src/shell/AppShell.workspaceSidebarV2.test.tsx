@@ -640,6 +640,16 @@ describe("workspace_sidebar_v2", () => {
     expect(tabs.host!.onHide).toBeUndefined();
     fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
     expect(drawer).toHaveAttribute("data-state", "closed");
+
+    // Go to File serves the drawer's tabs too, and a resize keeps an open finder mounted.
+    const finder = screen.getByTestId("go-to-file-host");
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws" });
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
+    resizeTo(NARROW_DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "drawer" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
   });
 
   it("opens the Workspace drawer on a page from the session's menu in a narrow window", async () => {
