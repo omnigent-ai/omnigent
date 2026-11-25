@@ -116,6 +116,8 @@ export class MarkdownDiffStore {
     const controller = new AbortController();
     entry.controller = controller;
     if (entry.fileDiff.isPartial && !this.loadFullText) {
+      // This patch's text isn't the earlier version's, so full text coming back prepares again.
+      entry.text = undefined;
       this.settle(entry, { status: "unavailable", message: NO_FULL_TEXT_MESSAGE });
       return;
     }

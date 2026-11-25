@@ -319,6 +319,8 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
     rail.get_by_role("button", name=re.compile(r"sentinel\.txt")).first.click()
     expect(rail.get_by_role("searchbox", name="Search all files")).to_have_count(0, timeout=30_000)
     rail.get_by_role("button", name="Close sentinel.txt", exact=True).click()
+    # Closing the last open tab hides the rail; reopen it on the Files panel.
+    open_right_rail(page)
     expect(path_button).to_contain_text(outside.name, timeout=30_000)
     expect(rail.get_by_role("button", name=re.compile(r"sentinel\.txt")).first).to_be_visible(
         timeout=30_000

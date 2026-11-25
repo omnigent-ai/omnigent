@@ -23,7 +23,6 @@ import type {
   FileDiffContentsLoader,
   FileDiffMetadata,
   SelectedLineRange,
-  SupportedLanguages,
   CodeViewScrollListener,
 } from "@pierre/diffs";
 import {
@@ -108,7 +107,6 @@ import {
   ownedFileCount,
   pathFromReviewItemId,
   reviewItemId,
-  syntaxLanguage,
   treeOrderedFiles,
   visibleReviewFiles,
   type DiffFilterAction,
@@ -203,6 +201,12 @@ import {
   type ReviewTextEvent,
   type ReviewTextHighlight,
 } from "./useReviewTextLayer";
+
+/**
+ * A review's own pool starts with plain text and loads each file's language as it highlights it,
+ * as the shared pool does, so the review doesn't wait for every language before it shows.
+ */
+const OWN_POOL_HIGHLIGHTER = { langs: ["text" as const], theme: DIFF_SYNTAX_THEME };
 
 /** How long to wait for a file to render before revealing a line in it anyway. */
 const REVEAL_RENDER_BUDGET_MS = 3000;
@@ -1709,17 +1713,8 @@ export function DiffReview<A = undefined>({
     [reviewScope, findNames.all, findNames.current, startFindRequest],
   );
 
-  const languages = useMemo(() => {
-    const set = new Set<SupportedLanguages>(["text"]);
-    for (const file of files) set.add(syntaxLanguage(file.path));
-    return [...set];
-  }, [files]);
   // The shared pool once it's started; before that, or after it fails, its own as before.
   const workers = useDiffWorkers();
-  const highlighterOptions = useMemo(
-    () => ({ langs: languages, theme: DIFF_SYNTAX_THEME }),
-    [languages],
-  );
   const poolOptions = useMemo(
     () => ({
       poolSize: Math.max(2, Math.min(4, navigator.hardwareConcurrency || 2)),
@@ -2441,7 +2436,7 @@ export function DiffReview<A = undefined>({
       workers.kind === "own" ? (
         <WorkerPoolContextProvider
           poolOptions={poolOptions}
-          highlighterOptions={highlighterOptions}
+          highlighterOptions={OWN_POOL_HIGHLIGHTER}
         >
           {codeView}
         </WorkerPoolContextProvider>

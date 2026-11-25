@@ -11,8 +11,9 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from types import MappingProxyType
 
 _logger = logging.getLogger(__name__)
 
@@ -63,6 +64,16 @@ class Feature(StrEnum):
     FLOATING_COMPOSER = "floating_composer"
     WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
     SIDEBAR_SAVED_VIEWS = "sidebar_saved_views"
+    FLOATING_PANES = "floating_panes"
+    SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
+
+
+class FeatureIntent(StrEnum):
+    """What a deployment asked for one feature in ``OMNIGENT_FEATURES``."""
+
+    AUTOMATIC = "automatic"
+    ON = "on"
+    OFF = "off"
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,8 @@ class FeatureDefinition:
     review_by_release: str
     frontend_visible: bool = True
     default_enabled: bool = False
+    # On Automatic the feature takes this feature's resolved value instead of its own default.
+    follows: Feature | None = None
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
@@ -361,6 +374,19 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="web",
         review_by_release="0.28.0",
     ),
+    FeatureDefinition(
+        feature=Feature.FLOATING_PANES,
+        description="Float the session's panes as rounded cards on the sidebar's color",
+        owner="web",
+        review_by_release="0.27.0",
+        follows=Feature.WORKSPACE_SIDEBAR_V2,
+    ),
+    FeatureDefinition(
+        feature=Feature.SHARED_SESSION_UPDATES_SOCKET,
+        description="Share one session-updates WebSocket between a browser's tabs",
+        owner="web",
+        review_by_release="0.28.0",
+    ),
 )
 
 
@@ -369,10 +395,18 @@ class FeatureFlags:
     """Immutable feature values for one server or runner process."""
 
     enabled_features: frozenset[Feature] = frozenset()
+    # What the deployment asked for; a feature it didn't name is on Automatic.
+    intents: Mapping[Feature, FeatureIntent] = field(
+        default_factory=lambda: MappingProxyType({}), hash=False
+    )
 
     def enabled(self, feature: Feature) -> bool:
         """Return whether *feature* is enabled in this snapshot."""
         return feature in self.enabled_features
+
+    def intent(self, feature: Feature) -> FeatureIntent:
+        """Return what the deployment asked for *feature*, apart from its resolved value."""
+        return self.intents.get(feature, FeatureIntent.AUTOMATIC)
 
     def frontend_dict(self) -> dict[str, bool]:
         """Return every frontend-visible feature and its resolved value."""
@@ -436,8 +470,9 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
 
     Comma-separated names enable features; ``-name`` disables them, for example
     ``usage_page,-claude_osc_status``. Unset or empty uses feature defaults.
-    Explicit disables win regardless of order. Retired names are ignored with
-    a warning; other unknown names fail startup.
+    Explicit disables win regardless of order. A feature that isn't named and
+    ``follows`` another takes that feature's value. Retired names are ignored
+    with a warning; other unknown names fail startup.
 
     :param environ: Environment mapping; defaults to :data:`os.environ`.
     :returns: Resolved immutable feature values.
@@ -454,22 +489,22 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
     raw = source.get(FEATURES_ENV_VAR, "")
     names = [name.strip() for name in raw.split(",") if name.strip()]
 
-    enabled = {
-        definition.feature for definition in FEATURE_DEFINITIONS if definition.default_enabled
-    }
-    disabled: set[Feature] = set()
+    intents: dict[Feature, FeatureIntent] = {}
     unknown: list[str] = []
     for name in names:
         if name.removeprefix("-") in _RETIRED_FEATURES:
             _logger.warning("%s: %s has been retired; ignoring it", FEATURES_ENV_VAR, name)
             continue
         try:
-            if name.startswith("-"):
-                disabled.add(Feature(name[1:]))
-            else:
-                enabled.add(Feature(name))
+            feature = Feature(name.removeprefix("-"))
         except ValueError:
             unknown.append(name)
+            continue
+        # An explicit disable wins regardless of order.
+        if name.startswith("-"):
+            intents[feature] = FeatureIntent.OFF
+        elif intents.get(feature) is not FeatureIntent.OFF:
+            intents[feature] = FeatureIntent.ON
 
     if unknown:
         known = ", ".join(feature.value for feature in Feature)
@@ -478,4 +513,41 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
             f"unknown feature(s) in {FEATURES_ENV_VAR}: {invalid}; known features: {known}"
         )
 
-    return FeatureFlags(frozenset(enabled - disabled))
+    return FeatureFlags(
+        resolve_effective_features(FEATURE_DEFINITIONS, intents), MappingProxyType(intents)
+    )
+
+
+def resolve_effective_features(
+    definitions: tuple[FeatureDefinition, ...], intents: Mapping[Feature, FeatureIntent]
+) -> frozenset[Feature]:
+    """Return the enabled features: an explicit intent, else the feature's automatic policy.
+
+    A feature on Automatic takes the resolved value of the feature it ``follows``, else its
+    ``default_enabled``.
+
+    :raises ValueError: If a feature on Automatic follows one without a definition, or its follows
+        form a cycle. A feature with an explicit intent doesn't read what it follows.
+    """
+    by_feature = {definition.feature: definition for definition in definitions}
+    resolved: dict[Feature, bool] = {}
+
+    def effective(feature: Feature, chain: tuple[Feature, ...]) -> bool:
+        if feature in resolved:
+            return resolved[feature]
+        if feature in chain:
+            raise ValueError(f"feature {feature.value} follows itself through {chain}")
+        definition = by_feature.get(feature)
+        if definition is None:
+            raise ValueError(f"{chain[-1].value} follows {feature.value}, which has no definition")
+        intent = intents.get(feature, FeatureIntent.AUTOMATIC)
+        if intent is not FeatureIntent.AUTOMATIC:
+            value = intent is FeatureIntent.ON
+        elif definition.follows is not None:
+            value = effective(definition.follows, (*chain, feature))
+        else:
+            value = definition.default_enabled
+        resolved[feature] = value
+        return value
+
+    return frozenset(feature for feature in by_feature if effective(feature, ()))

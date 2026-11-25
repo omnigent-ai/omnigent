@@ -214,6 +214,27 @@ async def test_the_hosts_git_environment_cannot_redirect_the_repository(
     assert listed == b"a.txt\0"
 
 
+async def test_only_check_ignore_runs_without_literal_pathspecs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check-ignore refuses literal pathspecs; every other command keeps them."""
+    root = _fake_git(
+        tmp_path,
+        monkeypatch,
+        'printf "%s %s" "${GIT_LITERAL_PATHSPECS:-unset}" "${GIT_DIR:-unset}"\n',
+    )
+    monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "decoy"))
+    repository = await _discover(root)
+
+    checked = await repository.run(["check-ignore", "-z", "--stdin"], deadline=Deadline(10))
+    listed = await repository.run(["ls-files", "-z"], deadline=Deadline(10))
+
+    # The host's own GIT_* variables stay dropped either way.
+    assert checked == b"unset unset"
+    assert listed == b"1 unset"
+
+
 async def test_configured_helpers_hooks_and_filters_never_run(tmp_path: Path) -> None:
     """fsmonitor, hooks, filter drivers, per-driver and external diff, and textconv are all off."""
     root = _repository(tmp_path / "repo")

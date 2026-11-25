@@ -4,10 +4,10 @@ import {
   PULL_REQUEST_REF,
   PULL_REQUEST_REF_HREF_PREFIX,
   gitHubPullRequestUrl,
+  linkedPullRequestUrl,
   parsePullRequestRefHref,
   pullRequestRefUrl,
   remarkPullRequestRefs,
-  sessionPullRequestRepo,
   splitPullRequestRefs,
 } from "./pullRequestRefs";
 
@@ -90,12 +90,16 @@ describe("splitPullRequestRefs", () => {
     ["#1234,#5678", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`, `${PULL_REQUEST_REF_HREF_PREFIX}5678`]],
     ["#4242, then", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
     ["#4242.\nNext", [`${PULL_REQUEST_REF_HREF_PREFIX}4242`]],
+    // Any bare number parks; it links only to a PR the session links.
+    [
+      "See #1 and #123.",
+      [`${PULL_REQUEST_REF_HREF_PREFIX}1`, `${PULL_REQUEST_REF_HREF_PREFIX}123`],
+    ],
   ])("links %j", (text, hrefs) => {
     expect(refHrefs(text)).toEqual(hrefs);
   });
 
   it.each([
-    "#123",
     "#0123",
     "#fff",
     "#123abc",
@@ -318,10 +322,14 @@ describe("parsePullRequestRefHref", () => {
       repo: "acme/app",
       number: "12",
     });
+    expect(parsePullRequestRefHref(`${PULL_REQUEST_REF_HREF_PREFIX}12`)).toEqual({
+      repo: null,
+      number: "12",
+    });
     for (const href of [
       undefined,
       "#omnigent-file",
-      `${PULL_REQUEST_REF_HREF_PREFIX}12`,
+      `${PULL_REQUEST_REF_HREF_PREFIX}012`,
       `${PULL_REQUEST_REF_HREF_PREFIX}a/b/c/12`,
       `${PULL_REQUEST_REF_HREF_PREFIX}a/../12`,
       "https://github.com/acme/app/pull/12",
@@ -344,84 +352,131 @@ describe("gitHubPullRequestUrl", () => {
   });
 });
 
-describe("sessionPullRequestRepo", () => {
-  it("resolves bare references against the workspace's repo, not the tracked PR's", () => {
-    const tracked = info({
-      repo: { name_with_owner: "owner/other", host: "github.com" },
-      selected_pr_url: "https://github.com/owner/other/pull/3",
-      workspace_repo: { name_with_owner: "owner/app", host: "github.com" },
+/** A PR the session links, as its PR info lists it. */
+function linked(url: string, relationship: "created" | "attached" | "inferred" = "attached") {
+  const [, repository, number] = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:[/?#]|$)/)!;
+  return { url, host: "github.com", repository, number: Number(number), relationship };
+}
+
+describe("linkedPullRequestUrl", () => {
+  it("links a bare number to the session's linked PR with it, in whichever repo", () => {
+    const session = info({
+      prs: [
+        linked("https://github.com/acme/app/pull/4242"),
+        linked("https://github.com/other/lib/pull/14971", "created"),
+      ],
     });
-    expect(sessionPullRequestRepo(tracked, null)).toBe("owner/app");
-    expect(pullRequestRefUrl({ repo: null, number: "1234" }, tracked)).toBe(
-      "https://github.com/owner/app/pull/1234",
+    expect(pullRequestRefUrl({ repo: null, number: "4242" }, session)).toBe(
+      "https://github.com/acme/app/pull/4242",
+    );
+    // Not the workspace's repo: the link names where the PR actually is.
+    expect(pullRequestRefUrl({ repo: null, number: "14971" }, session)).toBe(
+      "https://github.com/other/lib/pull/14971",
     );
   });
 
-  it("links nothing in an Enterprise workspace, even one tracking a github.com PR", () => {
-    const tracked = info({
-      provider: "github",
-      repo: { name_with_owner: "owner/other", host: "github.com" },
-      pr: { url: "https://github.com/owner/other/pull/3" } as PullRequestInfo["pr"],
-      selected_pr_url: "https://github.com/owner/other/pull/3",
-      workspace_repo: { name_with_owner: "owner/ws", host: "ghe.example.com" },
+  it("leaves a bare number the session doesn't link as text, whatever the workspace's repo", () => {
+    const session = info({ prs: [linked("https://github.com/acme/app/pull/4242")] });
+    expect(pullRequestRefUrl({ repo: null, number: "4243" }, session)).toBeNull();
+    expect(pullRequestRefUrl({ repo: null, number: "4242" }, info())).toBeNull();
+    expect(pullRequestRefUrl({ repo: null, number: "4242" }, undefined)).toBeNull();
+  });
+
+  it("leaves a number two linked repos share as text, since either could be meant", () => {
+    const session = info({
+      prs: [
+        linked("https://github.com/acme/app/pull/12"),
+        linked("https://github.com/other/lib/pull/12"),
+      ],
     });
-    expect(sessionPullRequestRepo(tracked, "org/main")).toBeNull();
-    expect(pullRequestRefUrl({ repo: null, number: "1234" }, tracked)).toBeNull();
-    expect(pullRequestRefUrl({ repo: "octocat/hello-world", number: "5" }, tracked)).toBeNull();
-  });
-
-  it("leaves text when the workspace's repo isn't reported, as from an older server", () => {
-    const older = info({ workspace_repo: undefined });
-    expect(sessionPullRequestRepo(older, "org/main")).toBeNull();
-    expect(pullRequestRefUrl({ repo: null, number: "4242" }, older)).toBeNull();
-    expect(pullRequestRefUrl({ repo: "o/r", number: "1" }, older)).toBeNull();
-    const hostless = info({ workspace_repo: { name_with_owner: "corp/app" } });
-    expect(sessionPullRequestRepo(hostless, "org/main")).toBeNull();
-    expect(sessionPullRequestRepo(undefined, "org/main")).toBeNull();
-  });
-
-  it("ignores signed-in accounts, which don't name the remote's host", () => {
-    const signedIn = info({
-      workspace_repo: { name_with_owner: "corp/app" },
-      auth: {
-        authenticated: true,
-        hint: null,
-        cli: null,
-        accounts: [{ login: "me", active: true, state: "success", host: "github.com" }],
-        selected_account: "me",
-      },
+    expect(linkedPullRequestUrl(session, "12")).toBeNull();
+    // The same PR listed twice, in another letter case, is still one PR.
+    const twice = info({
+      prs: [
+        linked("https://github.com/Acme/App/pull/12"),
+        linked("https://github.com/acme/app/pull/12", "inferred"),
+      ],
     });
-    expect(sessionPullRequestRepo(signedIn, "org/main")).toBeNull();
+    expect(linkedPullRequestUrl(twice, "12")).toBe("https://github.com/Acme/App/pull/12");
   });
 
-  it("falls back only when the workspace's repo is unnamed", () => {
-    const unnamed = { name_with_owner: null, host: "github.com" };
-    expect(sessionPullRequestRepo(info({ workspace_repo: unnamed }), "org/main")).toBe("org/main");
-    expect(sessionPullRequestRepo(info({ workspace_repo: unnamed }), null)).toBeNull();
-    expect(
-      sessionPullRequestRepo(
-        info({ workspace_repo: { name_with_owner: "a/b?x", host: "github.com" } }),
-        "org/main",
-      ),
-    ).toBeNull();
+  it("counts one PR however its stored link ends: a trailing slash, a query or a fragment", () => {
+    const session = info({
+      prs: [
+        linked("https://github.com/acme/app/pull/12"),
+        linked("https://github.com/acme/app/pull/12/", "inferred"),
+        linked("https://github.com/acme/app/pull/12?tab=files", "attached"),
+        linked("https://github.com/acme/app/pull/12#discussion_r1", "created"),
+      ],
+    });
+    expect(linkedPullRequestUrl(session, "12")).toBe("https://github.com/acme/app/pull/12");
   });
 
-  it("links nothing for a workspace on another forge", () => {
-    const gitlab = info({
+  it("links only providers whose #N names a pull request", () => {
+    const gitlab = {
+      url: "https://gitlab.example.com/acme/app/-/merge_requests/12",
+      host: "gitlab.example.com",
+      repository: "acme/app",
+      number: 12,
+      relationship: "attached" as const,
       provider: "gitlab",
-      workspace_repo: { name_with_owner: "acme/app", host: "gitlab.com" },
-    });
-    expect(sessionPullRequestRepo(gitlab, "org/main")).toBeNull();
-    expect(pullRequestRefUrl({ repo: "other/lib", number: "5" }, gitlab, null)).toBeNull();
+      provider_display: {
+        id: "gitlab",
+        display_name: "GitLab",
+        request_name: "merge request",
+        number_prefix: "!",
+      },
+    };
+    // On GitLab `#12` is an issue; the merge request is `!12`.
+    expect(linkedPullRequestUrl(info({ prs: [gitlab] }), "12")).toBeNull();
+    const azure = {
+      ...gitlab,
+      url: "https://dev.azure.example.com/acme/app/_git/app/pullrequest/12",
+      provider: "azure_devops",
+      provider_display: { ...gitlab.provider_display, id: "azure_devops" },
+    };
+    expect(linkedPullRequestUrl(info({ prs: [azure] }), "12")).toBeNull();
+    // A provider without its display copy can't say what `#N` means there.
+    const { provider_display: _display, ...bare } = gitlab;
+    expect(linkedPullRequestUrl(info({ prs: [bare] }), "12")).toBeNull();
+    const hashed = {
+      ...gitlab,
+      url: "https://code.example.com/acme/app/pulls/12",
+      provider: "forge",
+      provider_display: { ...gitlab.provider_display, id: "forge", number_prefix: "#" },
+    };
+    expect(linkedPullRequestUrl(info({ prs: [hashed] }), "12")).toBe(hashed.url);
+    // A GitHub PR with the same number beside a GitLab one is the only `#12`.
+    const github = linked("https://github.com/acme/app/pull/12");
+    expect(linkedPullRequestUrl(info({ prs: [gitlab, github] }), "12")).toBe(github.url);
+  });
+
+  it("links a linked PR on any code host by its stored URL, and nothing that isn't a web URL", () => {
+    const enterprise = {
+      url: "https://ghe.example.com/acme/app/pull/7",
+      host: "ghe.example.com",
+      repository: "acme/app",
+      number: 7,
+      relationship: "attached" as const,
+    };
+    expect(linkedPullRequestUrl(info({ prs: [enterprise] }), "7")).toBe(enterprise.url);
+    const scripted = { ...enterprise, url: "javascript:alert(1)" };
+    expect(linkedPullRequestUrl(info({ prs: [scripted] }), "7")).toBeNull();
+    expect(linkedPullRequestUrl(info({ prs: [enterprise] }), "07")).toBeNull();
   });
 });
 
 describe("pullRequestRefUrl", () => {
   it("links an explicit repo regardless of the workspace's, but only on github.com", () => {
     const ref = { repo: "other/lib", number: "5" };
-    expect(pullRequestRefUrl(ref, info(), null)).toBe("https://github.com/other/lib/pull/5");
-    expect(pullRequestRefUrl(ref, undefined, null)).toBeNull();
+    expect(pullRequestRefUrl(ref, info())).toBe("https://github.com/other/lib/pull/5");
+    expect(pullRequestRefUrl(ref, undefined)).toBeNull();
     const ghe = { name_with_owner: "acme/app", host: "ghe.example.com" };
-    expect(pullRequestRefUrl(ref, info({ workspace_repo: ghe }), null)).toBeNull();
+    expect(pullRequestRefUrl(ref, info({ workspace_repo: ghe }))).toBeNull();
+    const gitlab = info({
+      provider: "gitlab",
+      workspace_repo: { name_with_owner: "acme/app", host: "gitlab.com" },
+    });
+    expect(pullRequestRefUrl(ref, gitlab)).toBeNull();
   });
 });

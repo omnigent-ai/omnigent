@@ -22,9 +22,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { pickListInputProps, readlineListStep } from "@/lib/listNavigationKeys";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { type Chord, chordAriaShortcut, chordKeys, chordMatches } from "@/lib/shortcuts/chord";
 import { cn } from "@/lib/utils";
 
 import { readQuickPickHistory, recordQuickPickHistory } from "./history";
@@ -32,10 +34,12 @@ import { HighlightedText, type MatchHighlight } from "./HighlightedText";
 import type {
   QuickPickAcceptDetails,
   QuickPickAcceptResult,
+  QuickPickGroupAction,
   QuickPickInputError,
   QuickPickItem,
   QuickPickItemRow,
   QuickPickRow,
+  QuickPickRowAction,
   QuickPickSource,
   QuickPickStats,
 } from "./model";
@@ -50,6 +54,7 @@ import { useQuickPickSources } from "./useQuickPickSources";
 
 const NO_SEGMENTS: readonly QuickPickSegment<never>[] = [];
 const NO_SOURCES: readonly QuickPickSource<never>[] = [];
+const NO_GROUP_ACTIONS: readonly QuickPickGroupAction[] = [];
 
 export interface QuickPickProps<Value> {
   /** Accessible name for the query field and results, such as "Command palette". */
@@ -123,6 +128,10 @@ export interface QuickPickProps<Value> {
   listEnd?: ReactNode;
   /** Trailing content beside the query field, such as a close button. */
   inputEnd?: ReactNode;
+  /** Buttons in a group's heading, such as Close all, by the group's label. */
+  groupActions?: (group: string) => readonly QuickPickGroupAction[];
+  /** Each group's heading shows how many of its rows are listed. */
+  groupCounts?: boolean;
   autoFocus?: boolean;
   /**
    * A row the caller wants active, such as the last row before ones still loading.
@@ -257,6 +266,62 @@ function FooterAction({
   );
 }
 
+/** The `aria-keyshortcuts` of a row's buttons, space-separated as the attribute lists them. */
+function rowActionShortcuts(actions: readonly QuickPickRowAction[] | undefined) {
+  const shortcuts = (actions ?? []).flatMap((action) =>
+    action.chord ? [chordAriaShortcut(action.chord)] : [],
+  );
+  return shortcuts.length > 0 ? shortcuts.join(" ") : undefined;
+}
+
+/**
+ * Whether `chord` would edit the query instead, as ⌘⌫ or Ctrl+Backspace deletes text before the
+ * caret, so the field keeps it while there's something there to delete.
+ */
+function chordEditsField(chord: Chord, field: HTMLInputElement): boolean {
+  const key = chord.key?.toLowerCase();
+  if (key !== "backspace" && key !== "delete") return false;
+  const start = field.selectionStart ?? field.value.length;
+  const end = field.selectionEnd ?? start;
+  if (start !== end) return true;
+  return key === "backspace" ? start > 0 : start < field.value.length;
+}
+
+/** A button beside a row, for the pointer: it never takes focus, which stays in the query. */
+function RowActionButton({
+  action,
+  isMac,
+  onRun,
+}: {
+  action: QuickPickRowAction;
+  isMac: boolean;
+  onRun: () => void;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          tabIndex={-1}
+          aria-label={action.label}
+          data-slot="quick-pick-row-action"
+          data-action={action.id}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={onRun}
+          className="text-muted-foreground hover:text-foreground"
+        >
+          {action.icon}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent shortcut={action.chord ? chordKeys(action.chord, isMac) : undefined}>
+        {action.label}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 /**
  * Keyboard-first picker: a query field over fuzzy-ranked rows grouped under
  * headings. The caller owns the query and what accepting a row does.
@@ -317,6 +382,8 @@ export function QuickPick<Value>({
   status,
   listEnd,
   inputEnd,
+  groupActions,
+  groupCounts = false,
   autoFocus = true,
   activeId = null,
   onActiveIdChange,
@@ -385,11 +452,68 @@ export function QuickPick<Value>({
   );
   const isMac = useMemo(() => isMacPlatform(), []);
   const sections = useMemo(() => sectionsOf(rows), [rows]);
+  const headingCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const row of rows) {
+      if (row.kind === "item" && row.headingKey) {
+        counts.set(row.headingKey, (counts.get(row.headingKey) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [rows]);
+  const headingActions = useMemo(() => {
+    const byKey = new Map<string, readonly QuickPickGroupAction[]>();
+    if (!groupActions) return byKey;
+    for (const row of rows) {
+      if (row.kind !== "heading") continue;
+      const actions = groupActions(row.label);
+      if (actions.length > 0) byKey.set(row.key, actions);
+    }
+    return byKey;
+  }, [rows, groupActions]);
   // Card items show as cards only until the user types; results are plain rows in rank order.
   const cardsShown = query.trim().length === 0;
   const resultCount = rows.filter((row) => row.kind === "item").length;
   const showEmpty = !collapsed && resultCount === 0;
   const queryFieldRef = useRef<HTMLInputElement | null>(null);
+  const listboxRef = useRef<HTMLDivElement | null>(null);
+  // Where each mounted heading with buttons sits in the list, so its buttons, kept outside the
+  // listbox, line up with it, and how wide they are, which the heading leaves free for them;
+  // measured after every render, as rows come and go.
+  const [headingActionBars, setHeadingActionBars] = useState<
+    readonly { key: string; top: number; height: number; width: number }[]
+  >([]);
+  // The last measurement written: an unchanged one sets no state, since even a same-value
+  // update renders the list again, which would measure again after every commit.
+  const measuredBars = useRef("[]");
+  useLayoutEffect(() => {
+    const listbox = listboxRef.current;
+    const bars: { key: string; top: number; height: number; width: number }[] = [];
+    if (listbox && headingActions.size > 0) {
+      const origin = listbox.getBoundingClientRect();
+      const barWidths = new Map<string, number>();
+      for (const bar of listbox.parentElement?.querySelectorAll<HTMLElement>(
+        "[data-actions-for]",
+      ) ?? []) {
+        barWidths.set(bar.dataset.actionsFor!, bar.getBoundingClientRect().width);
+      }
+      for (const heading of listbox.querySelectorAll<HTMLElement>("[data-heading-key]")) {
+        const key = heading.dataset.headingKey!;
+        if (!headingActions.has(key)) continue;
+        const box = heading.getBoundingClientRect();
+        bars.push({
+          key,
+          top: box.top - origin.top,
+          height: box.height,
+          width: barWidths.get(key) ?? 0,
+        });
+      }
+    }
+    const measured = JSON.stringify(bars);
+    if (measured === measuredBars.current) return;
+    measuredBars.current = measured;
+    setHeadingActionBars(bars);
+  });
   const setQueryField = useCallback(
     (node: HTMLInputElement | null) => {
       queryFieldRef.current = node;
@@ -407,11 +531,28 @@ export function QuickPick<Value>({
   }>({ query, scope: selectionScope, id: null });
   const choiceCurrent = activeChoice.query === query && activeChoice.scope === selectionScope;
   if (!choiceCurrent) setActiveChoice({ query, scope: selectionScope, id: null });
-  const activeIndex = reconcileActiveIndex(
-    rows,
-    activeId ?? (choiceCurrent ? activeChoice.id : null),
+  // A row whose button may remove it, such as Close, hands the selection to its neighbour once
+  // it's gone, so the list doesn't jump back to its first row.
+  const [leavingRow, setLeavingRow] = useState<{ id: string; successorId: string | null } | null>(
+    null,
   );
+  const listedIds = useMemo(
+    () => new Set(rows.flatMap((row) => (row.kind === "item" ? [row.item.id] : []))),
+    [rows],
+  );
+  const wantedId = activeId ?? (choiceCurrent ? activeChoice.id : null);
+  const leftId =
+    leavingRow &&
+    wantedId === leavingRow.id &&
+    !listedIds.has(leavingRow.id) &&
+    leavingRow.successorId !== null &&
+    listedIds.has(leavingRow.successorId)
+      ? leavingRow.successorId
+      : null;
+  const activeIndex = reconcileActiveIndex(rows, leftId ?? wantedId);
   const pick = (id: string) => {
+    // A newer pick, by key or pointer, takes over from a row still closing.
+    setLeavingRow(null);
     setActiveChoice({ query, scope: selectionScope, id });
     onActiveIdChange?.(id);
   };
@@ -439,6 +580,34 @@ export function QuickPick<Value>({
     if (activeRow)
       document.getElementById(optionId(activeRow))?.scrollIntoView?.({ block: "nearest" });
   });
+
+  // Once the leaving row is gone, its neighbour becomes the pick, which a caller holding the
+  // active row hears too.
+  useEffect(() => {
+    if (!leavingRow || listedIds.has(leavingRow.id)) return;
+    setLeavingRow(null);
+    const { successorId } = leavingRow;
+    // Only while the closed row still held the selection: a newer query or scope chose anew.
+    if (wantedId !== leavingRow.id) return;
+    if (successorId === null || !listedIds.has(successorId)) return;
+    setActiveChoice({ query, scope: selectionScope, id: successorId });
+    onActiveIdChange?.(successorId);
+  }, [leavingRow, listedIds, wantedId, query, selectionScope, onActiveIdChange]);
+
+  /** Run one of `row`'s buttons; if it removes the active row, its neighbour takes over. */
+  const runRowAction = (row: QuickPickItemRow<Value>, action: QuickPickRowAction) => {
+    const index = rows.indexOf(row);
+    if (index !== -1 && index === activeIndex) {
+      const isItem = (candidate: QuickPickRow<Value> | undefined) => candidate?.kind === "item";
+      const after = rows.slice(index + 1).find(isItem);
+      const before = rows.slice(0, index).reverse().find(isItem);
+      const successor = (after ?? before) as QuickPickItemRow<Value> | undefined;
+      // A row highlighted only by default becomes the pick, so the handoff applies to it too.
+      if (wantedId !== row.item.id) pick(row.item.id);
+      setLeavingRow({ id: row.item.id, successorId: successor?.item.id ?? null });
+    }
+    action.run();
+  };
 
   const navigate = (navigation: QuickPickNavigation) => {
     const next = navigateQuickPick(rows, activeIndex, navigation, { loop });
@@ -507,6 +676,19 @@ export function QuickPick<Value>({
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
+    const rowAction = activeRow?.item.disabledReason
+      ? undefined
+      : activeRow?.item.actions?.find(
+          (action) =>
+            action.chord &&
+            chordMatches(action.chord, event.nativeEvent, isMac) &&
+            !chordEditsField(action.chord, event.currentTarget),
+        );
+    if (rowAction && activeRow) {
+      event.preventDefault();
+      runRowAction(activeRow, rowAction);
+      return;
+    }
     const navigation = navigationFor(event, pageSize, stepsWithCtrlNP);
     if (navigation) {
       event.preventDefault();
@@ -577,6 +759,8 @@ export function QuickPick<Value>({
       role: "option",
       "aria-selected": isActive,
       "aria-disabled": disabled || undefined,
+      // The row's buttons sit outside the option, so it names the keys that run them.
+      "aria-keyshortcuts": rowActionShortcuts(item.actions),
       "data-active": isActive || undefined,
       // Hovering an enabled row makes it the user's pick, as in a menu, even when it
       // is already the top row, so a result arriving above it doesn't take over.
@@ -637,7 +821,87 @@ export function QuickPick<Value>({
     );
   };
 
+  // A group's heading: its label, which names the group, then any count. Its buttons sit
+  // outside the listbox, laid over the heading's trailing edge.
+  const renderHeading = (heading: { key: string; label: string }, labelId?: string) => {
+    // A picker without counts or heading buttons keeps the plain caption.
+    if (!groupCounts && !groupActions) {
+      return (
+        <div
+          id={labelId}
+          role="presentation"
+          className="px-2 py-1.5 text-sm font-medium text-muted-foreground"
+        >
+          {heading.label}
+        </div>
+      );
+    }
+    const count = groupCounts ? headingCounts.get(heading.key) : undefined;
+    // The label gives way to the buttons laid over the heading, and the count stays whole.
+    const barWidth = headingActionBars.find((bar) => bar.key === heading.key)?.width ?? 0;
+    return (
+      <div
+        role="presentation"
+        data-slot="quick-pick-group-heading"
+        data-heading-key={heading.key}
+        style={barWidth > 0 ? { paddingRight: barWidth + 8 } : undefined}
+        className="flex min-h-8 items-center gap-2 px-2 py-1 text-sm font-medium text-muted-foreground"
+      >
+        <span
+          id={labelId}
+          data-slot="quick-pick-group-label"
+          className="flex min-w-0 items-baseline gap-1.5"
+        >
+          <span className="truncate">{heading.label}</span>
+          {count !== undefined && (
+            <>
+              {" "}
+              <span className="shrink-0 font-normal tabular-nums text-muted-foreground/80">
+                {count.toLocaleString()}
+              </span>
+            </>
+          )}
+        </span>
+      </div>
+    );
+  };
+
+  // A row with buttons: the option, then its buttons beside it, outside the option so it stays
+  // one thing to assistive tech; they're for the pointer, and the option names their keys.
   const renderOption = (row: QuickPickItemRow<Value>, index: number) => {
+    const actions = row.item.actions;
+    if (!actions?.length || sidebar) return renderOptionBody(row, index);
+    // The row paints the active tint behind the option and its buttons; the tint is
+    // translucent, so the option paints none of its own.
+    const option = renderOptionBody(row, index, true);
+    return (
+      <div
+        key={row.key}
+        role="presentation"
+        data-slot="quick-pick-row"
+        className="group/row flex items-center rounded-lg has-[[data-active]]:bg-muted"
+      >
+        <div role="presentation" className="min-w-0 flex-1">
+          {option}
+        </div>
+        <span
+          aria-hidden
+          className="invisible flex shrink-0 items-center gap-0.5 pr-1 group-hover/row:visible group-has-[[data-active]]/row:visible"
+        >
+          {actions.map((action) => (
+            <RowActionButton
+              key={action.id}
+              action={action}
+              isMac={isMac}
+              onRun={() => runRowAction(row, action)}
+            />
+          ))}
+        </span>
+      </div>
+    );
+  };
+
+  const renderOptionBody = (row: QuickPickItemRow<Value>, index: number, inRow = false) => {
     const { item } = row;
     const disabled = Boolean(item.disabledReason);
     const highlight = item.matchHighlight ?? matchHighlight;
@@ -650,7 +914,10 @@ export function QuickPick<Value>({
           "flex cursor-pointer select-none rounded-lg px-2 text-ui",
           sidebar
             ? "items-center gap-2 py-1.5 data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)]"
-            : "items-start gap-2 py-1.5 data-active:bg-muted data-active:text-foreground",
+            : cn(
+                "items-start gap-2 py-1.5 data-active:text-foreground",
+                !inRow && "data-active:bg-muted",
+              ),
           // Matches the menus' destructive item: red text, a red tint while active.
           !sidebar &&
             item.destructive &&
@@ -912,45 +1179,68 @@ export function QuickPick<Value>({
             </Button>
           </div>
         )}
-        <div id={listId} role="listbox" aria-label={label}>
-          {sections.map((section, sectionIndex) => {
-            const headingId = section.heading ? `${baseId}-heading-${sectionIndex}` : undefined;
-            return (
-              <div
-                key={section.heading?.key ?? `section-${sectionIndex}`}
-                role="group"
-                aria-labelledby={headingId}
-                className="pb-1"
-              >
-                {section.heading && (
-                  <div
-                    id={headingId}
-                    role="presentation"
-                    className="px-2 py-1.5 text-sm font-medium text-muted-foreground"
-                  >
-                    {section.heading.label}
-                  </div>
-                )}
-                {runsOf(section.rows, cardsShown).map((run) =>
-                  run.cards ? (
-                    // Cards flow two to a line where the list is wide enough; arrows keep reading order.
-                    <div
-                      key={run.rows[0].row.key}
-                      role="presentation"
-                      data-slot="quick-pick-cards"
-                      className="@container/cards"
-                    >
-                      <div className="grid grid-cols-1 gap-1 p-0.5 @[22rem]/cards:grid-cols-2">
-                        {run.rows.map(({ row, index }) => renderCard(row, index))}
+        <div role="presentation" className="relative">
+          <div ref={listboxRef} id={listId} role="listbox" aria-label={label}>
+            {sections.map((section, sectionIndex) => {
+              const headingId = section.heading ? `${baseId}-heading-${sectionIndex}` : undefined;
+              return (
+                <div
+                  key={section.heading?.key ?? `section-${sectionIndex}`}
+                  role="group"
+                  aria-labelledby={headingId}
+                  className="pb-1"
+                >
+                  {section.heading && renderHeading(section.heading, headingId)}
+                  {runsOf(section.rows, cardsShown).map((run) =>
+                    run.cards ? (
+                      // Cards flow two to a line where the list is wide enough; arrows keep reading order.
+                      <div
+                        key={run.rows[0].row.key}
+                        role="presentation"
+                        data-slot="quick-pick-cards"
+                        className="@container/cards"
+                      >
+                        <div className="grid grid-cols-1 gap-1 p-0.5 @[22rem]/cards:grid-cols-2">
+                          {run.rows.map(({ row, index }) => renderCard(row, index))}
+                        </div>
                       </div>
-                    </div>
-                  ) : (
-                    run.rows.map(({ row, index }) => renderOption(row, index))
-                  ),
-                )}
-              </div>
-            );
-          })}
+                    ) : (
+                      run.rows.map(({ row, index }) => renderOption(row, index))
+                    ),
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {headingActionBars.map((bar) => (
+            <div
+              key={bar.key}
+              data-slot="quick-pick-group-actions"
+              data-actions-for={bar.key}
+              style={{ top: bar.top, height: bar.height }}
+              className="absolute right-1 flex items-center gap-0.5"
+            >
+              {(headingActions.get(bar.key) ?? NO_GROUP_ACTIONS).map((action) => (
+                <Button
+                  key={action.id}
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  data-slot="quick-pick-group-action"
+                  aria-label={action.ariaLabel}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    action.run();
+                    // The button may leave with its group, so the query keeps the keys.
+                    queryFieldRef.current?.focus();
+                  }}
+                  className="font-normal text-muted-foreground hover:text-foreground"
+                >
+                  {action.label}
+                </Button>
+              ))}
+            </div>
+          ))}
         </div>
         {listEnd}
       </div>
@@ -982,6 +1272,18 @@ export function QuickPick<Value>({
             disabled={!canAcceptActive}
             onClick={() => activeRow && accept(activeRow)}
           />
+          {activeRow?.item.actions?.map(
+            (action) =>
+              action.chord && (
+                <FooterAction
+                  key={action.id}
+                  keys={chordKeys(action.chord, isMac)}
+                  shortcut={chordAriaShortcut(action.chord, isMac)}
+                  label={action.label}
+                  onClick={() => activeRow && runRowAction(activeRow, action)}
+                />
+              ),
+          )}
           {shownAlternateLabel && (
             <FooterAction
               keys={[isMac ? "⌘" : "Ctrl", "↵"]}

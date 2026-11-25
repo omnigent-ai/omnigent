@@ -5,9 +5,6 @@
 
 import { useCallback, useId, useLayoutEffect, useMemo, useSyncExternalStore } from "react";
 
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { isFeatureEnabled } from "@/lib/capabilities";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { terminalLayoutKeys } from "@/lib/paneSplitLayout";
 
 import { usePaneSplit } from "./paneSplitStore";
@@ -74,13 +71,6 @@ export function useMainOwnedTerminalKeys(
 
 /** No shells, for a main view that shows no split. */
 export const NO_MAIN_SPLIT_MEMBERS: ReadonlySet<string> = new Set();
-
-/** Whether terminals may show as splits: desktop owners, with splittable terminals on. */
-export function useTerminalSplitsAllowed(readOnly: boolean): boolean {
-  const serverInfo = useServerInfo();
-  const isMobile = useIsMobileViewport();
-  return !readOnly && !isMobile && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui");
-}
 
 /**
  * The shells of the Terminal view's saved split where that view shows splits, so the sidebar

@@ -111,13 +111,14 @@ def _make_app(
         discovery. Defaults to ``"claude-sdk"`` (today's behavior).
     :returns: The configured FastAPI app.
     """
+    # The fake server has no memory, so the runner's spec has the memory group off.
     spec = AgentSpec(
         spec_version=1,
         name="skills-test",
         skills=bundled,
         skills_filter=skills_filter,
         executor=ExecutorSpec(config={"harness": harness}),
-        tool_groups=ToolGroupsConfig(journal=journal_enabled),
+        tool_groups=ToolGroupsConfig(journal=journal_enabled, memory=False),
     )
     entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
 

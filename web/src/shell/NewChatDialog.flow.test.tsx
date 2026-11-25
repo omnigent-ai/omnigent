@@ -1,3 +1,4 @@
+import { peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -839,6 +840,9 @@ describe("NewChatLandingScreen in the floating panel", () => {
       "aria-keyshortcuts",
       `${ARIA_MOD_KEY}+Enter`,
     );
+    // The prompt sits under the panel's top edge, so suggestions open below it.
+    typeMessage("/");
+    expect(await screen.findByTestId("slash-command-menu")).toHaveClass("top-11");
   });
 
   it("keeps the main window's composer card, with no chord hint", async () => {
@@ -851,6 +855,8 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(screen.getByTestId("new-chat-landing-actions")).not.toHaveClass("border-t");
     expect(screen.queryByTestId("new-chat-landing-send-shortcut")).not.toBeInTheDocument();
     expect(screen.getByTestId("new-chat-landing-submit")).not.toHaveAttribute("aria-keyshortcuts");
+    typeMessage("/");
+    expect(await screen.findByTestId("slash-command-menu")).toHaveClass("bottom-full");
   });
 
   it("tells the panel when the native file picker opens and closes", async () => {
@@ -1745,6 +1751,69 @@ describe("NewChatLandingScreen create flow", () => {
     },
   );
 
+  it("sends a pasted chip's file once after its create fails and the prompt is resubmitted", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    const tempConvId = "temp:cccccccccccccccccccccccccccccccc";
+    let resolveCreate!: (response: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId,
+      pendingMsgTempId: "pend_chip",
+      createToken: "cccccccccccccccccccccccccccccccc",
+    });
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    cleanup();
+
+    // Stop leaves the submitted message as the temporary draft, its file in the tray.
+    setSessionDraft(tempConvId, { text: "@shot.png", files: [shot] });
+    hasPendingLocalMessageMock.mockReturnValue(false);
+    await act(async () => {
+      resolveCreate({
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: "host unavailable" }),
+      } as unknown as Response);
+    });
+    await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitForWorkspaceSeed();
+    beginLocalConversationMock.mockReturnValue({
+      tempConvId: "temp:dddddddddddddddddddddddddddddddd",
+      pendingMsgTempId: "pend_retry",
+      createToken: "dddddddddddddddddddddddddddddddd",
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_retry" }),
+    } as unknown as Response);
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(hydrateLocalConversationMock).toHaveBeenCalled());
+    const sentCall = hydrateLocalConversationMock.mock.calls.at(-1)!;
+    expect(sentCall[3]).toBe("@shot.png");
+    const sentFiles = sentCall[4] as File[];
+    expect(sentFiles).toHaveLength(1);
+    expect(sentFiles[0]).toBe(shot);
+  });
+
   it("does not restore a submitted prompt while creation is pending", async () => {
     const tempConvId = "temp:dddddddddddddddddddddddddddddddd";
     let resolveCreate!: (response: Response) => void;
@@ -2181,6 +2250,120 @@ describe("NewChatLandingScreen create flow", () => {
       }),
     );
     expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
+  });
+
+  it("hands a pasted chip's file to the first message on the CodeMirror prompt", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    const items = [{ kind: "file", type: "image/png", getAsFile: () => shot }];
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: { items, getData: () => "" },
+    });
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@shot.png");
+    expect(screen.queryByAltText("shot.png")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ files: [shot] }),
+      ),
+    );
+  });
+
+  it("keeps one file per pasted chip when creation fails with the launcher still mounted", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    // No temporary conversation: the failure returns the draft to the launcher that is still mounted.
+    beginLocalConversationMock.mockReturnValue(null);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      json: async () => ({ detail: "host unavailable" }),
+    } as unknown as Response);
+    renderLanding([], { features: { chat_composer_codemirror: true } });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getAllByAltText("shot.png").length).toBeGreaterThan(0));
+    // The restored draft keeps the typed @shot.png text and one tray file for the chip.
+    expect(composerTargetOf(screen.getByTestId("new-chat-landing-input"))!.value.trim()).toBe(
+      "@shot.png",
+    );
+    expect(screen.getAllByAltText("shot.png")).toHaveLength(1);
+  });
+
+  it("carries a pasted chip's file into a new session from an unavailable sibling", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    onTestFinished(() => resetCodeMirrorComposerLoadForTests());
+    searchParams = new URLSearchParams("sibling=source");
+    let sourceGone = false;
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (String(url).startsWith("/v1/sessions/source?")) {
+        if (sourceGone)
+          return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+        return new Response(
+          JSON.stringify({
+            id: "source",
+            title: "Source",
+            host_id: "host_1",
+            workspace: SEEDED_WORKSPACE,
+            agent_id: "ag_hello",
+            permission_level: 4,
+            labels: {},
+            items: [],
+          }),
+        );
+      }
+      return new Promise<Response>(() => {});
+    });
+    const info = { features: { chat_composer_codemirror: true }, sibling_sessions: true };
+    renderLanding([], info);
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    await waitForWorkspaceSeed();
+    const shot = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.paste(screen.getByTestId("new-chat-landing-input"), {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => shot }],
+        getData: () => "",
+      },
+    });
+    // Leaving the unsubmitted sibling launcher keeps its draft, chip included, for the source.
+    cleanup();
+
+    sourceGone = true;
+    renderLanding([], info);
+    fireEvent.click(await screen.findByRole("button", { name: "Continue in a new session" }));
+
+    const handoffUrl = String(navigateMock.mock.calls.at(-1)![0]);
+    const token = new URL(handoffUrl, "http://localhost").searchParams.get("handoff");
+    expect(token).not.toBeNull();
+    expect(peekNewSessionHandoff(token)!.text.trim()).toBe("@shot.png");
+    expect(peekNewSessionHandoff(token)!.files).toEqual([shot]);
+    expect(peekNewSessionHandoff(token)!.files[0]!.name).toBe("shot.png");
   });
 
   it("stashes the first prompt as the session's optimistic label", async () => {

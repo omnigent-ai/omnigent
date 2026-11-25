@@ -583,7 +583,7 @@ export function ChangesReview({
   });
   // Listed while the review is on screen, so the Commits tab can count them from either tab, and
   // read again on showing Commits once old, or when the session's files may have changed.
-  const commits = useBranchCommits(conversationId, changes.workspace, {
+  const commits = useBranchCommits(conversationId, changes.workspace, view.revisions.custom, {
     enabled: active && listsCommits,
     shown: section === "commits",
   });

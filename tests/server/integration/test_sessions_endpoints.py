@@ -60,7 +60,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -4743,6 +4743,90 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     assert row["pending_elicitations_count"] == 2
 
     store.set_pending_elicitation_count(session_id, 0)
+
+
+@pytest.mark.parametrize(
+    ("holds_runner", "child_runner", "child_read_fails", "expected_count"),
+    [
+        pytest.param(True, None, False, 0, id="repairs-on-runner-replica"),
+        pytest.param(False, None, False, 1, id="keeps-count-off-runner-replica"),
+        pytest.param(
+            True, "runner_child_replica", False, 1, id="keeps-child-prompt-from-another-replica"
+        ),
+        pytest.param(
+            True, "runner_stale_pending", False, 0, id="repairs-a-stale-child-on-the-same-runner"
+        ),
+        pytest.param(True, None, True, 1, id="serves-snapshot-when-repair-fails"),
+    ],
+)
+async def test_get_session_repairs_stale_pending_count_from_a_complete_index(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    holds_runner: bool,
+    child_runner: str | None,
+    child_read_fails: bool,
+    expected_count: int,
+) -> None:
+    """Detail reads repair stale pending counts without clearing prompts owned elsewhere.
+
+    :param app: The app behind ``client``; its tunnel registry gets the runner.
+    :param client: Test HTTP client backed by the real app.
+    :param db_uri: The app's DB, opened directly to seed the stored counts.
+    :param monkeypatch: Breaks the repair's child read in the failure case.
+    :param holds_runner: Whether this replica holds the session's runner.
+    :param child_runner: The runner of a child whose stored count is 1, if any.
+    :param child_read_fails: Whether the repair's child read raises.
+    :param expected_count: The listed count once the session has been opened.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server import session_live_state
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+    pending_elicitations.reset_for_tests()
+    if holds_runner:
+        register_test_runner(app, "runner_stale_pending")
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_stale_pending")
+    store.set_pending_elicitation_count(session_id, 1)
+    if child_runner is not None:
+        child = store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=session_id,
+            agent_id=agent["id"],
+            runner_id=child_runner,
+        )
+        store.set_pending_elicitation_count(child.id, 1)
+    if child_read_fails:
+
+        def _fail(*_args: object, **_kwargs: object) -> list[tuple[str, int]]:
+            raise RuntimeError("child read failed")
+
+        monkeypatch.setattr(
+            session_live_state.conversation_store(), "list_child_conversation_ids_page", _fail
+        )
+
+    async def listed_count() -> int:
+        resp = await client.get("/v1/sessions")
+        assert resp.status_code == 200
+        return next(r for r in resp.json()["data"] if r["id"] == session_id)[
+            "pending_elicitations_count"
+        ]
+
+    assert await listed_count() == 1
+
+    resp = await client.get(
+        f"/v1/sessions/{session_id}",
+        params={"include_items": "false", "include_live_status": "false"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["pending_elicitations"] == []
+    # One worker applies live-state writes in order, so this lands after any repair.
+    await asyncio.wrap_future(session_live_state.submit("test barrier", lambda: None))
+    assert await listed_count() == expected_count
 
 
 async def test_get_session_includes_runner_online(

@@ -1,6 +1,7 @@
 import { type RefObject, useState } from "react";
 
 import type { CornerCursor, DividerCorner } from "./paneDividerCorners";
+import type { PointerDragEnd } from "./paneDividerDragEnd";
 import { usePaneDividerPointer, type ViewPoint } from "./usePaneDividerPointer";
 
 /**
@@ -26,7 +27,7 @@ export function TerminalSplitCorner({
   onStart: (corner: DividerCorner) => void;
   onDrag: (corner: DividerCorner, point: ViewPoint) => void;
   onCommit: () => void;
-  onAbort: () => void;
+  onAbort: (reason: PointerDragEnd) => void;
   /** Whether the layout still has this corner's drag. */
   dragging: boolean;
 }) {

@@ -15,7 +15,11 @@ vi.mock("@/store/chatStore", () => ({
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
-import { usePullRequestInfo, usePullRequestInfos } from "./usePullRequests";
+import {
+  usePullRequestInfo,
+  usePullRequestInfos,
+  useRefreshPullRequestInfo,
+} from "./usePullRequests";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -51,7 +55,7 @@ function Probe({
 }: {
   id: string | undefined;
   batch?: boolean;
-  poll?: "linked";
+  poll?: true | "linked";
 }) {
   usePullRequestInfo(id, { poll });
   usePullRequestInfos(id, batch ? ["https://github.com/org/repo/pull/1"] : []);
@@ -170,6 +174,86 @@ describe("usePullRequestInfo turn-end invalidate", () => {
       expect(fetchMock).toHaveBeenCalledTimes(4);
       await act(() => vi.advanceTimersByTimeAsync(90_000));
       expect(fetchMock).toHaveBeenCalledTimes(4);
+      // The composer's 30 s polls match the stale time, so each one reads GitHub fresh.
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes("allow_cached"))).toBe(
+        false,
+      );
     },
   );
+});
+
+describe("PR info reads that may take the runner's previous answer", () => {
+  const allowsCached = (call: unknown[]) => String(call[0]).includes("allow_cached=true");
+
+  it("sends allow_cached only for the panel's interval polls, never a refresh or a reopen", async () => {
+    vi.useFakeTimers();
+    stubChatStore("conv_live", "idle");
+    // A tracking-capable host: the panel polls every 10 s.
+    fetchMock.mockResolvedValue(pullRequestInfoResponse({ tracking_available: true }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (
+      <QueryClientProvider client={client}>
+        <Probe id="conv_live" poll />
+      </QueryClientProvider>
+    );
+    const first = render(tree);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    // Refresh, turn end and edits invalidate, then refetch.
+    await act(() => client.invalidateQueries({ queryKey: ["github-info", "conv_live"] }));
+    first.unmount();
+    await act(() => vi.advanceTimersByTimeAsync(32_000));
+    render(tree);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+
+    // Load, poll, Refresh, reopen 32 s later, poll.
+    expect(fetchMock.mock.calls.map(allowsCached)).toEqual([false, true, false, false, true]);
+  });
+
+  it("a user refresh within the poll's fresh window still reads GitHub fresh", async () => {
+    vi.useFakeTimers();
+    stubChatStore("conv_live", "idle");
+    fetchMock.mockResolvedValue(pullRequestInfoResponse({ tracking_available: true }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let refresh: (() => Promise<unknown>) | undefined;
+    function RefreshProbe() {
+      usePullRequestInfo("conv_live", { poll: true });
+      refresh = useRefreshPullRequestInfo("conv_live");
+      return null;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <RefreshProbe />
+      </QueryClientProvider>,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    await act(() => refresh!());
+
+    // Load, poll, then the refresh 0 s after that poll.
+    expect(fetchMock.mock.calls.map(allowsCached)).toEqual([false, true, false]);
+  });
+
+  it("reads list rows fresh on every poll and after reopening", async () => {
+    vi.useFakeTimers();
+    stubChatStore("conv_live", "idle");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (
+      <QueryClientProvider client={client}>
+        <Probe id="conv_live" batch />
+      </QueryClientProvider>
+    );
+    const first = render(tree);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    first.unmount();
+    await act(() => vi.advanceTimersByTimeAsync(32_000));
+    render(tree);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+
+    const rows = fetchMock.mock.calls.filter(([url]) => String(url).includes("pr_url="));
+    // Load, the 30 s poll, reopen 32 s later.
+    expect(rows).toHaveLength(3);
+    expect(rows.some(allowsCached)).toBe(false);
+  });
 });

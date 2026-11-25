@@ -30,3 +30,12 @@ export function PageLoading({
     </div>
   );
 }
+
+/** Loading state that fills only the app shell's content pane, leaving the sidebar usable. */
+export function PaneLoading() {
+  return (
+    <div className="flex min-h-0 flex-1 items-center justify-center">
+      <Spinner className="size-5 text-muted-foreground" aria-label="Loading" />
+    </div>
+  );
+}

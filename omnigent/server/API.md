@@ -668,8 +668,10 @@ already uploaded or registered an agent. The response is the full
     `request_managed_sandbox_host_id`, so the caller can route the
     session's requests by it before the host connects. It is recorded
     in the `omnigent.sandbox.requested_host_id` label until the host
-    binds; null lets the server mint one. A malformed id, or one on a
-    child (`parent_session_id`) create, is a 422; an id that names an
+    binds; null lets the server mint one, which a host-sharded server
+    also records there when the create carries a slice key. A
+    malformed id, or one on a child (`parent_session_id`) create, is
+    a 422; an id that names an
     existing host, or whose `managed-<first 8 hex>` name one of the
     caller's hosts already uses, is a 409 `already_exists`, raised
     before the session is created. The multipart bundle create takes

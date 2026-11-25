@@ -50,10 +50,12 @@ export { readQuickPickHistory, recordQuickPickHistory, removeQuickPickHistory } 
 export type {
   QuickPickAcceptDetails,
   QuickPickAcceptResult,
+  QuickPickGroupAction,
   QuickPickInputError,
   QuickPickItem,
   QuickPickLoadRequest,
   QuickPickRanking,
+  QuickPickRowAction,
   QuickPickSource,
   QuickPickStats,
 } from "./model";

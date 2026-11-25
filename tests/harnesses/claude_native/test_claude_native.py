@@ -14,6 +14,9 @@ import os
 import queue
 import re
 import shlex
+import shutil
+import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -182,6 +185,44 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "TaskCreated",
         "UserPromptSubmit",
     ]
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_claude_tool_env_gives_heredoc_commands_eof_on_stdin(shell: str) -> None:
+    """
+    A stdin reader after a heredoc in one Bash call must not wait on Claude's pipe.
+
+    Claude Code inlines the env script ahead of each command, spawns the shell
+    with a stdin pipe it never closes, and skips its own ``< /dev/null`` when the
+    command has a heredoc. A pathless ``rg`` then hangs reading that pipe.
+    """
+    shell_path = shutil.which(shell)
+    if shell_path is None:
+        pytest.skip(f"{shell} is not installed")
+    script = Path(claude_native.claude_tool_env_file()).read_text(encoding="utf-8").strip()
+    command = "python3 - <<'EOF'\nprint('heredoc ran')\nEOF\ncat; echo stdin-closed"
+    # Mirrors how Claude Code assembles the Bash tool command line.
+    command_line = f"{script}\n: && eval {shlex.quote(command)}"
+
+    held_stdin, child_stdin = socket.socketpair()
+    with held_stdin, child_stdin:
+        process = subprocess.Popen(
+            [shell_path, "-c", command_line],
+            stdin=child_stdin.fileno(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # The blocked reader is a grandchild holding stdout open; end the group.
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            pytest.fail("stdin reader blocked on the shell's open stdin socket")
+
+    assert process.returncode == 0, stderr.decode()
+    assert stdout.decode().splitlines() == ["heredoc ran", "stdin-closed"]
 
 
 def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(

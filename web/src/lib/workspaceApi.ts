@@ -23,6 +23,7 @@ import {
 } from "@/gen/omnigent/api/workspace/v1alpha1/workspace_pb";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
+import type { RevisionSpec } from "@/lib/customComparison";
 import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { splitGlobList } from "@/lib/globList";
@@ -286,6 +287,41 @@ function routeCapabilities(
   return entry.pending;
 }
 
+const NO_CAPABILITIES: ReadonlySet<string> = new Set();
+// Failures of the route that carried GetCapabilities, not answers from its host.
+const ROUTE_FAILURE_CODES: ReadonlySet<Code> = new Set([
+  Code.Unavailable,
+  Code.Canceled,
+  Code.DeadlineExceeded,
+  Code.Unauthenticated,
+  Code.Unknown,
+]);
+
+/**
+ * A route's capabilities for a baseline method that only uses optional features: a host
+ * that answers GetCapabilities with an error still serves the method, just without them,
+ * for as long as an Unimplemented answer would be kept. A route that can't be reached
+ * fails, so the caller moves on to the next one.
+ */
+async function optionalCapabilities(
+  route: Route,
+  sessionId: string,
+  sshTarget: string | null | undefined,
+  signal: AbortSignal | undefined,
+): Promise<ReadonlySet<string>> {
+  try {
+    return await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (!(error instanceof ConnectError) || ROUTE_FAILURE_CODES.has(error.code)) throw error;
+    capabilities.set(routeKey(route, sessionId, sshTarget), {
+      pending: Promise.resolve(NO_CAPABILITIES),
+      expiresAtMs: Date.now() + ROUTE_RETRY_MS,
+    });
+    return NO_CAPABILITIES;
+  }
+}
+
 function concat(chunks: Uint8Array[]): Uint8Array {
   const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
   let offset = 0;
@@ -335,34 +371,65 @@ export interface ListedEntry {
   modified_at: number | null;
   /** The deepest directory of a single-child chain, when the host reports it. */
   leaf_directory_path?: string;
+  /** Git ignores the entry, as a host offering the "gitignore" feature reports. */
+  ignored?: true;
+}
+
+/** How a directory is listed. */
+export interface ListDirectoryOptions {
+  signal?: AbortSignal;
+  /** Leave out entries Git ignores, where the host can tell; others list them all. */
+  hideIgnored?: boolean;
+  /** Ask the host to report each single-folder chain's end, where it offers that. */
+  collapseSingleChildDirectories?: boolean;
 }
 
 const LIST_PAGE_SIZE = 1000;
+/** The ListDirectory feature that fills each entry's `leaf_directory_path`. */
+const DIRECTORY_CHAINS = "list_directory.collapse_single_child_directories";
+/** The ListDirectory feature that marks, and can leave out, what Git ignores. */
+const IGNORED_FEATURE = "gitignore";
 
 async function listDirectory(
   client: WorkspaceClient,
   path: string,
   maxEntries: number,
-  signal?: AbortSignal,
+  { signal, hideIgnored = false, collapseSingleChildDirectories = false }: ListDirectoryOptions,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
+  // A host whose token's entry was deleted starts its listing over, resending what it gave.
+  const held = new Set<string>();
   let pageToken = "";
+  // A host that hands back a token already asked for is cycling; stop before asking again.
+  const requested = new Set<string>();
   // Each page needs the token the previous one returned.
   /* oxlint-disable no-await-in-loop */
   do {
+    requested.add(pageToken);
     const page = await client.listDirectory(
-      { path, pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length), pageToken },
+      {
+        path,
+        pageSize: Math.min(LIST_PAGE_SIZE, maxEntries - data.length),
+        pageToken,
+        collapseSingleChildDirectories,
+        hideIgnored,
+      },
       { signal },
     );
-    // A host that hands back the token it was given is resending a page; stop before keeping it.
-    if (pageToken && page.nextPageToken === pageToken) break;
-    data.push(...page.entries.map(listedEntry));
+    // A page ending on a token already asked for resends one the listing holds; stop before keeping it.
+    if (page.nextPageToken && requested.has(page.nextPageToken)) break;
+    const fresh = page.entries.filter((entry) => !held.has(entry.path));
+    for (const entry of fresh) held.add(entry.path);
+    data.push(...fresh.map(listedEntry));
     pageToken = page.nextPageToken;
     // A page that adds nothing would never end the listing; report the rest as more.
-    if (page.entries.length === 0) break;
+    if (fresh.length === 0) break;
   } while (pageToken && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
-  return { data, hasMore: pageToken !== "" };
+  // A host may ignore the page size; keep to the caller's limit and report the rest as more.
+  const overLimit = data.length > maxEntries;
+  if (overLimit) data.length = maxEntries;
+  return { data, hasMore: overLimit || pageToken !== "" };
 }
 
 interface CallOptions {
@@ -370,6 +437,8 @@ interface CallOptions {
   sshTarget?: string | null;
   /** Optional features of `method` the call relies on, e.g. "search_files.substring". */
   features?: readonly string[];
+  /** Optional features the call uses when the route's host lists them; `call` is told which. */
+  usesFeatures?: readonly string[];
   /** Codes that answer the request rather than fail the route. */
   answerCodes?: ReadonlySet<Code>;
   /** Throw an answer to the caller, for methods REST can't answer instead. */
@@ -391,11 +460,12 @@ interface CallOptions {
 async function viaWorkspaceApi<T>(
   sessionId: string,
   method: Method,
-  call: (client: WorkspaceClient) => Promise<T>,
+  call: (client: WorkspaceClient, served: ReadonlySet<string>) => Promise<T>,
   {
     signal,
     sshTarget,
     features = [],
+    usesFeatures = [],
     answerCodes = ANSWER_CODES,
     throwAnswers = false,
   }: CallOptions = {},
@@ -408,12 +478,22 @@ async function viaWorkspaceApi<T>(
     const unsupportedKey = `${key}:${method}`;
     if ((unsupportedUntil.get(unsupportedKey) ?? 0) > Date.now()) continue;
     try {
+      let served: ReadonlySet<string> = NO_CAPABILITIES;
       if (checked) {
-        const served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+        served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
         const required = [capabilityName(method), ...features];
         if (!required.every((name) => served.has(name))) continue;
+      } else if (usesFeatures.length > 0) {
+        served = await optionalCapabilities(route, sessionId, sshTarget, signal);
       }
-      return await callOn(route, sessionId, call, signal, sshTarget, answerCodes);
+      return await callOn(
+        route,
+        sessionId,
+        (client) => call(client, served),
+        signal,
+        sshTarget,
+        answerCodes,
+      );
     } catch (error) {
       signal?.throwIfAborted();
       if (error instanceof UnusableAnswerError) {
@@ -446,27 +526,40 @@ async function viaWorkspaceApi<T>(
 
 /**
  * List a workspace directory through the workspace API, in the REST listing's
- * shape and order (ascending by path), reading pages up to `maxEntries`.
+ * shape and order (ascending by path), reading pages up to `maxEntries`. Where the
+ * route's host offers it, each directory whose only entry is a directory carries the
+ * end of that chain as `leaf_directory_path`, so the tree shows "a/b/c" on one row.
  *
  * :param sessionId: The session whose workspace to list.
  * :param path: Workspace-relative directory, ``""`` for the root.
  * :param maxEntries: Stop after this many entries, e.g. ``1000``; must be positive.
- * :returns: The entries and whether more remain, or null when the caller
- *     should list through REST (see :func:`readFileViaWorkspaceApi`).
+ * :param options: ``hideIgnored`` leaves out what Git ignores, where the host can tell.
+ * :returns: The entries, whether more remain and whether Git-ignored ones were left
+ *     out, or null when the caller should list through REST (see :func:`readFileViaWorkspaceApi`).
  */
 export function listDirectoryViaWorkspaceApi(
   sessionId: string,
   path: string,
   maxEntries: number,
   signal?: AbortSignal,
-): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+  { hideIgnored = false }: Omit<ListDirectoryOptions, "signal"> = {},
+): Promise<{ data: ListedEntry[]; hasMore: boolean; ignoredHidden?: true } | null> {
   // The host reads a page size of 0 as its default, so a 0 limit would still return entries.
   if (!(maxEntries > 0)) return Promise.reject(new RangeError("maxEntries must be positive"));
   return viaWorkspaceApi(
     sessionId,
     "listDirectory",
-    (client) => listDirectory(client, path, maxEntries, signal),
-    { signal },
+    async (client, served) => {
+      // Only a host offering the feature leaves ignored entries out; others list them all.
+      const ignoredHidden = hideIgnored && served.has(IGNORED_FEATURE);
+      const listed = await listDirectory(client, path, maxEntries, {
+        signal,
+        hideIgnored: ignoredHidden,
+        collapseSingleChildDirectories: served.has(DIRECTORY_CHAINS),
+      });
+      return ignoredHidden ? { ...listed, ignoredHidden: true as const } : listed;
+    },
+    { signal, usesFeatures: [DIRECTORY_CHAINS, ...(hideIgnored ? [IGNORED_FEATURE] : [])] },
   );
 }
 
@@ -506,6 +599,7 @@ function listedEntry(entry: Entry): ListedEntry {
     bytes: entry.size === undefined ? null : Number(entry.size),
     modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
     ...(entry.leafDirectoryPath ? { leaf_directory_path: entry.leafDirectoryPath } : {}),
+    ...(entry.ignored ? { ignored: true as const } : {}),
   };
 }
 
@@ -527,6 +621,8 @@ export interface FileSearchOptions {
   exclude: string;
   /** Maximum entries, 1 to 500. */
   limit: number;
+  /** Search what Git ignores too, as REST does; otherwise only what Git lists. */
+  includeGitIgnored?: boolean;
 }
 
 /**
@@ -540,7 +636,7 @@ export interface FileSearchOptions {
 export function searchFilesViaWorkspaceApi(
   sessionId: string,
   query: string,
-  { path, include, exclude, limit }: FileSearchOptions,
+  { path, include, exclude, limit, includeGitIgnored = true }: FileSearchOptions,
   signal?: AbortSignal,
 ): Promise<FoundEntries | null> {
   return viaWorkspaceApi(
@@ -555,8 +651,8 @@ export function searchFilesViaWorkspaceApi(
           path,
           include: splitGlobList(include),
           exclude: splitGlobList(exclude),
-          // The REST search walks ignored files too, so they stay findable.
-          includeGitIgnored: true,
+          // The REST search walks ignored files too, so by default they stay findable.
+          includeGitIgnored,
         },
         { signal },
       );
@@ -825,17 +921,25 @@ export function listRepositoryRefsViaWorkspaceApi(
   );
 }
 
-/** The commits HEAD has beyond its merge base with `baseRevision`, newest first. */
+/**
+ * The commits `range.head` (HEAD when empty) has beyond its merge base with `range.base`, newest
+ * first. A named head is asked of a host that lists one; an older one would list HEAD's.
+ */
 export function listBranchCommitsViaWorkspaceApi(
   sessionId: string,
-  baseRevision: string,
+  range: RevisionSpec,
   signal?: AbortSignal,
 ): Promise<ListBranchCommitsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listBranchCommits",
-    (client) => client.listBranchCommits({ baseRevision }, { signal }),
-    { ...GIT_OPTIONS, signal, features: ["branch_commits"] },
+    (client) =>
+      client.listBranchCommits({ baseRevision: range.base, headRevision: range.head }, { signal }),
+    {
+      ...GIT_OPTIONS,
+      signal,
+      features: range.head ? ["branch_commits", "branch_commits.head"] : ["branch_commits"],
+    },
   );
 }
 

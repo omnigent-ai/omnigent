@@ -22,6 +22,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const moduleLoader = require("node:module");
 const path = require("node:path");
+const v8 = require("node:v8");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
@@ -57,6 +58,7 @@ async function until(condition, label, deadline = Date.now() + 1000) {
   await until(condition, label, deadline);
 }
 const urlHelpers = require("../src/url");
+const { FLOATING_LAUNCH_OFFER_TIMEOUT_MS } = require("../src/floating_launch_offers");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
@@ -185,9 +187,12 @@ function loadNavigationHarness({
   oidc = {},
   acceptedSessions = new Set(),
   deepLinks = null,
+  desktopOpenServer = null,
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
   clipboardWriteText = async () => {},
   localHostNow = Date.now,
+  // Chords another app holds: the fake GlobalShortcut's register returns false for them.
+  refusedChords = [],
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -447,7 +452,9 @@ function loadNavigationHarness({
     Notification: Object.assign(
       function Notification(options) {
         calls.notifications = [...(calls.notifications ?? []), options];
-        return { on: () => {}, show: () => {} };
+        const notification = Object.assign(new EventEmitter(), { show: () => {} });
+        calls.shownNotifications = [...(calls.shownNotifications ?? []), new WeakRef(notification)];
+        return notification;
       },
       { isSupported: () => notificationsSupported },
     ),
@@ -457,7 +464,7 @@ function loadNavigationHarness({
       register: (accelerator, press) => {
         (calls.globalShortcuts ??= []).push(["register", accelerator]);
         (calls.presses ??= new Map()).set(accelerator, press);
-        return true;
+        return !refusedChords.includes(accelerator);
       },
       unregister: (accelerator) => (calls.globalShortcuts ??= []).push(["unregister", accelerator]),
     },
@@ -687,6 +694,9 @@ function loadNavigationHarness({
               setRecentSessionSwitchSupported: () => {},
               setOpenTabSupported: (supported) =>
                 browserRegistryCalls.setOpenTabSupported.push(supported),
+              setForwardedChords: () => {},
+              holdForwardedChords: () => {},
+              releaseForwardedChords: () => {},
               activeConversationId: () => null,
             };
           },
@@ -736,6 +746,10 @@ function loadNavigationHarness({
     },
   };
 
+  if (desktopOpenServer) {
+    localRequires["./desktopOpenServer"] = { startDesktopOpenServer: desktopOpenServer };
+  }
+
   if (sshPreviewVerification) {
     localRequires["./sshPreviewIdentity"] = {
       verifySshPreviewIdentity: sshPreviewVerification,
@@ -766,6 +780,10 @@ function loadNavigationHarness({
     "\nmodule.exports.sshHosts = sshHosts;" +
     "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, floatingComposerPanelIsCurrent, closePanelsOnSignIn, loadSetupPage, beginConnectionAttempt, openFloatingComposerFromShortcut, focusAfterBrowserSignIn };" +
     "\nmodule.exports.quitStarted = () => quitConfirmation.quitStarted();" +
+    "\nmodule.exports.startDesktopOpenListener = startDesktopOpenListener;" +
+    "\nmodule.exports.setBrowserHandoffTimeoutMs = (ms) => { browserHandoffTimeoutMs = ms; };" +
+    "\nmodule.exports.registerConversationShownReset = registerConversationShownReset;" +
+    "\nmodule.exports.notificationTestApi = { retainedNotifications: () => retainedNotifications, maxRetainedNotifications: () => MAX_RETAINED_NOTIFICATIONS };" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -799,7 +817,11 @@ function loadNavigationHarness({
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   const api = module.exports.testApi;
   Object.assign(api, module.exports.panelTestApi);
+  Object.assign(api, module.exports.notificationTestApi);
   api.quitStarted = module.exports.quitStarted;
+  api.startDesktopOpenListener = module.exports.startDesktopOpenListener;
+  api.setBrowserHandoffTimeoutMs = module.exports.setBrowserHandoffTimeoutMs;
+  api.registerConversationShownReset = module.exports.registerConversationShownReset;
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
@@ -889,6 +911,7 @@ describe("Arca extend IPC", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -2921,7 +2944,7 @@ describe("panel windows", () => {
     assert.equal(h.api.mainWindows()[0], h.win);
     assert.equal(h.api.activeWindow(), h.win);
     assert.equal(h.calls.overlays, 1);
-    assert.equal(h.calls.windowOptions.at(-1).minWidth, 720);
+    assert.equal(h.calls.windowOptions.at(-1).minWidth, 480);
     h.emitWindow("close");
     assert.deepEqual(savedBounds(h), { x: 0, y: 0, width: 1280, height: 860, maximized: false });
   });
@@ -3583,6 +3606,119 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
     assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, [false]);
     harness.cleanup();
   });
+
+  const HOST_URL = "https://host.example/ml/omnigents";
+  const reload = (h) => h.emit("did-start-navigation", HOST_URL, false, true);
+  const chord = (key) => ({ key, metaKey: true, ctrlKey: false, altKey: false, shiftKey: false });
+  // The outgoing renderer can still send its list while the window loads the next document.
+  const updateMidReload = (h, registry) => (reload(h), registry.setForwardedChords([chord("j")]));
+  // Each case ends with the keys the window still takes from the page: none, its first list,
+  // or the list it sent mid-reload.
+  for (const [scenario, navigate, forwardedKeys] of [
+    [
+      "an update mid-reload, then a new document",
+      (h, registry) => (updateMidReload(h, registry), h.emit("did-navigate")),
+      [],
+    ],
+    [
+      "an update mid-reload, then an error page",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -105, "", HOST_URL, true)
+      ),
+      [],
+    ],
+    [
+      "an update mid-reload, then a cancelled reload",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      ["j"],
+    ],
+    ["a reload into a bundle that never asks", (h) => (reload(h), h.emit("did-navigate")), []],
+    [
+      "an error page replacing the shell",
+      (h) => (reload(h), h.emit("did-fail-load", -105, "", HOST_URL, true)),
+      [],
+    ],
+    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" }), []],
+    [
+      "a cancelled reload",
+      (h) => (
+        reload(h),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      ["k"],
+    ],
+    [
+      "a reload that stopped without a new document",
+      (h) => (reload(h), h.emit("did-stop-loading")),
+      ["k"],
+    ],
+    [
+      "an in-page or subframe navigation",
+      (h) => (
+        h.emit("did-start-navigation", `${HOST_URL}#c/1`, true, true),
+        h.emit("did-start-navigation", "https://frame.example/", false, false)
+      ),
+      ["k"],
+    ],
+  ]) {
+    it(`${forwardedKeys.length ? "keeps forwarding keys" : "leaves a page its keys"} after ${scenario}`, () => {
+      const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+      try {
+        Object.assign(h.webContents, { focus() {} });
+        h.electron.session.fromPartition = () => ({
+          setPermissionRequestHandler() {},
+          setPermissionCheckHandler() {},
+          webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+        });
+        h.electron.createWebContentsView = () => {
+          const wc = Object.assign(new EventEmitter(), {
+            ipc: new EventEmitter(),
+            setWindowOpenHandler() {},
+            loadURL() {},
+          });
+          return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+        };
+        const registry = h.api.createBrowserRegistryForWindow(h.win);
+        const page = registry.openOrNavigate("browser-tab:conv:t1", "https://page.example/").entry
+          .view.webContents;
+        const press = (key) => {
+          let prevented = false;
+          const before = h.calls.progress.length;
+          page.emit(
+            "before-input-event",
+            { preventDefault: () => (prevented = true) },
+            { type: "keyDown", key, code: `Key${key.toUpperCase()}`, meta: true },
+          );
+          const forwarded = h.calls.progress
+            .slice(before)
+            .filter(({ channel }) => channel === "browser-forwarded-input");
+          return { prevented, forwarded: forwarded.length };
+        };
+
+        registry.setForwardedChords([chord("k")]);
+        assert.deepEqual(press("k"), { prevented: true, forwarded: 1 });
+        navigate(h, registry);
+        // A finished load that follows never hands back keys a new document didn't ask for.
+        h.emit("did-stop-loading");
+        for (const key of ["k", "j"]) {
+          const forwarded = forwardedKeys.includes(key);
+          assert.deepEqual(
+            press(key),
+            { prevented: forwarded, forwarded: forwarded ? 1 : 0 },
+            `⌘${key.toUpperCase()}`,
+          );
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
 });
 
 // Wiring guards for the window-open policy (src/popupPolicy.js decides,
@@ -3811,6 +3947,116 @@ describe("CLI deep-link handoff", () => {
   }
 });
 
+describe("browser conversation handoff", () => {
+  it("trusts only servers the app is connected to, and queues what the listener accepts", async () => {
+    let options;
+    const h = loadNavigationHarness({
+      serverUrl: "http://localhost:6767/",
+      savedServerUrl: "https://saved.example.com/omnigent",
+      desktopOpenServer: async (given) => {
+        options = given;
+        return { port: 28417, close: async () => {} };
+      },
+    });
+
+    await h.api.startDesktopOpenListener();
+
+    // The window's current server, and one saved from an earlier connection.
+    assert.equal(options.isKnownOrigin("http://localhost:6767"), true);
+    assert.equal(options.isKnownOrigin("https://saved.example.com"), true);
+    assert.equal(options.isKnownOrigin("https://attacker.example"), false);
+    h.api.disposeAuth();
+  });
+
+  /** Start the listener with a short wait, and return what it hands to `openLink`. */
+  async function handoffListener(t, harnessOptions = {}) {
+    let options;
+    const h = loadNavigationHarness({
+      serverUrl: "http://localhost:6767/",
+      deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => true },
+      desktopOpenServer: async (given) => {
+        options = given;
+        return { port: 28417, close: async () => {} };
+      },
+      ...harnessOptions,
+    });
+    t.after(() => h.api.disposeAuth());
+    h.electron.app.isReady = () => true;
+    h.api.registerIpc();
+    h.api.setBrowserHandoffTimeoutMs(300);
+    await h.api.startDesktopOpenListener();
+    return { h, openLink: options.openLink };
+  }
+
+  /** The window's page, at `url`, reports the conversation it has loaded (null for none). */
+  function pageReports(h, url, conversationId) {
+    h.webContents.getURL = () => url;
+    h.ipc.get("omnigent:conversation-shown")(
+      { sender: h.webContents, senderFrame: { url } },
+      conversationId,
+    );
+  }
+
+  it("reports success only once the page says it has loaded the conversation", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    const opening = openLink("omnigent://localhost:6767/c/conv_abc");
+    let settled = false;
+    void opening.then(() => (settled = true));
+
+    // On the conversation's address, signed in or not: that alone is not success.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    await new Promise((resolve) => {
+      setTimeout(resolve, 150);
+    });
+    assert.equal(settled, false);
+
+    pageReports(h, "http://localhost:6767/c/conv_abc", "conv_abc");
+    assert.equal(await opening, true);
+    assert.deepEqual(
+      h.calls.progress.filter(({ channel }) => channel === "omnigent:open-path"),
+      [{ channel: "omnigent:open-path", data: "/c/conv_abc" }],
+    );
+  });
+
+  it("reports failure when the page never loads the conversation", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    const link = "omnigent://localhost:6767/c/conv_abc";
+
+    // A signed-out page sits on the conversation's address, then goes to sign-in.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    const signedOut = openLink(link);
+    h.webContents.getURL = () => "http://localhost:6767/login?next=/c/conv_abc";
+    assert.equal(await signedOut, false);
+
+    // Another conversation's report, or a page too old to report, is not this one.
+    pageReports(h, "http://localhost:6767/c/conv_other", "conv_other");
+    assert.equal(await openLink(link), false);
+    // A report from a frame of another origin is ignored.
+    h.webContents.getURL = () => "http://localhost:6767/c/conv_abc";
+    h.ipc.get("omnigent:conversation-shown")(
+      { sender: h.webContents, senderFrame: { url: "https://attacker.example/" } },
+      "conv_abc",
+    );
+    assert.equal(await openLink(link), false);
+    assert.equal(await openLink("not a link"), false);
+  });
+
+  it("forgets what a page reported once the window loads a new document", async (t) => {
+    const { h, openLink } = await handoffListener(t);
+    h.api.registerConversationShownReset(h.win);
+    pageReports(h, "http://localhost:6767/c/conv_abc", "conv_abc");
+    assert.equal(await openLink("omnigent://localhost:6767/c/conv_abc"), true);
+
+    // A reload that succeeds: the window stays on its server, with nothing shown yet.
+    h.emit("did-navigate", "http://localhost:6767/c/conv_abc", 200, "OK");
+
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.origin, "http://localhost:6767");
+    assert.equal(state.shownConversationId, null);
+    assert.equal(await openLink("omnigent://localhost:6767/c/conv_abc"), false);
+  });
+});
+
 /** Lets the harness window act as the panel the shell builds; returns its visible state. */
 function asPanelWindow(h) {
   const panel = { visible: false, destroyed: false };
@@ -3901,6 +4147,32 @@ describe("floating panel wiring", () => {
       ["register", chord],
       ["unregister", chord],
     ]);
+  });
+
+  it("retries a failed saved show shortcut when Settings opens, and proposes a free chord meanwhile", (t) => {
+    const refusedChords = ["Alt+Space"];
+    const h = loadNavigationHarness({ platform: "linux", refusedChords });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    const getShortcut = h.ipc.get("omnigent:get-global-shortcut");
+    // Never turned on: Settings reads it without registering anything.
+    assert.deepEqual(getShortcut(event), { enabled: false, accelerator: "Alt+Space" });
+    assert.equal(h.calls.globalShortcuts, undefined);
+
+    fs.writeFileSync(
+      h.settingsPath,
+      JSON.stringify({ global_shortcut: { enabled: true, accelerator: "Alt+Space" } }),
+    );
+    assert.deepEqual(getShortcut(event), {
+      enabled: true,
+      accelerator: "Alt+Space",
+      error: "Alt+Space isn't working. Another app may be using it.",
+      suggestion: "Control+Alt+Shift+Space",
+    });
+    refusedChords.length = 0;
+    assert.deepEqual(getShortcut(event), { enabled: true, accelerator: "Alt+Space" });
+    assert.deepEqual(h.calls.globalShortcuts.at(-1), ["register", "Alt+Space"]);
   });
 
   it("holds nothing off macOS, and says the panel isn't available there", (t) => {
@@ -3996,6 +4268,7 @@ describe("floating panel wiring", () => {
       isMinimized: () => minimized,
       getPosition: () => [200, 200],
       restore: () => (main.restored += 1),
+      show: () => {},
       focus: () => (main.focused += 1),
       webContents: Object.assign(new EventEmitter(), {
         id: 9 + h.api.windows.size,
@@ -4115,8 +4388,12 @@ describe("floating panel wiring", () => {
     assert.equal(panel.destroyed, true);
   });
 
-  const openFromPanel = async (h, routePath) => ({
-    ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(fromPanel(h), routePath)),
+  const openFromPanel = async (h, routePath, launchMessage) => ({
+    ...(await h.ipc.get("omnigent:floating-composer:open-in-main-window")(
+      fromPanel(h),
+      routePath,
+      launchMessage,
+    )),
   });
 
   for (const routePath of ["/c/abc", "/settings/import"]) {
@@ -4198,6 +4475,234 @@ describe("floating panel wiring", () => {
     assert.deepEqual(await openFromPanel(h, "/c/abc"), { ok: false, error: "window-loading" });
     assert.deepEqual(main.sent, []);
     assert.equal(panel.visible, true);
+  });
+
+  /** A main window's top document, announced as able to show the panel. */
+  const announceMain = (h, main) => {
+    const frame = { url: main.url };
+    main.webContents.mainFrame = frame;
+    const event = { sender: main.webContents, senderFrame: frame };
+    h.ipc.get("omnigent:floating-composer:announce")(event, 1);
+    return event;
+  };
+  /** The same document, also subscribed to launch offers. */
+  const subscribeMain = (h, main) => {
+    const event = announceMain(h, main);
+    h.ipc.get("omnigent:floating-composer:launch-takers")(event, true);
+    return event;
+  };
+  const launchMessage = (overrides = {}) => ({
+    text: "Fix the build",
+    skill: null,
+    files: [],
+    ...overrides,
+  });
+  const offerTo = (main) =>
+    main.sent.findLast(([channel]) => channel === "omnigent:floating-composer:launch-offer")?.[1];
+  const confirmOffer = (h, event, offerId) =>
+    h.ipc.get("omnigent:floating-composer:launch-confirm")(event, offerId);
+
+  it("offers a launch's message to the subscribed window it routes to, and resolves once that window confirms", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const bytes = new Uint8Array([1, 2]);
+    const opened = openFromPanel(
+      h,
+      "/c/abc",
+      launchMessage({ files: [{ name: "notes.txt", type: "text/plain", bytes }] }),
+    );
+    // Routed first, so the page can navigate before it takes the message.
+    assert.deepEqual(main.sent[0], ["omnigent:open-path", "/c/abc"]);
+    const offer = offerTo(main);
+    assert.deepEqual(offer, { offerId: offer.offerId, sessionId: "abc" });
+    const taken = await h.ipc.get("omnigent:floating-composer:launch-take")(event, offer.offerId);
+    assert.deepEqual(taken, {
+      text: "Fix the build",
+      skill: null,
+      files: [{ name: "notes.txt", type: "text/plain", bytes }],
+    });
+    assert.equal(await confirmOffer(h, event, offer.offerId), true);
+    assert.deepEqual(await opened, { ok: true, delivery: "page" });
+  });
+
+  it("gives a window that only announced, without subscribing, the route but no offer", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    announceMain(h, main);
+    assert.deepEqual(await openFromPanel(h, "/c/abc", launchMessage()), { ok: true });
+    assert.deepEqual(main.sent, [["omnigent:open-path", "/c/abc"]]);
+  });
+
+  it("refuses to take a window that subscribes without announcing support", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const frame = { url: main.url };
+    main.webContents.mainFrame = frame;
+    h.ipc.get("omnigent:floating-composer:launch-takers")(
+      { sender: main.webContents, senderFrame: frame },
+      true,
+    );
+    assert.deepEqual(await openFromPanel(h, "/c/abc", launchMessage()), { ok: true });
+    assert.deepEqual(main.sent, [["omnigent:open-path", "/c/abc"]]);
+  });
+
+  it("delivers the message itself when the offered window doesn't confirm in time, and refuses its late confirm", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const opened = openFromPanel(h, "/c/abc", launchMessage());
+    const offer = offerTo(main);
+    t.mock.timers.tick(FLOATING_LAUNCH_OFFER_TIMEOUT_MS - 1);
+    const taken = h.ipc.get("omnigent:floating-composer:launch-take")(event, offer.offerId);
+    assert.notEqual(taken, null, "still open a tick before the timeout");
+    t.mock.timers.tick(1);
+    assert.deepEqual(await opened, { ok: true });
+    assert.equal(await confirmOffer(h, event, offer.offerId), false);
+  });
+
+  it("ends an offer at once when its document goes or its page unsubscribes, without waiting", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    subscribeMain(h, main);
+    const gone = openFromPanel(h, "/c/abc", launchMessage());
+    main.webContents.emit("did-navigate");
+    assert.deepEqual(await gone, { ok: true });
+
+    // The reloaded document announces and subscribes again, then unsubscribes.
+    const event = subscribeMain(h, main);
+    const unsubscribed = openFromPanel(h, "/c/def", launchMessage());
+    assert.equal(offerTo(main).sessionId, "def");
+    h.ipc.get("omnigent:floating-composer:launch-takers")(event, false);
+    assert.deepEqual(await unsubscribed, { ok: true });
+  });
+
+  it("tells the panel whether the window it would route to can take a launch", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const probe = () => h.ipc.get("omnigent:floating-composer:can-hand-off")(fromPanel(h));
+    const main = addMain(h);
+    assert.equal(await probe(), false);
+    subscribeMain(h, main);
+    assert.equal(await probe(), true);
+  });
+
+  it("a decline from the offered page ends its offer at once, so the panel delivers", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const opened = openFromPanel(h, "/c/abc", launchMessage());
+    const offer = offerTo(main);
+    const decline = h.ipc.get("omnigent:floating-composer:launch-decline");
+    assert.equal(await decline(event, offer.offerId), true);
+    assert.deepEqual(await opened, { ok: true });
+    assert.equal(await confirmOffer(h, event, offer.offerId), false);
+  });
+
+  it("refuses take, confirm and decline from another window, a subframe or another origin", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    const event = subscribeMain(h, main);
+    const opened = openFromPanel(h, "/c/abc", launchMessage());
+    const offer = offerTo(main);
+    const take = h.ipc.get("omnigent:floating-composer:launch-take");
+    const decline = h.ipc.get("omnigent:floating-composer:launch-decline");
+    const foreign = addMain(h, { url: `${serverUrl}/` });
+    const foreignFrame = { url: foreign.url };
+    foreign.webContents.mainFrame = foreignFrame;
+    const refused = [
+      {
+        label: "another window",
+        event: { sender: foreign.webContents, senderFrame: foreignFrame },
+      },
+      { label: "a subframe", event: { sender: main.webContents, senderFrame: { url: main.url } } },
+    ];
+    const answers = await Promise.all(
+      refused.map(async ({ label, event: foreignEvent }) => ({
+        label,
+        took: await take(foreignEvent, offer.offerId),
+        confirmed: await confirmOffer(h, foreignEvent, offer.offerId),
+        declined: await decline(foreignEvent, offer.offerId),
+      })),
+    );
+    for (const { label, took, confirmed, declined } of answers) {
+      assert.equal(took, null, label);
+      assert.equal(confirmed, false, label);
+      assert.equal(declined, false, label);
+    }
+    // A top frame on another origin, from the offered window: only the origin check refuses it,
+    // since the window, the frame and the registry all match the offer.
+    const realFrame = main.webContents.mainFrame;
+    const realUrl = main.url;
+    const otherOriginFrame = { url: "https://evil.example/" };
+    main.webContents.mainFrame = otherOriginFrame;
+    main.url = otherOriginFrame.url;
+    const otherOrigin = { sender: main.webContents, senderFrame: otherOriginFrame };
+    try {
+      assert.equal(await take(otherOrigin, offer.offerId), null, "another origin");
+      assert.equal(await confirmOffer(h, otherOrigin, offer.offerId), false, "another origin");
+      assert.equal(await decline(otherOrigin, offer.offerId), false, "another origin");
+    } finally {
+      main.webContents.mainFrame = realFrame;
+      main.url = realUrl;
+    }
+    // Refusals leave the offer open for the page it was made to.
+    assert.deepEqual(await take(event, offer.offerId), {
+      text: "Fix the build",
+      skill: null,
+      files: [],
+    });
+    assert.equal(await confirmOffer(h, event, offer.offerId), true);
+    assert.deepEqual(await opened, { ok: true, delivery: "page" });
+  });
+
+  it("never offers a message that fails the shell's checks, or a page that isn't a session", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    openPanel(h);
+    const main = addMain(h);
+    subscribeMain(h, main);
+    assert.deepEqual(await openFromPanel(h, "/c/abc", launchMessage({ files: "notes" })), {
+      ok: true,
+    });
+    assert.deepEqual(await openFromPanel(h, "/settings/import", launchMessage()), { ok: true });
+    assert.deepEqual(main.sent, [
+      ["omnigent:open-path", "/c/abc"],
+      ["omnigent:open-path", "/settings/import"],
+    ]);
   });
 
   it("skips a more recent window that isn't showing the app for one that is", async (t) => {
@@ -5437,6 +5942,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
         sshLocalhostPreview: true,
+        trustedRemoteLocalhostPreview: true,
         floatingComposer: true,
         floatingComposerShortcut: true,
       },
@@ -5601,6 +6107,16 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         ),
         /can't be verified as Arca/,
       );
+      h.electron.dialog.showMessageBox = async () => ({ response: 1 });
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId,
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        true,
+        "a managed sandbox can still use explicit trust",
+      );
     });
   }
 
@@ -5651,7 +6167,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(resolvedUrl, `${resolvedOrigin}/omnigent`);
     assert.notEqual(resolvedUrl, serverUrl);
     const deps = h.browserIpcDeps();
-    const recover = deps.recoverAgentNavigationForEvent;
+    let recoveryRequested = false;
+    const recover = (...args) =>
+      deps.recoverAgentNavigationForEvent(...args, undefined, () => {
+        recoveryRequested = true;
+      });
     const hint = deps.getAgentNavigationHintForEvent;
     const event = { sender: h.webContents, senderFrame: { url: resolvedUrl } };
     let previewPrompts = 0;
@@ -5671,6 +6191,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       false,
     );
     assert.equal(previewPrompts, 0, "pending reconnect consent must not start another prompt");
+    assert.equal(recoveryRequested, true);
     assert.equal(h.calls.arcaConsentRuns.length, 1);
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
@@ -5683,7 +6204,13 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       () => /declined/.test(hint(event, "http://localhost:5173", hostId, hostId)),
       "decline cooldown hint",
     );
+    recoveryRequested = false;
     assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(
+      recoveryRequested,
+      true,
+      "a declined recovery still suppresses another trust prompt",
+    );
     assert.equal(h.calls.arcaConsentRuns.length, 1);
   });
 
@@ -7257,22 +7784,40 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
   });
 
-  it("keeps a declined host blocked until restart and tells the agent why", async (t) => {
-    const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
-    assert.equal((await connect()).ok, true);
-    assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
+  for (const prefixed of [false, true]) {
+    it(`keeps a declined host blocked until restart (prefixed: ${prefixed})`, async (t) => {
+      const sourceHostId = prefixed ? `host_${hostId}` : hostId;
+      const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
+      assert.equal((await connect()).ok, true);
+      assert.equal(deps.getAgentNavigationHintForEvent(event, preview, sourceHostId), null);
 
-    const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(questions.length, 1);
-    assert.equal(eligible(context()), false);
-    assert.match(
-      deps.getAgentNavigationHintForEvent(event, preview, hostId),
-      /"devbox" were declined/,
-    );
-    assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
-  });
+      const opts = {
+        sourceHostId,
+        sourceSshTarget: "devbox",
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      };
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, preview, {
+          ...opts,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      assert.equal(questions.length, 1);
+      assert.equal(eligible(context()), false);
+      assert.match(
+        deps.getAgentNavigationHintForEvent(event, preview, sourceHostId),
+        prefixed ? /this host were declined/ : /"devbox" were declined/,
+      );
+      assert.equal(
+        deps.getAgentNavigationHintForEvent(event, "https://example.com/", sourceHostId),
+        null,
+      );
+    });
+  }
 
   it("does not ask an older renderer even for a recorded destination or supplied hint", async (t) => {
     const { event, deps, questions, eligible, connect } = previewHarness(t, () => 1);
@@ -7479,6 +8024,21 @@ describe("New Window keeps its source's server (src/main.js)", () => {
     h.calls.appMenu.getMenuItemById("new_window").click();
     assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
+
+  it("opens a window cloned from a session pop-out as a normal window", async (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow("https://host.example/ml/omnigents");
+    h.setUrl("https://host.example/ml/omnigents/c/conv_1?window=session&tab=files");
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    h.calls.appMenu.getMenuItemById("new_window").click();
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(h.calls.loadURL.at(-1)[0], "https://host.example/ml/omnigents/c/conv_1?tab=files");
+    assert.equal(h.api.windows.get(h.win).sessionWindowId, undefined);
+  });
 });
 
 describe("floating panel loading", () => {
@@ -7490,6 +8050,412 @@ describe("floating panel loading", () => {
     assert.equal(
       (h.calls.loading ?? []).some((call) => call.action === "show"),
       false,
+    );
+  });
+});
+
+describe("session windows (src/main.js)", () => {
+  const serverUrl = "https://host.example/omnigent";
+  const flush = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  function openSessionWindow(h, sessionId, frameUrl = h.webContents.getURL()) {
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: frameUrl } };
+    return h.ipc.get("omnigent:open-session-window")(event, sessionId);
+  }
+
+  it("opens the session in a new window on the sender's server", async (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    await flush();
+    const { width, height, minWidth } = h.calls.windowOptions.at(-1);
+    assert.deepEqual({ width, height, minWidth }, { width: 960, height: 820, minWidth: 480 });
+    assert.equal(h.calls.loadURL.at(-1)[0], `${serverUrl}/c/conv_1?window=session`);
+    const state = h.api.windows.get(h.win);
+    assert.equal(state.serverUrl, serverUrl);
+    assert.equal(state.sessionWindowId, "conv_1");
+    assert.equal(state.role, "main");
+  });
+
+  it("keeps the main window's saved bounds when a session window moves or closes", async (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    const saved = { x: 10, y: 20, width: 1400, height: 900, maximized: false };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ window_bounds: saved }));
+    openSessionWindow(h, "conv_1");
+    await flush();
+    assert.equal(h.calls.windowOptions.at(-1).x, undefined);
+    for (const eventName of ["move", "resize", "close"]) h.emitWindow(eventName);
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).window_bounds, saved);
+  });
+
+  it("brings an open window for the session forward instead of opening another", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    h.api.windows.get(h.win).sessionWindowId = "conv_1";
+    h.setUrl(`${serverUrl}/c/conv_1?window=session`);
+    const before = h.calls.windowOptions?.length ?? 0;
+    const focusedBefore = h.calls.focused ?? 0;
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(h.calls.windowOptions?.length ?? 0, before);
+    assert.equal(h.calls.focused, focusedBefore + 1);
+  });
+
+  it("focuses a pop-out that is still loading instead of opening a duplicate", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    const popOut = {
+      focused: 0,
+      isDestroyed: () => false,
+      isMinimized: () => false,
+      show: () => {},
+      focus: () => (popOut.focused += 1),
+      webContents: { getURL: () => "" },
+    };
+    h.api.windows.set(popOut, { serverUrl, role: "main", sessionWindowId: "conv_1" });
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(openSessionWindow(h, "conv_1"), true);
+    assert.equal(h.calls.windowOptions, undefined);
+    assert.equal(popOut.focused, 2);
+  });
+
+  it("refuses untrusted pages and malformed session ids", (t) => {
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    assert.equal(openSessionWindow(h, "conv_1", "https://evil.example"), false);
+    assert.equal(openSessionWindow(h, "../settings"), false);
+    assert.equal(openSessionWindow(h, { id: "conv_1" }), false);
+    assert.equal(h.calls.windowOptions, undefined);
+  });
+});
+
+describe("settings-based remote previews", () => {
+  for (const redirected of [false, true]) {
+    it(`requires matching provenance and rereads settings (redirected: ${redirected})`, async (t) => {
+      const server = "https://server.example.com/preview";
+      const host = "sandbox-host";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createBrowserRegistryForWindow(h.win);
+      const deps = h.browserIpcDeps();
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      const opts = { sourceHostId: host, sessionHostProtocol: 1, trustedRemotePreviewProtocol: 1 };
+      const pickedServer = redirected ? "https://account.example.com/preview" : server;
+      await h.api.loadServerUrl(h.win, pickedServer);
+      h.api.setWindowServerUrl(h.win, server);
+      h.api.pinWindow(h.win, new URL(server).origin);
+      await h.win.loadURL(server);
+      const context = (options = opts) => deps.getAgentContextForEvent(event, options);
+      const allowed = h.browserRegistryDeps().allowsLocalhost;
+      const save = (serverUrl, hostId) =>
+        fs.writeFileSync(
+          h.settingsPath,
+          JSON.stringify({
+            trusted_remote_hosts: [{ server_url: serverUrl, host_id: hostId }],
+          }),
+        );
+      assert.equal(allowed(context()), false);
+      const hint = deps.getAgentNavigationHintForEvent(
+        event,
+        "http://localhost:5173",
+        host,
+        undefined,
+        false,
+        true,
+        1,
+      );
+      const advertised = JSON.parse(hint.match(/add (\{.*\}) to trusted_remote_hosts/)[1]);
+      assert.deepEqual(advertised, { server_url: server, host_id: host });
+      save(advertised.server_url, advertised.host_id);
+      assert.equal(context().serverTarget, server);
+      assert.equal(context().hostIsTrustedRemotePreview, true);
+      assert.equal(context().hostIsThisMachine, false);
+      assert.equal(allowed(context()), true);
+      for (const trustedRemotePreviewProtocol of [undefined, 0, 2]) {
+        assert.equal(allowed(context({ ...opts, trustedRemotePreviewProtocol })), false);
+      }
+      assert.equal(allowed(context({ ...opts, sourceHostId: "another-host" })), false);
+      const loaded = context();
+      h.api.setWindowServerUrl(h.win, "https://other.example.com");
+      assert.equal(allowed(loaded), false);
+      h.api.setWindowServerUrl(h.win, server);
+      assert.equal(allowed(loaded), true);
+      save("https://other.example.com", host);
+      assert.equal(allowed(loaded), false);
+      save(server, "another-host");
+      assert.equal(allowed(loaded), false);
+      fs.writeFileSync(h.settingsPath, "{}");
+      assert.equal(allowed(loaded), false);
+      assert.equal(context().hostIsTrustedRemotePreview, undefined);
+    });
+  }
+
+  it("offers an exact settings entry only for a denied localhost permission", (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const hint = (url, blocked, options = { trustedRemotePreviewProtocol: 1 }) =>
+      h
+        .browserIpcDeps()
+        .getAgentNavigationHintForEvent(
+          event,
+          url,
+          'host"quoted',
+          undefined,
+          false,
+          blocked,
+          options.trustedRemotePreviewProtocol,
+        );
+    assert.match(hint("http://localhost:5173", true), /trusted_remote_hosts/);
+    assert.ok(
+      hint("http://localhost:5173", true).includes(
+        JSON.stringify({
+          server_url: `${server}/`,
+          host_id: 'host"quoted',
+        }),
+      ),
+    );
+    assert.equal(hint("http://localhost:5173", false), null);
+    assert.equal(hint("https://example.com", true), null);
+    assert.match(hint("http://localhost:5173", true, {}), /web app.*Update it/);
+    assert.doesNotMatch(hint("http://localhost:5173", true, {}), /trusted_remote_hosts/);
+  });
+
+  it("confirms Settings grants and scopes host management to the connected server", async (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const list = h.ipc.get("omnigent:get-trusted-remote-hosts");
+    const add = h.ipc.get("omnigent:add-trusted-remote-host");
+    const remove = h.ipc.get("omnigent:remove-trusted-remote-host");
+    // IPC results cross a vm boundary, so compare plain JSON copies.
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    const other = { server_url: "https://other.example.com/", host_id: "other-host" };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ trusted_remote_hosts: [other] }));
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts++;
+      assert.match(options.detail, /Server: https:\/\/server.example.com\//);
+      assert.match(options.detail, /Host ID: abc123/);
+      assert.equal(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts.length, 1);
+      return { response: 1 };
+    };
+    assert.deepEqual(plain(await list(event)), { ok: true, serverUrl: `${server}/`, hosts: [] });
+    assert.equal((await add(event, other.server_url, "abc123")).ok, false);
+    assert.equal((await remove(event, other.server_url, other.host_id)).ok, false);
+    const unpinned = { ...event, senderFrame: { url: "https://unconnected.example.com" } };
+    assert.equal((await list(unpinned)).ok, false);
+    assert.equal((await add(unpinned, server, "abc123")).ok, false);
+    assert.equal(prompts, 0);
+    const added = plain(await add(event, `${server}/`, "ABC123"));
+    assert.equal(added.ok, true);
+    assert.deepEqual(added.hosts, [{ server_url: `${server}/`, host_id: "abc123" }]);
+    assert.deepEqual(plain((await list(event)).hosts), added.hosts);
+    assert.equal((await add(event, server, "abc123")).ok, true);
+    assert.equal(prompts, 1, "existing trust is idempotent");
+    assert.equal((await add(event, "not a url", "abc123")).ok, false);
+    const removed = plain(await remove(event, server, "ABC123"));
+    assert.equal(removed.removed, true);
+    assert.deepEqual(removed.hosts, []);
+    assert.equal((await remove(event, server, "abc123")).ok, false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts, [other]);
+  });
+
+  for (const [name, contents] of [
+    ["malformed", "{"],
+    ["non-object", "null"],
+    ["array", "[]"],
+    ["unreadable", null],
+  ]) {
+    it(`refuses to manage trust when desktop settings are ${name}`, async (t) => {
+      const server = "https://server.example.com";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createBrowserRegistryForWindow(h.win);
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      if (contents === null) fs.mkdirSync(h.settingsPath);
+      else fs.writeFileSync(h.settingsPath, contents);
+      h.electron.dialog.showMessageBox = () =>
+        assert.fail("unreadable settings must not offer a grant");
+      const list = await h.ipc.get("omnigent:get-trusted-remote-hosts")(event);
+      assert.equal(list.ok, false);
+      assert.match(list.error, /Could not read desktop settings/);
+      assert.equal(
+        (await h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        (await h.ipc.get("omnigent:remove-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        await h.browserIpcDeps().requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId: "example-host",
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      if (contents === null) assert.equal(fs.statSync(h.settingsPath).isDirectory(), true);
+      else assert.equal(fs.readFileSync(h.settingsPath, "utf8"), contents);
+    });
+  }
+
+  for (const changed of ["server", "page", "closed", "declined", "settings"]) {
+    it(`does not save a Settings grant when consent is ${changed}`, async (t) => {
+      const server = "https://server.example.com/app";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      const consent = Promise.withResolvers();
+      let prompted = false;
+      h.electron.dialog.showMessageBox = async () => {
+        prompted = true;
+        return consent.promise;
+      };
+      const pending = h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host");
+      await until(() => prompted, "native trust confirmation");
+      assert.equal(fs.existsSync(h.settingsPath), false);
+      if (changed === "server") h.api.windows.get(h.win).serverUrl = `${server}/other`;
+      if (changed === "page") h.setUrl("https://other.example.com");
+      if (changed === "closed") h.win.isDestroyed = () => true;
+      if (changed === "settings") fs.writeFileSync(h.settingsPath, "{");
+      consent.resolve({ response: changed === "declined" ? 0 : 1 });
+      assert.equal((await pending).ok, false);
+      if (changed === "settings") assert.equal(fs.readFileSync(h.settingsPath, "utf8"), "{");
+      else assert.equal(fs.existsSync(h.settingsPath), false);
+    });
+  }
+
+  it("trusts a host from the native dialog and holds a decline until restart", async (t) => {
+    const server = "https://server.example.com";
+    const host = "sandbox-host";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const opts = {
+      sourceHostId: host.toUpperCase(),
+      sessionHostProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
+    };
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts += 1;
+      assert.match(options.message, /Let sessions on/);
+      assert.match(options.detail, /Host ID: (sandbox-host|other-host)/);
+      return { response: prompts === 1 ? 1 : 0 };
+    };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", opts),
+      true,
+    );
+    assert.equal(prompts, 1);
+    assert.equal(deps.getAgentContextForEvent(event, opts).hostIsTrustedRemotePreview, true);
+    assert.equal(
+      h.browserRegistryDeps().allowsLocalhost(deps.getAgentContextForEvent(event, opts)),
+      true,
+    );
+    // A second host is asked once, declined, and not asked again this run.
+    const other = { ...opts, sourceHostId: "other-host" };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(prompts, 2);
+    const settingsRetry = await h.ipc.get("omnigent:add-trusted-remote-host")(
+      event,
+      server,
+      "other-host",
+    );
+    assert.equal(settingsRetry.ok, false);
+    assert.match(settingsRetry.error, /restart Omnigent/);
+    assert.equal(prompts, 2, "Settings IPC must not bypass a native decline");
+    assert.match(
+      deps.getAgentNavigationHintForEvent(
+        event,
+        "http://localhost:5173",
+        "other-host",
+        undefined,
+        false,
+        true,
+        1,
+      ),
+      /restart Omnigent/,
+    );
+  });
+});
+
+describe("desktop notifications", () => {
+  const server = "https://omni.example";
+  const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+  const collectGarbage = () => {
+    v8.setFlagsFromString("--expose-gc");
+    vm.runInNewContext("gc")();
+  };
+
+  it("opens the notification's session when it is clicked after garbage collection", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    await h.ipc.get("omnigent:notify")(pageEvent(h), {
+      title: "Done",
+      navigatePath: "/c/conv_abc",
+    });
+    // A toast can report `close` and still be clicked later from Notification Center.
+    h.calls.shownNotifications.at(-1).deref().emit("close");
+    await wait();
+    collectGarbage();
+    await wait();
+    collectGarbage();
+
+    const notification = h.calls.shownNotifications.at(-1).deref();
+    assert.ok(notification, "the shown notification was garbage-collected before its click");
+    notification.emit("click");
+    assert.deepEqual(h.calls.progress.at(-1), {
+      channel: "omnigent:notification-activated",
+      data: "/c/conv_abc",
+    });
+  });
+
+  it("releases clicked or failed notifications and keeps only the newest others", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    const max = h.api.maxRetainedNotifications();
+    for (let i = 0; i <= max; i++) {
+      h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done", navigatePath: `/c/${i}` });
+    }
+    const shown = h.calls.shownNotifications.map((ref) => ref.deref());
+    const retainedIndexes = () =>
+      [...h.api.retainedNotifications()].map((notification) => shown.indexOf(notification));
+    const newestIndexes = shown.map((_, index) => index).slice(1);
+    assert.deepEqual(retainedIndexes(), newestIndexes);
+
+    shown.at(-1).emit("click");
+    shown.at(-3).emit("failed");
+    assert.deepEqual(
+      retainedIndexes(),
+      newestIndexes.filter((index) => index !== max && index !== max - 2),
     );
   });
 });

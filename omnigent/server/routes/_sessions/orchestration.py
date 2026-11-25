@@ -418,6 +418,7 @@ from omnigent.server.schemas import (
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
+    SessionFamily,
     SessionListItem,
     SessionModelEvent,
     SessionPullRequestSummary,
@@ -5775,6 +5776,8 @@ async def _bind_and_launch_managed_runner(
                 tunnel_registry,
                 tracker,
                 settle_failure=False,
+                conversation_store=conversation_store,
+                host_id=managed.host_id,
             )
             if not connected:
                 reason = "managed runner did not connect after launch"
@@ -6910,6 +6913,7 @@ async def _run_managed_wake(
                 on_stage=_on_stage,
                 agent_name=agent_name,
                 slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
+                launch_state=tracker.get(session_id),
             )
         except SandboxGoneError:
             _logger.info(
@@ -15492,41 +15496,61 @@ async def _get_session_snapshot(
         observed = int(raw_window_label)
         if observed > 0:
             context_window = observed
-    # Resolve strict runner + host liveness for the open-session view.
-    # The lookup hits the conversations + hosts tables, so offload it to
-    # a worker thread (mirroring _apply_liveness_to_items). Left None on
-    # both fields when no lookup is wired (focused tests).
+    permission_store = (
+        getattr(request.app.state, "permission_store", None) if request is not None else None
+    )
+
+    def _read_overlays() -> tuple[
+        dict[str, SessionLiveness] | None,
+        dict[str, Any],
+        Host | None,
+        list[dict[str, Any]],
+        dict[str, SessionFamily] | None,
+    ]:
+        # Independent reads share one worker-thread hop: each hop waits in the
+        # default executor's queue, which dominates latency on a busy replica.
+        # Liveness hits the conversations + hosts tables; left None when no
+        # lookup is wired (focused tests).
+        liveness = liveness_lookup([session_id]) if liveness_lookup is not None else None
+        # Display costs include descendants. Empty usage marks a skipped aggregate;
+        # None would fall back to the parent's own spend and under-report it.
+        usage = (
+            load_session_usage(conv.id, conv_store, root_conversation_id=conv.root_conversation_id)
+            if include_usage
+            else {}
+        )
+        # Static signal telling the open view a host-bound, host-down session is a
+        # resumable managed host it can wake by sending a message, vs a terminal
+        # host_offline dead-end. Computed independently of liveness_lookup (the web
+        # chat passes include_liveness=False, so host_online is None here and
+        # liveness arrives via the poll/stream). One indexed host read, gated to
+        # host-bound sessions.
+        host = (
+            host_store.get_host(conv.host_id)
+            if host_store is not None and sandbox_config is not None and conv.host_id is not None
+            else None
+        )
+        pending = _pending_elicitation_snapshot_for_session(conv_store, conv)
+        families = None
+        if request is not None:
+            from omnigent.server.session_families import project_families
+
+            _, families = project_families(conv_store, permission_store, [conv], viewer_id)
+        return liveness, usage, host, pending, families
+
+    liveness, subtree_usage, host_for_resume, pending_events, families = await asyncio.to_thread(
+        _read_overlays
+    )
     runner_online: bool | None = None
     host_online: bool | None = None
-    if liveness_lookup is not None:
-        liveness = await asyncio.to_thread(liveness_lookup, [session_id])
+    if liveness is not None:
         result = liveness.get(session_id)
         if result is not None:
             runner_online = result.runner_online
             host_online = result.host_online
-    # Display costs include descendants. Empty usage marks a skipped aggregate;
-    # None would fall back to the parent's own spend and under-report it.
-    subtree_usage = (
-        await asyncio.to_thread(
-            load_session_usage,
-            conv.id,
-            conv_store,
-            root_conversation_id=conv.root_conversation_id,
-        )
-        if include_usage
-        else {}
-    )
-    # Static signal telling the open view a host-bound, host-down session is a
-    # resumable managed host it can wake by sending a message, vs a terminal
-    # host_offline dead-end. Computed independently of liveness_lookup (the web
-    # chat passes include_liveness=False, so host_online is None here and
-    # liveness arrives via the poll/stream). One indexed host read, gated to
-    # host-bound sessions.
     host_resumable = False
-    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
-        host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
-        if host_for_resume is not None:
-            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    if host_for_resume is not None and sandbox_config is not None:
+        host_resumable = host_resume_supported(host_for_resume, sandbox_config)
     # A claude-native turn waiting on its background agent keeps the collapsed
     # ``running`` status: released headless ``-p`` clients stop polling on any
     # other value and would return before the agent's result. The agents ride
@@ -15553,11 +15577,7 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        pending_elicitation_events=await asyncio.to_thread(
-            _pending_elicitation_snapshot_for_session,
-            conv_store,
-            conv,
-        ),
+        pending_elicitation_events=pending_events,
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
         agent_store=agent_store,
@@ -15565,16 +15585,7 @@ async def _get_session_snapshot(
         harness=harness,
         agent=agent,
     )
-    if request is not None:
-        from omnigent.server.session_families import project_families
-
-        _, families = await asyncio.to_thread(
-            project_families,
-            conv_store,
-            getattr(request.app.state, "permission_store", None),
-            [conv],
-            viewer_id,
-        )
+    if families is not None:
         response.family = families.get(conv.id)
         if (
             response.family

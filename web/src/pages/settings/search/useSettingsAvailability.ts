@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { desktopAppHandoffSupported } from "@/lib/desktopAppHandoff";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import {
   getDesktopFeatures,
@@ -12,6 +13,7 @@ import {
   supportsGlobalShortcut,
   supportsWidenWindowForRightSidebar,
 } from "@/lib/nativeBridge";
+import { usePaneCorners } from "@/shell/useFloatingPanes";
 
 import type { SettingsAvailability } from "./catalog/types";
 
@@ -37,6 +39,7 @@ export function useSettingsAvailability(): SettingsAvailability {
     globalShortcut && floatingComposerFlag && shellTakesPanelShortcut;
   const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   const inAppBrowser = supportsBrowser();
+  const desktopAppHandoff = desktopAppHandoffSupported();
   const adminView = useAdminViewSwitchShown();
   const accountsEnabled = loaded?.accounts_enabled === true;
   const archiveWorktreeCleanup = loaded?.archive_worktree_cleanup === true;
@@ -46,12 +49,14 @@ export function useSettingsAvailability(): SettingsAvailability {
   const projectKanban = isFeatureEnabled(info, "project_kanban");
   const sessionTitleInstructions = loaded?.session_title_instructions === true;
   const proactiveAgent = loaded?.proactive_agent_available === true;
+  const floatingPanes = usePaneCorners().available;
   return useMemo(
     () => ({
       globalShortcut,
       floatingComposerShortcut,
       widenWindowForRightSidebar,
       inAppBrowser,
+      desktopAppHandoff,
       adminView,
       accountsEnabled,
       archiveWorktreeCleanup,
@@ -60,12 +65,14 @@ export function useSettingsAvailability(): SettingsAvailability {
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,
+      floatingPanes,
     }),
     [
       globalShortcut,
       floatingComposerShortcut,
       widenWindowForRightSidebar,
       inAppBrowser,
+      desktopAppHandoff,
       adminView,
       accountsEnabled,
       archiveWorktreeCleanup,
@@ -75,6 +82,7 @@ export function useSettingsAvailability(): SettingsAvailability {
       projectKanban,
       sessionTitleInstructions,
       proactiveAgent,
+      floatingPanes,
     ],
   );
 }

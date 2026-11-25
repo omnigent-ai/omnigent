@@ -70,7 +70,10 @@ from omnigent.runner.app import (
     _publish_terminal_pending,
     _terminal_lookup_miss_log_state,
 )
-from omnigent.runner.native.orchestration import _build_pi_native_args
+from omnigent.runner.native.orchestration import (
+    _build_pi_native_args,
+    _codex_own_memory_launch,
+)
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -2583,6 +2586,287 @@ async def test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigen
     )
 
     assert captured["spec"].env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_memory", "spec_memory", "offered"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+    ids=["memory-on", "server-memory-off", "agent-memory-off"],
+)
+async def test_auto_create_claude_terminal_offers_its_own_notes_on_the_first_launch_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_memory: bool,
+    spec_memory: bool,
+    offered: bool,
+) -> None:
+    """Claude Code's existing notes are offered once, and only while its auto memory is off."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    note = tmp_path / "claude-config" / "projects" / "-home-me-repo" / "memory" / "role.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nname: role\ntype: user\n---\nBody.\n")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": server_memory})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        tool_groups=ToolGroupsConfig(memory=spec_memory),
+    )
+
+    prompts: list[str] = []
+    for _ in range(2):
+        captured: dict[str, Any] = {}
+        await _auto_create_claude_terminal(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            agent_spec=agent_spec,
+        )
+        args = captured["spec"].args
+        prompts.append(args[args.index("--append-system-prompt") + 1])
+
+    offers = [("Claude Code's own memory" in prompt) for prompt in prompts]
+    assert offers == ([True, False] if offered else [False, False])
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_keeps_the_offer_for_a_retry_after_a_failed_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch refused before Claude starts leaves the offer for the next launch, once."""
+    from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    note = tmp_path / "claude-config" / "projects" / "-home-me-repo" / "memory" / "role.md"
+    note.parent.mkdir(parents=True)
+    note.write_text("---\nname: role\ntype: user\n---\nBody.\n")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration.resolve_cli_binary",
+        lambda _name: tmp_path / "claude",
+    )
+    refusals = [ClaudeNativeHookInterpreterMismatchError("Windows-native claude")]
+
+    def _validate(_binary: Path) -> None:
+        if refusals:
+            raise refusals.pop()
+
+    monkeypatch.setattr(
+        claude_native_bridge, "validate_claude_hook_interpreter_compatibility", _validate
+    )
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": True})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json={"labels": {}})
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        tool_groups=ToolGroupsConfig(memory=True),
+    )
+    offers = tmp_path / "omnigent-data" / "memory-import-offers"
+
+    async def _launch() -> dict[str, Any]:
+        captured: dict[str, Any] = {}
+        await _auto_create_claude_terminal(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            _RecordingClaudeRegistry(captured),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            agent_spec=agent_spec,
+        )
+        return captured
+
+    with pytest.raises(ClaudeNativeHookInterpreterMismatchError):
+        await _launch()
+    assert list(offers.iterdir()) == []
+
+    prompts = []
+    for _ in range(2):
+        args = (await _launch())["spec"].args
+        prompts.append(args[args.index("--append-system-prompt") + 1])
+    assert [("Claude Code's own memory" in prompt) for prompt in prompts] == [True, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["wrapper-config-dir", "wrapper-unsets-memory-off", "child"])
+async def test_auto_create_claude_terminal_offers_the_notes_of_the_launched_claude_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """
+    The offer follows the launch Claude actually gets, and only a top-level session spends it.
+
+    An ``env`` wrapper's ``CLAUDE_CONFIG_DIR`` is offered and marked, not the runner's;
+    a wrapper that unsets the memory-off variable leaves auto memory on, so no offer;
+    a child session (here linked only by its parent id) makes no offer and no marker.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "runner-config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    wrapped = tmp_path / "wrapped-config"
+    for config_dir in (tmp_path / "runner-config", wrapped):
+        note = config_dir / "projects" / "-home-me-repo" / "memory" / "role.md"
+        note.parent.mkdir(parents=True)
+        note.write_text("---\nname: role\ntype: user\n---\nBody.\n")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+    )
+    wrapper_args = (
+        ["-u", "CLAUDE_CODE_DISABLE_AUTO_MEMORY", f"CLAUDE_CONFIG_DIR={wrapped}"]
+        if case == "wrapper-unsets-memory-off"
+        else [f"CLAUDE_CONFIG_DIR={wrapped}"]
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: [*wrapper_args, "claude", *cli_args],
+    )
+    snapshot: dict[str, Any] = {"labels": {}}
+    if case == "child":
+        snapshot["parent_session_id"] = "conv_parent"
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": True})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json=snapshot)
+
+    captured: dict[str, Any] = {}
+    await _auto_create_claude_terminal(
+        "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=httpx.AsyncClient(
+            base_url="http://test-server", transport=httpx.MockTransport(_handle_request)
+        ),
+        agent_spec=AgentSpec(
+            spec_version=1,
+            name="claude-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+            tool_groups=ToolGroupsConfig(memory=True),
+        ),
+    )
+
+    args = captured["spec"].args
+    prompt = args[args.index("--append-system-prompt") + 1]
+    assert str(tmp_path / "runner-config") not in prompt
+    offers = tmp_path / "omnigent-data" / "memory-import-offers"
+    if case == "wrapper-config-dir":
+        assert json.dumps(str(wrapped)) in prompt
+        assert len(list(offers.iterdir())) == 1
+    else:
+        assert "Claude Code's own memory" not in prompt
+        assert not offers.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_memory", "spec_memory", "overrides"),
+    [(True, True, ["features.memories=false"]), (False, True, []), (True, False, [])],
+    ids=["memory-on", "server-memory-off", "agent-memory-off"],
+)
+async def test_codex_launch_turns_its_own_memory_off_and_offers_its_notes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server_memory: bool,
+    spec_memory: bool,
+    overrides: list[str],
+) -> None:
+    """Codex's own memory goes off, and its notes are offered, only with Omnigent memory on."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    notes = tmp_path / "codex-home" / "memories" / "MEMORY.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("# Task Group: repo\n")
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"memory": server_memory})
+        ),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        tool_groups=ToolGroupsConfig(memory=spec_memory),
+    )
+
+    launches = [await _codex_own_memory_launch(agent_spec, fake_client) for _ in range(2)]
+
+    assert [launch[0] for launch in launches] == [overrides, overrides]
+    offers = ["Codex's own memory" in (launch[1] or "") for launch in launches]
+    assert offers == ([True, False] if overrides else [False, False])
+
+
+@pytest.mark.asyncio
+async def test_a_codex_child_launch_leaves_the_offer_to_its_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child's memory still goes off, but the offer waits for a top-level launch."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    notes = tmp_path / "codex-home" / "memories" / "MEMORY.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("# Task Group: repo\n")
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={"memory": True})),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        tool_groups=ToolGroupsConfig(memory=True),
+    )
+
+    child = await _codex_own_memory_launch(agent_spec, fake_client, offer=False)
+    parent = await _codex_own_memory_launch(agent_spec, fake_client)
+
+    assert child == (["features.memories=false"], None)
+    assert "Codex's own memory" in (parent[1] or "")
 
 
 @pytest.mark.asyncio
@@ -6037,8 +6321,15 @@ class _RecordingCodexRegistry:
 
     terminal_registry = None
 
-    def __init__(self, captured: dict[str, Any]) -> None:
+    def __init__(self, captured: dict[str, Any], launch_error: Exception | None = None) -> None:
         self.captured = captured
+        self.captured["calls"] = []
+        self.launch_error = launch_error
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        """Record the close and report the terminal closed."""
+        self.captured["calls"].append(("close", session_id, terminal_id))
+        return True
 
     async def launch_auxiliary_terminal(
         self,
@@ -6052,10 +6343,44 @@ class _RecordingCodexRegistry:
     ) -> SessionResourceView:
         """Record the spec and return a terminal resource view."""
         del terminal_name, session_key, resource_role, parent_os_env
+        self.captured["calls"].append(("launch", session_id))
         self.captured["spec"] = spec
+        if self.launch_error is not None:
+            raise self.launch_error
         return SessionResourceView(
             id="terminal_codex_main", type="terminal", session_id=session_id, name="codex:main"
         )
+
+
+def _recorded_codex_launch_inputs(
+    tmp_path: Path,
+    *,
+    workspace: Path,
+    codex_cli_version: tuple[int, int, int] | None,
+    terminal_launch_args: list[str] | None = None,
+) -> tuple[Any, Any]:
+    from omnigent.runner.native.orchestration import _CodexNativeLaunchConfig
+
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=codex_cli_version,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    launch_config = _CodexNativeLaunchConfig(
+        workspace=workspace,
+        policy_server_url="http://127.0.0.1:8000",
+        terminal_launch_args=terminal_launch_args,
+        model_override=None,
+        external_session_id=None,
+        fork_source_id=None,
+        fork_source_external_id=None,
+        fork_carry_history=False,
+        bypass_sandbox=False,
+    )
+    return app_server, launch_config
 
 
 async def _launch_recorded_codex_tui(
@@ -6066,41 +6391,120 @@ async def _launch_recorded_codex_tui(
     codex_cli_version: tuple[int, int, int] | None,
     terminal_launch_args: list[str] | None = None,
 ) -> Any:
-    from omnigent.runner.native.orchestration import (
-        _CodexNativeLaunchConfig,
-        _launch_codex_native_tui,
-    )
+    from omnigent.runner.native.orchestration import _launch_codex_native_tui
 
     captured: dict[str, Any] = {}
-    app_server = SimpleNamespace(
-        listen_url="ws://127.0.0.1:9876",
-        config_overrides=[],
+    app_server, launch_config = _recorded_codex_launch_inputs(
+        tmp_path,
+        workspace=workspace,
         codex_cli_version=codex_cli_version,
-        codex_path="/opt/codex/bin/codex",
-        codex_home=tmp_path / "codex-home",
-        env={},
+        terminal_launch_args=terminal_launch_args,
     )
     await _launch_codex_native_tui(
         "conv_codex_launch",
         _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
-        app_server=app_server,  # type: ignore[arg-type]
-        launch_config=_CodexNativeLaunchConfig(
-            workspace=workspace,
-            policy_server_url="http://127.0.0.1:8000",
-            terminal_launch_args=terminal_launch_args,
-            model_override=None,
-            external_session_id=None,
-            fork_source_id=None,
-            fork_source_external_id=None,
-            fork_carry_history=False,
-            bypass_sandbox=False,
-        ),
+        app_server=app_server,
+        launch_config=launch_config,
         bridge_dir=tmp_path / "bridge",
         thread_id=thread_id,
         agent_spec=None,
     )
     return captured["spec"]
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_relaunch_on_thread_replaces_the_pane_on_its_app_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving a session's TUI to another thread retracts its pane, then resumes that thread."""
+    from omnigent.runner.native.orchestration import _relaunch_codex_native_tui_on_thread
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "config-home").mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    app_server, launch_config = _recorded_codex_launch_inputs(
+        tmp_path, workspace=workspace, codex_cli_version=None
+    )
+    captured: dict[str, Any] = {}
+    published: list[tuple[str, str]] = []
+
+    await _relaunch_codex_native_tui_on_thread(
+        "conv_new",
+        "thread_fresh",
+        resource_registry=_RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        publish_event=lambda session_id, event: published.append((session_id, event["type"])),
+        app_server=app_server,
+        launch_config=launch_config,
+        bridge_dir=tmp_path / "bridge",
+        agent_spec=None,
+    )
+
+    assert captured["calls"] == [
+        ("close", "conv_new", "terminal_codex_main"),
+        ("launch", "conv_new"),
+    ]
+    assert captured["spec"].args[-4:] == [
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_fresh",
+    ]
+    assert published == [
+        ("conv_new", "session.resource.deleted"),
+        ("conv_new", "session.resource.created"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_relaunch_failure_retracts_the_closed_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed replacement launch re-raises with the closed pane already retracted."""
+    from omnigent.runner.native.orchestration import _relaunch_codex_native_tui_on_thread
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "config-home").mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    app_server, launch_config = _recorded_codex_launch_inputs(
+        tmp_path, workspace=workspace, codex_cli_version=None
+    )
+    captured: dict[str, Any] = {}
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    with pytest.raises(RuntimeError, match="tmux spawn failed"):
+        await _relaunch_codex_native_tui_on_thread(
+            "conv_new",
+            "thread_fresh",
+            resource_registry=_RecordingCodexRegistry(  # type: ignore[arg-type]
+                captured, launch_error=RuntimeError("tmux spawn failed")
+            ),
+            publish_event=lambda session_id, event: published.append((session_id, event)),
+            app_server=app_server,
+            launch_config=launch_config,
+            bridge_dir=tmp_path / "bridge",
+            agent_spec=None,
+        )
+
+    assert captured["calls"] == [
+        ("close", "conv_new", "terminal_codex_main"),
+        ("launch", "conv_new"),
+    ]
+    assert published == [
+        (
+            "conv_new",
+            {
+                "type": "session.resource.deleted",
+                "resource_id": "terminal_codex_main",
+                "resource_type": "terminal",
+                "session_id": "conv_new",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
