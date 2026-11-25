@@ -13251,12 +13251,20 @@ def debug_db_upgrade(url: str) -> None:
     "distinct user (merges admin rights). Off by default to avoid "
     "accidental privilege merges.",
 )
+@click.option(
+    "--gadget-dir",
+    default=None,
+    metavar="DIR",
+    help="The server's gadget directory (its config's gadget_location), checked so users "
+    "with gadgets are refused rather than cut off from them. Defaults to <data dir>/gadgets.",
+)
 def debug_migrate_accounts_to_oidc(
     url: str,
     maps: tuple[str, ...],
     domain: str | None,
     commit: bool,
     force: bool,
+    gadget_dir: str | None,
 ) -> None:
     """Remap user identities when switching the accounts provider to OIDC.
 
@@ -13279,6 +13287,10 @@ def debug_migrate_accounts_to_oidc(
       omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com --commit
       # Explicit per-user mapping (add --commit to apply)
       omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --map alice=alice@corp.com
+
+    Gadgets are not moved: a user who owns gadgets, has pinned ones, or has
+    been granted access to someone's is refused, and their rows stay as
+    they are. Delete or hand off those gadgets first, then run it again.
 
     \b
     IMPORTANT: always back up your database before running with
@@ -13306,7 +13318,16 @@ def debug_migrate_accounts_to_oidc(
         if not mapping:
             raise click.UsageError("nothing to migrate: pass --domain DOMAIN and/or --map OLD=NEW")
 
-        report = remap_identities(engine, mapping, dry_run=not commit, force=force)
+        gadget_location = gadget_dir or _default_gadget_location()
+        gadget_store = None
+        if Path(gadget_location).is_dir():
+            from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+            # Read only: no cleanup step and no directories made.
+            gadget_store = LocalGadgetStore(gadget_location, maintain=False)
+        report = remap_identities(
+            engine, mapping, dry_run=not commit, force=force, gadget_store=gadget_store
+        )
     finally:
         engine.dispose()
 
@@ -13345,6 +13366,11 @@ def debug_migrate_accounts_to_oidc(
         click.echo(
             "  REFUSED (NEW id already exists — re-run with --force to merge): "
             + ", ".join(report.refused)
+        )
+    if report.refused_gadgets:
+        click.echo(
+            "  REFUSED (has gadgets this remap can't move — delete or hand them off, then "
+            "re-run): " + ", ".join(report.refused_gadgets)
         )
 
     if not report.committed:

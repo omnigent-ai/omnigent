@@ -25,6 +25,13 @@ User-id-bearing columns rewritten (the full set as of this schema):
 - ``policies.created_by``
 - ``hosts.user_id`` (unique-constraint part)
 
+Gadgets are not moved: their ownership, shelves and authorship live in the gadget store
+under the old username's registration, outside these tables. A user who holds gadget data
+(owned gadgets, a shelf, or gadget grants made to them) is refused before anything of
+theirs changes, so the remap never strands it; the operator deletes or hands off those
+gadgets first. Comments and actions the user wrote on other people's gadgets keep their
+text but are no longer theirs to edit after a remap.
+
 Ordering within a mapping is load-bearing: the new ``users`` row is
 created first (so FK-bearing children can point at it), children are
 repointed next, and the old ``users`` row is deleted last (so the
@@ -52,6 +59,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.query_context import query_name_scope
 from omnigent.server.auth import _RESERVED_USERS
+from omnigent.stores.gadget_store import GadgetStore, NotFound
 
 
 def _lock_host_collisions_and_check_tombstones(
@@ -98,6 +106,8 @@ class RemapReport:
     :param refused: ``old -> new`` pairs skipped because ``new`` already
         existed as a distinct user and ``force`` was not set, e.g.
         ``["alice -> bob@example.com"]``.
+    :param refused_gadgets: ``old -> new`` pairs skipped because ``old`` holds gadget
+        data the remap cannot move, e.g. ``["alice -> alice@example.com"]``.
     :param committed: ``True`` if the transaction was committed,
         ``False`` for a dry run (changes rolled back).
     """
@@ -106,6 +116,7 @@ class RemapReport:
     per_table: dict[str, int] = field(default_factory=dict)
     skipped_missing: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
+    refused_gadgets: list[str] = field(default_factory=list)
     committed: bool = False
 
     def _bump(self, table: str, n: int = 1) -> None:
@@ -151,12 +162,42 @@ def build_domain_mapping(engine: Engine, domain: str) -> dict[str, str]:
     return mapping
 
 
+def _holds_gadget_data(session: Session, user: SqlUser, gadget_store: GadgetStore | None) -> bool:
+    """Whether *user* has gadget data a remap would strand.
+
+    Grants made to them are rows in ``gadget_shares``; their own gadgets and shelf are in
+    *gadget_store*, owned under their username's registration. Each check reads at most a
+    page. Without a store only the grants are checked.
+    """
+    from omnigent.stores.permission_store.sqlalchemy_store import holds_gadget_grants
+
+    if holds_gadget_grants(session, user.id):
+        return True
+    if gadget_store is None:
+        return False
+    from omnigent.db.account_authority import account_registration
+    from omnigent.gadgets.access import workspace_registration
+    from omnigent.gadgets.service import SHELF_ROOT
+
+    registration = workspace_registration(account_registration(user.created_at))
+    if gadget_store.owns_any(user.id, owner_registration=registration):
+        return True
+    try:
+        pinned, _ = gadget_store.user_files(user.id, owner_registration=registration).list_page(
+            SHELF_ROOT, after=None, limit=1
+        )
+    except NotFound:
+        return False
+    return bool(pinned)
+
+
 def remap_identities(
     engine: Engine,
     mapping: dict[str, str],
     *,
     dry_run: bool = True,
     force: bool = False,
+    gadget_store: GadgetStore | None = None,
 ) -> RemapReport:
     """Rewrite user-identity strings across the database in one transaction.
 
@@ -181,6 +222,8 @@ def remap_identities(
     :param dry_run: When ``True`` (default), all changes are rolled back
         and the report reflects what *would* happen. ``False`` commits.
     :param force: Allow merging onto an existing distinct ``new`` user.
+    :param gadget_store: The server's gadget store, to refuse users who own gadgets or
+        have a shelf (see the module docstring). ``None`` checks only gadget grants.
     :returns: A :class:`RemapReport` describing the outcome.
     """
     report = RemapReport(mapping=dict(mapping))
@@ -198,6 +241,10 @@ def remap_identities(
             old_user = session.get(SqlUser, (current_workspace_id(), old_id))
             if old_user is None:
                 report.skipped_missing.append(old_id)
+                continue
+
+            if _holds_gadget_data(session, old_user, gadget_store):
+                report.refused_gadgets.append(f"{old_id} -> {new_id}")
                 continue
 
             new_user = session.get(SqlUser, (current_workspace_id(), new_id))

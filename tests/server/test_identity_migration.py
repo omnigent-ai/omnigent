@@ -24,6 +24,7 @@ from omnigent.db.db_models import (
     SqlComment,
     SqlHost,
     SqlPolicy,
+    SqlUser,
 )
 from omnigent.db.enum_codecs import (
     encode_account_token_kind,
@@ -101,6 +102,77 @@ def test_remap_moves_user_grant_and_admin(db_uri: str) -> None:
     moved = perm_store.get("alice@example.com", conv_id)
     assert moved is not None and moved.level == 3
     assert perm_store.get("alice", conv_id) is None
+
+
+def _gadget_service(db_uri: str, store, user: str):  # type: ignore[no-untyped-def]
+    """*user*'s gadget service, with the viewer the gadget routes would resolve."""
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.service import GadgetService, GadgetViewer
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    registration = permissions.account_registrations([user]).get(user)
+    access = PermissionStoreGadgetAccess(store, permissions)
+    return GadgetService(store, access, GadgetViewer(user, registration))
+
+
+def test_remap_refuses_a_user_with_gadgets_and_leaves_them_reachable(
+    db_uri: str, tmp_path
+) -> None:
+    """Gadgets live outside these tables, so a user holding them is refused, not stranded."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", hash_password("password123"))
+    accounts.create_user_with_password("bob", hash_password("password123"))
+    accounts.create_user_with_password("carol", hash_password("password123"))
+    board = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+    _gadget_service(db_uri, store, "alice").pin(board["id"], {"pinned": True})
+    permissions.grant_for_gadget("bob", board["id"], 2)
+
+    report = remap_identities(
+        get_or_create_engine(db_uri),
+        {"alice": "alice@example.com", "carol": "carol@example.com"},
+        dry_run=False,
+        gadget_store=store,
+    )
+
+    assert report.refused_gadgets == ["alice -> alice@example.com"]
+    # Carol has no gadget data, so her remap goes ahead in the same run.
+    assert account_store_ids(db_uri) >= {"alice", "carol@example.com"}
+    assert accounts.get_user("carol") is None
+    # Alice keeps her gadget, her pin and her collaborator.
+    alice = _gadget_service(db_uri, store, "alice")
+    assert [item["id"] for item in alice.list_owned()["items"]] == [board["id"]]
+    assert [item["id"] for item in alice.shelf()["pinned"]] == [board["id"]]
+    assert [item["id"] for item in _gadget_service(db_uri, store, "bob").shared()["items"]] == [
+        board["id"]
+    ]
+
+
+def test_remap_refuses_a_user_granted_a_gadget_even_without_the_gadget_store(
+    db_uri: str,
+) -> None:
+    """Grants to a user are rows in this database, so they are checked with no store."""
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("bob", hash_password("password123"))
+    permissions.grant_for_gadget("bob", "0123456789abcdef0123456789abcdef", 1)
+
+    report = remap_identities(
+        get_or_create_engine(db_uri), {"bob": "bob@example.com"}, dry_run=False
+    )
+
+    assert report.refused_gadgets == ["bob -> bob@example.com"]
+    assert accounts.get_user("bob") is not None
+    assert accounts.get_user("bob@example.com") is None
+
+
+def account_store_ids(db_uri: str) -> set[str]:
+    """Every user ID in the default workspace."""
+    with Session(get_or_create_engine(db_uri)) as session:
+        return set(session.execute(select(SqlUser.id)).scalars())
 
 
 def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
@@ -380,6 +452,34 @@ def test_cli_commit_applies(db_uri: str) -> None:
     assert "COMMITTED" in result.output
     assert account_store.get_user("alice") is None
     assert account_store.get_user("alice@example.com") is not None
+
+
+def test_cli_reports_a_user_refused_for_their_gadgets(db_uri: str, tmp_path) -> None:
+    """``--gadget-dir`` names the server's gadgets, and a refused user is reported."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    _gadget_service(db_uri, store, "alice").create("Synthetic board")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--gadget-dir",
+            str(tmp_path / "gadgets"),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "REFUSED (has gadgets" in result.output
+    assert account_store.get_user("alice") is not None
 
 
 def test_cli_requires_a_mapping(db_uri: str) -> None:
