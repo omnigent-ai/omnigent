@@ -12,6 +12,7 @@ import asyncio
 import logging
 import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -19,7 +20,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import update
 
+from omnigent.db.db_models import SqlConversation
 from omnigent.db.utils import generate_agent_id, get_or_create_engine, make_managed_session_maker
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
@@ -257,7 +260,7 @@ def _seed_sessions_behind_side_chats(
     """Create visible sessions, then newer side chats; return the visible ids."""
     agent_id = generate_agent_id()
     SqlAlchemyAgentStore(db_uri).create(
-        agent_id, name="side-chat-agent", bundle_location="test:///bundle"
+        agent_id, name=f"side-chat-agent-{agent_id}", bundle_location="test:///bundle"
     )
     conv_store = SqlAlchemyConversationStore(db_uri)
     visible = {
@@ -297,6 +300,13 @@ async def test_list_sessions_side_chats_do_not_take_page_slots(
     if project:
         params["project"] = project
 
+    if project:
+        # A newer session outside the folder must stay out of the folder's page.
+        _seed_sessions_behind_side_chats(db_uri, visible_count=1, side_chat_count=0)
+    params: dict[str, str | int] = {**_SIDEBAR_LIST_PARAMS, "limit": limit}
+    if project:
+        params["project"] = project
+
     resp = await client.get("/v1/sessions", params=params)
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -304,30 +314,108 @@ async def test_list_sessions_side_chats_do_not_take_page_slots(
     assert body["has_more"] is False
 
 
-async def test_list_sessions_side_chat_refill_is_bounded(
+def _spy_store_reads(
+    monkeypatch: pytest.MonkeyPatch, between_reads: Callable[[], None] | None = None
+) -> list[tuple[int, str | None]]:
+    """Record each store page read's ``(limit, after)``; run ``between_reads`` after the first."""
+    original = SqlAlchemyConversationStore.list_conversations
+    reads: list[tuple[int, str | None]] = []
+
+    def spy(self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any) -> Any:
+        page = original(self, *args, **kwargs)
+        reads.append((kwargs["limit"], kwargs.get("after")))
+        if between_reads is not None and len(reads) == 1:
+            between_reads()
+        return page
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "list_conversations", spy)
+    return reads
+
+
+async def test_list_sessions_side_chat_reread_is_bounded(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Side chats beyond the refill budget give a short page that resumes from last_id."""
+    """Side chats beyond the re-read budget give a short page that resumes from last_id."""
     from omnigent.server.routes.sessions import routes_core
 
-    monkeypatch.setattr(routes_core, "_SIDE_CHAT_PAGE_REFILLS", 1)
+    monkeypatch.setattr(routes_core, "_SIDE_CHAT_PAGE_REREADS", 1)
     visible = _seed_sessions_behind_side_chats(db_uri, visible_count=2, side_chat_count=6)
+    reads = _spy_store_reads(monkeypatch)
 
-    # Two reads of two rows each cover only four of the six side chats.
+    # The first read and one wider re-read cover only four of the six side chats.
     first = await client.get("/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "limit": 2})
     assert first.status_code == 200, first.text
     assert first.json()["data"] == []
     assert first.json()["has_more"] is True
+    assert reads == [(2, None), (4, None)]
 
+    cursor = first.json()["last_id"]
     second = await client.get(
-        "/v1/sessions",
-        params={**_SIDEBAR_LIST_PARAMS, "limit": 2, "after": first.json()["last_id"]},
+        "/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "limit": 2, "after": cursor}
     )
     assert second.status_code == 200, second.text
     assert {row["id"] for row in second.json()["data"]} == visible
     assert second.json()["has_more"] is False
+    assert reads[2:] == [(2, cursor), (4, cursor)]
+
+
+@pytest.mark.parametrize(
+    ("order", "change"),
+    [
+        pytest.param("desc", "delete", id="desc-side-chat-deleted"),
+        pytest.param("desc", "move", id="desc-side-chat-moves-first"),
+        pytest.param("asc", "move", id="asc-session-moves-last"),
+    ],
+)
+async def test_list_sessions_reread_survives_rows_changing_between_reads(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    order: str,
+    change: str,
+) -> None:
+    """A row deleted or re-sorted between reads neither fails, duplicates, nor drops sessions."""
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(
+        agent_id, name="side-chat-agent", bundle_location="test:///bundle"
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    def create(*, side_chat: bool = False) -> str:
+        labels = {SIDE_CHAT_LABEL_KEY: "1"} if side_chat else None
+        return conv_store.create_conversation(agent_id=agent_id, labels=labels).id
+
+    # Creation order puts a side chat and one session on the first two-row read
+    # and leaves the other session for the wider re-read.
+    if order == "desc":
+        older, changed, newer = create(), create(side_chat=True), create()
+        visible = {older, newer}
+    else:
+        _side_chat, changed, newer = create(side_chat=True), create(), create()
+        visible = {changed, newer}
+
+    def change_row() -> None:
+        if change == "delete":
+            asyncio.run(conv_store.delete_conversation(changed))
+            return
+        with get_or_create_engine(db_uri).begin() as conn:
+            conn.execute(
+                update(SqlConversation)
+                .where(SqlConversation.id == changed)
+                .values(updated_at=SqlConversation.updated_at + 3600)
+            )
+
+    reads = _spy_store_reads(monkeypatch, change_row)
+    resp = await client.get(
+        "/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "order": order, "limit": 2}
+    )
+    assert resp.status_code == 200, resp.text
+    ids = [row["id"] for row in resp.json()["data"]]
+    assert sorted(ids) == sorted(visible)
+    assert resp.json()["has_more"] is False
+    assert len(reads) == 2
 
 
 # ── GET /v1/sessions/{id} (get snapshot) ────────────────────────────
