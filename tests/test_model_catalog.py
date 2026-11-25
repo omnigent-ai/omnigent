@@ -2179,6 +2179,41 @@ def test_antigravity_native_provider_follows_launch_credentials(
     assert "fake-key" not in str(listing)
 
 
+def test_antigravity_native_catalog_cache_follows_the_configured_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Changing the key at the same endpoint misses the cached verified listing."""
+    from omnigent.harnesses.antigravity_native import credentials as agy_credentials
+    from omnigent.harnesses.antigravity_native import models as agy_models
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    current = {"key": "first-fake-key"}
+    monkeypatch.setattr(
+        agy_credentials,
+        "resolve_antigravity_credentials",
+        lambda: agy_credentials.AntigravityCredentials(
+            current["key"], "https://gateway.example/gemini"
+        ),
+    )
+    monkeypatch.setattr(
+        agy_models,
+        "list_agy_cli_model_options",
+        lambda: [{"id": f"model-for-{current['key']}", "displayName": "M", "isDefault": False}],
+    )
+    spec = _worker_spec("antigravity-native")
+
+    first = catalog_for_spec(spec)["self"]
+    assert catalog_for_spec(spec)["self"] == first
+    current["key"] = "second-fake-key"
+    second = catalog_for_spec(spec)["self"]
+
+    assert first["models"] == [{"id": "model-for-first-fake-key", "family": "other"}]
+    assert second["models"] == [{"id": "model-for-second-fake-key", "family": "other"}]
+    provider = resolve_model_provider(spec, "antigravity-native")
+    assert provider.api_key is None
+    assert "second-fake-key" not in repr(provider)
+
+
 def test_antigravity_native_provider_needing_repair_reports_no_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

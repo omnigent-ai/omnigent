@@ -259,6 +259,8 @@ class ResolvedModelProvider:
     :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
+    :param credential_fingerprint: Precomputed :func:`_credential_fingerprint`
+        for a provider that does not carry its credential, e.g. native agy.
     """
 
     kind: str
@@ -270,6 +272,7 @@ class ResolvedModelProvider:
     cli: str | None = None
     model_provider: str | None = None
     detail: str = ""
+    credential_fingerprint: str | None = None
 
 
 def _model_configuration_host(base_url: str) -> str | None:
@@ -357,12 +360,17 @@ def _credential_fingerprint(provider: ResolvedModelProvider) -> str:
         ``auth_command`` string), e.g. ``"9f86d081884c7d65"``; ``""``
         when the provider carries no inline credential.
     """
+    if provider.credential_fingerprint is not None:
+        return provider.credential_fingerprint
     if provider.api_key:
-        material = f"key:{provider.api_key}"
-    elif provider.auth_command:
-        material = f"cmd:{provider.auth_command}"
-    else:
-        return ""
+        return _fingerprint_material(f"key:{provider.api_key}")
+    if provider.auth_command:
+        return _fingerprint_material(f"cmd:{provider.auth_command}")
+    return ""
+
+
+def _fingerprint_material(material: str) -> str:
+    """Return the sha256-prefix digest used to fingerprint a credential."""
     return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
@@ -627,11 +635,14 @@ def _antigravity_native_provider() -> ResolvedModelProvider:
             cli="agy",
             detail="agy Databricks profile gateway",
         )
+    # Keyed like other key providers so a changed key misses cached listings,
+    # without the provider retaining the key itself.
     return ResolvedModelProvider(
         kind=KEY_KIND,
         base_url=credentials.base_url,
         cli="agy",
         detail="agy Gemini API key",
+        credential_fingerprint=_fingerprint_material(f"key:{credentials.api_key}"),
     )
 
 
