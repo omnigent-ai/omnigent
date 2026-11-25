@@ -258,8 +258,8 @@ export function ProjectProductApproversSection({ projectId }: { projectId: strin
     <section className="flex flex-col gap-2 border-t pt-4" data-testid="project-product-approvers">
       <h3 className="font-medium text-ui">Product approvers</h3>
       <p className="text-muted-foreground text-sm">
-        A feature someone other than the owner asked for lands only after a product approver adds
-        `product-ok` on its ticket. The owner always counts.
+        A feature someone other than the owner asked for lands only after a product approver adds{" "}
+        <code className="text-xs">product-ok</code> on its ticket. The owner always counts.
       </p>
       {isOwner && (
         <form onSubmit={onSubmit} className="flex gap-2">

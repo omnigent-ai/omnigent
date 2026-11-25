@@ -248,10 +248,11 @@ describe("ProjectHomeTitle", () => {
     ).toBeVisible();
   });
 
-  it("opens project settings and offers only rename and delete in the overflow menu", () => {
+  it("opens the project's Rules page and offers only rename and delete in the overflow menu", () => {
     renderTitle();
-    fireEvent.click(screen.getByRole("button", { name: "Project settings" }));
-    expect(mocks.actions.openSettings).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Project rules and settings" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/projects/Payments?tab=rules");
+    expect(mocks.actions.openSettings).not.toHaveBeenCalled();
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Payments" }), {
       button: 0,
@@ -355,7 +356,7 @@ describe("ProjectHomeTitle", () => {
     const actions = screen.getByRole("navigation", { name: "Header actions" });
     expect(
       [...actions.querySelectorAll("button")].map((button) => button.getAttribute("aria-label")),
-    ).toEqual(["New session", "Project settings", "Project actions for Payments"]);
+    ).toEqual(["New session", "Project rules and settings", "Project actions for Payments"]);
   });
 });
 

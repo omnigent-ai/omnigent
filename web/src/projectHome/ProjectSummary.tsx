@@ -5,6 +5,7 @@ import {
   ArrowDownIcon,
   ArrowUpIcon,
   PencilIcon,
+  ScrollTextIcon,
   SquareKanbanIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -22,12 +23,14 @@ import {
   type ProjectStatusSummary,
   type ProjectStatusWindow,
 } from "@/lib/projectStatusApi";
+import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { MemberName, memberDisplayName } from "./MemberName";
 import { ProjectKpiTiles } from "./ProjectKpis";
 import { ProjectStatusItemsDialog, type StatusDrilldown } from "./ProjectStatusItems";
 import { useProjectMandate } from "./ProjectMandateDialog";
+import { type ProjectHomeView, projectRulesPath } from "./projectHomeNavigation";
 import { TicketLoadError } from "./TicketControls";
 import { TicketMarkdown } from "./ticketImages";
 import { useTicketProject } from "./useProjectTickets";
@@ -133,6 +136,12 @@ function ProjectCharter({
         <h2 className="min-w-0 flex-1 text-[length:calc(var(--text-ui)+2px)] font-bold">
           About this project
         </h2>
+        <Button asChild variant="ghost" size="sm" data-testid="project-summary-rules-link">
+          <Link to={projectRulesPath(projectName)}>
+            <ScrollTextIcon aria-hidden />
+            How this project works
+          </Link>
+        </Button>
         {canEdit && (
           <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
             <PencilIcon aria-hidden />
@@ -431,19 +440,19 @@ function NumberCell({
 }
 
 /**
- * The project's view toolbar, in the same place on both views: the Board /
- * Summary switch, an optional control after it (the board's ticket filter) and
- * optional tools at the right end.
+ * The project's view toolbar, in the same place on every view: the Board /
+ * Summary / Rules switch, an optional control after it (the board's ticket
+ * filter) and optional tools at the right end.
  */
 export function ProjectHomeTabs({
-  summaryOpen,
+  view,
   onChange,
   className,
   trailing,
   end,
 }: {
-  summaryOpen: boolean;
-  onChange: (summary: boolean) => void;
+  view: ProjectHomeView;
+  onChange: (view: ProjectHomeView) => void;
   className?: string;
   trailing?: ReactNode;
   end?: ReactNode;
@@ -457,14 +466,17 @@ export function ProjectHomeTabs({
       )}
     >
       <div role="tablist" aria-label="Project views" className="flex rounded-[9px] bg-muted p-0.5">
-        {[
-          { summary: false, label: "Board", Icon: SquareKanbanIcon },
-          { summary: true, label: "Summary", Icon: AlignLeftIcon },
-        ].map(({ summary, label, Icon }) => {
-          const selected = summaryOpen === summary;
+        {(
+          [
+            { id: "board", label: "Board", Icon: SquareKanbanIcon },
+            { id: "summary", label: "Summary", Icon: AlignLeftIcon },
+            { id: "rules", label: "Rules", Icon: ScrollTextIcon },
+          ] as const
+        ).map(({ id, label, Icon }) => {
+          const selected = view === id;
           return (
             <button
-              key={label}
+              key={id}
               type="button"
               role="tab"
               aria-selected={selected}
@@ -474,7 +486,7 @@ export function ProjectHomeTabs({
                   ? "bg-background text-foreground shadow-xs dark:bg-white/12"
                   : "text-muted-foreground hover:text-foreground",
               )}
-              onClick={() => onChange(summary)}
+              onClick={() => onChange(id)}
             >
               <Icon aria-hidden className="size-3.5" />
               <span className="text-optical">{label}</span>

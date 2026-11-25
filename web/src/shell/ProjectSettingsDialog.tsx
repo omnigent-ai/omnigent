@@ -87,9 +87,12 @@ export function ProjectSettingsDialog({
   onOpenChange,
   projectId,
   projectName,
+  defaultsOnly = false,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Only the session defaults: the Rules page shows sharing and approvers itself. */
+  defaultsOnly?: boolean;
   /** First-class project id, or `null` for a label-only folder (promoted on
    *  save — a row is created under `projectName` so its config can be stored). */
   projectId: string | null;
@@ -395,7 +398,7 @@ export function ProjectSettingsDialog({
         onInteractOutside={guardDialogDismiss}
       >
         <DialogHeader>
-          <DialogTitle>Project settings</DialogTitle>
+          <DialogTitle>{defaultsOnly ? "Session defaults" : "Project settings"}</DialogTitle>
           <DialogDescription>
             Defaults for new sessions in <span className="font-medium">{projectName}</span>. Each is
             a starting point you can change per session; leave a field blank for no default.
@@ -699,8 +702,10 @@ export function ProjectSettingsDialog({
             </Button>
           </DialogFooter>
         </form>
-        {projectId !== null && <ProjectSharingSection projectId={projectId} />}
-        {projectId !== null && <ProjectProductApproversSection projectId={projectId} />}
+        {projectId !== null && !defaultsOnly && <ProjectSharingSection projectId={projectId} />}
+        {projectId !== null && !defaultsOnly && (
+          <ProjectProductApproversSection projectId={projectId} />
+        )}
       </DialogContent>
     </Dialog>
   );

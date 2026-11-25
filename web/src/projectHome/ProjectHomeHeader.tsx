@@ -32,7 +32,7 @@ import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
 import { MOBILE_GLASS_SURFACE } from "@/shell/mobileGlass";
 import { SessionMenuHeader } from "@/shell/SessionMenuHeader";
 import { useProjectFolderMenu } from "@/shell/Sidebar";
-import { projectHomePath } from "./projectHomeNavigation";
+import { projectHomePath, projectRulesPath } from "./projectHomeNavigation";
 import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTickets";
 import { ProjectBoardActions } from "./ProjectBoardActions";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
@@ -167,15 +167,15 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             type="button"
             variant="ghost"
             size="icon-sm"
-            aria-label="Project settings"
+            aria-label="Project rules and settings"
             data-testid="project-home-settings"
             className={buttonClass}
-            onClick={actions.openSettings}
+            onClick={() => navigate(projectRulesPath(projectName))}
           >
             <Settings2Icon className={iconClass} />
           </MobileHeaderButton>
         </TooltipTrigger>
-        <TooltipContent side="bottom">Project settings</TooltipContent>
+        <TooltipContent side="bottom">Project rules and settings</TooltipContent>
       </Tooltip>
       {/* Non-modal on phones, as in the session header: a modal menu leaves itself the only touch target. */}
       <DropdownMenu

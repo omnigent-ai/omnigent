@@ -12,7 +12,10 @@ import {
 import {
   PROJECT_PANEL_PERSONA_PARAM,
   PROJECT_PANEL_SESSION_PARAM,
+  PROJECT_RULES_TAB,
   PROJECT_SUMMARY_TAB,
+  type ProjectHomeView,
+  projectHomeView,
   PROJECT_TAB_PARAM,
   isLegacyOrchestratorLink,
   projectHomePath,
@@ -28,6 +31,7 @@ import { ProjectOrchestrator, ProjectPersonaChat } from "@/projectHome/ProjectOr
 import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
 import { ProjectViewTools } from "@/projectHome/ProjectBoardActions";
+import { ProjectRules } from "@/projectHome/ProjectRules";
 import { ProjectHomeTabs, ProjectSummary } from "@/projectHome/ProjectSummary";
 import {
   TicketBoardRequesterFilter,
@@ -128,12 +132,12 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   }
 
   const [boardMine, setBoardMine] = useBoardRequesterFilter(projectId ?? null);
-  const summaryOpen =
-    tickets && !orchestrator && searchParams.get(PROJECT_TAB_PARAM) === PROJECT_SUMMARY_TAB;
-  // The Summary replaces the board, so it drops the board's ticket and panel selection.
-  const showTab = (summary: boolean) => {
-    const next = summary ? new URLSearchParams() : new URLSearchParams(searchParams);
-    if (summary) next.set(PROJECT_TAB_PARAM, PROJECT_SUMMARY_TAB);
+  const view: ProjectHomeView = tickets && !orchestrator ? projectHomeView(searchParams) : "board";
+  // Summary and Rules replace the board, so they drop its ticket and panel selection.
+  const showTab = (nextView: ProjectHomeView) => {
+    const next = nextView === "board" ? new URLSearchParams(searchParams) : new URLSearchParams();
+    if (nextView === "summary") next.set(PROJECT_TAB_PARAM, PROJECT_SUMMARY_TAB);
+    else if (nextView === "rules") next.set(PROJECT_TAB_PARAM, PROJECT_RULES_TAB);
     else next.delete(PROJECT_TAB_PARAM);
     navigate(`${projectHomePath(projectName)}${next.size ? `?${next}` : ""}`);
   };
@@ -149,13 +153,17 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
       </PageScroll>
     );
 
-  if (summaryOpen)
+  if (view !== "board")
     return (
       <div className="relative flex min-h-0 flex-1 flex-col">
         <ProjectFileViewerHost projectId={projectId} />
         <PageScroll maxWidthClassName="max-w-none" extraTop={isMobile ? "0.25rem" : "0.5rem"}>
-          <ProjectHomeTabs summaryOpen onChange={showTab} end={viewTools} />
-          <ProjectSummary key={projectName} projectName={projectName} />
+          <ProjectHomeTabs view={view} onChange={showTab} end={viewTools} />
+          {view === "summary" ? (
+            <ProjectSummary key={projectName} projectName={projectName} />
+          ) : (
+            <ProjectRules key={projectName} projectName={projectName} />
+          )}
         </PageScroll>
       </div>
     );
@@ -174,7 +182,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
       >
         {tickets && !ticketFillsPage && (
           <ProjectHomeTabs
-            summaryOpen={false}
+            view="board"
             onChange={showTab}
             end={viewTools}
             trailing={
