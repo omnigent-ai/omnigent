@@ -72,11 +72,11 @@ def test_a_runs_sidebar_card_follows_its_steps(
 
     # The card stays open on the row and follows the run while the step runs.
     row.hover()
-    expect(tasks).to_contain_text("1/2 · Open PRs for safe upgrades", timeout=30_000)
-    expect(tasks).to_contain_text("2/2 · All done", timeout=60_000)
+    expect(tasks).to_contain_text("1/2Open PRs for safe upgrades", timeout=30_000)
+    expect(tasks).to_contain_text("2/2All done", timeout=60_000)
     # The row itself stays one line.
     expect(row).not_to_contain_text("All done")
     # The list a reload reads carries it too.
     page.reload()
     row.hover()
-    expect(tasks).to_contain_text("2/2 · All done", timeout=15_000)
+    expect(tasks).to_contain_text("2/2All done", timeout=15_000)

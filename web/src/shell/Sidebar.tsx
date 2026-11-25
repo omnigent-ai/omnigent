@@ -5836,26 +5836,30 @@ const PLAN_LEAD_TONES = {
 } as const;
 
 // A workflow run's card row: its finished steps, then the step it's on or how it
-// finished, e.g. "3/5 · Open PRs for safe upgrades", with "+2" for more in progress.
+// finished, with "+2" for more in progress. The step gets a line of its own, so a
+// long name wraps instead of truncating.
 function SessionTasksDetail({ line }: { line: PlanProgressLine }) {
   return (
-    <SessionTooltipDetail
-      label="Tasks"
-      icon={ListTodoIcon}
-      testId="session-tooltip-tasks"
-      suffix={line.more > 0 ? `+${line.more}` : undefined}
-    >
-      <span className="tabular-nums">
-        {line.finished}/{line.total}
-      </span>
-      {" · "}
-      {line.lead && (
-        <>
-          <span className={PLAN_LEAD_TONES[line.lead.tone]}>{line.lead.text}</span>:{" "}
-        </>
-      )}
-      {line.text}
-    </SessionTooltipDetail>
+    <div data-testid="session-tooltip-tasks" className="flex flex-col gap-0.5 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <span className="shrink-0 text-muted-foreground">Tasks</span>
+        <span className="flex items-center gap-1.5">
+          <ListTodoIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="tabular-nums">
+            {line.finished}/{line.total}
+          </span>
+        </span>
+      </div>
+      <p className="line-clamp-2 break-words">
+        {line.lead && (
+          <>
+            <span className={PLAN_LEAD_TONES[line.lead.tone]}>{line.lead.text}</span>:{" "}
+          </>
+        )}
+        {line.text}
+        {line.more > 0 && <span className="text-muted-foreground"> +{line.more}</span>}
+      </p>
+    </div>
   );
 }
 

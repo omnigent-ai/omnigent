@@ -596,7 +596,7 @@ describe("Sidebar session list", () => {
     fireEvent.pointerMove(link, { pointerType: "mouse" });
     const card = await screen.findByTestId("session-tooltip-content");
     const tasks = () => within(card).getByTestId("session-tooltip-tasks");
-    expect(tasks()).toHaveTextContent("Tasks2/5 · Open PRs for safe upgrades+2");
+    expect(tasks()).toHaveTextContent("Tasks2/5Open PRs for safe upgrades +2");
 
     mockConversations([
       run(
@@ -610,10 +610,10 @@ describe("Sidebar session list", () => {
       ),
     ]);
     refresh();
-    expect(tasks()).toHaveTextContent("3/5 · Waiting for you: Approve major upgrades");
+    expect(tasks()).toHaveTextContent("3/5Waiting for you: Approve major upgrades");
     mockConversations([run({ total: 5, done: 4, failed: 1 })]);
     refresh();
-    expect(tasks()).toHaveTextContent("5/5 · Finished, 1 failed");
+    expect(tasks()).toHaveTextContent("5/5Finished, 1 failed");
     // A cleared summary takes the row away.
     mockConversations([run(null)]);
     refresh();
@@ -633,9 +633,7 @@ describe("Sidebar session list", () => {
 
     fireEvent.focus(screen.getByRole("link", { name: "pinned_run" }));
     const card = await screen.findByTestId("pinned-project-flyout");
-    expect(within(card).getByTestId("session-tooltip-tasks")).toHaveTextContent(
-      "1/3 · Next: Ship it",
-    );
+    expect(within(card).getByTestId("session-tooltip-tasks")).toHaveTextContent("1/3Next: Ship it");
   });
 
   describe.each(["legacy", "grouping", "pinned"] as const)(
