@@ -111,6 +111,8 @@ describe("trusted remote host requests", () => {
     };
     assert.equal(await requests.request("not a url", HOST, approve), false);
     assert.equal(await requests.request(SERVER, "", approve), false);
+    assert.equal(await requests.request(SERVER, "line\nbreak", approve), false);
+    assert.equal(await requests.request(SERVER, "a".repeat(65), approve), false);
     assert.equal(approvals, 0);
   });
 });

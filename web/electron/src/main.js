@@ -6573,7 +6573,7 @@ function registerIpc() {
       const serverUrl = normalizedServerTarget(senderServerUrl(event));
       if (!serverUrl) return false;
       // A declined or failed SSH check must not lead to another permission question.
-      if (sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)) return false;
+      if (sshPreviewHosts.hint(senderServerUrl(event), opts?.sourceHostId)) return false;
       return requestTrustedRemoteHost(event, serverUrl, sourceHostId);
     },
     getAgentNavigationHintForEvent: (

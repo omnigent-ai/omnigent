@@ -2,11 +2,13 @@
 
 const { normalizedServerTarget: trustedRemoteTarget } = require("./hostStatusIdentity");
 
+const TRUSTED_HOST_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
 /** Normalize a session host ID for comparison; the `host_` prefix is not significant. */
 function normalizeTrustedHostId(hostId) {
   if (typeof hostId !== "string") return null;
   const normalized = hostId.replace(/^host_/, "").toLowerCase();
-  return normalized === "" ? null : normalized;
+  return TRUSTED_HOST_ID_RE.test(normalized) ? normalized : null;
 }
 
 /**

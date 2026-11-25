@@ -7647,29 +7647,40 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
   });
 
-  it("keeps a declined host blocked until restart and tells the agent why", async (t) => {
-    const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
-    assert.equal((await connect()).ok, true);
-    assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
+  for (const prefixed of [false, true]) {
+    it(`keeps a declined host blocked until restart (prefixed: ${prefixed})`, async (t) => {
+      const sourceHostId = prefixed ? `host_${hostId}` : hostId;
+      const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
+      assert.equal((await connect()).ok, true);
+      assert.equal(deps.getAgentNavigationHintForEvent(event, preview, sourceHostId), null);
 
-    const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(
-      await deps.requestTrustedRemoteHostForEvent(event, preview, {
-        ...opts,
-        trustedRemotePreviewProtocol: 1,
-      }),
-      false,
-    );
-    assert.equal(questions.length, 1);
-    assert.equal(eligible(context()), false);
-    assert.match(
-      deps.getAgentNavigationHintForEvent(event, preview, hostId),
-      /"devbox" were declined/,
-    );
-    assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
-  });
+      const opts = {
+        sourceHostId,
+        sourceSshTarget: "devbox",
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      };
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, preview, {
+          ...opts,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      assert.equal(questions.length, 1);
+      assert.equal(eligible(context()), false);
+      assert.match(
+        deps.getAgentNavigationHintForEvent(event, preview, sourceHostId),
+        prefixed ? /this host were declined/ : /"devbox" were declined/,
+      );
+      assert.equal(
+        deps.getAgentNavigationHintForEvent(event, "https://example.com/", sourceHostId),
+        null,
+      );
+    });
+  }
 
   it("does not ask an older renderer even for a recorded destination or supplied hint", async (t) => {
     const { event, deps, questions, eligible, connect } = previewHarness(t, () => 1);

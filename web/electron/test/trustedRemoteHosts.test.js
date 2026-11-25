@@ -36,6 +36,22 @@ describe("trusted remote hosts", () => {
     assert.equal(normalizeTrustedHostId("host_ABC"), "abc");
     assert.equal(normalizeTrustedHostId(""), null);
     assert.equal(normalizeTrustedHostId(null), null);
+    assert.equal(normalizeTrustedHostId("a".repeat(64)), "a".repeat(64));
+    assert.equal(
+      normalizeTrustedHostId("01234567-89ab-cdef-0123-456789abcdef"),
+      "01234567-89ab-cdef-0123-456789abcdef",
+    );
+    for (const invalid of [
+      " leading",
+      "trailing ",
+      "line\nbreak",
+      "tab\tname",
+      "nul\0name",
+      "name\u202e",
+      "a".repeat(65),
+    ]) {
+      assert.equal(normalizeTrustedHostId(invalid), null);
+    }
   });
 
   it("keeps valid settings entries and drops malformed ones", () => {
