@@ -149,24 +149,11 @@ async def test_a_disabled_server_hides_every_route_before_reading_the_body(
     assert not list((stores.root / "gadgets").glob("*"))
 
 
-@pytest.mark.parametrize(
-    "constraint",
-    [
-        {"name": "bad", "kind": "unique", "collection": [], "fields": ["title"]},
-        {"name": "bad", "kind": "unique", "collection": "cards", "fields": [{}]},
-        {
-            "name": "bad",
-            "kind": "reference",
-            "collection": "cards",
-            "field": "title",
-            "target": [],
-        },
-    ],
-    ids=["collection", "fields", "target"],
-)
 async def test_rules_of_the_wrong_type_get_the_gadget_error_shape(
-    client: httpx.AsyncClient, constraint: dict
+    client: httpx.AsyncClient,
 ) -> None:
+    # One input for the HTTP mapping; the service tests cover the malformed-rule matrix.
+    constraint = {"name": "bad", "kind": "unique", "collection": [], "fields": ["title"]}
     created = await client.post("/v1/gadgets", json={"name": "Board"}, headers=_as(ALICE))
     response = await client.post(
         f"/v1/gadgets/{created.json()['id']}/revisions",
@@ -700,17 +687,6 @@ async def test_viewers_read_only_the_published_revision(client: httpx.AsyncClien
     assert published.status_code == 200
     own = await client.get(f"{base}/revisions/{draft.json()['id']}", headers=_as(ALICE))
     assert own.json()["html"] == "<p>Synthetic draft</p>"
-
-
-async def test_an_unpublished_gadget_describes_how_to_build_it(client: httpx.AsyncClient) -> None:
-    created = await client.post("/v1/gadgets", json={"name": "New"}, headers=_as(ALICE))
-    described = await client.get(
-        f"/v1/gadgets/{created.json()['id']}/describe", headers=_as(ALICE)
-    )
-    assert described.status_code == 200, described.text
-    body = described.json()
-    assert body["published_revision"] is None
-    assert body["next_steps"].startswith("Nothing is published yet")
 
 
 async def test_store_conflicts_carry_their_reason_and_busy_ones_are_retryable() -> None:

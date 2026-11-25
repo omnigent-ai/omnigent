@@ -68,7 +68,8 @@ with their own terminal retain the switcher.
   ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
   chords work only while those buttons show. ⌘/Ctrl+Alt+Shift+] / [ focus the
   next / previous pane. All of them work with focus inside a terminal.
-- On desktop with `workspace_sidebar_v2` on, a session owner's Terminal view is
+- On desktop with `workspace_sidebar_v2` on (and the `gadgets` feature off: with it
+  on, sessions keep the classic sidebar), a session owner's Terminal view is
   the panes view: the agent's terminal is one pane, ⌘D splits it with a shell,
   ⌘⌥ plus an arrow key moves between panes, ⌘K lists the pane commands, and each
   pane's title strip has a menu with Close Pane. While a split shows, Chat keeps

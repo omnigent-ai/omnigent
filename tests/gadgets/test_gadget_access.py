@@ -221,9 +221,23 @@ def test_a_gadget_belongs_to_its_owner_only_in_the_workspace_it_was_made_in(
         return GadgetService(store, access, GadgetViewer(ALICE, registration), None)
 
     if registered:
+        # A registered account in each workspace, made at the same time: the same
+        # registration in both, so only the workspace tells the gadgets apart.
+        from sqlalchemy import update
+
+        from omnigent.db.db_models import SqlUser
+
         for workspace in (1, 2):
             with workspace_scope(workspace):
                 grants.ensure_user(ALICE)
+                with grants._session("test_register") as session:
+                    session.execute(
+                        update(SqlUser)
+                        .where(SqlUser.workspace_id == workspace, SqlUser.id == ALICE)
+                        .values(created_at=1_700_000_000)
+                    )
+        with workspace_scope(1):
+            assert workspace_registrations(grants, [ALICE])[ALICE] is not None
     with workspace_scope(1):
         made = service().create("Board")
         assert access.permissions(ALICE, store.get(made["id"])) == FULL_ACCESS

@@ -316,12 +316,7 @@ async function recordWithRetries(
   }
 }
 
-/**
- * Called when a session started from the gadget exists: shows the gadget in that session's side
- * panel, which also makes it the viewer's gadget session, and records as delivered there the
- * actions whose requests its first message carried. The viewer may have edited New session's
- * prompt, so an action whose request isn't in `firstMessage` stays undelivered.
- */
+/** Links a newly created session to the gadget; delivery acknowledgement is separate. */
 export async function adoptStartedGadgetSession(
   appId: string,
   sessionId: string,

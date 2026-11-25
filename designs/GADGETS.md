@@ -89,7 +89,9 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
   revisions roll into segments; its newest is found by probing segment starts by number and
   listing only the newest segment. Deleted records give their capacity back after a retention
   period (seven days by default) when the store can delete, and removed files go a bounded
-  number per step.
+  number per step: the trash is read one entry at a time, an owner's index skips a bounded
+  number of retired segments per call, and deleted accounts' cleanups wait in a segmented
+  queue read a segment or two at a time.
 - **Lifecycle follows the data directory.** Backing up or moving `<data_dir>` carries gadgets
   with sessions; deleting a gadget or an account removes its scope in one rename.
 
@@ -155,7 +157,8 @@ revokes the account's sessions but keeps the registration, so nothing in the gad
 changes, while a username registered again gets a new registration and starts with nothing.
 Deleting an account deletes its registration's gadgets, with their grants and its shelf, once
 the deletion commits; until that cleanup finishes, they are shared with no one, even if the
-username is registered again meanwhile.
+username is registered again meanwhile. Deleting also marks the registration for good, so a
+create or shelf write that was already on its way and lands after the cleanup queues it again.
 
 The frame's write and action controls follow these: the SDK disables controls marked
 `data-omnigent-requires="write"` or `"action"` for viewers without that access.

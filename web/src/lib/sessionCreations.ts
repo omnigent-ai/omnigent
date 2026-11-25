@@ -1,8 +1,4 @@
-// Sessions this tab created, with each one's first message. A create is an attempt:
-// `beginSessionCreation` numbers it, and it ends as a created session
-// (`noteSessionCreatedHere`) or a failure (`noteSessionCreationFailed`). A page can bind its
-// work to the attempt it saw begin. That a session exists is not that its first message was
-// taken: `noteFirstInputAccepted` reports that, with the text the server accepted.
+// Tracks sessions created by this tab and acceptance of their first input.
 type CreatedListener = (
   sessionId: string,
   firstMessage: string | null,

@@ -65,7 +65,8 @@ the header menu), and each place is a separate entry point.
   under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,
   Rename, Mark as unread, Create automation, Archive or Unarchive, and Delete.
   The QuickPick palette (`quick_pick_palette`) always lists them; the default
-  palette lists them where `workspace_sidebar_v2` shows feature commands. They're
+  palette lists them where `workspace_sidebar_v2` shows feature commands (with the
+  `gadgets` feature on, sessions keep the classic sidebar, so it doesn't). They're
   offered to the session's owner, as the header menu is; one that can't run
   stays listed with the reason, and a dialog such as Rename opens with focus in
   it. With `quick_pick_palette`, **Go to Session…** turns the open palette into
@@ -1552,7 +1553,10 @@ its discoverability.
   full screen, and `web/src/gadgets/ui/GadgetOpenSessionButton.test.tsx` the menu.
   By hand: start a local server with `OMNIGENT_FEATURES=gadgets`, create a gadget
   from the Gadget page, open it from the sidebar pin (sidebar stays) and from its
-  copied link in a new tab (sidebar collapses).
+  copied link in a new tab (sidebar collapses). The templates' own buttons send
+  actions to the gadget's session the same way: Data story's **Find stories in my
+  work** (before a story exists) and **Refresh data**, and the agent-designed views'
+  **Back to the previous look**; `web/src/gadgets/templates/*.test.ts` drive them.
 
 ## Gotchas
 
