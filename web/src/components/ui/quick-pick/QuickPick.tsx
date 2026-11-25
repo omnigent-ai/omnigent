@@ -367,21 +367,23 @@ function navigationFor(
 const PREVIEW_HEIGHT = "h-[min(24rem,60vh)]";
 
 /**
- * The list alone, or beside the active row's preview when the picker has one (`preview` is
- * undefined without one, and null while no row is active).
+ * The list alone, or beside the active row's preview when the picker has one. A row with
+ * nothing to preview, or no active row, shows "No preview" in the same place.
  */
 function PreviewBeside({
+  enabled,
   preview,
   fillHeight,
   hidden,
   children,
 }: {
-  preview: ReactNode | undefined;
+  enabled: boolean;
+  preview: ReactNode;
   fillHeight: boolean;
   hidden: boolean;
   children: ReactNode;
 }) {
-  if (preview === undefined) return children;
+  if (!enabled) return children;
   return (
     <div className={cn("flex min-h-0", fillHeight && "flex-1", hidden && "hidden")}>
       {children}
@@ -392,10 +394,12 @@ function PreviewBeside({
           fillHeight ? "min-h-0" : PREVIEW_HEIGHT,
         )}
       >
-        {preview ?? (
+        {preview === undefined || preview === null || preview === false ? (
           <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
             No preview
           </div>
+        ) : (
+          preview
         )}
       </div>
     </div>
@@ -1168,7 +1172,8 @@ export function QuickPick<Value>({
       </div>
       {belowInput}
       <PreviewBeside
-        preview={renderPreview && (activeRow ? renderPreview(activeRow.item) : null)}
+        enabled={renderPreview !== undefined}
+        preview={renderPreview && activeRow ? renderPreview(activeRow.item) : null}
         fillHeight={fillHeight}
         hidden={collapsed}
       >

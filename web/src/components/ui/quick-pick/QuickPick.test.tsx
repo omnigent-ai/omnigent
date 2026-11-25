@@ -943,6 +943,15 @@ describe("QuickPick preview", () => {
     fireEvent.change(input, { target: { value: "zzz-no-match" } });
     expect(preview()).toHaveTextContent("No preview");
   });
+
+  it("keeps the pane, saying there's no preview, for a row that renders none", () => {
+    const { input } = renderPicker({
+      renderPreview: (row) => (row.label === "New session" ? undefined : <p>Preview</p>),
+    });
+    expect(preview()).toHaveTextContent("No preview");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(preview()).toHaveTextContent("Preview");
+  });
 });
 
 describe("QuickPick content below the query field", () => {
