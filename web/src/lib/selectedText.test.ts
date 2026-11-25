@@ -16,4 +16,9 @@ describe("searchQueryFromSelection", () => {
     expect(searchQueryFromSelection("x".repeat(4096))).toHaveLength(4096);
     expect(searchQueryFromSelection("x".repeat(4097))).toBeNull();
   });
+
+  it("counts the limit in characters, as the search routes do, not UTF-16 units", () => {
+    expect(searchQueryFromSelection("😀".repeat(4096))).toHaveLength(8192);
+    expect(searchQueryFromSelection("😀".repeat(4097))).toBeNull();
+  });
 });
