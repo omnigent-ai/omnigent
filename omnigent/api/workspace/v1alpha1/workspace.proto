@@ -900,8 +900,8 @@ message ListReviewThreadCommentsResponse {
 
 message ListLabelsRequest {
   string pr_url = 1;
-  // Labels whose name matches; unset lists the repository's labels. A host
-  // without label search answers INVALID_ARGUMENT when it's set.
+  // Labels whose name matches; unset lists the repository's labels.
+  // Not supported yet: setting this field returns INVALID_ARGUMENT.
   string text = 2;
 }
 
