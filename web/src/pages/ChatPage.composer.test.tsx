@@ -1775,9 +1775,10 @@ describe("Composer slash-command menu", () => {
       expect(listLoops).toHaveBeenCalledExactlyOnceWith("conv_test");
       expect(cancelTimer).not.toHaveBeenCalled();
       expect(textarea()).toHaveValue("");
-      // The loop is never sent to the agent as text.
-      expect(onSend).not.toHaveBeenCalled();
       expect(await screen.findByText(/^Loop armed: every 5m/)).toBeVisible();
+      // The command itself never reaches the agent; the prompt runs once now, as an
+      // ordinary message, and then on every tick.
+      expect(onSend).toHaveBeenCalledExactlyOnceWith("check CI");
     },
   );
 
@@ -1826,14 +1827,15 @@ describe("Composer slash-command menu", () => {
     expect(textarea()).toHaveValue(typed);
   });
 
-  it("/loop shows a refused timer under the composer", async () => {
-    const { setTimer } = renderLoopComposer("claude-sdk", savesTimers);
+  it("/loop shows a refused timer under the composer and does not run the prompt", async () => {
+    const { setTimer, onSend } = renderLoopComposer("claude-sdk", savesTimers);
     setTimer.mockRejectedValueOnce(new Error("This session is archived, so it can't take timers"));
     fireEvent.change(textarea(), { target: { value: "/loop 5m check CI" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(
       await screen.findByText("This session is archived, so it can't take timers"),
     ).toBeVisible();
+    expect(onSend).not.toHaveBeenCalled();
   });
 
   it.each([

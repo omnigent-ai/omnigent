@@ -3617,15 +3617,18 @@ function ComposerImpl(
             repeat: true,
             note: command.prompt,
           });
+          // Like Claude Code's /loop: run the prompt now rather than waiting for the
+          // first tick. Sent as an ordinary message so the first run has a visible cause.
+          appendEntry(`${cmd} ${arg}`);
+          onSend(command.prompt);
           const every = formatLoopInterval(timer.intervalSeconds ?? command.seconds);
-          const firstRun = new Date(timer.fireAt);
-          const firstRunLabel = Number.isNaN(firstRun.getTime())
+          const nextRun = new Date(timer.fireAt);
+          const nextRunLabel = Number.isNaN(nextRun.getTime())
             ? ""
-            : `, first run at ${firstRun.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+            : `, next run at ${nextRun.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
           setCommandError(
-            `Loop armed: every ${every}${firstRunLabel}${existing.length > 0 ? ", replacing the previous loop" : ""}. ` +
-              "It repeats until /loop stop and survives runner restarts; each run is sent " +
-              "as a message, so it joins a turn already in progress.",
+            `Loop armed: every ${every}${nextRunLabel}${existing.length > 0 ? ", replacing the previous loop" : ""}. ` +
+              "Running the prompt now; it repeats until /loop stop and survives runner restarts.",
           );
         })().catch((err: unknown) => {
           setCommandError(err instanceof Error ? err.message : "Loop failed");
