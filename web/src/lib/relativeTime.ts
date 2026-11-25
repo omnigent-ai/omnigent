@@ -55,3 +55,23 @@ export function absoluteTime(timestampMs: number): string {
   if (!Number.isFinite(timestampMs)) return "";
   return new Date(timestampMs).toLocaleString();
 }
+
+const UNITS: readonly [limitSeconds: number, unit: Intl.RelativeTimeFormatUnit, seconds: number][] =
+  [
+    [60, "second", 1],
+    [3_600, "minute", 60],
+    [86_400, "hour", 3_600],
+    [2_592_000, "day", 86_400],
+    [Infinity, "month", 2_592_000],
+  ];
+
+/** "4 days ago", "yesterday", as a card reads its time in a sentence. */
+export function longRelativeTime(time: number, now: number = Date.now()): string {
+  const seconds = Math.round((time - now) / 1000);
+  const absolute = Math.abs(seconds);
+  const [, unit, size] = UNITS.find(([limit]) => absolute < limit)!;
+  return new Intl.RelativeTimeFormat(undefined, { numeric: "auto" }).format(
+    Math.round(seconds / size),
+    unit,
+  );
+}

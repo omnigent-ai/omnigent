@@ -34,7 +34,7 @@ export interface PullRequestReferenceContext {
 /** A repository the session's checkout names, on a host whose PR links are known. */
 export interface ContextRepository {
   /** Null while it's still unknown whether the host serves GitHub. */
-  provider: "github" | null;
+  provider: "github" | "gitspoke" | null;
   host: string;
   /** `owner/repo`. */
   repository: string;
@@ -273,4 +273,24 @@ export function parsePullRequestReference(
   if (/^[a-z][\w+.-]*:\/\//i.test(input)) return parseLink(input, context);
   if (SCHEMELESS_LINK.test(input)) return parseLink(`https://${input}`, context);
   return null;
+}
+
+/** The host, `owner/repo`, and number in a GitHub pull request link, or null. */
+export function githubPullRequestLocation(
+  url: string | null | undefined,
+): { host: string; repository: string; number: number } | null {
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const match = GITHUB_PULL_PATH.exec(parsed.pathname);
+  if (!match || !/^https?:$/.test(parsed.protocol)) return null;
+  return {
+    host: parsed.hostname.toLowerCase(),
+    repository: `${match[1]}/${match[2]}`,
+    number: Number(match[3]),
+  };
 }
