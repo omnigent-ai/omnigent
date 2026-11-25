@@ -31,18 +31,13 @@ _KNOWN_GAPS = {
     **contract.gaps(
         "R1: the permission hook retries at most every 30s, so the card is gone for up "
         "to 30s after the server returns and an approval in that gap is lost",
-        [(contract.APPROVAL_PENDING, 60)],
+        [(contract.APPROVAL_PENDING, 60), (contract.APPROVAL_PENDING, 120)],
     ),
     **contract.gaps(
         "R1: Codex re-POSTs its approval at most every 30s, so the card returns up to 30s "
         "after the server and an approval in that gap is lost",
         [(contract.APPROVAL_PENDING, 60), (contract.APPROVAL_PENDING, 120)],
         harnesses=("codex",),
-    ),
-    **contract.gaps(
-        "R2: after 8 consecutive failed re-POSTs (~90s) the permission hook falls back "
-        "to the terminal prompt; the web card never returns and the turn stays blocked",
-        [(contract.APPROVAL_PENDING, 120)],
     ),
 }
 
