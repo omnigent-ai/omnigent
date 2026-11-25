@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -78,6 +79,16 @@ def _layout(tmp_path: Path) -> Path:
     _worktree_metadata(tmp_path / "outside-metadata", workspace / ".git")
     (workspace / "metadata-back").mkdir()
     (workspace / "metadata-back" / ".git").write_text(f"gitdir: {tmp_path / 'outside-metadata'}\n")
+    # Repositories inside the workspace whose objects or refs come from the one outside.
+    outside_store = other / ".git"
+    borrowed = _repository(workspace / "borrowed") / ".git" / "objects" / "info"
+    (borrowed / "alternates").write_text(f"{outside_store / 'objects'}\n")
+    http_borrowed = _repository(workspace / "http-borrowed") / ".git" / "objects" / "info"
+    (http_borrowed / "http-alternates").write_text("https://example.com/objects\n")
+    for name, part in (("linked-objects", "objects"), ("linked-refs", "refs")):
+        store = _repository(workspace / name) / ".git" / part
+        shutil.rmtree(store)
+        store.symlink_to(outside_store / part)
     return workspace
 
 
@@ -149,6 +160,10 @@ async def _refusal(workspace: Path, repository: str) -> str:
         ("forged", "belongs to a repository outside the workspace"),
         ("elsewhere", "has its working tree outside the workspace"),
         ("metadata-back", "belongs to a repository outside the workspace"),
+        ("borrowed", "reads objects or refs from outside the workspace"),
+        ("http-borrowed", "reads objects or refs from outside the workspace"),
+        ("linked-objects", "reads objects or refs from outside the workspace"),
+        ("linked-refs", "reads objects or refs from outside the workspace"),
         ("INSIDE_LARGER:outer-git", "belongs to a repository outside the workspace"),
         ("INSIDE_LARGER:inner-metadata", "belongs to a repository outside the workspace"),
     ],
@@ -274,6 +289,8 @@ _CALLS: dict[str, Callable[[WorkspaceServiceClient, str], Awaitable[Any]]] = {
         "forged",
         "elsewhere",
         "metadata-back",
+        "borrowed",
+        "linked-objects",
     ],
 )
 async def test_every_git_method_refuses_a_folder_outside_the_workspace(

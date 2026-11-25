@@ -3,9 +3,10 @@
 A request may name a directory relative to the workspace root, such as a worktree
 checked out inside it. It is confined the way file reads are. Its repository's Git
 directory, common directory and working tree must all lie inside the workspace, unless
-the repository is exactly the workspace's own (the same Git directory and working tree),
-so a crafted link, ``.git`` file, ``commondir`` or ``core.worktree`` can't point a
-comparison at another place on the host.
+the repository is exactly the workspace's own (the same Git directory and working tree).
+A repository inside must also keep its objects and refs inside, with no alternates. So a
+crafted link, ``.git`` file, ``commondir``, ``core.worktree``, symlinked store or
+alternates file can't point a comparison at another place on the host.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from omnigent.host.workspace_git.runner import (
     CheckedRepository,
     Deadline,
     GitError,
+    GitProblem,
     GitRepository,
     UnreadableRepository,
 )
@@ -49,6 +51,10 @@ def _refuse(repository: str, reason: str) -> ConnectError:
     return ConnectError(Code.INVALID_ARGUMENT, f"Repository {repository!r} {reason}")
 
 
+# Files that point an object store at another one.
+_ALTERNATES_FILES = ("alternates", "http-alternates")
+
+
 def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
@@ -62,6 +68,27 @@ def _places(repository: GitRepository) -> tuple[Path, Path, Path]:
     )
 
 
+async def _reads_from_outside(found: GitRepository, workspace: Path, deadline: Deadline) -> bool:
+    """Whether Git would read objects or refs for ``found`` from outside the workspace.
+
+    A symlinked ``objects`` or ``refs`` resolves outside, and an alternates file borrows
+    another object store, so resolved commits and base files could come from elsewhere.
+    """
+    output = await found.run(
+        ["rev-parse", "--git-path", "objects", "--git-path", "refs"], deadline=deadline
+    )
+    try:
+        lines = [line for line in output.decode().split("\n") if line]
+    except UnicodeDecodeError:
+        raise GitError(GitProblem.FAILED, "The repository path isn't valid UTF-8") from None
+    places = [(found.working_directory / line).resolve() for line in lines]
+    if len(places) != 2 or not all(_is_within(place, workspace) for place in places):
+        return True
+    objects = places[0]
+    stores = {objects, (found.common_directory / "objects").resolve()}
+    return any((store / "info" / name).exists() for store in stores for name in _ALTERNATES_FILES)
+
+
 async def repository_folder(reader: WorkspaceReader, repository: str) -> RepositoryFolder:
     """The folder a Git request named by ``repository`` compares, once checked.
 
@@ -71,7 +98,8 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
     :raises ConnectError: INVALID_ARGUMENT when it escapes the workspace, even through a
         symlink, isn't a folder, lies in a Git directory, or belongs to a repository whose
         Git directory, common directory or working tree lies outside the workspace without
-        it being exactly the workspace's own repository.
+        it being exactly the workspace's own repository, or one inside it that reads
+        objects or refs from outside it.
     """
     workspace = reader.root
     if not repository:
@@ -94,6 +122,8 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
             return RepositoryFolder(folder, OUTSIDE_ANY_REPOSITORY)
         places = _places(found)
         if all(_is_within(place, workspace) for place in places):
+            if await _reads_from_outside(found, workspace, deadline):
+                raise _refuse(repository, "reads objects or refs from outside the workspace")
             return RepositoryFolder(folder, found)
         own = await GitRepository.discover(workspace, deadline)
     except GitError as error:
