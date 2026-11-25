@@ -34,10 +34,21 @@ export interface GoToFileHostProps {
 }
 
 export interface OpenRequest {
-  /** Changes with each opening, so a new request starts the dialog fresh. */
-  key: number;
+  /**
+   * Changes with each opening, so a new request starts the dialog fresh. Named for the store
+   * the request came from, since file and session requests count separately.
+   */
+  key: string;
   query: string | undefined;
   mode: GoToFileMode;
+}
+
+/** The dialog's key for `request`: its store, then its id there. */
+export function openRequestKey(request: {
+  id: number;
+  kind: FileFinderRequest["kind"] | "sessions";
+}): string {
+  return `${request.kind === "sessions" ? "sessions" : "files"}:${request.id}`;
 }
 
 /**
@@ -51,7 +62,7 @@ export function nextOpenRequest(
   },
 ): OpenRequest | null {
   const mode: GoToFileMode = request.kind;
-  if (!current) return { key: request.id, query: request.query, mode };
+  if (!current) return { key: openRequestKey(request), query: request.query, mode };
   if (current.mode !== mode) return { ...current, mode };
   return request.toggle ? null : current;
 }
@@ -73,12 +84,18 @@ export function GoToFileHost({
   const sessionSearch = useSessionSearchStore((state) => state.request);
   useEffect(() => {
     if (!sessionSearch) return;
+    const sessionRequest = {
+      id: sessionSearch.id,
+      kind: "sessions" as const,
+      query: sessionSearch.query,
+      toggle: false,
+    };
     setOpened((current) =>
       nextOpenRequest(
         current && sessionSearch.query !== undefined
-          ? { ...current, query: sessionSearch.query, key: sessionSearch.id }
+          ? { ...current, query: sessionSearch.query, key: openRequestKey(sessionRequest) }
           : current,
-        { id: sessionSearch.id, kind: "sessions", query: sessionSearch.query, toggle: false },
+        sessionRequest,
       ),
     );
     // Taken once, so a host that mounts later, such as on the next session, doesn't reopen it.

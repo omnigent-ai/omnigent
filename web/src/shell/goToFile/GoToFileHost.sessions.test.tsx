@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import { requestFileFinder, useFileFinderStore } from "@/store/fileFinder";
 import { requestSessionSearch, useSessionSearchStore } from "@/store/sessionSearch";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
 
@@ -239,6 +240,26 @@ describe("the finder's Sessions tab", () => {
     );
     await user.click(within(tabs).getByRole("tab", { name: "Sessions" }));
     expect(within(dialog).getByRole("combobox", { name: "Search sessions" })).toHaveValue("upload");
+  });
+
+  it("takes a session search's text while Files shows, even when both requests share an id", () => {
+    renderHost();
+    // File and session requests count separately, so the same id can come from both.
+    let fileRequestId: number | undefined;
+    const stop = useFileFinderStore.subscribe((state) => {
+      fileRequestId ??= state.request?.id;
+    });
+    act(() => {
+      requestFileFinder("conv_files");
+    });
+    stop();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("combobox", { name: "Go to a file" })).toHaveValue("");
+    expect(fileRequestId).toBeDefined();
+    act(() => useSessionSearchStore.setState({ request: { id: fileRequestId!, query: "upload" } }));
+    expect(
+      within(screen.getByRole("dialog")).getByRole("combobox", { name: "Search sessions" }),
+    ).toHaveValue("upload");
   });
 
   it("offers Sessions alone, with no tabs, when no session is open", () => {

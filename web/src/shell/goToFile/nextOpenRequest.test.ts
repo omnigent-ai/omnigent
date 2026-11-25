@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("./GoToFileDialog", () => ({ GoToFileDialog: () => null }));
-const { nextOpenRequest } = await import("./GoToFileHost");
+const { nextOpenRequest, openRequestKey } = await import("./GoToFileHost");
 
 const files = { id: 1, kind: "files" as const };
 const text = { id: 2, kind: "text" as const };
@@ -9,7 +9,7 @@ const text = { id: 2, kind: "text" as const };
 describe("nextOpenRequest", () => {
   it("opens on the mode asked for, with the request's text", () => {
     expect(nextOpenRequest(null, { ...text, query: "needle" })).toEqual({
-      key: 2,
+      key: "files:2",
       query: "needle",
       mode: "text",
     });
@@ -24,5 +24,11 @@ describe("nextOpenRequest", () => {
     const open = nextOpenRequest(null, text)!;
     expect(nextOpenRequest(open, { ...text, id: 3, toggle: true })).toBeNull();
     expect(nextOpenRequest(open, { ...text, id: 3 })).toBe(open);
+  });
+
+  it("keys file and session requests apart, since each store counts from 1", () => {
+    expect(openRequestKey(files)).toBe("files:1");
+    expect(openRequestKey(text)).toBe("files:2");
+    expect(openRequestKey({ id: 1, kind: "sessions" })).toBe("sessions:1");
   });
 });
