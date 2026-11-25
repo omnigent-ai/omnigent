@@ -130,18 +130,21 @@ describe("antigravityModelGroups", () => {
   });
 
   it("keeps siblings standalone when the bare family id is also advertised", () => {
+    // Variants come first so a grouped row would claim the bare id before the bare row.
     const options: NativeModelOption[] = [
-      { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
       { id: "gemini-4-neon-high", displayName: "Gemini 4 Neon (High)" },
-      { id: "gemini-4-neon-xhigh", displayName: "Gemini 4 Neon (XHigh)" },
+      { id: "gemini-4-neon-low", displayName: "Gemini 4 Neon (Low)" },
+      { id: "gemini-4-neon", displayName: "Gemini 4 Neon" },
     ];
     const groups = antigravityModelGroups(options);
+    const ids = groups.map((group) => group.id);
 
-    expect(groups.map((group) => group.id)).toEqual(options.map((option) => option.id));
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual(options.map((option) => option.id));
     expect(groups.every((group) => group.efforts.length === 0)).toBe(true);
-    expect(antigravityModelGroupForModel(groups, "gemini-4-neon")?.defaultModelId).toBe(
-      "gemini-4-neon",
-    );
+    const bare = antigravityModelGroupForModel(groups, "gemini-4-neon");
+    expect(bare?.id).toBe("gemini-4-neon");
+    expect(bare?.defaultModelId).toBe("gemini-4-neon");
   });
 
   it("resolves a selected effort back to its exact CLI launch id", () => {
