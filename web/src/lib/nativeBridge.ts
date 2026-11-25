@@ -537,8 +537,7 @@ export type HostControlAction = "start" | "stop" | "restart";
 
 export type ArcaExtendMode = "overnight" | "workweek";
 export type ArcaExtendResult =
-  | { ok: true; shutdownAt: number | null }
-  | { ok: false; error: string };
+  { ok: true; shutdownAt: number | null } | { ok: false; error: string };
 export type DbcertRefreshResult = { ok: true } | { ok: false; error: string };
 export interface DbcertRefreshOptions {
   skipArcaSync?: boolean;
@@ -592,8 +591,7 @@ export interface WorkspaceSocketResponse {
  * outside the shell, on Windows, and in shells too old to offer it.
  */
 export function workspaceSocketBridge():
-  | ((request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>)
-  | null {
+  ((request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>) | null {
   const electron = electronApi();
   return electron?.workspaceSocketRequest ? electron.workspaceSocketRequest.bind(electron) : null;
 }
@@ -654,6 +652,7 @@ export interface TrustedRemoteHost {
 /** Result of listing, adding, or removing trusted remote hosts. */
 export interface TrustedRemoteHostsResult {
   ok: boolean;
+  serverUrl?: string;
   error?: string;
   hosts?: TrustedRemoteHost[];
   added?: boolean;

@@ -90,6 +90,7 @@ const {
   readTrustedRemoteHosts,
   removeTrustedRemoteHost,
   serializeTrustedRemoteHosts,
+  normalizeTrustedHostId,
 } = require("./trustedRemoteHosts");
 const { createTrustedRemoteHostRequests } = require("./trustedRemoteHostRequests");
 const { normalizedServerTarget } = require("./hostStatusIdentity");
@@ -459,30 +460,19 @@ const trustedRemoteHostRequests = createTrustedRemoteHostRequests({
   },
 });
 
-/**
- * Ask, in a dialog the page can't draw over, before sessions on a remote host
- * may open this computer's localhost pages. The grant is written to settings
- * on approval, so it survives restarts until removed. Null when there is no
- * window to ask in.
- */
+/** Ask in the shell before persisting localhost access for a remote host. */
 async function approveTrustedRemoteHost(win, serverUrl, hostId) {
   if (!win || win.isDestroyed()) return null;
-  let serverHost = serverUrl;
-  try {
-    serverHost = new URL(serverUrl).host;
-  } catch {
-    /* keep the raw server value in the prompt */
-  }
   const { response } = await dialog.showMessageBox(win, {
     type: "question",
     buttons: ["Not now", "Trust this host"],
     defaultId: 0,
     cancelId: 0,
-    message: `Let sessions on "${serverHost}" open localhost pages?`,
+    message: `Let sessions on "${new URL(serverUrl).host}" open localhost pages?`,
     detail:
-      `${serverHost} says this session runs on a remote host (${hostId}). ` +
+      `Server: ${serverUrl}\nHost ID: ${hostId}\n\n` +
       "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host. Trust stays in place until you remove it in Settings, and the host's port must already be forwarded to this computer.\n\n" +
-      `Trust only if you recognize "${serverHost}".`,
+      "Only trust hosts you recognize with access to this computer's local services.",
   });
   return win.isDestroyed() ? null : response === 1;
 }
@@ -6169,9 +6159,7 @@ function registerIpc() {
     };
   });
 
-  // SPA → list, add, and remove trusted remote hosts for localhost previews.
-  // The list is the settings file, canonicalised; add/remove rewrite it.
-  // A host id is stable across restarts, so a grant normally needs no renewal.
+  // Each connected server manages only its own entries; all grants need shell consent.
   const trustedRemoteHostsResult = (event) => {
     if (!isPinnedOriginSender(event)) {
       return {
@@ -6179,36 +6167,60 @@ function registerIpc() {
         error: "trusted remote hosts are only available to a connected server page",
       };
     }
-    return { ok: true, hosts: serializeTrustedRemoteHosts(loadSettings().trusted_remote_hosts) };
+    const serverUrl = normalizedServerTarget(senderServerUrl(event));
+    if (!serverUrl) return { ok: false, error: "This window is not connected to a server." };
+    return {
+      ok: true,
+      serverUrl,
+      hosts: serializeTrustedRemoteHosts(loadSettings().trusted_remote_hosts).filter(
+        (entry) => entry.server_url === serverUrl,
+      ),
+    };
+  };
+  const requestTrustedRemoteHost = (event, serverUrl, hostId) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const current = () =>
+      win &&
+      !win.isDestroyed() &&
+      isPinnedOriginSender(event) &&
+      normalizedServerTarget(senderServerUrl(event)) === serverUrl;
+    return trustedRemoteHostRequests.request(serverUrl, hostId, async () => {
+      if (!current()) return null;
+      const answer = await approveTrustedRemoteHost(win, serverUrl, hostId);
+      return current() ? answer : null;
+    });
   };
   ipcMain.handle("omnigent:get-trusted-remote-hosts", (event) => trustedRemoteHostsResult(event));
-  ipcMain.handle("omnigent:add-trusted-remote-host", (event, serverUrl, hostId) => {
+  ipcMain.handle("omnigent:add-trusted-remote-host", async (event, serverUrl, hostId) => {
     const listed = trustedRemoteHostsResult(event);
     if (!listed.ok) return listed;
-    const settings = loadSettings();
-    const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
-    if (!result.added) {
+    const host = normalizeTrustedHostId(hostId);
+    if (normalizedServerTarget(serverUrl) !== listed.serverUrl || !host) {
+      return { ...listed, ok: false, error: "Enter a host ID for this window's server." };
+    }
+    const allowed = await requestTrustedRemoteHost(event, listed.serverUrl, host);
+    if (!allowed) {
       return {
         ok: false,
-        error: "That server and host id did not form a valid trusted entry.",
-        hosts: result.entries,
+        error: trustedRemoteHostRequests.hint(listed.serverUrl, host) ?? "Trust was not saved.",
       };
     }
-    settings.trusted_remote_hosts = result.entries;
-    saveSettings(settings);
-    return { ok: true, added: true, hosts: result.entries };
+    return { ...trustedRemoteHostsResult(event), added: true };
   });
   ipcMain.handle("omnigent:remove-trusted-remote-host", (event, serverUrl, hostId) => {
     const listed = trustedRemoteHostsResult(event);
     if (!listed.ok) return listed;
+    if (normalizedServerTarget(serverUrl) !== listed.serverUrl) {
+      return { ...listed, ok: false, error: "Manage trusted hosts from their server's window." };
+    }
     const settings = loadSettings();
     const result = removeTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
     if (!result.removed) {
-      return { ok: false, error: "That trusted host was not listed.", hosts: result.entries };
+      return { ...listed, ok: false, error: "That trusted host was not listed." };
     }
     settings.trusted_remote_hosts = result.entries;
     saveSettings(settings);
-    return { ok: true, removed: true, hosts: result.entries };
+    return { ...trustedRemoteHostsResult(event), removed: true };
   });
 
   // SPA → a workspace API call on a session host's local socket. The socket and
@@ -6558,9 +6570,9 @@ function registerIpc() {
       }
       const serverUrl = normalizedServerTarget(senderServerUrl(event));
       if (!serverUrl) return false;
-      return trustedRemoteHostRequests.request(serverUrl, sourceHostId, () =>
-        approveTrustedRemoteHost(win, serverUrl, sourceHostId),
-      );
+      // A declined or failed SSH check must not lead to another permission question.
+      if (sshPreviewHosts.hint(senderServerUrl(event), sourceHostId)) return false;
+      return requestTrustedRemoteHost(event, serverUrl, sourceHostId);
     },
     getAgentNavigationHintForEvent: (
       event,

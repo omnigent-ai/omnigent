@@ -892,7 +892,7 @@ describe("browser IPC localhost previews from trusted remote hosts", () => {
         state.calls.push(allowed ? "allowed" : "denied");
         return allowed ? { ok: true } : { ok: false, error: "blocked", localhostBlocked: true };
       },
-      openOrNavigate: (_id, url) => {
+      openOrNavigate: (_id, _url) => {
         state.calls.push("navigate");
         return { ok: true, created: false };
       },
@@ -937,7 +937,7 @@ describe("browser IPC localhost previews from trusted remote hosts", () => {
     assert.deepEqual(state.calls, ["denied", "request-trusted"]);
   });
 
-  it("falls back to trust after the SSH question declines", async () => {
+  it("falls back to trust when SSH is unavailable", async () => {
     const { state, navigate } = trustedSetup({
       request: () => false,
       requestTrusted: (current) => {

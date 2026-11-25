@@ -30,8 +30,9 @@ describe("trusted remote host requests", () => {
   });
 
   it("declines hold until restart and surface in the hint", async () => {
+    let trusted = false;
     const requests = createTrustedRemoteHostRequests({
-      isTrusted: () => false,
+      isTrusted: () => trusted,
       add: () => true,
     });
     let approvals = 0;
@@ -52,6 +53,13 @@ describe("trusted remote host requests", () => {
     assert.equal(approvals, 1);
     assert.match(requests.hint(SERVER, HOST), /restart Omnigent/);
     assert.equal(requests.hint(SERVER, "other-host"), null);
+    trusted = true;
+    assert.equal(
+      await requests.request(SERVER, HOST, async () => {
+        throw new Error("must not prompt");
+      }),
+      true,
+    );
   });
 
   it("a failed persist does not grant trust", async () => {

@@ -18,13 +18,9 @@ import {
 } from "@/lib/nativeBridge";
 import { UPDATE_DESKTOP_NOTE } from "./BrowserAgentToolsSettingsGroup";
 
-/** Settings > General > Browser: remote hosts trusted for localhost previews.
- *  Desktop apps with the embedded browser only; the shell owns the list in
- *  settings.json, so this reads and writes it through the bridge. A host id
- *  is stable across restarts, so a grant normally needs no renewal; removing
- *  one revokes it on the session's next browser operation. */
+/** Manage this server's localhost-preview grants through the desktop shell. */
 export function TrustedRemoteHostsSettingsGroup() {
-  const bridge = trustedRemoteHostsBridge();
+  const [bridge] = useState(trustedRemoteHostsBridge);
   const [supported, setSupported] = useState<boolean | null>(null);
   const [hosts, setHosts] = useState<TrustedRemoteHost[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -48,29 +44,36 @@ export function TrustedRemoteHostsSettingsGroup() {
         setSupported(true);
         const result = await bridge.list();
         if (!cancelled) {
-          if (result.ok) setHosts(result.hosts ?? []);
-          else setError(result.error ?? "Could not load trusted hosts.");
+          if (result.ok) {
+            setHosts(result.hosts ?? []);
+            setServerUrl(result.serverUrl ?? "");
+          } else setError(result.error ?? "Could not load trusted hosts.");
         }
       })
       .catch(() => {
-        if (!cancelled) setSupported(false);
+        if (!cancelled) setError("Could not load trusted hosts.");
       });
     return () => {
       cancelled = true;
     };
-    // The bridge is a fresh object per render; the shell behind it is stable.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [bridge]);
 
   const remove = useCallback(
     async (host: TrustedRemoteHost) => {
-      if (!bridge) return;
+      if (!bridge || busy) return;
+      setBusy(true);
       setError(null);
-      const result = await bridge.remove(host.server_url, host.host_id);
-      if (result.ok) setHosts(result.hosts ?? []);
-      else setError(result.error ?? "Could not remove that trusted host.");
+      try {
+        const result = await bridge.remove(host.server_url, host.host_id);
+        if (result.ok) setHosts(result.hosts ?? []);
+        else setError(result.error ?? "Could not remove that trusted host.");
+      } catch {
+        setError("Could not remove that trusted host.");
+      } finally {
+        setBusy(false);
+      }
     },
-    [bridge],
+    [bridge, busy],
   );
 
   const add = useCallback(async () => {
@@ -81,11 +84,12 @@ export function TrustedRemoteHostsSettingsGroup() {
       const result = await bridge.add(serverUrl.trim(), hostId.trim());
       if (result.ok) {
         setHosts(result.hosts ?? []);
-        setServerUrl("");
         setHostId("");
       } else {
         setError(result.error ?? "Could not trust that host.");
       }
+    } catch {
+      setError("Could not trust that host.");
     } finally {
       setBusy(false);
     }
@@ -102,7 +106,7 @@ export function TrustedRemoteHostsSettingsGroup() {
           description={
             supported === false
               ? UPDATE_DESKTOP_NOTE
-              : "Sessions on a trusted remote host can open localhost pages in the in-app browser. Trust stays until removed, and a host id is stable across restarts — only a brand-new host needs a new entry. The host's port must already be forwarded to this computer."
+              : "Manage hosts for this server. Trust lets their sessions and agents access this computer's localhost pages across ports, including forwarded services. The desktop asks you to confirm each new grant. Trust stays until removed; forwarding must already be established."
           }
         />
         {supported === true && (
@@ -129,8 +133,10 @@ export function TrustedRemoteHostsSettingsGroup() {
                       type="button"
                       variant="ghost"
                       size="sm"
-                      {...settingsControlProps(TRUSTED_REMOTE_HOSTS_ENTRY, "remove")}
-                      aria-label={`Remove trusted host ${host.server_url} ${host.host_id}`}
+                      {...settingsControlProps(TRUSTED_REMOTE_HOSTS_ENTRY, "remove", {
+                        runtime: `${host.server_url} ${host.host_id}`,
+                      })}
+                      disabled={busy}
                       onClick={() => void remove(host)}
                       className="shrink-0 text-muted-foreground"
                       componentId="settings.general.trusted_remote_hosts.remove"
@@ -171,13 +177,13 @@ export function TrustedRemoteHostsSettingsGroup() {
                   Trust host
                 </Button>
               </div>
-              {error && (
-                <p role="alert" className="text-sm text-destructive">
-                  {error}
-                </p>
-              )}
             </div>
           </div>
+        )}
+        {error && (
+          <p role="alert" className="mt-2 text-sm text-destructive">
+            {error}
+          </p>
         )}
       </SettingsItem>
     </SettingsGroup>

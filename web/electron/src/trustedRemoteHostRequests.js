@@ -26,8 +26,8 @@ function createTrustedRemoteHostRequests({ isTrusted, add } = {}) {
     request(serverUrl, hostId, approve) {
       const key = keyFor(serverUrl, hostId);
       if (key === null) return Promise.resolve(false);
-      if (declined.has(key)) return Promise.resolve(false);
       if (isTrusted?.(serverUrl, hostId) === true) return Promise.resolve(true);
+      if (declined.has(key)) return Promise.resolve(false);
       const inFlight = pending.get(key);
       if (inFlight) return inFlight;
       const attempt = Promise.resolve()

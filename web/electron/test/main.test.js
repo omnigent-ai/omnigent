@@ -7655,6 +7655,13 @@ describe("localhost previews for hosts reached over SSH", () => {
     const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
     assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
     assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, preview, {
+        ...opts,
+        trustedRemotePreviewProtocol: 1,
+      }),
+      false,
+    );
     assert.equal(questions.length, 1);
     assert.equal(eligible(context()), false);
     assert.match(
@@ -8075,7 +8082,7 @@ describe("settings-based remote previews", () => {
     assert.doesNotMatch(hint("http://localhost:5173", true, {}), /trusted_remote_hosts/);
   });
 
-  it("lists, adds, and removes trusted hosts through IPC, canonicalising entries", async (t) => {
+  it("confirms Settings grants and scopes host management to the connected server", async (t) => {
     const server = "https://server.example.com";
     const h = loadNavigationHarness({ serverUrl: server });
     t.after(h.cleanup);
@@ -8086,18 +8093,61 @@ describe("settings-based remote previews", () => {
     const remove = h.ipc.get("omnigent:remove-trusted-remote-host");
     // IPC results cross a vm boundary, so compare plain JSON copies.
     const plain = (value) => JSON.parse(JSON.stringify(value));
-    assert.deepEqual(plain(await list(event)), { ok: true, hosts: [] });
+    const other = { server_url: "https://other.example.com/", host_id: "other-host" };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ trusted_remote_hosts: [other] }));
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts++;
+      assert.match(options.detail, /Server: https:\/\/server.example.com\//);
+      assert.match(options.detail, /Host ID: abc123/);
+      assert.equal(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts.length, 1);
+      return { response: 1 };
+    };
+    assert.deepEqual(plain(await list(event)), { ok: true, serverUrl: `${server}/`, hosts: [] });
+    assert.equal((await add(event, other.server_url, "abc123")).ok, false);
+    assert.equal((await remove(event, other.server_url, other.host_id)).ok, false);
+    const unpinned = { ...event, senderFrame: { url: "https://unconnected.example.com" } };
+    assert.equal((await list(unpinned)).ok, false);
+    assert.equal((await add(unpinned, server, "abc123")).ok, false);
+    assert.equal(prompts, 0);
     const added = plain(await add(event, `${server}/`, "ABC123"));
     assert.equal(added.ok, true);
     assert.deepEqual(added.hosts, [{ server_url: `${server}/`, host_id: "abc123" }]);
     assert.deepEqual(plain((await list(event)).hosts), added.hosts);
-    assert.equal((await add(event, server, "abc123")).ok, false);
+    assert.equal((await add(event, server, "abc123")).ok, true);
+    assert.equal(prompts, 1, "existing trust is idempotent");
     assert.equal((await add(event, "not a url", "abc123")).ok, false);
     const removed = plain(await remove(event, server, "ABC123"));
     assert.equal(removed.removed, true);
     assert.deepEqual(removed.hosts, []);
     assert.equal((await remove(event, server, "abc123")).ok, false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts, [other]);
   });
+
+  for (const changed of ["server", "page", "closed", "declined"]) {
+    it(`does not save a Settings grant when consent is ${changed}`, async (t) => {
+      const server = "https://server.example.com/app";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      const consent = Promise.withResolvers();
+      let prompted = false;
+      h.electron.dialog.showMessageBox = async () => {
+        prompted = true;
+        return consent.promise;
+      };
+      const pending = h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host");
+      await until(() => prompted, "native trust confirmation");
+      assert.equal(fs.existsSync(h.settingsPath), false);
+      if (changed === "server") h.api.windows.get(h.win).serverUrl = `${server}/other`;
+      if (changed === "page") h.setUrl("https://other.example.com");
+      if (changed === "closed") h.win.isDestroyed = () => true;
+      consent.resolve({ response: changed === "declined" ? 0 : 1 });
+      assert.equal((await pending).ok, false);
+      assert.equal(fs.existsSync(h.settingsPath), false);
+    });
+  }
 
   it("trusts a host from the native dialog and holds a decline until restart", async (t) => {
     const server = "https://server.example.com";
@@ -8113,7 +8163,7 @@ describe("settings-based remote previews", () => {
     h.electron.dialog.showMessageBox = async (_win, options) => {
       prompts += 1;
       assert.match(options.message, /Let sessions on/);
-      assert.match(options.detail, /remote host/);
+      assert.match(options.detail, /Host ID: (sandbox-host|other-host)/);
       return { response: prompts === 1 ? 1 : 0 };
     };
     assert.equal(

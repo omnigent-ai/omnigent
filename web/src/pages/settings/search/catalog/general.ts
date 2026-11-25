@@ -136,6 +136,7 @@ export const TRUSTED_REMOTE_HOSTS_ENTRY = settingsEntry({
     serverUrl: "Server URL",
     hostId: "Host ID",
   },
+  nameTemplates: { remove: { before: "Remove trusted host " } },
 });
 
 export const PROACTIVE_AGENT_ENTRY = settingsEntry({

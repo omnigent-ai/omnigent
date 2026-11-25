@@ -572,6 +572,7 @@ function registerBrowserIpc({
         }
         if (
           !previewAllowed &&
+          isCurrent() &&
           opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL
         ) {
           previewAllowed = (await requestTrustedRemoteHostForEvent(event, url, opts)) === true;

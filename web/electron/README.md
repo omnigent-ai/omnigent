@@ -618,7 +618,8 @@ trusts that host. The first time such a preview is blocked, the desktop asks
 in a native dialog whether to trust that host; trusting writes the entry and
 retries the preview. A decline holds until the desktop restarts, so a retrying
 agent cannot keep asking. Trusted hosts can also be listed, added, and removed
-in Settings > General > Trusted remote hosts.
+in Settings > General > Trusted remote hosts. Settings shows only the connected
+server's entries, and adding a host there requires the same native confirmation.
 
 Trust is stored as `trusted_remote_hosts` in the desktop's `settings.json`,
 preserving any other settings:
