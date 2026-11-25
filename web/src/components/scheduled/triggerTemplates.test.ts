@@ -42,6 +42,7 @@ import {
   updateTriggerWorkerSettings,
   withTriggerEvent,
   TRIGGER_SOURCES,
+  TRIGGER_TEMPLATES,
   type TriggerCondition,
   type TriggerConfig,
   type TriggerFields,
@@ -989,6 +990,148 @@ describe("Slack thread replies", () => {
       expect(prompt).not.toContain("replies in their threads");
       expect(prompt).toContain("still write your reply.");
     }
+  });
+});
+
+describe("Slack thread reply triggers", () => {
+  const threadReply = (overrides: Partial<TriggerFields> = {}) =>
+    fields({
+      event: "thread_reply",
+      scope: "roadmap",
+      scopeOperator: "is",
+      conditions: [],
+      ...overrides,
+    });
+
+  it("offers the event for channels, with its own help text", () => {
+    const event = TRIGGER_TEMPLATES.slack.events.find((e) => e.id === "thread_reply");
+    expect(event).toMatchObject({
+      label: "Reply posted in a thread",
+      scopePrefix: "#",
+      authorAction: "reply in a thread in this channel",
+    });
+    expect(triggerEventDescription("slack", "thread_reply")).toBe(
+      "Runs your automation on new replies in any thread in these channels, including threads it never handled, and starts one session per thread with new matching replies. New top-level posts don't count; use Message posted in a channel for those.",
+    );
+    // Both events name channels, so switching between them keeps the scope and its conditions.
+    const author: TriggerCondition = { field: "author", operator: "is", value: "alice" };
+    const posted = fields({ event: "posted", scope: "roadmap, eng", scopeOperator: "in" });
+    expect(
+      withTriggerEvent("slack", { ...posted, conditions: [author] }, "thread_reply"),
+    ).toMatchObject({
+      event: "thread_reply",
+      scope: "roadmap, eng",
+      scopeOperator: "in",
+      conditions: [author],
+    });
+    expect(triggerFieldsComplete(threadReply(), "slack")).toBe(true);
+    expect(triggerFieldsComplete(threadReply({ scope: "#" }), "slack")).toBe(false);
+  });
+
+  it("finds threads by latest_reply and reads their new replies from the check time", () => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      threadReply({
+        scope: "roadmap, C0123ABCD",
+        scopeOperator: "in",
+        conditions: [{ field: "text", operator: "contains", value: "fix" }],
+      }),
+      CTX,
+    );
+    expect(prompt).toContain(
+      "starts one Omnigent session for each thread with new replies that matches.",
+    );
+    expect(prompt).toContain(
+      'Watch: new replies in threads in #roadmap, C0123ABCD whose text contains "fix"\n',
+    );
+    // The channel lookups and their saved state are the posted event's.
+    expect(prompt).toContain(
+      `Your most recent reply's "Slack IDs:" line, when there is one, gives each channel's ID, the workspace URL`,
+    );
+    expect(prompt).toContain("Call auth.test for the workspace URL and your own user ID");
+    expect(prompt).toContain(
+      'Above it, write a "Slack IDs:" line followed by one-line JSON with channel_ids',
+    );
+    // Thread starters are older than the check time, so the history read has its own window.
+    expect(prompt).toContain(
+      "The message that starts a thread is usually older than the check time, so don't bound this read by it: for each channel, read its top-level messages from the last 30 days with conversations.history, called with the channel ID, oldest set to 30 days before the time you noted as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off",
+    );
+    expect(prompt).toContain(
+      "with exactly these keys: ts, user, text (verbatim), reply_count, latest_reply.",
+    );
+    expect(prompt).toContain(
+      "follow the cursor only while has_more is true and the oldest message on the page is still inside those 30 days.",
+    );
+    expect(prompt).toContain(
+      "a thread has new replies when its latest_reply is after the check time. Use the check time itself here, not 5 minutes before it",
+    );
+    expect(prompt).toContain(
+      'read its replies with conversations.replies, called with the channel ID, ts set to the thread ts, oldest set to the check time as a Unix timestamp, latest set to the time you noted, inclusive false, limit 200 and caching off, following the cursor while has_more is true; if your Slack tool takes an analysis_prompt, pass "Output one JSON object per line for every message, oldest first, with exactly these keys: ts, thread_ts, user, bot_id, subtype, text (verbatim).',
+    );
+    // Omnigent's own posts never count, and the conditions apply to the new replies.
+    expect(prompt).toContain(
+      'Leave out the message that started the thread, replies that end with a "Sent with Omnigent" line, which Omnigent sessions add to what they post, and replies whose user is your own user ID from auth.test.',
+    );
+    expect(prompt).toContain(
+      'Only new replies whose text contains "fix" count; a thread whose new replies all fail the conditions starts nothing.',
+    );
+    expect(prompt).toContain(
+      "?thread_ts=<thread ts>&cid=<channel ID>; the message that started the thread takes that form without the query.",
+    );
+    // One session per thread, oldest first, carrying the whole thread with the new replies marked.
+    expect(prompt).toContain(
+      "handle the threads oldest first, by the ts of the message that started each.",
+    );
+    expect(prompt).toContain(
+      'For each other thread, oldest first, call sys_session_create with agent_id set to your agent ID, placement "same_host", title "Slack <channel> <thread ts> replies <newest reply ts>"',
+    );
+    expect(prompt).toContain(
+      "then gives the channel, the message that started the thread with its author, text and permalink, and then every reply you read in the thread, oldest first, each with its author, text and permalink, with each reply posted after the check time marked as new between <slack-thread> and </slack-thread> lines.",
+    );
+    expect(prompt).toContain(
+      'whose title starts with "Slack <channel> <thread ts> replies " for that thread. The ts at the end of the latest such title, or of a pending entry for the thread, is the newest reply already handled: skip the thread when it is at or after the thread\'s newest new reply, and otherwise count only the replies after it.',
+    );
+    expect(prompt).toContain(
+      'otherwise the previous check time, and say why you stopped. Above it, write a "Slack IDs:" line',
+    );
+    // The worker answers in the thread it was given.
+    expect(prompt).toContain(
+      "Wherever a Slack tool asks which message to reply to, name the message that started the thread, not a reply.",
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+  });
+
+  it("excludes new top-level posts and doesn't follow threads between runs", () => {
+    const prompt = renderTriggerPrompt("slack", threadReply(), CTX);
+    expect(prompt).toContain(
+      "New top-level messages never count for this event: a message with no reply after the check time starts nothing, however new it is. Every new reply by a person counts.",
+    );
+    expect(prompt).toContain(
+      "a thread that gets more replies later is found again by its latest_reply then.",
+    );
+    expect(prompt).not.toContain("Slack threads:");
+    expect(prompt).not.toContain("replies in their threads");
+    expect(prompt).not.toContain("Then send new replies in the threads you follow");
+    expect(prompt).toContain("still write your reply.");
+    expect(prompt).not.toContain("top-level messages posted in #roadmap since that time");
+  });
+
+  it("sends each thread's new replies to a task session once", () => {
+    const prompt = renderTriggerPrompt("slack", threadReply(), {
+      ...CTX,
+      taskSessionMode: "continue",
+    });
+    expect(prompt).toContain(
+      "its task session, and sends it each thread with new replies that matches.",
+    );
+    expect(prompt).toContain(
+      'Skip any thread whose new replies you already sent to the task session, or that is on a "Delivery pending:" line.',
+    );
+    expect(prompt).toContain(
+      'for task messages from your session whose title starts with "Slack <channel> <thread ts> replies " for that thread.',
+    );
+    expect(prompt).not.toContain("Slack threads:");
   });
 });
 

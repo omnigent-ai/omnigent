@@ -4943,6 +4943,46 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("Watch: new Slack messages in your group DM with @alice and @bob\n");
   });
 
+  it("watches replies in any thread of a Slack channel, leaving top-level posts out", async () => {
+    renderTrigger("slack");
+    type("task-trigger-scope", "roadmap");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-author");
+    type("task-trigger-condition-0-value", "@alice");
+
+    pick("task-trigger-event", "task-trigger-event-thread_reply");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Reply posted in a thread");
+    // Threads live in channels, so the channel scope and its Author row carry over.
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where channel");
+    expect(screen.getByTestId("task-trigger-scope-prefix")).toHaveTextContent("#");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("roadmap");
+    expect(screen.getByTestId("task-trigger-condition-0-value")).toHaveValue("@alice");
+    expect(screen.getByTestId("task-trigger-description")).toHaveTextContent(
+      "Runs your automation on new replies in any thread in these channels, including threads it never handled, and starts one session per thread with new matching replies.",
+    );
+    expect(showMoreTriggerDetails()).toHaveTextContent(
+      "New top-level posts don't count; use Message posted in a channel for those.",
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "More trigger details" }), {
+      key: "Escape",
+    });
+    expectWarningMessage(
+      "task-trigger-untrusted-note",
+      "Anyone who can reply in a thread in this channel may direct the agent",
+    );
+    type("task-trigger-instructions", "Apply the correction to the roadmap.");
+
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0].templateId).toBe("slack");
+    expect(prompt).toContain("Watch: new replies in threads in #roadmap posted by @alice\n");
+    expect(prompt).toContain(
+      "a thread has new replies when its latest_reply is after the check time",
+    );
+    expect(prompt).toContain("New top-level messages never count for this event");
+    expect(prompt).toContain('title "Slack <channel> <thread ts> replies <newest reply ts>"');
+    expect(prompt).not.toContain("Slack threads:");
+  });
+
   it("builds a Linear trigger for a team, with an unassigned row and the issue link-back", async () => {
     renderTrigger("linear");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Linear issues");

@@ -21,10 +21,12 @@ to customize.
 - `scope`: **equals** matches one project, channel, repository, team, or service.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
   the entered values. PagerDuty also offers **contains**, matching every service
-  whose name contains one piece of text; it rejects lists the same way. Slack can watch a channel, direct messages from listed
+  whose name contains one piece of text; it rejects lists the same way. Slack can watch a channel's
+  top-level messages or the replies in any of its threads, direct messages from listed
   senders, or the one group DM with exactly the listed people (two or more; no
   operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
-  Switching between channel and people events clears the scope; DMs hide Author.
+  Switching between channel and people events clears the scope; the two channel
+  events keep it. DMs hide Author.
 - `change-events`: GitHub **Review requested from [reviewer]** (me, a username, or
   `org/team`; required) fires on each request or re-request on open, non-draft pull
   requests, and Jira **Assignee changed to [assignee]** (empty means anyone) fires on
@@ -45,6 +47,12 @@ to customize.
   posts in the thread only when a reply needs it; no reply starts a session. The form
   has no control for it. Threads are followed for 24 hours after their latest reply,
   at most 10 at a time; DM triggers don't follow threads.
+- `slack-thread-reply-event`: Slack **Reply posted in a thread** starts one session per
+  thread that gets new replies in the watched channels, including threads the
+  automation never handled; new top-level posts don't count. Its help text says so.
+  Each run finds threads by their `latest_reply` over the last 30 days of top-level
+  messages, reads the new replies from the check time, skips Omnigent's own posts, and
+  applies the conditions to the new replies. Nothing is followed between runs.
 - `task-session`: when creating a trigger, Advanced shows **Start a new session for
   each match**, on by default. Turning it off sends every match to one task session,
   titled after the automation and started on the first match; later matches arrive
@@ -224,6 +232,10 @@ to customize.
   answers a message in its thread, reply in that thread. At the next poll the
   session that handled the message receives the reply and answers there if the
   reply asks something; no session starts for the reply.
+- **Slack thread replies:** with a **Reply posted in a thread** trigger on a channel,
+  reply in the thread of any message there, including one posted before the
+  automation existed. At the next poll one session starts for that thread, with the
+  reply marked as new; a new top-level message starts nothing.
 - **Mobile web:** use the same tabs and creation paths after opening Automations.
 - **Managed embedded:** open Automations through the host navigation; tabs,
   gallery, and modal use the same components under the host's mount path.
