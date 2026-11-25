@@ -7541,8 +7541,19 @@ export async function startStreamPump(
           // settles shortly after reconnect clears in seconds. Guarded +
           // idempotent, and scoped to the active conversation by
           // reconcileActiveSessionStatus itself. A same-server rotation had no
-          // restart, so it keeps only the launch-stage re-reads.
-          scheduleStatusCatchup(!sameServerRotation);
+          // restart, so it keeps only the launch-stage re-reads, unless the
+          // re-reads must also retry a failed backfill or a final item missed
+          // behind an interrupted preview.
+          scheduleStatusCatchup(
+            !sameServerRotation ||
+              missedEventRecovery.backfillOwed ||
+              get().blocks.some(
+                (block) =>
+                  isLiveProvisionalBlock(block) &&
+                  block.type === "text_done" &&
+                  block.previewInterrupted,
+              ),
+          );
         } else {
           // A launch's `ready` sent before this first open subscribed is in no snapshot
           // read yet, so re-read its stage over the next ~20 s while it still shows.
