@@ -181,9 +181,10 @@ def test_list_agy_cli_model_options_reports_credential_repair_without_details(
 
 def test_discovery_timeout_fits_the_host_model_options_deadline() -> None:
     """Discovery plus its termination grace ends before the host request expires."""
+    from omnigent.inner import _proc
     from omnigent.server.routes import hosts
 
-    budget = models._DISCOVERY_TIMEOUT_S + models._TERMINATE_GRACE_S
+    budget = models._DISCOVERY_TIMEOUT_S + _proc._RUN_ISOLATED_REAP_TIMEOUT_S
     assert budget + 2.0 <= hosts._MODEL_OPTIONS_TIMEOUT_S
 
 
@@ -210,18 +211,22 @@ def test_gateway_discovery_never_raises_the_caller_timeout(
 
 
 def _process_alive(pid: int) -> bool:
-    """Whether *pid* is a live (non-zombie) process."""
-    stat = Path(f"/proc/{pid}/stat")
-    if stat.parent.parent.is_dir() and Path("/proc/self").exists():
-        try:
-            return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
-        except FileNotFoundError:
-            return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+    from omnigent.inner._proc import process_alive
+
+    return process_alive(pid)
+
+
+def _record_group_signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, bool]]:
+    """Record each ``killpg`` with whether its group leader still existed (even as a zombie)."""
+    calls: list[tuple[int, bool]] = []
+    real_killpg = os.killpg
+
+    def _killpg(pgid: int, sig: int) -> None:
+        calls.append((pgid, Path(f"/proc/{pgid}").exists()))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", _killpg)
+    return calls
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
@@ -229,7 +234,6 @@ def test_discovery_timeout_removes_the_wrapped_process_tree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A timed-out wrapper and the agy it started both stop, even ignoring SIGTERM."""
-    monkeypatch.setattr(models, "_TERMINATE_GRACE_S", 0.2)
     pid_file = tmp_path / "child.pid"
     wrapper = tmp_path / "wrapper.py"
     wrapper.write_text(
@@ -267,3 +271,46 @@ def test_discovery_reports_a_failed_command() -> None:
         )
     assert raised.value.returncode == 3
     assert raised.value.output == "out\n"
+
+
+@pytest.mark.skipif(not Path("/proc/self").exists(), reason="needs /proc to observe leaders")
+def test_discovery_timeout_after_the_leader_exits_cleans_up_safely(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A leader that exits early leaves an orphan; teardown removes it without
+    signalling a process-group id whose leader is already reaped."""
+    calls = _record_group_signals(monkeypatch)
+    pid_file = tmp_path / "orphan.pid"
+    leader = tmp_path / "leader.py"
+    leader.write_text(
+        textwrap.dedent(
+            f"""
+            import pathlib, subprocess, sys
+            stubborn = "import signal, time; signal.signal(15, signal.SIG_IGN); time.sleep(60)"
+            orphan = subprocess.Popen([sys.executable, "-c", stubborn])
+            pathlib.Path({str(pid_file)!r}).write_text(str(orphan.pid))
+            """
+        )
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        models._run_discovery([sys.executable, str(leader)], env=None, timeout_s=1.0)
+
+    orphan_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while _process_alive(orphan_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _process_alive(orphan_pid)
+    assert all(leader_present for _pgid, leader_present in calls)
+
+
+def test_successful_discovery_sends_no_group_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A discovery that finishes in time is reaped without any group teardown."""
+    calls = _record_group_signals(monkeypatch)
+
+    completed = models._run_discovery(
+        [sys.executable, "-c", "print('m\\tM')"], env=None, timeout_s=10
+    )
+
+    assert completed.stdout == "m\tM\n"
+    assert calls == []
