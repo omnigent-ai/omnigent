@@ -162,6 +162,7 @@ import { replaceComposerDocument } from "@/lib/composerText";
 import {
   discardDictatedSpans,
   mapDictatedSpansAcrossDocuments,
+  dictationLanding,
   writeDictatedEdit,
   type DictatedSpan,
 } from "@/lib/dictatedSpans";
@@ -2498,6 +2499,8 @@ function ComposerImpl(
   // The text this take wrote in the editor, which a discard removes and nothing else touches.
   const dictatedRef = useRef<DictatedSpan[]>([]);
   const dictatedDocRef = useRef("");
+  // The engine the take now running started on; see onVoiceDiscard.
+  const takeEngineRef = useRef<typeof renderedEngine | null>(null);
   // Edits that don't come from dictation, such as typing or a quote, move or drop those spans.
   useLayoutEffect(() => {
     const target = textareaRef.current;
@@ -2515,11 +2518,16 @@ function ComposerImpl(
       writeDocument(next);
       return;
     }
-    dictatedRef.current = writeDictatedEdit(target, dictatedRef.current, next, change);
+    dictatedRef.current = writeDictatedEdit(target, dictatedRef.current, change);
     dictatedDocRef.current = target.value;
   };
   // Declared after textareaRef so dictation inserts at the caret.
-  const dictation = useDictationInsert(composerValue, writeDictation, textareaRef);
+  const dictation = useDictationInsert(
+    composerValue,
+    writeDictation,
+    textareaRef,
+    renderedEngine === "codemirror" ? dictationLanding : undefined,
+  );
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
@@ -4902,10 +4910,17 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
+                  takeEngineRef.current = renderedEngine;
                   voiceSnapshotRef.current = composerValue;
                   dictatedRef.current = [];
                 }}
                 onVoiceDiscard={() => {
+                  // The take's text belongs to the engine it started on; a switch mid-take
+                  // relinquishes it rather than writing that engine's shape into the other.
+                  if (takeEngineRef.current !== renderedEngine) {
+                    dictatedRef.current = [];
+                    return;
+                  }
                   if (renderedEngine !== "codemirror") {
                     setValue(voiceSnapshotRef.current);
                     return;

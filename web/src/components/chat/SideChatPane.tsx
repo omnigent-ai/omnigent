@@ -137,6 +137,7 @@ import {
 import {
   discardDictatedSpans,
   mapDictatedSpansAcrossDocuments,
+  dictationLanding,
   writeDictatedEdit,
   type DictatedSpan,
 } from "@/lib/dictatedSpans";
@@ -1059,6 +1060,8 @@ function SideChatComposer({
   // The text this take wrote in the editor, in one document; see `dictatedSpans`.
   const dictatedRef = useRef<DictatedSpan[]>([]);
   const dictatedDocRef = useRef("");
+  // Whether the take now running started in the single document; see onVoiceDiscard.
+  const takeSingleDocumentRef = useRef(false);
   const voiceEditsRef = useRef(
     new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
   );
@@ -1185,7 +1188,7 @@ function SideChatComposer({
       if (singleDocument) {
         const target = editorSurface();
         if (!target) return;
-        dictatedRef.current = writeDictatedEdit(target, dictatedRef.current, edited, change);
+        dictatedRef.current = writeDictatedEdit(target, dictatedRef.current, change);
         dictatedDocRef.current = target.value;
         return;
       }
@@ -1203,7 +1206,12 @@ function SideChatComposer({
     },
     [activeTextId, composerKey, editText, editorSurface, reconcileVoiceEdits, singleDocument],
   );
-  const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
+  const dictation = useDictationInsert(
+    activeText,
+    setActiveText,
+    textareaRef,
+    singleDocument ? dictationLanding : undefined,
+  );
   // An engine switch replaces every input; keep the active one and its id current.
   const restoreActiveInput = useCallback((target: ComposerTextTarget, inputId: string) => {
     textareaRef.current = target;
@@ -1838,10 +1846,18 @@ function SideChatComposer({
                 className="size-8 md:size-7"
                 disabled={!ready}
                 onVoiceStart={() => {
+                  takeSingleDocumentRef.current = singleDocument;
                   voiceEditsRef.current.clear();
                   dictatedRef.current = [];
                 }}
                 onVoiceDiscard={() => {
+                  // The take's spans belong to the engine it started on; a switch mid-take
+                  // relinquishes them rather than writing their shape into the other engine.
+                  if (takeSingleDocumentRef.current !== singleDocument) {
+                    voiceEditsRef.current.clear();
+                    dictatedRef.current = [];
+                    return;
+                  }
                   reconcileVoiceEdits(
                     useChatStore.getState().sideChatComposers[composerKey] ??
                       EMPTY_SIDE_CHAT_COMPOSER,

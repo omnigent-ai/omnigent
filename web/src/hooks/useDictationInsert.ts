@@ -97,6 +97,11 @@ export function useDictationInsert(
   /** Writes the draft; `change` is the one edit it makes, in the draft as it was before. */
   setDraft: (next: string, change: TextEdit) => void,
   textareaRef?: RefObject<ComposerTextTarget | null>,
+  /**
+   * Where the editor keeps text written at `at`, when it keeps it elsewhere (a card's line moves
+   * text typed on it to the line after). Writing there keeps the draft equal to the editor's.
+   */
+  landingAt?: (draft: string, at: number) => number,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
   appendFinal: (text: string) => void;
@@ -177,7 +182,7 @@ export function useDictationInsert(
       // the end of the draft, dictation's pre-positional behavior.
       const stale = mine !== null && wantCaretRef.current !== null;
       const at = region?.start ?? (stale ? mine.tail : (live ?? base.length));
-      const spliced = splice(base, at, text);
+      const spliced = splice(base, landingAt ? landingAt(base, at) : at, text);
 
       const settled: Produced = {
         value: spliced.next,
@@ -211,7 +216,7 @@ export function useDictationInsert(
       setInterimPending(settled.region !== null);
       setDraft(spliced.next, change);
     },
-    [setDraft, textareaRef],
+    [landingAt, setDraft, textareaRef],
   );
 
   return {

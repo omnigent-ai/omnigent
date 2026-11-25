@@ -3898,9 +3898,10 @@ describe("side-chat reply in one editor", () => {
     act(() => editor.dispatch({ selection: { anchor: 0 } }));
     act(() => mic.current!.onVoiceStart!());
     act(() => mic.current!.onTranscript("spoken"));
-    // Text typed above the seed lands below it, as it does in the textarea.
-    expect(editorText()).toBe(`${seedCard}\nspoken `);
-    expect(storeText()).toBe("spoken ");
+    // Text typed above the seed lands below it, as it does in the textarea. Nothing follows it
+    // there, so no separator is added (the separator came only from the seed's text it used to sit in front of).
+    expect(editorText()).toBe(`${seedCard}\nspoken`);
+    expect(storeText()).toBe("spoken");
     expect(pendingSeed()).toBe("Seed passage");
   });
 
@@ -3924,6 +3925,24 @@ describe("side-chat reply in one editor", () => {
     expect(storeText()).toBe("Draft server dictation smoke test transcript");
     expect(editorText().endsWith("Draft server dictation smoke test transcript")).toBe(true);
     expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+  });
+
+  it("streams interim updates above the pinned seed, as the browser does at the top", async () => {
+    await renderEditor();
+    const editor = EditorView.findFromDOM(editorInput())!;
+    act(() => editor.focus());
+    act(() => editor.dispatch({ selection: { anchor: 0 } }));
+    act(() => mic.current!.onVoiceStart!());
+    for (const partial of ["server", "server dictation", "server dictation smoke"]) {
+      act(() => mic.current!.onInterim!(partial));
+    }
+    act(() => mic.current!.onTranscript!("server dictation smoke test transcript"));
+    expect(editorText().startsWith(seedCard)).toBe(true);
+    expect(editorText().split("\n").slice(1).join("\n")).toBe(
+      "server dictation smoke test transcript",
+    );
+    expect(storeText()).toBe("server dictation smoke test transcript");
+    expect(pendingSeed()).toBe("Seed passage");
   });
 
   it("keeps a repeated word the user typed when the dictated copy is deleted by hand", async () => {
@@ -3980,9 +3999,9 @@ describe("side-chat reply in one editor", () => {
     expect(editorText()).toBe(`${seedCard}\n`);
     act(() => mic.current!.onVoiceStart!());
     act(() => mic.current!.onTranscript("spoken"));
-    // The caret sat at the card's end, so the dictated words land on the line after it.
-    expect(editorText()).toBe(`${seedCard}\n spoken\n`);
-    expect(storeText()?.trim()).toBe("spoken");
+    // The caret sat at the card's end, so the dictated words land on the line after it, at its start.
+    expect(editorText()).toBe(`${seedCard}\nspoken`);
+    expect(storeText()).toBe("spoken");
     expect(storeText()).not.toMatch(/[\uFDD0\uFDD1]/);
     expect(pendingSeed()).toBe("Seed passage");
     expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
