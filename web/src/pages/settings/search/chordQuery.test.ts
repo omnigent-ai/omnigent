@@ -12,6 +12,7 @@ import {
 import { type ShortcutPageContext, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
 
 import { CHORD_TIER, parseChordQuery, rowsForChord, searchableChords } from "./chordQuery";
+import { SETTINGS_ENTRIES } from "./catalog";
 import type { SettingsAvailability } from "./catalog/types";
 import { searchSettings, settingsSearchTargets, textMatcher } from "./settingsSearchIndex";
 import { settingsSearchMatchers } from "./settingsSearchMatchers";
@@ -367,5 +368,25 @@ describe("chord results in Settings search", () => {
         ),
       );
     }
+  });
+
+  it("ranks a bare key name after the settings it names, and still finds its shortcut rows", () => {
+    const everything = settingsSearchTargets(
+      [...SETTINGS_ENTRIES, ...shortcutSettingsEntries(groups)],
+      [
+        { id: "appearance", label: "Appearance" },
+        { id: "shortcuts", label: "Keyboard shortcuts" },
+      ],
+      SHOWN,
+    );
+    const ids = (query: string) =>
+      searchSettings(query, everything, matchers).map((result) => result.target.entry.id);
+    // "tab" finds the Default Workspace tab setting before the Tab key's shortcut rows.
+    const tab = ids("tab");
+    expect(tab.indexOf("default-workspace-tab")).toBeGreaterThanOrEqual(0);
+    expect(tab.indexOf("default-workspace-tab")).toBeLessThan(tab.indexOf("shortcut.slash.apply"));
+    expect(ids("down")).toContain("shortcut.slash.previous");
+    // A chord with a modifier still ranks first.
+    expect(ids("cmd k")[0]).toBe("shortcut.palette.commands");
   });
 });
