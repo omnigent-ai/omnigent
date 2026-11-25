@@ -443,6 +443,14 @@ export function pullRequestNotFoundReason(
     : "no_os_env";
 }
 
+/** A poll's runner is still reading; the server stopped waiting and a later poll gets it. */
+class PullRequestPollTimeoutError extends Error {}
+
+/**
+ * Read a session's PR info. With `allowCached`, the read is a poll: it may take
+ * the runner's previous answer, and it fails with a `PullRequestPollTimeoutError`
+ * rather than wait long for a runner that keeps the read for the next poll.
+ */
 export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
@@ -450,7 +458,10 @@ export async function fetchPullRequestInfo(
   allowCached = false,
 ): Promise<PullRequestInfo> {
   const params = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
-  if (allowCached) params.set("allow_cached", "true");
+  if (allowCached) {
+    params.set("allow_cached", "true");
+    params.set("allow_timeout", "true");
+  }
   const search = params.toString();
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${search ? `?${search}` : ""}`,
@@ -477,6 +488,7 @@ export async function fetchPullRequestInfo(
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
+  if (allowCached && res.status === 504) throw new PullRequestPollTimeoutError();
   if (!res.ok) throw await errorFromResponse(res);
   return normalizePullRequestInfo((await res.json()) as PullRequestInfo);
 }
@@ -714,14 +726,22 @@ function pullRequestInfoQueryOptions(
   const prUrl = options?.prUrl;
   return queryOptions({
     queryKey: pullRequestInfoQueryKey(conversationId, prUrl),
-    queryFn: ({ client, queryKey, signal }) => {
+    queryFn: async ({ client, queryKey, signal }) => {
       const query = client.getQueryCache().find<PullRequestInfo>({ queryKey, exact: true });
       const allowCached = pollAcceptsCachedAnswer(query);
-      return prUrl
-        ? pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
-            fetchPullRequestInfo(conversationId!, prUrl, signal, allowCached),
-          )
-        : fetchPullRequestInfo(conversationId!, undefined, undefined, allowCached);
+      try {
+        return await (prUrl
+          ? pullRequestReads.run(pullRequestReadKey(conversationId!, prUrl), signal, () =>
+              fetchPullRequestInfo(conversationId!, prUrl, signal, allowCached),
+            )
+          : fetchPullRequestInfo(conversationId!, undefined, undefined, allowCached));
+      } catch (error) {
+        // The runner is still reading for the next poll; keep showing the last answer.
+        if (error instanceof PullRequestPollTimeoutError && query?.state.data) {
+          return query.state.data;
+        }
+        throw error;
+      }
     },
     enabled,
     retry,

@@ -234,6 +234,43 @@ describe("PR info reads that may take the runner's previous answer", () => {
     expect(fetchMock.mock.calls.map(allowsCached)).toEqual([false, true, false]);
   });
 
+  it("keeps the panel's last answer while a poll's runner is still reading", async () => {
+    vi.useFakeTimers();
+    stubChatStore("conv_live", "idle");
+    fetchMock.mockResolvedValue(pullRequestInfoResponse({ tracking_available: true, branch: "a" }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    type Panel = ReturnType<typeof usePullRequestInfo>;
+    let panel: Pick<Panel, "data" | "error"> | undefined;
+    function PanelProbe() {
+      // Read during render, so the query re-renders when they change.
+      const { data, error } = usePullRequestInfo("conv_live", { poll: true });
+      panel = { data, error };
+      return null;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <PanelProbe />
+      </QueryClientProvider>,
+    );
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 504,
+      statusText: "Gateway Timeout",
+      json: async () => ({ detail: "poll again" }),
+    } as unknown as Response);
+    // Each check runs a second after a poll, well before the next one.
+    await act(() => vi.advanceTimersByTimeAsync(11_000));
+    expect(panel?.error).toBeNull();
+    expect(panel?.data?.branch).toBe("a");
+
+    fetchMock.mockResolvedValue(pullRequestInfoResponse({ tracking_available: true, branch: "b" }));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
+    expect(panel?.data?.branch).toBe("b");
+    // Load, the poll that timed out, then the poll that got the runner's read.
+    expect(fetchMock.mock.calls.map(allowsCached)).toEqual([false, true, true]);
+  });
+
   it("reads list rows fresh on every poll and after reopening", async () => {
     vi.useFakeTimers();
     stubChatStore("conv_live", "idle");

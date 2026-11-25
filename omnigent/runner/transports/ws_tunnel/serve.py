@@ -1670,6 +1670,7 @@ async def _send_hello(
         CAP_FILESYSTEM_ATTACHMENTS,
     )
     from omnigent.runner.background_titles.service import CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS
+    from omnigent.runner.pr_resource import CAP_PR_INFO_POLL_CACHE
 
     await send_text(
         encode_frame(
@@ -1684,6 +1685,7 @@ async def _send_hello(
                     CAP_SIDE_CHAT_SETTINGS,
                     CAP_CODEX_SIDE_CHAT_RESUME,
                     CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
+                    CAP_PR_INFO_POLL_CACHE,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,

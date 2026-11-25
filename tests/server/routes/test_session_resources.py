@@ -3648,6 +3648,81 @@ async def test_github_info_serves_a_tunnelled_runners_late_answer_unchanged(
     assert not session.in_flight
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capable", "params", "bounded"),
+    [
+        (True, {"allow_cached": "true", "allow_timeout": "true"}, True),
+        (True, {"allow_cached": "true"}, False),
+        (True, {}, False),
+        (False, {"allow_cached": "true", "allow_timeout": "true"}, False),
+    ],
+    ids=["opted-in-poll", "poll-without-opt-in", "one-shot", "runner-without-capability"],
+)
+async def test_only_an_opted_in_poll_stops_waiting_for_a_tunnelled_runner_that_keeps_its_read(
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capable: bool,
+    params: dict[str, str],
+    bounded: bool,
+) -> None:
+    """The tunnel ignores httpx timeouts; the bound needs the client's opt-in and the runner's."""
+    import dataclasses
+
+    from omnigent.runner.pr_resource import CAP_PR_INFO_POLL_CACHE
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.server.routes.sessions import routes_resources
+
+    del runner_globals_reset
+
+    class _SilentRunnerSocket:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    registry = TunnelRegistry()
+    hello = HelloFrame(
+        runner_version="0.1.0",
+        frame_protocol_version=1,
+        harnesses=[],
+        envs=[],
+        capabilities=[CAP_PR_INFO_POLL_CACHE] if capable else [],
+    )
+    registry.register("runner_one", _SilentRunnerSocket(), hello)
+    store = _ConversationStore()
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    store._conversations[session_id] = dataclasses.replace(
+        store._conversations[session_id], runner_id="runner_one"
+    )
+    set_runner_router(RunnerRouter(registry=registry, conversation_store=store))  # type: ignore[arg-type]
+    monkeypatch.setattr(routes_resources, "_PR_INFO_POLL_TIMEOUT_S", 0.2)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_sessions_app(store)), base_url="http://server"
+    ) as client:
+        read = asyncio.create_task(
+            client.get(f"/v1/sessions/{session_id}/resources/github", params=params)
+        )
+        done, _ = await asyncio.wait({read}, timeout=budget(1))
+        read.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await read
+
+    session = registry.get("runner_one")
+    assert session is not None
+    if bounded:
+        assert read in done
+        assert read.result().status_code == 504
+        assert "poll again" in read.result().json()["detail"]
+        assert not session.in_flight
+    else:
+        assert not done  # still waiting for the runner, as before
+
+
 def _pr_app(db_uri: str, **router_options: Any) -> FastAPI:
     """App whose sessions keep their pull requests in a real SQLite store."""
     SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)

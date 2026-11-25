@@ -189,6 +189,8 @@ class _RunnerStreamResponse(StreamingResponse):
 # budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
 # reported as failed.
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
+# The longest a PR panel poll that allows it waits for a runner that keeps the read.
+_PR_INFO_POLL_TIMEOUT_S = 10.0
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
@@ -3623,11 +3625,15 @@ def register_resources_routes(
         pr_url: str | None = None,
         *,
         allow_cached: bool = False,
+        allow_timeout: bool = False,
     ) -> dict[str, Any]:
         """Read PR context through the runner or host and store what it reports.
 
         :param allow_cached: The client polls again soon, so the runner may answer
             from its previous read.
+        :param allow_timeout: With ``allow_cached``, a runner that keeps the read for
+            the next poll is waited for at most :data:`_PR_INFO_POLL_TIMEOUT_S`.
+        :raises HTTPException: 504 when that wait ends.
         """
         params = await _github_params(
             session_id,
@@ -3636,15 +3642,27 @@ def register_resources_routes(
                 **({"allow_cached": True} if allow_cached else {}),
             },
         )
+        bounded = allow_cached and allow_timeout and _runner_keeps_polled_reads(conv)
         requested_at = time.time()
-        info = await _fs_get_with_host_fallback(
-            session_id,
-            conv,
-            op="github_info",
-            host_params=params,
-            runner_params=params or None,
-            runner_path=f"/v1/sessions/{session_id}/resources/github",
-        )
+        # The tunnel transport ignores httpx timeouts, so the bound is enforced here.
+        deadline = asyncio.timeout(_PR_INFO_POLL_TIMEOUT_S if bounded else None)
+        try:
+            async with deadline:
+                info = await _fs_get_with_host_fallback(
+                    session_id,
+                    conv,
+                    op="github_info",
+                    host_params=params,
+                    runner_params=params or None,
+                    runner_path=f"/v1/sessions/{session_id}/resources/github",
+                )
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise
+            raise HTTPException(
+                status_code=504,
+                detail="The runner is still reading this pull request; poll again for its answer.",
+            ) from exc
         # A runner or host may answer from a read that began before this request.
         age = info.pop("cache_age_s", 0)
         if isinstance(age, int | float) and age > 0:
@@ -3709,6 +3727,18 @@ def register_resources_routes(
         elif store_unlink:
             await _store_unlink(session_id, url)
         return await _with_server_pull_requests(session_id, result, requested_at)
+
+    def _runner_keeps_polled_reads(conv: Conversation) -> bool:
+        """Whether the session's runner keeps a PR panel poll's read for the next poll."""
+        from omnigent.runner.pr_resource import CAP_PR_INFO_POLL_CACHE
+        from omnigent.runtime import get_runner_router
+
+        routing = get_runner_router()
+        return (
+            conv.runner_id is not None
+            and routing is not None
+            and routing.runner_has_capability(conv.runner_id, CAP_PR_INFO_POLL_CACHE)
+        )
 
     def _tunnel_is_local(conv: Conversation) -> bool:
         """Whether this replica holds the session's runner or host tunnel."""
@@ -3891,6 +3921,7 @@ def register_resources_routes(
         session_id: str,
         pr_url: str | None = None,
         allow_cached: bool = False,
+        allow_timeout: bool = False,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -3903,10 +3934,15 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param allow_cached: Set by a client that polls again soon: the answer may
             come from the runner's previous read, at most a minute old.
+        :param allow_timeout: Set with ``allow_cached`` by a client that keeps its last
+            answer meanwhile: a runner that keeps the read for the next poll is waited
+            for at most 10 seconds, after which the response is a 504.
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
+        return await _github_info(
+            session_id, conv, pr_url, allow_cached=allow_cached, allow_timeout=allow_timeout
+        )
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",

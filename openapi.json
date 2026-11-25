@@ -27050,6 +27050,17 @@
               "title": "Allow Cached",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Set with `allow_cached` by a client that keeps its last answer meanwhile: a runner that keeps the read for the next poll is waited for at most 10 seconds, after which the response is a 504.",
+            "in": "query",
+            "name": "allow_timeout",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Allow Timeout",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

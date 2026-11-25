@@ -266,10 +266,10 @@ describe("fetchPullRequestInfo", () => {
   });
 });
 
-describe("fetchPullRequestInfo's allow_cached", () => {
+describe("fetchPullRequestInfo's poll flags", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it("is sent only when the caller polls", async () => {
+  it("are sent only when the caller polls", async () => {
     const fetchMock = vi.fn<typeof fetch>(
       async () => new Response(JSON.stringify({ object: "session.github.info" }), { status: 200 }),
     );
@@ -280,8 +280,8 @@ describe("fetchPullRequestInfo's allow_cached", () => {
     await fetchPullRequestInfo("conv", undefined, undefined, true);
     const urls = fetchMock.mock.calls.map(([url]) => String(url));
     expect(urls[0]).toMatch(/\?pr_url=[^&]+$/);
-    expect(urls[1]).toMatch(/\?pr_url=[^&]+&allow_cached=true$/);
-    expect(urls[2]).toMatch(/\/resources\/github\?allow_cached=true$/);
+    expect(urls[1]).toMatch(/\?pr_url=[^&]+&allow_cached=true&allow_timeout=true$/);
+    expect(urls[2]).toMatch(/\/resources\/github\?allow_cached=true&allow_timeout=true$/);
   });
 });
 

@@ -110,6 +110,10 @@ _DISCOVERY_LOCK = Lock()
 _DISCOVERY_JOBS: dict[tuple[str, str, str | None], Future[dict[str, Any]]] = {}
 _DISCOVERY_RESULT_LIMIT = 128
 
+# Advertised in the runner's tunnel hello: a PR panel poll's read goes on after the server
+# stops waiting for it, and a later poll takes it (see :func:`cached_pr_info`).
+CAP_PR_INFO_POLL_CACHE = "pr_info_poll_cache"
+
 # Panel polls share forge reads; see :func:`cached_pr_info`.
 _PANEL_READ_FRESH_SECONDS = 5.0
 _PANEL_READ_STALE_SECONDS = 60.0
