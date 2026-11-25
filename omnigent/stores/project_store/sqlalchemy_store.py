@@ -28,6 +28,8 @@ from omnigent.db.db_models import (
     SqlProjectTicketLink,
     SqlProjectTicketRead,
     SqlProjectTicketSession,
+    SqlProjectTicketStageMove,
+    SqlProjectTicketStageMoveBuild,
     current_workspace_id,
 )
 from omnigent.db.envelope import seal, seal_text
@@ -742,6 +744,8 @@ class SqlAlchemyProjectStore(ProjectStore):
                 return False
             if delete_tickets:
                 for model in (
+                    SqlProjectTicketStageMove,
+                    SqlProjectTicketStageMoveBuild,
                     SqlProjectTicketEvent,
                     SqlProjectTicketSession,
                     SqlProjectTicketRead,

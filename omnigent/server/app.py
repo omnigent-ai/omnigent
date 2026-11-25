@@ -2709,6 +2709,13 @@ def create_app(
         from omnigent.stores.project_ticket_store import ProjectTicketStore
 
         ticket_store = ProjectTicketStore(project_store.storage_location)
+        if conversation_store is not None:
+            from omnigent.server.routes.project_status import move_member_resolver
+
+            # Stage moves are credited to members as they're written, not per request.
+            ticket_store.set_move_member_resolver(
+                lambda project: move_member_resolver(project, conversation_store)
+            )
         project_ticket_notifications = ProjectTicketNotifications(
             ticket_store, project_store, startup_inputs
         )

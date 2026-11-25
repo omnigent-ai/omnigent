@@ -5,11 +5,12 @@ from __future__ import annotations
 import builtins
 import re
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select, union_all, update
+from sqlalchemy import and_, case, delete, func, or_, select, union_all, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -22,6 +23,8 @@ from omnigent.db.db_models import (
     SqlProjectTicketLink,
     SqlProjectTicketRead,
     SqlProjectTicketSession,
+    SqlProjectTicketStageMove,
+    SqlProjectTicketStageMoveBuild,
     current_workspace_id,
 )
 from omnigent.db.keyset import keyset_after
@@ -59,6 +62,7 @@ from omnigent.server.project_status_cache import invalidate_after_commit
 from omnigent.stores.project_store.access import accessible_project_ids, project_role
 from omnigent.stores.project_store.sqlalchemy_store import (
     _decode_config,
+    _to_entity,
     router_session_id_for_row,
 )
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
@@ -363,6 +367,7 @@ class ProjectTicketStore:
         self._write = make_named_managed_session_maker(
             engine, query_name_prefix="omnigent.project_tickets", immediate=True
         )
+        self._move_member: Callable[[Any], Callable[[dict[str, Any]], str]] | None = None
 
     @staticmethod
     def _project(
@@ -393,8 +398,135 @@ class ProjectTicketStore:
             raise OmnigentError("Ticket not found", code=ErrorCode.NOT_FOUND)
         return row
 
+    def set_move_member_resolver(
+        self, factory: Callable[[Any], Callable[[dict[str, Any]], str]]
+    ) -> None:
+        """Credit stage moves to members as they're written: ``factory(project)(move)``.
+
+        With a resolver set, status metrics read stage moves from an indexed table
+        instead of replaying events and resolving each mover's session per request.
+        """
+        self._move_member = factory
+
     @staticmethod
+    def _stage_move(kind: str, payload: dict[str, Any]) -> tuple[str, bool, bool] | None:
+        """``(stage_id, is_complete, is_creation)`` for a created or stage-change event."""
+        stage = payload.get("stage")
+        if not isinstance(stage, dict) or not isinstance(stage.get("id"), str):
+            return None
+        if kind == "updated":
+            changes = payload.get("changes")
+            if not isinstance(changes, dict) or "stage_id" not in changes:
+                return None
+        elif kind != "created":
+            return None
+        return stage["id"], stage.get("is_complete") is True, kind == "created"
+
+    def _record_move(
+        self,
+        session: Session,
+        project: SqlProject,
+        ticket_id: str,
+        position: int,
+        kind: str,
+        payload: dict[str, Any],
+        actor: TicketActor,
+        moved_at: int,
+    ) -> None:
+        """Add the stage move an event makes, once the project's moves are built."""
+        move = self._stage_move(kind, payload)
+        if move is None or self._move_member is None:
+            return
+        if session.get(SqlProjectTicketStageMoveBuild, (project.workspace_id, project.id)) is None:
+            return
+        stage_id, is_complete, is_creation = move
+        member = self._move_member(_to_entity(project))(
+            {"session_id": actor.session_id, "user_id": actor.user_id}
+        )
+        session.add(
+            SqlProjectTicketStageMove(
+                workspace_id=project.workspace_id,
+                project_id=project.id,
+                ticket_id=ticket_id,
+                position=position,
+                moved_at=moved_at,
+                stage_id=stage_id,
+                is_complete=is_complete,
+                is_creation=is_creation,
+                user_id=actor.user_id,
+                session_id=actor.session_id,
+                member_key=member,
+            )
+        )
+
+    def _ensure_moves_built(self, project_id: str, user_id: str | None) -> bool:
+        """Build a project's stage moves from its events once; ``False`` without a resolver."""
+        if self._move_member is None:
+            return False
+        with self._session("check_ticket_stage_moves_built") as session:
+            project = self._project(session, project_id, user_id)
+            if session.get(SqlProjectTicketStageMoveBuild, (project.workspace_id, project.id)):
+                return True
+
+        def build(session: Session) -> bool:
+            project = self._project(session, project_id, user_id)
+            key = (project.workspace_id, project.id)
+            if session.get(SqlProjectTicketStageMoveBuild, key) is not None:
+                return True
+            member_of = self._move_member(_to_entity(project))
+            session.execute(
+                delete(SqlProjectTicketStageMove).where(
+                    SqlProjectTicketStageMove.workspace_id == project.workspace_id,
+                    SqlProjectTicketStageMove.project_id == project.id,
+                )
+            )
+            events = session.scalars(
+                select(SqlProjectTicketEvent)
+                .where(
+                    SqlProjectTicketEvent.workspace_id == project.workspace_id,
+                    SqlProjectTicketEvent.project_id == project.id,
+                    SqlProjectTicketEvent.kind.in_(
+                        (EVENT_CODES["created"], EVENT_CODES["updated"])
+                    ),
+                )
+                .order_by(SqlProjectTicketEvent.ticket_id, SqlProjectTicketEvent.position)
+            )
+            created_seen: set[str] = set()
+            for event in events:
+                kind = "created" if event.kind == EVENT_CODES["created"] else "updated"
+                move = self._stage_move(kind, event.payload or {})
+                if move is None or (move[2] and event.ticket_id in created_seen):
+                    continue
+                if move[2]:
+                    created_seen.add(event.ticket_id)
+                session.add(
+                    SqlProjectTicketStageMove(
+                        workspace_id=project.workspace_id,
+                        project_id=project.id,
+                        ticket_id=event.ticket_id,
+                        position=event.position,
+                        moved_at=event.created_at,
+                        stage_id=move[0],
+                        is_complete=move[1],
+                        is_creation=move[2],
+                        user_id=event.user_id,
+                        session_id=event.session_id,
+                        member_key=member_of(
+                            {"session_id": event.session_id, "user_id": event.user_id}
+                        ),
+                    )
+                )
+            session.add(
+                SqlProjectTicketStageMoveBuild(
+                    workspace_id=project.workspace_id, project_id=project.id, built_at=now_epoch()
+                )
+            )
+            return True
+
+        return run_write_transaction(self._write, "build_ticket_stage_moves", build)
+
     def _append(
+        self,
         session: Session,
         project: SqlProject,
         ticket: SqlProjectTicket,
@@ -436,6 +568,7 @@ class ProjectTicketStore:
             state = NOTIFICATION_PENDING
         else:
             state = NOTIFICATION_DIGEST
+        created_at = now_epoch()
         session.add(
             SqlProjectTicketEvent(
                 workspace_id=project.workspace_id,
@@ -448,9 +581,19 @@ class ProjectTicketStore:
                 session_id=actor.session_id,
                 agent_id=actor.agent_id,
                 payload=payload,
-                created_at=now_epoch(),
+                created_at=created_at,
                 notification_state=state,
             )
+        )
+        self._record_move(
+            session,
+            project,
+            ticket.id,
+            ticket.next_event_position,
+            kind,
+            payload,
+            actor,
+            created_at,
         )
         ticket.next_event_position += 1
         ticket.updated_at = now_epoch()
@@ -469,8 +612,31 @@ class ProjectTicketStore:
         """Every move of a ticket into a completed stage since *since_epoch* (inclusive).
 
         Readable by any project member. Each row is ``{"ticket_id", "user_id",
-        "session_id", "created_at"}``: who moved it, for per-member counts.
+        "session_id", "created_at"}``: who moved it, for per-member counts. With a
+        move resolver set, rows come from the stage-move table and add ``member_key``.
         """
+        if self._ensure_moves_built(project_id, user_id):
+            with self._session("list_ticket_completed_stage_moves") as session:
+                project = self._project(session, project_id, user_id)
+                stmt = select(SqlProjectTicketStageMove).where(
+                    SqlProjectTicketStageMove.workspace_id == project.workspace_id,
+                    SqlProjectTicketStageMove.project_id == project.id,
+                    SqlProjectTicketStageMove.is_complete.is_(True),
+                    SqlProjectTicketStageMove.is_creation.is_(False),
+                )
+                if since_epoch is not None:
+                    stmt = stmt.where(SqlProjectTicketStageMove.moved_at >= since_epoch)
+                order = (SqlProjectTicketStageMove.moved_at, SqlProjectTicketStageMove.position)
+                return [
+                    {
+                        "ticket_id": row.ticket_id,
+                        "user_id": row.user_id,
+                        "session_id": row.session_id,
+                        "created_at": row.moved_at,
+                        "member_key": row.member_key,
+                    }
+                    for row in session.scalars(stmt.order_by(*order))
+                ]
         with self._session("list_ticket_completed_moves") as session:
             self._project(session, project_id, user_id)
             stmt = select(SqlProjectTicketEvent).where(
@@ -515,7 +681,40 @@ class ProjectTicketStore:
         :param since_epoch: Only tickets created or updated at or after it, each with
             its whole history, so a move's previous stage and the ticket's creation
             are still there. ``None`` reads every ticket.
+
+        With a move resolver set, entries come from the stage-move table and add
+        ``member_key``; tickets are those with a move since *since_epoch*.
         """
+        if self._ensure_moves_built(project_id, user_id):
+            with self._session("list_ticket_stage_move_histories") as session:
+                project = self._project(session, project_id, user_id)
+                scope = (
+                    SqlProjectTicketStageMove.workspace_id == project.workspace_id,
+                    SqlProjectTicketStageMove.project_id == project.id,
+                )
+                stmt = select(SqlProjectTicketStageMove).where(*scope)
+                if since_epoch is not None:
+                    active = (
+                        select(SqlProjectTicketStageMove.ticket_id)
+                        .where(*scope, SqlProjectTicketStageMove.moved_at >= since_epoch)
+                        .distinct()
+                    )
+                    stmt = stmt.where(SqlProjectTicketStageMove.ticket_id.in_(active))
+                histories: dict[str, builtins.list[dict[str, Any]]] = {}
+                order = (SqlProjectTicketStageMove.ticket_id, SqlProjectTicketStageMove.position)
+                for row in session.scalars(stmt.order_by(*order)):
+                    histories.setdefault(row.ticket_id, []).append(
+                        {
+                            "stage_id": row.stage_id,
+                            "is_complete": row.is_complete,
+                            "at": row.moved_at,
+                            "created": row.is_creation,
+                            "user_id": row.user_id,
+                            "session_id": row.session_id,
+                            "member_key": row.member_key,
+                        }
+                    )
+                return histories
         with self._session("list_ticket_stage_histories") as session:
             self._project(session, project_id, user_id)
             scope = (

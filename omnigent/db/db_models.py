@@ -1274,6 +1274,48 @@ class SqlUsageEvent(OmnigentBase):
     )
 
 
+class SqlProjectTicketStageMove(OmnigentBase):
+    """One ticket stage move, with the member it counts for, for status metrics.
+
+    A projection of the ticket's created and stage-change events, so metrics read
+    an indexed table instead of decoding event payloads and resolving each mover's
+    session per request. Built for a project on its first read, then kept current
+    as events are written.
+    """
+
+    __tablename__ = "project_ticket_stage_moves"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # The event's position on its ticket.
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    moved_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    stage_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Whether the stage was a completed one when the ticket moved there.
+    is_complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # The ticket's creation, not a move.
+    is_creation: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Who the move counts for, e.g. "user:a@example.com" or "identity:orchestrator".
+    member_key: Mapped[str] = mapped_column(String(160), nullable=False)
+
+    __table_args__ = (
+        Index("ix_project_ticket_stage_moves_time", "workspace_id", "project_id", "moved_at"),
+    )
+
+
+class SqlProjectTicketStageMoveBuild(OmnigentBase):
+    """Marks a project whose stage moves have been built from its events."""
+
+    __tablename__ = "project_ticket_stage_move_builds"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    built_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class SqlProjectTicketLink(OmnigentBase):
     """An untyped, undirected link stored once with the smaller ticket ID first."""
 

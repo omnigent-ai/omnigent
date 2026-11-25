@@ -113,6 +113,8 @@ def move_member_resolver(
         return key
 
     def resolve(move: dict[str, Any]) -> MemberKey:
+        if move.get("member_key"):
+            return move["member_key"]
         session_id = move.get("session_id")
         return (session_member(session_id, move.get("user_id")) if session_id else None) or (
             user_member_key(move.get("user_id") or project.user_id)
@@ -144,7 +146,7 @@ def tickets_done_by_member(
     latest = {move["ticket_id"]: move for move in moves}
     by_member: dict[MemberKey, int] = {}
     for move in latest.values():
-        key = member_of(move)
+        key = move.get("member_key") or member_of(move)
         by_member[key] = by_member.get(key, 0) + 1
     return MemberTotals(total=len(latest), by_member=by_member)
 
