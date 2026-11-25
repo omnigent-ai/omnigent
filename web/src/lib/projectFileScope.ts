@@ -1,3 +1,4 @@
+import { stripBasePath } from "./basePath";
 import { TEMP_CONV_ID_PREFIX } from "./tempConversationId";
 
 // A project file opens in the session FileViewer under a client-only scope ID.
@@ -52,6 +53,8 @@ export interface ProjectContentTarget extends ProjectFileScope {
   contentPath: string;
 }
 
+const VIDEO_ATTACHMENT_MARKER = "?type=video";
+
 // `/v1/projects/{project}/files/{id}/content` or `.../ticket-attachments/{id}/content`.
 export const PROJECT_CONTENT_PATH =
   /^\/v1\/projects\/([^/?#]+)\/(files|ticket-attachments)\/([^/?#]+)\/content$/;
@@ -64,15 +67,19 @@ export function parseProjectContentLink(href: string): ProjectContentTarget | nu
   } catch {
     return null;
   }
-  if (url.origin !== window.location.origin || url.search || url.hash) return null;
-  const match = PROJECT_CONTENT_PATH.exec(url.pathname);
+  // Ticket attachments mark a video with exactly `?type=video`; nothing else may ride along.
+  if (url.origin !== window.location.origin || url.hash) return null;
+  if (url.search && url.search !== VIDEO_ATTACHMENT_MARKER) return null;
+  const pathname = stripBasePath(url.pathname);
+  const match = PROJECT_CONTENT_PATH.exec(pathname);
+  if (url.search && match?.[2] !== "ticket-attachments") return null;
   if (!match) return null;
   try {
     return {
       projectId: decodeURIComponent(match[1]),
       fileId: decodeURIComponent(match[3]),
       kind: match[2] === "files" ? "file" : "attachment",
-      contentPath: url.pathname,
+      contentPath: pathname,
     };
   } catch {
     return null;

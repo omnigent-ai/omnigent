@@ -45,5 +45,14 @@ describe("project file scope", () => {
     ).toBeNull();
     expect(parseProjectContentLink("/v1/projects/p1/files/f1")).toBeNull();
     expect(parseProjectContentLink("/home/u/ws/report.md")).toBeNull();
+    // A video attachment's marker is the only query allowed, and only on attachments.
+    expect(
+      parseProjectContentLink("/v1/projects/p1/ticket-attachments/a1/content?type=video"),
+    ).toMatchObject({
+      kind: "attachment",
+      contentPath: "/v1/projects/p1/ticket-attachments/a1/content",
+    });
+    expect(parseProjectContentLink("/v1/projects/p1/files/f1/content?type=video")).toBeNull();
+    expect(parseProjectContentLink("/v1/projects/p1/ticket-attachments/a1/content?x=1")).toBeNull();
   });
 });

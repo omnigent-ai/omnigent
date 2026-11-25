@@ -840,12 +840,12 @@ describe("links to project files and ticket attachments", () => {
 
   it("keeps them as real links instead of looking them up in the workspace", () => {
     renderMarkdown(
-      `[report.md](${FILE}) and [shot.png](${ATTACHMENT})`,
+      `[report.md](${FILE}), [shot.png](${ATTACHMENT}) and [demo.mp4](${ATTACHMENT}?type=video)`,
       [],
       FILE_VIEWER_WITH_SESSION,
     );
     const links = screen.getAllByTestId("project-content-link");
-    expect(links.map((link) => link.getAttribute("href"))).toEqual([FILE, ATTACHMENT]);
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([FILE, ATTACHMENT, ATTACHMENT]);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(openFile).not.toHaveBeenCalled();
   });

@@ -525,7 +525,6 @@ function WorkspaceFileLink({
   );
 }
 
-/** Right-click menu that copies the path a file link names. */
 /**
  * A link to a project file or ticket attachment. It opens with the viewer's own
  * credentials, like the project Files panel, whatever host runs the session.
@@ -582,6 +581,7 @@ function ProjectContentLink({
   );
 }
 
+/** Right-click menu that copies the path a file link names. */
 function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
   const copyPath = () =>
     void copyText(path).then(
