@@ -5,8 +5,18 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { useFileFinderStore } from "@/store/fileFinder";
 import { STICKY_LINE_CLASS } from "./codeMirrorStickyScroll";
-import { EditorContextMenu, isInsideSelection, placeCursorForMenu } from "./EditorContextMenu";
+import {
+  COPY_FAILED_MESSAGE,
+  CUT_FAILED_MESSAGE,
+  EditorContextMenu,
+  isInsideSelection,
+  PASTE_FAILED_MESSAGE,
+  placeCursorForMenu,
+} from "./EditorContextMenu";
 import type { CodeMirrorSelectionActions } from "./useCodeMirrorCommentLayer";
+
+const { toastError } = vi.hoisted(() => ({ toastError: vi.fn() }));
+vi.mock("sonner", () => ({ toast: { error: toastError } }));
 
 const views: EditorView[] = [];
 const readOnlyCompartment = new Compartment();
@@ -26,6 +36,7 @@ afterAll(() => {
 
 afterEach(() => {
   cleanup();
+  toastError.mockClear();
   for (const view of views.splice(0)) view.destroy();
   useFileFinderStore.setState({
     availableSessionId: null,
@@ -160,6 +171,38 @@ describe("EditorContextMenu", () => {
     rightClick(view);
     await userEvent.click(screen.getByRole("menuitem", { name: /^Paste/ }));
     await vi.waitFor(() => expect(view.state.doc.toString()).toBe("pasted text"));
+  });
+
+  it("leaves the text and says so when the clipboard can't be read", async () => {
+    vi.stubGlobal("navigator", {
+      ...navigator,
+      clipboard: { readText: () => Promise.reject(new Error("denied")) },
+    });
+    const { view } = editorWithMenu("old text", EditorSelection.single(0, 3), { editable: true });
+    rightClick(view);
+    await userEvent.click(screen.getByRole("menuitem", { name: /^Paste/ }));
+    await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith(PASTE_FAILED_MESSAGE));
+    expect(view.state.doc.toString()).toBe("old text");
+  });
+
+  it.each([
+    ["Cut", CUT_FAILED_MESSAGE],
+    ["Copy", COPY_FAILED_MESSAGE],
+  ])("names %s in the message when the browser refuses it", async (label, message) => {
+    const original = document.execCommand;
+    const execCommand = vi.fn(() => false);
+    document.execCommand = execCommand;
+    try {
+      const { view } = editorWithMenu("old text", EditorSelection.single(0, 3), {
+        editable: true,
+      });
+      rightClick(view);
+      await userEvent.click(screen.getByRole("menuitem", { name: new RegExp(`^${label}`) }));
+      expect(execCommand).toHaveBeenCalledWith(label.toLowerCase());
+      expect(toastError).toHaveBeenCalledWith(message);
+    } finally {
+      document.execCommand = original;
+    }
   });
 
   function delayedClipboard() {

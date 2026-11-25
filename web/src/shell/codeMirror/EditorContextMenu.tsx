@@ -39,6 +39,7 @@ const MOVES_FOCUS: ReadonlySet<EditorMenuAction> = new Set([
 
 export const PASTE_FAILED_MESSAGE = "Couldn't read the clipboard.";
 export const COPY_FAILED_MESSAGE = "Couldn't copy the selection.";
+export const CUT_FAILED_MESSAGE = "Couldn't cut the selection.";
 
 export interface EditorContextMenuProps {
   view: EditorView | null;
@@ -189,7 +190,9 @@ export function EditorContextMenu({
         if (action === "cut" && !acceptsEdits(view)) return;
         // The editor's own copy handler writes the file's raw text.
         view.focus();
-        if (!document.execCommand(action)) toast.error(COPY_FAILED_MESSAGE);
+        if (!document.execCommand(action)) {
+          toast.error(action === "cut" ? CUT_FAILED_MESSAGE : COPY_FAILED_MESSAGE);
+        }
         return;
       case "paste":
         if (!acceptsEdits(view)) return;
