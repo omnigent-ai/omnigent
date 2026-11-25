@@ -857,10 +857,28 @@ def _group(content: str, reacted: bool) -> dict[str, Any]:
         ("add", {"reaction": {"content": "HEART"}}),
         ("add", {"subject": {"reactionGroups": [_group("THUMBS_UP", False)]}}),
         ("remove", {"subject": {"reactionGroups": [_group("THUMBS_UP", True)]}}),
+        ("add", {}),
+        ("remove", {}),
+        ("add", {"reaction": None, "subject": None}),
+        ("remove", {"reaction": None, "subject": None}),
+        ("add", {"subject": {"reactionGroups": [_group("HEART", True)]}}),
+        ("remove", {"subject": {"reactionGroups": []}}),
+        ("add", {"subject": {"reactionGroups": [{"content": "THUMBS_UP"}]}}),
     ],
-    ids=["add-another-reaction", "add-not-reacted", "remove-still-reacted"],
+    ids=[
+        "add-another-reaction",
+        "add-not-reacted",
+        "remove-still-reacted",
+        "add-empty",
+        "remove-empty",
+        "add-null-fields",
+        "remove-null-fields",
+        "add-subject-without-its-group",
+        "remove-subject-without-groups",
+        "add-group-without-viewer-state",
+    ],
 )
-def test_a_reaction_change_github_contradicts_is_an_unknown_outcome(
+def test_a_reaction_change_github_does_not_confirm_is_an_unknown_outcome(
     fake: FakeGitHub, verb: str, payload: dict[str, Any]
 ) -> None:
     mutation = f"{verb}Reaction"
@@ -875,6 +893,26 @@ def test_a_reaction_change_github_contradicts_is_an_unknown_outcome(
             comment_id=5,
             content="THUMBS_UP",
         )
+    assert len(fake.mutations(mutation)) == 1
+
+
+@pytest.mark.parametrize("verb", ["add", "remove"])
+def test_a_reaction_change_confirmed_only_by_its_group_succeeds(
+    fake: FakeGitHub, verb: str
+) -> None:
+    mutation = f"{verb}Reaction"
+    group = _group("THUMBS_UP", verb == "add")
+    fake.graphql_failure = _answer(mutation, {"subject": {"reactionGroups": [group]}})
+    change = pr_actions.add_reaction if verb == "add" else pr_actions.remove_reaction
+    result = change(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        kind="issue",
+        comment_id=5,
+        content="THUMBS_UP",
+    )
+    assert result["reacted"] is (verb == "add")
     assert len(fake.mutations(mutation)) == 1
 
 

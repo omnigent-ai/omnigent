@@ -766,15 +766,17 @@ def _set_reaction(
 
 
 def _confirm_reaction(payload: dict[str, Any], *, content: str, reacted: bool) -> None:
-    """Refuse to report success when GitHub's answer contradicts the reaction change.
+    """Report success only when GitHub's answer confirms the reaction change.
 
-    The reaction and the comment's reaction groups are optional; only what's there is checked.
+    Either the changed reaction or the comment's group for it must confirm it; neither may
+    contradict it.
     """
+    confirmed = False
     reaction = payload.get("reaction")
-    if reaction is not None and (
-        not isinstance(reaction, dict) or reaction.get("content") != content
-    ):
-        raise github_failures.unknown_outcome()
+    if reaction is not None:
+        if not isinstance(reaction, dict) or reaction.get("content") != content:
+            raise github_failures.unknown_outcome()
+        confirmed = True
     subject = payload.get("subject")
     groups = subject.get("reactionGroups") if isinstance(subject, dict) else None
     for group in groups if isinstance(groups, list) else []:
@@ -782,9 +784,12 @@ def _confirm_reaction(payload: dict[str, Any], *, content: str, reacted: bool) -
             isinstance(group, dict)
             and group.get("content") == content
             and isinstance(group.get("viewerHasReacted"), bool)
-            and group["viewerHasReacted"] is not reacted
         ):
-            raise github_failures.unknown_outcome()
+            if group["viewerHasReacted"] is not reacted:
+                raise github_failures.unknown_outcome()
+            confirmed = True
+    if not confirmed:
+        raise github_failures.unknown_outcome()
 
 
 def _reactions_after(payload: dict[str, Any]) -> dict[str, Any]:
