@@ -6,6 +6,7 @@
 import { randomUUID } from "@/lib/randomUUID";
 import { newPendingSideChatId } from "@/lib/sideChat";
 
+import type { BrowserTabChange } from "./browserTabNavigation";
 import { isPinnedTab, withPinnedFirst } from "./pinnedTabs";
 import { createShellWaits } from "./shellWaits";
 import { type HistoryMoveOptions, WorkspaceHistory } from "./workspaceHistory";
@@ -102,6 +103,17 @@ export function isOnlyEmptyNewTab(tabs: readonly WorkspaceTabRecord[], tabId?: T
     only.place.app === undefined &&
     (tabId === undefined || only.id === tabId)
   );
+}
+
+/** A browser tab's navigation owner, as the store uses it: the page moves only through it. */
+export interface BrowserTabLanding {
+  /** Make the page show `visit`; the cursor is already on it. Sets the tab's place itself. */
+  land: (visit: Visit) => unknown;
+  /** The page is still loading a step, so stepping into this tab waits. */
+  isWaitingForReplay: () => boolean;
+  /** What the page last committed; null when nothing has, so the tab's place stands. */
+  committedPlace: () => WorkspacePlace | null;
+  deselected: () => void;
 }
 
 /** The visit a tab shows now, with its page's history entry. */
@@ -246,6 +258,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   // Most recently selected first, for "the most recently selected tab showing that file".
   let recentlySelected: TabId[] = selectedTabId === null ? [] : [selectedTabId];
   const listeners = new Set<() => void>();
+  let browserNavigation: (tabId: TabId) => BrowserTabLanding | undefined = () => undefined;
   // Inside a transaction, commits wait for its end, so a step and its landing publish once.
   let transactionDepth = 0;
   let commitPending = false;
@@ -344,6 +357,9 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   }
 
   function markSelected(tabId: TabId) {
+    if (selectedTabId !== null && selectedTabId !== tabId) {
+      browserNavigation(selectedTabId)?.deselected();
+    }
     selectedTabId = tabId;
     recentlySelected = [tabId, ...recentlySelected.filter((id) => id !== tabId)];
   }
@@ -434,6 +450,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
         land(tab.id);
         if (plan.select) markSelected(tab.id);
         recordVisit(plan.history, changed ? { tabId: tab.id, place: plan.place } : visitOf(next));
+        loadNewPage(tab, plan.place);
         return { tabId: tab.id, created: false, selected: plan.select };
       }
       case "attention": {
@@ -583,27 +600,78 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
             history.recordStep(visit);
           }
         }
+        loadNewPage(current, place);
         commit();
         return { ok: true as const };
       }),
     );
   }
 
-  /** Show `visit` in its browser tab. */
+  /**
+   * One browser tab transition from its navigation owner: what the page shows and,
+   * when it changes, the timeline, published together in one commit.
+   */
+  function applyBrowserTransition(tabId: TabId, change: BrowserTabChange): boolean {
+    const tab = findTab(tabId);
+    if (tab?.binding?.kind !== "browser-view") return false;
+    const { url } = change.place;
+    const place: WorkspacePlace = url === undefined ? { kind: "web" } : { kind: "web", url };
+    replaceTab(showingVisit(tab, { tabId, place }));
+    if (change.history) history.state = change.history;
+    commit();
+    return true;
+  }
+
+  /** Point the store at the browser tabs' navigation owners; none leaves pages where they are. */
+  function setBrowserNavigation(lookup: ((tabId: TabId) => BrowserTabLanding | undefined) | null) {
+    browserNavigation = lookup ?? (() => undefined);
+  }
+
+  /** A browser owner's waiting changed: Back and Forward's availability did too. */
+  function noteBrowserWaiting() {
+    if (transactionDepth > 0) return;
+    snapshot = makeSnapshot();
+    for (const listener of [...listeners]) listener();
+  }
+
+  /** Stepping onto `visit` waits while its browser page is still loading an earlier step. */
+  function isVisitBlocked(visit: Visit): boolean {
+    return browserNavigation(visit.tabId)?.isWaitingForReplay() ?? false;
+  }
+
+  /**
+   * A browser tab was sent to a new page, already in its place and the timeline:
+   * its owner loads it.
+   */
+  function loadNewPage(tab: WorkspaceTab, place: WorkspacePlace) {
+    if (tab.binding?.kind !== "browser-view" || samePlace(tab.place, place)) return;
+    void browserNavigation(tab.id)?.land({ tabId: tab.id, place });
+  }
+
+  /** Show `visit` in its browser tab: through its owner, which moves the page and sets the place. */
   function landBrowserTab(tab: WorkspaceTab, visit: Visit) {
-    replaceTab(showingVisit(withoutUnseen(tab), visit));
+    const owner = browserNavigation(tab.id);
+    replaceTab(owner ? withoutUnseen(tab) : showingVisit(withoutUnseen(tab), visit));
+    if (owner) void owner.land(visit);
+  }
+
+  /** Back and Forward step over a browser visit whose page is still loading an earlier step. */
+  function stepOptionsFor(moveOptions?: HistoryMoveOptions): HistoryMoveOptions {
+    return {
+      isBlocked: (visit) => (moveOptions?.isBlocked?.(visit) ?? false) || isVisitBlocked(visit),
+    };
   }
 
   /**
    * Step Back or Forward through the timeline: select the visit's tab and, when it
    * shows something else, navigate it there, asking about unsaved edits first.
-   * A browser page lands in the same commit.
+   * A browser page lands through its navigation owner, in the same commit.
    */
   async function go(
     direction: "back" | "forward",
     moveOptions?: HistoryMoveOptions,
   ): Promise<GuardedResult> {
-    const stepOptions: HistoryMoveOptions = moveOptions ?? {};
+    const stepOptions = stepOptionsFor(moveOptions);
     const target =
       direction === "back" ? history.backTarget(stepOptions) : history.forwardTarget(stepOptions);
     if (!target) return { ok: false, reason: "There's nowhere to go." };
@@ -687,6 +755,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       return;
     }
     // Closing the last tab leaves none for now; a session's commit puts a New tab in its place.
+    if (selectedTabId !== null) browserNavigation(selectedTabId)?.deselected();
     selectedTabId = null;
   }
 
@@ -702,7 +771,12 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       removed.binding?.kind !== "terminal" &&
       removed.place.kind !== "new"
     ) {
-      closed = [...closed, { tab: withoutMarks(removed), index }].slice(-MAX_CLOSED_TABS);
+      // A landing still in flight hasn't moved the page: reopening loads what it last committed.
+      const committed = browserNavigation(removed.id)?.committedPlace() ?? null;
+      const record = withoutMarks(removed);
+      const kept =
+        committed && !samePlace(committed, record.place) ? withPlace(record, committed) : record;
+      closed = [...closed, { tab: kept, index }].slice(-MAX_CLOSED_TABS);
     }
     const restore = history.removeTab(tabId);
     if (removed.id === selectedTabId) landAfterRemoval(index, restore);
@@ -1190,6 +1264,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
           wasSelected && isPositionOnlyMove(current.place, place) ? "replace" : "append",
           samePlace(current.place, place) ? visitOf(shown) : { tabId, place },
         );
+        loadNewPage(current, place);
         commit();
         return { ok: true as const };
       }),
@@ -1276,6 +1351,10 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
     open,
     openBrowserView,
     navigate,
+    applyBrowserTransition,
+    setBrowserNavigation,
+    noteBrowserWaiting,
+    isVisitBlocked,
     /** Whether `tabId` is selected right now, even inside a transition not yet published. */
     isSelected: (tabId: TabId) => selectedTabId === tabId,
     select,
