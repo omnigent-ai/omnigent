@@ -28,6 +28,11 @@ describe("stepTimeLimit", () => {
     );
   });
 
+  it("breaks lines where Markdown does, at a lone CR too", () => {
+    expect(stepTimeLimit("Fix it.\r**Time limit:** 2 hours")).toBe("2 hours");
+    expect(stepTimeLimit("Example:\r\r```\r**Time limit:** 2 hours\r```")).toBeNull();
+  });
+
   it("reads a description whose lines break with CRLF", () => {
     expect(stepTimeLimit("Fix it.\r\n\r\n**Time limit:** 1 hour\r\n")).toBe("1 hour");
   });
@@ -197,6 +202,17 @@ describe("withStepTimeLimit", () => {
     expect(stepTimeLimit(listed)).toBe("2 hours");
   });
 
+  it("leaves a Time limit line inside inline code that runs across lines alone", () => {
+    const example = "Copy `example\n**Time limit:** 2 hours\nend` unchanged.";
+    expect(stepTimeLimit(example)).toBeNull();
+    expect(withStepTimeLimit(example, null)).toBe(example);
+    const limited = withStepTimeLimit(example, "1 hour");
+    expect(limited).toBe(`${example}\n\n**Time limit:** 1 hour`);
+    expect(stepTimeLimit(limited)).toBe("1 hour");
+    expect(withStepTimeLimit(limited, "4 hours")).toBe(`${example}\n\n**Time limit:** 4 hours`);
+    expect(withStepTimeLimit(limited, null)).toBe(example);
+  });
+
   it("changes only the edited lines: their breaks and the first line's indent stay", () => {
     expect(withStepTimeLimit("Fix it.\r\n\r\n**Details:** run it.", "1 hour")).toBe(
       "Fix it.\r\n\r\n**Time limit:** 1 hour\r\n\r\n**Details:** run it.",
@@ -245,17 +261,6 @@ describe("withTimeLimitLength", () => {
       "**Time limit:** 1 hour",
     );
   });
-
-  it("leaves a Time limit line inside inline code that runs across lines alone", () => {
-    const example = "Copy `example\n**Time limit:** 2 hours\nend` unchanged.";
-    expect(stepTimeLimit(example)).toBeNull();
-    expect(withStepTimeLimit(example, null)).toBe(example);
-    const limited = withStepTimeLimit(example, "1 hour");
-    expect(limited).toBe(`${example}\n\n**Time limit:** 1 hour`);
-    expect(stepTimeLimit(limited)).toBe("1 hour");
-    expect(withStepTimeLimit(limited, "4 hours")).toBe(`${example}\n\n**Time limit:** 4 hours`);
-    expect(withStepTimeLimit(limited, null)).toBe(example);
-  });
 });
 
 describe("withSavedTimeLimits", () => {
@@ -286,5 +291,14 @@ describe("splitTimeLimit", () => {
     expect(splitTimeLimit(after)).toEqual(splitTimeLimit(withStepTimeLimit(GOAL, "2 hours")));
     expect(splitTimeLimit(after)).toEqual([GOAL, "2 hours"]);
     expect(splitTimeLimit(null)).toEqual([null, null]);
+  });
+
+  // Matching that backtracked over a long run of spaces would take minutes on these.
+  it("reads descriptions with long runs of spaces quickly", () => {
+    const spaces = " ".repeat(200_000);
+    const example = `Copy this example:\n\n${spaces}x`;
+    expect(splitTimeLimit(example)).toEqual([example, null]);
+    expect(stepTimeLimit(`**Time limit:** a${spaces}b`)).toBe(`a${spaces}b`);
+    expect(timeLimitMinutes(`1h${spaces}30m`)).toBe(90);
   });
 });

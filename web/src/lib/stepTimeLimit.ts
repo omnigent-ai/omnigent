@@ -18,22 +18,23 @@ export const TIME_LIMIT_CHOICES = [
 ] as const;
 
 // A line of its own, as a paragraph, a list item or a quote, with the colon in the bold or just
-// after it, e.g. "- **Time limit:** 2 hours" or "1. **Time limit**: 2 hours".
+// after it, e.g. "- **Time limit:** 2 hours" or "1. **Time limit**: 2 hours". Each run of spaces
+// can match only one way, so a long one doesn't make matching slow.
 const LIMIT_LINE =
-  /^([ \t]*(?:>[ \t]?)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?)\*\*Time limit(?::\*\*|\*\*[ \t]*:)[ \t]*(.*?)[ \t]*$/i;
+  /^([ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?)\*\*Time limit(?::\*\*|\*\*[ \t]*:)[ \t]*(.*)$/i;
 const DETAILS_LINE = /^([ \t]*)((?:[-*+]|\d{1,9}[.)])[ \t]+)?\*\*Details(?::\*\*|\*\*[ \t]*:)/i;
 // Most descriptions name no limit, and those need no parsing.
 const LIMIT_MARK = /\*\*Time limit(?::\*\*|\*\*[ \t]*:)/i;
 // Minutes in a length's unit, by the unit's first letter.
 const UNIT_MINUTES: Readonly<Record<string, number>> = { d: 1440, h: 60, m: 1 };
-// One part of a length, e.g. "1 hour" in "1 hour 30 minutes" or "1h" in "1h30m", with what
+// One part of a length, e.g. "1 hour" in "1 hour 30 minutes" or "1h" in "1h30m", and then what
 // separates it from the next.
 const LENGTH_PART =
-  /^(\d+(?:\.\d+)?)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d)(?![a-z])[\s,]*(?:and\s+)?/i;
+  /(\d+(?:\.\d+)?)\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d)(?![a-z])([\s,]*(?:and\s+)?)/iy;
 
-/** A description's lines, which may break with CRLF. */
+/** A description's lines, broken where Markdown breaks them: at CRLF, LF or a lone CR. */
 function descriptionLines(goal: string | null): string[] {
-  return goal ? goal.split(/\r?\n/) : [];
+  return goal ? goal.split(/\r\n|\r|\n/) : [];
 }
 
 interface CodeBlock {
@@ -105,7 +106,7 @@ export function stepTimeLimit(goal: string | null): string | null {
   const lines = descriptionLines(goal);
   for (const index of matchingLines(lines, LIMIT_LINE)) {
     // An empty line names no limit; a later one may.
-    const text = LIMIT_LINE.exec(lines[index]!)?.[2];
+    const text = LIMIT_LINE.exec(lines[index]!)?.[2]?.trimEnd();
     if (text) return text;
   }
   return null;
@@ -114,15 +115,16 @@ export function stepTimeLimit(goal: string | null): string | null {
 /** The length a limit starts with, e.g. "1 hour 30 minutes", and how many minutes it is. */
 function leadingLength(limit: string): { text: string; minutes: number } | null {
   const text = limit.trim();
-  let rest = text;
   let minutes = 0;
-  for (let part = LENGTH_PART.exec(rest); part; part = LENGTH_PART.exec(rest)) {
+  // Where the last part's unit ends: the length stops there, before what separates it.
+  let end = 0;
+  LENGTH_PART.lastIndex = 0;
+  for (let part = LENGTH_PART.exec(text); part; part = LENGTH_PART.exec(text)) {
     minutes += Number(part[1]) * UNIT_MINUTES[part[2]![0]!.toLowerCase()]!;
-    rest = rest.slice(part[0].length);
+    end = LENGTH_PART.lastIndex - part[3]!.length;
   }
-  if (rest === text || minutes === 0) return null;
-  const length = text.slice(0, text.length - rest.length).replace(/[\s,]*(?:and\s*)?$/i, "");
-  return { text: length, minutes };
+  if (end === 0 || minutes === 0) return null;
+  return { text: text.slice(0, end), minutes };
 }
 
 /** How long a limit allows in minutes, e.g. 90 for "1 hour 30 minutes"; null without a length. */
@@ -151,8 +153,9 @@ export function shortTimeLimit(limit: string): string | null {
 export function withStepTimeLimit(goal: string | null, limit: string | null): string | null {
   const lines = descriptionLines(goal);
   const limitLine = limit ? `**Time limit:** ${limit}` : null;
-  const code = limitLine || (goal && LIMIT_MARK.test(goal)) ? codeLines(lines) : NO_CODE;
-  const found = matchingLines(lines, LIMIT_LINE, code);
+  const marked = !!goal && LIMIT_MARK.test(goal);
+  const code = limitLine || marked ? codeLines(lines) : NO_CODE;
+  const found = marked ? matchingLines(lines, LIMIT_LINE, code) : [];
   const kept = limitLine ? found[0] : undefined;
   // From the last, so the earlier lines keep their places.
   for (const at of [...found].reverse()) {

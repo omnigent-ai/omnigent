@@ -497,16 +497,23 @@ class WorkflowStore:
                 steps=current.steps if steps is None else steps,
             )
             now = now_epoch()
-            # A write that leaves the description, such as a time limit's change to the steps,
-            # keeps its time. The plan holds that time only while it's older than the last write.
+            # A write of the steps that leaves the description, such as a time limit's, keeps the
+            # description's time, held in the plan while it's older than the last write. Only such
+            # a write starts holding it: its plan is size-checked with the time, so a rename or a
+            # planning chat can't push a full plan past its limit. Those keep a time already held.
             was_written_at = (
                 current.updated_at
                 if current.description_updated_at is None
                 else current.description_updated_at
             )
-            described_at = now if describes else was_written_at
-            held = None if described_at == now else described_at
             was_held = None if was_written_at == current.updated_at else was_written_at
+            if describes:
+                held = None
+            elif steps is not None:
+                held = None if was_written_at == now else was_written_at
+            else:
+                held = was_held
+            described_at = now if held is None else held
             # The plan keeps the description's source and time, so a new one rewrites it.
             rewrites_plan = (
                 steps is not None or source != current.description_source or held != was_held

@@ -15,7 +15,7 @@ from sqlalchemy import Update, event, select, update
 from omnigent.db import compression
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlPreference, SqlWorkflow
 from omnigent.db.utils import get_or_create_engine
-from omnigent.entities.workflow import InvalidWorkflowError, Workflow
+from omnigent.entities.workflow import InvalidWorkflowError, Workflow, normalize_workflow
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores import workflow_store
 from omnigent.stores.workflow_store import (
@@ -306,15 +306,52 @@ def test_a_kept_description_time_goes_once_an_older_server_writes_the_descriptio
         connection.execute(
             update(SqlWorkflow)
             .where(SqlWorkflow.id == saved.id)
-            .values(description=compression.encode("Older words."), updated_at=150)
+            .values(description=compression.encode("Older words."), updated_at=115)
         )
     reread = store.get(saved.id, user_id=ALICE)
     assert reread is not None and reread.description == "Older words."
-    assert reread.description_updated_at == 150
-    # The next write keeps the time for the description it has now.
-    renamed = store.update(saved.id, user_id=ALICE, name="deploy-2")
-    assert renamed is not None and renamed.description_updated_at == 150
-    assert store.get(saved.id, user_id=ALICE) == renamed
+    assert reread.description_updated_at == 115
+    # The next write of the steps keeps the time of the description it has now.
+    stepped = store.update(saved.id, user_id=ALICE, steps=STEPS)
+    assert stepped is not None
+    assert (stepped.updated_at, stepped.description_updated_at) == (120, 115)
+    assert store.get(saved.id, user_id=ALICE) == stepped
+
+
+def _full_plan_steps(store: WorkflowStore) -> list[dict[str, object]]:
+    """One step whose random goal makes the stored plan as large as the store takes."""
+    noise = "".join(random.Random(3).choices(string.ascii_letters + string.digits, k=30_000))
+
+    def fits(length: int) -> bool:
+        steps = [{"id": "big", "name": "Big", "goal": noise[:length]}]
+        _, text, normalized = normalize_workflow(name="full", description="Run it.", steps=steps)
+        try:
+            store._stored_texts(text, workflow_store._plan_text(normalized))
+        except InvalidWorkflowError:
+            return False
+        return True
+
+    low, high = 0, len(noise)
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if fits(middle) else (low, middle - 1)
+    return [{"id": "big", "name": "Big", "goal": noise[:low]}]
+
+
+def test_a_full_plan_can_still_be_renamed_and_planned_later(
+    store: WorkflowStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter(range(100, 1000, 10))
+    monkeypatch.setattr(workflow_store, "now_epoch", lambda: next(clock))
+    saved = store.create(
+        user_id=ALICE, name="full", description="Run it.", steps=_full_plan_steps(store)
+    )
+    # Writes that leave the steps add nothing to a plan with no room left.
+    renamed = store.update(saved.id, user_id=ALICE, name="full-2")
+    assert renamed is not None and renamed.name == "full-2"
+    planned = store.update(saved.id, user_id=ALICE, planning_session_id="c" * 32)
+    assert planned is not None and planned.planning_session_id == "c" * 32
+    assert planned.description_updated_at == planned.updated_at == 120
 
 
 def test_a_write_from_steps_read_earlier_is_refused_once_they_change(
