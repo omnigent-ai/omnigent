@@ -74,6 +74,10 @@ function ContextMenuItem({
   description?: React.ReactNode;
 }) {
   const descriptionId = React.useId();
+  const row = describedWithShortcut(children, description, descriptionId, shortcut);
+  // The caller's own description reads first; keys it names replace the binding's.
+  const describedBy =
+    [props["aria-describedby"], row["aria-describedby"]].filter(Boolean).join(" ") || undefined;
   return (
     <ContextMenuPrimitive.Item
       data-slot="context-menu-item"
@@ -84,7 +88,9 @@ function ContextMenuItem({
         className,
       )}
       {...props}
-      {...describedWithShortcut(children, description, descriptionId, shortcut)}
+      {...row}
+      aria-describedby={describedBy}
+      aria-keyshortcuts={props["aria-keyshortcuts"] ?? row["aria-keyshortcuts"]}
     />
   );
 }

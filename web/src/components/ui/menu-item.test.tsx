@@ -83,6 +83,25 @@ describe("context menu row shortcuts and descriptions", () => {
     expect(row).toHaveAccessibleDescription("Press ⌘V to paste here.");
   });
 
+  it("keeps the caller's own description and keys beside the row's", () => {
+    openContextMenu(
+      <>
+        <span id="row-hint">Runs on the open file.</span>
+        <ContextMenuItem
+          shortcut="session.rename"
+          description="Press ⌘V to paste here."
+          aria-describedby="row-hint"
+          aria-keyshortcuts="F2"
+        >
+          Rename
+        </ContextMenuItem>
+      </>,
+    );
+    const row = screen.getByRole("menuitem", { name: /Rename/ });
+    expect(row).toHaveAccessibleDescription("Runs on the open file. Press ⌘V to paste here.");
+    expect(row).toHaveAttribute("aria-keyshortcuts", "F2");
+  });
+
   it("leaves a row without a binding or description unchanged", () => {
     openContextMenu(<ContextMenuItem>Plain</ContextMenuItem>);
     const row = screen.getByRole("menuitem", { name: "Plain" });
