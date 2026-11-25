@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, TypedDict, TypeVar
 
 from omnigent.entities import Project
@@ -302,10 +302,12 @@ class ProjectStore(ABC):
         model: str | None = None,
         effort: str | None = None,
         created_by_session_id: str | None = None,
+        scope: Mapping[str, Sequence[str]] | None = None,
     ) -> ProjectIdentity:
         """Insert an identity; names are unique within the project.
 
         *created_by_session_id* names the creating agent session, or ``None`` for the owner.
+        *scope* holds its ``owns`` and ``excludes`` lists.
 
         :raises OmnigentError: ``NOT_FOUND`` for an unowned project,
             ``ALREADY_EXISTS`` for a duplicate name, ``INVALID_INPUT`` for bounds.
@@ -325,8 +327,11 @@ class ProjectStore(ABC):
         effort: str | None = None,
         clear: frozenset[str] = frozenset(),
         agent_editor: bool = False,
+        scope: Mapping[str, Sequence[str]] | None = None,
     ) -> ProjectIdentity | None:
         """Update fields; ``None`` leaves one unchanged and *clear* names fields to null.
+
+        A *scope* with both lists empty, or ``"scope"`` in *clear*, removes the scope.
 
         :raises OmnigentError: ``FORBIDDEN`` when *agent_editor* targets an owner-made identity.
         """

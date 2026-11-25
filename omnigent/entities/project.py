@@ -135,6 +135,26 @@ PROJECT_IDENTITY_MAX_COUNT = 20
 PROJECT_IDENTITY_LABEL_KEY = "omnigent.project_identity_id"
 
 
+#: A role's scope lists: what it owns and what it doesn't.
+ROLE_SCOPE_KEYS = ("owns", "excludes")
+ROLE_SCOPE_MAX_ITEMS = 12
+ROLE_SCOPE_ITEM_MAX_CHARS = 200
+#: Stored size of a role's sealed scope; the caps above fit well inside it.
+PROJECT_IDENTITY_SCOPE_MAX_BYTES = 16383
+
+
+def role_scope_text(scope: dict[str, list[str]] | None) -> str:
+    """A role's scope as two short lines for its session, or ``""`` when it has none."""
+    if not scope:
+        return ""
+    lines = []
+    if scope.get("owns"):
+        lines.append("Owns: " + "; ".join(scope["owns"]))
+    if scope.get("excludes"):
+        lines.append("Doesn't own: " + "; ".join(scope["excludes"]))
+    return "\n".join(lines)
+
+
 @dataclass
 class ProjectIdentity:
     """
@@ -153,6 +173,8 @@ class ProjectIdentity:
     :param active_session_id: The identity's current session, or ``None``.
     :param created_by_session_id: The agent session that created it, or ``None``
         when the owner did; agents may edit only agent-created identities.
+    :param scope: The role's ``{"owns": [...], "excludes": [...]}`` lists, or
+        ``None`` when it has none.
     :param created_at: Unix epoch seconds at creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
     """
@@ -166,6 +188,7 @@ class ProjectIdentity:
     effort: str | None = None
     active_session_id: str | None = None
     created_by_session_id: str | None = None
+    scope: dict[str, list[str]] | None = None
     created_at: int = 0
     updated_at: int | None = None
 

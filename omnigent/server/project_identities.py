@@ -59,6 +59,7 @@ def identity_response(identity: ProjectIdentity, state: IdentitySessionState) ->
         "name": identity.name,
         "builtin": False,
         "instructions": identity.instructions,
+        "scope": identity.scope,
         "agent_id": identity.agent_id,
         "model": identity.model,
         "effort": identity.effort,

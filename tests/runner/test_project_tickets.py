@@ -819,3 +819,13 @@ async def test_file_view_rejects_other_paths_and_workspace_escapes(tmp_path):
     assert "Not a project file path" in json.loads(bad_path)["error"]
     assert "error" in json.loads(escape)
     assert all(path == f"/v1/sessions/{SOURCE}" for _, path, _ in seen)
+
+
+def test_scope_lists_fold_into_the_api_scope_and_keep_the_list_left_out() -> None:
+    from omnigent.runner.project_tickets import _with_scope
+
+    assert _with_scope({"name": "PM"}) == {"name": "PM"}
+    assert _with_scope({"owns": ["plans"]}) == {"scope": {"owns": ["plans"], "excludes": []}}
+    assert _with_scope(
+        {"does_not_own": ["code review"]}, {"owns": ["plans"], "excludes": ["old"]}
+    ) == {"scope": {"owns": ["plans"], "excludes": ["code review"]}}

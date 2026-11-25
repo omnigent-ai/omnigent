@@ -835,6 +835,7 @@ def create_projects_router(
             model=body.model,
             effort=body.effort,
             created_by_session_id=source_session,
+            scope=body.scope.model_dump() if body.scope is not None else None,
         )
         announce_projects_changed(user_id)
         # A new identity starts its one session right away; a failure retries on the next list.
@@ -934,6 +935,7 @@ def create_projects_router(
             effort=body.effort or None,
             clear=clear,
             agent_editor=ORCHESTRATION_SOURCE_HEADER in request.headers,
+            scope=body.scope.model_dump() if body.scope is not None else None,
         )
         if identity is None:
             raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)

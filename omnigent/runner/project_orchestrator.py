@@ -98,6 +98,9 @@ def project_identity_instruction(identity: object) -> str | None:
     )
     if persona:
         block += f"\n\n<project_identity_persona>\n{persona}\n</project_identity_persona>"
+    scope = identity.get("scope")
+    if isinstance(scope, str) and scope.strip():
+        block += f"\n\n<project_identity_scope>\n{scope.strip()}\n</project_identity_scope>"
     return block
 
 

@@ -38,6 +38,7 @@ from omnigent.db.envelope import EnvelopedJSON, EnvelopedText
 from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.entities.project import (
     MANDATE_PROPOSALS_MAX_STORED_BYTES,
+    PROJECT_IDENTITY_SCOPE_MAX_BYTES,
     PROJECT_MANDATE_MAX_BYTES,
     PROJECT_MANDATE_MAX_STORED_BYTES,
 )
@@ -1030,6 +1031,10 @@ class SqlProjectIdentity(OmnigentBase):
     # The agent session that created it; NULL for owner-made identities, which
     # agents may not edit.
     created_by_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # The role's "Owns / Doesn't own" lists: {"owns": [...], "excludes": [...]}; NULL for none.
+    scope: Mapped[dict[str, list[str]] | None] = mapped_column(
+        EnvelopedJSON(PROJECT_IDENTITY_SCOPE_MAX_BYTES), nullable=True
+    )
     # The seat's project agent (an ``agents`` row scoped to this project). NULL
     # until the role is converted; ``agent_id``, ``instructions``, ``model`` and
     # ``effort`` keep their meaning so older binaries still run the role.

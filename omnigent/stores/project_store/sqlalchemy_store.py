@@ -7,6 +7,7 @@ import dataclasses
 import json
 import re
 import uuid
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import zstandard
@@ -51,8 +52,12 @@ from omnigent.entities.project import (
     MANDATE_PROPOSALS_MAX_STORED_BYTES,
     PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES,
     PROJECT_IDENTITY_MAX_COUNT,
+    PROJECT_IDENTITY_SCOPE_MAX_BYTES,
     PROJECT_MANDATE_MAX_BYTES,
     PROJECT_MANDATE_MAX_STORED_BYTES,
+    ROLE_SCOPE_ITEM_MAX_CHARS,
+    ROLE_SCOPE_KEYS,
+    ROLE_SCOPE_MAX_ITEMS,
     MandateProposal,
     ProjectIdentity,
     ProjectShare,
@@ -326,6 +331,34 @@ def _normalize_identity_instructions(instructions: str) -> str:
     return trimmed
 
 
+def _normalize_identity_scope(
+    scope: Mapping[str, Sequence[str]] | None,
+) -> dict[str, list[str]] | None:
+    """Trim a role's scope lists; ``None`` when both are empty.
+
+    :raises OmnigentError: ``INVALID_INPUT`` for too many or too long items.
+    """
+    if scope is None:
+        return None
+    normalized: dict[str, list[str]] = {}
+    for key in ROLE_SCOPE_KEYS:
+        items = [item.strip() for item in scope.get(key) or () if item.strip()]
+        if len(items) > ROLE_SCOPE_MAX_ITEMS or any(
+            len(item) > ROLE_SCOPE_ITEM_MAX_CHARS for item in items
+        ):
+            raise OmnigentError(
+                f"A role's scope holds at most {ROLE_SCOPE_MAX_ITEMS} items per list, "
+                f"each up to {ROLE_SCOPE_ITEM_MAX_CHARS} characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        normalized[key] = items
+    if not any(normalized.values()):
+        return None
+    if len(seal(normalized)) > PROJECT_IDENTITY_SCOPE_MAX_BYTES:
+        raise OmnigentError("A role's scope is too large", code=ErrorCode.INVALID_INPUT)
+    return normalized
+
+
 def _identity_entity(row: SqlProjectIdentity) -> ProjectIdentity:
     return ProjectIdentity(
         id=row.id,
@@ -337,6 +370,7 @@ def _identity_entity(row: SqlProjectIdentity) -> ProjectIdentity:
         effort=row.effort,
         active_session_id=row.active_session_id,
         created_by_session_id=row.created_by_session_id,
+        scope=row.scope,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -1260,9 +1294,11 @@ class SqlAlchemyProjectStore(ProjectStore):
         model: str | None = None,
         effort: str | None = None,
         created_by_session_id: str | None = None,
+        scope: Mapping[str, Sequence[str]] | None = None,
     ) -> ProjectIdentity:
         stored_name = _normalize_identity_name(name)
         stored_instructions = _normalize_identity_instructions(instructions)
+        stored_scope = _normalize_identity_scope(scope)
         created_at = now_epoch()
 
         def write(session: Session) -> ProjectIdentity:
@@ -1289,6 +1325,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 created_at=created_at,
                 created_by_session_id=created_by_session_id,
             )
+            row.scope = stored_scope
             return _identity_entity(row)
 
         return run_write_transaction(self._session_immediate, "insert_project_identity", write)
@@ -1306,7 +1343,9 @@ class SqlAlchemyProjectStore(ProjectStore):
         effort: str | None = None,
         clear: frozenset[str] = frozenset(),
         agent_editor: bool = False,
+        scope: Mapping[str, Sequence[str]] | None = None,
     ) -> ProjectIdentity | None:
+        stored_scope = _normalize_identity_scope(scope)
         stored_name = _normalize_identity_name(name) if name is not None else None
         stored_instructions = (
             _normalize_identity_instructions(instructions) if instructions is not None else None
@@ -1337,6 +1376,8 @@ class SqlAlchemyProjectStore(ProjectStore):
                 row.name = stored_name
             if stored_instructions is not None:
                 row.instructions = stored_instructions
+            if "scope" in clear or scope is not None:
+                row.scope = stored_scope
             for field_name, value in (
                 ("agent_id", agent_id),
                 ("model", model),

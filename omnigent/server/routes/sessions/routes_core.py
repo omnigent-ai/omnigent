@@ -57,7 +57,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import MessageData
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import SessionPermission
-from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY, Project
+from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY, Project, role_scope_text
 from omnigent.errors import (
     ErrorCategory,
     ErrorCode,
@@ -2812,6 +2812,9 @@ def register_core_routes(
                     if include_project_mandate:
                         # Runners compose the persona with the mandate.
                         snapshot.project_identity["instructions"] = identity.instructions
+                        scope = role_scope_text(identity.scope)
+                        if scope:
+                            snapshot.project_identity["scope"] = scope
             if project is not None and conv.side_chat_parent_id and not conv.archived:
                 snapshot.project_side_chat_role = await _side_chat_project_role(
                     project, conv.side_chat_parent_id, include_project_mandate

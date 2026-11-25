@@ -1715,3 +1715,42 @@ async def test_a_manager_invites_members_but_owner_only_settings_stay_with_the_o
     demoted = await client.patch(f"{shares}/{BOB}", json={"role": "member"}, headers=owner)
     assert demoted.json()["role"] == "member"
     assert (await client.post(shares, json={"user_id": dan}, headers=bob)).status_code == 403
+
+
+async def test_a_role_has_an_editable_owns_and_does_not_own_scope(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Scope is trimmed, edited as two lists, shown to the role's session and clearable."""
+    created = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    identities = f"/v1/projects/{created['id']}/identities"
+    designer = (
+        await project_client.post(
+            identities,
+            json={
+                "name": "Designer",
+                "instructions": "Design.",
+                "scope": {"owns": [" visual design ", "", "UX reviews"], "excludes": ["roadmap"]},
+            },
+        )
+    ).json()
+    assert designer["scope"] == {"owns": ["visual design", "UX reviews"], "excludes": ["roadmap"]}
+
+    snapshot = await project_client.get(
+        f"/v1/sessions/{designer['active_session_id']}",
+        params={"include_project_mandate": "true"},
+    )
+    assert snapshot.json()["project_identity"]["scope"] == (
+        "Owns: visual design; UX reviews\nDoesn't own: roadmap"
+    )
+
+    path = f"{identities}/{designer['id']}"
+    edited = await project_client.patch(path, json={"scope": {"owns": ["icons"]}})
+    assert edited.json()["scope"] == {"owns": ["icons"], "excludes": []}
+    too_many = await project_client.patch(path, json={"scope": {"owns": ["x" * 201]}})
+    assert too_many.status_code == 400, too_many.text
+    widest = ["\u6f22" * 200 for _ in range(12)]
+    full = await project_client.patch(path, json={"scope": {"owns": widest, "excludes": widest}})
+    assert full.status_code == 200, full.text
+    assert full.json()["scope"]["owns"] == widest
+    cleared = await project_client.patch(path, json={"scope": {"owns": [], "excludes": []}})
+    assert cleared.json()["scope"] is None

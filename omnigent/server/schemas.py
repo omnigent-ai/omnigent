@@ -6740,6 +6740,19 @@ class UpdateProjectRequest(BaseModel):
         return trimmed
 
 
+class ProjectRoleScope(BaseModel):
+    """A role's scope: what it owns and what it leaves to others.
+
+    :param owns: Areas the role is accountable for, e.g. ``"visual design"``.
+    :param excludes: Areas it doesn't own, e.g. ``"the roadmap"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    owns: list[str] = Field(default_factory=list, max_length=12)
+    excludes: list[str] = Field(default_factory=list, max_length=12)
+
+
 class ProjectIdentityRequest(BaseModel):
     """Create or edit a project identity (a named persistent role).
 
@@ -6748,6 +6761,7 @@ class ProjectIdentityRequest(BaseModel):
     :param agent_id: Default agent for its sessions; empty clears it.
     :param model: Default model override; empty clears it.
     :param effort: Default reasoning effort; empty clears it.
+    :param scope: What the role owns and doesn't; empty lists clear it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -6757,6 +6771,7 @@ class ProjectIdentityRequest(BaseModel):
     agent_id: str | None = None
     model: str | None = None
     effort: str | None = None
+    scope: ProjectRoleScope | None = None
 
 
 class ProjectIdentitySessionRequest(BaseModel):
