@@ -226,6 +226,8 @@ export interface PushPrefix {
   stop: { sha: string; ticket_id: string | null; reason: string } | null;
   /** Verified tickets after the stop, held back by it. */
   blocked_verified_ticket_ids: string[];
+  /** Each ticket in the unpushed range; `verified` means it's in a Verified stage. */
+  tickets?: { ticket_id: string; verified: boolean }[];
 }
 
 /** The project's push-prefix report, or null where the server doesn't provide one. */

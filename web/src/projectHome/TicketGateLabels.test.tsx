@@ -85,3 +85,48 @@ describe("gate labels on a card", () => {
     expect(screen.queryByLabelText(/more label/)).toBeNull();
   });
 });
+
+describe("ship blocker panel copy", () => {
+  it("speaks to the person, not in the server's terms", async () => {
+    const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
+    const { TicketShipBlocker, BLOCKING_NEXT_STEP } = await import("./TicketShipBlocker");
+    const client = new QueryClient();
+    client.setQueryData(["project-tickets", "p1", "push-prefix"], {
+      pushable_sha: null,
+      stop: {
+        sha: APPROVED,
+        ticket_id: "t1",
+        reason: "ticket `t1` is in `implemented`, not Verified",
+      },
+      blocked_verified_ticket_ids: ["t2", "t3"],
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <TicketShipBlocker projectId="p1" ticketId="t1" variant="panel" />
+      </QueryClientProvider>,
+    );
+    const signal = screen.getByTestId("ticket-ship-blocker");
+    expect(signal).toHaveTextContent("Blocking 2 Verified tickets from shipping");
+    expect(signal).toHaveTextContent(BLOCKING_NEXT_STEP);
+    expect(signal).not.toHaveTextContent("`");
+    expect(signal).not.toHaveAttribute("title");
+  });
+
+  it("tells a Verified ticket to land the rest rather than to verify it", async () => {
+    const { blockingNextStep, BLOCKING_NEXT_STEP, BLOCKING_PARTIAL_STEP } =
+      await import("./TicketShipBlocker");
+    const prefix = {
+      pushable_sha: null,
+      stop: { sha: APPROVED, ticket_id: "t1", reason: "only part of it is on the branch" },
+      blocked_verified_ticket_ids: ["t2"],
+      tickets: [
+        { ticket_id: "t1", verified: true },
+        { ticket_id: "t2", verified: true },
+      ],
+    };
+    expect(blockingNextStep(prefix, "t1")).toBe(BLOCKING_PARTIAL_STEP);
+    const unverified = { ...prefix, tickets: [{ ticket_id: "t1", verified: false }] };
+    expect(blockingNextStep(unverified, "t1")).toBe(BLOCKING_NEXT_STEP);
+    expect(blockingNextStep({ ...prefix, tickets: undefined }, "t1")).toBe(BLOCKING_NEXT_STEP);
+  });
+});

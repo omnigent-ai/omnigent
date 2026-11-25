@@ -20,6 +20,19 @@ export function blockedCount(prefix: PushPrefix | null | undefined, ticketId: st
   return prefix?.stop?.ticket_id === ticketId ? prefix.blocked_verified_ticket_ids.length : 0;
 }
 
+/** The panel's next step. The signal only shows on the stop ticket itself, so it speaks to that. */
+export const BLOCKING_NEXT_STEP =
+  "This ticket has landed but isn't verified yet. Verify it or revert it to let the others ship.";
+/** For a Verified ticket whose verified commit hasn't fully landed. */
+export const BLOCKING_PARTIAL_STEP =
+  "Only part of this ticket has landed. Land the rest, or revert it, to let the others ship.";
+
+/** What to do about the stop ticket, from what the report says about it. */
+export function blockingNextStep(prefix: PushPrefix | null | undefined, ticketId: string): string {
+  const row = prefix?.tickets?.find((ticket) => ticket.ticket_id === ticketId);
+  return row?.verified ? BLOCKING_PARTIAL_STEP : BLOCKING_NEXT_STEP;
+}
+
 export function blockingLabel(count: number): string {
   return `Blocking ${count} Verified ${count === 1 ? "ticket" : "tickets"} from shipping`;
 }
@@ -37,12 +50,10 @@ export function TicketShipBlocker({
   const prefix = usePushPrefix(projectId);
   const count = blockedCount(prefix, ticketId);
   if (count === 0) return null;
-  const reason = prefix?.stop?.reason;
   return (
     <div
       role="status"
       data-testid="ticket-ship-blocker"
-      title={reason || undefined}
       className={cn(
         "flex min-w-0 items-start gap-1.5 rounded-md border border-warning/50 bg-warning/10 text-warning",
         variant === "card" ? "px-2 py-1 text-xs font-medium" : "px-3 py-2 text-sm",
@@ -55,9 +66,7 @@ export function TicketShipBlocker({
       <span className="min-w-0">
         <span className="font-medium">{blockingLabel(count)}</span>
         {variant === "panel" && (
-          <span className="block text-foreground/80">
-            {reason ? `${reason}. ` : ""}Verify this ticket, or revert it, so they can be pushed.
-          </span>
+          <span className="block text-foreground/80">{blockingNextStep(prefix, ticketId)}</span>
         )}
       </span>
     </div>
