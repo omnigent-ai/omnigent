@@ -673,49 +673,58 @@ it("does not mistake subframe loading for an initial main-frame navigation", () 
   assert.equal("pendingUrl" in result, false);
 });
 
-describe("browser IPC localhost previews from hosts reached over SSH", () => {
-  /** A registry that grants one host only, recording each step. */
-  function previewSetup({ request, recover } = {}) {
-    const ipcMain = makeIpcMain();
-    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
-    const state = { allowed: false, allowedHost: "host-1", calls: [], loaded: [] };
-    const registry = {
-      ...createBrowserViewRegistry(),
-      checkAgentNavigation: async (_id, _url, context) => {
-        const allowed = state.allowed && context.sourceHostId === state.allowedHost;
-        state.calls.push(allowed ? "allowed" : "denied");
-        return allowed ? { ok: true } : { ok: false, error: "blocked", localhostBlocked: true };
+/** A registry that grants one host only, recording each step. */
+function previewSetup({
+  request,
+  requestTrusted,
+  recover,
+  protocols = { sshPreviewProtocol: 1 },
+} = {}) {
+  const ipcMain = makeIpcMain();
+  const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+  const state = { allowed: false, allowedHost: "host-1", calls: [], loaded: [] };
+  const registry = {
+    ...createBrowserViewRegistry(),
+    checkAgentNavigation: async (_id, _url, context) => {
+      const allowed = state.allowed && context.sourceHostId === state.allowedHost;
+      state.calls.push(allowed ? "allowed" : "denied");
+      return allowed ? { ok: true } : { ok: false, error: "blocked", localhostBlocked: true };
+    },
+    openOrNavigate: (_id, url) => {
+      state.calls.push("navigate");
+      state.loaded.push(url);
+      return { ok: true, created: false };
+    },
+  };
+  registerBrowserIpc({
+    ipcMain,
+    isPinnedOriginSender: () => true,
+    getRegistryForEvent: () => registry,
+    getAgentContextForEvent: (_event, opts) => ({ sourceHostId: opts?.sourceHostId ?? null }),
+    ...(recover ? { recoverAgentNavigationForEvent: recover } : {}),
+    requestPreviewHostForEvent: async (...args) => {
+      state.calls.push("request");
+      return request ? request(state, ...args) : false;
+    },
+    requestTrustedRemoteHostForEvent: async (...args) => {
+      state.calls.push("request-trusted");
+      return requestTrusted ? requestTrusted(state, ...args) : false;
+    },
+  });
+  const navigate = (opts, url = "http://127.0.0.1:8787/") =>
+    ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url,
+        opts: { sessionHostProtocol: 1, ...protocols, ...opts },
       },
-      openOrNavigate: (_id, url) => {
-        state.calls.push("navigate");
-        state.loaded.push(url);
-        return { ok: true, created: false };
-      },
-    };
-    registerBrowserIpc({
-      ipcMain,
-      isPinnedOriginSender: () => true,
-      getRegistryForEvent: () => registry,
-      getAgentContextForEvent: (_event, opts) => ({ sourceHostId: opts?.sourceHostId ?? null }),
-      ...(recover ? { recoverAgentNavigationForEvent: recover } : {}),
-      requestPreviewHostForEvent: async (...args) => {
-        state.calls.push("request");
-        return request(state, ...args);
-      },
-    });
-    const navigate = (opts, url = "http://127.0.0.1:8787/") =>
-      ipcMain.invoke(
-        "omnigent:browser-open-or-navigate",
-        {},
-        {
-          conversationId: "source",
-          url,
-          opts: { sessionHostProtocol: 1, sshPreviewProtocol: 1, ...opts },
-        },
-      );
-    return { state, navigate, registry, ipcMain };
-  }
+    );
+  return { state, navigate, registry, ipcMain };
+}
 
+describe("browser IPC localhost previews from hosts reached over SSH", () => {
   it("asks about the source host, then requires fresh provenance before retrying", async () => {
     const seen = [];
     const { state, navigate } = previewSetup({
@@ -881,51 +890,9 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
 });
 
 describe("browser IPC localhost previews from trusted remote hosts", () => {
-  function trustedSetup({ request, requestTrusted } = {}) {
-    const ipcMain = makeIpcMain();
-    const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
-    const state = { allowed: false, calls: [] };
-    const registry = {
-      ...createBrowserViewRegistry(),
-      checkAgentNavigation: async (_id, _url, context) => {
-        const allowed = state.allowed && context.sourceHostId === "host-1";
-        state.calls.push(allowed ? "allowed" : "denied");
-        return allowed ? { ok: true } : { ok: false, error: "blocked", localhostBlocked: true };
-      },
-      openOrNavigate: (_id, _url) => {
-        state.calls.push("navigate");
-        return { ok: true, created: false };
-      },
-    };
-    registerBrowserIpc({
-      ipcMain,
-      isPinnedOriginSender: () => true,
-      getRegistryForEvent: () => registry,
-      getAgentContextForEvent: (_event, opts) => ({ sourceHostId: opts?.sourceHostId ?? null }),
-      requestPreviewHostForEvent: async (...args) => {
-        state.calls.push("request-ssh");
-        return request ? request(state, ...args) : false;
-      },
-      requestTrustedRemoteHostForEvent: async (...args) => {
-        state.calls.push("request-trusted");
-        return requestTrusted ? requestTrusted(state, ...args) : false;
-      },
-    });
-    const navigate = (opts, url = "http://127.0.0.1:8787/") =>
-      ipcMain.invoke(
-        "omnigent:browser-open-or-navigate",
-        {},
-        {
-          conversationId: "source",
-          url,
-          opts: { sessionHostProtocol: 1, trustedRemotePreviewProtocol: 1, ...opts },
-        },
-      );
-    return { state, navigate };
-  }
-
   it("asks to trust the host when no SSH protocol was offered, then retries", async () => {
-    const { state, navigate } = trustedSetup({
+    const { state, navigate } = previewSetup({
+      protocols: { trustedRemotePreviewProtocol: 1 },
       requestTrusted: (current) => {
         current.allowed = true;
         return true;
@@ -938,7 +905,8 @@ describe("browser IPC localhost previews from trusted remote hosts", () => {
   });
 
   it("falls back to trust when SSH is unavailable", async () => {
-    const { state, navigate } = trustedSetup({
+    const { state, navigate } = previewSetup({
+      protocols: { trustedRemotePreviewProtocol: 1 },
       request: () => false,
       requestTrusted: (current) => {
         current.allowed = true;
@@ -950,11 +918,12 @@ describe("browser IPC localhost previews from trusted remote hosts", () => {
       sshPreviewProtocol: 1,
     });
     assert.equal(result.retryWithFreshHost, true);
-    assert.deepEqual(state.calls, ["denied", "request-ssh", "request-trusted"]);
+    assert.deepEqual(state.calls, ["denied", "request", "request-trusted"]);
   });
 
   it("does not ask to trust when the renderer did not offer the trusted protocol", async () => {
-    const { state, navigate } = trustedSetup({
+    const { state, navigate } = previewSetup({
+      protocols: { trustedRemotePreviewProtocol: 1 },
       requestTrusted: () => assert.fail("must not ask"),
     });
     const result = await navigate({ sourceHostId: "host-1", trustedRemotePreviewProtocol: 0 });
