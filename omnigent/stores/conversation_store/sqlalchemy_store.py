@@ -4231,6 +4231,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        exclude_label: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -4303,6 +4304,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             can access but does NOT own — i.e. sessions shared with them
             by another user. Requires ``accessible_by`` to be set.
             ``False`` (default) disables the filter.
+        :param exclude_label: When set, exclude conversations carrying
+            this label key before pagination. ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises ValueError: If ``search_scope`` is not a known scope.
@@ -4511,6 +4514,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
+            if exclude_label is not None:
+                stmt = stmt.where(
+                    ~select(SqlConversationLabel.conversation_id)
+                    .where(
+                        SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                        SqlConversationLabel.conversation_id == SqlConversation.id,
+                        SqlConversationLabel.key == exclude_label,
+                    )
+                    .exists()
+                )
             if search_query:
                 pattern = _like_contains_pattern(search_query)
                 title_match = func.lower(SqlConversation.title).like(pattern, escape=_LIKE_ESCAPE)

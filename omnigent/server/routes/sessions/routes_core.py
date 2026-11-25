@@ -2816,13 +2816,10 @@ def register_core_routes(
                     pinned=pinned,
                     # Pins are per-user: filter to the caller's own pin key.
                     pinned_owner=user_id,
+                    # Side chats surface as Workspace-rail tabs, not top-level sessions.
+                    # Exclude them before LIMIT so hidden rows cannot consume a page.
+                    exclude_label=SIDE_CHAT_LABEL_KEY,
                 )
-                # Side chats surface only as Workspace-rail tabs, so drop any
-                # side-chat-labeled fork from the sidebar list (it is still a
-                # normal session, just not listed as a top-level one here).
-                page.data = [
-                    conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
-                ]
                 boundary_row = page.data[-1] if page.data else None
                 page_boundary = (
                     {
