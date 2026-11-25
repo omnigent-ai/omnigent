@@ -3020,7 +3020,14 @@ class TerminalInstance:
             return False
 
         try:
-            stdout, stderr = await proc.communicate()
+            try:
+                stdout, stderr = await proc.communicate()
+            finally:
+                # A caller that gives up, e.g. past its deadline, leaves no tmux probe behind.
+                if proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    await proc.wait()
             if proc.returncode != 0:
                 detail = stderr.decode(errors="replace").strip() or "<no stderr>"
                 if not _tmux_reports_target_gone(detail):

@@ -1041,6 +1041,73 @@ async def test_terminal_shell_answers_the_same_404_when_tmux_exited_under_a_stal
 
 
 @pytest.mark.asyncio
+async def test_terminal_shell_answers_unknown_in_time_when_its_liveness_check_stalls(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux liveness probe that never answers is cut off with the read, not waited out."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    gave_up = asyncio.Event()
+
+    async def stalled_tmux() -> bool:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            gave_up.set()
+        raise AssertionError("unreachable")
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    instance.is_alive = stalled_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await asyncio.wait_for(
+        client.get("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"), 5
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "unknown", "foreground": None, "background_jobs": None}
+    assert gave_up.is_set()
+
+
+@pytest.mark.asyncio
+async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_read(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several close paths asking at once start one tmux probe and one read between them."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    probes = 0
+    reads = 0
+    release = asyncio.Event()
+
+    async def live_tmux() -> bool:
+        nonlocal probes
+        probes += 1
+        await release.wait()
+        return True
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        nonlocal reads
+        reads += 1
+        return ShellInspection(ShellState.IDLE)
+
+    instance.is_alive = live_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    path = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"
+    requests = [asyncio.create_task(client.get(path)) for _ in range(3)]
+    while probes == 0:
+        await asyncio.sleep(0)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    responses = await asyncio.gather(*requests)
+
+    assert [resp.json()["state"] for resp in responses] == ["idle"] * 3
+    assert (probes, reads) == (1, 1)
+
+
+@pytest.mark.asyncio
 async def test_transfer_terminal_moves_resource_without_closing(
     client: httpx.AsyncClient,
     registry: TerminalRegistry,

@@ -323,6 +323,30 @@ async def test_concurrent_requests_for_one_terminal_share_one_read() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_read_past_the_budget_is_cancelled_and_answers_unknown() -> None:
+    cancelled = asyncio.Event()
+
+    async def stalled() -> ShellInspection:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("unreachable")
+
+    inspector = ShellInspector(timeout_seconds=0.05)
+    assert await asyncio.wait_for(inspector.inspect("terminal-a", stalled), 2) == UNKNOWN
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_gone_terminal_answers_none() -> None:
+    async def gone() -> None:
+        return None
+
+    assert await ShellInspector().inspect("terminal-a", gone) is None
+
+
+@pytest.mark.asyncio
 async def test_an_answer_is_reused_briefly_then_read_again() -> None:
     clock = _Clock()
     answers = iter([ShellInspection(ShellState.IDLE), ShellInspection(ShellState.BUSY, "vim", 0)])

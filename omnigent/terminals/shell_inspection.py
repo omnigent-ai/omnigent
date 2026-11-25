@@ -322,8 +322,10 @@ class ShellInspector:
     """Runs inspections one per terminal at a time, under a shared limit, with a short cache.
 
     A request for a terminal already being read waits for that read; a request within
-    :data:`CACHE_SECONDS` of the last answer reuses it. Keys must name one terminal, e.g. its
-    tmux socket path; callers check that the caller may see that terminal first.
+    :data:`CACHE_SECONDS` of the last answer reuses it. Each read, a liveness check included,
+    gets :data:`INSPECTION_TIMEOUT_SECONDS` in all, and is cancelled past it. Keys must name one
+    terminal, e.g. its tmux socket path; callers check that the caller may see that terminal
+    first. A read answers ``None`` for a terminal that's gone.
     """
 
     def __init__(
@@ -332,21 +334,25 @@ class ShellInspector:
         max_concurrent: int = MAX_CONCURRENT_INSPECTIONS,
         cache_seconds: float = CACHE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        timeout_seconds: float = INSPECTION_TIMEOUT_SECONDS,
     ) -> None:
         self._slots = asyncio.Semaphore(max_concurrent)
         self._cache_seconds = cache_seconds
         self._clock = clock
-        self._answers: dict[str, tuple[float, ShellInspection]] = {}
-        self._in_flight: dict[str, asyncio.Task[ShellInspection]] = {}
+        self._timeout_seconds = timeout_seconds
+        self._answers: dict[str, tuple[float, ShellInspection | None]] = {}
+        self._in_flight: dict[str, asyncio.Task[ShellInspection | None]] = {}
 
     async def inspect(
-        self, key: str, read: Callable[[], Awaitable[ShellInspection]]
-    ) -> ShellInspection:
+        self, key: str, read: Callable[[], Awaitable[ShellInspection | None]]
+    ) -> ShellInspection | None:
         """The answer for the terminal ``key``, reading it with ``read`` only when needed.
 
         :param key: One terminal's identity, e.g. its tmux socket path.
-        :param read: Reads the terminal, e.g. ``read_pane_shell`` bound to its pane.
-        :returns: The inspection; unknown when ``read`` raises.
+        :param read: Checks the terminal is alive and reads it, e.g. ``read_pane_shell`` bound
+            to its pane; ``None`` when it's gone.
+        :returns: The inspection, or ``None`` for a gone terminal; unknown when ``read`` raises
+            or runs past the budget.
         """
         now = self._clock()
         self._answers = {
@@ -365,12 +371,14 @@ class ShellInspector:
         return await asyncio.shield(task)
 
     async def _read(
-        self, key: str, read: Callable[[], Awaitable[ShellInspection]]
-    ) -> ShellInspection:
+        self, key: str, read: Callable[[], Awaitable[ShellInspection | None]]
+    ) -> ShellInspection | None:
         try:
             async with self._slots:
+                answer: ShellInspection | None
                 try:
-                    answer = await read()
+                    # Cancelling the read past its budget kills and reaps what it started.
+                    answer = await asyncio.wait_for(read(), self._timeout_seconds)
                 # A surprise answers unknown, so no exception text holding a row is logged.
                 except Exception:  # noqa: BLE001
                     answer = UNKNOWN

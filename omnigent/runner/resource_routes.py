@@ -76,7 +76,11 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.slow_io import run_provider_cli, run_slow_io
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
-from omnigent.terminals.shell_inspection import TERMINAL_SHELL_NOT_FOUND, ShellInspector
+from omnigent.terminals.shell_inspection import (
+    TERMINAL_SHELL_NOT_FOUND,
+    ShellInspection,
+    ShellInspector,
+)
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -862,13 +866,20 @@ def register_resource_routes(
         :returns: ``{"state", "foreground", "background_jobs"}``; see :class:`ShellInspection`.
         """
         entry = resolve_terminal_entry_by_resource_id(session_id, terminal_id, terminal_registry)
-        # Live tmux state, not the optimistic flag: a stopped terminal is a miss like any other.
-        if entry is None or not entry.instance.running or not await entry.instance.is_alive():
+        if entry is None or not entry.instance.running:
             return JSONResponse(status_code=404, content=TERMINAL_SHELL_NOT_FOUND)
         instance = entry.instance
-        inspection = await shell_inspector.inspect(
-            str(instance.socket_path), instance.inspect_shell
-        )
+
+        async def read_live_shell() -> ShellInspection | None:
+            # Live tmux state, not the optimistic flag: a stopped terminal is a miss too.
+            if not await instance.is_alive():
+                return None
+            return await instance.inspect_shell()
+
+        # Concurrent requests share one liveness check and one read, both inside the budget.
+        inspection = await shell_inspector.inspect(str(instance.socket_path), read_live_shell)
+        if inspection is None:
+            return JSONResponse(status_code=404, content=TERMINAL_SHELL_NOT_FOUND)
         return JSONResponse(status_code=200, content=inspection.to_dict())
 
     @app.get("/v1/sessions/{session_id}/sign-in-link")
