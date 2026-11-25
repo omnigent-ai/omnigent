@@ -4,6 +4,9 @@
 
 import { SearchQuery } from "@codemirror/search";
 import type { Text } from "@codemirror/state";
+import { NOTHING_FOUND, plainMatches } from "./plainTextMatches";
+
+export { NOTHING_FOUND };
 
 /** A find query as plain data, so it can cross to a worker. */
 export interface FindQuerySpec {
@@ -46,9 +49,6 @@ interface CursorResult {
   match?: RegExpExecArray;
 }
 
-/** A match the scope left out: work done, nothing found. */
-export const OUTSIDE_SCOPE = null;
-
 /** CodeMirror's rule for a pattern that can span lines, which it matches across the document. */
 const MULTILINE_PATTERN = /\\[sWDnr]|\n|\r|\[\^/;
 
@@ -68,21 +68,22 @@ export function matchContext(
 }
 
 function cursorIn(query: SearchQuery, doc: Text, from: number, to: number) {
-  return query.getCursor(doc, from, to) as Iterator<CursorResult> & Iterable<CursorResult>;
+  const cursor = plainMatches(query, doc, from, to) ?? query.getCursor(doc, from, to);
+  return { [Symbol.iterator]: () => cursor as Iterator<CursorResult | typeof NOTHING_FOUND> };
 }
 
 /**
  * Every match of `query` in `doc`, or only those wholly inside `scope`'s sorted ranges. A
  * scoped search reads each range in its whole-file context, so `^`, `$` and lookaround
  * answer as they would across the file, and a match that runs past the scope is left out.
- * An empty scope has no matches. Each match left out yields `OUTSIDE_SCOPE`, so a caller
- * working to a time budget can pause between them, however many there are.
+ * An empty scope has no matches. Each match left out, or whole-word candidate turned
+ * down, yields `NOTHING_FOUND`, so a caller working to a time budget can pause between them.
  */
 export function* matchesIn(
   query: SearchQuery,
   doc: Text,
   scope: readonly { from: number; to: number }[] | null | undefined,
-): Generator<CursorResult | typeof OUTSIDE_SCOPE> {
+): Generator<CursorResult | typeof NOTHING_FOUND> {
   if (!scope) {
     yield* cursorIn(query, doc, 0, doc.length);
     return;
@@ -97,15 +98,19 @@ export function* matchesIn(
   let rangeIndex = 0;
   for (const context of contexts) {
     for (const result of cursorIn(query, doc, context.from, context.to)) {
+      if (result === NOTHING_FOUND) {
+        yield NOTHING_FOUND;
+        continue;
+      }
       while (rangeIndex < scope.length && scope[rangeIndex]!.to < result.from) rangeIndex += 1;
       const range = scope[rangeIndex];
-      yield range && result.from >= range.from && result.to <= range.to ? result : OUTSIDE_SCOPE;
+      yield range && result.from >= range.from && result.to <= range.to ? result : NOTHING_FOUND;
     }
   }
 }
 
 export class MatchCollector {
-  private readonly cursor: Iterator<CursorResult | typeof OUTSIDE_SCOPE>;
+  private readonly cursor: Iterator<CursorResult | typeof NOTHING_FOUND>;
   private done = false;
 
   constructor(doc: Text, spec: FindQuerySpec) {
@@ -125,7 +130,7 @@ export class MatchCollector {
         this.done = true;
         break;
       }
-      if (result.value === OUTSIDE_SCOPE) continue;
+      if (result.value === NOTHING_FOUND) continue;
       batch.froms.push(result.value.from);
       batch.tos.push(result.value.to);
       if (result.value.precise === false) batch.imprecise.push(result.value.from);

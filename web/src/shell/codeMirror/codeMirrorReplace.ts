@@ -8,7 +8,7 @@ import { getSearchQuery, type SearchQuery } from "@codemirror/search";
 import type { ChangeSpec, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { FindMatchIndex } from "./codeMirrorFind";
-import { matchContext, matchesIn, OUTSIDE_SCOPE } from "./findMatchCollector";
+import { matchContext, matchesIn, NOTHING_FOUND } from "./findMatchCollector";
 import { type FindScheduler, timeoutScheduler } from "./findMatchSource";
 import { type FindRange, findScopeOf } from "./findScope";
 import { withCaseOf } from "./preserveCase";
@@ -195,7 +195,7 @@ export class FindReplacer {
     // Groups come from the same cursor the index uses, in the same scope, so they match what find counted.
     const scope = findScopeOf(state);
     const cursor = matchesIn(query, state.doc, scope) as Iterator<
-      CursorMatch | typeof OUTSIDE_SCOPE
+      CursorMatch | typeof NOTHING_FOUND
     >;
     this.run(view, {
       doc: state.doc,
@@ -206,7 +206,7 @@ export class FindReplacer {
         const result = cursor.next();
         if (result.done) return { done: true };
         // A match outside the scope still took time, so the slice can pause after it.
-        if (result.value === OUTSIDE_SCOPE) return { done: false };
+        if (result.value === NOTHING_FOUND) return { done: false };
         const { from, to, match } = result.value;
         const insert = inCase(
           replacementText(query, match ?? null),
