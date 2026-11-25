@@ -20,7 +20,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -659,10 +659,49 @@ async def test_a_gadget_is_shown_only_beside_a_session_its_viewer_can_read(
         )
         assert registered.status_code == 404, registered.text
     assert (await client.get(f"{base}/session", headers=_as(ALICE))).json()["session_id"] is None
-    # A session shared with her works.
+    # A session shared with her shows the gadget, but its agent works for Bob, so it doesn't
+    # become her gadget session, and she can't make it one.
     stores.permissions.grant(ALICE, bobs, LEVEL_EDIT)
     linked = await client.put(f"{base}/sessions/{bobs}", json={"linked": True}, headers=_as(ALICE))
     assert linked.status_code == 200, linked.text
+    assert (await client.get(f"{base}/session", headers=_as(ALICE))).json()["session_id"] is None
+    registered = await client.put(f"{base}/session", json={"session_id": bobs}, headers=_as(ALICE))
+    assert registered.status_code == 403, registered.text
+    cited = await client.put(
+        f"{base}/sessions/{bobs}",
+        json={"linked": True, "handles_actions": False},
+        headers=_as(ALICE),
+    )
+    assert cited.status_code == 200, cited.text
+
+    # Her own session shared with edit access shows it too, and takes no actions either.
+    shared = _own_session(stores)
+    stores.permissions.grant(BOB, shared, LEVEL_EDIT)
+    linked = await client.put(
+        f"{base}/sessions/{shared}", json={"linked": True}, headers=_as(ALICE)
+    )
+    assert linked.status_code == 200, linked.text
+    assert (await client.get(f"{base}/session", headers=_as(ALICE))).json()["session_id"] is None
+    registered = await client.put(
+        f"{base}/session", json={"session_id": shared}, headers=_as(ALICE)
+    )
+    assert registered.status_code == 403, registered.text
+
+    # Her own private session becomes her gadget session; shared only with a reader it stays
+    # one, and shared with an editor later it stops being used.
+    private = _own_session(stores)
+    linked = await client.put(
+        f"{base}/sessions/{private}", json={"linked": True}, headers=_as(ALICE)
+    )
+    assert linked.status_code == 200, linked.text
+    current = await client.get(f"{base}/session", headers=_as(ALICE))
+    assert current.json()["session_id"] == private
+    stores.permissions.grant(BOB, private, LEVEL_READ)
+    current = await client.get(f"{base}/session", headers=_as(ALICE))
+    assert current.json()["session_id"] == private
+    stores.permissions.grant(BOB, private, LEVEL_EDIT)
+    current = await client.get(f"{base}/session", headers=_as(ALICE))
+    assert current.json()["session_id"] is None
 
 
 async def test_viewers_read_only_the_published_revision(client: httpx.AsyncClient) -> None:

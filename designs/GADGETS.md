@@ -20,7 +20,9 @@ comments.
 - **Comments.** Anchored to a selection in the gadget; agents list them and mark them addressed.
 - **Shelf.** Per user: pinned gadgets (listed in the sidebar) and the gadgets each session
   shows in its side panel. The session a person last opened a gadget in becomes their gadget
-  session for it.
+  session for it, if its agent may make the gadget calls that work needs: on a server with
+  sharing, one they own and haven't shared with edit access. Others only show the gadget, and
+  a gadget session later shared with an editor stops taking actions.
 
 ## Where it runs
 

@@ -772,7 +772,9 @@ class GadgetService:
                 shown.append(app_id)
             if len(shown) > MAX_SESSION_GADGETS:
                 raise CapacityExceeded(f"A session can show at most {MAX_SESSION_GADGETS} gadgets")
-            if permissions.publish and handles_actions:
+            # Shown beside a session whose agent can't do the viewer's gadget work (someone
+            # else's, or shared with edit access), it only shows the gadget there.
+            if permissions.publish and handles_actions and self._takes_actions(session_id):
                 self._register_gadget_session(gadget, session_id)
         else:
             shown = [value for value in shown if value != app_id]
@@ -1120,15 +1122,14 @@ class GadgetService:
         if record is None:
             return {"session_id": None, "version": None}
         session_id = record.value.get("session_id")
-        if (
-            isinstance(session_id, str)
-            and self.sessions is not None
-            and not self.sessions.available(session_id)
-        ):
-            # A deleted or archived session no longer takes the gadget's work; the next
-            # one started from the gadget replaces it.
+        if isinstance(session_id, str) and not self._takes_actions(session_id):
+            # A deleted or archived session, or one since shared with edit access, no longer
+            # takes the gadget's work; the next one started from the gadget replaces it.
             return {"session_id": None, "version": record.version}
         return {"session_id": session_id, "version": record.version}
+
+    def _takes_actions(self, session_id: str) -> bool:
+        return self.sessions is None or self.sessions.takes_actions(session_id)
 
     def set_gadget_session(self, app_id: str, body: dict) -> dict:
         """Registers one of the sessions the viewer can read as their gadget session."""
@@ -1136,6 +1137,13 @@ class GadgetService:
         self._require(permissions, "publish")
         session_id = _session_id(body.get("session_id"))
         self._require_session(session_id)
+        if not self._takes_actions(session_id):
+            raise GadgetError(
+                "PERMISSION_DENIED",
+                "That session can't do this gadget's actions: use one of your own sessions "
+                "that isn't shared with edit access",
+                403,
+            )
         return self._register_gadget_session(gadget, session_id)
 
     def _register_gadget_session(self, gadget: Gadget, session_id: str) -> dict:

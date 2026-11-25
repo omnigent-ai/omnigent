@@ -38,7 +38,10 @@ from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes.gadget_permissions import register_gadget_permissions_routes
 from omnigent.server.routes.scheduled_task_permissions import display_names_or_ids
-from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.server.session_orchestration import (
+    require_named_source_private,
+    require_owned_session,
+)
 from omnigent.stores import ConversationStore
 from omnigent.stores.gadget_store import (
     CapacityExceeded,
@@ -274,8 +277,20 @@ def create_gadgets_router(
                 conversation_store,
             )
 
+        def can_take_actions(session_id: str) -> bool:
+            # The same test an agent's gadget call from that session must pass.
+            if auth_provider is None or permission_store is None or user_id == RESERVED_USER_LOCAL:
+                return True
+            try:
+                require_owned_session(
+                    session_id, user_id, conversation_store, permission_store, private=True
+                )
+            except (OmnigentError, ValueError):
+                return False
+            return True
+
         owned_by = None if auth_provider is None else user_id
-        return SessionStateReader(conversation_store, can_read, owned_by)
+        return SessionStateReader(conversation_store, can_read, owned_by, can_take_actions)
 
     def _display_names(user_ids: Sequence[str]) -> dict[str, str]:
         if permission_store is None:

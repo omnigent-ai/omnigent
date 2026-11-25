@@ -349,11 +349,22 @@ class SessionStateReader:
     """
 
     def __init__(
-        self, conversation_store: Any, can_read: Callable[[str], bool], user_id: str | None = None
+        self,
+        conversation_store: Any,
+        can_read: Callable[[str], bool],
+        user_id: str | None = None,
+        can_take_actions: Callable[[str], bool] | None = None,
     ) -> None:
+        """
+        :param can_take_actions: Whether a readable session may also do the caller's gadget
+            actions: its agent's gadget calls must be allowed, so on a server with sharing
+            it is one the caller owns and hasn't shared with edit access. ``None`` allows any
+            readable session.
+        """
         self._store = conversation_store
         self._can_read = can_read
         self._user_id = user_id
+        self._can_take_actions = can_take_actions
 
     def available(self, session_id: str) -> bool:
         """Whether the session still exists, is not archived and the caller can read it."""
@@ -361,6 +372,12 @@ class SessionStateReader:
             return False
         conversation = self._store.get_conversations([session_id]).get(session_id)
         return conversation is not None and not getattr(conversation, "archived", False)
+
+    def takes_actions(self, session_id: str) -> bool:
+        """Whether the session is available and its agent could do the caller's actions."""
+        if not self.available(session_id):
+            return False
+        return self._can_take_actions is None or self._can_take_actions(session_id)
 
     def read(self, session_ids: Iterable[str]) -> SessionStates:
         from omnigent.server.routes._sessions.helpers import (
