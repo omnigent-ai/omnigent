@@ -169,7 +169,8 @@ for (const trustSource of trustSources) {
         const answer = async (response, details) => {
           const outcome = await eventually(async () => {
             const prompts = await desktop.electronApp.evaluate(() => global.previewPrompts);
-            if (prompts.length) return { prompts };
+            const pending = await desktop.electronApp.evaluate(() => global.previewPromptPending);
+            if (pending) return { prompts };
             const error = desktop.window.getByText(/navigation blocked:.*loopback\/internal host/);
             return (await error.isVisible()) ? { error: await error.innerText() } : null;
           }, "SSH preview consent");
@@ -178,9 +179,8 @@ for (const trustSource of trustSources) {
             outcome.prompts,
             `Expected SSH consent before opening the preview; UI says: ${outcome.error}`,
           );
-          assert.equal(requests.length, 0, "no loopback request before consent");
           if (process.env.OMNIGENT_DESKTOP_NATIVE_DIALOGS === "1") {
-            const button = response === 1 ? "Allow" : "Not now";
+            const button = outcome.prompts.at(-1).buttons[response];
             const clicked = spawnSync(
               "osascript",
               [
@@ -239,26 +239,24 @@ for (const trustSource of trustSources) {
         const details = await launch("allow");
         await navigate(url);
         const settingsFile = path.join(details.profile, "settings.json");
-        const setTrusted = (entries) => {
-          const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
-          fs.writeFileSync(
-            settingsFile,
-            JSON.stringify({ ...settings, trusted_remote_hosts: entries }, null, 2),
-          );
-        };
+        await eventually(
+          async () =>
+            (await desktop.electronApp.evaluate(() => global.previewPrompts)).length === 1,
+          "preview consent",
+        );
+        assert.equal(requests.length, 0, "no loopback request before consent");
+        await answer(1, details);
         if (settingsTrust) {
-          await desktop.window.getByText(/navigation blocked:.*loopback\/internal host/).waitFor();
-          const denied = await agentNavigate(backend.sessionId, url);
-          assert.equal(denied.ok, false, JSON.stringify(denied));
-          assert.match(denied.error, /trusted_remote_hosts/);
-          assert.equal(requests.length, 0);
-          evidence.denied = denied;
-          await hold();
-          setTrusted([{ server_url: backend.serverUrl, host_id: HOST }]);
+          await eventually(
+            () =>
+              JSON.parse(fs.readFileSync(settingsFile, "utf8")).trusted_remote_hosts?.length === 1,
+            "persisted trust",
+          );
           evidence.settingsSavedAt = new Date().toISOString();
-          await navigate(url);
-        } else {
-          await answer(1, details);
+          const saved = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+          assert.deepEqual(saved.trusted_remote_hosts, [
+            { server_url: `${backend.serverUrl}/`, host_id: HOST },
+          ]);
         }
         const loaded = await eventually(async () => {
           const value = await page(url);
@@ -306,17 +304,35 @@ for (const trustSource of trustSources) {
           assert.equal(screenshot.ok, true, JSON.stringify(screenshot));
           assert.match(screenshot.data_url, /^data:image\/png;base64,/);
         }
-        assert.equal(
-          (await desktop.electronApp.evaluate(() => global.previewPrompts)).length,
-          settingsTrust ? 0 : 1,
-        );
+        assert.equal((await desktop.electronApp.evaluate(() => global.previewPrompts)).length, 1);
         await hold();
 
         if (settingsTrust) {
-          setTrusted([]);
+          assert.equal((await agentAction(backend.sessionId, "snapshot")).ok, true);
+          const saved = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+          fs.writeFileSync(settingsFile, JSON.stringify({ ...saved, trusted_remote_hosts: [] }));
           const revoked = await agentAction(backend.sessionId, "snapshot");
           assert.equal(revoked.ok, false, JSON.stringify(revoked));
+          assert.match(revoked.error, /previous browser page is no longer available/);
           evidence.revoked = revoked;
+          fs.writeFileSync(settingsFile, JSON.stringify(saved));
+          await desktop.window.goto(`${backend.serverUrl}/settings/general#trusted-remote-hosts`);
+          const group = desktop.window.getByTestId("settings-group-trusted-remote-hosts");
+          await group.getByRole("button", { name: /Remove trusted host/ }).click();
+          await group.getByText("No remote hosts trusted yet.", { exact: false }).waitFor();
+          await hold();
+          assert.deepEqual(
+            JSON.parse(fs.readFileSync(settingsFile, "utf8")).trusted_remote_hosts,
+            [],
+          );
+          await group.getByRole("textbox", { name: "Host ID" }).fill(HOST);
+          await group.getByRole("button", { name: "Trust host", exact: true }).click();
+          await answer(1, details);
+          await group.getByRole("button", { name: /Remove trusted host/ }).waitFor();
+          await hold();
+          await openSessionBrowserTab(desktop.window, backend.serverUrl, backend.sessionId);
+          assert.equal((await agentNavigate(backend.sessionId, url)).ok, true);
+          evidence.settingsAdded = true;
           evidence.result = "passed";
           await hold();
           return;
@@ -325,6 +341,7 @@ for (const trustSource of trustSources) {
         await openSessionBrowserTab(desktop.window, backend.serverUrl, backend.otherSessionId);
         const count = requests.length;
         await navigate(`${url}?other-host`);
+        await answer(0, details);
         await desktop.window.getByText(/navigation blocked:.*loopback\/internal host/).waitFor();
         const denied = await agentNavigate(backend.otherSessionId, `${url}?other-agent`);
         assert.equal(denied.ok, false, JSON.stringify(denied));

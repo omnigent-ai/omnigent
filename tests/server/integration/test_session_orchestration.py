@@ -18,6 +18,7 @@ from omnigent.server.feature_flags import (
     FeatureFlags,
     resolve_feature_flags,
 )
+from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE
 from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
@@ -3481,6 +3482,7 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
         "disabled",
         "shared_source",
         "read_only_target",
+        "edit_only_target",
         "missing_source",
         "legacy_disabled",
     ],
@@ -3505,9 +3507,10 @@ async def test_scripted_pr_link_checks_source_and_target(
     permissions.ensure_user("bob")
     if scenario == "shared_source":
         permissions.grant("bob", source["id"], LEVEL_EDIT)
-    if scenario == "read_only_target":
+    if scenario in ("read_only_target", "edit_only_target"):
         target = await _create_session_as(auth_client, "", "bob")
-        permissions.grant("alice", target["id"], LEVEL_READ)
+        level = LEVEL_READ if scenario == "read_only_target" else LEVEL_EDIT
+        permissions.grant("alice", target["id"], level)
     host = uuid4().hex
     _register_online_host(auth_app, host, "alice")
     SqlAlchemyConversationStore(db_uri).set_host_id(target["id"], host, workspace="/repo")
@@ -3537,6 +3540,9 @@ async def test_scripted_pr_link_checks_source_and_target(
     )
     if scenario != "allowed":
         assert response.status_code == 403, response.text
+        if scenario == "edit_only_target":
+            # A valid source the caller owns, so only the target's owner check refuses it.
+            assert response.json()["error"]["message"] == OWNER_ONLY_CHANGES_MESSAGE
         assert not captured
         return
     assert response.status_code == 200, response.text

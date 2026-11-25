@@ -913,6 +913,29 @@ describe("prompt-first automation setup", () => {
     expect(screen.queryByRole("button", { name: "Done" })).not.toBeInTheDocument();
     expect(screen.getByTestId("create-scheduled-task-dialog")).toBeVisible();
   });
+
+  it("closes the time picker and the Schedule popover together on a click outside both", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
+    openAutomationSection("Schedule");
+    const scheduleTrigger = screen.getByTestId("task-schedule-trigger");
+    expect(scheduleTrigger).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(screen.getByLabelText("Time", { exact: true }));
+    const timePicker = screen.getByTestId("schedule-time-picker");
+    const hours = within(timePicker).getByRole("listbox", { name: "Hours" });
+    // Picking an option lands inside the nested popper: the parent stays open.
+    await userEvent.click(within(hours).getByRole("option", { name: "17" }));
+    expect(screen.getByLabelText("Time", { exact: true })).toHaveValue("05:00 PM");
+    expect(screen.getByTestId("schedule-time-picker")).toBeVisible();
+    expect(scheduleTrigger).toHaveAttribute("aria-expanded", "true");
+    // One click on the form, outside every popper, closes both layers at once.
+    const prompt = screen.getByTestId("task-prompt-input");
+    await userEvent.click(prompt);
+    expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("schedule-fields")).not.toBeInTheDocument();
+    expect(scheduleTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(prompt).toHaveFocus();
+    expect(screen.getByTestId("create-scheduled-task-dialog")).toBeVisible();
+  });
 });
 
 describe("agent picker readiness (needs-setup badges)", () => {
@@ -3180,6 +3203,23 @@ describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", ()
     const view = renderDialog(onOpenChange);
     fireEvent.click(screen.getByTestId("picker-open"));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={onOpenChange} />);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    onOpenChange.mockClear();
+    await userEvent.click(document.querySelector('[data-slot="dialog-overlay"]')!);
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+  });
+
+  it("keeps typed instructions open on a backdrop click until the X closes the dialog", async () => {
+    const onOpenChange = vi.fn();
+    const view = renderDialog(onOpenChange);
+    await userEvent.type(screen.getByTestId("task-prompt-input"), "Summarize new issues");
+    await userEvent.click(document.querySelector('[data-slot="dialog-overlay"]')!);
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("task-prompt-input")).toHaveValue("Summarize new issues");
+
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(onOpenChange).toHaveBeenCalledWith(false);
     view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={onOpenChange} />);
     view.rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);

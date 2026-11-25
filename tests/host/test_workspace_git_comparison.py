@@ -111,8 +111,10 @@ async def _compare(root: Path, base: str, head: str = "") -> ListWorkingCopyChan
     )
 
 
-async def _branch_commits(root: Path, base: str) -> ListBranchCommitsResponse:
-    return await list_branch_commits(root, ListBranchCommitsRequest(base_revision=base))
+async def _branch_commits(root: Path, base: str, head: str = "") -> ListBranchCommitsResponse:
+    return await list_branch_commits(
+        root, ListBranchCommitsRequest(base_revision=base, head_revision=head)
+    )
 
 
 def _subjects(response: ListBranchCommitsResponse) -> list[str]:
@@ -490,6 +492,33 @@ async def test_branch_commits_stop_at_the_limit_and_say_so(tmp_path: Path) -> No
     assert len(listed.commits) == 200
     assert listed.truncated
     assert listed.commits[0].subject == "step 199"
+
+
+async def test_branch_commits_list_a_named_heads_commits_rather_than_heads(
+    tmp_path: Path,
+) -> None:
+    root = _branches(tmp_path)
+    _git(root, "checkout", "-q", "main")
+    listed = await _branch_commits(root, "main", "feature")
+    assert _subjects(listed) == ["feature work"]
+    assert listed.commits[0].object == _git(root, "rev-parse", "feature").strip()
+    # HEAD, on the base, has none of its own.
+    assert not (await _branch_commits(root, "main")).commits
+
+
+async def test_branch_commits_report_a_head_that_isnt_there_or_could_be_an_option(
+    tmp_path: Path,
+) -> None:
+    root = _branches(tmp_path)
+    for head, expected in [
+        ("no-such-branch", COMPARISON_PROBLEM_HEAD_NOT_FOUND),
+        ("--output=leaked.txt", COMPARISON_PROBLEM_INVALID_REVISION),
+    ]:
+        listed = await _branch_commits(root, "main", head)
+        assert not listed.commits, head
+        assert listed.base.unavailable.problem == expected, head
+        assert listed.base.unavailable.field == COMPARISON_FIELD_HEAD, head
+    assert not (root / "leaked.txt").exists()
 
 
 async def test_branch_commits_report_a_base_that_isnt_there_or_could_be_an_option(

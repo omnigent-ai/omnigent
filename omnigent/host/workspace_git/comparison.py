@@ -399,7 +399,7 @@ async def _log_commits(
 async def list_branch_commits(
     root: Path, request: ListBranchCommitsRequest
 ) -> ListBranchCommitsResponse:
-    """The commits HEAD has beyond its merge base with the base, newest first.
+    """The commits a head (HEAD when empty) has past its merge base with the base, newest first.
 
     A base that can't be compared answers with its reason in ``base.unavailable``.
     """
@@ -408,7 +408,9 @@ async def list_branch_commits(
         repository = await GitRepository.discover(root, deadline)
         if repository is None:
             raise ComparisonUnavailableError(COMPARISON_PROBLEM_NOT_A_REPOSITORY)
-        comparison = await resolve_revisions(repository, request.base_revision, "HEAD", deadline)
+        comparison = await resolve_revisions(
+            repository, request.base_revision, request.head_revision or "HEAD", deadline
+        )
         output = await _log_commits(repository, comparison.base, comparison.head, deadline)
         commits = _parse_commits(output)
         truncated = len(commits) > MAXIMUM_BRANCH_COMMITS

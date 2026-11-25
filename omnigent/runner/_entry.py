@@ -22,7 +22,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Generator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterator
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from tempfile import mkdtemp
 from typing import TYPE_CHECKING, cast
@@ -2082,6 +2082,25 @@ def _handle_loop_exception(
         _logger.error("asyncio reported an unhandled failure", extra=extra)
 
 
+def _on_tunnel_reconnect(
+    catch_up_scan: Callable[[], Awaitable[None]] | None,
+) -> Callable[[], Awaitable[None]]:
+    """Return the tunnel's reconnect callback: drop PR panel reads, then run *catch_up_scan*.
+
+    While this runner was offline the host served the session's PR panel edits,
+    which this process's cached reads predate.
+    """
+
+    async def reconnected() -> None:
+        from omnigent.runner import pr_resource
+
+        pr_resource.drop_panel_reads()
+        if catch_up_scan is not None:
+            await catch_up_scan()
+
+    return reconnected
+
+
 async def _run_tunnel_from_env() -> None:
     """Run the runner as a WebSocket tunnel client.
 
@@ -2306,7 +2325,7 @@ async def _run_tunnel_from_env() -> None:
             tunnel_token=binding_token,
             auth_token_factory=auth_token_factory,
             event_dispatcher=event_dispatcher,
-            on_reconnect=getattr(app.state, "catch_up_scan", None),
+            on_reconnect=_on_tunnel_reconnect(getattr(app.state, "catch_up_scan", None)),
             on_activity=_mark_activity,
             report_keep_warm=lambda: sandbox_busy.keep_warm(keep_warm_grace_s),
             shutdown_event=tunnel_shutdown_event,

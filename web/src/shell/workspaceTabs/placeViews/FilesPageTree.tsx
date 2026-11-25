@@ -15,11 +15,13 @@ import {
   RunnerOfflineError,
   joinBrowseLocation,
   relativizeToWorkspace,
+  listingCutOff,
   listingIgnoredFiles,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
+  type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { usePaletteCommands } from "@/store/paletteCommands";
 import { breadcrumbSegments, workspaceFolderName } from "@/shell/breadcrumbPaths";
@@ -83,8 +85,12 @@ function TreeMessage({ children, alert = false }: { children: string; alert?: bo
 }
 
 /** Why a listing shows nothing: everything left is hidden, or Git ignores the rest. */
-function hiddenListingMessage(listed: number, ignoredHidden: boolean): string {
-  if (listed === 0) return "No files here, apart from any that Git ignores.";
+function hiddenListingMessage(entries: readonly WorkspaceFile[], ignoredHidden: boolean): string {
+  if (entries.length === 0) return "No files here, apart from any that Git ignores.";
+  // The listing stopped short, so files past it may well show.
+  if (listingCutOff(entries)) {
+    return `The first ${entries.length.toLocaleString("en-US")} entries here are hidden, and the list stops there.`;
+  }
   return ignoredHidden
     ? "Every file here is hidden or ignored by Git."
     : "Every file here is hidden.";
@@ -451,7 +457,7 @@ export function FilesPageTree({
     if (visibleEntries(entries, showHidden).length === 0) {
       return (
         <div className="flex flex-col items-start gap-2 pb-2">
-          <TreeMessage>{hiddenListingMessage(entries.length, ignoredHidden)}</TreeMessage>
+          <TreeMessage>{hiddenListingMessage(entries, ignoredHidden)}</TreeMessage>
           <div className="mx-3 flex flex-wrap gap-2">
             {entries.length > 0 && onShowHidden ? (
               <Button type="button" variant="outline" size="sm" onClick={onShowHidden}>

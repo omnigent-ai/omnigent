@@ -274,7 +274,7 @@ describe("Git reads no route serves", () => {
     ["readBaseFile", () => source.readBaseFile(SESSION, { commit: "c", path: "a", object: "o" })],
     ["readLinkText", () => source.readLinkText(SESSION, "link")],
     ["listRepositoryRefs", () => source.listRepositoryRefs(SESSION)],
-    ["listBranchCommits", () => source.listBranchCommits(SESSION, "")],
+    ["listBranchCommits", () => source.listBranchCommits(SESSION, { base: "", head: "" })],
     ["resolveRepositoryContext", () => source.resolveRepositoryContext(SESSION)],
   ];
 
@@ -287,7 +287,7 @@ describe("Git reads no route serves", () => {
 
   it("are unavailable by default, as today's API serves none of them", async () => {
     setWorkspaceSidebarApiForTests(DEFAULT_WORKSPACE_SIDEBAR_API);
-    await expect(source.listBranchCommits(SESSION, "")).rejects.toBeInstanceOf(
+    await expect(source.listBranchCommits(SESSION, { base: "", head: "" })).rejects.toBeInstanceOf(
       WorkspaceMethodUnavailableError,
     );
     await expect(source.servesGitComparisons(SESSION)).resolves.toBe(false);
@@ -338,7 +338,9 @@ describe("aborted reads", () => {
       },
     });
     await expect(source.listDirectory(SESSION, "", 10, controller.signal)).rejects.toBe(reason);
-    await expect(source.listBranchCommits(SESSION, "", controller.signal)).rejects.toBe(reason);
+    await expect(
+      source.listBranchCommits(SESSION, { base: "", head: "" }, controller.signal),
+    ).rejects.toBe(reason);
     await expect(source.servesGitComparisons(SESSION, controller.signal)).rejects.toBe(reason);
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });

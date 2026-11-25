@@ -1229,7 +1229,7 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
     release_hint = threading.Event()
     event_loop_thread = threading.get_ident()
     hint_threads: list[int] = []
-    monkeypatch.setattr(fire_mod, "_REGISTRATION_HINT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(managed_hosts, "PROVIDER_RECOVERY_HINT_TIMEOUT_S", 0.01)
 
     def hint() -> str | None:
         hint_threads.append(threading.get_ident())

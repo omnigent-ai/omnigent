@@ -5,11 +5,7 @@ import { cn } from "@/lib/utils";
 
 import { useSettingsRowReveal } from "./SettingsItem";
 import { SETTINGS_HIGHLIGHT_CLASS } from "./settingsReveal";
-import {
-  type BoundShortcutRow,
-  isBoundShortcutRow,
-  shortcutSettingsEntry,
-} from "./shortcutEntries";
+import { shortcutSettingsEntry } from "./shortcutEntries";
 
 interface ShortcutSettingsRowProps {
   row: ShortcutPageRow;
@@ -18,25 +14,8 @@ interface ShortcutSettingsRowProps {
   children: ReactNode;
 }
 
-/**
- * A Keyboard shortcuts row in Settings. A row the registry binds can be revealed by search; an
- * upstream-only row is read-only and has nothing to reveal.
- */
+/** A Keyboard shortcuts row in Settings, which search can reveal and highlight. */
 export function ShortcutSettingsRow({ row, group, className, children }: ShortcutSettingsRowProps) {
-  if (!isBoundShortcutRow(row)) return <li className={className}>{children}</li>;
-  return (
-    <RevealableShortcutRow row={row} group={group} className={className}>
-      {children}
-    </RevealableShortcutRow>
-  );
-}
-
-function RevealableShortcutRow({
-  row,
-  group,
-  className,
-  children,
-}: ShortcutSettingsRowProps & { row: BoundShortcutRow }) {
   const entry = shortcutSettingsEntry(row, group);
   const rowRef = useRef<HTMLLIElement | null>(null);
   useSettingsRowReveal(entry, rowRef);

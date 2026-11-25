@@ -7604,13 +7604,18 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
     managed launch (create-time provisioning or a dead-sandbox
     relaunch): resolve as soon as the launch settles, surface the
     recorded reason when it failed, and give up with a clear retry
-    hint when the launch outlives the rendezvous budget.
+    hint when the launch outlives the rendezvous budget. A launch whose
+    provisioned sandbox's host has not registered says so instead,
+    with the provider's recovery guidance when it offers some.
 
     :param launch: The session's tracker entry.
     :raises OmnigentError: 503 when the launch failed or is still
         running at the timeout.
     """
-    from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+    from omnigent.server.managed_hosts import (
+        MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+        read_provider_recovery_hint,
+    )
 
     try:
         await asyncio.wait_for(
@@ -7618,10 +7623,15 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
             timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
         )
     except TimeoutError:
-        raise OmnigentError(
-            "The session's managed sandbox is still provisioning; try again shortly",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from None
+        message = "The session's managed sandbox is still provisioning; try again shortly"
+        # The hint is bound only while a provisioned sandbox's host registers.
+        if (hint_callback := launch.host_online_failure_hint) is not None:
+            hint = await read_provider_recovery_hint(hint_callback)
+            message = (
+                "The host in the session's managed sandbox has not connected to the server"
+                + (f" — {hint}" if hint else " yet; try again shortly")
+            )
+        raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE) from None
     if launch.error is not None:
         raise OmnigentError(
             f"The session's managed sandbox failed to launch: {launch.error}",

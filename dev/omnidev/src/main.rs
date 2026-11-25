@@ -1,6 +1,6 @@
 //! omnidev — dev tooling for Omnigent.
 //!
-//! Three surfaces in one binary:
+//! Four surfaces in one binary:
 //! - **pod supervisor** (bare `omnidev`): manages an isolated dev instance for
 //!   the current checkout — server/host/vite, restarting the backend on Python
 //!   changes while Vite handles frontend HMR.
@@ -10,6 +10,8 @@
 //! - **omnigent passthrough** (`omnidev omnigent …`): run any omnigent command
 //!   against the current checkout's pod via pinned `uv run --python …`, with the pod's
 //!   isolated env applied. Requires a checkout, like the supervisor.
+//! - **remote UI** (`omnidev ui`): run only the checkout's Vite UI, proxied to
+//!   a remote server given by `--server` or picked from recent ones.
 
 mod browser;
 mod install;
@@ -22,6 +24,7 @@ mod pod;
 mod ports;
 mod process;
 mod profile;
+mod remote_ui;
 mod shellhook;
 mod state;
 mod supervisor;
@@ -93,6 +96,18 @@ enum Command {
     Omnigent {
         #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Run only this checkout's UI, proxied to a remote server (no local backend).
+    ///
+    /// Without `--server`, pick from recently used servers or enter a new URL.
+    Ui {
+        /// Server URL. For a Databricks workspace, keep its `?o=<org-id>` selector.
+        #[arg(long)]
+        server: Option<String>,
+        /// Databricks CLI profile for the proxy's token (default: match by host).
+        /// Remembered with the server; pass "" to clear it.
+        #[arg(long)]
+        databricks_profile: Option<String>,
     },
 }
 
@@ -173,6 +188,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Omnigent { args: passthrough }) => run_omnigent(args.run, passthrough),
+        Some(Command::Ui {
+            server,
+            databricks_profile,
+        }) => remote_ui::run(server, databricks_profile),
         None => run_supervisor(args.run),
     }
 }

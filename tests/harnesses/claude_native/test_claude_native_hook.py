@@ -29,6 +29,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_active_session_id,
     read_transcript_path,
     record_hook_event,
+    update_permission_hook_auth_headers,
     validate_claude_hook_interpreter_compatibility,
     write_active_session_id,
 )
@@ -1383,6 +1384,164 @@ def _run_scripted_permission_hook(
 
     assert exit_code == 0
     return client
+
+
+def test_parked_permission_prompt_takes_the_runner_refreshed_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A prompt parked past its token's lifetime re-parks with the runner's new token.
+
+    The hook cannot mint a token of its own, and resending the expired bearer
+    would lose the approval answer.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_lapse")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Read", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", lambda *_args: lambda: None)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        claude_native_hook.time, "sleep", lambda seconds: clock.update(t=clock["t"] + seconds)
+    )
+    bearers: list[str] = []
+
+    class _ExpiringTokenClient:
+        def __init__(self, *, headers: dict[str, str], **_kwargs: object) -> None:
+            self._bearer = headers.get("Authorization", "")
+
+        def __enter__(self) -> _ExpiringTokenClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            bearers.append(self._bearer)
+            request = httpx.Request("POST", url)
+            if len(bearers) == 1:
+                # The poll is held while the token expires and the runner refreshes it.
+                clock["t"] += 300.0
+                update_permission_hook_auth_headers(bridge_dir, {"Authorization": "Bearer fresh"})
+                raise httpx.RemoteProtocolError("gateway cut the held poll", request=request)
+            if self._bearer != "Bearer fresh":
+                return httpx.Response(403, text="Invalid Token", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExpiringTokenClient)
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert bearers == ["Bearer xyz", "Bearer xyz", "Bearer fresh"]
+
+
+def test_parked_permission_prompt_without_a_runner_refresh_mints_its_own_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    A parked prompt whose token lapses, with no newer runner snapshot, still mints one.
+
+    A hook launched outside the runner (``omnigent claude``) never sees its
+    header snapshot refreshed, so it must keep renewing the way it always has.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_cli_lapse")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Read", "tool_input": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    mints: list[int] = []
+
+    def _reauth_factory(
+        _server_url: str, headers: dict[str, str]
+    ) -> Callable[[], dict[str, str] | None]:
+        def _reauth() -> dict[str, str] | None:
+            mints.append(1)
+            return {**headers, "Authorization": "Bearer minted"}
+
+        return _reauth
+
+    monkeypatch.setattr(native_policy_hook, "policy_hook_reauth", _reauth_factory)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        claude_native_hook.time, "sleep", lambda seconds: clock.update(t=clock["t"] + seconds)
+    )
+    bearers: list[str] = []
+
+    class _ExpiringTokenClient:
+        def __init__(self, *, headers: dict[str, str], **_kwargs: object) -> None:
+            self._bearer = headers.get("Authorization", "")
+
+        def __enter__(self) -> _ExpiringTokenClient:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            bearers.append(self._bearer)
+            request = httpx.Request("POST", url)
+            if len(bearers) == 1:
+                # The poll is held while the token expires; nothing refreshes the snapshot.
+                clock["t"] += 300.0
+                raise httpx.RemoteProtocolError("gateway cut the held poll", request=request)
+            if self._bearer != "Bearer minted":
+                return httpx.Response(403, text="Invalid Token", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _ExpiringTokenClient)
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert bearers == ["Bearer xyz", "Bearer xyz", "Bearer minted"]
+    assert len(mints) == 1
+
+
+@pytest.mark.parametrize(
+    ("started_from", "server_url", "renewed_with"),
+    [
+        ({"Authorization": "Bearer old"}, "http://127.0.0.1:8787", "Bearer xyz"),
+        (None, "http://127.0.0.1:8787", "Bearer minted"),
+        ({"Authorization": "Bearer old"}, "https://other.example.com", "Bearer minted"),
+    ],
+    ids=["snapshot-rewritten-at-startup", "headers-from-argv", "snapshot-for-another-server"],
+)
+def test_permission_hook_reauth_takes_only_a_matching_unsent_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    started_from: dict[str, str] | None,
+    server_url: str,
+    renewed_with: str,
+) -> None:
+    """The runner's snapshot renews only a hook that started from it, for its own server."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_unsent")
+    monkeypatch.setattr(
+        native_policy_hook,
+        "policy_hook_reauth",
+        lambda *_args: lambda: {"Authorization": "Bearer minted"},
+    )
+
+    reauth = claude_native_hook._permission_hook_reauth(
+        bridge_dir, server_url, {"Authorization": "Bearer old"}, started_from
+    )
+
+    renewed = reauth()
+    assert renewed is not None and renewed["Authorization"] == renewed_with
+    assert reauth() == {"Authorization": "Bearer minted"}, "an unchanged snapshot mints"
 
 
 def _assert_chat_fallback(stdout: str) -> None:

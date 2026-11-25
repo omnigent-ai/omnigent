@@ -41,7 +41,8 @@ New in v2:
 - **Diffs**: the working copy's changes as a review, including rendered
   Markdown diffs. Rendered Markdown is sanitized before it reaches the page, as
   in the existing file viewer. Where the host can compare revisions, a Commits
-  list shows the branch's commits, each opening what it changed.
+  list shows the branch's commits, or a typed base and head's, each opening
+  what it changed.
 - **Pull Requests**: the session's pull requests and a page for each one.
 
 Existing pages, which come along unchanged as tabs: terminals, the browser,

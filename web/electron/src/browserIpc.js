@@ -25,7 +25,11 @@ const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
 const { isBrowserViewFocused, registerDesignToolsIpc } = require("./designTools");
 
-const { SESSION_HOST_PROTOCOL, SSH_PREVIEW_PROTOCOL } = require("./hostIdentity");
+const {
+  SESSION_HOST_PROTOCOL,
+  SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
+} = require("./hostIdentity");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
@@ -391,6 +395,9 @@ function makeDesignModeInputHandler(gestureState, isAgentInput = () => false) {
  *          Promise<boolean>} [deps.requestPreviewHostForEvent]
  *        After a blocked navigation, asks whether the session's host may open
  *        localhost pages; true asks the renderer to refresh provenance before retrying.
+ * @param {(event: Electron.IpcMainInvokeEvent, url: string, opts: object) =>
+ *          Promise<boolean>} [deps.requestTrustedRemoteHostForEvent]
+ *        Same, for a host the user trusts explicitly instead of over SSH.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -400,6 +407,7 @@ function registerBrowserIpc({
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
   requestPreviewHostForEvent = async () => false,
+  requestTrustedRemoteHostForEvent = async () => false,
   // The window with a tab's one page (browserTabs.js).
   routeViewForEvent = () => null,
   whileOpeningView = (handler) => handler, // the page's window while it opens
@@ -534,6 +542,7 @@ function registerBrowserIpc({
     let r = await navigate(g.registry);
     if (!isCurrent()) return cancelled;
     let recovered = false;
+    let recoveryRequested = false;
     if (!r.ok && opts?.agent) {
       try {
         recovered = await recoverAgentNavigationForEvent(
@@ -542,23 +551,37 @@ function registerBrowserIpc({
           opts?.sourceHostId,
           opts?.rememberedArcaHostId,
           opts?.sourceIsArcaHost,
+          () => {
+            recoveryRequested = true;
+          },
         );
       } catch {
         recovered = false;
       }
     }
     // Typed URLs and links reach here too; the question names the session's host, not the page.
+    // SSH verification runs first when the renderer offered it; explicit trust
+    // is the fallback for hosts with no SSH destination, such as sandboxes.
     let previewAllowed = false;
     if (
       !r.ok &&
       r.localhostBlocked === true &&
       opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
-      opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
       !recovered &&
       isCurrent()
     ) {
       try {
-        previewAllowed = (await requestPreviewHostForEvent(event, url, opts)) === true;
+        if (opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL) {
+          previewAllowed = (await requestPreviewHostForEvent(event, url, opts)) === true;
+        }
+        if (
+          !previewAllowed &&
+          !recoveryRequested &&
+          isCurrent() &&
+          opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL
+        ) {
+          previewAllowed = (await requestTrustedRemoteHostForEvent(event, url, opts)) === true;
+        }
       } catch {
         previewAllowed = false;
       }
@@ -661,6 +684,14 @@ function registerBrowserIpc({
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     return g.registry.setRecentSessionSwitchSupported(!!args?.supported);
+  });
+
+  // The app chords a focused page hands to this renderer. Like Ctrl+Tab, none
+  // are taken from the page until a renderer that handles them asks.
+  ipcMain.handle("omnigent:browser-set-forwarded-chords", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.setForwardedChords(args?.chords);
   });
 
   // Turn Cmd/Ctrl-clicked page links into new tabs only while a compatible
