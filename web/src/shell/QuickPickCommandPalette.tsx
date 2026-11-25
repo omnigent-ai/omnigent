@@ -152,9 +152,10 @@ export function QuickPickCommandPalette({
   }, [open]);
   const childPage = useStore(paletteChildPageStore, (state) => state.page);
   // Back on the row that opened the page, once a choice applies or its setting goes away.
+  // A parent that is itself a page gets its own filter back; the root keeps its query.
   const restoreParent = (parent: PaletteParentPlace | null) => {
-    setPageQuery("");
-    if (parent && parent.query !== query) search.setQuery(parent.query);
+    setPageQuery(parent?.page ? parent.query : "");
+    if (parent && !parent.page && parent.query !== query) search.setQuery(parent.query);
     setParkedId(parent?.activeId ?? null);
   };
   const settingPage = useSettingChoicesPage(commandItems, targetKey, restoreParent);

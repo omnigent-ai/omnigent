@@ -13,7 +13,11 @@ import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands
 
 import { CommandContextProvider } from "./commandContext";
 import { OPTION_GONE_STATUS } from "./commandOptionsPage";
-import { openPaletteChildPage, rememberPaletteParent } from "./commandPaletteChildPage";
+import {
+  openPaletteChildPage,
+  paletteChildPageStore,
+  rememberPaletteParent,
+} from "./commandPaletteChildPage";
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 
 vi.mock("@/lib/routing", () => ({
@@ -205,5 +209,26 @@ describe("a command's options in ⌘K", () => {
     press("Escape");
     await waitFor(() => expect(input()).toHaveValue("Move Tab"));
     expect(screen.getByRole("option", { name: /Move Tab…/ })).toBeTruthy();
+  });
+
+  it("restores a parent page's filter on Back from a nested page, then the root's query", async () => {
+    renderPalette();
+    await openMoveTab();
+    type("Right");
+    await waitFor(() => expect(optionLabels()).toEqual(["To Right"]));
+    act(() => {
+      const { page, parent } = paletteChildPageStore.getState();
+      if (page === null) throw new Error("Move Tab's page should be open");
+      rememberPaletteParent({ query: "Right", activeId: null, page: { page, parent } });
+      openPaletteChildPage({ kind: "pick-session", command: "archive" });
+    });
+    expect(screen.queryAllByRole("option")).toEqual([]);
+    press("Escape");
+    await waitFor(() => expect(heading()).toBe("Move Tab"));
+    expect(input()).toHaveValue("Right");
+    expect(optionLabels()).toEqual(["To Right"]);
+    press("Escape");
+    await waitFor(() => expect(heading()).toBeNull());
+    expect(input()).toHaveValue("Move Tab");
   });
 });
