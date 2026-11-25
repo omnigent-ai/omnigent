@@ -138,8 +138,10 @@ _CODEX = "codex-native"
     [
         (_CLAUDE, {}, [], True),
         (_CLAUDE, {_CLAUDE_MODE_LABEL: "default"}, [], True),
-        (_CLAUDE, {_CLAUDE_MODE_LABEL: "auto"}, [], False),
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "auto"}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"], False),
         (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"], False),
+        # A reported mode, which editors can write, can only keep the review.
+        (_CLAUDE, {_CLAUDE_MODE_LABEL: "auto"}, [], True),
         (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["bypassPermissions"], False),
         (_CLAUDE, {}, PERMISSION_LAUNCH_ARGS[_CLAUDE]["dontAsk"], False),
         # A reported mode that skips approval counts only from the launch settings.
@@ -221,7 +223,9 @@ def test_a_wrapper_only_claude_session_follows_its_live_mode(
     labels = {_CLAUDE_MODE_LABEL: "auto"}
     if wrapped:
         labels[WRAPPER_LABEL_KEY] = CLAUDE_NATIVE_WRAPPER_VALUE
-    conv = conversation_store.create_conversation(labels=labels)
+    conv = conversation_store.create_conversation(
+        labels=labels, terminal_launch_args=PERMISSION_LAUNCH_ARGS[_CLAUDE]["auto"]
+    )
     engine = build_policy_engine(
         spec=parse(agent_dir),
         conversation_id=conv.id,

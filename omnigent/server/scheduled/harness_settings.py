@@ -233,8 +233,10 @@ def session_skips_scheduled_task_review(session: Conversation, harness: str | No
     A session a person started, in a mode that skips approval or in Claude Code's auto
     mode, may: it runs its other tools without asking a person either. A session that
     another session or an automation started keeps the review, since the agent that
-    started it picked its mode. The mode is read as :func:`session_permission_mode`
-    reads it, so a reported mode that keeps approval wins over stale launch flags.
+    started it picked its mode. The mode comes from the launch settings, which only the
+    owner or runner set, and where a confirmed switch is pinned. A reported mode, which
+    editors can write too, can only keep the review: one that keeps approval wins over
+    stale launch flags, as :func:`session_permission_mode` reads it.
 
     :param session: The calling session, freshly read.
     :param harness: The harness it runs, e.g. ``"claude-native"``.
@@ -251,7 +253,9 @@ def session_skips_scheduled_task_review(session: Conversation, harness: str | No
     harness = canonicalize_harness(harness)
     if started_by_an_agent or harness is None:
         return False
-    mode = session_permission_mode(session, harness)
+    mode = _launch_permission_mode(session, harness)
+    if session_permission_mode(session, harness) != mode:
+        return False
     return mode in APPROVAL_SKIPPING_PERMISSION_MODES or (
         harness == "claude-native" and mode == "auto"
     )
