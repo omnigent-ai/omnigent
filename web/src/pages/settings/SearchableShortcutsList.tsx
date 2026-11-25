@@ -4,6 +4,7 @@ import { SearchIcon } from "lucide-react";
 import { useLayoutEffect, useMemo, useState } from "react";
 
 import { KeyboardShortcutsList, useShortcutPageGroups } from "@/components/KeyboardShortcutsDialog";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useLocation } from "@/lib/routing";
 import { currentShortcutEnvironment } from "@/lib/shortcuts/registry";
 
@@ -36,7 +37,8 @@ export function SearchableShortcutsList() {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Escape" && query !== "") {
+              // An IME's Escape cancels its composition, not the committed query.
+              if (event.key === "Escape" && query !== "" && !isImeCompositionKeyEvent(event)) {
                 event.preventDefault();
                 setQuery("");
               }

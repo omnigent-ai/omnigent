@@ -60,6 +60,16 @@ describe("SearchableShortcutsList", () => {
     expect(rowNames()).toHaveLength(all);
   });
 
+  it("leaves the query alone when Escape cancels an IME composition", async () => {
+    const field = renderList();
+    await userEvent.type(field, "model");
+    fireEvent.keyDown(field, { key: "Escape", isComposing: true });
+    fireEvent.keyDown(field, { key: "Escape", keyCode: 229 });
+    expect(field).toHaveValue("model");
+    fireEvent.keyDown(field, { key: "Escape" });
+    expect(field).toHaveValue("");
+  });
+
   it("says when nothing matches", async () => {
     const field = renderList();
     await userEvent.type(field, "no such shortcut");
