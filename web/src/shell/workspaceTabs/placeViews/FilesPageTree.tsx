@@ -33,7 +33,7 @@ import {
 import { usePaletteCommands } from "@/store/paletteCommands";
 import { breadcrumbSegments, workspaceFolderName } from "@/shell/breadcrumbPaths";
 import { useRememberedBrowseLocation } from "@/shell/filesPane/browseLocations";
-import { treeFilterSummary } from "@/shell/filesPane/treeFilterSummary";
+import { type TreeFilterValues, treeFilterSummary } from "@/shell/filesPane/treeFilterSummary";
 import { useTreeFilters } from "@/shell/filesPane/useTreeFilters";
 import { activeFileTreePath } from "@/shell/fileTree/activeFileTreePath";
 import {
@@ -82,6 +82,14 @@ export interface FilesPageTreeProps {
    * a ⌘-click (Ctrl-click off macOS) or a middle click, which want it in its own tab.
    */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
+}
+
+/** The globs a filter narrows the tree by: only while it has no name, which searches instead. */
+function treePatternsOf(filter: TreeFilterValues): TreePatterns | undefined {
+  const summary = treeFilterSummary(filter);
+  return summary.active && !summary.search
+    ? { include: filter.include, exclude: filter.exclude }
+    : undefined;
 }
 
 function TreeMessage({ children, alert = false }: { children: string; alert?: boolean }) {
@@ -194,10 +202,7 @@ export function FilesPageTree({
   const summary = treeFilterSummary(filters.applied);
   // A name searches; globs without one narrow the tree itself.
   const searching = summary.active && summary.search;
-  const patterns: TreePatterns | undefined =
-    summary.active && !summary.search
-      ? { include: filters.applied.include, exclude: filters.applied.exclude }
-      : undefined;
+  const patterns = treePatternsOf(filters.applied);
   const [filterOpen, setFilterOpen] = useState(() =>
     Boolean(filters.edited.nameContains || filters.edited.include || filters.edited.exclude),
   );
@@ -235,12 +240,14 @@ export function FilesPageTree({
     filterEndedFor.current = revealKey;
     if (filterName) clearNameContains();
   }, [revealKey, filterName, clearNameContains]);
-  // Likewise a reveal of a file the globs leave out ends them, so the file can show.
+  // Likewise a reveal of a file the globs leave out ends them, so the file can show, even
+  // globs still waiting to apply, which would otherwise hide it once the reveal is done.
   const revealFile = reveal.activeReveal?.file ?? null;
   const revealFiltered =
     revealFile !== null &&
-    patterns !== undefined &&
-    !treeFilePathFilter(true, patterns)(revealFile);
+    [patterns, treePatternsOf(filters.edited)].some(
+      (globs) => globs !== undefined && !treeFilePathFilter(true, globs)(revealFile),
+    );
   const { clear: clearFilters } = filters;
   useEffect(() => {
     if (revealFiltered) clearFilters();

@@ -802,6 +802,24 @@ describe("FilesPageTree", () => {
       expect(toast.info).not.toHaveBeenCalled();
     });
 
+    it("ends an exclude still waiting to apply when it would hide a file being revealed", () => {
+      vi.useFakeTimers();
+      renderTree(listed([entry("src")]));
+      openFilter();
+      fireEvent.click(screen.getByRole("button", { name: "Files to include or exclude" }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Files to exclude" }), {
+        target: { value: "src" },
+      });
+      // Revealed and done before the exclude applies, so nothing is left to end it later.
+      act(() => {
+        requestActiveFileReveal("conv_1", "src/a.ts");
+      });
+      act(() => captured.tree?.onActiveRevealHandled?.(captured.tree.activeReveal!.key));
+      act(() => vi.advanceTimersByTime(TREE_FILTER_DEBOUNCE_MS));
+      expect(captured.tree?.patterns).toBeUndefined();
+      expect(screen.getByRole("textbox", { name: "Files to exclude" })).toHaveValue("");
+    });
+
     it("narrows a name search with globs", () => {
       vi.useFakeTimers();
       renderTree(listed([entry("src")]));
