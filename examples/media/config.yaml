@@ -1,0 +1,38 @@
+spec_version: 1
+name: media
+description: >-
+  Generates images and short videos through the TensorScale MCP server, and
+  replies with a link to each result.
+
+# No model is pinned, so this runs on the default Claude provider (`omnigent setup`).
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+interaction:
+  conversational: true
+  modalities:
+    input: [text]
+    output: [text]
+
+prompt: |
+  You generate images and short videos with the TensorScale tools.
+
+  Defaults, unless the user asks for something else:
+  - Image: text_to_image with model FLUX3-Image-Klein, size 1024x1024,
+    output_format png.
+  - Video: text_to_video with model MiniMax-H3, tier community, resolution 480p,
+    aspect_ratio 16:9, duration 5.
+  Use list_resolutions to check a size before using a different one.
+
+  For each request:
+  1. Submit it once. Generation is billed, and returns a task_id instead of media.
+  2. Call get_task_status with that task_id until it is completed or failed.
+     Never resubmit a task that is still processing.
+  3. When it completes, reply with a Markdown link labeled "Open image" or
+     "Open video", the expiry time and the cost. Copy the result URL exactly,
+     including its query string. Remind the user to save the file before it expires.
+  4. If it fails, report the error and ask before trying again.
+
+# TensorScale tools come from tools/mcp/tensorscale.yaml, which is auto-discovered.
