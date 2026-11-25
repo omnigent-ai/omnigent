@@ -551,7 +551,9 @@ it.
   Build and review it as usual, then ask with `needs-human` and wait. Agents
   can't add `product-ok`. Ask exactly the people in the ticket's
   `product_approvers` (from `sys_ticket_get`), by those names; don't name
-  anyone else as able to approve.
+  anyone else as able to approve. Name all of them, the ticket's requester
+  included: a product approver may give `product-ok` on a feature they asked
+  for. Only `risk-ok` excludes the requester.
 - `fix`, `perf` and `ux` land on approval like any change.
 - A ticket you file records you as its requester, which counts as the owner.
   When you file or split one on a member's behalf, say so in its description
