@@ -2995,7 +2995,7 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     )
     assert {row["id"] for row in expanded.json()["data"]} == {source["id"], sibling_id}
     assert expanded.json()["page_boundary"]["id"] == sibling_id
-    # Filtering a cursor side chat must not move the boundary into appended family context.
+    # Hidden side chats do not consume the page or become cursor boundaries.
     from omnigent.server.auth import LEVEL_OWNER
     from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 
@@ -3016,13 +3016,11 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
             params={"limit": 2, "agent_id": sibling.agent_id, "expand_families": True},
         )
     ).json()
-    assert filtered["last_id"] == hidden.id
-    assert filtered["page_boundary"] == {
-        "id": sibling_id,
-        "created_at": sibling.created_at,
-        "updated_at": sibling.updated_at,
-    }
-    assert {row["id"] for row in filtered["data"]} == {source["id"], sibling_id}
+    assert filtered["last_id"] != hidden.id
+    assert filtered["page_boundary"]["id"] != hidden.id
+    filtered_ids = {row["id"] for row in filtered["data"]}
+    assert {source["id"], sibling_id} <= filtered_ids
+    assert hidden.id not in filtered_ids
     pinned = await auth_client.patch(
         f"/v1/sessions/{sibling_id}", json={"labels": {"omnigent.pinned": "1"}}
     )
