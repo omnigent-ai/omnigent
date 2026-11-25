@@ -138,6 +138,8 @@ class ProgramStatusParser:
 
     def feed(self, data: bytes) -> bytes:
         """Consume queries and optionally wrap valid reports for tmux, in order."""
+        if self._state == "ground" and b"\x1b" not in data:
+            return data
         output = bytearray()
         for byte in data:
             if self._state == "ground":
