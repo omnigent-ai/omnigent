@@ -810,22 +810,44 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
     });
   }
 
-  it("asks after identity recovery declines an agent navigation", async () => {
-    const { state, navigate } = previewSetup({
-      recover: async () => {
-        state.calls.push("recover");
-        return false;
-      },
-      request: (current) => {
-        current.allowed = true;
-        return true;
-      },
+  for (const offersTrust of [false, true]) {
+    it(`asks through SSH when identity recovery cannot proceed (trust protocol: ${offersTrust})`, async () => {
+      const { state, navigate } = previewSetup({
+        protocols: {
+          sshPreviewProtocol: 1,
+          ...(offersTrust ? { trustedRemotePreviewProtocol: 1 } : {}),
+        },
+        recover: async (
+          _event,
+          _url,
+          _host,
+          _remembered,
+          _sourceIsRecoveryHost,
+          onRecoveryRequested,
+        ) => {
+          state.calls.push("recover");
+          onRecoveryRequested();
+          return false;
+        },
+        request: (current) => {
+          current.allowed = true;
+          return true;
+        },
+        requestTrusted: () => assert.fail("SSH approval must not ask for persistent trust"),
+      });
+      const source = { agent: true, sourceHostId: "host-1" };
+      const result = await navigate(source);
+      assert.equal(result.ok, false);
+      assert.equal(result.retryWithFreshHost, true);
+      assert.deepEqual(state.calls, ["denied", "recover", "request"]);
+      const retry = await navigate({
+        ...source,
+        navigationRetryToken: result.navigationRetryToken,
+      });
+      assert.equal(retry.ok, true);
+      assert.deepEqual(state.calls, ["denied", "recover", "request", "allowed", "navigate"]);
     });
-    const result = await navigate({ agent: true, sourceHostId: "host-1" });
-    assert.equal(result.ok, false);
-    assert.equal(result.retryWithFreshHost, true);
-    assert.deepEqual(state.calls, ["denied", "recover", "request"]);
-  });
+  }
 
   it("doesn't ask when identity recovery already allowed the page", async () => {
     const { state, navigate } = previewSetup({

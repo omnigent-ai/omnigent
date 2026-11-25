@@ -568,7 +568,6 @@ function registerBrowserIpc({
       r.localhostBlocked === true &&
       opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
       !recovered &&
-      !recoveryRequested &&
       isCurrent()
     ) {
       try {
@@ -577,6 +576,7 @@ function registerBrowserIpc({
         }
         if (
           !previewAllowed &&
+          !recoveryRequested &&
           isCurrent() &&
           opts?.trustedRemotePreviewProtocol === TRUSTED_REMOTE_PREVIEW_PROTOCOL
         ) {
