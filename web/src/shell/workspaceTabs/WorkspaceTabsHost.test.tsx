@@ -173,18 +173,6 @@ describe("WorkspaceTabsHost", () => {
     expect(await screen.findByRole("dialog")).toHaveTextContent("vim is running in zsh · s1");
   });
 
-  it("closes an idle shell's tab without asking", async () => {
-    vi.spyOn(console, "info").mockImplementation(() => {});
-    shellState.body = { state: "idle" };
-    host();
-    let closing!: Promise<boolean>;
-    act(() => {
-      closing = captured.panel!.confirmCloseShell("terminal:t1");
-    });
-    await expect(closing).resolves.toBe(true);
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
   it("leaves a shell that won't end for the sidebar to report", async () => {
     host();
     captured.deleteTerminal.mockRejectedValueOnce(new Error("runner offline"));

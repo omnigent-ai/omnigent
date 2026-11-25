@@ -63,7 +63,7 @@ with their own terminal retain the switcher.
 - On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
   right" / "Split down" buttons in Terminal view and pick a shell type. Drag a
   divider (or focus it and use the arrow keys along its axis) to resize. "Close
-  pane" asks for confirmation, then kills the focused shell; the agent pane
+  pane" kills the focused shell at once when it's idle, and asks first otherwise; the agent pane
   cannot be closed. Panes are saved per session in this browser and show only
   for desktop owners outside grid cells. ⌘/Ctrl+Alt+Shift+\ splits right and
   ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
@@ -94,13 +94,16 @@ with their own terminal retain the switcher.
   while an embedded browser tab has focus. The menu item is disabled whenever
   the chord would be inert.
 - Select an open shell from the rail's shell list; close it from its tab.
-- Closing a shell, from any of the places below, first asks its runner what it runs. A shell
-  idle at its prompt closes without asking; a busy one asks and names its job, such as "vim is
-  running in zsh". When the runner can't answer within half a second, the server is too old to
-  serve the check, or the shell was typed into meanwhile, it asks as before.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
+- Closing a shell, from any of these places, first asks its runner what it runs. A shell
+  idle at its prompt closes without asking; a busy one asks and names its job, such as "vim is
+  running in zsh". When the runner can't answer within half a second, the server is too old to
+  serve the check, or the shell was typed into meanwhile, it asks as before. In the rail, a grid
+  cell or the split controls, closing another shell while the first is still being checked
+  joins the two: both close, or one question asks about both. The tabs sidebar keeps the first
+  shell open instead.
 - Right-click any open workspace tab, or open the rail's panel picker (⌄), and
   choose Close other tabs or Close all tabs. Shells in the batch close together
   after one confirmation ("Close N shells?"). The batch's other tabs close
