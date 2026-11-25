@@ -250,6 +250,33 @@ describe("FilesTree", () => {
     );
   });
 
+  it("names a nested folder that stopped short only while it's open", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async () =>
+      // The host says more lie past these two, but gives no cursor to read them by.
+      Response.json({
+        object: "list",
+        data: [file("partial/a.txt"), file("partial/b.txt")].map((entry) => ({
+          id: entry.path,
+          ...entry,
+        })),
+        has_more: true,
+        last_id: null,
+      }),
+    );
+    // A folder no other case opens: the tree remembers open folders per session.
+    renderTree([folder("partial"), file("README.md")]);
+    const partial = await screen.findByRole("treeitem", { name: "partial" });
+
+    fireEvent.click(partial);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Showing the first 2 entries of partial.",
+    );
+    fireEvent.click(screen.getByRole("treeitem", { name: "partial" }));
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("treeitem", { name: "partial" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("of partial.");
+  });
+
   it("says nothing of a complete listing as long as the entry limit", async () => {
     // A host that ignores the page size can list a whole folder of this size in one go.
     const entries = Array.from({ length: LISTING_ENTRY_LIMIT }, (_, i) => file(`f${i}.txt`));

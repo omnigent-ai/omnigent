@@ -3,7 +3,16 @@
 // and the panel's sort, change marks, sizes, menus and ⌘K target carry over.
 // Row interactions the tree doesn't offer are delegated from its root.
 
-import { type CSSProperties, type FocusEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type FocusEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   FileTree,
   type FileTreeDirectoryHandle,
@@ -459,19 +468,22 @@ function FilesTreeRows(props: FilesTreeProps) {
   const pending = loadingFolders.find(
     (folder) => directories.get(folder)?.isLoading && !directories.get(folder)?.data,
   );
-  // A folder whose listing stopped short: the tree can't show what lies past it.
-  const cutOffListing = rawListings.find(({ entries }) => listingCutOff(entries));
-  const cutOffName =
-    cutOffListing &&
-    ((cutOffListing.folder || browseLocation).split("/").filter(Boolean).at(-1) || "this folder");
-  const status =
-    failed !== undefined
-      ? `Couldn’t load ${failed.split("/").at(-1)}.`
-      : pending !== undefined
-        ? `Loading ${pending.split("/").at(-1)}…`
-        : cutOffListing
-          ? `Showing the first ${cutOffListing.entries.length.toLocaleString("en-US")} entries of ${cutOffName}.`
-          : null;
+  const cutOffListings = rawListings.filter(({ entries }) => listingCutOff(entries));
+  // Only a cut-off folder whose entries show is named; one status line has room for one.
+  const shownCutOffFolder = useShownFolder(
+    model,
+    cutOffListings.map(({ folder }) => folder),
+  );
+  const cutOffListing = cutOffListings.find(({ folder }) => folder === shownCutOffFolder);
+  const status = treeStatus({
+    failed,
+    pending,
+    cutOff: cutOffListing && {
+      count: cutOffListing.entries.length,
+      name:
+        (cutOffListing.folder || browseLocation).split("/").filter(Boolean).at(-1) || "this folder",
+    },
+  });
   return (
     // The tree stays mounted while its folder is empty, so its listeners are there once files arrive.
     <div ref={containerRef} className="flex min-h-0 flex-1 flex-col">
@@ -526,6 +538,41 @@ function FilesTreeRows(props: FilesTreeProps) {
         />
       )}
     </div>
+  );
+}
+
+/** The tree's one status line: a folder that failed or is loading, then one that stopped short. */
+function treeStatus({
+  failed,
+  pending,
+  cutOff,
+}: {
+  failed?: string;
+  pending?: string;
+  cutOff?: { count: number; name: string };
+}): string | null {
+  if (failed !== undefined) return `Couldn’t load ${failed.split("/").at(-1)}.`;
+  if (pending !== undefined) return `Loading ${pending.split("/").at(-1)}…`;
+  if (cutOff)
+    return `Showing the first ${cutOff.count.toLocaleString("en-US")} entries of ${cutOff.name}.`;
+  return null;
+}
+
+/** Whether `folder`'s entries show now: the root's always do, another's while it's open in view. */
+function folderShown(model: FileTreeModel, folder: string): boolean {
+  if (folder === "") return true;
+  const path = folderTreePath(folder);
+  return (
+    model.getVisibleIndexOfPath(path) >= 0 && (asFolder(model.getItem(path))?.isExpanded() ?? false)
+  );
+}
+
+/** The first of `folders` whose entries show, followed as folders open and close; null for none. */
+function useShownFolder(model: FileTreeModel, folders: readonly string[]): string | null {
+  const subscribe = useCallback((onChange: () => void) => model.subscribe(onChange), [model]);
+  return useSyncExternalStore(
+    subscribe,
+    () => folders.find((folder) => folderShown(model, folder)) ?? null,
   );
 }
 
