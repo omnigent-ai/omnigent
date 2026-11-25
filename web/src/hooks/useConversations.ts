@@ -2147,12 +2147,19 @@ function unpinFamilyInCaches(
   headLabels: Record<string, string>,
   family: SessionFamily,
 ) {
-  overlayFamilyIntoCaches(
-    queryClient,
-    { ...family, pinned: false, pinned_at: null },
-    headId,
-    headLabels,
-  );
+  const head = findCachedConversationRow(queryClient, headId);
+  const unpinned = { ...family, pinned: false, pinned_at: null };
+  overlayFamilyIntoCaches(queryClient, unpinned, headId, headLabels);
+  // An open head that only the Pinned section listed is fetched once it leaves;
+  // seed that row so a fetch before the write commits can't restore the pin.
+  const backfillKey = ["conversation-backfill", headId];
+  if (head && queryClient.getQueryData(backfillKey) === undefined) {
+    queryClient.setQueryData<Conversation>(backfillKey, {
+      ...head,
+      labels: headLabels,
+      family: unpinned,
+    });
+  }
   queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
     old
       ? {
@@ -2275,10 +2282,11 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
-      // A nest's pin is server-derived across its members, so only its unpin
-      // is applied up front; a nest pin waits for the refetch after the write.
+      // A nest's pin is server-derived across its members, so only the head's
+      // unpin is applied up front; other nest writes wait for the refetch.
       const family = existing?.family ?? undefined;
-      const prevFamily = !pinned && family?.pinned ? family : undefined;
+      const prevFamily =
+        !pinned && family?.pinned && family.representative_id === id ? family : undefined;
       if (!family) patch(id, labels, pinned);
       else if (prevFamily) unpinFamilyInCaches(queryClient, id, labels, prevFamily);
       return { prevPinned, prevPin: base[PINNED_LABEL_KEY], prevFamily };
@@ -2312,7 +2320,17 @@ export function useTogglePinnedConversation() {
       // The row snaps back, so say why (e.g. an Undo re-pin that didn't save).
       showToast(pinned ? "Couldn't pin the session." : "Couldn't unpin the session.");
     },
-    onSuccess: (updated, { pinned }) => {
+    onSuccess: (updated, { pinned }, ctx) => {
+      // Like a plain unpin, reconcile rows fetched mid-write instead of
+      // refetching `?pinned=true`, whose index can still list the nest.
+      if (ctx?.prevFamily) {
+        const base = findRow(updated.id)?.labels ?? updated.labels;
+        const labels = Object.fromEntries(
+          Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY),
+        );
+        unpinFamilyInCaches(queryClient, updated.id, labels, ctx.prevFamily);
+        return;
+      }
       if (updated.family || findRow(updated.id)?.family) {
         invalidateFamilyLists(queryClient);
         return;
