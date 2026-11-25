@@ -33,11 +33,16 @@ const encoder = new TextEncoder();
 interface IdentityDraft extends IdentitySessionChoice {
   name: string;
   instructions: string;
+  /** One scope item per line. */
+  owns: string;
+  excludes: string;
 }
 
 const EMPTY_DRAFT: IdentityDraft = {
   name: "",
   instructions: "",
+  owns: "",
+  excludes: "",
   agentId: "",
   model: "",
   effort: "",
@@ -47,10 +52,19 @@ function draftOf(identity: ProjectIdentity): IdentityDraft {
   return {
     name: identity.name,
     instructions: identity.instructions,
+    owns: (identity.scope?.owns ?? []).join("\n"),
+    excludes: (identity.scope?.excludes ?? []).join("\n"),
     agentId: identity.agent_id ?? "",
     model: identity.model ?? "",
     effort: identity.effort ?? "",
   };
+}
+
+function scopeLines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 function inputOf(draft: IdentityDraft, builtin: boolean): ProjectIdentityInput {
@@ -60,8 +74,14 @@ function inputOf(draft: IdentityDraft, builtin: boolean): ProjectIdentityInput {
     model: draft.model.trim(),
     effort: draft.effort.trim(),
   };
-  // The Lead keeps its name; its agent, model and effort are the project's defaults.
-  return builtin ? session : { name: draft.name.trim(), ...session };
+  // The Lead keeps its name and has no scope; its agent, model and effort are the
+  // project's defaults.
+  if (builtin) return session;
+  return {
+    name: draft.name.trim(),
+    ...session,
+    scope: { owns: scopeLines(draft.owns), excludes: scopeLines(draft.excludes) },
+  };
 }
 
 /** Adds and edits the project's identities: named roles the user can talk to. */
@@ -222,6 +242,32 @@ export function ProjectTeamDialog({
                     {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
                   </span>
                 </label>
+                {!isLead && (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="flex flex-col gap-1 text-sm">
+                      Owns
+                      <Textarea
+                        data-testid="project-team-owns"
+                        value={draft.owns}
+                        placeholder={"One per line, e.g.\nVisual design\nUX reviews"}
+                        className="min-h-20 text-sm"
+                        onChange={(event) => setDraft({ ...draft, owns: event.target.value })}
+                        disabled={busy}
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-sm">
+                      Doesn&apos;t own
+                      <Textarea
+                        data-testid="project-team-excludes"
+                        value={draft.excludes}
+                        placeholder={"One per line, e.g.\nThe roadmap\nCode review"}
+                        className="min-h-20 text-sm"
+                        onChange={(event) => setDraft({ ...draft, excludes: event.target.value })}
+                        disabled={busy}
+                      />
+                    </label>
+                  </div>
+                )}
                 <IdentityModelEffortFields
                   config={project?.config}
                   agentId={draft.agentId}
