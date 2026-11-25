@@ -20,6 +20,8 @@ export interface LazyFolderTreeState {
   present: ReadonlySet<string>;
   /** Every path the tree holds right now, for work done in the same commit as a sync. */
   currentPresent: () => ReadonlySet<string>;
+  /** Whether the snapshot above reflects this render's listings, not ones they replaced. */
+  synced: boolean;
 }
 
 /**
@@ -56,6 +58,7 @@ export function useLazyFolderTree(
   const loadedFolders = useRef<Set<string>>(initial.loadedFolders);
   const [wantedFolders, setWantedFolders] = useState<string[]>([]);
   const [snapshot, setSnapshot] = useState({
+    version: null as string | null,
     isEmpty: initial.present.size === 0,
     loadedFolders: initial.loadedFolders as ReadonlySet<string>,
     present: initial.present as ReadonlySet<string>,
@@ -86,6 +89,7 @@ export function useLazyFolderTree(
       return kept.length === current.length && added.length === 0 ? current : [...kept, ...added];
     });
     setSnapshot({
+      version: listingVersion,
       isEmpty: sync.present.size === 0,
       loadedFolders: sync.loadedFolders,
       present: sync.present,
@@ -112,5 +116,6 @@ export function useLazyFolderTree(
   }, [model]);
 
   const currentPresent = useCallback((): ReadonlySet<string> => present.current, []);
-  return { wantedFolders, ...snapshot, currentPresent };
+  const { version: syncedVersion, ...state } = snapshot;
+  return { wantedFolders, ...state, currentPresent, synced: syncedVersion === listingVersion };
 }

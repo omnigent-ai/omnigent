@@ -247,13 +247,8 @@ function FilesTreeRows(props: FilesTreeProps) {
   const orderSignature = treeOrderSignature(props.sort, meta);
   const appliedOrder = useRef(orderSignature);
   const containerRef = useRef<HTMLDivElement>(null);
-  const { wantedFolders, isEmpty, present, loadedFolders, currentPresent } = useLazyFolderTree(
-    model,
-    initial,
-    listings,
-    listingsVersion(listings),
-    [""],
-    {
+  const { wantedFolders, isEmpty, present, loadedFolders, currentPresent, synced } =
+    useLazyFolderTree(model, initial, listings, listingsVersion(listings), [""], {
       // A folder adding hundreds of entries rebuilds once, in this render's order.
       rebuild: (paths) => {
         rebuildTreeInPlace(model, paths, {
@@ -261,8 +256,7 @@ function FilesTreeRows(props: FilesTreeProps) {
         });
         appliedOrder.current = orderSignature;
       },
-    },
-  );
+    });
   useEffect(() => {
     setLoadingFolders((current) =>
       current.length === wantedFolders.length &&
@@ -445,7 +439,8 @@ function FilesTreeRows(props: FilesTreeProps) {
     model,
     selection: selectionRef.current,
     file: props.activeFile ?? null,
-    request: props.activeReveal ?? null,
+    // A request waits for the sync, so a change of patterns can't miss it against old rows.
+    request: synced ? (props.activeReveal ?? null) : null,
     onRequestHandled: props.onActiveRevealHandled,
     onRequestMissed: props.onActiveRevealMissed,
     present,

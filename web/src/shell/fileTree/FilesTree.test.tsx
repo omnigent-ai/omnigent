@@ -110,6 +110,9 @@ function renderTree(
     /** Filter the same listings by `patterns`, or stop filtering. */
     filter: (entries: readonly WorkspaceFile[], patterns?: TreePatterns) =>
       view.rerender(<FilesTree {...props(entries, null, patterns)} />),
+    /** Rerender the first listing with `changes` over the starting props. */
+    update: (changes: Partial<FilesTreeProps>) =>
+      view.rerender(<FilesTree {...props(rootEntries)} {...changes} />),
   };
 }
 
@@ -350,6 +353,21 @@ describe("FilesTree", () => {
     });
     expect(await screen.findByRole("treeitem", { name: /README\.md/ })).toBeInTheDocument();
     expect(screen.queryByRole("treeitem", { name: /pnpm\.lock/ })).not.toBeInTheDocument();
+  });
+
+  it("reveals a file asked for in the same render that its exclude clears", async () => {
+    const onActiveRevealMissed = vi.fn();
+    const tree = renderTree([file("a.ts"), file("README.md")], vi.fn(), {
+      patterns: { include: "", exclude: "a.ts" },
+      activeFile: "a.ts",
+      onActiveRevealMissed,
+    });
+    expect(await screen.findByRole("treeitem", { name: /README\.md/ })).toBeInTheDocument();
+    // The rows still lack a.ts until the tree syncs the cleared exclude.
+    tree.update({ patterns: undefined, activeReveal: { key: 1, file: "a.ts" } });
+    const row = await screen.findByRole("treeitem", { name: /a\.ts/ });
+    await waitFor(() => expect(row).toHaveAttribute("aria-selected", "true"));
+    expect(onActiveRevealMissed).not.toHaveBeenCalled();
   });
 
   describe("opening a folder of hundreds of entries", () => {

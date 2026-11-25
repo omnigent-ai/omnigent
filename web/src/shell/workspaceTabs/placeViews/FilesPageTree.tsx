@@ -571,7 +571,8 @@ export function FilesPageTree({
         }}
         reveal={null}
         activeFile={activeFileTreePath(activePath, location, workspaceRoot)}
-        activeReveal={reveal.activeReveal}
+        // Held back while globs that hide the file clear, so the tree can't miss it first.
+        activeReveal={revealFiltered ? null : reveal.activeReveal}
         onActiveRevealMissed={reveal.onActiveRevealMissed}
         onActiveRevealHandled={reveal.onActiveRevealHandled}
         label="Workspace files"

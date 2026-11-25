@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ComponentProps, type ReactNode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,6 +20,7 @@ import {
   rememberBrowseLocation,
   rememberedBrowseLocation,
 } from "@/shell/filesPane/browseLocations";
+import type * as FilesTreeModule from "@/shell/fileTree/FilesTree";
 import type { FilesTree } from "@/shell/fileTree/FilesTree";
 import {
   forgetActiveFileRevealsForTests,
@@ -43,7 +44,11 @@ import { FilesPageTree } from "./FilesPageTree";
 
 vi.mock("sonner", () => ({ toast: { info: vi.fn() } }));
 
-const captured = vi.hoisted(() => ({ tree: null as ComponentProps<typeof FilesTree> | null }));
+// `real` renders the actual tree, for cases that need its own reveal lifecycle.
+const captured = vi.hoisted(() => ({
+  tree: null as ComponentProps<typeof FilesTree> | null,
+  real: false,
+}));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
@@ -77,12 +82,15 @@ vi.mock("@/shell/fileTree/FilesTreeMatches", () => ({
 vi.mock("@/hooks/useSession", () => ({
   useSession: () => ({ session: { permissionLevel: null } }),
 }));
-vi.mock("@/shell/fileTree/FilesTree", () => ({
-  FilesTree: (props: ComponentProps<typeof FilesTree>) => {
-    captured.tree = props;
-    return <div data-testid="files-tree" />;
-  },
-}));
+vi.mock("@/shell/fileTree/FilesTree", async (importOriginal) => {
+  const actual = await importOriginal<typeof FilesTreeModule>();
+  return {
+    FilesTree: (props: ComponentProps<typeof FilesTree>) => {
+      captured.tree = props;
+      return captured.real ? <actual.FilesTree {...props} /> : <div data-testid="files-tree" />;
+    },
+  };
+});
 
 /** The folder's file actions read the session's hosts, so the tree needs a query client. */
 function TestProviders({ children }: { children: ReactNode }) {
@@ -123,7 +131,11 @@ const listed = (entries: WorkspaceFile[], ignoredHidden = false) =>
 function renderTree(
   files: Partial<FilesResult>,
   showHidden = false,
-  { active = true, showIgnored = true }: { active?: boolean; showIgnored?: boolean } = {},
+  {
+    active = true,
+    showIgnored = true,
+    activePath = "src/a.ts",
+  }: { active?: boolean; showIgnored?: boolean; activePath?: string } = {},
 ) {
   vi.mocked(useWorkspaceAllFiles).mockReturnValue(files as FilesResult);
   const onFileSelect = vi.fn();
@@ -136,7 +148,7 @@ function renderTree(
         conversationId="conv_1"
         active={active}
         commandsActive={active}
-        activePath="src/a.ts"
+        activePath={activePath}
         sort="alpha"
         onSortChange={onSortChange}
         showHidden={showHidden}
@@ -166,6 +178,7 @@ const listedLocations = () => vi.mocked(useWorkspaceAllFiles).mock.calls.map((ca
 
 beforeEach(() => {
   captured.tree = null;
+  captured.real = false;
   vi.mocked(useWorkspaceAllFiles).mockClear();
   vi.mocked(useWorkspaceFileSearch).mockReturnValue({ data: undefined } as never);
   vi.mocked(useWorkspaceEnvironment).mockReturnValue({
@@ -842,6 +855,27 @@ describe("FilesPageTree", () => {
       });
       expect(captured.tree?.patterns).toBeUndefined();
       expect(captured.tree?.activeReveal).toMatchObject({ file: "src/a.ts" });
+      expect(toast.info).not.toHaveBeenCalled();
+    });
+
+    it("reveals a file its globs hid on the first ask, once the tree lists it again", async () => {
+      captured.real = true;
+      vi.mocked(toast.info).mockClear();
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: { available: true, data: [] },
+      } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
+      vi.useFakeTimers();
+      renderTree(listed([entry("a.ts"), entry("README.md")]), false, { activePath: "a.ts" });
+      openFilter();
+      setGlob("Files to exclude", "a.ts");
+      vi.useRealTimers();
+      expect(await screen.findByRole("treeitem", { name: /README\.md/ })).toBeInTheDocument();
+      expect(screen.queryByRole("treeitem", { name: /a\.ts/ })).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "Reveal Active File" }));
+      const row = await screen.findByRole("treeitem", { name: /a\.ts/ });
+      await waitFor(() => expect(row).toHaveAttribute("aria-selected", "true"));
+      expect(captured.tree?.patterns).toBeUndefined();
       expect(toast.info).not.toHaveBeenCalled();
     });
 
