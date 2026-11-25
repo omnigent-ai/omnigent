@@ -86,7 +86,10 @@ function useLatest<T>(value: T) {
   return ref;
 }
 
-/** Flips an option from Alt and its letter while focus is in `scope`, the dialog. */
+/**
+ * Flips an option from Alt and its letter while focus is in `scope`, the dialog, but not in a
+ * filter field, where Option and a letter type a character such as ç on a Mac.
+ */
 export function useTextSearchOptionKeys(
   scope: () => Element | null,
   props: TextSearchControlsProps,
@@ -98,7 +101,9 @@ export function useTextSearchOptionKeys(
       const option = TEXT_SEARCH_OPTIONS.find((candidate) => candidate.code === event.code);
       const current = latest.current;
       const within = current.scope();
-      if (!option || !within || !within.contains(document.activeElement)) return;
+      const focused = document.activeElement;
+      if (!option || !within || !within.contains(focused)) return;
+      if (focused?.closest("[data-text-search-filters]")) return;
       event.preventDefault();
       event.stopPropagation();
       if (option.id === "filter") current.onFilteringChange(!current.filtering);
@@ -156,7 +161,10 @@ export function TextSearchFilters({
   onInputChange,
 }: Pick<TextSearchControlsProps, "input" | "onInputChange">) {
   return (
-    <div className="grid grid-cols-2 gap-2 border-b border-border px-3 py-2 text-xs">
+    <div
+      className="grid grid-cols-2 gap-2 border-b border-border px-3 py-2 text-xs"
+      data-text-search-filters
+    >
       <label className="space-y-1">
         <span className="text-muted-foreground">Files to include</span>
         <Input

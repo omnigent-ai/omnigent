@@ -249,7 +249,14 @@ describe("GoToFileHost", () => {
       "true",
     );
     await userEvent.click(screen.getByRole("button", { name: "Files to include or exclude" }));
-    await userEvent.type(screen.getByRole("textbox", { name: "Files to include" }), "src/**");
+    const include = screen.getByRole("textbox", { name: "Files to include" });
+    await userEvent.type(include, "src/**");
+    // In a filter field Option and a letter type a character, so no option flips.
+    expect(fireEvent.keyDown(include, { key: "ç", code: "KeyC", altKey: true })).toBe(true);
+    expect(screen.getByRole("button", { name: "Match case" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     await waitFor(() =>
       expect(textSearches.calls.at(-1)).toMatchObject({
         query: "needle",
