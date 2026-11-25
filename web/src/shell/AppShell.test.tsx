@@ -1222,6 +1222,23 @@ describe("AppShell header", () => {
       expect(column()).toHaveAttribute("data-main-view", "chat");
     });
 
+    // 1000px floats the cards but is below the desktop layout, so there is no panes view.
+    it("keeps the chat's card and row when a split is published but the panes view isn't shown", async () => {
+      windowWidth(1000);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      act(() => setSplitBesideChat("conv_terminal", true));
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      act(() => setSplitBesideChat("conv_terminal", false));
+    });
+
     it.each([
       ["without floating panes", undefined, 1440, { "omnigent.ui": "terminal" }],
       ["below 48rem", FLOATING, 700, { "omnigent.ui": "terminal" }],
