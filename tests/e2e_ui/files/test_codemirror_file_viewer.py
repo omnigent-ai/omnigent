@@ -108,7 +108,7 @@ def _open_file(
 def test_alt_drag_selects_a_column_and_the_palette_grows_it(
     page: Page, code_session: tuple[str, str]
 ) -> None:
-    """⌥-drag puts a cursor on each line it crosses, and Column select up is a command."""
+    """⌥-drag puts a cursor on each line it crosses, and the Column select commands grow it."""
     base_url, session_id = code_session
     editor = _open_file(page, base_url, session_id, _COLUMNS_PATH)
     lines = editor.locator(".cm-line")
@@ -124,17 +124,21 @@ def test_alt_drag_selects_a_column_and_the_palette_grows_it(
     page.mouse.move(end["x"] + 1, end["y"] + end["height"] / 2, steps=6)
     page.mouse.up()
     page.keyboard.up("Alt")
+    # Column select down grows the dragged box itself, not only its last line.
+    run_palette(page, "Column select down")
     page.keyboard.type("# ")
-    expect(lines).to_have_text(["# alpha = 1", "# beta = 2", "# gamma = 3", "delta = 4", ""])
+    expect(lines).to_have_text(
+        ["# alpha = 1", "# beta = 2", "# gamma = 3", "# delta = 4", ""], timeout=10_000
+    )
 
     # From one cursor, the palette's Column select up grows a box over the line above.
     lines.nth(3).click(position={"x": 1, "y": 5})
     run_palette(page, "Column select up")
     page.keyboard.type("! ")
     expect(lines).to_have_text(
-        ["# alpha = 1", "# beta = 2", "! # gamma = 3", "! delta = 4", ""], timeout=10_000
+        ["# alpha = 1", "# beta = 2", "! # gamma = 3", "! # delta = 4", ""], timeout=10_000
     )
-    _wait_for_persisted(base_url, session_id, _COLUMNS_PATH, "! delta = 4")
+    _wait_for_persisted(base_url, session_id, _COLUMNS_PATH, "! # delta = 4")
 
 
 def test_a_read_only_file_highlights_matching_brackets(

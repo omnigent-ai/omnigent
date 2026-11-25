@@ -142,6 +142,19 @@ describe("pressing with ⌥", () => {
     view.dispatch({ selection });
     expect(selectedTexts(view)).toEqual(["lp", "et", "am"]);
   });
+
+  it("lets a Column select command grow the box a drag drew, from all of its lines", () => {
+    const view = editorView("alpha one\nbeta two\ngamma three\ndelta four", 0);
+    laidOut(view);
+    const style = press(view, { clientX: 2, clientY: 5 });
+    view.dispatch({ selection: style.get(at(32, 25), false, false), userEvent: "select.pointer" });
+    expect(selectedTexts(view)).toEqual(["alp", "bet", "gam"]);
+
+    run(view, "file.columnSelectDown");
+    expect(selectedTexts(view)).toEqual(["alp", "bet", "gam", "del"]);
+    run(view, "file.columnSelectRight");
+    expect(selectedTexts(view)).toEqual(["alph", "beta", "gamm", "delt"]);
+  });
 });
 
 describe("Column select commands", () => {

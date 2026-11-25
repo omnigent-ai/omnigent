@@ -103,19 +103,27 @@ function columnSelectionStyle(view: EditorView, event: MouseEvent): MouseSelecti
         const cursor = EditorSelection.cursor(view.posAtCoords({ x: startX, y: startY }, false));
         return multiple ? startSelection.addRange(cursor) : EditorSelection.create([cursor]);
       }
-      return columnBoxSelection(view.state, { anchor, head: pointUnder(view, current) });
+      const box = { anchor, head: pointUnder(view, current) };
+      const selection = columnBoxSelection(view.state, box);
+      drawnBoxes.set(selection, box);
+      return selection;
     },
   };
 }
 
 const setColumnBox = StateEffect.define<ColumnBox>();
 
-/** The box the Column select commands last drew, until the selection changes another way. */
+/** The box behind each selection a drag drew, so a Column select command can grow it. */
+const drawnBoxes = new WeakMap<EditorSelection, ColumnBox>();
+
+/** The box a drag or the Column select commands last drew, until the selection changes another way. */
 const columnBoxField = StateField.define<ColumnBox | null>({
   create: () => null,
   update(box, transaction) {
     for (const effect of transaction.effects) if (effect.is(setColumnBox)) return effect.value;
-    return transaction.docChanged || transaction.selection ? null : box;
+    if (transaction.docChanged) return null;
+    if (transaction.selection) return drawnBoxes.get(transaction.selection) ?? null;
+    return box;
   },
 });
 
