@@ -20557,6 +20557,47 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
+  it("shows the text before an approval card without waiting for a frame", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_card",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_live_card");
+    sink.push(sse("response.created", { id: "resp_c", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "a ", false));
+    sink.push(nativeDelta("m1", 1, "b ", false));
+    sink.push(nativeDelta("m1", 2, "c ", false));
+    sink.push(elicitationReq("elicit_card"));
+    await tick();
+
+    // No frame has fired: the card's arrival alone must land the text before it.
+    expect(provisional()?.fullText).toBe("a b c ");
+    controller.abort();
+  });
+
+  it("never lands a released conversation's chunks in the one bound after it", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_released",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_released");
+    sink.push(sse("response.created", { id: "resp_r", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "a ", false));
+    sink.push(nativeDelta("m1", 1, "b ", false));
+    await tick();
+
+    conversationRegistry.release("conv_live_released");
+    useChatStore.setState({ conversationId: "conv_live_next", blocks: [] });
+    manual.fire();
+    controller.abort();
+    await tick();
+
+    expect(useChatStore.getState().conversationId).toBe("conv_live_next");
+    expect(provisional()).toBeUndefined();
+  });
+
   it("marks a skipped native chunk until the authoritative message arrives", async () => {
     useChatStore.setState({
       conversationId: "conv_live_gap",
