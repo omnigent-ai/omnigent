@@ -40,6 +40,7 @@ from omnigent.gadgets.access import (
     GadgetPermissions,
     owned_by,
 )
+from omnigent.gadgets.accounts import DeletedAccountGadgets
 from omnigent.gadgets.actions import (
     validate_actions,
     validate_request,
@@ -506,7 +507,15 @@ class GadgetService:
         gadget = self.store.create(
             self.viewer.user_id, _gadget_name(name), owner_registration=self.viewer.registration
         )
+        self._after_owned_write()
         return self._app(gadget, self.access.permissions(self.viewer.user_id, gadget))
+
+    def _after_owned_write(self) -> None:
+        """A write for the viewer's registration that lands after that account was deleted
+        (it was on its way meanwhile) queues the account's cleanup again."""
+        DeletedAccountGadgets.after_registration_write(
+            self.store, self.viewer.user_id, self.viewer.registration
+        )
 
     def list_owned(self, limit: Any = 100, cursor: Any = None) -> dict:
         """One page of the viewer's own gadgets, in the store's order.
@@ -626,6 +635,9 @@ class GadgetService:
             self._shelf.replace(
                 collection, doc_id, value, current.version, operation_id, self.viewer.user_id
             )
+        else:
+            return
+        self._after_owned_write()
 
     def _pins(self) -> tuple[Any, list[dict]]:
         current = self._shelf.get("pins", "all")

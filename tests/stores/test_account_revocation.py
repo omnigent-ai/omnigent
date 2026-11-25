@@ -1623,6 +1623,105 @@ def test_deletion_removes_the_accounts_gadgets_and_who_they_were_shared_with(
     assert store.get(kept["id"]) is not None
 
 
+def test_a_write_on_its_way_when_the_account_is_deleted_is_cleaned_up_after_it_lands(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    """A create and a pin that had passed their checks before the account was deleted land
+    after its cleanup finished; they queue the cleanup again, so nothing of the deleted
+    registration stays behind, and the name registered again starts empty."""
+    import threading
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("bob")
+    kept = service("bob").create("Bob's board")
+    permissions.grant_for_gadget("alice", kept["id"], 1)
+    alice = service("alice")
+    registration = alice.registration
+    assert registration is not None
+
+    release = threading.Event()
+    paused = threading.Barrier(3)
+    real_create = store.create
+    real_user_files = store.user_files
+
+    def late_create(owner_id, name, **kwargs):  # type: ignore[no-untyped-def]
+        if owner_id == "alice":
+            paused.wait(timeout=10)
+            release.wait(timeout=10)
+        return real_create(owner_id, name, **kwargs)
+
+    class LateFiles:
+        waited = False
+
+        def __init__(self, files) -> None:  # type: ignore[no-untyped-def]
+            self._files = files
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(self._files, name)
+
+        def _pause(self) -> None:
+            # Only the pin's first write waits; the shelf is reopened on every call.
+            if not LateFiles.waited:
+                LateFiles.waited = True
+                paused.wait(timeout=10)
+                release.wait(timeout=10)
+
+        def mkdirs(self, path: str) -> None:
+            # Paused before the pin's first write, which recreates the deleted scope.
+            self._pause()
+            self._files.mkdirs(path)
+
+        def create_json(self, path: str, value: dict) -> None:
+            self._pause()
+            self._files.create_json(path, value)
+
+    def user_files(user_id, **kwargs):  # type: ignore[no-untyped-def]
+        files = real_user_files(user_id, **kwargs)
+        if user_id == "alice" and kwargs.get("owner_registration") == registration:
+            return LateFiles(files)
+        return files
+
+    monkeypatch.setattr(store, "create", late_create)
+    monkeypatch.setattr(store, "user_files", user_files)
+    errors: list[BaseException] = []
+
+    def run(call) -> None:  # type: ignore[no-untyped-def]
+        try:
+            call()
+        except BaseException as error:
+            errors.append(error)
+
+    writers = [
+        threading.Thread(target=run, args=(lambda: alice.create("Late board"),)),
+        threading.Thread(target=run, args=(lambda: alice.pin(kept["id"], {"pinned": True}),)),
+    ]
+    for writer in writers:
+        writer.start()
+    paused.wait(timeout=10)
+    # Both writes are past their checks; the account goes, and its cleanup finishes.
+    assert accounts.delete_user("alice") is True
+    release.set()
+    for writer in writers:
+        writer.join(timeout=10)
+    assert errors == []
+    # They landed after the cleanup, for the deleted registration.
+    assert len(list(store.iter_owned("alice", owner_registration=registration))) == 1
+    assert (store._user_dir("alice", registration)).exists()
+
+    monkeypatch.setattr(store, "user_files", real_user_files)
+    for _ in range(3):
+        accounts._gadgets.resume()
+    assert list(store.iter_owned("alice", owner_registration=registration)) == []
+    assert not store._user_dir("alice", registration).exists()
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert service("alice").list_owned() == {"items": [], "next_cursor": None}
+    assert service("alice").shelf()["pinned"] == []
+    assert store.get(kept["id"]) is not None
+
+
 def test_a_gadget_whose_create_stopped_before_its_owner_marker_leaves_nothing_behind(
     db_uri: str, tmp_path
 ) -> None:
@@ -1725,11 +1824,11 @@ def test_with_gadgets_off_deleting_an_account_only_notes_its_gadgets_cleanup(
     accounts.update_password("alice", "hash-1", revoke_sessions=True)
     assert accounts.delete_user("alice") is True
     assert accounts.create_user_with_password("alice", "replacement-hash").id == "alice"
-    # Only the cleanup note was written: no gadgets were listed or deleted, and opening the
-    # store with gadgets off ran no cleanup of its own.
+    # Only the cleanup note (and the lock its queue is written under) was written: no gadgets
+    # were listed or deleted, and opening the store with gadgets off ran no cleanup of its own.
     root = tmp_path / "gadgets"
     written = {path.relative_to(root).parts[0] for path in root.rglob("*") if path.is_file()}
-    assert written == {"users"}
+    assert written == {"users", ".locks"}
 
 
 def test_a_cleanup_noted_while_gadgets_were_off_finishes_once_they_are_on(
@@ -2117,14 +2216,11 @@ def test_a_cleanup_that_keeps_failing_never_blocks_the_others(
     permissions = SqlAlchemyPermissionStore(db_uri)
     store, _, service = _gadgets(db_uri, tmp_path, accounts)
     gadgets = accounts._gadgets
-    # An unreadable note, and a deleted account whose gadgets can't be listed.
-    pending = (
-        store._user_dir(gadget_accounts._CLEANUP_SCOPE, gadget_accounts._CLEANUP_REGISTRATION)
-        / "pending"
-    )
-    pending.mkdir(parents=True)
-    (pending / ("0" * 32 + ".json")).write_text("{not json")
+    # An unreadable note, and a deleted account whose gadgets can't be listed, both at the
+    # front of the queue.
+    scope = store._user_dir(gadget_accounts._CLEANUP_SCOPE, gadget_accounts._CLEANUP_REGISTRATION)
     gadgets._note("mallory", None)
+    (scope / gadget_accounts._segment(0) / ("0" * 32 + ".json")).write_text("{not json")
     real_page = store.list_owned_page
 
     def page(user_id, **kwargs):  # type: ignore[no-untyped-def]
@@ -2142,6 +2238,70 @@ def test_a_cleanup_that_keeps_failing_never_blocks_the_others(
         gadgets.resume()
     assert list(store.iter_owned("alice", owner_registration=alice.registration)) == []
     assert all(store.get(board["id"]) is None for board in boards)
+
+
+def test_a_long_cleanup_backlog_is_read_a_bounded_part_at_a_time(tmp_path, monkeypatch) -> None:
+    """However many deleted accounts wait, one call reads a bounded part of the queue (at most
+    two segments, and the newest when sending notes to the back) and works on a few notes;
+    each goes to the back, so every note gets its turn."""
+    import os
+
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import local as local_module
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    segment = 5
+    monkeypatch.setattr(gadget_accounts, "QUEUE_SEGMENT_SIZE", segment)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    gadgets = DeletedAccountGadgets(store, NoGrants())  # type: ignore[arg-type]
+    users = [f"user{n:03d}" for n in range(150)]
+    for user in users:
+        gadgets._note(user, None)
+
+    examined = 0
+    real_scandir = os.scandir
+
+    class CountingScandir:
+        def __init__(self, path: object) -> None:
+            self._it = real_scandir(path)
+
+        def __enter__(self) -> CountingScandir:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._it.close()
+
+        def __iter__(self) -> CountingScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            nonlocal examined
+            entry = next(self._it)
+            examined += 1
+            return entry
+
+    monkeypatch.setattr(local_module.os, "scandir", CountingScandir)
+    worked: list[str] = []
+
+    def step(user_id: str, registration: str | None) -> bool:
+        worked.append(user_id)
+        return user_id in users[::3]  # Some finish; the others need more calls.
+
+    monkeypatch.setattr(gadgets, "_step", step)
+    for _ in range(80):
+        examined = 0
+        gadgets.resume()
+        # Two front segments, and the newest once per note sent back: never the backlog.
+        bound = (2 + gadget_accounts.PENDING_PER_RESUME) * (segment + 1)
+        assert examined <= bound < len(users)
+    # Every waiting cleanup got its turn, not only those at the front.
+    assert set(worked) == set(users)
+    assert all(worked.count(user) == 1 for user in users[::3])
 
 
 def test_an_account_named_like_the_cleanup_scope_keeps_the_others_cleanup_notes(
