@@ -98,7 +98,8 @@ export function unweaveReplyDraft(document: string): ReplyDraft {
   for (const line of document.split("\n")) {
     const quote = parseReplyQuoteLine(line);
     if (!quote) {
-      pending.push(line);
+      // A stray mark in plain text can't pose as a card, so it goes with the text.
+      pending.push(withoutReplyQuoteMarks(line));
       continue;
     }
     let id = quote.id;
@@ -127,8 +128,20 @@ export function sameReplyDraft(a: ReplyDraft, b: ReplyDraft): boolean {
  * edits such as a deleted blank line survive. After a change made in code, the woven draft.
  */
 export function typedDocumentFor(draft: ReplyDraft, typed: string | null | undefined): string {
-  if (typed != null && sameReplyDraft(unweaveReplyDraft(typed), draft)) return typed;
+  if (typed != null && hasOnlyWholeCards(typed) && sameReplyDraft(unweaveReplyDraft(typed), draft))
+    return typed;
   return weaveReplyDraft(draft);
+}
+
+/** Whether every mark in `document` sits in a whole, well-formed card line. */
+function hasOnlyWholeCards(document: string): boolean {
+  return document
+    .split("\n")
+    .every((line) => !hasReplyQuoteMark(line) || parseReplyQuoteLine(line) !== null);
+}
+
+function hasReplyQuoteMark(text: string): boolean {
+  return text.includes(REPLY_QUOTE_MARK) || text.includes(REPLY_QUOTE_END);
 }
 
 /** The document with `quote` added as the newest card, after the text that ends it. */
@@ -173,6 +186,35 @@ export function removeReplyQuoteAt(document: string, index: number): string {
   return lineIndex < 0 ? document : removeReplyQuoteLine(document, lineIndex);
 }
 
+/**
+ * A document with the editor's rules applied to an edit made in code: text beside a card goes on
+ * its own line, plain lines hold no marks or damaged tokens, and a card is never the last line.
+ */
+export function settleReplyDocument(document: string): string {
+  const lines: string[] = [];
+  const pushText = (segment: string) => {
+    const plain = withoutReplyQuoteMarks(segment);
+    if (plain !== "") lines.push(plain);
+  };
+  for (const line of document.split("\n")) {
+    const tokens = replyQuoteTokenRanges(line);
+    if (tokens.length === 0) {
+      lines.push(withoutReplyQuoteMarks(line));
+      continue;
+    }
+    let rest = 0;
+    for (const token of tokens) {
+      pushText(line.slice(rest, token.start));
+      const card = line.slice(token.start, token.end);
+      if (parseReplyQuoteLine(card) !== null) lines.push(card);
+      rest = token.end;
+    }
+    pushText(line.slice(rest));
+  }
+  if (lines.length > 0 && parseReplyQuoteLine(lines[lines.length - 1]!) !== null) lines.push("");
+  return lines.join("\n");
+}
+
 /** Where a document's text sits in the composer's inputs: each card's text before it, then the tail. */
 export interface ComposerTextRegion {
   /** The input that holds the text: a card's id, or the tail's. */
@@ -206,7 +248,8 @@ export function composerTextRegions(
     }
     lineStart += line.length + 1;
   }
-  regions.push({ inputId: tailId, start, end: document.length });
+  // A document that ends in a card has no text after it, so the tail starts at its end.
+  regions.push({ inputId: tailId, start: Math.min(start, document.length), end: document.length });
   return regions;
 }
 

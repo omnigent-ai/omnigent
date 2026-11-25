@@ -3561,6 +3561,51 @@ describe("grid cell @-mention picker", () => {
     expect(getSessionDraft(childId)?.mentions?.files ?? []).toEqual([]);
   });
 
+  describe("in the CodeMirror composer, below a quote", () => {
+    beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
+    afterEach(() => resetCodeMirrorComposerLoadForTests());
+
+    it("opens on @ below the quote, and a picked file lands after the card", async () => {
+      const replyDraft: StoredReplyDraft = {
+        version: 1,
+        quotes: [{ before: "Intro", text: "Quoted line" }],
+        text: "",
+      };
+      setSessionDraft(childId, { text: serializeReplyDraft(replyDraft), files: [], replyDraft });
+      useChatStore.setState({
+        sideChatComposers: {
+          [gridCellComposerKey(childId)]: {
+            text: "",
+            files: [],
+            quotes: [{ id: "q", before: "Intro", text: "Quoted line" }],
+          },
+        },
+      });
+      renderHook(() => useSharedSessionDraft(childId));
+      renderPane(
+        <CapabilitiesProvider
+          info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } }}
+        >
+          <SideChatPane childId={childId} fullSession gridComposer={{}} />
+        </CapabilitiesProvider>,
+      );
+      await waitFor(() =>
+        expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+      );
+      const editor = composerTargetOf(screen.getByTestId("side-chat-input"))!;
+      const end = editor.value.length;
+      act(() => insertComposerText(editor, "@read", end, end));
+
+      expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+      fireEvent.click(screen.getByTitle("Attach readme.md"));
+
+      expect(editor.value).toBe(
+        `Intro\n${replyQuoteLine({ id: "q", text: "Quoted line" })}\n@readme.md `,
+      );
+      expect(getSessionDraft(childId)?.mentions).toEqual({ files: [readmeTag], sessions: [] });
+    });
+  });
+
   it("a command typed before an @ leaves the arrow and Enter keys to the picker", () => {
     conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
     skillsFixture.current = {
@@ -3741,11 +3786,12 @@ describe("side-chat reply in one editor", () => {
   const editorInput = () => screen.getByTestId("side-chat-input");
   const editorText = () => composerTargetOf(editorInput())!.value;
   const storeText = () => useChatStore.getState().sideChatComposers[seeded]?.text;
+  const storeQuotes = () => useChatStore.getState().sideChatComposers[seeded]?.quotes ?? [];
   const pendingSeed = () => useChatStore.getState().sideChatDrafts[seeded];
   const typeAt = (start: number, end: number, text: string) =>
     act(() => insertComposerText(composerTargetOf(editorInput())!, text, start, end));
-  async function renderEditor() {
-    const view = renderPane(withFlag(true, <SideChatPane childId={seeded} />));
+  async function renderEditor(onStart?: (text: string) => Promise<void>) {
+    const view = renderPane(withFlag(true, <SideChatPane childId={seeded} onStart={onStart} />));
     await waitFor(() =>
       expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
     );
@@ -3796,6 +3842,23 @@ describe("side-chat reply in one editor", () => {
     },
   );
 
+  it("brings the seed card and its pending draft back when an undo restores the seed, and sends it", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    await renderEditor(onStart);
+    typeAt(0, 0, "Typed");
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    expect(pendingSeed()).toBeUndefined();
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(0);
+
+    act(() => void undo(EditorView.findFromDOM(editorInput())!));
+    expect(pendingSeed()).toBe("Seed passage");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Seed passage");
+    expect(storeText()).toBe("Typed");
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("> Seed passage\n\nTyped");
+  });
+
   it("undoes a deleted blank line, and an earlier edit stays undoable", async () => {
     await renderEditor();
     typeAt(0, 0, "Typed");
@@ -3826,6 +3889,49 @@ describe("side-chat reply in one editor", () => {
     act(() => mic.current!.onVoiceDiscard!());
     expect(storeText()).toBe("Draft");
     expect(pendingSeed()).toBe("Seed passage");
+  });
+
+  it("dictates onto the line after a card that ends the document, and the card stays", async () => {
+    await renderEditor();
+    // Deleting the final newline: the editor keeps an empty line under a card, so the card is never last.
+    const end = editorText().length;
+    typeAt(end - 1, end, "");
+    expect(editorText()).toBe(`${seedCard}\n`);
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    // The caret sat at the card's end, so the dictated words land on the line after it.
+    expect(editorText()).toBe(`${seedCard}\n spoken\n`);
+    expect(storeText()?.trim()).toBe("spoken");
+    expect(storeText()).not.toMatch(/[\uE000\uE001]/);
+    expect(pendingSeed()).toBe("Seed passage");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
+  });
+
+  it("removes the seed beside a following quote without moving the text around it", async () => {
+    await renderEditor();
+    typeAt(0, 0, "Intro");
+    act(() => {
+      useChatStore.getState().updateSideChatComposer(seeded, (current) => ({
+        ...current,
+        ...appendReplyQuote(current, "Second passage"),
+      }));
+    });
+    const end = editorText().length;
+    typeAt(end, end, "Reply");
+    expect(editorText()).toBe(
+      `${seedCard}\nIntro\n${replyQuoteLine({ id: storeQuotes()[0]!.id, text: "Second passage" })}\nReply`,
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]!);
+
+    expect(pendingSeed()).toBeUndefined();
+    expect(storeQuotes()).toEqual([
+      { id: storeQuotes()[0]!.id, before: "Intro", text: "Second passage" },
+    ]);
+    expect(storeText()).toBe("Reply");
+    expect(editorText()).toBe(
+      `Intro\n${replyQuoteLine({ id: storeQuotes()[0]!.id, text: "Second passage" })}\nReply`,
+    );
   });
 
   it("lands typed text at the caret after the editor hands off to the textarea and back", async () => {

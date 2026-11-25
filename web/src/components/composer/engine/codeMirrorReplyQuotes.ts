@@ -177,7 +177,9 @@ function isHistory(transaction: Transaction): boolean {
  * that card only, so the rest of the edit lands. A change covering a whole card removes it.
  */
 function keepCardsWhole(transaction: Transaction): boolean | readonly number[] {
-  if (!transaction.docChanged || isHistory(transaction)) return true;
+  // A controlled sync brings in the owner's document as it is, cards and all.
+  if (!transaction.docChanged || isHistory(transaction) || transaction.annotation(controlledUpdate))
+    return true;
   const cards = transaction.startState.field(cardField).cards;
   if (cards.length === 0) return true;
   const partial = new Set<Card>();
@@ -272,35 +274,56 @@ function normalizeCards(
       })),
   );
 
-  // A deletion with nothing inserted removes the card it joins text onto; any other edit splits.
-  const pureDeletion = inserts.length === 0;
-  const removals: ChangeSpec[] = [];
+  // Backspace at the line after a card removes the card above the break; Delete and ⌃K at the
+  // line before one remove the card below. Any other join keeps every card on its own line.
+  const startCards = transaction.startState.field(cardField).cards;
+  const deleted: { from: number; to: number }[] = [];
+  transaction.changes.iterChanges((fromA, toA) => deleted.push({ from: fromA, to: toA }));
+  const [only] = deleted;
+  let removal: { from: number; to: number } | null = null;
+  if (
+    inserts.length === 0 &&
+    deleted.length === 1 &&
+    only !== undefined &&
+    only.to - only.from === 1 &&
+    transaction.startState.sliceDoc(only.from, only.to) === "\n"
+  ) {
+    const above = startCards.find((card) => card.to === only.from);
+    const below = startCards.find((card) => card.from === only.to);
+    if (transaction.isUserEvent("delete.backward") && above) {
+      removal = { from: above.from, to: above.to };
+    } else if (transaction.isUserEvent("delete.forward") && below) {
+      // The card below moves up to the break's position once the break is gone.
+      removal = { from: only.from, to: only.from + (below.to - below.from) };
+    }
+  }
   const breaks = new Set<number>();
-  for (let number = 1; number <= doc.lines; number += 1) {
-    const line = doc.line(number);
-    if (!line.text.includes(REPLY_QUOTE_MARK)) continue;
-    for (const token of replyQuoteTokenRanges(line.text)) {
-      const from = line.from + token.start;
-      const to = line.from + token.end;
-      const beside = token.start > 0 || token.end < line.text.length;
-      if (!beside) continue;
-      if (pureDeletion) removals.push({ from, to });
-      else {
-        if (token.start > 0) breaks.add(from);
-        if (token.end < line.text.length) breaks.add(to);
+  if (removal === null) {
+    for (let number = 1; number <= doc.lines; number += 1) {
+      const line = doc.line(number);
+      if (!line.text.includes(REPLY_QUOTE_MARK)) continue;
+      for (const token of replyQuoteTokenRanges(line.text)) {
+        if (token.start > 0) breaks.add(line.from + token.start);
+        if (token.end < line.text.length) breaks.add(line.from + token.end);
       }
     }
   }
   apply(
-    pureDeletion
-      ? removals
+    removal
+      ? [removal]
       : [...breaks].sort((a, b) => a - b).map((position) => ({ from: position, insert: "\n" })),
   );
 
-  // The seed is the first line: text above it moves to the start of the text after it.
+  // The seed is the first line: text above it moves to the start of the text after it. Only
+  // while the seed itself stays first; once it is removed, the next card must not take its place.
   let selection: EditorSelection | undefined;
+  const seedId = parseReplyQuoteLine(transaction.startState.doc.line(1).text)?.id;
   const first = transaction.startState.facet(pinnedFirstCard) ? firstCardRange(doc) : null;
-  if (first && first.from > 0) {
+  const seedKept =
+    first !== null &&
+    seedId !== undefined &&
+    parseReplyQuoteLine(doc.lineAt(first.from).text)?.id === seedId;
+  if (first && seedKept && first.from > 0) {
     const prefix = doc.sliceString(0, first.from - 1);
     const cardLine = doc.lineAt(first.to);
     const next = cardLine.number < doc.lines ? doc.line(cardLine.number + 1) : null;
@@ -313,6 +336,11 @@ function normalizeCards(
     ]);
     const insertedAt = at - first.from + (next ? 0 : 1);
     selection = EditorSelection.single(insertedAt + prefix.length);
+  }
+
+  // A card is never the last line, so the text after it always has a line to go to.
+  if (parseReplyQuoteLine(doc.line(doc.lines).text) !== null) {
+    apply([{ from: doc.length, insert: "\n" }]);
   }
 
   if (fixes.empty) return transaction;

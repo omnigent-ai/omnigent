@@ -3,6 +3,7 @@
 // selection and its scroll, and waits while a switch would interrupt the user.
 
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import type { ComposerInputSelection } from "@/lib/replyDraftDocument";
 import {
   COMPOSER_INPUT_ID_ATTRIBUTE,
   COMPOSER_INPUT_SELECTOR,
@@ -10,12 +11,6 @@ import {
   type ComposerInputEngine,
   type ComposerTextTarget,
 } from "./composerInput";
-
-/** An input's selection, in the input's own offsets. */
-export type ComposerInputSelection = Pick<
-  HandoffSnapshot,
-  "inputId" | "selectionStart" | "selectionEnd"
->;
 
 interface HandoffSnapshot {
   /** The active input's id ("tail" or a reply quote's), which both engines render. */
@@ -121,6 +116,11 @@ export function useComposerEngineHandoff(
   const onRenderedEngineChangeRef = useRef(onRenderedEngineChange);
   const mapSelectionRef = useRef(mapSelection);
   const activeInputIdRef = useRef(activeInputId);
+  // Reports the engine rendered at mount too, so an owner that starts from another value agrees.
+  const [mountedEngine] = useState(rendered);
+  useLayoutEffect(() => {
+    onRenderedEngineChangeRef.current?.(mountedEngine);
+  }, [mountedEngine]);
   useLayoutEffect(() => {
     onActiveInputChangeRef.current = onActiveInputChange;
     onRenderedEngineChangeRef.current = onRenderedEngineChange;

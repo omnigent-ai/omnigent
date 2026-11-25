@@ -10594,6 +10594,11 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     expect(vi.mocked(props.onSend).mock.calls[0][0]).toBe(
       "My introduction\n\n> First point\n\nMy answer",
     );
+    expect(vi.mocked(props.onSend).mock.calls[0][2]).toEqual({
+      version: 1,
+      quotes: [{ before: "My introduction", text: "First point" }],
+      text: "My answer",
+    });
   });
 
   it("shows the textarea's text and quote blocks while the editor chunk is loading", () => {
@@ -10653,36 +10658,45 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     expect(editorTarget().value.split("\n")[0]).toBe("My introduction");
   });
 
-  it("keeps the textarea until a composition ends, then switches to the editor", async () => {
+  it("keeps the textarea's quote blocks through a composition, then shows them in the editor", async () => {
     const finishLoad = deferEditorLoad();
+    const ref = createRef<ComponentRef<typeof Composer>>();
     render(
       <CapabilitiesProvider info={codeMirrorInfo}>
-        <Composer {...composerProps()} />
+        <Composer {...composerProps()} ref={ref} />
       </CapabilitiesProvider>,
     );
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    act(() => ref.current?.appendReplyQuote("First point"));
     fireEvent.compositionStart(textarea());
     await finishLoad();
-    expect(textarea()).toBeInTheDocument();
     expect(document.querySelector(".cm-content")).toBeNull();
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
 
     act(() => {
       fireEvent.compositionEnd(textarea());
     });
     await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    expect(editorTarget().value.split("\n")[0]).toBe("My introduction");
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(1);
   });
 
-  it("keeps the editor until a composition ends, then switches to the textarea", async () => {
+  it("keeps the editor's quote through a composition, then shows it in the textarea", async () => {
     resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    const ref = createRef<ComponentRef<typeof Composer>>();
     const { rerender } = render(
       <CapabilitiesProvider info={codeMirrorInfo}>
-        <Composer {...composerProps()} />
+        <Composer {...composerProps()} ref={ref} />
       </CapabilitiesProvider>,
     );
     await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    act(() => insertComposerText(editorTarget(), "My introduction"));
+    act(() => ref.current?.appendReplyQuote("First point"));
     fireEvent.compositionStart(screen.getByLabelText("Message the agent"));
     rerender(
       <CapabilitiesProvider info={plainInfo}>
-        <Composer {...composerProps()} />
+        <Composer {...composerProps()} ref={ref} />
       </CapabilitiesProvider>,
     );
     expect(document.querySelector(".cm-content")).not.toBeNull();
@@ -10691,6 +10705,8 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
       fireEvent.compositionEnd(screen.getByLabelText("Message the agent"));
     });
     await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
   });
 
   it("creates no card from a token typed into the textarea while the editor loads", async () => {

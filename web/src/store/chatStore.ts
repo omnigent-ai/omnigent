@@ -1373,6 +1373,8 @@ export interface ChatActions {
   openSideChatWithDraft: (childSessionId: string, draft: string, parentId: string) => void;
   /** Clear a side chat's seeded composer draft (called after it's consumed). */
   clearSideChatDraft: (childSessionId: string) => void;
+  /** Put back a side chat's seeded composer draft, as an undo of its removal does. */
+  restoreSideChatDraft: (childSessionId: string, draft: string) => void;
   /** Update one side chat's unsent composer state (text + attachments). */
   updateSideChatComposer: (
     childSessionId: string,
@@ -2933,6 +2935,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ),
       };
     });
+  },
+  restoreSideChatDraft: (childSessionId, draft) => {
+    useChatStore.setState((s) => ({
+      sideChatDrafts: { ...s.sideChatDrafts, [childSessionId]: draft },
+    }));
   },
   clearSideChatDraft: (childSessionId) => {
     useChatStore.setState((s) => {

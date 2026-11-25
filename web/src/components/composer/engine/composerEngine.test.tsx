@@ -322,6 +322,26 @@ describe("autofocus across an engine switch", () => {
   });
 });
 
+describe("reporting the engine at mount", () => {
+  it("tells the owner the textarea is rendered while the editor chunk is still loading", () => {
+    resetCodeMirrorComposerLoadForTests(() => new Promise(() => {}));
+    const onRenderedEngineChange = vi.fn();
+    render(
+      <ChatComposer
+        engine="codemirror"
+        onRenderedEngineChange={onRenderedEngineChange}
+        keyboard={KEYBOARD}
+        input={{ "aria-label": "Message the agent", value: "pasted" }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+    expect(onRenderedEngineChange).toHaveBeenLastCalledWith("textarea");
+    expect(document.querySelector(".cm-content")).toBeNull();
+    expect(screen.getByLabelText("Message the agent")).toHaveValue("pasted");
+    resetCodeMirrorComposerLoadForTests();
+  });
+});
+
 describe("switching with a reply quote's input active", () => {
   function QuoteHarness({
     engine,

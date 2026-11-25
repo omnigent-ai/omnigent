@@ -6,6 +6,7 @@ import {
   parseReplyQuoteLine,
   quoteRemovalSpan,
   removeReplyQuoteAt,
+  settleReplyDocument,
   removeReplyQuoteLine,
   replyQuoteClipboardText,
   replyQuoteLine,
@@ -60,6 +61,16 @@ describe("reply draft document", () => {
     expect(withoutReplyQuoteMarks(`a${REPLY_QUOTE_MARK}!${REPLY_QUOTE_END}c`)).toBe("a!c");
   });
 
+  it("strips a stray mark from plain text, and re-weaves a typed document that holds one", () => {
+    const draft: ReplyDraft = { quotes: [quote("a", "Q")], text: "tail" };
+    expect(
+      unweaveReplyDraft(`Head${REPLY_QUOTE_MARK}\n${replyQuoteLine({ id: "a", text: "Q" })}\ntail`)
+        .quotes[0]!.before,
+    ).toBe("Head");
+    const typed = `Head${REPLY_QUOTE_MARK}\n${replyQuoteLine({ id: "a", text: "Q" })}\ntail`;
+    expect(typedDocumentFor(draft, typed)).toBe(weaveReplyDraft(draft));
+  });
+
   it("gives a repeated token id a fresh suffix, the same way every time", () => {
     const token = replyQuoteLine({ id: "dup", text: "Copy" });
     const document = [token, token].join("\n");
@@ -97,6 +108,22 @@ describe("reply draft document", () => {
     expect(appendQuoteToDocument("Opener", { id: "n", text: "New" })).toBe(
       `Opener\n${replyQuoteLine({ id: "n", text: "New" })}\n`,
     );
+  });
+
+  it("places the tail of a document that ends in a card at its end", () => {
+    const card = replyQuoteLine({ id: "a", text: "A" });
+    const regions = composerTextRegions(card, ["a"], "tail");
+    expect(regions.at(-1)).toEqual({ inputId: "tail", start: card.length, end: card.length });
+  });
+
+  it("settles an edit made in code the way the editor settles its own", () => {
+    const card = replyQuoteLine({ id: "a", text: "A" });
+    // Text typed beside a card goes on its own line, and a card never ends the document.
+    expect(settleReplyDocument(`Head${card}Tail`)).toBe(`Head\n${card}\nTail`);
+    expect(settleReplyDocument(`Opener\n${card}`)).toBe(`Opener\n${card}\n`);
+    expect(settleReplyDocument(`A${REPLY_QUOTE_MARK}!${REPLY_QUOTE_END}`)).toBe("A!");
+    const draft: ReplyDraft = { quotes: [quote("a", "A", "Head")], text: "Tail" };
+    expect(settleReplyDocument(weaveReplyDraft(draft))).toBe(weaveReplyDraft(draft));
   });
 
   it("copies cards as markdown quotes", () => {

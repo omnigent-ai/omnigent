@@ -12,6 +12,7 @@ import {
 import {
   appendQuoteToDocument,
   removeReplyQuoteAt,
+  settleReplyDocument,
   typedDocumentFor,
   unweaveReplyDraft,
 } from "@/lib/replyDraftDocument";
@@ -43,8 +44,12 @@ export function useReplyDraft(singleDocument = false) {
     (id: string | null, next: SetStateAction<string>) => {
       setState((current) => {
         if (singleDocument) {
+          // A quote's own input is gone in this mode; an edit addressed to one would
+          // otherwise replace the whole document.
+          if (id !== null) return current;
           const document = typedDocumentFor(current.draft, current.typed);
-          const edited = typeof next === "function" ? next(document) : next;
+          // The editor's rules apply to edits made here too, so a card keeps its own line.
+          const edited = settleReplyDocument(typeof next === "function" ? next(document) : next);
           return { draft: unweaveReplyDraft(edited), typed: edited };
         }
         const update = (text: string) => (typeof next === "function" ? next(text) : next);
@@ -74,10 +79,12 @@ export function useReplyDraft(singleDocument = false) {
     (text: string) => {
       setState((current) => {
         if (singleDocument) {
-          const edited = appendQuoteToDocument(typedDocumentFor(current.draft, current.typed), {
-            id: nanoid(),
-            text: text.replace(/\r\n?/g, "\n"),
-          });
+          const edited = settleReplyDocument(
+            appendQuoteToDocument(typedDocumentFor(current.draft, current.typed), {
+              id: nanoid(),
+              text: text.replace(/\r\n?/g, "\n"),
+            }),
+          );
           return { draft: unweaveReplyDraft(edited), typed: edited };
         }
         return { draft: appendReplyQuote(current.draft, text), typed: null };
@@ -92,7 +99,9 @@ export function useReplyDraft(singleDocument = false) {
         if (singleDocument) {
           const index = current.draft.quotes.findIndex((quote) => quote.id === id);
           if (index < 0) return current;
-          const edited = removeReplyQuoteAt(typedDocumentFor(current.draft, current.typed), index);
+          const edited = settleReplyDocument(
+            removeReplyQuoteAt(typedDocumentFor(current.draft, current.typed), index),
+          );
           return { draft: unweaveReplyDraft(edited), typed: edited };
         }
         return { draft: removeReplyQuote(current.draft, id), typed: null };

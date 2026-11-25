@@ -13,7 +13,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import { insertComposerText } from "@/lib/composerText";
-import { parseReplyQuoteLine, replyQuoteLine } from "@/lib/replyDraftDocument";
+import { replyQuoteLine, settleReplyDocument } from "@/lib/replyDraftDocument";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
@@ -695,24 +695,21 @@ describe("CodeMirrorComposerInput reply cards", () => {
 
   it("paints each card with a truncated preview and the full text for screen readers", () => {
     const long = "x".repeat(130);
-    const { container } = mountDocument(`Opener\n${card(long)}\nWhy`);
+    const { container, content } = mountDocument(`Opener\n${card(long)}\nWhy`);
     const row = container.querySelector<HTMLElement>('[data-testid="composer-reply-quote"]')!;
     const quote = row.querySelector("blockquote")!;
     expect(quote.getAttribute("title")).toBe(long);
     expect(quote.querySelector('[aria-hidden="true"]')!.textContent).toBe(`${"x".repeat(120)}…`);
     expect(quote.querySelector(".sr-only")!.textContent).toBe(long);
     expect(row.querySelector('button[aria-label="Remove quote"]')).not.toBeNull();
+    // The editor lets a long card shrink, so its X stays on screen.
+    expect(getComputedStyle(content).minWidth).toBe("0px");
   });
 
   it("disables a card's X while the draft is read-only", () => {
     const { container } = mountDocument(`${card("Quoted")}\nWhy`, { readOnly: true });
     const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove quote"]')!;
     expect(remove.disabled).toBe(true);
-  });
-
-  it("lets a long card shrink inside the editor, so its X stays on screen", () => {
-    const { content } = mountDocument(`${card("Quoted")}\nWhy`);
-    expect(getComputedStyle(content).minWidth).toBe("0px");
   });
 
   it("steps the arrow keys over a card, to the text on either side", () => {
@@ -748,15 +745,31 @@ describe("CodeMirrorComposerInput reply cards", () => {
   it("puts pasted text at a card's start or end on its own line", () => {
     const quoted = card("Quoted");
     const value = `Opener\n${quoted}\nWhy`;
-    const { editor } = mountDocument(value);
-    pasteAt(editor, value.indexOf(quoted) + quoted.length, "pasted");
-    expect(editor.state.doc.toString()).toBe(`Opener\n${quoted}\npasted\nWhy`);
+    const start = value.indexOf(quoted);
+    const first = mountDocument(value);
+    pasteAt(first.editor, start, "pasted");
+    expect(first.editor.state.doc.toString()).toBe(`Opener\npasted\n${quoted}\nWhy`);
+    const last = mountDocument(value);
+    pasteAt(last.editor, start + quoted.length, "pasted");
+    expect(last.editor.state.doc.toString()).toBe(`Opener\n${quoted}\npasted\nWhy`);
   });
 
   it("drops a card pasted as text, so no duplicate card appears", () => {
     const { editor } = mountDocument(`Opener\nWhy`);
     pasteAt(editor, "Opener\n".length, card("Pasted", "copy"));
     expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+  });
+
+  it.each([
+    ["at a card's start", `Opener\n${card("Quoted")}\nWhy`, 7],
+    ["at a card's end", `Opener\n${card("Quoted")}\nWhy`, 7 + card("Quoted").length],
+    ["above the first card", `${card("Quoted")}\nWhy`, 0],
+  ])("settles typed text %s as settleReplyDocument does", (_name, value, offset) => {
+    const { editor } = mountDocument(value);
+    typeAt(editor, offset, "x");
+    expect(editor.state.doc.toString()).toBe(
+      settleReplyDocument(value.slice(0, offset) + "x" + value.slice(offset)),
+    );
   });
 
   it("removes a card when typing over it, and keeps the card when typing over the break beside it", () => {
@@ -790,10 +803,10 @@ describe("CodeMirrorComposerInput reply cards", () => {
 
   it("keeps the text of an insert whose range ends inside a card", () => {
     const quoted = card("Quoted");
-    const { editor } = mountDocument(`Opener\n${quoted}\nWhy`);
-    act(() => insertComposerText(editorTarget(editor), "X", 0, "Opener\n".length + 2));
-    expect(editor.state.doc.toString()).toContain("X");
-    expect(editor.state.doc.toString().split("\n").filter(isCard)).toHaveLength(1);
+    const { target } = mountDocument(`Opener\n${quoted}\nWhy`);
+    // The range stops two characters into the card: the edit keeps the card and its insert.
+    act(() => insertComposerText(target(), "X", 0, "Opener\n".length + 2));
+    expect(target().value).toBe(`X\n${quoted}\nWhy`);
   });
 
   it("removes a card with Backspace at the start of the line after it", () => {
@@ -850,6 +863,73 @@ describe("CodeMirrorComposerInput reply cards", () => {
     expect(copied).toBe("Opener\n> one\n> two\nWhy");
   });
 
+  it("keeps the text after a removed seed in place, not below the next card", () => {
+    const seed = card("Seed");
+    const next = card("Next", "next");
+    const value = `${seed}\nRest\n${next}\nMore`;
+    const { content, editor, target } = mountDocument(value, { pinnedFirstCard: true });
+    caret(editor, seed.length + 1);
+    key(content, { key: "Backspace" });
+    expect(target().value).toBe(`Rest\n${next}\nMore`);
+  });
+
+  it("reports the edit when the seed's X removes it, and keeps the text after it in place", () => {
+    const seed = card("Seed");
+    const next = card("Next", "next");
+    const onChange = vi.fn();
+    const { container, target } = mountDocument(`${seed}\nRest\n${next}\nMore`, {
+      pinnedFirstCard: true,
+      onChange,
+    });
+    const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove quote"]')!;
+    act(() => void fireEvent.click(remove));
+    expect(target().value).toBe(`Rest\n${next}\nMore`);
+    expect(onChange).toHaveBeenCalled();
+  });
+
+  it("keeps an unselected card when a selection that joins text onto it is deleted", () => {
+    const quoted = card("Quoted");
+    const { editor } = mountDocument(`Intro\n${quoted}\nReply`);
+    // "tro\n" is the selection: deleting it joins "In" onto the card, which then stays on its own line.
+    act(() => void editor.dispatch({ changes: { from: 2, to: 6 }, userEvent: "delete.backward" }));
+    expect(editor.state.doc.toString()).toBe(`In\n${quoted}\nReply`);
+  });
+
+  it("removes adjacent cards one at a time, in the direction of the key", () => {
+    const first = card("One", "one");
+    const second = card("Two", "two");
+    const value = `A\n${first}\n${second}\nB`;
+    const { content, editor, target } = mountDocument(value);
+    caret(editor, `A\n${first}\n`.length);
+    key(content, { key: "Backspace" });
+    expect(target().value).toBe(`A\n${second}\nB`);
+
+    const again = mountDocument(value);
+    caret(again.editor, `A\n${first}`.length);
+    key(again.content, { key: "Delete" });
+    expect(again.target().value).toBe(`A\n${first}\nB`);
+  });
+
+  it("follows a controlled value that removes a card from the middle, or swaps the cards", () => {
+    const cards = [card("One", "one"), card("Two", "two"), card("Three", "three")];
+    const { rerender, setTarget, target } = mountDocument(`A\n${cards.join("\n")}\nB`);
+    const removedMiddle = `A\n${cards[0]}\n${cards[2]}\nB`;
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={removedMiddle}
+        ref={setTarget}
+      />,
+    );
+    expect(target().value).toBe(removedMiddle);
+
+    const swapped = `A\n${card("Four", "four")}\nB`;
+    rerender(
+      <CodeMirrorComposerInput aria-label="Message the agent" value={swapped} ref={setTarget} />,
+    );
+    expect(target().value).toBe(swapped);
+  });
+
   it("keeps the seed card first: text typed above it lands below it", () => {
     const seed = card("Seed");
     const { editor, target } = mountDocument(`${seed}\nRest`, { pinnedFirstCard: true });
@@ -870,23 +950,3 @@ describe("CodeMirrorComposerInput reply cards", () => {
     expect(target().value).toBe("Rest");
   });
 });
-
-function isCard(line: string): boolean {
-  return parseReplyQuoteLine(line) !== null;
-}
-
-function editorTarget(editor: EditorView) {
-  return {
-    get value() {
-      return editor.state.doc.toString();
-    },
-    insertText: (text: string, start: number, end: number) =>
-      editor.dispatch({ changes: { from: start, to: end, insert: text } }),
-    get selectionStart() {
-      return editor.state.selection.main.from;
-    },
-    get selectionEnd() {
-      return editor.state.selection.main.to;
-    },
-  } as unknown as ComposerTextTarget;
-}
