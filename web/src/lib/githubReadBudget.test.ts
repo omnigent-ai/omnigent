@@ -1,0 +1,253 @@
+// A reader's hourly budget, as answers report it: polls slow below a quarter of the reader's
+// own limit, pause below a tenth until the reset, and run as usual once it passes.
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { createGitHubReadBudgets, GITHUB_READ_BUDGET_FLAG } from "./githubReadBudget";
+
+const KEY = "github.com\namy";
+const START = 1_000_000;
+const RESET = START + 30 * 60_000;
+
+function budgets() {
+  let clock = START;
+  let setEnabled: (enabled: boolean) => void = () => {};
+  const store = createGitHubReadBudgets({
+    now: () => clock,
+    watchEnabled: (set) => {
+      setEnabled = set;
+    },
+  });
+  return {
+    store,
+    setEnabled: (enabled: boolean) => setEnabled(enabled),
+    advance: (ms: number) => {
+      clock += ms;
+    },
+  };
+}
+
+const graphql = (remaining: number, limit = 5000, resetAt = RESET) => ({
+  resource: "graphql" as const,
+  limit,
+  remaining,
+  resetAt,
+});
+
+describe("githubReadBudgets", () => {
+  it("slows below a quarter and stops below a tenth of the reader's own limit", () => {
+    const cases: [number, number, string][] = [
+      [5000, 1250, "normal"],
+      [5000, 1249, "slow"],
+      [5000, 500, "slow"],
+      [5000, 499, "stopped"],
+      [15000, 3749, "slow"],
+      [15000, 1500, "slow"],
+      [15000, 1499, "stopped"],
+      [15000, 4000, "normal"],
+    ];
+    for (const [limit, remaining, pace] of cases) {
+      const { store } = budgets();
+      store.observe(KEY, graphql(remaining, limit));
+      expect(store.pace(KEY).pace, `${remaining}/${limit}`).toBe(pace);
+    }
+    const { store } = budgets();
+    store.observe(KEY, graphql(10));
+    expect(store.pace(KEY)).toEqual({ pace: "stopped", until: RESET });
+    store.observe(KEY, graphql(1000));
+    expect(store.pace(KEY)).toEqual({ pace: "stopped", until: RESET });
+  });
+
+  it("lifts the stop at the reset with no read in between", () => {
+    const { store, advance } = budgets();
+    store.observe(KEY, graphql(0));
+    advance(RESET - START - 1);
+    expect(store.pace(KEY).pace).toBe("stopped");
+    advance(1);
+    expect(store.pace(KEY)).toEqual({ pace: "normal" });
+  });
+
+  it("never lets a late answer from the same or an earlier window restore spent budget", () => {
+    const { store } = budgets();
+    store.observe(KEY, graphql(100));
+    store.observe(KEY, graphql(4900));
+    store.observe(KEY, graphql(4900, 5000, RESET - 60 * 60_000));
+    expect(store.pace(KEY).pace).toBe("stopped");
+    // A later reset is a new window.
+    store.observe(KEY, graphql(4900, 5000, RESET + 60 * 60_000));
+    expect(store.pace(KEY).pace).toBe("normal");
+  });
+
+  it("paces nothing it has no budget for, and ignores a malformed one", () => {
+    const { store } = budgets();
+    store.observe(KEY, { ...graphql(0), limit: 0 });
+    store.observe(KEY, undefined);
+    expect(store.pace(KEY).pace).toBe("normal");
+    expect(store.pace(null).pace).toBe("normal");
+    expect(store.pace("github.com\nother").pace).toBe("normal");
+  });
+});
+
+describe("githubReadBudgets for reads nobody asked for yet", () => {
+  const core = (remaining: number, resetAt = RESET) => ({
+    resource: "core" as const,
+    limit: 5000,
+    remaining,
+    resetAt,
+  });
+  const GRAPHQL = ["graphql"] as const;
+
+  it("allows them only on a known budget with half or more of every resource left", () => {
+    const { store } = budgets();
+    // Nothing seen yet, or no reader: no proof the budget is healthy.
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(false);
+    expect(store.speculativeAllowed(null, GRAPHQL)).toBe(false);
+    store.observe(KEY, graphql(2500));
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(true);
+    // A pace of normal isn't enough: 40% left still paces normally.
+    store.observe(KEY, core(2000));
+    expect(store.pace(KEY).pace).toBe("normal");
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(false);
+    expect(store.speculativeAllowed("github.com\nsomeone-else", GRAPHQL)).toBe(false);
+  });
+
+  it("allows none once every budget it knew has reset, until an answer reports one again", () => {
+    const { store, advance } = budgets();
+    store.observe(KEY, graphql(4000));
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(true);
+    advance(RESET - START);
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(false);
+    store.observe(KEY, graphql(4999, 5000, RESET + 60 * 60_000));
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(true);
+  });
+
+  it("allows none while pacing is off", () => {
+    const { store, setEnabled } = budgets();
+    store.observe(KEY, graphql(4000));
+    setEnabled(false);
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(false);
+    store.observe(KEY, graphql(4000));
+    expect(store.speculativeAllowed(KEY, GRAPHQL)).toBe(false);
+  });
+
+  it("allows a read only on a known budget for each resource it spends", () => {
+    const { store, advance } = budgets();
+    store.observe(KEY, graphql(4500));
+    // A healthy GraphQL budget says nothing about REST's, which a patch spends.
+    expect(store.speculativeAllowed(KEY, ["graphql"])).toBe(true);
+    expect(store.speculativeAllowed(KEY, ["core"])).toBe(false);
+    expect(store.speculativeAllowed(KEY, ["graphql", "core"])).toBe(false);
+    expect(store.speculativeAllowed(KEY, [])).toBe(false);
+    store.observe(KEY, core(4000, START + 60_000));
+    expect(store.speculativeAllowed(KEY, ["core"])).toBe(true);
+    expect(store.speculativeAllowed(KEY, ["graphql", "core"])).toBe(true);
+    // REST's window resets before GraphQL's: until an answer reports it again, it isn't known.
+    advance(60_000);
+    expect(store.speculativeAllowed(KEY, ["graphql"])).toBe(true);
+    expect(store.speculativeAllowed(KEY, ["core"])).toBe(false);
+  });
+});
+
+describe("githubReadBudgets across resources", () => {
+  const core = (remaining: number, resetAt: number) => ({
+    resource: "core" as const,
+    limit: 5000,
+    remaining,
+    resetAt,
+  });
+
+  it("keeps each resource's own window, so an older answer for another can't erase a tighter one", () => {
+    const { store } = budgets();
+    store.observe(KEY, graphql(100, 5000, START + 50 * 60_000));
+    store.observe(KEY, core(4000, START + 30 * 60_000));
+    expect(store.pace(KEY)).toEqual({ pace: "stopped", until: START + 50 * 60_000 });
+  });
+
+  it("paces on the tightest resource whose window is still open", () => {
+    const { store, advance } = budgets();
+    store.observe(KEY, core(100, START + 10 * 60_000));
+    store.observe(KEY, graphql(1000, 5000, START + 50 * 60_000));
+    expect(store.pace(KEY)).toEqual({ pace: "stopped", until: START + 10 * 60_000 });
+    advance(10 * 60_000);
+    expect(store.pace(KEY).pace).toBe("slow");
+  });
+});
+
+describe("githubReadBudgets and the shell's rollback flag", () => {
+  afterEach(() => {
+    delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
+    vi.resetModules();
+  });
+
+  it("drops every budget the moment the flag turns off, and keeps none while it's off", () => {
+    const { store, setEnabled } = budgets();
+    store.observe(KEY, graphql(10));
+    expect(store.pace(KEY).pace).toBe("stopped");
+    setEnabled(false);
+    expect(store.pace(KEY).pace).toBe("normal");
+    store.observe(KEY, graphql(10));
+    expect(store.pace(KEY).pace).toBe("normal");
+    setEnabled(true);
+    store.observe(KEY, graphql(10));
+    expect(store.pace(KEY).pace).toBe("stopped");
+  });
+
+  it("wakes the polls it held when the flag turns off or a resource's window resets", () => {
+    const { store, setEnabled } = budgets();
+    const setOptions = vi.fn();
+    const query = { observers: [{ options: { queryKey: ["q"] }, setOptions }] };
+    store.observe(KEY, graphql(10));
+    store.hold(query);
+    store.observe(KEY, graphql(5));
+    expect(setOptions).not.toHaveBeenCalled();
+    store.observe(KEY, graphql(4900, 5000, RESET + 60 * 60_000));
+    expect(setOptions).toHaveBeenCalledWith({ queryKey: ["q"] });
+    store.hold(query);
+    setEnabled(false);
+    expect(setOptions).toHaveBeenCalledTimes(2);
+  });
+
+  it("tells work paced by hand when a window resets or the flag turns off, until it stops", () => {
+    const { store, setEnabled } = budgets();
+    const eased = vi.fn();
+    const stop = store.subscribe(eased);
+    store.observe(KEY, graphql(10));
+    store.observe(KEY, graphql(5));
+    expect(eased).not.toHaveBeenCalled();
+    store.observe(KEY, graphql(4900, 5000, RESET + 60 * 60_000));
+    expect(eased).toHaveBeenCalledTimes(1);
+    setEnabled(false);
+    expect(eased).toHaveBeenCalledTimes(2);
+    stop();
+    setEnabled(true);
+    store.observe(KEY, graphql(10));
+    store.observe(KEY, graphql(4900, 5000, RESET + 2 * 60 * 60_000));
+    expect(eased).toHaveBeenCalledTimes(2);
+  });
+
+  it("watches the shell's own flag, live, once a budget first arrives", async () => {
+    let deliver: (value: unknown) => void = () => {};
+    const subscribe = vi.fn(
+      (_name: string, _options: unknown, callback: (value: unknown) => void) => {
+        deliver = callback;
+        return () => {};
+      },
+    );
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      featureFlags: { subscribe },
+      getDesktopFeatures: async () => ({ featureFlags: { names: [GITHUB_READ_BUDGET_FLAG] } }),
+    };
+    vi.resetModules();
+    const { githubReadBudgets } = await import("./githubReadBudget");
+    const budget = { ...graphql(10), resetAt: Date.now() + 30 * 60_000 };
+    githubReadBudgets.observe(KEY, budget);
+    await vi.waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
+    expect(subscribe.mock.calls[0]![0]).toBe(GITHUB_READ_BUDGET_FLAG);
+    deliver(true);
+    githubReadBudgets.observe(KEY, budget);
+    expect(githubReadBudgets.pace(KEY).pace).toBe("stopped");
+    deliver(false);
+    expect(githubReadBudgets.pace(KEY).pace).toBe("normal");
+  });
+});

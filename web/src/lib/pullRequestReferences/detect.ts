@@ -1,0 +1,51 @@
+// Finds pull request references written in prose: `#123`, `repo#123` and `owner/repo#123`.
+// Links to PRs arrive as anchors and are read with `parseCodeHostPullRequestUrl` instead.
+
+/** A reference as written: which repository it names, if any, and the number. */
+export interface PullRequestShorthand {
+  /** Null for `#123`; set for `owner/repo#123`. */
+  owner: string | null;
+  /** Null for `#123`; set for `repo#123` and `owner/repo#123`. */
+  repo: string | null;
+  number: number;
+  /** Where it starts and ends in the searched text. */
+  start: number;
+  end: number;
+}
+
+// A managed user's login holds `_` before its enterprise's code.
+const OWNER = "[A-Za-z0-9](?:[A-Za-z0-9_-]{0,38})";
+const REPOSITORY = "[A-Za-z0-9_.-]{1,100}";
+// At least two characters, so `C#7` and `F#1` stay language names, and no dots, so
+// `file.md#3` stays a file's anchor; `owner/name.js#3` still names a dotted repository.
+const BARE_REPOSITORY = "[A-Za-z0-9_][A-Za-z0-9_-]{0,98}[A-Za-z0-9_]";
+const NUMBER = "[1-9][0-9]{0,9}";
+// Not inside a word, a path, a URL fragment, an entity or a mention.
+const BEFORE = "(?<![\\w./#&@-])";
+// Not followed by more of a word, `.md`, or `:12`.
+const AFTER = "(?![\\w-]|[.:]\\w)";
+const SHORTHAND = new RegExp(
+  `${BEFORE}(?:(${OWNER})\\/(${REPOSITORY})|(${BARE_REPOSITORY}))?#(${NUMBER})${AFTER}`,
+  "g",
+);
+/** GitHub's largest PR number fits a signed 32-bit integer. */
+const MAX_NUMBER = 2 ** 31 - 1;
+
+/** Every PR reference in `text`, in order; none when the text has no `#`. */
+export function detectPullRequestShorthand(text: string): PullRequestShorthand[] {
+  if (!text.includes("#")) return [];
+  const found: PullRequestShorthand[] = [];
+  for (const match of text.matchAll(SHORTHAND)) {
+    const [whole, owner, ownedRepo, bareRepo, digits] = match;
+    const number = Number(digits);
+    if (number > MAX_NUMBER) continue;
+    found.push({
+      owner: owner ?? null,
+      repo: ownedRepo ?? bareRepo ?? null,
+      number,
+      start: match.index,
+      end: match.index + whole.length,
+    });
+  }
+  return found;
+}

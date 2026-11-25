@@ -1,0 +1,109 @@
+import { describe, expect, it } from "vitest";
+
+import { markdownListStackFormat } from "@/lib/pullRequestStacks/formats/markdownListStack";
+import type { StackParse, StackSelf } from "@/lib/pullRequestStacks/stackModel";
+import { EXAMPLE_STACK_FORMAT } from "@/test/pullRequestIntegrations";
+
+const prUrl = (number: number) => `https://github.com/acme/app/pull/${number}`;
+const SELF: StackSelf = { host: "github.com", repository: "acme/app", number: 102 };
+const parse = (body: string) => EXAMPLE_STACK_FORMAT.parse(body, SELF);
+const shape = (parsed: StackParse | null) =>
+  parsed?.nodes.map((node) => [
+    node.branch,
+    node.ref?.number ?? null,
+    node.depth,
+    node.parentIndex,
+  ]);
+const tolerancesOf = (parsed: StackParse | null) =>
+  parsed?.trust === "tolerated" ? parsed.tolerances : [];
+
+const HEADER = "## Stacked changes (_written by stk_)";
+const INTRO = `Review the changes since the PR below [here](${prUrl(102)}/files/a..b).`;
+const ENTRIES = [
+  `- [stack/base](${prUrl(100)}) [[Files changed](${prUrl(100)}/files)]`,
+  `  - [stack/middle](${prUrl(101)}) [[Files changed](${prUrl(101)}/files/a..b)]`,
+  `    - [**stack/current**](${prUrl(102)}) [[Files changed](${prUrl(102)}/files/b..c)] ← _this PR_`,
+];
+const described = (lines: string[], header = HEADER) =>
+  [header, ...lines, "", "---------", "## Summary", "The change.", ""].join("\n");
+const LINEAR = described([INTRO, ...ENTRIES]);
+
+describe("markdownListStackFormat on its producer's output", () => {
+  it("verifies a linear stack and spans exactly the header through the footer", () => {
+    const parsed = parse(LINEAR);
+    expect(parsed).toMatchObject({ format: "example-stack", trust: "verified", selfIndex: 2 });
+    expect(shape(parsed)).toEqual([
+      ["stack/base", 100, 0, null],
+      ["stack/middle", 101, 1, 0],
+      ["stack/current", 102, 2, 1],
+    ]);
+    if (parsed?.trust !== "verified") throw new Error("expected a verified parse");
+    expect(LINEAR.slice(parsed.span.end)).toBe("## Summary\nThe change.\n");
+  });
+
+  it("verifies without the header suffix or the intro line, which the syntax makes optional", () => {
+    expect(parse(described(ENTRIES, "## Stacked changes"))?.trust).toBe("verified");
+  });
+
+  it("sets a leading dependency apart and lifts the stack under it to the root", () => {
+    const parsed = parse(
+      described([
+        `- [stack/dependency](${prUrl(99)}) ⬆️ (dependency: merge first)`,
+        `  - [**stack/current**](${prUrl(102)}) ← _this PR_`,
+        `    - [stack/child](${prUrl(103)})`,
+      ]),
+    );
+    expect(parsed?.trust).toBe("verified");
+    expect(parsed?.dependency).toMatchObject({ branch: "stack/dependency", ref: { number: 99 } });
+    expect(shape(parsed)).toEqual([
+      ["stack/current", 102, 0, null],
+      ["stack/child", 103, 1, 0],
+    ]);
+  });
+
+  it("reads merged and unpushed entries, and leaves a stack of one unmarked", () => {
+    const parsed = parse(
+      described([
+        `- [stack/base](${prUrl(100)}) [MERGED]`,
+        "  - stack/unpushed",
+        `    - [**stack/current**](${prUrl(102)}) ← _this PR_`,
+      ]),
+    );
+    expect(parsed?.nodes[0]?.markers.merged).toBe(true);
+    expect(parsed?.nodes[1]?.ref).toBeNull();
+    expect(parse(described([`- [stack/only](${prUrl(102)})`]))).toMatchObject({
+      trust: "verified",
+      selfIndex: 0,
+    });
+  });
+
+  it("carries the syntax's landing tool, and none for a syntax without one", () => {
+    expect(EXAMPLE_STACK_FORMAT.landing?.landName).toBe("stk land");
+    expect(markdownListStackFormat({ id: "plain", header: "## Plain" }).landing).toBeUndefined();
+  });
+});
+
+describe("markdownListStackFormat on hand-edited descriptions", () => {
+  it.each([
+    ["a reworded header", LINEAR.replace(HEADER, "## Stacked changes, edited"), "header"],
+    ["no footer", LINEAR.replace("\n---------\n", "\n"), "footer"],
+    [
+      "a line of prose",
+      LINEAR.replace("\n\n---------", "\nSome prose.\n\n---------"),
+      "unexpected-line",
+    ],
+    ["odd indentation", LINEAR.replace("  - [stack/middle]", "   - [stack/middle]"), "indentation"],
+    ["the bold marker without the pointer", LINEAR.replace(" ← _this PR_", ""), "current-marker"],
+  ])("tolerates %s for navigation only", (_case, body, tolerance) => {
+    const parsed = parse(body);
+    expect(parsed?.trust).toBe("tolerated");
+    expect(tolerancesOf(parsed)).toContain(tolerance);
+    expect(parsed?.nodes[parsed.selfIndex]?.ref?.number).toBe(102);
+  });
+
+  it("finds no stack without its header, under two headers, or in another syntax's header", () => {
+    expect(parse(LINEAR.replace(`${HEADER}\n`, ""))).toBeNull();
+    expect(parse(`${LINEAR}\n${LINEAR}`)).toBeNull();
+    expect(parse(LINEAR.replace("## Stacked changes", "## Stack list"))).toBeNull();
+  });
+});
