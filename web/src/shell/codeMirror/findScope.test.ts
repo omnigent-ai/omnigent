@@ -2,7 +2,7 @@ import { history } from "@codemirror/commands";
 import { SearchQuery, openSearchPanel, search, setSearchQuery } from "@codemirror/search";
 import { EditorSelection, EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FIND_OPTIONS } from "@/components/FindBar";
 import { applyFindQuery, FindMatchIndex, findStatusLabel, stepToMatch } from "./codeMirrorFind";
 import { FindReplacer } from "./codeMirrorReplace";
@@ -244,6 +244,33 @@ describe("find in selection edge cases", () => {
     expect(shown.map((match) => match.textContent)).toEqual(["HIT"]);
     new FindReplacer(index, immediate).replaceAll(view);
     expect(view.state.doc.toString()).toBe("X one HIT two");
+  });
+
+  it("looks for edge-crossing matches near the screen only, not through all of a long line", () => {
+    const text = `HIT ${"x".repeat(200_000)} HIT`;
+    const view = longLineEditor(text);
+    openSearchPanel(view);
+    query(view, "HIT");
+    view.dispatch({ selection: { anchor: 0, head: 2 }, userEvent: "select" });
+    const cursors = vi.spyOn(SearchQuery.prototype, "getCursor");
+    toggleFindInSelection(view, true);
+    // Only the crossing-match marks read the editor's state; find's counting reads the text.
+    const windows = cursors.mock.calls
+      .filter(([source]) => source instanceof EditorState)
+      .map(([, from, to]) => [from, to]);
+    cursors.mockRestore();
+    const screenEnd = view.visibleRanges.at(-1)!.to;
+    expect(screenEnd).toBeLessThan(text.length / 10);
+    expect(windows.length).toBeGreaterThan(0);
+    for (const [from, to] of windows) {
+      expect(from).toBe(0);
+      expect(to).toBeLessThanOrEqual(screenEnd + "HIT".length);
+    }
+    // The first HIT still crosses the scope's edge, so none of it shows.
+    const shown = [...view.dom.querySelectorAll(".cm-searchMatch")].filter(
+      (match) => !match.closest(".cm-find-outside-scope"),
+    );
+    expect(shown).toHaveLength(0);
   });
 
   it("keeps a scope whose text was all removed, matching nothing", () => {

@@ -111,6 +111,20 @@ function rangeHolding(scope: readonly FindRange[], position: number): FindRange 
   return null;
 }
 
+/** How far past the screen CodeMirror's match highlighting looks for a regular expression. */
+const HIGHLIGHT_MARGIN = 250;
+
+/** The visible ranges, joined where they lie close, as CodeMirror's highlighting joins them. */
+function mergedVisibleRanges(view: EditorView): FindRange[] {
+  const merged: FindRange[] = [];
+  for (const { from, to } of view.visibleRanges) {
+    const last = merged.at(-1);
+    if (last && from - 2 * HIGHLIGHT_MARGIN < last.to) last.to = to;
+    else merged.push({ from, to });
+  }
+  return merged;
+}
+
 /**
  * The inside parts of the shown matches that cross a scope edge. Find leaves such a match
  * out, so these join the outside marks, and none of its highlight shows.
@@ -123,10 +137,12 @@ function crossingMatchMarks(view: EditorView): DecorationSet {
     return Decoration.none;
   }
   const marks = [];
-  // The lines on screen, as CodeMirror's own match highlighting reads them.
-  for (const visible of view.visibleRanges) {
-    const from = state.doc.lineAt(visible.from).from;
-    const to = state.doc.lineAt(visible.to).to;
+  // The text on screen plus a margin, as CodeMirror's own match highlighting reads it, so
+  // a long line is read near the screen only.
+  const margin = query.regexp ? HIGHLIGHT_MARGIN : query.search.length;
+  for (const visible of mergedVisibleRanges(view)) {
+    const from = Math.max(0, visible.from - margin);
+    const to = Math.min(state.doc.length, visible.to + margin);
     const cursor = query.getCursor(state, from, to) as Iterator<FindRange>;
     for (let next = cursor.next(); !next.done; next = cursor.next()) {
       const match = next.value;
