@@ -483,6 +483,27 @@ async def test_an_owner_method_refuses_a_pr_the_session_never_recorded(
     assert providers == []
 
 
+# SetPullRequestAccount refuses a missing URL earlier, as its own cases show.
+@pytest.mark.parametrize("method", sorted(set(_OWNER_CALLS) - {"SetPullRequestAccount"}))
+async def test_an_owner_method_naming_no_pr_changes_none_the_server_offers_by_default(
+    tmp_path: Path, method: str, providers: list[str | None]
+) -> None:
+    """A vouch's default PR serves reads; a change must name the PR it changes."""
+    request, _function, _kwargs = _OWNER_CALLS[method]
+    unnamed = type(request)()
+    unnamed.CopyFrom(request)
+    unnamed.ClearField("pr_url")
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, unnamed.SerializeToString(), vouch=vouch)
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message is not None and message.startswith("Select a pull request to ")
+    assert providers == []
+
+
 async def test_list_labels_refuses_a_search_it_cant_do(
     tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
 ) -> None:

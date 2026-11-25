@@ -9,7 +9,7 @@ the PR reads that get past the host's scope check. The callers' gates are in
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -224,41 +224,6 @@ async def test_the_session_sent_to_the_host_is_the_one_in_the_url(
     assert provider_reads == []
 
 
-async def test_get_pull_request_stores_the_reported_prs_and_answers_with_the_servers(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    host_calls: list[HostWorkspaceCallFrame],
-    provider_reads: list[str | None],
-) -> None:
-    stored = _linked(_PR)
-    ingested: list[dict[str, Any]] = []
-
-    def ingest(_store: object, session_id: str, info: Any, *, requested_at: float) -> Any:
-        assert session_id == _SESSION and requested_at > 0
-        ingested.append(dict(info))
-        return stored
-
-    monkeypatch.setattr(server_prs, "ingest_info", ingest)
-    monkeypatch.setattr(server_prs, "answer", lambda info, _stored: {**info, "prs": ["server"]})
-    monkeypatch.setattr(
-        WorkspaceReader,
-        "github_info",
-        lambda _self, _session, _url: {"pr": None, "prs": [{"url": _PR}], "count": 2},
-    )
-    client = _client(tmp_path, monkeypatch, _Store(stored))
-
-    response = await client.get_pull_request(pb.GetPullRequestRequest(pr_url=_PR))
-    assert ingested == [{"pr": None, "prs": [{"url": _PR}], "count": 2}]
-    # The Struct carries numbers as floats; what's stored gets the integer back.
-    assert type(ingested[0]["count"]) is int
-    await client.list_pull_request_files(pb.ListPullRequestFilesRequest(pr_url=_PR))
-
-    assert payload_dict(response.payload) == {"pr": None, "prs": ["server"], "count": 2}
-    # The other reads store nothing.
-    assert len(ingested) == 1
-    assert [call.method for call in host_calls] == ["GetPullRequest", "ListPullRequestFiles"]
-
-
 async def test_capabilities_through_the_server_list_the_pull_request_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
 ) -> None:
@@ -362,12 +327,53 @@ async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(
     assert host_calls == []
 
 
-async def test_set_account_stores_the_reported_prs_and_answers_with_the_servers(
+_OVERVIEW = {"pr": None, "prs": [{"url": _PR}], "count": 2}
+
+
+def _get_answers_the_overview(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        WorkspaceReader, "github_info", lambda _self, _session, _url: dict(_OVERVIEW)
+    )
+
+
+def _set_account_answers_the_overview(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pr_resource, "set_pr_preference", lambda _root, **_kwargs: dict(_OVERVIEW))
+    monkeypatch.setattr(pr_resource, "create_pr_comment", lambda _root, **_kwargs: {"id": 1})
+
+
+@pytest.mark.parametrize(
+    ("answer_overview", "method", "request_message", "then", "then_request"),
+    [
+        pytest.param(
+            _get_answers_the_overview,
+            "GetPullRequest",
+            pb.GetPullRequestRequest(pr_url=_PR),
+            "ListPullRequestFiles",
+            pb.ListPullRequestFilesRequest(pr_url=_PR),
+            id="get-pull-request",
+        ),
+        pytest.param(
+            _set_account_answers_the_overview,
+            "SetPullRequestAccount",
+            pb.SetPullRequestAccountRequest(pr_url=_PR, account="octocat"),
+            "CreateComment",
+            _CREATE_COMMENT,
+            id="set-account",
+        ),
+    ],
+)
+async def test_an_overview_answer_stores_the_reported_prs_and_answers_with_the_servers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
+    provider_reads: list[str | None],
+    answer_overview: Callable[[pytest.MonkeyPatch], None],
+    method: str,
+    request_message: Any,
+    then: str,
+    then_request: Any,
 ) -> None:
-    """Its answer is the PR overview, so it updates the server's list as REST does."""
+    """These answers are the PR overview, so they update the server's list as REST does."""
     stored = _linked(_PR)
     ingested: list[dict[str, Any]] = []
 
@@ -378,23 +384,21 @@ async def test_set_account_stores_the_reported_prs_and_answers_with_the_servers(
 
     monkeypatch.setattr(server_prs, "ingest_info", ingest)
     monkeypatch.setattr(server_prs, "answer", lambda info, _stored: {**info, "prs": ["server"]})
-    monkeypatch.setattr(
-        pr_resource,
-        "set_pr_preference",
-        lambda _root, **_kwargs: {"pr": None, "prs": [{"url": _PR}], "count": 1},
-    )
-    monkeypatch.setattr(pr_resource, "create_pr_comment", lambda _root, **_kwargs: {"id": 1})
+    answer_overview(monkeypatch)
     client = _client(tmp_path, monkeypatch, _Store(stored))
 
-    response = await client.set_pull_request_account(
-        pb.SetPullRequestAccountRequest(pr_url=_PR, account="octocat")
-    )
-    await client.create_comment(_CREATE_COMMENT)
+    def send(name: str) -> Any:
+        return getattr(client, WORKSPACE_METHODS[name].python_name)
 
-    assert payload_dict(response.payload) == {"pr": None, "prs": ["server"], "count": 1}
-    # The other changes store nothing.
-    assert ingested == [{"pr": None, "prs": [{"url": _PR}], "count": 1}]
-    assert [call.method for call in host_calls] == ["SetPullRequestAccount", "CreateComment"]
+    response = await send(method)(request_message)
+    await send(then)(then_request)
+
+    assert payload_dict(response.payload) == {**_OVERVIEW, "prs": ["server"]}
+    # The ordinary call after it stores nothing.
+    assert ingested == [_OVERVIEW]
+    # The Struct carries numbers as floats; what's stored gets the integer back.
+    assert type(ingested[0]["count"]) is int
+    assert [call.method for call in host_calls] == [method, then]
 
 
 _SERVICE_PATH = (
