@@ -10,7 +10,9 @@ import type { WorkflowRun } from "@/lib/workflowRuns";
 import {
   useCloneWorkflow,
   useSaveStepTimeLimit,
+  useSaveWorkflowDescription,
   useSaveWorkflowPlan,
+  useWorkflow,
   useWorkflowRunDescendants,
   useWorkflowRuns,
 } from "./useWorkflow";
@@ -309,6 +311,59 @@ describe("useSaveStepTimeLimit", () => {
       expected_steps: steps,
     });
     expect(result?.description_updated_at).toBe(200);
+  });
+});
+
+describe("a saved workflow's response", () => {
+  it("leaves a later write's description shown when it comes after that write's", async () => {
+    const steps = [{ id: "review", name: "Review", goal: "Read it.", depends_on: [] }];
+    let stored = {
+      id: "workflow",
+      name: "Review",
+      description: "Old words.",
+      steps,
+      updated_at: 100,
+    };
+    let answerLimit: () => void = () => {};
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) => {
+      if (init?.method !== "PATCH") return Response.json(stored);
+      const body = JSON.parse(String(init.body));
+      if (body.steps) {
+        // The limit's write lands at once, and its response comes late.
+        stored = { ...stored, steps: body.steps, updated_at: 110 };
+        const written = stored;
+        await new Promise<void>((resolve) => {
+          answerLimit = resolve;
+        });
+        return Response.json(written);
+      }
+      stored = { ...stored, description: body.description, updated_at: 120 };
+      return Response.json(stored);
+    });
+    const { result } = renderQuery(() => ({
+      shown: useWorkflow("workflow"),
+      limit: useSaveStepTimeLimit("workflow"),
+      describe: useSaveWorkflowDescription("workflow"),
+    }));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(result.current.shown.data?.description).toBe("Old words.");
+
+    let limitSaved: Promise<unknown> = Promise.resolve();
+    act(() => {
+      limitSaved = result.current.limit.mutateAsync({ stepId: "review", limit: "1 hour" });
+    });
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(stored.updated_at).toBe(110);
+    await act(() => result.current.describe.mutateAsync("New words."));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(result.current.shown.data?.description).toBe("New words.");
+    await act(async () => {
+      answerLimit();
+      await limitSaved;
+    });
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(result.current.shown.data?.description).toBe("New words.");
+    expect(result.current.shown.data?.steps[0]?.goal).toBe("Read it.\n\n**Time limit:** 1 hour");
   });
 });
 

@@ -93,10 +93,21 @@ async function refusedFields(res: Response): Promise<unknown[]> {
   );
 }
 
+/**
+ * Show a saved workflow, unless the page already shows a later write: a response that comes
+ * after a later write's is left out. One from the same second goes in, and the workflow is
+ * read again, since the two can't be told apart.
+ */
 function useWorkflowSaved() {
   const queryClient = useQueryClient();
   return (workflow: WorkflowDetail) => {
-    queryClient.setQueryData(["workflow", workflow.id], workflow);
+    const key = ["workflow", workflow.id];
+    const shown = queryClient.getQueryData<WorkflowDetail>(key)?.updated_at;
+    const written = workflow.updated_at;
+    if (shown === undefined || written === undefined || written >= shown)
+      queryClient.setQueryData(key, workflow);
+    if (written !== undefined && written === shown)
+      void queryClient.invalidateQueries({ queryKey: key });
     void queryClient.invalidateQueries({ queryKey: ["saved-workflows"] });
   };
 }
