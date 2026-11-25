@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectHomePage } from "./ProjectHomePage";
@@ -141,12 +141,26 @@ beforeEach(() => {
   useProjectComposerStore.setState({ open: false });
 });
 
+/** The board shows the Board/Summary project views, with Board selected, and no Chat tab. */
+function expectBoardTabs() {
+  const views = screen.getByRole("tablist", { name: "Project views" });
+  expect(within(views).getByRole("tab", { name: "Board" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(within(views).getByRole("tab", { name: "Summary" })).toHaveAttribute(
+    "aria-selected",
+    "false",
+  );
+  expect(screen.queryByRole("tab", { name: "Chat" })).toBeNull();
+}
+
 describe("ProjectHomePage tickets", () => {
   it.each(["", "?view=board"])("opens the board by default for %s", (search) => {
     mocks.ticketsEnabled = true;
     renderPage(`/projects/Payments${search}`);
     expect(screen.getByTestId("ticket-board")).toBeVisible();
-    expect(screen.queryByRole("tablist")).toBeNull();
+    expectBoardTabs();
     expect(screen.queryByTestId("project-orchestrator")).toBeNull();
     expect(screen.queryByRole("complementary")).toBeNull();
   });
@@ -170,7 +184,7 @@ describe("ProjectHomePage tickets", () => {
       const panel = screen.getByRole("complementary", { name: "Lead side chat" });
       expect(screen.getByTestId("ticket-board")).toBeVisible();
       expect(screen.getByTestId("project-orchestrator")).toBeVisible();
-      expect(screen.queryByRole("tablist")).toBeNull();
+      expectBoardTabs();
       const width = panel.style.width;
       fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowLeft" });
       expect(panel.style.width).not.toBe(width);
