@@ -225,7 +225,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
           />
         )}
         {tickets && !ticketFillsPage && (
-          <OutdatedHostBanner sessionId={leadSessionId} name="the Lead" className="mb-2" />
+          <OutdatedHostBanner sessionId={leadSessionId} name="the Lead" className="mx-4 mb-2" />
         )}
         <div className="flex min-h-0 flex-1">
           {tickets ? (
