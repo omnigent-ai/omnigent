@@ -91,6 +91,7 @@ from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
+    timer_interval,
     timer_rule,
 )
 from omnigent.server.scheduled.telemetry import log_task_created
@@ -2521,6 +2522,13 @@ def create_scheduled_tasks_router(
     # Agent timers are a session primitive, so the per-request automations gate
     # doesn't hide them; they still need the database scheduler.
     timers = APIRouter()
+    # A timer's name says which client set it: the composer's /loop saves
+    # ``Loop: <note>``; an agent's sys_timer_set saves ``Timer: <note>``. The
+    # listing derives ``origin`` from that prefix, so no column is needed.
+    _LOOP_NAME_PREFIX = "Loop"
+
+    def _timer_origin(name: str) -> str:
+        return "loop" if name == _LOOP_NAME_PREFIX or name.startswith("Loop: ") else "agent"
 
     async def _timer_session(request: Request, session_id: str) -> tuple[str | None, Conversation]:
         """Authorize a timer call as a message would be.
@@ -2561,10 +2569,14 @@ def create_scheduled_tasks_router(
         ``reason``, tells the runner to keep it in memory.
 
         :param body: ``{"seconds": number, "repeat": bool, "note": str | null}``, checked
-            like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``.
+            like the tool's arguments, e.g. ``{"seconds": 120, "repeat": true}``, plus an
+            optional ``origin``: ``"loop"`` marks a timer the web composer's ``/loop`` set,
+            saved under the name ``Loop: <note>`` rather than ``Timer: <note>`` so the
+            listing can tell it from the agent's own; anything else is refused.
         :returns: ``durable`` true, ``timer_id``, ``status`` ``"scheduled"``, the UTC
             ``fire_at`` of the first firing, ``interval_seconds`` for a repeating timer
-            (else ``None``), and the ``seconds``, ``repeat`` and ``note`` it was set with.
+            (else ``None``), and the ``seconds``, ``repeat``, ``note`` and ``origin`` it
+            was set with.
         :raises OmnigentError: 400 for bad arguments, a delay under
             ``DURABLE_TIMER_MIN_SECONDS``, an archived or closed session, or a server with
             timers off (no database scheduler, or the ``session_timers`` feature off);
@@ -2576,12 +2588,15 @@ def create_scheduled_tasks_router(
                 "session_timers feature",
                 code=ErrorCode.INVALID_INPUT,
             )
-        unknown = sorted(set(body) - {"seconds", "repeat", "note"})
+        unknown = sorted(set(body) - {"seconds", "repeat", "note", "origin"})
         if unknown:
             raise OmnigentError(
                 f"unknown timer fields: {', '.join(unknown)}", code=ErrorCode.INVALID_INPUT
             )
-        validated = validate_timer_set_args(body)
+        origin = body.get("origin")
+        if origin is not None and origin != "loop":
+            raise OmnigentError("origin must be 'loop'", code=ErrorCode.INVALID_INPUT)
+        validated = validate_timer_set_args({k: v for k, v in body.items() if k != "origin"})
         if isinstance(validated, str):
             raise OmnigentError(validated, code=ErrorCode.INVALID_INPUT)
         seconds, repeat, note = validated
@@ -2620,7 +2635,11 @@ def create_scheduled_tasks_router(
             # Synchronous, so a cancel can't land after the save and release the saved ID.
             task = store.create(
                 scheduled_task_id=task_id,
-                name=f"Timer: {note}"[:256] if note else "Timer",
+                name=(
+                    f"{_LOOP_NAME_PREFIX if origin else 'Timer'}: {note}"[:256]
+                    if note
+                    else (_LOOP_NAME_PREFIX if origin else "Timer")
+                ),
                 # The hidden message each firing sends into the session.
                 prompt=f"[System: timer {task_id} fired]" + (f"\nnote: {note!r}" if note else ""),
                 rrule=timer_rule(interval, repeat=repeat),
@@ -2645,7 +2664,45 @@ def create_scheduled_tasks_router(
             "seconds": seconds,
             "repeat": repeat,
             "note": note,
+            "origin": origin,
         }
+
+    @timers.get("/sessions/{session_id}/timers", include_in_schema=False)
+    async def list_session_timers(request: Request, session_id: str) -> dict[str, Any]:
+        """List the caller's saved timers in this session, oldest first.
+
+        The automations listing hides timers unless asked for every kind and sits
+        behind the automations gate; this route doesn't, so a client that sets
+        timers (the composer's ``/loop``) can find its own without either. Like the
+        cancel route, it shows only timers the caller set in this session; a
+        collaborator's are not listed.
+
+        :returns: ``{"timers": [...]}``, each with ``timer_id``, ``origin`` (``"loop"``
+            for the composer's ``/loop``, else ``"agent"``), ``name``, ``repeat``,
+            ``interval_seconds`` and the UTC ``next_run_at`` (``None`` once a one-shot
+            has fired).
+        """
+        user_id, conv = await _timer_session(request, session_id)
+        tasks = await asyncio.to_thread(store.list, owner_user_id=user_id, kinds=("timer",))
+        timers_out: list[dict[str, Any]] = []
+        for task in sorted(tasks, key=lambda t: (t.created_at, t.id)):
+            if task.session_id != conv.id or task.user_id != user_id or task.state != "active":
+                continue
+            timers_out.append(
+                {
+                    "timer_id": task.id,
+                    "origin": _timer_origin(task.name),
+                    "name": task.name,
+                    "repeat": not is_one_time_rule(task.rrule),
+                    "interval_seconds": timer_interval(task.rrule),
+                    "next_run_at": (
+                        datetime.fromtimestamp(task.next_run_at, UTC).isoformat()
+                        if task.next_run_at is not None
+                        else None
+                    ),
+                }
+            )
+        return {"timers": timers_out}
 
     @timers.delete("/sessions/{session_id}/timers/{timer_id}", include_in_schema=False)
     async def cancel_session_timer(

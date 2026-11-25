@@ -135,10 +135,17 @@ import {
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
 import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
-import { formatLoopInterval, parseLoopCommand } from "@/lib/loopCommand";
+import {
+  formatLoopInterval,
+  looksLikeCommand,
+  loopRunMessage,
+  parseLoopCommand,
+} from "@/lib/loopCommand";
 import {
   cancelSessionTimer,
   listSessionLoops,
+  LOOP_TIMER_ORIGIN,
+  runSessionTimerMutation,
   sessionTakesSavedTimers,
   setSessionTimer,
 } from "@/lib/sessionTimersApi";
@@ -2219,10 +2226,11 @@ const LOOP_HARNESSES: ReadonlySet<string> = new Set([
 
 /**
  * Whether the composer offers ``/loop`` for *session* on *harness*: the server
- * saves session timers (``session_timers``), the harness is one the loop was
- * verified on, and the session is top-level (a sub-agent's or side chat's
- * timers are not saved). Elsewhere a typed /loop stays plaintext, so Claude
- * Code's own ``/loop`` still runs on claude-native.
+ * saves and lists session timers (``session_timers`` and ``session_timer_list``,
+ * the listing being outside the automations gate), the harness is one the loop
+ * was verified on, and the session is top-level, since a sub-agent's or side
+ * chat's timers are not saved. Elsewhere a typed /loop stays plaintext, so
+ * Claude Code's own ``/loop`` still runs on claude-native.
  */
 export function composerOffersLoop(
   harness: string | null,
@@ -2230,7 +2238,8 @@ export function composerOffersLoop(
   session:
     { parentSessionId?: string | null; labels?: Record<string, string> | null } | null | undefined,
 ): boolean {
-  if (info === "loading" || info.session_timers !== true) return false;
+  if (info === "loading") return false;
+  if (info.session_timers !== true || info.session_timer_list !== true) return false;
   if (harness === null || !LOOP_HARNESSES.has(harness)) return false;
   return sessionTakesSavedTimers(session);
 }
@@ -3017,11 +3026,14 @@ function ComposerImpl(
   );
   const showClear = composerOffersClear(sessionHarness, composerServerInfo);
   const showRewind = composerOffersRewind(sessionHarness, composerServerInfo);
-  // /loop arms a repeating saved timer on the server, so it needs a session the
-  // server will save timers for; see composerOffersLoop.
   const showLoop =
     composerSessionId !== null &&
     composerOffersLoop(sessionHarness, composerServerInfo, composerSession);
+  // The /loop handler settles after the user may have switched sessions or typed again.
+  const composerSessionIdRef = useRef(composerSessionId);
+  composerSessionIdRef.current = composerSessionId;
+  const draftRef = useRef(value);
+  draftRef.current = value;
   const [rewindPickerOpen, setRewindPickerOpen] = useState(false);
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
@@ -3602,36 +3614,54 @@ function ComposerImpl(
         setValue("");
         setCommandError(null);
         const loopSessionId = composerSessionId;
-        void (async () => {
-          // One loop per session: a new /loop replaces the running one.
+        const typed = `${cmd} ${arg}`;
+        // Hints land only in the session the command was typed in.
+        const report = (hint: string) => {
+          if (composerSessionIdRef.current === loopSessionId) setCommandError(hint);
+        };
+        // Starts and stops queue per session, so two submissions can't both see
+        // no loop and arm two, and a stop waits for an arm still in flight.
+        void runSessionTimerMutation(loopSessionId, async () => {
+          // One loop per session: a new /loop cancels the one it replaces. Only the
+          // loops /loop tagged are touched; the agent's own timers are left alone.
           const existing = await listSessionLoops(loopSessionId);
-          await Promise.all(existing.map((loop) => cancelSessionTimer(loopSessionId, loop.id)));
+          await Promise.all(
+            existing.map((loop) => cancelSessionTimer(loopSessionId, loop.timerId)),
+          );
           if (command.kind === "stop") {
-            setCommandError(
-              existing.length === 0 ? "No loop is running in this session." : "Loop stopped.",
-            );
+            report(existing.length === 0 ? "No loop is running in this session." : "Loop stopped.");
             return;
           }
+          const message = loopRunMessage(command.prompt);
           const timer = await setSessionTimer(loopSessionId, {
             seconds: command.seconds,
             repeat: true,
-            note: command.prompt,
+            note: message,
+            origin: LOOP_TIMER_ORIGIN,
           });
-          // Like Claude Code's /loop: run the prompt now rather than waiting for the
-          // first tick. Sent as an ordinary message so the first run has a visible cause.
-          appendEntry(`${cmd} ${arg}`);
-          onSend(command.prompt);
+          // Like Claude Code's /loop, run the prompt now rather than waiting for the
+          // first tick, as the same message every tick sends.
+          appendEntry(typed);
+          onSend(message);
           const every = formatLoopInterval(timer.intervalSeconds ?? command.seconds);
           const nextRun = new Date(timer.fireAt);
           const nextRunLabel = Number.isNaN(nextRun.getTime())
             ? ""
             : `, next run at ${nextRun.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-          setCommandError(
-            `Loop armed: every ${every}${nextRunLabel}${existing.length > 0 ? ", replacing the previous loop" : ""}. ` +
-              "Running the prompt now; it repeats until /loop stop and survives runner restarts.",
+          const replaced = existing.length > 0 ? ", replacing the previous loop" : "";
+          const asText = looksLikeCommand(command.prompt)
+            ? " The prompt looks like a command; the loop passes it as plain text."
+            : "";
+          report(
+            `Loop armed: every ${every}${nextRunLabel}${replaced}. Running the prompt now; ` +
+              `it repeats until /loop stop and survives runner restarts.${asText}`,
           );
-        })().catch((err: unknown) => {
-          setCommandError(err instanceof Error ? err.message : "Loop failed");
+        }).catch((err: unknown) => {
+          // Give the command back to fix, unless the user has typed since.
+          if (draftRef.current === "" && composerSessionIdRef.current === loopSessionId) {
+            setValue(typed);
+          }
+          report(err instanceof Error ? err.message : "Loop failed");
         });
         return true;
       }

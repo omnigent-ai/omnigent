@@ -1,17 +1,11 @@
-/**
- * Saved session timers: the server primitive behind the composer's `/loop`.
- *
- * `POST /v1/sessions/{id}/timers` saves a timer as a hidden scheduled task of
- * kind `timer`, so it survives runner exits, idle shutdowns and server restarts;
- * each firing sends the session a hidden `[System: timer <id> fired]` message
- * carrying the note, which starts or joins a turn as a user message would. The
- * server advertises the feature as `session_timers` in `/v1/info`.
- */
+/** Saved session timers (`/v1/sessions/{id}/timers`): the server primitive behind `/loop`. */
 
 import { authenticatedFetch } from "./identity";
-import { listAllScheduledTasks, type ScheduledTask } from "./scheduledTasksApi";
 import { SIDE_CHAT_LABEL_KEY } from "./sessionListCache";
 import { ApiError, apiErrorFromResponse } from "./sessionsApi";
+
+/** The `origin` the composer's `/loop` tags its timers with, so it cancels only those. */
+export const LOOP_TIMER_ORIGIN = "loop";
 
 export interface SessionTimer {
   timerId: string;
@@ -22,12 +16,26 @@ export interface SessionTimer {
   seconds: number;
   repeat: boolean;
   note: string | null;
+  origin: string | null;
 }
 
 export interface SetSessionTimerInput {
   seconds: number;
   repeat: boolean;
   note?: string | null;
+  /** A short lowercase tag naming the client that sets the timer, e.g. {@link LOOP_TIMER_ORIGIN}. */
+  origin?: string | null;
+}
+
+/** One of the caller's saved timers in a session, as `GET /v1/sessions/{id}/timers` lists it. */
+export interface SessionTimerSummary {
+  timerId: string;
+  origin: string | null;
+  name: string;
+  repeat: boolean;
+  intervalSeconds: number;
+  /** UTC ISO-8601 time of the next firing; `null` once a one-shot has fired. */
+  nextRunAt: string | null;
 }
 
 /** The `ApiError.code` for a timer the server would not save (for example, a side chat's). */
@@ -63,6 +71,7 @@ export async function setSessionTimer(
       seconds: input.seconds,
       repeat: input.repeat,
       note: input.note ?? null,
+      ...(input.origin ? { origin: input.origin } : {}),
     }),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -75,6 +84,7 @@ export async function setSessionTimer(
     seconds?: number;
     repeat?: boolean;
     note?: string | null;
+    origin?: string | null;
   };
   if (body.durable !== true || typeof body.timer_id !== "string") {
     throw new ApiError(
@@ -90,6 +100,7 @@ export async function setSessionTimer(
     seconds: body.seconds ?? input.seconds,
     repeat: body.repeat ?? input.repeat,
     note: body.note ?? input.note ?? null,
+    origin: body.origin ?? input.origin ?? null,
   };
 }
 
@@ -109,22 +120,57 @@ export async function cancelSessionTimer(sessionId: string, timerId: string): Pr
   return true;
 }
 
-/** Whether *task* is a repeating saved timer: the shape `/loop` creates. */
-export function isRepeatingTimer(task: ScheduledTask): boolean {
-  return (
-    task.kind === "timer" &&
-    task.state === "active" &&
-    task.rrule !== null &&
-    !/;COUNT=1$/.test(task.rrule)
-  );
+/** The caller's active saved timers in *sessionId*, oldest first. */
+export async function listSessionTimers(sessionId: string): Promise<SessionTimerSummary[]> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/timers`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  const body = (await res.json()) as {
+    timers?: {
+      timer_id: string;
+      origin?: string | null;
+      name?: string;
+      repeat?: boolean;
+      interval_seconds?: number;
+      next_run_at?: string | null;
+    }[];
+  };
+  return (body.timers ?? []).map((timer) => ({
+    timerId: timer.timer_id,
+    origin: timer.origin ?? null,
+    name: timer.name ?? "",
+    repeat: timer.repeat === true,
+    intervalSeconds: timer.interval_seconds ?? 0,
+    nextRunAt: timer.next_run_at ?? null,
+  }));
 }
 
+/** The loops `/loop` armed in *sessionId*: the caller's repeating timers tagged {@link LOOP_TIMER_ORIGIN}. */
+export async function listSessionLoops(sessionId: string): Promise<SessionTimerSummary[]> {
+  const timers = await listSessionTimers(sessionId);
+  return timers.filter((timer) => timer.origin === LOOP_TIMER_ORIGIN && timer.repeat);
+}
+
+const pendingMutations = new Map<string, Promise<unknown>>();
+
 /**
- * The caller's repeating saved timers in *sessionId*, oldest first. The server
- * lists timers only when asked for every kind, so the Automations page never
- * shows them.
+ * Run *mutation* once every earlier one queued for *sessionId* has settled, so two
+ * `/loop` submissions can't both see no loop and arm two, and a `/loop stop` sent
+ * while an arm is in flight waits for it and then cancels it. A rejected mutation
+ * doesn't block the next.
  */
-export async function listSessionLoops(sessionId: string): Promise<ScheduledTask[]> {
-  const tasks = await listAllScheduledTasks();
-  return tasks.filter((task) => task.sessionId === sessionId && isRepeatingTimer(task));
+export function runSessionTimerMutation<T>(
+  sessionId: string,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  const previous = pendingMutations.get(sessionId) ?? Promise.resolve();
+  const run = previous.then(mutation, mutation);
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  pendingMutations.set(sessionId, settled);
+  void settled.then(() => {
+    if (pendingMutations.get(sessionId) === settled) pendingMutations.delete(sessionId);
+  });
+  return run;
 }

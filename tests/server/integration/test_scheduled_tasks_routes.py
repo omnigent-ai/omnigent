@@ -8085,6 +8085,7 @@ async def test_a_sub_agent_or_side_chat_timer_is_left_to_its_runner(
         ({"seconds": -1}, "seconds must be non-negative"),
         ({"seconds": 119}, "saves timers of at least 120 seconds"),
         ({"seconds": 300, "every": 5}, "unknown timer fields: every"),
+        ({"seconds": 300, "origin": "cron"}, "origin must be 'loop'"),
     ],
 )
 async def test_timer_requests_are_checked_like_the_tools_arguments(
@@ -8149,6 +8150,63 @@ async def test_turning_timers_off_stops_new_ones_but_still_cancels_existing_ones
     assert [task.id for task in tasks.list(kinds=("timer",))] == []
 
 
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_a_session_lists_the_callers_own_timers_with_their_origin(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _owned_session(db_uri)
+    other_session = _owned_session(db_uri)
+    _make_user(db_uri, "bob@example.com")
+
+    async def saved(body: dict[str, object]) -> str:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/timers", json=body, headers=_headers()
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["timer_id"]
+
+    # A tagged repeating timer (the composer's /loop) beside an agent's own timers.
+    loop_id = await saved({"seconds": 300, "repeat": True, "note": "check CI", "origin": "loop"})
+    agent_repeating = await saved({"seconds": 600, "repeat": True})
+    agent_once = await saved({"seconds": 300})
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    # The name carries the origin; the hidden prompt has the same shape for both.
+    assert (store.get(loop_id).name, store.get(agent_repeating).name) == (
+        "Loop: check CI",
+        "Timer",
+    )
+    assert store.get(loop_id).prompt == f"[System: timer {loop_id} fired]\nnote: 'check CI'"
+
+    listed = await auth_client.get(f"/v1/sessions/{session_id}/timers", headers=_headers())
+    assert listed.status_code == 200, listed.text
+    timers = {t["timer_id"]: t for t in listed.json()["timers"]}
+    # Three timers saved within the same second, so no order is assumed.
+    assert {
+        (t["timer_id"], t["origin"], t["repeat"], t["interval_seconds"]) for t in timers.values()
+    } == {
+        (loop_id, "loop", True, 300),
+        (agent_repeating, "agent", True, 600),
+        (agent_once, "agent", False, 300),
+    }
+    assert timers[loop_id]["name"] == "Loop: check CI"
+    assert timers[loop_id]["next_run_at"] is not None
+    # Only the caller's timers in this session: another session lists none, and
+    # another user is refused as for every timer call.
+    empty = await auth_client.get(f"/v1/sessions/{other_session}/timers", headers=_headers())
+    assert empty.json() == {"timers": []}
+    outsider = await auth_client.get(
+        f"/v1/sessions/{session_id}/timers", headers=_headers("bob@example.com")
+    )
+    assert outsider.status_code == 404, outsider.text
+    # Cancelling the tagged one leaves the agent's untouched.
+    cancelled = await auth_client.delete(
+        f"/v1/sessions/{session_id}/timers/{loop_id}", headers=_headers()
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    after = await auth_client.get(f"/v1/sessions/{session_id}/timers", headers=_headers())
+    assert {t["timer_id"] for t in after.json()["timers"]} == {agent_repeating, agent_once}
+
+
 async def test_the_automations_gate_does_not_hide_timers(
     db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient, runtime_init: None
 ) -> None:
@@ -8162,6 +8220,9 @@ async def test_the_automations_gate_does_not_hide_timers(
             f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
         )
         assert created.status_code == 201, created.text
+        listed = await client.get(f"/v1/sessions/{session_id}/timers", headers=_headers())
+        assert listed.status_code == 200, listed.text
+        assert [t["timer_id"] for t in listed.json()["timers"]] == [created.json()["timer_id"]]
         cancelled = await client.delete(
             f"/v1/sessions/{session_id}/timers/{created.json()['timer_id']}", headers=_headers()
         )

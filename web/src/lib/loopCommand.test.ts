@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   formatLoopInterval,
+  looksLikeCommand,
   LOOP_MAX_SECONDS,
   LOOP_MIN_SECONDS,
   LOOP_USAGE,
+  loopRunMessage,
   parseLoopCommand,
   parseLoopInterval,
 } from "./loopCommand";
@@ -101,5 +103,21 @@ describe("parseLoopCommand", () => {
       kind: "start",
       seconds: LOOP_MAX_SECONDS,
     });
+  });
+});
+
+describe("loopRunMessage / looksLikeCommand", () => {
+  it("prefixes the prompt so the first run and every tick send the same instruction", () => {
+    expect(loopRunMessage("check CI")).toBe("Run now: check CI");
+    expect(loopRunMessage("/babysit-prs")).toBe("Run now: /babysit-prs");
+  });
+
+  it.each([
+    ["/babysit-prs", true],
+    ["$review", true],
+    ["check CI", false],
+    ["/ not a command", false],
+  ])("%s looks like a command: %s", (prompt, expected) => {
+    expect(looksLikeCommand(prompt)).toBe(expected);
   });
 });

@@ -234,6 +234,28 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   attachment that could not be restored (a warning asks the user to attach it
   again, including missing files and failed server lookups; failed downloads
   name the affected files).
+- `slash-loop`: `/loop <interval> <prompt>` repeats a prompt on an interval by
+  saving a repeating session timer on the server (`POST /v1/sessions/{id}/timers`
+  with `origin: "loop"`, named `Loop: <note>`), so it survives runner and server
+  restarts. The prompt runs once right away as the message `Run now: <prompt>`;
+  every tick then sends the same text as the timer's hidden `[System: timer <id>
+  fired]` note, which starts or joins a turn like a user message, so a task that
+  outlasts its interval accumulates ticks. One loop per session: a new `/loop`
+  cancels the running one first and `/loop stop` (no arguments) cancels it; only
+  loop-tagged timers are touched, never the agent's own `sys_timer_set` timers.
+  Starts and stops queue per session, so overlapping submissions can't arm two.
+  Intervals are a leading `5m`, `2h` or `1d` token, from 2 minutes (the server's
+  saved-timer floor) to 7 days. A prompt starting with `/` or `$` is passed as
+  plain text, and the hint says so. Offered in Claude Code native, claude-sdk,
+  Codex native and codex sessions, top-level only (a sub-agent's or side chat's
+  timers aren't saved), when `/v1/info` reports both `session_timers` and
+  `session_timer_list`; otherwise a typed `/loop` is sent as text, so Claude
+  Code's own `/loop` runs in a native session. Selecting **/loop** in Commands
+  fills `/loop ` to complete. States: "Loop armed: every 5m, next run at …",
+  "Loop stopped.", "No loop is running in this session.", usage and interval
+  errors under the composer with the text kept, a server refusal with the text
+  restored. Timers belong to the user who set them, so in a shared session a
+  collaborator's `/loop stop` doesn't see the owner's loop.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -488,6 +510,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   page in the same project. Selecting **/new** in Commands also opens it.
 - In a claude-sdk session, type `/cl` and click **/clear**, or type the whole
   `/clear` and press Enter; either opens a new, empty chat on the same machine.
+- In a Claude Code native, claude-sdk, Codex native or codex session on a
+  server with saved timers (`OMNIGENT_FEATURES=automations_v2,session_timers`),
+  type `/lo` and click **/loop**, complete `/loop 2m Say tick`, and press
+  Enter: "Loop armed: every 2m" shows under the composer and `Run now: Say
+  tick` is sent; two minutes later the agent replies to the hidden tick. Type
+  `/loop stop` and press Enter to end it.
 - In a claude-sdk or Claude Code native session with a few prompts sent,
   type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
   pick a prompt (search, or **Load older prompts** in a long session). The new

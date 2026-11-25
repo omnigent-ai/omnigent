@@ -361,6 +361,9 @@ class ServerInfoResponse(BaseModel):
     # ``POST /v1/sessions/{id}/timers`` saves sys_timer_set timers as scheduled tasks,
     # which needs the database scheduler; absent on older servers.
     session_timers: bool = False
+    # ``GET /v1/sessions/{id}/timers`` lists the caller's saved timers with their
+    # ``origin``; the composer's ``/loop`` needs it as well as ``session_timers``.
+    session_timer_list: bool = False
     automation_trigger_poll_minutes: int = 10
     # Longest session message this server delivers; older servers omit it and
     # deliver at most 8,000 characters.
@@ -4235,6 +4238,7 @@ def create_app(
                 "scheduled_task_clone": automations_enabled
                 and bool(app.state.scheduled_task_dispatch_enabled),
                 "session_timers": bool(app.state.session_timers_enabled),
+                "session_timer_list": True,
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "session_archive_runner_checks": True,

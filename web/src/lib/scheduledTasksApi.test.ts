@@ -19,7 +19,6 @@ import {
   listScheduledTaskRunPullRequests,
   listScheduledTaskRuns,
   listScheduledTasks,
-  listAllScheduledTasks,
   listSharedScheduledTasks,
   listAutomationFailures,
   runScheduledTaskNow,
@@ -117,25 +116,6 @@ describe("listScheduledTasks", () => {
   it("returns [] when the server omits the key", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}));
     await expect(listScheduledTasks()).resolves.toEqual([]);
-  });
-
-  // Reminders and timers stay off the Automations page unless every kind is asked for.
-  it("lists every kind on request", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({ scheduled_tasks: [] }));
-    await listAllScheduledTasks();
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks?kind=all");
-  });
-
-  // Older servers omit the kind; everything they list is an automation.
-  it.each([
-    ["absent", {}, "automation"],
-    ["present", { kind: "timer" }, "timer"],
-  ])("maps a task's kind (%s)", async (_, extra, kind) => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
-    );
-    const [task] = await listAllScheduledTasks();
-    expect(task.kind).toBe(kind);
   });
 
   // Servers that predate task MCP services omit the key.

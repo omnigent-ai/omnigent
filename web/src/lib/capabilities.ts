@@ -366,6 +366,11 @@ export interface ServerInfo {
    */
   session_timers?: boolean;
   /**
+   * True when `GET /v1/sessions/{id}/timers` lists the caller's saved timers with
+   * their origin, which `/loop` needs to find its own; absent on older servers (off).
+   */
+  session_timer_list?: boolean;
+  /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
@@ -802,6 +807,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_rewind: data.session_rewind === true,
           session_timers: data.session_timers === true,
+          session_timer_list: data.session_timer_list === true,
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,

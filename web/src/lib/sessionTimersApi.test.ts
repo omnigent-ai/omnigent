@@ -3,13 +3,13 @@ import { ApiError } from "./sessionsApi";
 import { SIDE_CHAT_LABEL_KEY } from "./sessionListCache";
 import {
   cancelSessionTimer,
-  isRepeatingTimer,
   listSessionLoops,
+  listSessionTimers,
+  runSessionTimerMutation,
   sessionTakesSavedTimers,
   setSessionTimer,
   TIMER_NOT_SAVED_CODE,
 } from "./sessionTimersApi";
-import type { ScheduledTask } from "./scheduledTasksApi";
 
 const fetchMock = vi.fn();
 
@@ -37,25 +37,44 @@ const SAVED = {
   interval_seconds: 300,
   seconds: 300,
   repeat: true,
-  note: "check CI",
+  note: "Run now: check CI",
+  origin: "loop",
 };
 
 describe("setSessionTimer", () => {
-  it("posts the timer and maps the saved reply", async () => {
+  it("posts the timer with its origin and maps the saved reply", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(SAVED, 201));
-    const timer = await setSessionTimer("conv_a", { seconds: 300, repeat: true, note: "check CI" });
+    const timer = await setSessionTimer("conv_a", {
+      seconds: 300,
+      repeat: true,
+      note: "Run now: check CI",
+      origin: "loop",
+    });
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_a/timers");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(String(init.body))).toEqual({ seconds: 300, repeat: true, note: "check CI" });
+    expect(JSON.parse(String(init.body))).toEqual({
+      seconds: 300,
+      repeat: true,
+      note: "Run now: check CI",
+      origin: "loop",
+    });
     expect(timer).toEqual({
       timerId: "st_timer",
       fireAt: "2026-11-25T10:05:00+00:00",
       intervalSeconds: 300,
       seconds: 300,
       repeat: true,
-      note: "check CI",
+      note: "Run now: check CI",
+      origin: "loop",
     });
+  });
+
+  it("omits an unset origin, as the agent's own timers do", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...SAVED, origin: null }, 201));
+    await setSessionTimer("conv_a", { seconds: 300, repeat: true });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ seconds: 300, repeat: true, note: null });
   });
 
   it("throws the server's reason when it keeps no timers for the session", async () => {
@@ -104,75 +123,78 @@ describe("sessionTakesSavedTimers", () => {
   });
 });
 
-function task(overrides: Partial<ScheduledTask>): ScheduledTask {
-  return {
-    id: "st_1",
-    kind: "timer",
-    state: "active",
-    rrule: "FREQ=SECONDLY;INTERVAL=300",
-    sessionId: "conv_a",
-    ...overrides,
-  } as ScheduledTask;
-}
+const LISTED = {
+  timers: [
+    {
+      timer_id: "st_loop",
+      origin: "loop",
+      name: "Loop: Run now: check CI",
+      repeat: true,
+      interval_seconds: 300,
+      next_run_at: "2026-11-25T10:05:00+00:00",
+    },
+    // The agent's own repeating timer, and a one-shot: neither is a loop.
+    { timer_id: "st_agent", origin: "agent", name: "Timer", repeat: true, interval_seconds: 600 },
+    {
+      timer_id: "st_once",
+      origin: "loop",
+      name: "Loop",
+      repeat: false,
+      interval_seconds: 300,
+      next_run_at: null,
+    },
+  ],
+};
 
-describe("listSessionLoops", () => {
-  it("asks for every kind and keeps the session's active repeating timers", async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        scheduled_tasks: [
-          {
-            id: "st_loop",
-            kind: "timer",
-            state: "active",
-            rrule: "FREQ=SECONDLY;INTERVAL=300",
-            session_id: "conv_a",
-            name: "Timer: check CI",
-            prompt: "",
-            workspace: null,
-          },
-          {
-            id: "st_once",
-            kind: "timer",
-            state: "active",
-            rrule: "FREQ=SECONDLY;INTERVAL=300;COUNT=1",
-            session_id: "conv_a",
-            name: "Timer",
-            prompt: "",
-            workspace: null,
-          },
-          {
-            id: "st_other",
-            kind: "timer",
-            state: "active",
-            rrule: "FREQ=SECONDLY;INTERVAL=300",
-            session_id: "conv_b",
-            name: "Timer",
-            prompt: "",
-            workspace: null,
-          },
-          {
-            id: "st_auto",
-            kind: "automation",
-            state: "active",
-            rrule: "FREQ=DAILY",
-            session_id: "conv_a",
-            name: "Nightly",
-            prompt: "x",
-            workspace: null,
-          },
-        ],
-      }),
-    );
-    const loops = await listSessionLoops("conv_a");
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks?kind=all");
-    expect(loops.map((loop) => loop.id)).toEqual(["st_loop"]);
+describe("listSessionTimers / listSessionLoops", () => {
+  it("reads the session's timers from the ungated listing route", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(LISTED));
+    const timers = await listSessionTimers("conv_a");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_a/timers");
+    expect(timers[0]).toEqual({
+      timerId: "st_loop",
+      origin: "loop",
+      name: "Loop: Run now: check CI",
+      repeat: true,
+      intervalSeconds: 300,
+      nextRunAt: "2026-11-25T10:05:00+00:00",
+    });
+    expect(timers[1]).toMatchObject({ timerId: "st_agent", origin: "agent", nextRunAt: null });
   });
 
-  it("isRepeatingTimer excludes one-shots, other kinds and inactive timers", () => {
-    expect(isRepeatingTimer(task({}))).toBe(true);
-    expect(isRepeatingTimer(task({ rrule: "FREQ=SECONDLY;INTERVAL=300;COUNT=1" }))).toBe(false);
-    expect(isRepeatingTimer(task({ kind: "reminder" }))).toBe(false);
-    expect(isRepeatingTimer(task({ state: "paused" }))).toBe(false);
-    expect(isRepeatingTimer(task({ rrule: null }))).toBe(false);
+  it("keeps only the repeating loop-tagged timers, leaving the agent's alone", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(LISTED));
+    const loops = await listSessionLoops("conv_a");
+    expect(loops.map((loop) => loop.timerId)).toEqual(["st_loop"]);
+  });
+
+  it("throws the server's error when the listing is refused", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Session not found" }, 404));
+    await expect(listSessionLoops("conv_a")).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe("runSessionTimerMutation", () => {
+  it("runs a session's mutations one after another, and keeps going after a failure", async () => {
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const first = runSessionTimerMutation("conv_a", async () => {
+      await new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      order.push("first");
+      throw new Error("first failed");
+    });
+    const second = runSessionTimerMutation("conv_a", async () => {
+      order.push("second");
+      return "done";
+    });
+    // Another session is not held up.
+    await expect(runSessionTimerMutation("conv_b", async () => "other")).resolves.toBe("other");
+    expect(order).toEqual([]);
+    releaseFirst();
+    await expect(first).rejects.toThrow("first failed");
+    await expect(second).resolves.toBe("done");
+    expect(order).toEqual(["first", "second"]);
   });
 });

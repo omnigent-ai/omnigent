@@ -1,17 +1,23 @@
-/**
- * Parsing for the composer's `/loop` command.
- *
- * `/loop <interval> <prompt>` arms a repeating saved timer that sends the prompt
- * into the session on every tick (see `sessionTimersApi`); `/loop stop` cancels
- * it. The limits mirror the server's saved timers: it saves timers of at least
- * two minutes, and an interval over a week is refused here so a typo can't park
- * a repeating wake for months.
- */
+/** Parsing for the composer's `/loop <interval> <prompt>` and `/loop stop`. */
 
 /** The server saves timers of at least this many seconds (its `DURABLE_TIMER_MIN_SECONDS`). */
 export const LOOP_MIN_SECONDS = 120;
-/** The longest interval `/loop` accepts: one week. */
+/** The longest interval `/loop` accepts: a week, so a typo can't park a wake for months. */
 export const LOOP_MAX_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * The message every run of a loop sends, the first run and each tick alike. The
+ * prefix makes the hidden timer note read as an instruction, and keeps a prompt
+ * that starts with a slash from running as a command on the first run.
+ */
+export function loopRunMessage(prompt: string): string {
+  return `Run now: ${prompt}`;
+}
+
+/** Whether the prompt reads as a slash or skill command, which a loop passes as plain text. */
+export function looksLikeCommand(prompt: string): boolean {
+  return /^[/$]\S/.test(prompt);
+}
 
 export const LOOP_USAGE =
   "Usage: /loop <interval> <prompt> (e.g. /loop 5m check the deploy), or /loop stop";
