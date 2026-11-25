@@ -3,7 +3,28 @@ import { configure } from "@testing-library/react";
 import type * as ReactVirtualModule from "@tanstack/react-virtual";
 import { afterEach, vi } from "vitest";
 
+import type * as GitHubPollFocusModule from "@/lib/githubPollFocus";
+import type * as GitHubPollIdleModule from "@/lib/githubPollIdle";
 import { abortInFlightXhrs, FetchBackedXhr, sentXhrs } from "@/test/fetchBackedXhr";
+
+// The read path caches what the shell offers; each test stubs its own shell. Imported
+// late so a test's own module mocks (such as the signed-in user) still apply to it.
+afterEach(async () => {
+  (await import("@/lib/desktopReadPath")).resetDesktopReadPathForTests();
+});
+// The window-focus pause counts real time from its first use, and jsdom's window is never
+// focused, so in a long file it would stop every later test's GitHub polls. Each test starts
+// afresh. The actual module, so a file that mocks it keeps its mock and this still resets the real one.
+afterEach(async () => {
+  const focus = await vi.importActual<typeof GitHubPollFocusModule>("@/lib/githubPollFocus");
+  focus.resetGitHubPollFocusForTests();
+});
+// Idle counts real time from its first use too, and a test that types nothing would slow every
+// later test's list polls: each test starts in use.
+afterEach(async () => {
+  const idle = await vi.importActual<typeof GitHubPollIdleModule>("@/lib/githubPollIdle");
+  idle.resetGitHubPollIdleForTests();
+});
 
 // Tooltip surfaces intentionally wait 1s; leave enough margin for async queries
 // to observe them without racing Testing Library's matching default timeout.
