@@ -3982,11 +3982,10 @@ describe("side-chat reply in one editor", () => {
         ...appendReplyQuote(current, "Added during take"),
       }));
     });
+    const addedId = storeQuotes()[0]!.id;
     act(() => mic.current!.onVoiceDiscard!());
     // The dictated word goes; the text it was added to and the new quote stay.
-    expect(storeQuotes()).toEqual([
-      { id: storeQuotes()[0]!.id, before: "Draft", text: "Added during take" },
-    ]);
+    expect(storeQuotes()).toEqual([{ id: addedId, before: "Draft", text: "Added during take" }]);
     expect(storeText()).toBe("");
     expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
   });
@@ -4016,21 +4015,20 @@ describe("side-chat reply in one editor", () => {
         ...appendReplyQuote(current, "Second passage"),
       }));
     });
+    const quoteId = storeQuotes()[0]!.id;
     const end = editorText().length;
     typeAt(end, end, "Reply");
     expect(editorText()).toBe(
-      `${seedCard}\nIntro\n${replyQuoteLine({ id: storeQuotes()[0]!.id, text: "Second passage" })}\nReply`,
+      `${seedCard}\nIntro\n${replyQuoteLine({ id: quoteId, text: "Second passage" })}\nReply`,
     );
 
     fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]!);
 
     expect(pendingSeed()).toBeUndefined();
-    expect(storeQuotes()).toEqual([
-      { id: storeQuotes()[0]!.id, before: "Intro", text: "Second passage" },
-    ]);
+    expect(storeQuotes()).toEqual([{ id: quoteId, before: "Intro", text: "Second passage" }]);
     expect(storeText()).toBe("Reply");
     expect(editorText()).toBe(
-      `Intro\n${replyQuoteLine({ id: storeQuotes()[0]!.id, text: "Second passage" })}\nReply`,
+      `Intro\n${replyQuoteLine({ id: quoteId, text: "Second passage" })}\nReply`,
     );
   });
 

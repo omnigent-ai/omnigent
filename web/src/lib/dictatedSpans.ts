@@ -34,7 +34,7 @@ export function mapDictatedSpansAcrossDocuments(
  * Apply a dictation write: `change` replaces the text it owns, and the text it inserts becomes a
  * span. The spans follow what the editor actually did, which can differ from `change` when it
  * normalizes the write, so the editor's text is diffed before and after, never the expected text.
- * Returns the spans, which are never empty.
+ * Returns the surviving non-empty spans (possibly none).
  */
 export function writeDictatedEdit(
   target: ComposerTextTarget,

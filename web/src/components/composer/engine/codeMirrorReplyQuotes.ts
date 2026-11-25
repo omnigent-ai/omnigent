@@ -296,11 +296,12 @@ function normalizeCards(
   ) {
     const above = startCards.find((card) => card.to === only.from);
     const below = startCards.find((card) => card.from === only.to);
-    const target = transaction.isUserEvent("delete.backward")
-      ? above
-      : transaction.isUserEvent("delete.forward")
-        ? below
-        : undefined;
+    // A selection that is only the break is not a caret delete, so the card it touches stays.
+    let target: Card | undefined;
+    if (transaction.startState.selection.main.empty) {
+      if (transaction.isUserEvent("delete.backward")) target = above;
+      else if (transaction.isUserEvent("delete.forward")) target = below;
+    }
     if (target) {
       // The card goes with the blank line that separates it, as its X removes it. The span is
       // mapped into the new document, where the break is already gone.
@@ -352,7 +353,9 @@ function normalizeCards(
     const next = cardLine.number < doc.lines ? doc.line(cardLine.number + 1) : null;
     const joinsTail = next !== null && parseReplyQuoteLine(next.text) === null;
     const at = next ? next.from : first.to;
-    const insert = joinsTail ? prefix : next ? `${prefix}\n` : `\n${prefix}`;
+    let insert = `\n${prefix}`;
+    if (joinsTail) insert = prefix;
+    else if (next) insert = `${prefix}\n`;
     apply([
       { from: 0, to: first.from },
       { from: at, insert },

@@ -69,7 +69,7 @@ describe("dictated spans", () => {
     expect(
       mapDictatedSpansAcrossDocuments(dictated, "Draft spoken", "Draft spoken\nCARD\n"),
     ).toEqual(dictated);
-    // An empty insert deletes text; the search it used to need never runs.
+    // A deletion-only edit (empty insert) shifts the following span back.
     expect(mapDictatedSpans(dictated, { from: 0, to: 2, insert: "" })).toEqual([
       { from: 3, to: 9 },
     ]);

@@ -10745,6 +10745,29 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Added during take");
   });
 
+  it("leaves the draft alone when the engine switches mid-take and the take is then discarded", async () => {
+    const finishLoad = deferEditorLoad();
+    const { rerender } = render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await finishLoad();
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    act(() => insertComposerText(editorTarget(), "Draft"));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    rerender(
+      <CapabilitiesProvider info={plainInfo}>
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    expect(textarea()).toHaveValue("Draft spoken");
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(textarea()).toHaveValue("Draft spoken");
+  });
+
   it("keeps the user's own copy of a repeated word when they delete the dictated one, then discard", async () => {
     const finishLoad = deferEditorLoad();
     render(

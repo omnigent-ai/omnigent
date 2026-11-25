@@ -147,6 +147,13 @@ describe("reply draft document", () => {
     expect(minimalTextChange("", "new")).toEqual({ from: 0, to: 0, insert: "new" });
   });
 
+  it("never starts or ends a change inside a surrogate pair", () => {
+    // 😀 and 😁 share a high surrogate, so a bare code-unit diff would start inside the pair.
+    expect(minimalTextChange("a😀b", "a😁b")).toEqual({ from: 1, to: 3, insert: "😁" });
+    // Here the low surrogates match, so a bare diff would end inside the pair.
+    expect(minimalTextChange("😀😀", "😁😀")).toEqual({ from: 0, to: 2, insert: "😁" });
+  });
+
   it("copies cards as markdown quotes", () => {
     const text = `Head\n${replyQuoteLine({ id: "a", text: "one\ntwo" })}\nTail`;
     expect(replyQuoteClipboardText(text)).toBe("Head\n> one\n> two\nTail");

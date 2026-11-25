@@ -230,12 +230,17 @@ export interface TextEdit {
   insert: string;
 }
 
+const isHighSurrogate = (unit: number) => unit >= 0xd800 && unit <= 0xdbff;
+const isLowSurrogate = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff;
+
 /** The one change that turns `before` into `after`, or null when they are equal. */
 export function minimalTextChange(before: string, after: string): TextEdit | null {
   if (before === after) return null;
   const limit = Math.min(before.length, after.length);
   let prefix = 0;
   while (prefix < limit && before[prefix] === after[prefix]) prefix += 1;
+  // Keep the change off a surrogate pair: a prefix ending on a high surrogate gives it back.
+  if (prefix > 0 && isHighSurrogate(before.charCodeAt(prefix - 1))) prefix -= 1;
   let suffix = 0;
   while (
     suffix < limit - prefix &&
@@ -243,6 +248,8 @@ export function minimalTextChange(before: string, after: string): TextEdit | nul
   ) {
     suffix += 1;
   }
+  // A suffix starting on a low surrogate gives that unit back to the change.
+  if (suffix > 0 && isLowSurrogate(before.charCodeAt(before.length - suffix))) suffix -= 1;
   return {
     from: prefix,
     to: before.length - suffix,

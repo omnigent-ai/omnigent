@@ -906,6 +906,21 @@ describe("CodeMirrorComposerInput reply cards", () => {
     expect(editor.state.doc.toString()).toBe(`In\n${quoted}\nReply`);
   });
 
+  it("keeps a card when only the break beside it is selected and Backspace deletes that break", () => {
+    const quoted = card("Quoted");
+    const value = `Opener\n${quoted}\nWhy`;
+    const { content, editor } = mountDocument(value);
+    const breakAfterCard = `Opener\n${quoted}`.length;
+    act(
+      () =>
+        void editor.dispatch({
+          selection: { anchor: breakAfterCard, head: breakAfterCard + 1 },
+        }),
+    );
+    key(content, { key: "Backspace" });
+    expect(editor.state.doc.toString()).toBe(value);
+  });
+
   it("removes adjacent cards one at a time, in the direction of the key", () => {
     const first = card("One", "one");
     const second = card("Two", "two");

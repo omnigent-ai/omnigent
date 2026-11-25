@@ -2495,6 +2495,8 @@ function ComposerImpl(
   const writeDocument = (next: string) => {
     if (renderedEngine !== "codemirror") setValue(next);
     else if (textareaRef.current) replaceComposerDocument(textareaRef.current, next);
+    // No editor is mounted, so the draft state is the only place the write can land.
+    else setEditorDocument(next);
   };
   // The text this take wrote in the editor, which a discard removes and nothing else touches.
   const dictatedRef = useRef<DictatedSpan[]>([]);
