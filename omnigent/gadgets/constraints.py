@@ -35,11 +35,14 @@ A ``unique`` value that data from before the rule already repeats keeps every re
 holding it, so those records stay editable as long as they keep that value, and the value
 is not free for another record until all of them have moved off it.
 
-Each ``reference`` rule keeps an index of the records naming each target
-(``refs/<rule>/g<generation>/<target>/<record>``), written as part of every guarded
-change, so deleting a target reads only the records that name it. Entries a change left
-behind are checked against the record and dropped. A lookup reads at most
-``MAX_STALE_INDEX_ENTRIES`` of those: one that would read more has the index rebuilt.
+Each ``reference`` rule keeps an index of the records naming each target, written as part
+of every guarded change, so deleting a target reads only the records that name it. A
+target's entries are numbered without gaps (``refs/g<generation>/<rule>/<target>/n/...``)
+and read by number, so a lookup examines only the entries it reads, never a directory
+listing; ``ids/<record>`` says which entry is a record's, so it is added once and a change
+moving the record away removes it. An entry whose record no longer names the target stays
+(numbers have no gaps) and is skipped: a lookup reads at most ``MAX_STALE_INDEX_ENTRIES``
+of those, and one that would read more has the index rebuilt without them.
 When the rules change, the index needs rebuilding, or a write fails half-way, the derived
 state is rebuilt a page at a time into a new index generation, with its progress saved in
 the guard, so each step costs bounded work and a stopped rebuild resumes; generations
@@ -110,7 +113,10 @@ REBUILD_PAGE = 200
 REBUILD_STEPS_PER_WRITE = 64
 # Bumped when the derived state gains something a rebuild must fill in (the reference index,
 # its generations, every holder of a repeated unique value).
-_STATE_FORMAT = 3
+_STATE_FORMAT = 4
+# Entries per directory of a target's reference index.
+_INDEX_PER_SEGMENT = 1000
+_INDEX_APPEND_ATTEMPTS = 16
 
 
 class _IndexNeedsRebuild(Exception):
@@ -535,7 +541,8 @@ class ConstraintGuard:
                     if target is not None:
                         operation = {
                             "kind": kind,
-                            "path": self._index_path(rule, generation, target, changed_id),
+                            "directory": self._index_directory(rule, generation, target),
+                            "id": changed_id,
                         }
                         if kind == "ref_remove":
                             # What a remover checks before deleting, so it never deletes
@@ -558,10 +565,71 @@ class ConstraintGuard:
         return f"{self.guard_root}/refs"
 
     def _index_directory(self, rule: dict, generation: int, target_id: str) -> str:
-        return f"{self._index_root()}/{_digest(rule, 16)}/g{generation}/{target_id}"
+        return f"{self._index_root()}/g{generation}/{_digest(rule, 16)}/{target_id}"
 
-    def _index_path(self, rule: dict, generation: int, target_id: str, record_id: str) -> str:
-        return f"{self._index_directory(rule, generation, target_id)}/{record_id}"
+    @staticmethod
+    def _entry_path(directory: str, number: int) -> str:
+        segment = (number - 1) // _INDEX_PER_SEGMENT + 1
+        return f"{directory}/n/s{segment:08d}/{number:08d}"
+
+    def _entry(self, directory: str, number: int) -> str | None:
+        """The record ID entry *number* names, or ``None`` past the last entry."""
+        try:
+            raw = self.files.read_json(self._entry_path(directory, number))
+        except NotFound:
+            return None
+        record_id = raw.get("id")
+        if not isinstance(record_id, str):
+            raise CorruptData("Invalid reference index entry")
+        return record_id
+
+    def _entries_end(self, directory: str) -> int:
+        """How many entries *directory* has: numbered without gaps, so the last is found by
+        reading entries 1, 2, 4, ... and bisecting, about ``2 * log2(entries)`` reads."""
+        if self._entry(directory, 1) is None:
+            return 0
+        low, high = 1, 2
+        while self._entry(directory, high) is not None:
+            low, high = high, high * 2
+        while high - low > 1:
+            middle = (low + high) // 2
+            if self._entry(directory, middle) is not None:
+                low = middle
+            else:
+                high = middle
+        return low
+
+    def _index_add(self, directory: str, record_id: str) -> None:
+        """Index *record_id* under *directory*'s target, once.
+
+        The entry goes after the last; a writer that loses that number takes the next. Its
+        ``ids`` marker, written after, says the record is indexed; one stopped before writing
+        it only leaves a second entry for the record, which a lookup reads as one.
+        """
+        marker = f"{directory}/ids/{record_id}"
+        try:
+            number = self.files.read_json(marker).get("n")
+        except NotFound:
+            number = None
+        if type(number) is int and self._entry(directory, number) == record_id:
+            return
+        end = self._entries_end(directory)
+        for _attempt in range(_INDEX_APPEND_ATTEMPTS):
+            path = self._entry_path(directory, end + 1)
+            try:
+                self.files.mkdirs(path.rsplit("/", 1)[0])
+                self.files.create_json(path, {"id": record_id})
+                break
+            except Conflict:
+                end = max(end + 1, self._entries_end(directory))
+        else:
+            raise Conflict("The gadget's rules are busy; try again shortly", reason="busy")
+        self.files.mkdirs(f"{directory}/ids")
+        if self.files.supports_delete:
+            with contextlib.suppress(NotFound):
+                self.files.delete_tree(marker)
+        with contextlib.suppress(Conflict):
+            self.files.create_json(marker, {"n": end + 1})
 
     def _check(self, rule: dict, plan: _Plan, record_id: str, old: Any, new: Any) -> None:
         kind = rule["kind"]
@@ -619,44 +687,34 @@ class ConstraintGuard:
     def _dependents(self, rule: dict, target_id: str, generation: int) -> list[Document]:
         """The live records whose *rule* field names *target_id*, read from the rule's index.
 
-        Stops after one more than a change may touch, which is enough to refuse or cap the
-        change. Entries for records that no longer name the target are dropped as found. A
+        Reads entries by number, so it examines only the entries it reads. Stops after one
+        more than a change may touch, which is enough to refuse or cap the change. Entries
+        whose record no longer names the target (or that repeat a record) are skipped; a
         lookup that meets more than ``MAX_STALE_INDEX_ENTRIES`` of those raises
         ``_IndexNeedsRebuild`` rather than guess from part of the index.
         """
         directory = self._index_directory(rule, generation, target_id)
         found: list[Document] = []
-        after: str | None = None
+        seen: set[str] = set()
         stale = 0
+        number = 0
         while len(found) <= MAX_PLAN_OPERATIONS:
-            try:
-                names, more = self.files.list_page(
-                    directory, after=after, limit=MAX_PLAN_OPERATIONS + 1
-                )
-            except NotFound:
+            number += 1
+            record_id = self._entry(directory, number)
+            if record_id is None:
                 return found
-            for name in names:
-                after = name
-                record = (
-                    self.data.get(rule["collection"], name)
-                    if _IDENTIFIER.fullmatch(name)
-                    else None
-                )
-                if record is not None and record.value.get(rule["field"]) == target_id:
-                    found.append(record)
-                    continue
-                stale += 1
-                if stale > MAX_STALE_INDEX_ENTRIES:
-                    raise _IndexNeedsRebuild()
-                self._drop_entry(
-                    f"{directory}/{name}",
-                    rule["collection"] if _IDENTIFIER.fullmatch(name) else None,
-                    name,
-                    rule["field"],
-                    target_id,
-                )
-            if not more:
-                return found
+            record = (
+                self.data.get(rule["collection"], record_id)
+                if record_id not in seen and _IDENTIFIER.fullmatch(record_id)
+                else None
+            )
+            if record is not None and record.value.get(rule["field"]) == target_id:
+                seen.add(record_id)
+                found.append(record)
+                continue
+            stale += 1
+            if stale > MAX_STALE_INDEX_ENTRIES:
+                raise _IndexNeedsRebuild()
         return found
 
     # -- applying ---------------------------------------------------------------
@@ -676,23 +734,20 @@ class ConstraintGuard:
 
     def _apply(self, operation: dict) -> dict:
         if operation["kind"] == "ref_add":
-            path = operation["path"]
-            self.files.mkdirs(path.rsplit("/", 1)[0])
-            with contextlib.suppress(Conflict):  # Already there.
-                self.files.create_json(path, {})
+            if "directory" in operation:
+                self._index_add(operation["directory"], operation["id"])
+            # A plan saved before the index was numbered writes into a generation no lookup
+            # reads (the state format changed), so it needs nothing.
             return {}
         if operation["kind"] == "ref_remove":
-            if "id" in operation:
+            if "directory" in operation:
                 self._drop_entry(
-                    operation["path"],
+                    operation["directory"],
                     operation["collection"],
                     operation["id"],
                     operation["field"],
                     operation["target"],
                 )
-            elif self.files.supports_delete:  # A plan saved before entries named their record.
-                with contextlib.suppress(NotFound):
-                    self.files.delete_tree(operation["path"])
             return {}
         kind, collection, record_id = operation["kind"], operation["collection"], operation["id"]
         actor, operation_id = operation["actor"], operation["operation_id"]
@@ -741,21 +796,18 @@ class ConstraintGuard:
             return self._apply_again(operation)
 
     def _drop_entry(
-        self, path: str, collection: str | None, record_id: str, field: str, target_id: str
+        self, directory: str, collection: str, record_id: str, field: str, target_id: str
     ) -> None:
-        """Deletes the index entry at *path* unless its record names *target_id* again.
+        """Forget that *record_id* is indexed under *directory*'s target, unless its record
+        names *target_id* again.
 
-        Checked and deleted under the record's lock, which every write of the record holds:
-        a record moved away and back has its entry added again after its write, so a remover
-        that saw it away, or that replays an old plan, never deletes the entry it needs now.
-        A store that cannot delete, or a lock not taken, keeps the entry; lookups check
-        entries against their records.
+        Only the ``ids`` marker goes: entries are numbered without gaps, so the record's
+        entry stays and lookups skip it. Checked and removed under the record's lock, which
+        every write of the record holds: a record moved away and back is indexed again after
+        its write, so a remover that saw it away, or that replays an old plan, never removes
+        the marker it needs now. A store that cannot delete, or a lock not taken, keeps it.
         """
         if not self.files.supports_delete:
-            return
-        if collection is None:  # Not a record ID: nothing could need the entry.
-            with contextlib.suppress(NotFound):
-                self.files.delete_tree(path)
             return
         with self.data.record_lock(collection, record_id) as held:
             if not held:
@@ -764,7 +816,7 @@ class ConstraintGuard:
             if current is not None and current.value.get(field) == target_id:
                 return
             with contextlib.suppress(NotFound):
-                self.files.delete_tree(path)
+                self.files.delete_tree(f"{directory}/ids/{record_id}")
 
     def _apply_again(self, operation: dict) -> dict:
         """A rule's update of a dependent that changed after the plan: done against its
@@ -975,11 +1027,12 @@ class ConstraintGuard:
 
         Generations only grow: a rebuild writes ``ref_generation + 1`` of the state it
         started from, so every rebuild begun after this one committed, or still running,
-        writes a higher generation, whatever rules it is for. Removing only lower ones, under
-        every rule's directory, therefore never removes entries a later rebuild wrote, however
-        late this runs; rule directories stay, since a later rebuild may be writing into one.
-        Each removal is one ``delete_tree``, which the store does in bounded work; a store
-        that cannot delete keeps them, and lookups never read them again.
+        writes a higher generation, whatever rules it is for. Removing only lower ones
+        therefore never removes entries a later rebuild wrote, however late this runs. The
+        index's top level holds only generations, and each rebuild removes the ones below
+        it, so listing it reads a handful of names. Each removal is one ``delete_tree``,
+        which the store does in bounded work; a store that cannot delete keeps them, and
+        lookups never read them again.
         """
         if not self.files.supports_delete:
             return
@@ -987,15 +1040,11 @@ class ConstraintGuard:
         with contextlib.suppress(NotFound):
             names, _more = self.files.list_page(root, after=None, limit=MAX_CONSTRAINTS * 4)
             for name in names:
-                with contextlib.suppress(NotFound):
-                    generations, _ = self.files.list_page(
-                        f"{root}/{name}", after=None, limit=MAX_CONSTRAINTS * 4
-                    )
-                    for generation in generations:
-                        number = _generation_number(generation)
-                        if number is not None and number < current:
-                            with contextlib.suppress(NotFound):
-                                self.files.delete_tree(f"{root}/{name}/{generation}")
+                number = _generation_number(name)
+                # Anything else is an index from before generations came first.
+                if number is None or number < current:
+                    with contextlib.suppress(NotFound):
+                        self.files.delete_tree(f"{root}/{name}")
 
     def _rebuild_record(self, progress: dict, collection: str, record: Document) -> None:
         for rule in self.rules:
@@ -1014,8 +1063,8 @@ class ConstraintGuard:
             elif rule["kind"] == "reference":
                 target = self._reference_of(rule, record.value)
                 if target is not None:
-                    path = self._index_path(rule, int(progress["generation"]), target, record.id)
-                    self._apply({"kind": "ref_add", "path": path})
+                    directory = self._index_directory(rule, int(progress["generation"]), target)
+                    self._index_add(directory, record.id)
 
     def _epochs(self) -> list[str]:
         try:

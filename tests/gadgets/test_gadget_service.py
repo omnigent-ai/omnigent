@@ -14,7 +14,7 @@ from omnigent.gadgets import documents as documents_module
 from omnigent.gadgets import service as service_module
 from omnigent.gadgets.constraints import ConstraintGuard, ConstraintViolation
 from omnigent.gadgets.documents import StoreLimits
-from omnigent.gadgets.service import GadgetError, GadgetService
+from omnigent.gadgets.service import GadgetError, GadgetService, GadgetViewer
 from omnigent.stores.gadget_store import (
     CapacityExceeded,
     Conflict,
@@ -116,7 +116,8 @@ def test_sharing_data_does_not_grant_frontend_publication(gadgets: Fixture) -> N
     assert seen["owner_id"] == person(1)
     shared = rpc(teammate, app, "create", id="shared", value={"title": "Mate"}, operation_id="c-s")
     assert shared["id"] == "shared"
-    assert shared["created_by"] == person(2)
+    # Gadget code sees its author as the teammate's gadget-scoped ID, not their user ID.
+    assert shared["created_by"] == teammate.content(app["id"])["viewer"]["id"]
     with pytest.raises(GadgetError) as error:
         teammate.create_revision(app["id"], {})
     assert error.value.code == "PERMISSION_DENIED"
@@ -1512,9 +1513,22 @@ def test_deleting_a_referenced_record_reads_only_the_records_that_name_it(
     assert rpc(service, app, "get", collection="runs", id="r-quiet") is None
     # The 60 runs naming the other card are never listed or read.
     assert not any(path.rstrip("/").endswith("/runs") for path in listed)
-    # More dependents than one change may touch are refused, not cut short.
+    # More dependents than one change may touch are refused, not cut short, after reading
+    # one more entry than that and listing no index directory, however many there are.
+    read: list[str] = []
+    original_read = LocalGadgetFiles.read_json
+
+    def counting_read(self, path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        read.append(path)
+        return original_read(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(LocalGadgetFiles, "read_json", counting_read)
+    listed.clear()
     with pytest.raises(CapacityExceeded):
         rpc(service, app, "delete", id="busy", if_version=busy["version"], operation_id="d-b")
+    assert not any("/refs/" in path for path in listed)
+    entries = [path for path in read if "/refs/" in path and "/n/" in path]
+    assert len(entries) == constraints_module.MAX_PLAN_OPERATIONS + 1
 
 
 _RUN_CARD_RESTRICT = {
@@ -2719,3 +2733,44 @@ def test_the_viewers_own_gadgets_page_in_id_order(gadgets: Fixture) -> None:
     assert [item["id"] for item in [item for page in pages for item in page]] == sorted(made)
     assert owner.shelf()["has_owned"] is True
     assert gadgets.service(2).shelf()["has_owned"] is False
+
+
+def test_gadget_code_never_learns_who_its_viewers_are(gadgets: Fixture) -> None:
+    """Gadget code gets an opaque ID per viewer, the same across the gadget's records and
+    different in every gadget, and a name only when the server has a real one."""
+    owner = gadgets.service()
+    app = publish_board(owner)
+    other = publish_board(owner)
+    gadgets.access.share(app, 2, DATA_EDIT)
+    names = {person(1): "Ada Lovelace", person(2): person(2)}
+    teammate = GadgetService(
+        gadgets.store,
+        gadgets.access,
+        GadgetViewer(person(2)),
+        display_names=lambda ids: {user_id: names.get(user_id, user_id) for user_id in ids},
+    )
+    named = GadgetService(
+        gadgets.store,
+        gadgets.access,
+        GadgetViewer(person(1)),
+        display_names=lambda ids: {user_id: names.get(user_id, user_id) for user_id in ids},
+    )
+
+    mine = named.content(app["id"])["viewer"]
+    theirs = teammate.content(app["id"])["viewer"]
+    assert mine["display_name"] == "Ada Lovelace"
+    # A name that is only the login (here an email) is never passed on.
+    assert theirs["display_name"] is None
+    assert mine["id"] != theirs["id"]
+    assert person(2) not in theirs["id"] and person(1) not in mine["id"]
+    # Stable within the gadget, different in another.
+    assert teammate.content(app["id"])["viewer"]["id"] == theirs["id"]
+    assert named.content(other["id"])["viewer"]["id"] != mine["id"]
+
+    created = rpc(teammate, app, "create", id="c1", value={"title": "Mate"}, operation_id="c1")
+    listed = rpc(teammate, app, "list", limit=10)
+    fetched = rpc(teammate, app, "get", id="c1")
+    for record in (created, fetched, *listed["items"]):
+        assert record["created_by"] == theirs["id"]
+        assert record["updated_by"] == theirs["id"]
+    assert person(2) not in json.dumps([created, listed, fetched])

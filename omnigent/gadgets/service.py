@@ -443,6 +443,7 @@ class GadgetService:
         self.viewer = viewer
         self.sessions = sessions
         self._display_names = display_names
+        self._salts: dict[str, str] = {}
 
     # -- resolving gadgets and permissions ------------------------------------
 
@@ -1042,7 +1043,7 @@ class GadgetService:
         return revision
 
     def content(self, app_id: str) -> dict:
-        _, permissions, revision, publication = self._active(app_id)
+        gadget, permissions, revision, publication = self._active(app_id)
         granted = (
             set(revision["capabilities"])
             & _SUPPORTED_CAPABILITIES
@@ -1055,7 +1056,72 @@ class GadgetService:
             "html": revision["html"],
             "sdk_version": 1,
             "capabilities": sorted(granted),
+            "viewer": {
+                "id": self._gadget_user_id(gadget, self.viewer.user_id),
+                "display_name": self._shown_name(),
+            },
         }
+
+    # -- who gadget code sees ---------------------------------------------------
+
+    def _viewer_salt(self, gadget: Gadget) -> str:
+        """The gadget's secret for the user IDs its code sees, made on first use.
+
+        Kept in the gadget's own bookkeeping, which its code never reads, so an ID can't be
+        matched against guessed user IDs.
+        """
+        cached = self._salts.get(gadget.id)
+        if cached is not None:
+            return cached
+        store = self._sessions(gadget)
+        current = store.get("meta", "viewer-salt")
+        if current is None:
+            try:
+                current = store.create(
+                    "meta",
+                    "viewer-salt",
+                    {"salt": uuid.uuid4().hex + uuid.uuid4().hex},
+                    "viewer-salt",
+                    self.viewer.user_id,
+                )
+            except Conflict:  # Another request made it first.
+                current = store.get("meta", "viewer-salt")
+        salt = current.value.get("salt") if current is not None else None
+        if not isinstance(salt, str) or not salt:
+            raise CorruptData("Invalid gadget viewer secret")
+        self._salts[gadget.id] = salt
+        return salt
+
+    def _gadget_user_id(self, gadget: Gadget, user_id: str | None) -> str | None:
+        """What gadget code sees for *user_id*: stable within the gadget, opaque, and
+        different in every gadget, so its code can tell people apart without learning who
+        they are."""
+        if user_id is None:
+            return None
+        salt = self._viewer_salt(gadget)
+        return "u_" + hashlib.sha256(f"{salt}\0{user_id}".encode()).hexdigest()[:32]
+
+    def _shown_name(self) -> str | None:
+        """The viewer's name for gadget code: only a real one, never their login or email."""
+        if self._display_names is None:
+            return None
+        user_id = self.viewer.user_id
+        name = self._display_names([user_id]).get(user_id)
+        if not isinstance(name, str) or not name.strip() or name == user_id or "@" in name:
+            return None
+        return name
+
+    def _for_gadget_code(self, gadget: Gadget, result: Any) -> Any:
+        """*result* of a data call with each record's authors as gadget code sees them."""
+        if isinstance(result, dict) and isinstance(result.get("items"), list):
+            return {**result, "items": [self._for_gadget_code(gadget, i) for i in result["items"]]}
+        if isinstance(result, dict) and "created_by" in result:
+            return {
+                **result,
+                "created_by": self._gadget_user_id(gadget, result.get("created_by")),
+                "updated_by": self._gadget_user_id(gadget, result.get("updated_by")),
+            }
+        return result
 
     def get_revision(self, app_id: str, revision_id: str | None = None) -> dict:
         if revision_id is None:
@@ -1465,9 +1531,23 @@ class GadgetService:
     # -- the frame's data bridge -----------------------------------------------------
 
     def rpc(self, app_id: str, revision_id: Any, method: Any, params: Any) -> Any:
+        """A data call from gadget code (or an agent's ``sys_gadget_records``); records'
+        authors come back as the gadget-scoped IDs its code sees as the viewer's."""
         gadget, permissions, revision, publication = self._active(
             app_id, _revision_id(revision_id)
         )
+        result = self._rpc(gadget, permissions, revision, publication, method, params)
+        return self._for_gadget_code(gadget, result)
+
+    def _rpc(
+        self,
+        gadget: Gadget,
+        permissions: GadgetPermissions,
+        revision: dict,
+        publication: dict,
+        method: Any,
+        params: Any,
+    ) -> Any:
         if not isinstance(params, dict):
             raise InvalidInput("RPC params must be an object")
         reads = {"data.v1.get", "data.v1.list"}

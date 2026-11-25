@@ -119,8 +119,13 @@ export interface OmnigentCollection<T extends JsonValue = JsonValue> {
 export interface OmnigentClientContext {
   app: { id: string; name: string };
   revisionId: string;
-  /** `id` is a stable opaque principal ID; store it rather than `displayName`, which can change. */
-  viewer: { id: string; displayName: string };
+  /**
+   * `id` is opaque and stable within this gadget, and is what records' `createdBy` and
+   * `updatedBy` hold for the viewer, so `record.createdBy === context.viewer.id` tells the
+   * viewer's own. `displayName` is a real name, or `null` when the server has none; never a
+   * login or email.
+   */
+  viewer: { id: string; displayName: string | null };
   permissions: { writeData: boolean; publish: boolean };
   /**
    * True in a template preview, where data lives in memory, nothing is saved and actions are off.

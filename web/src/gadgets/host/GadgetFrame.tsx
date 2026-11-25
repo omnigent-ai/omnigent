@@ -410,12 +410,13 @@ export function GadgetFrame({
         protocol: GADGET_PROTOCOL_VERSION,
         app: { id: latest.app.id, name: latest.app.name },
         revisionId: latest.content.revision_id,
-        // Prefer the stable principal ID; fall back to the viewer's name for servers without it.
+        // Gadget code never learns who the viewer is: the server's gadget-scoped ID and a real
+        // name only, never the login or email (an older server's principal ID, and no name).
         viewer: preview
           ? { id: "preview", displayName: "Preview" }
           : {
-              id: latest.app.viewer_principal_id ?? latest.app.viewer_id,
-              displayName: latest.app.viewer_id,
+              id: latest.content.viewer?.id ?? latest.app.viewer_principal_id ?? "viewer",
+              displayName: latest.content.viewer?.display_name ?? null,
             },
         capabilities: grantedCapabilities(latest.content),
         permissions: {

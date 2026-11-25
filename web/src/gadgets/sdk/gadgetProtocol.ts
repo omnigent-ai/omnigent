@@ -189,8 +189,11 @@ export interface GadgetInitContext {
   protocol: typeof GADGET_PROTOCOL_VERSION;
   app: { id: string; name: string };
   revisionId: string;
-  /** The signed-in viewer (not the app owner): a stable opaque ID plus a name to show. */
-  viewer: { id: string; displayName: string };
+  /**
+   * The signed-in viewer (not the app owner): an opaque ID stable within this gadget (records
+   * name their authors the same way), and a real name to show or `null`; never a login or email.
+   */
+  viewer: { id: string; displayName: string | null };
   /** Capabilities granted to this viewer for this revision. */
   capabilities: GadgetCapability[];
   permissions: { writeData: boolean; publish: boolean };

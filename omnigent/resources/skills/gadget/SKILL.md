@@ -77,7 +77,8 @@ collection at a time:
 | `delete` | `id`, `if_version` | `{"id", "version", "deleted": true}` |
 
 A record is `{"id", "value", "version", "created_at", "updated_at",
-"created_by", "updated_by"}`. Pass a stable `operation_id` for each change and
+"created_by", "updated_by"}`; the authors are opaque IDs, the same for one person across
+the gadget's records and equal to `context.viewer.id` in its page, never their user ID. Pass a stable `operation_id` for each change and
 reuse it when you retry, so the change applies once; a `create` without `id`
 gets an ID derived from it.
 
@@ -204,7 +205,7 @@ interface Client {
   context: {
     app: { id: string; name: string };
     revisionId: string;
-    viewer: { id: string; displayName: string }; // who is viewing; store viewer.id, not the name
+    viewer: { id: string; displayName: string | null }; // opaque, per gadget; name may be null
     permissions: { writeData: boolean; publish: boolean };
     preview: boolean; // template preview: data in memory, actions off
   };

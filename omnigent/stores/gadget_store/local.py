@@ -291,8 +291,10 @@ class LocalGadgetFiles(GadgetFiles):
 
     def list_page(self, path: str, *, after: str | None, limit: int) -> tuple[list[str], bool]:
         # One pass over the directory, keeping only the next *limit* names: memory stays
-        # bounded by the page. The file system reads the directory to seek; a database store
-        # seeks with its index instead.
+        # bounded by the page. The file system reads the directory to seek, so the gadget
+        # code lists only directories it keeps small (an index's live generations, a cleanup
+        # queue segment, a user's few top-level folders); anything that grows is numbered and
+        # read by number instead. A database store seeks with its index.
         target = self._resolve(path)
         try:
             with os.scandir(target) as entries:

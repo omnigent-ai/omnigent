@@ -91,7 +91,9 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
   keeping its reference.
 - **Every read and write is bounded.** Documents are at most 32 KiB, HTML at most 1 MiB,
   collections and records are capped, and a collection pages through a numbered order of its
-  records, reading a fixed number of entries per call however large it grows. A record's
+  records, reading a fixed number of entries per call however large it grows; a rule's
+  reference index is numbered the same way, so deleting a target reads only the entries that
+  name it. A record's
   revisions roll into segments; its newest is found by probing segment starts by number and
   listing only the newest segment. Deleted records give their capacity back after a retention
   period (seven days by default) when the store can delete, and removed files go a bounded
@@ -193,6 +195,12 @@ everywhere and the rest only warn about it. So treat gadget code as able to send
   anyway;
 - the viewer's session list and session details, only after the viewer agreed to let that
   gadget read them (asked once per page load).
+
+Who the viewer is stays out of that list: gadget code gets an ID that is opaque and different
+in every gadget (a hash with a secret the gadget's own bookkeeping keeps), the same one its
+records name as their authors, and a name only when the server has a real one, never a
+login or email. A gadget can tell its viewers apart, and mark a viewer's own records, without
+learning who anyone is.
 
 When the frame loads a second document, the web app closes its port at once, stops the frame
 and tells the viewer, who can reload it; it does not reload it on its own. A gadget is written by

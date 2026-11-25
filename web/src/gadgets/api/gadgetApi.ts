@@ -39,6 +39,12 @@ export interface GadgetContent {
   html: string;
   sdk_version: number;
   capabilities: string[];
+  /**
+   * Who gadget code sees as the viewer: an ID that is stable within this gadget and the same
+   * one its records name as their authors, and a name only when the server has a real one
+   * (never a login or email). Older servers omit it.
+   */
+  viewer?: { id: string; display_name: string | null };
 }
 
 /** A rule across records that the server checks on every write (see `gadgets_constraints.py`). */
@@ -231,6 +237,7 @@ function parseContent(value: unknown): GadgetContent {
   ) {
     throw malformed("app content");
   }
+  const viewer = isRecord(value.viewer) ? value.viewer : null;
   return {
     revision_id: value.revision_id,
     html: value.html,
@@ -238,6 +245,14 @@ function parseContent(value: unknown): GadgetContent {
     capabilities: value.capabilities.filter(
       (capability): capability is string => typeof capability === "string",
     ),
+    ...(viewer && typeof viewer.id === "string" && viewer.id !== ""
+      ? {
+          viewer: {
+            id: viewer.id,
+            display_name: typeof viewer.display_name === "string" ? viewer.display_name : null,
+          },
+        }
+      : {}),
   };
 }
 

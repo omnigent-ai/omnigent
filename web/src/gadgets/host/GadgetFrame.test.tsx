@@ -176,7 +176,8 @@ describe("GadgetFrame", () => {
         kind: "init",
         context: expect.objectContaining({
           app: { id: "app-1", name: "Team board" },
-          viewer: { id: "42", displayName: "viewer@example.com" },
+          // Never the viewer's login: an older server's principal ID, and no name.
+          viewer: { id: "42", displayName: null },
           capabilities: ["data.read"],
           permissions: { writeData: true, publish: false },
         }),
@@ -186,6 +187,27 @@ describe("GadgetFrame", () => {
     // One port per document: a second hello gets nothing.
     greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, frameId, nonce });
     expect(posted).toHaveBeenCalledTimes(1);
+  });
+
+  it("tells gadget code only the gadget-scoped viewer ID and a real name, never the login", () => {
+    const view = render(
+      <MemoryRouter>
+        <GadgetFrame
+          app={APP}
+          content={{ ...CONTENT, viewer: { id: "u_opaque", display_name: "Ada" } }}
+          onRevisionChanged={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    const frame = view.container.querySelector("iframe") as HTMLIFrameElement;
+    const frameWindow = frame.contentWindow as Window;
+    vi.spyOn(frameWindow, "postMessage").mockImplementation(() => {});
+    const { frameId, nonce } = mountOf(frame);
+    greet(frameWindow, { type: GADGET_HELLO_MESSAGE_TYPE, frameId, nonce });
+    const channel = FakeMessageChannel.created.at(-1) as FakeMessageChannel;
+    const init = (channel.port1.postMessage as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(init.context.viewer).toEqual({ id: "u_opaque", displayName: "Ada" });
+    expect(JSON.stringify(init)).not.toContain("viewer@example.com");
   });
 
   describe("actions", () => {

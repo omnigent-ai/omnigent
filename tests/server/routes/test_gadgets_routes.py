@@ -224,7 +224,8 @@ async def test_an_owner_builds_publishes_and_uses_a_gadget(
     )
     assert created.status_code == 200, created.text
     record = created.json()["result"]
-    assert record["value"] == {"title": "Ship"} and record["created_by"] == ALICE
+    # Gadget code sees the author as an opaque ID, the viewer ID its content gives it.
+    assert record["value"] == {"title": "Ship"} and record["created_by"] != ALICE
     listed = await client.post(f"{base}/rpc", json=_rpc(gadget, "list"), headers=_as(ALICE))
     assert listed.json()["result"]["items"] == [record]
 
@@ -234,6 +235,8 @@ async def test_an_owner_builds_publishes_and_uses_a_gadget(
     assert published["html"] == "<main>Board</main>"
     content = (await client.get(f"{base}/content", headers=_as(ALICE))).json()
     assert content["capabilities"] == ["data.read", "data.write"]
+    assert content["viewer"]["id"] == record["created_by"]
+    assert ALICE not in json.dumps(content["viewer"])
 
     request = {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "r1"}
     queued = await client.post(f"{base}/actions", json=request, headers=_as(ALICE))
