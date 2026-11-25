@@ -425,7 +425,11 @@ async def test_replacement_proposals_show_their_target_apply_on_accept_and_go_st
     base = f"/v1/projects/{created['id']}/mandate/proposals"
     section = await project_client.post(
         base,
-        json={"mode": "replace_section", "section": "push", "text": "## Push\n\nPush Verified work."},
+        json={
+            "mode": "replace_section",
+            "section": "push",
+            "text": "## Push\n\nPush Verified work.",
+        },
         headers=agent,
     )
     assert section.status_code == 200, section.text
@@ -449,7 +453,9 @@ async def test_replacement_proposals_show_their_target_apply_on_accept_and_go_st
         {"mode": "append", "section": "Git", "text": "x"},
     ):
         assert (await project_client.post(base, json=bad, headers=agent)).status_code == 400, bad
-    assert (await project_client.post(f"{base}/{proposal['id']}/accept", headers=agent)).status_code == 403
+    assert (
+        await project_client.post(f"{base}/{proposal['id']}/accept", headers=agent)
+    ).status_code == 403
     accepted = (await project_client.post(f"{base}/{proposal['id']}/accept")).json()
     assert accepted["mandate"] == "# Rules\n\n## Push\n\nPush Verified work.\n\n## Git\n\nTrailer."
     pending = {entry["id"]: entry for entry in accepted["mandate_proposals"]}
@@ -1648,6 +1654,15 @@ async def test_a_manager_invites_members_but_owner_only_settings_stay_with_the_o
         await client.post(
             shares, json={"user_id": dan}, headers={**owner, ORCHESTRATION_SOURCE_HEADER: "x"}
         ),
+        await client.post(
+            shares, json={"user_id": dan}, headers={**owner, RUNNER_TUNNEL_TOKEN_HEADER: "x"}
+        ),
+        await client.patch(
+            f"{shares}/{BOB}",
+            json={"role": "member"},
+            headers={**bob, RUNNER_TUNNEL_TOKEN_HEADER: "x"},
+        ),
+        await client.delete(f"{shares}/{carol}", headers={**bob, RUNNER_TUNNEL_TOKEN_HEADER: "x"}),
     ):
         assert refused.status_code in (403, 404), refused.text
     assert (await client.get(path, headers=bob)).status_code == 200

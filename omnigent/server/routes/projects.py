@@ -149,8 +149,14 @@ def _share_response(share: ProjectShare) -> dict[str, Any]:
 
 
 def _refuse_agent_share_write(request: Request) -> None:
-    """Sharing is a person's decision: agent tools may never add, change or revoke a share."""
-    if ORCHESTRATION_SOURCE_HEADER in request.headers:
+    """Sharing is a person's decision: agent tools may never add, change or revoke a share.
+
+    An agent's runner carries a source or a runner token header; either one refuses.
+    """
+    if (
+        ORCHESTRATION_SOURCE_HEADER in request.headers
+        or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+    ):
         raise OmnigentError(
             "Agents can't change who has access to a project", code=ErrorCode.FORBIDDEN
         )
