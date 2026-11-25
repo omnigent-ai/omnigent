@@ -8,12 +8,10 @@ the macOS shell in Chromium, as
 
 from __future__ import annotations
 
-import contextlib
 import os
 import re
 from collections.abc import Iterator
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
@@ -23,6 +21,7 @@ from tests.e2e_ui.desktop._mac_shell import (
     WINDOW_CONTROLS_STRIP,
     intersects_window_controls,
 )
+from tests.e2e_ui.files._files_page import seeded_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag
 
 _WIDE_VIEWPORT = {"width": 1280, "height": 860}
@@ -71,8 +70,8 @@ _EMPTY_TITLE_BAR_POINTS_SCRIPT = (
 """
 )
 
-# Samples the maximized rail's tab bar: its tabs, the strip above them, and the empty
-# space between the last tab and the first trailing control.
+# Samples the maximized rail's tab bar: its tabs and trailing controls, the strip above
+# the tabs, and the empty space between the last tab and the first trailing control.
 _WORKSPACE_TAB_BAR_REGIONS_SCRIPT = (
     """
 ({ tabLabels, controlLabels }) => {"""
@@ -81,10 +80,10 @@ _WORKSPACE_TAB_BAR_REGIONS_SCRIPT = (
   const toolbar = document.querySelector('[role="toolbar"][aria-label="Workspace tabs"]');
   const box = (label) => toolbar.querySelector(`[aria-label="${label}"]`)?.getBoundingClientRect();
   const tabs = tabLabels.map(box);
+  const controls = controlLabels.map(box).filter(Boolean);
   const emptyStart = Math.max(...tabs.map((rect) => rect.right));
-  const emptyEnd = Math.min(
-    ...controlLabels.map(box).filter(Boolean).map((rect) => rect.left),
-  );
+  const emptyEnd = Math.min(...controls.map((rect) => rect.left));
+  if (![emptyStart, emptyEnd].every(Number.isFinite)) throw new Error("tab-bar bounds not found");
   const bar = toolbar.getBoundingClientRect();
   const middle = Math.round(bar.top + bar.height / 2);
   const center = (rect) => Math.round(rect.left + rect.width / 2);
@@ -94,6 +93,7 @@ _WORKSPACE_TAB_BAR_REGIONS_SCRIPT = (
   }
   return {
     tabs: tabs.map((rect) => regionAt(center(rect), middle)),
+    controls: controls.map((rect) => regionAt(center(rect), middle)),
     stripAboveTabs: tabs.map((rect) => regionAt(center(rect), bar.top + 8)),
     emptySpace,
   };
@@ -114,6 +114,7 @@ _TABS_SIDEBAR_STRIP_EMPTY_SPACE_SCRIPT = (
     .map((button) => button.getBoundingClientRect())
     .filter((rect) => rect.width && rect.right <= exit.left);
   const emptyStart = Math.max(...leading.map((rect) => rect.right));
+  if (!Number.isFinite(emptyStart)) throw new Error("no toolbar buttons before Exit full screen");
   const bar = toolbar.getBoundingClientRect();
   const middle = Math.round(bar.top + bar.height / 2);
   const emptySpace = [];
@@ -290,22 +291,9 @@ def test_narrow_window_title_bar_stays_draggable(
 def session_with_workspace_files(
     seeded_session: tuple[str, str],
 ) -> Iterator[tuple[str, str]]:
-    base_url, session_id = seeded_session
-    file_urls = [
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{name}"
-        for name in _WORKSPACE_TAB_FILES
-    ]
-    try:
-        for name, file_url in zip(_WORKSPACE_TAB_FILES, file_urls, strict=True):
-            httpx.put(
-                file_url, json={"content": f"# {name}\n", "encoding": "utf-8"}, timeout=10.0
-            ).raise_for_status()
-        yield base_url, session_id
-    finally:
-        # Session deletion leaves workspace files behind.
-        for file_url in file_urls:
-            with contextlib.suppress(httpx.HTTPError):
-                httpx.delete(file_url, timeout=10.0).raise_for_status()
+    files = {name: f"# {name}\n" for name in _WORKSPACE_TAB_FILES}
+    with seeded_workspace(seeded_session, files) as session:
+        yield session
 
 
 def test_maximized_workspace_tab_bar_empty_space_drags_the_window(
@@ -332,6 +320,10 @@ def test_maximized_workspace_tab_bar_empty_space_drags_the_window(
     )
     assert all(point["region"] == "no-drag" for point in regions["tabs"]), (
         f"open tabs would move the window instead of selecting: {regions['tabs']}"
+    )
+    assert len(regions["controls"]) == len(_TAB_BAR_TRAILING_CONTROLS), regions["controls"]
+    assert all(point["region"] == "no-drag" for point in regions["controls"]), (
+        f"trailing controls would move the window instead of clicking: {regions['controls']}"
     )
     assert all(point["region"] == "drag" for point in regions["stripAboveTabs"]), (
         f"strip above the tabs does not drag the window: {regions['stripAboveTabs']}"
