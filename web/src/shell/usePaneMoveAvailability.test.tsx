@@ -41,9 +41,31 @@ function Panes({ width, attached = true }: { width: () => number; attached?: boo
   );
 }
 
+let renders = 0;
+
+/** Panes whose element is a new one on every render, as an owner that remounts it would give. */
+function RemountingPanes({ width }: { width: () => number }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  renders += 1;
+  latest = usePaneMoveAvailability({
+    layout: SIDE_BY_SIDE,
+    zoomedKey: null,
+    paneKey: "a",
+    sizing: () => sizingAt(width),
+    rootRef,
+  });
+  return (
+    <div key={renders} ref={rootRef}>
+      <div data-terminal-pane="a" data-terminal-cols="80" />
+      <div data-terminal-pane="b" />
+    </div>
+  );
+}
+
 afterEach(() => {
   cleanup();
   latest = null;
+  renders = 0;
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -85,5 +107,19 @@ describe("usePaneMoveAvailability", () => {
     const observers = vi.spyOn(MutationObserver.prototype, "disconnect");
     view.unmount();
     expect(observers).toHaveBeenCalled();
+  });
+
+  it("settles when the panes' element is replaced on every render, and watches the new one", () => {
+    let width = 800;
+    const resize = installResizableWidth(width);
+    const view = render(<RemountingPanes width={() => width} />);
+    expect(latest).toEqual({ available: true });
+    expect(renders).toBeLessThan(5);
+
+    view.rerender(<RemountingPanes width={() => width} />);
+    width = 200;
+    resize(width);
+    expect(latest).toEqual({ available: false, reason: NO_ROOM_TO_MOVE_REASON });
+    expect(renders).toBeLessThan(10);
   });
 });

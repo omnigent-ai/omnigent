@@ -217,6 +217,30 @@ def test_chat_keeps_a_split_on_screen_and_splits_from_its_composer(
     )
 
 
+@pytest.mark.parametrize("chord", ["Meta+d", "Meta+Shift+d"])
+def test_a_lone_chat_splits_with_cmd_d(
+    page: Page, panes_session: tuple[str, str], chord: str
+) -> None:
+    """In Chat, before any split, ⌘D and ⇧⌘D from the composer open a shell beside the chat."""
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    _select_view(page, "chat")
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_visible(timeout=30_000)
+    # The agent's terminal, hidden under the chat, is the pane a first split divides.
+    agent = page.get_by_test_id("split-panes-main-view").locator(_AGENT_PANE)
+    expect(agent.get_by_test_id("terminal-view")).to_have_attribute(
+        "data-state", "connected", timeout=60_000
+    )
+    composer.focus()
+    page.keyboard.press(chord)
+    panes = _main_panes(page)
+    expect(panes.locator("[data-chat-pane-body]")).to_be_visible(timeout=60_000)
+    expect(panes.get_by_role("toolbar", name=re.compile(r"^zsh · .* pane$"))).to_have_count(
+        1, timeout=60_000
+    )
+
+
 def test_a_tabs_sidebar_shell_splits_keeps_both_shells_through_a_reload_and_closes_whole(
     page: Page, panes_session: tuple[str, str]
 ) -> None:
