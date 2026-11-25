@@ -53,8 +53,6 @@ function DialogHarness({
   );
 }
 
-const openDialog = () => document.querySelector('[data-quick-pick-dialog][data-state="open"]');
-
 async function openPicker(label = "Run a command") {
   const trigger = screen.getByRole("button", { name: "Open picker" });
   await userEvent.click(trigger);
@@ -77,7 +75,7 @@ describe("QuickPickDialog", () => {
     document.body.append(elsewhere);
     onTestFinished(() => elsewhere.remove());
     const afterClose = vi.fn(() => {
-      expect(openDialog()).toBeNull();
+      expect(screen.queryByRole("dialog")).toBeNull();
       elsewhere.focus();
     });
     render(<DialogHarness onAccept={() => ({ afterClose })} />);
@@ -522,6 +520,37 @@ describe("QuickPickDialog closing at commit with an exit animation", () => {
     expect(editor).toHaveFocus();
   });
 
+  it("drops the accepted row's action when reopened during its exit, without closesAtCommit", async () => {
+    const elsewhere = document.createElement("input");
+    document.body.append(elsewhere);
+    onTestFinished(() => elsewhere.remove());
+    // An action that moves focus, run only once the dialog is gone.
+    const afterClose = vi.fn(() => {
+      expect(document.querySelector("[data-quick-pick-dialog]")).toBeNull();
+      elsewhere.focus();
+    });
+    const { animation } = await openFromEditor(() => ({ afterClose }), false);
+    await userEvent.keyboard("{Enter}");
+    const content = document.querySelector<HTMLElement>("[data-quick-pick-dialog]");
+    expect(content?.dataset.state).toBe("closed");
+    act(() => setOpen(true));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Pick" })).toHaveFocus());
+    expect(afterClose).not.toHaveBeenCalled();
+
+    // Neither a later cancel nor the exit finishing runs the dropped action.
+    animation.stop();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(afterClose).not.toHaveBeenCalled();
+
+    // An accept that closes uninterrupted runs its action once closed, and the focus it moved stays.
+    act(() => setOpen(true));
+    await screen.findByRole("combobox", { name: "Pick" });
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(afterClose).toHaveBeenCalledOnce());
+    expect(elsewhere).toHaveFocus();
+  });
+
   it("keeps the picker focused when reopened during its exit, and runs nothing again", async () => {
     const afterClose = vi.fn();
     const { animation } = await openFromEditor(() => ({ afterClose }));
@@ -766,7 +795,7 @@ describe("QuickPickDialog deferred accepts", () => {
 
   it("waits open, then closes as an accept and runs its action once closed, without a cancel", async () => {
     const onCancel = vi.fn();
-    const afterClose = vi.fn(() => expect(openDialog()).toBeNull());
+    const afterClose = vi.fn(() => expect(dialog()).toBeNull());
     const load = deferred();
     render(<Deferring accept={() => load.promise} onCancel={onCancel} />);
     await screen.findByRole("combobox", { name: "Pick" });
