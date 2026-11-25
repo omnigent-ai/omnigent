@@ -217,16 +217,25 @@ def _process_alive(pid: int) -> bool:
 
 
 def _record_group_signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, bool]]:
-    """Record each ``killpg`` with whether its group leader still existed (even as a zombie)."""
+    """Record each group signal with whether its leader still existed (even as a zombie)."""
+    from omnigent.inner import _proc
+
     calls: list[tuple[int, bool]] = []
-    real_killpg = os.killpg
+    real_killpg = _proc._killpg_fn
+    assert real_killpg is not None
 
     def _killpg(pgid: int, sig: int) -> None:
         calls.append((pgid, Path(f"/proc/{pgid}").exists()))
         real_killpg(pgid, sig)
 
-    monkeypatch.setattr(os, "killpg", _killpg)
+    # The process-tree helpers call the function captured at import, not os.killpg.
+    monkeypatch.setattr(_proc, "_killpg_fn", _killpg)
     return calls
+
+
+_requires_group_signals = pytest.mark.skipif(
+    not hasattr(os, "killpg"), reason="needs POSIX process-group signals"
+)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
@@ -273,6 +282,7 @@ def test_discovery_reports_a_failed_command() -> None:
     assert raised.value.output == "out\n"
 
 
+@_requires_group_signals
 @pytest.mark.skipif(not Path("/proc/self").exists(), reason="needs /proc to observe leaders")
 def test_discovery_timeout_after_the_leader_exits_cleans_up_safely(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -301,9 +311,11 @@ def test_discovery_timeout_after_the_leader_exits_cleans_up_safely(
     while _process_alive(orphan_pid) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not _process_alive(orphan_pid)
+    assert calls, "the timed-out tree was never signalled as a group"
     assert all(leader_present for _pgid, leader_present in calls)
 
 
+@_requires_group_signals
 def test_successful_discovery_sends_no_group_signals(monkeypatch: pytest.MonkeyPatch) -> None:
     """A discovery that finishes in time is reaped without any group teardown."""
     calls = _record_group_signals(monkeypatch)
