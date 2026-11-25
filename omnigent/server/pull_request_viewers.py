@@ -7,6 +7,11 @@ from enum import StrEnum
 from typing import Any
 
 from omnigent.runner.git_providers import ProviderCapabilities
+from omnigent.runner.github_review_fields import (
+    ACCOUNT_COMMENT_FIELDS,
+    ACCOUNT_REACTION_FIELD,
+    ACCOUNT_THREAD_FIELDS,
+)
 
 OWNER_ONLY_CHANGES_MESSAGE = (
     "Only the session's owner can change its pull requests. "
@@ -79,8 +84,18 @@ def _read_only_capabilities(capabilities: object) -> dict[str, bool]:
 
 
 # What the host's account may do in a review conversation, and with each comment in it.
-_THREAD_RIGHTS = ("can_reply", "can_resolve", "can_unresolve")
-_COMMENT_RIGHTS = ("can_react", "can_update", "can_delete", "viewer_did_author")
+# Hosts send whether it may reply even unasked, so that is hidden here too.
+_THREAD_RIGHTS = ("can_reply", *ACCOUNT_THREAD_FIELDS)
+_COMMENT_RIGHTS = ACCOUNT_COMMENT_FIELDS
+
+
+def review_read_params(params: dict[str, Any], viewer: PullRequestViewer) -> dict[str, Any]:
+    """A review read's host params: only the owner's ask for the host account's rights.
+
+    A host sends them only when asked, so they never reach anyone else, whatever the
+    shaping below does.
+    """
+    return {**params, "account_rights": True} if viewer is PullRequestViewer.OWNER else params
 
 
 def review_threads_for_viewer(
@@ -129,7 +144,7 @@ def _comment_for_others(comment: Any) -> Any:
     if isinstance(reactions, list):
         # The counts are everyone's; whether "you" reacted is the host account's.
         shown["reactions"] = [
-            {**reaction, "viewer_reacted": False} if isinstance(reaction, dict) else reaction
+            {**reaction, ACCOUNT_REACTION_FIELD: False} if isinstance(reaction, dict) else reaction
             for reaction in reactions
         ]
     return shown

@@ -561,7 +561,9 @@ async def serve_tunnel_call(
     carries the error, if any.
     """
     pull_request_call = (
-        PullRequestCall(session_id=frame.session_id, vouch=frame.vouch)
+        PullRequestCall(
+            session_id=frame.session_id, vouch=frame.vouch, account_rights=frame.account_rights
+        )
         if frame.session_id
         else None
     )

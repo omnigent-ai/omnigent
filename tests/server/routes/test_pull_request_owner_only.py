@@ -178,9 +178,11 @@ class _RecordingHost:
     def __init__(self) -> None:
         self.reads: list[str] = []
         self.writes: list[str] = []
+        self.read_params: dict[str, dict[str, Any]] = {}
 
-    async def read(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
+    async def read(self, *, op: str, session_id: str, **kwargs: Any) -> dict[str, Any]:
         self.reads.append(f"{session_id}:{op}")
+        self.read_params[op] = kwargs.get("params") or {}
         return copy.deepcopy(_HOST_READS.get(op, {"object": "x"}))
 
     async def write(self, *, op: str, session_id: str, **_kwargs: Any) -> dict[str, Any]:
@@ -576,6 +578,81 @@ async def test_anyone_else_reads_a_threads_comments_without_the_rights(
     assert comment["database_id"] == 5
     assert {name: comment[name] for name in _RIGHTS_OFF} == _RIGHTS_OFF
     assert comment["reactions"][0]["count"] == 2
+
+
+_REVIEW_READS = [
+    ("github_review_threads", _THREADS_PATH, {"pr_url": _PR}),
+    ("github_review_thread_comments", _COMMENTS_PATH, {"pr_url": _PR, "after": "c"}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=["threads", "comments"])
+@pytest.mark.parametrize(
+    ("caller", "asks"),
+    [(_OWNER, True), (_ADMIN_OWNER, True), (_EDITOR, False), (_MANAGER, False), (_ADMIN, False)],
+)
+async def test_the_server_asks_the_host_for_its_accounts_rights_for_the_owner_alone(
+    client: httpx.AsyncClient,
+    host: _RecordingHost,
+    op: str,
+    path: str,
+    params: dict[str, Any],
+    caller: str,
+    asks: bool,
+) -> None:
+    """A host sends what its account may do only when asked, so no one else's read asks."""
+    response = await _call(client, "GET", path, {"params": params}, caller=caller)
+
+    assert response.status_code == 200, response.text
+    assert host.read_params[op].get("account_rights") is (True if asks else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("op", "path", "params"), _REVIEW_READS, ids=["threads", "comments"])
+async def test_unsure_who_reads_the_server_does_not_ask_for_the_accounts_rights(
+    client: httpx.AsyncClient,
+    host: _RecordingHost,
+    monkeypatch: pytest.MonkeyPatch,
+    op: str,
+    path: str,
+    params: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(routes_resources, "_is_session_owner", _lookup_fails)
+    response = await _call(client, "GET", path, {"params": params}, caller=_OWNER)
+
+    assert response.status_code == 200, response.text
+    assert "account_rights" not in host.read_params[op]
+
+
+# A page from a host older than account rights: it sends only whether the account may reply.
+_OLDER_HOST_THREADS: dict[str, Any] = {
+    "data": [{"id": "PRRT_1", "can_reply": True, "comments": {"data": [{"id": "PRRC_1"}]}}],
+    "has_more": False,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("caller", "can_reply"), [(_OWNER, True), (_EDITOR, False)])
+async def test_an_older_hosts_threads_read_as_before(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+    can_reply: bool,
+) -> None:
+    """The owner gets no rights the host didn't send; anyone else, none of the account's."""
+    monkeypatch.setitem(_HOST_READS, "github_review_threads", _OLDER_HOST_THREADS)
+    response = await _call(
+        client, "GET", _THREADS_PATH, {"params": {"pr_url": _PR}}, caller=caller
+    )
+
+    assert response.status_code == 200, response.text
+    [thread] = response.json()["data"]
+    assert thread["can_reply"] is can_reply
+    if caller == _OWNER:
+        assert response.json() == _OLDER_HOST_THREADS
+    else:
+        assert thread["comments"]["data"][0]["viewer_did_author"] is False
 
 
 @pytest.mark.asyncio

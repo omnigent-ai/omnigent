@@ -7,6 +7,7 @@ A provider read past the scope check is a test failure unless the case allows it
 
 from __future__ import annotations
 
+import copy
 import socket
 from pathlib import Path
 from typing import Any
@@ -64,8 +65,11 @@ def _frame(
     *,
     session_id: str | None = _SESSION,
     vouch: PullRequestVouch | None = None,
+    account_rights: bool = False,
 ) -> HostWorkspaceCallFrame:
-    return HostWorkspaceCallFrame("r1", str(root), method, request, session_id, vouch)
+    return HostWorkspaceCallFrame(
+        "r1", str(root), method, request, session_id, vouch, account_rights=account_rights
+    )
 
 
 async def _answer(frame: HostWorkspaceCallFrame) -> tuple[list[bytes], str | None, str | None]:
@@ -982,7 +986,7 @@ _READ_CALLS: dict[str, tuple[Any, str, tuple[Any, ...], dict[str, Any]]] = {
         ),
         "github_review_threads",
         (_SESSION, _PR, "cursor_1", _HEAD, _BASE),
-        {},
+        {"account_rights": False},
     ),
     "ListReviewThreadComments": (
         pb.ListReviewThreadCommentsRequest(
@@ -990,7 +994,7 @@ _READ_CALLS: dict[str, tuple[Any, str, tuple[Any, ...], dict[str, Any]]] = {
         ),
         "github_review_thread_comments",
         (_SESSION, _PR, "thread_1", "cursor_2"),
-        {},
+        {"account_rights": False},
     ),
 }
 
@@ -1023,3 +1027,107 @@ async def test_a_read_passes_the_requests_fields_to_its_reader_and_its_answer_ba
     assert calls == [(reader_method, args, kwargs)]
     payload = payload_dict(WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload)
     assert payload == {"object": "test", "count": 3, "items": [{"line": 4}]}
+
+
+# A review page as GitHub answers it for the host's account, which wrote and reacted.
+_ACCOUNT_COMMENT = {
+    "id": "PRRC_1",
+    "database_id": 5,
+    "author": "host-login",
+    "body": "Why this?",
+    "reactions": [{"content": "HEART", "count": 2, "viewer_reacted": True}],
+    "can_react": True,
+    "can_update": True,
+    "can_delete": True,
+    "viewer_did_author": True,
+}
+_ACCOUNT_THREADS = {
+    "data": [
+        {
+            "id": "PRRT_1",
+            "can_reply": True,
+            "can_resolve": True,
+            "can_unresolve": False,
+            "comments": {"data": [_ACCOUNT_COMMENT], "has_more": False},
+        }
+    ],
+    "has_more": False,
+}
+
+
+class _AccountFacet:
+    """A provider that answers every review read with the host account's rights."""
+
+    def review_threads(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(_ACCOUNT_THREADS)
+
+    def review_thread_comments(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(_ACCOUNT_THREADS["data"][0]["comments"])
+
+
+@pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
+@pytest.mark.parametrize("account_rights", [False, True], ids=["older-server", "owner-asks"])
+async def test_a_review_read_carries_the_accounts_rights_only_when_the_server_asks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, account_rights: bool
+) -> None:
+    """An older server shows the host's page to anyone, so it gets none of the account's."""
+    monkeypatch.setattr(pr_resource, "_review_target", lambda *_a, **_k: (_AccountFacet(), None))
+    request = (
+        pb.ListReviewThreadsRequest(pr_url=_PR)
+        if method == "ListReviewThreads"
+        else pb.ListReviewThreadCommentsRequest(pr_url=_PR, thread_id="PRRT_1", page_token="c")
+    )
+    vouch = PullRequestVouch(server_tracked=True)
+
+    messages, code, message = await _answer(
+        _frame(
+            tmp_path,
+            method,
+            request.SerializeToString(),
+            vouch=vouch,
+            account_rights=account_rights,
+        )
+    )
+
+    assert code is None, message
+    page = payload_dict(WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload)
+    if method == "ListReviewThreads":
+        [thread] = page["data"]
+        assert (thread["id"], thread["can_reply"]) == ("PRRT_1", True)
+        assert ("can_resolve" in thread, "can_unresolve" in thread) == (account_rights,) * 2
+        [comment] = thread["comments"]["data"]
+    else:
+        [comment] = page["data"]
+    assert (comment["id"], comment["database_id"], comment["author"]) == (
+        "PRRC_1",
+        5,
+        "host-login",
+    )
+    assert comment["reactions"][0]["count"] == 2
+    if account_rights:
+        assert comment == _ACCOUNT_COMMENT
+    else:
+        assert not {"can_react", "can_update", "can_delete", "viewer_did_author"} & comment.keys()
+        assert comment["reactions"] == [{"content": "HEART", "count": 2}]
+
+
+@pytest.mark.parametrize("case", ["ListReviewThreads", "ListReviewThreadComments"])
+async def test_the_servers_account_rights_reach_the_review_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    request, reader_method, args, _kwargs = _READ_CALLS[case]
+    calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def record(_self: Any, *got: Any, **got_kwargs: Any) -> dict[str, Any]:
+        calls.append((reader_method, got, got_kwargs))
+        return {"data": []}
+
+    monkeypatch.setattr(WorkspaceReader, reader_method, record)
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+
+    _messages, code, message = await _answer(
+        _frame(tmp_path, case, request.SerializeToString(), vouch=vouch, account_rights=True)
+    )
+
+    assert code is None, message
+    assert calls == [(reader_method, args, {"account_rights": True})]

@@ -1768,6 +1768,7 @@ def register_resource_routes(
         base_sha: str = "",
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        account_rights: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
@@ -1776,6 +1777,7 @@ def register_resource_routes(
             after=after,
             head_sha=head_sha,
             base_sha=base_sha,
+            account_rights=account_rights,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )
@@ -1788,6 +1790,7 @@ def register_resource_routes(
         after: str,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        account_rights: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
@@ -1795,6 +1798,7 @@ def register_resource_routes(
             pr_url=pr_url,
             thread_id=thread_id,
             after=after,
+            account_rights=account_rights,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
         )

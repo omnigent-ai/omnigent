@@ -1099,6 +1099,43 @@ async def test_anyone_else_reads_threads_through_the_api_without_the_rights(
     assert (comment["database_id"], comment["can_update"]) == (2**53 - 1, False)
 
 
+@pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
+@pytest.mark.parametrize(
+    ("viewer", "asks"),
+    [
+        (PullRequestViewer.OWNER, True),
+        (PullRequestViewer.EDITOR, False),
+        (PullRequestViewer.VIEWER, False),
+    ],
+)
+async def test_the_frame_asks_for_the_accounts_rights_for_the_owner_alone(
+    tmp_path: Path, method: str, viewer: PullRequestViewer, asks: bool
+) -> None:
+    """The ask is the server's, in the frame; a request message can't carry it."""
+    tunnel = _tunnel(tmp_path, viewer=viewer)
+    request = (
+        pb.ListReviewThreadsRequest(pr_url=_PR)
+        if method == "ListReviewThreads"
+        else pb.ListReviewThreadCommentsRequest(pr_url=_PR, thread_id="PRRT_1", page_token="c")
+    )
+    call = asyncio.create_task(tunnel.call(method, request))
+    await tunnel.frame_sent()
+    call.cancel()
+
+    [frame] = tunnel.sent
+    assert frame.account_rights is asks
+
+
+async def test_no_other_pull_request_call_asks_for_the_accounts_rights(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path, viewer=PullRequestViewer.OWNER)
+    call = asyncio.create_task(tunnel.call("GetPullRequest", pb.GetPullRequestRequest(pr_url=_PR)))
+    await tunnel.frame_sent()
+    call.cancel()
+
+    [frame] = tunnel.sent
+    assert frame.account_rights is False
+
+
 def test_the_route_takes_the_reader_to_be_the_least_trusted_unless_told() -> None:
     route = workspace_api.PullRequestRoute(_SESSION, vouch=_no_vouch, overview=_as_reported)
     assert route.viewer is PullRequestViewer.VIEWER
@@ -1117,11 +1154,11 @@ async def test_a_failed_owner_lookup_reads_threads_without_the_rights(
 
     monkeypatch.setattr(routes_resources, "_is_session_owner", lookup_fails)
     monkeypatch.setattr(
-        WorkspaceReader, "github_review_threads", lambda _self, *_args: _HOST_THREADS
+        WorkspaceReader, "github_review_threads", lambda _self, *_args, **_kwargs: _HOST_THREADS
     )
     comments = _HOST_THREADS["data"][0]["comments"]
     monkeypatch.setattr(
-        WorkspaceReader, "github_review_thread_comments", lambda _self, *_args: comments
+        WorkspaceReader, "github_review_thread_comments", lambda _self, *_args, **_kwargs: comments
     )
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
 
@@ -1148,7 +1185,7 @@ async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
 
     monkeypatch.setattr(routes_resources, "_is_session_owner", lambda *_a, **_k: owner)
     monkeypatch.setattr(
-        WorkspaceReader, "github_review_threads", lambda _self, *_args: _HOST_THREADS
+        WorkspaceReader, "github_review_threads", lambda _self, *_args, **_kwargs: _HOST_THREADS
     )
     client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
 

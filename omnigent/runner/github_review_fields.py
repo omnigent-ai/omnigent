@@ -6,6 +6,7 @@ Pure, so the server can check a request with them before it forwards it.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 # The verdicts a review can carry, and the state GitHub reports for each once submitted.
@@ -53,3 +54,49 @@ def reactions(groups: Any) -> list[dict[str, Any]]:
                 }
             )
     return shaped
+
+
+# What GitHub says the host's account may do in a review conversation, or did there. A server
+# hides them from all but the session's owner, so the host sends them only when it asks.
+ACCOUNT_THREAD_FIELDS = ("can_resolve", "can_unresolve")
+ACCOUNT_COMMENT_FIELDS = ("can_react", "can_update", "can_delete", "viewer_did_author")
+ACCOUNT_REACTION_FIELD = "viewer_reacted"
+
+
+def threads_without_account_rights(page: dict[str, Any]) -> dict[str, Any]:
+    """A review-threads page without its account fields; IDs, content and counts stay."""
+    return {**page, "data": _mapped(page.get("data"), _thread_without_account_rights)}
+
+
+def comments_without_account_rights(page: dict[str, Any]) -> dict[str, Any]:
+    """A page of one conversation's comments without its account fields; see above."""
+    return {**page, "data": _mapped(page.get("data"), _comment_without_account_rights)}
+
+
+def _mapped(items: Any, shape: Callable[[Any], Any]) -> Any:
+    return [shape(item) for item in items] if isinstance(items, list) else items
+
+
+def _thread_without_account_rights(thread: Any) -> Any:
+    if not isinstance(thread, dict):
+        return thread
+    shown = {key: value for key, value in thread.items() if key not in ACCOUNT_THREAD_FIELDS}
+    comments = thread.get("comments")
+    if isinstance(comments, dict):
+        shown["comments"] = comments_without_account_rights(comments)
+    return shown
+
+
+def _comment_without_account_rights(comment: Any) -> Any:
+    if not isinstance(comment, dict):
+        return comment
+    shown = {key: value for key, value in comment.items() if key not in ACCOUNT_COMMENT_FIELDS}
+    reactions = comment.get("reactions")
+    if isinstance(reactions, list):
+        shown["reactions"] = [
+            {key: value for key, value in reaction.items() if key != ACCOUNT_REACTION_FIELD}
+            if isinstance(reaction, dict)
+            else reaction
+            for reaction in reactions
+        ]
+    return shown

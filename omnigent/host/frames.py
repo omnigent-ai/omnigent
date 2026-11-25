@@ -1340,6 +1340,8 @@ class HostWorkspaceCallFrame:
         Only the server sets it; a host serves no pull request call without it.
     :param vouch: The server's vouch for a pull request call's PR, or ``None`` when the
         server stores none of the session's PRs yet, so the host's own record decides.
+    :param account_rights: Whether a review read may include what the host's account may do
+        and did. The server asks only for the session's owner; an older one never asks.
     """
 
     request_id: str
@@ -1348,6 +1350,7 @@ class HostWorkspaceCallFrame:
     request: bytes = b""
     session_id: str | None = None
     vouch: PullRequestVouch | None = None
+    account_rights: bool = False
 
 
 @dataclass
@@ -2321,6 +2324,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                     if frame.vouch is not None
                     else {}
                 ),
+                **({"account_rights": True} if frame.account_rights else {}),
             }
         )
     if isinstance(frame, HostWorkspaceReplyFrame):
@@ -2936,6 +2940,7 @@ def _decode_known_host_frame(
                 request=base64.b64decode(_optional_nullable_str(msg, "request") or ""),
                 session_id=_optional_nullable_str(msg, "session_id"),
                 vouch=_optional_pull_request_vouch(msg, "vouch"),
+                account_rights=_optional_bool(msg, "account_rights"),
             )
         case HostFrameKind.WORKSPACE_REPLY:
             message = _optional_nullable_str(msg, "message")

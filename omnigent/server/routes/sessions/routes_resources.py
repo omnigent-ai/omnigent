@@ -69,6 +69,7 @@ from omnigent.server.pull_request_viewers import (
     PullRequestViewer,
     info_for_viewer,
     review_comments_for_viewer,
+    review_read_params,
     review_threads_for_viewer,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -4495,6 +4496,9 @@ def register_resources_routes(
                 "base_sha": base_sha,
             },
         )
+        # The host account's rights in each conversation are the owner's to see.
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
         threads = await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -4503,8 +4507,7 @@ def register_resources_routes(
             runner_params=params,
             runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
         )
-        # The host account's rights in each conversation are the owner's to see.
-        return review_threads_for_viewer(threads, await _pull_request_viewer(conv, request))
+        return review_threads_for_viewer(threads, viewer)
 
     @router.get(
         "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
@@ -4520,6 +4523,8 @@ def register_resources_routes(
         """Load additional replies in a published PR review conversation."""
         conv = await _validate_session(session_id, request, LEVEL_READ)
         params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
         comments = await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -4531,7 +4536,7 @@ def register_resources_routes(
                 f"{urllib.parse.quote(thread_id, safe='')}/comments"
             ),
         )
-        return review_comments_for_viewer(comments, await _pull_request_viewer(conv, request))
+        return review_comments_for_viewer(comments, viewer)
 
     @router.post(
         "/sessions/{session_id}/resources/github/review-threads",

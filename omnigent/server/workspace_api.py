@@ -200,18 +200,21 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         vouch = await route.vouch(getattr(request, "pr_url", ""))
         sent_at = time.time()
         changes = not method.no_side_effects
+        shape = _VIEWER_SHAPES.get(method.name)
+        owner = route.viewer is PullRequestViewer.OWNER
         message = await self._unary(
             method.name,
             request,
             session_id=route.session_id,
             vouch=vouch,
+            # The host sends its account's rights in a review read only when asked.
+            account_rights=shape is not None and owner,
             unconfirmed=_unconfirmed_change(method.name) if changes else None,
             timeout=_WRITE_REPLY_TIMEOUT_S if changes else _REPLY_TIMEOUT_S,
         )
         # Every pull request response is one ``payload`` Struct, the REST route's JSON.
         response: Any = method.response_type.FromString(message)
-        shape = _VIEWER_SHAPES.get(method.name)
-        if shape is not None and route.viewer is not PullRequestViewer.OWNER:
+        if shape is not None and not owner:
             shaped = shape(payload_dict(response.payload), route.viewer)
             return method.response_type(payload=payload_struct(shaped))
         if method.name not in _OVERVIEW_METHODS:
@@ -230,6 +233,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         *,
         session_id: str | None = None,
         vouch: PullRequestVouch | None = None,
+        account_rights: bool = False,
         unconfirmed: str | None = None,
         timeout: float = _REPLY_TIMEOUT_S,
     ) -> bytes:
@@ -240,6 +244,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
                 request,
                 session_id=session_id,
                 vouch=vouch,
+                account_rights=account_rights,
                 unconfirmed=unconfirmed,
                 timeout=timeout,
             )
@@ -255,6 +260,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         *,
         session_id: str | None = None,
         vouch: PullRequestVouch | None = None,
+        account_rights: bool = False,
         unconfirmed: str | None = None,
         timeout: float = _REPLY_TIMEOUT_S,
     ) -> AsyncIterator[bytes]:
@@ -262,6 +268,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
 
         :param session_id: The authorized session, sent on pull request calls only.
         :param vouch: The server's vouch for a pull request call's PR.
+        :param account_rights: Whether to ask for the host account's rights in a review read.
         :param unconfirmed: For a change, the message when it may have been made but its
             answer was lost: once the frame is sent, a timeout is DEADLINE_EXCEEDED, and an
             UNAVAILABLE end, such as a dropped tunnel, or a host's INTERNAL is UNKNOWN.
@@ -282,6 +289,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
                 request.SerializeToString(),
                 session_id=session_id,
                 vouch=vouch,
+                account_rights=account_rights,
             )
             try:
                 target.registry.send_text(target.host, encode_host_frame(call))

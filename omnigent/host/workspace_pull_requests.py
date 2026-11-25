@@ -36,10 +36,13 @@ class PullRequestCall:
     :param session_id: The session the caller was authorized for, e.g. ``"conv_1"``.
     :param vouch: The server's vouch for the call's PR, or ``None`` when the server
         stores none of the session's PRs yet, so this host's own record decides.
+    :param account_rights: Whether the server asked for the host account's rights in a
+        review read, which it does only for the session's owner.
     """
 
     session_id: str
     vouch: PullRequestVouch | None = None
+    account_rights: bool = False
 
 
 # One pull request method: the reader, the call and the request, to the REST payload.
@@ -216,10 +219,19 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
         from_sha=_optional(request.from_sha),
     ),
     "ListReviewThreads": lambda reader, call, request: reader.github_review_threads(
-        call.session_id, request.pr_url, request.page_token, request.head_sha, request.base_sha
+        call.session_id,
+        request.pr_url,
+        request.page_token,
+        request.head_sha,
+        request.base_sha,
+        account_rights=call.account_rights,
     ),
     "ListReviewThreadComments": lambda reader, call, request: reader.github_review_thread_comments(
-        call.session_id, request.pr_url, request.thread_id, request.page_token
+        call.session_id,
+        request.pr_url,
+        request.thread_id,
+        request.page_token,
+        account_rights=call.account_rights,
     ),
     # The session owner's: what the edit controls offer, and the changes themselves.
     "ListLabels": lambda reader, call, request: reader.github_labels(
