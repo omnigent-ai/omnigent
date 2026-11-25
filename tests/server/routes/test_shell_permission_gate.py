@@ -1273,6 +1273,41 @@ async def test_workspace_api_follows_the_file_read_gate(
     assert b"unavailable" in resp.content
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("session", "passes"), [("conv_share", False), ("conv_open", True)])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+    ],
+)
+async def test_workspace_api_gates_a_repository_folder_like_the_workspace(
+    client: httpx.AsyncClient, session: str, passes: bool, method: str
+) -> None:
+    """Naming a folder inside the workspace needs the same file read gate, and no other."""
+    body = b'{"repository": ".worktrees/feature"}'
+    streaming = method == "ReadBaseFile"
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers={
+            "X-Forwarded-Email": "viewer@example.com",
+            "Content-Type": "application/connect+json" if streaming else "application/json",
+        },
+        content=b"\x00" + len(body).to_bytes(4, "big") + body if streaming else body,
+    )
+
+    if not passes:
+        assert resp.status_code == 403, resp.text
+        return
+    assert resp.status_code == (200 if streaming else 503), resp.text
+    assert b"unavailable" in resp.content
+
+
 _PR_BROWSE_READS = [
     "ListPullRequestFiles",
     "GetPullRequestDiff",

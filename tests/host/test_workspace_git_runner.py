@@ -25,9 +25,11 @@ from omnigent.host.workspace_git import runner
 from omnigent.host.workspace_git.runner import (
     Deadline,
     GitError,
+    GitOutput,
     GitProblem,
     GitRepository,
     check_revision,
+    failure,
     is_object_name,
     parse_behavior_configuration,
     parse_version,
@@ -703,3 +705,35 @@ async def test_partial_output_never_signals_a_reaped_git(
 
     assert output.overflowed and len(output.stdout) == 1000
     assert reaped == []
+
+
+@pytest.mark.parametrize(
+    ("stderr", "detail"),
+    [
+        (
+            "fatal: not a git repository: '/srv/main/.git/worktrees/work'",
+            "fatal: not a git repository: '<path>'",
+        ),
+        (
+            "fatal: not a git repository: '/srv/my repo/.git/worktrees/work'",
+            "fatal: not a git repository: '<path>'",
+        ),
+        (
+            "fatal: cannot chdir to /srv/my repo/sub: No such file or directory",
+            "fatal: cannot chdir to <path>: No such file or directory",
+        ),
+        # Unquoted, a path's end can't be told from the words after it, so they go too.
+        ("error: C:\\repo\\.git\\index is locked", "error: <path>"),
+        ("fatal: bad revision 'origin/main'", "fatal: bad revision 'origin/main'"),
+    ],
+)
+def test_a_failed_git_call_leaves_absolute_paths_out_of_its_detail(
+    stderr: str, detail: str
+) -> None:
+    """A linked worktree's Git directory may lie outside the workspace; clients don't see it."""
+    error = failure(
+        GitOutput(stdout=b"", returncode=128, stderr=f"warning: first\n{stderr}\n"), "status"
+    )
+
+    assert error.problem is GitProblem.FAILED
+    assert error.detail == detail

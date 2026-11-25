@@ -30,6 +30,7 @@ from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from connectrpc.protocol import ProtocolType
 from fastapi import FastAPI
+from google.protobuf.message import Message
 from pyqwest import Client
 from pyqwest.testing import ASGITransport
 
@@ -43,6 +44,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ENTRY_TYPE_DIRECTORY,
     FILE_SEARCH_MODE_SUBSTRING,
     GetCapabilitiesRequest,
+    ListBranchCommitsRequest,
     ListDirectoryRequest,
     ListRepositoryRefsRequest,
     ListWorkingCopyChangesRequest,
@@ -932,6 +934,64 @@ async def test_base_reads_match_file_reads_and_changes_list_on_every_route(
     assert base[0].metadata.content_type == disk[0].metadata.content_type
 
 
+async def test_a_named_folder_and_head_reach_the_host_on_every_route(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """A worktree folder compares on its own, and a named head lists its own commits."""
+    root = _repository(tmp_path / "repo")
+    _git(root, "worktree", "add", "-q", "-b", "feature", ".worktrees/feature")
+    feature = root / ".worktrees" / "feature"
+    (feature / "a.txt").write_text("changed in the worktree\n")
+    _git(feature, "commit", "-qam", "feature work")
+    (feature / "new.txt").write_text("new\n")
+    client = client_for(root)
+
+    changes = await client.list_working_copy_changes(
+        ListWorkingCopyChangesRequest(repository=".worktrees/feature")
+    )
+    commits = await client.list_branch_commits(
+        ListBranchCommitsRequest(base_revision="main", head_revision="feature")
+    )
+    with pytest.raises(ConnectError) as refused:
+        await client.list_working_copy_changes(ListWorkingCopyChangesRequest(repository=".."))
+
+    assert [file.path for file in changes.files] == ["new.txt"]
+    assert changes.base.head == _git(feature, "rev-parse", "HEAD").strip()
+    assert [commit.subject for commit in commits.commits] == ["feature work"]
+    assert refused.value.code == Code.INVALID_ARGUMENT
+
+
+def _older_branch_commits_request() -> type[Message]:
+    """ListBranchCommitsRequest as a server from before head_revision and repository knew it."""
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+    file = descriptor_pb2.FileDescriptorProto(name="older_workspace.proto", package="older")
+    message = file.message_type.add(name="ListBranchCommitsRequest")
+    message.field.add(
+        name="base_revision",
+        number=1,
+        type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+        label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+    )
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file)
+    return message_factory.GetMessageClass(
+        pool.FindMessageTypeByName("older.ListBranchCommitsRequest")
+    )
+
+
+async def test_a_server_reencoding_a_request_keeps_fields_its_proto_doesnt_know() -> None:
+    """The server decodes and re-encodes each call; an older one still forwards newer fields."""
+    sent = ListBranchCommitsRequest(
+        base_revision="main", head_revision="feature", repository=".worktrees/feature"
+    )
+    older = _older_branch_commits_request().FromString(sent.SerializeToString())
+
+    forwarded = ListBranchCommitsRequest.FromString(older.SerializeToString())
+
+    assert forwarded == sent
+
+
 async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: ClientFor) -> None:
     client = client_for(tmp_path)
 
@@ -957,6 +1017,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
         "text_search_priority",
         "ResolveWorkingCopyBase",
         "revision_comparison",
+        "comparison.repository",
         "ListWorkingCopyChanges",
         "ReadBaseFile",
         "ListRepositoryRefs",

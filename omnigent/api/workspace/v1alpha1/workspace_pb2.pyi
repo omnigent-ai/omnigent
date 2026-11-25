@@ -429,10 +429,12 @@ class WorkingCopyBase(_message.Message):
     def __init__(self, kind: _Optional[_Union[ComparisonKind, str]] = ..., head: _Optional[str] = ..., base: _Optional[str] = ..., reference: _Optional[str] = ..., reference_commit: _Optional[str] = ..., unavailable: _Optional[_Union[ComparisonUnavailable, _Mapping]] = ..., merge_base: _Optional[str] = ..., base_display: _Optional[str] = ..., head_display: _Optional[str] = ..., head_is_working_copy: _Optional[bool] = ...) -> None: ...
 
 class ResolveWorkingCopyBaseRequest(_message.Message):
-    __slots__ = ("comparison",)
+    __slots__ = ("comparison", "repository")
     COMPARISON_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
     comparison: Comparison
-    def __init__(self, comparison: _Optional[_Union[Comparison, _Mapping]] = ...) -> None: ...
+    repository: str
+    def __init__(self, comparison: _Optional[_Union[Comparison, _Mapping]] = ..., repository: _Optional[str] = ...) -> None: ...
 
 class ResolveWorkingCopyBaseResponse(_message.Message):
     __slots__ = ("base",)
@@ -491,10 +493,12 @@ class WorkingFileMetadata(_message.Message):
     def __init__(self, size: _Optional[int] = ..., modified_unix_nanos: _Optional[int] = ..., changed_unix_nanos: _Optional[int] = ..., inode: _Optional[int] = ..., device: _Optional[int] = ...) -> None: ...
 
 class ListWorkingCopyChangesRequest(_message.Message):
-    __slots__ = ("comparison",)
+    __slots__ = ("comparison", "repository")
     COMPARISON_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
     comparison: Comparison
-    def __init__(self, comparison: _Optional[_Union[Comparison, _Mapping]] = ...) -> None: ...
+    repository: str
+    def __init__(self, comparison: _Optional[_Union[Comparison, _Mapping]] = ..., repository: _Optional[str] = ...) -> None: ...
 
 class ListWorkingCopyChangesResponse(_message.Message):
     __slots__ = ("base", "files", "unrepresentable_names")
@@ -507,16 +511,18 @@ class ListWorkingCopyChangesResponse(_message.Message):
     def __init__(self, base: _Optional[_Union[WorkingCopyBase, _Mapping]] = ..., files: _Optional[_Iterable[_Union[ChangedFile, _Mapping]]] = ..., unrepresentable_names: _Optional[int] = ...) -> None: ...
 
 class ReadBaseFileRequest(_message.Message):
-    __slots__ = ("commit", "path", "object", "maximum_bytes")
+    __slots__ = ("commit", "path", "object", "maximum_bytes", "repository")
     COMMIT_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
     OBJECT_FIELD_NUMBER: _ClassVar[int]
     MAXIMUM_BYTES_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
     commit: str
     path: str
     object: str
     maximum_bytes: int
-    def __init__(self, commit: _Optional[str] = ..., path: _Optional[str] = ..., object: _Optional[str] = ..., maximum_bytes: _Optional[int] = ...) -> None: ...
+    repository: str
+    def __init__(self, commit: _Optional[str] = ..., path: _Optional[str] = ..., object: _Optional[str] = ..., maximum_bytes: _Optional[int] = ..., repository: _Optional[str] = ...) -> None: ...
 
 class ReadBaseFileResponse(_message.Message):
     __slots__ = ("metadata", "data")
@@ -539,8 +545,10 @@ class ReadLinkTextResponse(_message.Message):
     def __init__(self, target: _Optional[bytes] = ...) -> None: ...
 
 class ListRepositoryRefsRequest(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...
+    __slots__ = ("repository",)
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
+    repository: str
+    def __init__(self, repository: _Optional[str] = ...) -> None: ...
 
 class ListRepositoryRefsResponse(_message.Message):
     __slots__ = ("refs", "truncated", "default_branch_ref")
@@ -553,12 +561,14 @@ class ListRepositoryRefsResponse(_message.Message):
     def __init__(self, refs: _Optional[_Iterable[str]] = ..., truncated: _Optional[bool] = ..., default_branch_ref: _Optional[str] = ...) -> None: ...
 
 class ListBranchCommitsRequest(_message.Message):
-    __slots__ = ("base_revision", "head_revision")
+    __slots__ = ("base_revision", "head_revision", "repository")
     BASE_REVISION_FIELD_NUMBER: _ClassVar[int]
     HEAD_REVISION_FIELD_NUMBER: _ClassVar[int]
+    REPOSITORY_FIELD_NUMBER: _ClassVar[int]
     base_revision: str
     head_revision: str
-    def __init__(self, base_revision: _Optional[str] = ..., head_revision: _Optional[str] = ...) -> None: ...
+    repository: str
+    def __init__(self, base_revision: _Optional[str] = ..., head_revision: _Optional[str] = ..., repository: _Optional[str] = ...) -> None: ...
 
 class BranchCommit(_message.Message):
     __slots__ = ("object", "subject", "author_name", "author_time_unix", "root", "body")
