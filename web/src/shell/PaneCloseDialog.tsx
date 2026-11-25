@@ -16,6 +16,7 @@ export function PaneCloseDialog({
     <CloseShellDialog
       open={pendingClose !== null}
       shellLabel={pendingClose && terminalDisplayLabel(pendingClose.terminal)}
+      busy={pendingClose?.busy}
       onConfirm={actions.confirmClose}
       onCancel={actions.cancelClose}
     />

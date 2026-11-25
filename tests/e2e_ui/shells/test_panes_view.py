@@ -21,8 +21,10 @@ are in the component tests (``useTerminalPaneHotkeys``, ``terminalPaneActions``,
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -425,3 +427,92 @@ def test_a_split_resizes_through_a_whole_drag(
     ).json_value()
     # As the divider rounds it: Math.round, halves up.
     expect(divider).to_have_attribute("aria-valuenow", str(math.floor(saved * 100 + 0.5)))
+
+
+# Floating panes: an exiting shell and a pane row's move band.
+
+_WIDE_DESKTOP = {"width": 2200, "height": 900}
+
+
+def _capture(page: Page, name: str) -> None:
+    """Save what the page shows as `name`.png under OMNIGENT_E2E_CAPTURES, when it's set."""
+    if target := os.environ.get("OMNIGENT_E2E_CAPTURES"):
+        page.screenshot(path=str(Path(target, f"{name}.png")))
+
+
+# Resolves once two frames have painted, so a pointer move's re-render has landed.
+_TWO_FRAMES = "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+
+
+def test_a_split_pane_closes_as_soon_as_its_shell_exits(
+    page: Page, panes_session: tuple[str, str]
+) -> None:
+    """``exit`` in a split pane removes it within two seconds, before the runner reports the
+    exit, and the agent pane beside it takes the keyboard."""
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    shell = _split_from(page, panes, agent)
+    expect(shell).to_be_focused(timeout=30_000)
+
+    page.keyboard.type("exit")
+    page.keyboard.press("Enter")
+    # The runner lists an exited shell for about 3 s more; the pane goes on the attach's end.
+    expect(panes.get_by_test_id("terminal-view")).to_have_count(1, timeout=2_000)
+    expect(agent).to_be_focused()
+
+
+def _capture_both_schemes(page: Page, name: str) -> None:
+    """Save `name` in the light and the dark theme, leaving the page light."""
+    for scheme in ("light", "dark"):
+        page.emulate_media(color_scheme=scheme)
+        page.evaluate(_TWO_FRAMES)
+        _capture(page, f"{name}-{scheme}")
+    page.emulate_media(color_scheme="light")
+
+
+def test_a_floating_pane_maximizes_on_a_double_click_away_from_its_move_handle(
+    page: Page, panes_session: tuple[str, str]
+) -> None:
+    """A double-click on a pane's toolbar away from its handle maximizes the pane without lifting
+    it; a double-click in the band around the handle, which moves the pane, maximizes nothing."""
+    page.emulate_media(color_scheme="light")
+    base_url, session_id = panes_session
+    _open(page, base_url, session_id, floating=True)
+    page.set_viewport_size(_WIDE_DESKTOP)
+    _select_view(page, "terminal")
+    panes = _main_panes(page)
+    agent = _connected(panes.locator(_AGENT_PANE).get_by_test_id("terminal-view"))
+    _split_from(page, panes, agent)
+    shell_pane = panes.locator(f"[data-terminal-pane]:not({_AGENT_PANE})").first
+    strip = shell_pane.locator("[data-pane-strip]")
+    box = strip.bounding_box()
+    assert box is not None
+    middle_x, middle_y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    # Any press that lifts the pane, however brief, stays in the record.
+    page.evaluate(
+        """() => {
+      window.__lifted = false;
+      new MutationObserver(() => {
+        if (document.querySelector("[data-pane-held]")) window.__lifted = true;
+      }).observe(document.body, {
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["data-pane-held"],
+      });
+    }"""
+    )
+    page.mouse.move(middle_x, middle_y)
+    _capture_both_schemes(page, "pane-move-band")
+
+    page.mouse.dblclick(middle_x, middle_y)
+    page.evaluate(_TWO_FRAMES)
+    expect(panes.locator("[data-pane-zoomed]")).to_have_count(0)
+    page.evaluate("window.__lifted = false")
+
+    page.mouse.dblclick(box["x"] + box["width"] - 140, middle_y)
+    expect(panes.locator("[data-pane-zoomed]")).to_have_count(1, timeout=10_000)
+    assert page.evaluate("window.__lifted") is False
+    _capture_both_schemes(page, "pane-maximized")
