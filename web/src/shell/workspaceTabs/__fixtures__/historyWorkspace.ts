@@ -127,8 +127,9 @@ export class HistoryWorkspace {
   /** The user selects a tab: a step for whatever it shows. */
   select(id: TabId): void {
     if (id === this.selectedTabId) return;
-    this.browsers.get(this.selectedTabId)?.deselected();
+    const previous = this.selectedTabId;
     this.selectedTabId = id;
+    this.browsers.get(previous)?.deselected();
     const tab = this.tab(id);
     tab.dot = false;
     this.history = recordStep(this.history, this.visitOf(tab));
@@ -226,8 +227,9 @@ export class HistoryWorkspace {
     if (changesPlace && tab.dirty && (await this.askToLeave([tab.id])) === "cancel")
       return { moved: false };
     this.history = direction < 0 ? goBack(this.history, options) : goForward(this.history, options);
-    if (this.selectedTabId !== tab.id) this.browsers.get(this.selectedTabId)?.deselected();
+    const previous = this.selectedTabId;
     this.selectedTabId = tab.id;
+    if (previous !== tab.id) this.browsers.get(previous)?.deselected();
     return { moved: true, landing: this.show(target) };
   }
 

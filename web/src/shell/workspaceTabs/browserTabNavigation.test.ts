@@ -5,7 +5,7 @@ import {
   FakeBrowserBridge,
   HistoryWorkspace,
 } from "./__fixtures__/historyWorkspace";
-import { REPLAY_WAIT_MS, type BrowserTabNavigation, type LandResult } from "./browserTabNavigation";
+import { REPLAY_WAIT_MS, type LandResult } from "./browserTabNavigation";
 import { recordStep } from "./workspaceHistory";
 import { formatWorkspaceLink, parseWorkspaceLink } from "./workspaceLink";
 import type { Visit } from "./workspacePlace";
@@ -118,18 +118,56 @@ describe("browser pages in the timeline, replay mode", () => {
     expect(describeHistory(ws.history)).toBe("[W:/a*]");
   });
 
-  it.each([
-    ["the user acts in the tab", (owner: BrowserTabNavigation) => owner.userActed()],
-    ["the tab is deselected", (owner: BrowserTabNavigation) => owner.deselected()],
-  ])("the wait ends when %s, and later URL events are ordinary", async (_name, end) => {
-    const { ws, owner } = browserWorkspace("replay", "/a");
+  it("the wait ends when the user acts in the tab, which goes back to the page it shows", async () => {
+    const { ws, bridge, owner } = browserWorkspace("replay", "/a");
     owner.onUrlChanged({ viewKey: "view-W", url: page("/b") });
+    // Back's load waits for the session's host, so it is never issued.
+    holdLoadOf(bridge, "/a");
     const replay = await ws.back();
-    end(owner);
+    expect(ws.tab("W").place).toEqual({ kind: "web", url: page("/a") });
+
+    owner.userActed();
     expect(await replay.landing).toBe("superseded");
     expect(owner.isWaitingForReplay()).toBe(false);
+    expect(ws.tab("W").place).toEqual({ kind: "web", url: page("/b") });
+    expect(describeHistory(ws.history)).toBe("[W:/a, W:/b*]");
+    // The reload commits the same page: nothing moves.
+    owner.onUrlChanged({ viewKey: "view-W", url: page("/b") });
+    expect(describeHistory(ws.history)).toBe("[W:/a, W:/b*]");
+    // Later URL events are ordinary steps.
     owner.onUrlChanged({ viewKey: "view-W", url: page("/c") });
-    expect(describeHistory(ws.history)).toBe("[W:/a, W:/c*]");
+    expect(describeHistory(ws.history)).toBe("[W:/a, W:/b, W:/c*]");
+  });
+
+  it("the wait ends when another tab is selected, and the tab keeps the page it shows", async () => {
+    const { ws, bridge, owner } = browserWorkspace("replay", "/a");
+    owner.onUrlChanged({ viewKey: "view-W", url: page("/b") });
+    holdLoadOf(bridge, "/a");
+    const replay = await ws.back();
+
+    ws.select("F");
+    expect(await replay.landing).toBe("superseded");
+    expect(owner.isWaitingForReplay()).toBe(false);
+    expect(ws.tab("W").place).toEqual({ kind: "web", url: page("/b") });
+    // In the background, a URL event moves only the tab.
+    owner.onUrlChanged({ viewKey: "view-W", url: page("/c") });
+    expect(ws.tab("W").place).toEqual({ kind: "web", url: page("/c") });
+    expect(describeHistory(ws.history)).toBe("[W:/a, F:a*]");
+  });
+
+  it("a typed load still waiting for the host ends, and the tab goes back to its page", async () => {
+    const { ws, bridge, owner } = browserWorkspace("untracked", "/a");
+    openFromUrlBar(ws, "/b");
+    await owner.land({ tabId: "W", place: { kind: "web", url: page("/b") } });
+    const release = holdLoadOf(bridge, "/a");
+    const back = await ws.back();
+    expect(ws.tab("W").place).toEqual({ kind: "web", url: page("/a") });
+
+    owner.userActed();
+    release();
+    expect(await back.landing).toBe("superseded");
+    expect(ws.tab("W").place).toEqual({ kind: "web", url: page("/b") });
+    expect(describeHistory(ws.history)).toBe("[W:/a, W:/b*]");
   });
 
   it("the wait ends after 15 seconds without claiming a failure", async () => {

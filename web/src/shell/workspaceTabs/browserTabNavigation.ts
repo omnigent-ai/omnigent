@@ -181,12 +181,15 @@ export class BrowserTabNavigation {
   /**
    * The user typed in the URL bar, used the page's own ‹ › or reloaded: a waiting
    * landing ends, and a load not yet issued (one waiting for the session's host) is
-   * revoked, so it can't overwrite where the user went.
+   * revoked, so it can't overwrite where the user went. The tab and cursor go back to
+   * the page the view last committed, which is the one the user acted on.
    */
   userActed(submission?: number): void {
     this.generation += 1;
+    const abandoned = this.loadInFlight();
     if (this.pending) this.finish(this.pending, "superseded");
     this.untrackedLoad = null;
+    if (abandoned) this.reconcileWithLivePage();
     this.submission =
       submission === undefined ? null : { id: submission, generation: this.generation };
   }
@@ -240,12 +243,15 @@ export class BrowserTabNavigation {
   }
 
   /**
-   * Another tab was selected: a waiting replay ends. A load not yet issued, and a
-   * typed address whose load is still to be accepted, are kept: only focus moved,
-   * and no other navigation competes with them.
+   * Another tab is being selected: a waiting replay ends, and the tab shows the page the
+   * view last committed until another event moves it. The timeline is left to the new
+   * selection. An untracked load not yet issued, and a typed address whose load is still
+   * to be accepted, are kept: only focus moved, and no other navigation competes with them.
    */
   deselected(): void {
-    if (this.pending) this.finish(this.pending, "superseded");
+    if (!this.pending) return;
+    this.finish(this.pending, "superseded");
+    if (this.live) this.host.apply({ place: { url: placeUrl(this.live.url) } });
   }
 
   /** The tab closed, the session or design switched: late events for it are ignored from now on. */

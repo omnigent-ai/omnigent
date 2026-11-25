@@ -268,6 +268,8 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   let recentlySelected: TabId[] = selectedTabId === null ? [] : [selectedTabId];
   const listeners = new Set<() => void>();
   let browserNavigation: (tabId: TabId) => BrowserTabLanding | undefined = () => undefined;
+  // The tab the selection left, told so at the next commit.
+  let deselectedTabId: TabId | null = null;
   // Inside a transaction, commits wait for its end, so a step and its landing publish once.
   let transactionDepth = 0;
   let commitPending = false;
@@ -309,6 +311,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       commitPending = true;
       return;
     }
+    tellDeselected();
     // A session's sidebar is never empty: whatever removed the last tab leaves a New tab.
     if (tabs.length === 0 && resting === "new-tab") addEmptyNewTab();
     // Whatever moved, opened or came back, pinned tabs stay first.
@@ -373,11 +376,27 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
   }
 
   function markSelected(tabId: TabId) {
-    if (selectedTabId !== null && selectedTabId !== tabId) {
-      browserNavigation(selectedTabId)?.deselected();
-    }
+    const previous = selectedTabId;
     selectedTabId = tabId;
     recentlySelected = [tabId, ...recentlySelected.filter((id) => id !== tabId)];
+    if (previous !== null && previous !== tabId) deselectedTabId ??= previous;
+  }
+
+  /**
+   * Tell the tab the selection left that it isn't selected, once the change it was part of
+   * is whole: what its page shows then lands in the same publish, never moving the timeline.
+   */
+  function tellDeselected() {
+    const tabId = deselectedTabId;
+    deselectedTabId = null;
+    if (tabId === null || tabId === selectedTabId) return;
+    transactionDepth += 1;
+    try {
+      browserNavigation(tabId)?.deselected();
+    } finally {
+      transactionDepth -= 1;
+      commitPending = false;
+    }
   }
 
   function replaceTab(next: WorkspaceTab) {
@@ -771,7 +790,7 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       return;
     }
     // Closing the last tab leaves none for now; a session's commit puts a New tab in its place.
-    if (selectedTabId !== null) browserNavigation(selectedTabId)?.deselected();
+    if (selectedTabId !== null) deselectedTabId ??= selectedTabId;
     selectedTabId = null;
   }
 
