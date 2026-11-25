@@ -1,12 +1,15 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { ComponentProps } from "react";
+import { type ComponentProps, type ReactNode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { type FileContentResponse, useFileContent } from "@/hooks/useFileContent";
 import type { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { FileViewer } from "@/shell/FileViewer";
+import { useFileFinderStore } from "@/store/fileFinder";
 
 import { type FilesPageLeaveGuard, FilesPageViewer, showsInFileViewer } from "./FilesPageViewer";
 
@@ -41,6 +44,18 @@ vi.mock("@/shell/FileViewer", () => ({
 
 type FileResult = ReturnType<typeof useFileContent>;
 
+/** The file's actions read the session's hosts, so the page needs a query client. */
+function Providers({ children }: { children: ReactNode }) {
+  const [client] = useState(
+    () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  );
+  return (
+    <QueryClientProvider client={client}>
+      <TooltipProvider>{children}</TooltipProvider>
+    </QueryClientProvider>
+  );
+}
+
 function file(path: string, content: string, extra: Partial<FileContentResponse> = {}) {
   return {
     object: "session.environment.filesystem.file_content",
@@ -62,6 +77,7 @@ function renderViewer(
   const onClose = vi.fn();
   const view = render(
     <FilesPageViewer conversationId="conv_1" path={path} active onClose={onClose} {...props} />,
+    { wrapper: Providers },
   );
   return { onClose, ...view };
 }
@@ -105,7 +121,7 @@ describe("FilesPageViewer", () => {
     expect(useFileContent).toHaveBeenCalledWith("conv_1", "a.ts", { visible: false });
   });
 
-  it("edits text in CodeMirror at the cited position, with Changes and Close in its toolbar", async () => {
+  it("edits text in CodeMirror at the cited position, with Show changes and Close in its toolbar", async () => {
     const onShowChanges = vi.fn();
     const position = { line: 3 };
     const { onClose } = renderViewer(
@@ -115,15 +131,76 @@ describe("FilesPageViewer", () => {
     );
     expect(screen.getByTestId("editor")).toHaveTextContent("const a = 1;");
     expect(captured.editor).toMatchObject({ path: "src/a.ts", truncated: true, position });
-    await userEvent.click(screen.getByRole("button", { name: "Changes" }));
+    await userEvent.click(screen.getByRole("button", { name: "Show changes" }));
     expect(onShowChanges).toHaveBeenCalledTimes(1);
     await userEvent.click(screen.getByRole("button", { name: "Close file" }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("offers no Changes button where the file has no changes view", () => {
+  it("offers no Show changes button where the file has no changes view", () => {
     renderViewer("a.ts", { data: file("a.ts", "x") });
-    expect(screen.queryByRole("button", { name: "Changes" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Show changes" })).toBeNull();
+  });
+
+  it("puts find, the file's paths, its download and the finders in File actions", async () => {
+    useFileFinderStore.getState().setAvailableSession("conv_1");
+    renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
+    await userEvent.click(screen.getByRole("button", { name: "File actions" }));
+    const menu = screen.getByRole("menu");
+    const rows = [...menu.querySelectorAll('[role^="menuitem"]')].map((row) => row.textContent);
+    // Without a host, the file has no editor or file manager to open it in.
+    expect(rows).toEqual([
+      "Find in file",
+      "Copy path",
+      "Copy link to file",
+      "Download file",
+      "Go to File in Workspace…",
+      "Search Text in Workspace…",
+    ]);
+    expect(captured.editor!.searchOpen).toBe(false);
+    await userEvent.click(within(menu).getByRole("menuitem", { name: "Find in file" }));
+    expect(captured.editor!.searchOpen).toBe(true);
+    act(() => captured.editor!.onSearchHandled!());
+    expect(captured.editor!.searchOpen).toBe(false);
+    useFileFinderStore.getState().setAvailableSession(null);
+  });
+
+  it("leaves the finders out of File actions while the session can't search", async () => {
+    renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
+    await userEvent.click(screen.getByRole("button", { name: "File actions" }));
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Go to File in Workspace…" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Search Text in Workspace…" })).toBeNull();
+  });
+
+  it("opens a finder from File actions only once focus is back on ⋯, so cancelling it lands there", async () => {
+    useFileFinderStore.getState().setAvailableSession("conv_1");
+    renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
+    const trigger = screen.getByRole("button", { name: "File actions" });
+    const openFromMenu = async (row: string, kind: "files" | "text") => {
+      useFileFinderStore.setState({ request: null });
+      let focusedOnRequest: Element | null = null;
+      const stop = useFileFinderStore.subscribe((state) => {
+        if (state.request && !focusedOnRequest) focusedOnRequest = document.activeElement;
+      });
+      await userEvent.click(trigger);
+      await userEvent.click(screen.getByRole("menuitem", { name: row }));
+      await waitFor(() => expect(useFileFinderStore.getState().request).toMatchObject({ kind }));
+      stop();
+      expect(focusedOnRequest).toBe(trigger);
+    };
+    await openFromMenu("Go to File in Workspace…", "files");
+    await openFromMenu("Search Text in Workspace…", "text");
+    useFileFinderStore.getState().setAvailableSession(null);
+  });
+
+  it("shows the editor's save status in the toolbar", () => {
+    renderViewer("a.ts", { data: file("a.ts", "x") });
+    expect(screen.queryByText("Saving…")).toBeNull();
+    act(() => captured.editor!.onSaveStatusChange!("saving"));
+    expect(screen.getByText("Saving…")).toBeInTheDocument();
+    act(() => captured.editor!.onSaveStatusChange!("error"));
+    expect(screen.getByText("Save failed")).toBeInTheDocument();
   });
 
   it("shows an image in the app's viewer, and text-named bytes that aren't text there too", () => {
@@ -200,7 +277,7 @@ describe("FilesPageViewer", () => {
     expect(captured.viewer!.permissionLevel).toBe(1);
   });
 
-  it("keeps the tree toggle, Changes and Close above a rich file, without repeating its path", async () => {
+  it("keeps the tree toggle, Show changes and Close above a rich file, without repeating its path", async () => {
     const onShowChanges = vi.fn();
     const { onClose } = renderViewer(
       "docs/guide.md",
@@ -208,7 +285,9 @@ describe("FilesPageViewer", () => {
       { toolbarLeading: <button type="button">Show tree</button>, onShowChanges },
     );
     expect(screen.getByRole("button", { name: "Show tree" })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Changes" }));
+    // The app's viewer has its own actions, so the toolbar adds no File actions.
+    expect(screen.queryByRole("button", { name: "File actions" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Show changes" }));
     expect(onShowChanges).toHaveBeenCalledTimes(1);
     await userEvent.click(screen.getByRole("button", { name: "Close file" }));
     expect(onClose).toHaveBeenCalledTimes(1);

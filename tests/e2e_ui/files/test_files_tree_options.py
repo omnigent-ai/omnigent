@@ -1,5 +1,7 @@
 """E2E: the tabs sidebar's Files tree sorts and shows hidden files from its menu and ⌘K.
 
+A text file's toolbar ends with a File actions ⋯, whose Find in file opens the editor's find.
+
 With ``workspace_sidebar_v2`` on, the Files tree header's "Tree options" menu and ⌘K's
 "Sort Files Tree by …" and "Show Hidden Files" / "Hide Hidden Files" rows run the same
 actions. Hidden files show until they're hidden. Seeded via the filesystem PUT endpoint
@@ -73,3 +75,19 @@ def test_the_tree_sorts_and_shows_hidden_files_from_its_menu_and_the_palette(
     expect(hidden).to_be_visible(timeout=15_000)
     run_palette(page, "Sort Files Tree by Filename")
     _expect_order(sidebar, "alpha.txt", "zulu.txt")
+
+
+def test_a_text_file_keeps_its_actions_in_the_toolbar_menu(
+    page: Page, options_session: tuple[str, str]
+) -> None:
+    base_url, session_id = options_session
+    sidebar = open_workspace(page, base_url, session_id)
+    _open_app(page, sidebar, "Files")
+    sidebar.locator('[role="treeitem"][data-item-path="alpha.txt"]').click(timeout=30_000)
+    place = sidebar.locator('[data-testid="workspace-files-place"]:visible')
+    expect(place.locator(".cm-line").first).to_have_text("a", timeout=30_000)
+
+    place.get_by_role("button", name="File actions").click()
+    expect(page.get_by_role("menuitem", name="Copy path")).to_be_visible()
+    page.get_by_role("menuitem", name="Find in file").click()
+    expect(page.get_by_test_id("file-find-input")).to_be_focused(timeout=10_000)
