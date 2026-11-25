@@ -26,7 +26,7 @@ export type LoopCommand =
  * when the token is not an interval.
  */
 export function parseLoopInterval(token: string): number | null {
-  const match = INTERVAL_PATTERN.exec(token);
+  const match = token.match(INTERVAL_PATTERN);
   if (match === null) return null;
   const amount = Number(match[1]);
   if (!Number.isFinite(amount) || amount <= 0) return null;
