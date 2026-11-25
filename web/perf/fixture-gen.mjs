@@ -109,12 +109,16 @@ function codeSnippet(rng, lang, lines) {
     switch (lang) {
       case "typescript":
         body.push(`export function ${w1}${i}(${w2}: string): Promise<void> {`);
-        body.push(`  const payload = await load${w1.charAt(0).toUpperCase() + w1.slice(1)}(${w2});`);
+        body.push(
+          `  const payload = await load${w1.charAt(0).toUpperCase() + w1.slice(1)}(${w2});`,
+        );
         body.push(`  metrics.record("${w1}", payload.size);`);
         body.push("}");
         break;
       case "tsx":
-        body.push(`export const ${w1.charAt(0).toUpperCase() + w1.slice(1)}Row = memo(function ${w1}${i}({ item }: Props) {`);
+        body.push(
+          `export const ${w1.charAt(0).toUpperCase() + w1.slice(1)}Row = memo(function ${w1}${i}({ item }: Props) {`,
+        );
         body.push(`  const [open, setOpen] = useState(false);`);
         body.push(`  return <li onClick={() => setOpen(!open)}>{item.${w2}}</li>;`);
         body.push("});");
@@ -209,7 +213,9 @@ function mdMessage(rng, { big = false } = {}) {
     parts.push("|------|--------|-------|");
     const rows = rng.int(3, big ? 14 : 5);
     for (let i = 0; i < rows; i++) {
-      parts.push(`| ${rng.pick(WORDS)} | ${rng.pick(["ok", "pending", "failed"])} | ${rng.int(0, 999)} |`);
+      parts.push(
+        `| ${rng.pick(WORDS)} | ${rng.pick(["ok", "pending", "failed"])} | ${rng.int(0, 999)} |`,
+      );
     }
   }
   const blocks = big ? rng.int(3, 6) : rng.int(1, 2);
@@ -251,7 +257,9 @@ function bigOutput(rng) {
       `  File "/home/dev/example-project/src/${rng.pick(WORDS)}/mod_${i}.py", line ${rng.int(1, 900)}, in ${rng.pick(WORDS)}`,
     );
   }
-  lines.push(`${rng.pick(["TimeoutError", "ConnectionResetError", "ValueError"])}: ${sentence(rng)}`);
+  lines.push(
+    `${rng.pick(["TimeoutError", "ConnectionResetError", "ValueError"])}: ${sentence(rng)}`,
+  );
   return lines.join("\n");
 }
 
@@ -441,7 +449,12 @@ function genTree(rng, totalEntries) {
     for (let d = 1; d < depth; d++) segs.push(`${rng.pick(WORDS)}${rng.int(0, 9)}`);
     const dir = segs.join("/");
     // A directory row plus a few files under it.
-    entries.push({ name: segs[segs.length - 1], path: dir, type: "ENTRY_TYPE_DIRECTORY", ignored: false });
+    entries.push({
+      name: segs[segs.length - 1],
+      path: dir,
+      type: "ENTRY_TYPE_DIRECTORY",
+      ignored: false,
+    });
     made++;
     const files = Math.min(rng.int(2, 5), totalEntries - made);
     for (let f = 0; f < files; f++) {
@@ -470,7 +483,12 @@ function genChanges(rng, count) {
     const deletions = rng.int(0, 180);
     changes.push({
       path: `src/${dir}/${name}`,
-      change_type: additions === 0 ? "CHANGE_TYPE_DELETED" : deletions === 0 ? "CHANGE_TYPE_ADDED" : "CHANGE_TYPE_MODIFIED",
+      change_type:
+        additions === 0
+          ? "CHANGE_TYPE_DELETED"
+          : deletions === 0
+            ? "CHANGE_TYPE_ADDED"
+            : "CHANGE_TYPE_MODIFIED",
       additions: String(additions),
       deletions: String(deletions),
       binary: false,
@@ -487,7 +505,9 @@ function genFileContent(rng, lines) {
     out.push(
       `// ${String(i + 1).padStart(4, "0")} — ${w1} ${w2} handler, keeps the ${rng.pick(WORDS)} bounded and retries transient failures.`,
     );
-    out.push(`export async function ${w1}${i}(input: ${w1.charAt(0).toUpperCase() + w1.slice(1)}Input) {`);
+    out.push(
+      `export async function ${w1}${i}(input: ${w1.charAt(0).toUpperCase() + w1.slice(1)}Input) {`,
+    );
     out.push(`  const step = await queue.push("${w1}", input);`);
     out.push(`  return { ok: true, id: step.id };`);
     out.push(`}`);
@@ -528,7 +548,14 @@ function main() {
   SESSION_SPECS.forEach((spec, idx) => {
     const id = `conv_perf_${spec.key}`;
     const { session, items } = genSession(
-      { ...spec, id, key: spec.key, title: TITLES[spec.key], created_at: now - 86400 * (idx + 1), updated_at: now - 3600 * (idx + 1) },
+      {
+        ...spec,
+        id,
+        key: spec.key,
+        title: TITLES[spec.key],
+        created_at: now - 86400 * (idx + 1),
+        updated_at: now - 3600 * (idx + 1),
+      },
       0x5eed0000 + idx * 7919,
     );
     writeFileSync(path.join(OUT_DIR, `items_${spec.key}.json`), JSON.stringify(items));
@@ -539,7 +566,8 @@ function main() {
       return acc + 200;
     }, 0);
     const codeBlocks = items.reduce(
-      (acc, it) => acc + (it.type === "message" ? (it.content?.[0]?.text?.match(/```/g)?.length ?? 0) / 2 : 0),
+      (acc, it) =>
+        acc + (it.type === "message" ? (it.content?.[0]?.text?.match(/```/g)?.length ?? 0) / 2 : 0),
       0,
     );
     const toolCalls = items.filter((it) => it.type === "function_call").length;
@@ -583,7 +611,12 @@ function main() {
           response_id: `resp_${id}_${i}`,
           status: "completed",
           role: i % 2 === 0 ? "user" : "assistant",
-          content: [{ type: i % 2 === 0 ? "input_text" : "output_text", text: `Filler message ${i + 1} of session ${f + 1}. ${sentence(makeRng(1000 + f * 10 + i))}` }],
+          content: [
+            {
+              type: i % 2 === 0 ? "input_text" : "output_text",
+              text: `Filler message ${i + 1} of session ${f + 1}. ${sentence(makeRng(1000 + f * 10 + i))}`,
+            },
+          ],
           created_at: now - 7200 - f * 600 + i * 30,
         })),
       ),
@@ -609,7 +642,10 @@ function main() {
   writeFileSync(path.join(OUT_DIR, "hugefile.txt"), hugeFile);
 
   // Report
-  const totals = stats.reduce((acc, s) => ({ items: acc.items + s.items, chars: acc.chars + s.approx_chars }), { items: 0, chars: 0 });
+  const totals = stats.reduce(
+    (acc, s) => ({ items: acc.items + s.items, chars: acc.chars + s.approx_chars }),
+    { items: 0, chars: 0 },
+  );
   const treeBytes = statSync(path.join(OUT_DIR, "tree.json")).size;
   console.log("Fixture generation complete →", OUT_DIR);
   for (const s of stats) {

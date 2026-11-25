@@ -28,12 +28,17 @@ const inputs = files.length ? files : [path.join(outDir, "results-v2.json")];
 const merged = { scenarios: {}, meta: [] };
 for (const f of inputs) {
   const data = JSON.parse(fs.readFileSync(f, "utf8"));
-  if (merged.meta.length && data.cpuThrottle !== merged.meta[0].throttle) throw new Error("cannot merge different throttle rates");
+  if (merged.meta.length && data.cpuThrottle !== merged.meta[0].throttle)
+    throw new Error("cannot merge different throttle rates");
   for (const [k, v] of Object.entries(data.scenarios ?? {})) {
     if (Object.hasOwn(merged.scenarios, k)) throw new Error(`duplicate scenario: ${k}`);
     merged.scenarios[k] = v;
   }
-  merged.meta.push({ file: path.basename(path.dirname(f)), throttle: data.cpuThrottle, errors: data.consoleErrors?.length ?? 0 });
+  merged.meta.push({
+    file: path.basename(path.dirname(f)),
+    throttle: data.cpuThrottle,
+    errors: data.consoleErrors?.length ?? 0,
+  });
 }
 
 function pctile(values, p) {
@@ -82,12 +87,21 @@ const switchFields = {
   recalcStyleMs: (x) => (x.cdp?.RecalcStyleDuration ?? 0) * 1000,
 };
 
-for (const scen of ["switch", "switchEvicting", "switchFiles", "switchChanges", "switchCollapsedFile"]) {
+for (const scen of [
+  "switch",
+  "switchEvicting",
+  "switchFiles",
+  "switchChanges",
+  "switchCollapsedFile",
+]) {
   const rows = merged.scenarios[scen];
   if (!rows) continue;
   const table = {};
   for (const [k, f] of Object.entries(switchFields)) table[k] = stats(rows.map(f));
-  table.placeholder = { mounted: rows.filter((row) => row.placeholder?.mounted).length, painted: rows.filter((row) => row.placeholder?.painted).length };
+  table.placeholder = {
+    mounted: rows.filter((row) => row.placeholder?.mounted).length,
+    painted: rows.filter((row) => row.placeholder?.painted).length,
+  };
   table.warmByTarget = {};
   for (const t of [...new Set(rows.map((x) => x.target))]) {
     const rs = rows.filter((x) => x.target === t);
@@ -103,26 +117,61 @@ for (const scen of ["switch", "switchEvicting", "switchFiles", "switchChanges", 
     const components = new Map();
     const phases = {
       pointerToClick: (row) => row.pointerCommitEvents?.length ?? 0,
-      placeholderMount: (row) => (row.commitEvents ?? []).filter((event) => event.mounts.includes("HydratingPlaceholder")).length,
-      surfaceMount: (row) => (row.commitEvents ?? []).filter((event) => event.mounts.includes("MainAgentSurfaceImpl")).length,
-      scrollRefMount: (row) => (row.commitEvents ?? []).filter((event) => event.mounts.includes("ConversationScrollRefBridge")).length,
-      virtualizerStack: (row) => (row.commitEvents ?? []).filter((event) => /Virtualizer\.(resizeItem|measureElement|onChange)/.test(event.stack)).length,
-      historyScrollStack: (row) => (row.commitEvents ?? []).filter((event) => /handleScroll/.test(event.stack)).length,
-      scrollbarRender: (row) => (row.commitEvents ?? []).filter((event) => event.renders.TranscriptScrollbar).length,
-      composerRender: (row) => (row.commitEvents ?? []).filter((event) => event.renders.ComposerImpl).length,
-      reconcileStack: (row) => (row.commitEvents ?? []).filter((event) => /reconcileOnReconnect/.test(event.stack)).length,
-      onlineRefreshStack: (row) => (row.commitEvents ?? []).filter((event) => /refreshSessionState/.test(event.stack)).length,
+      placeholderMount: (row) =>
+        (row.commitEvents ?? []).filter((event) => event.mounts.includes("HydratingPlaceholder"))
+          .length,
+      surfaceMount: (row) =>
+        (row.commitEvents ?? []).filter((event) => event.mounts.includes("MainAgentSurfaceImpl"))
+          .length,
+      scrollRefMount: (row) =>
+        (row.commitEvents ?? []).filter((event) =>
+          event.mounts.includes("ConversationScrollRefBridge"),
+        ).length,
+      virtualizerStack: (row) =>
+        (row.commitEvents ?? []).filter((event) =>
+          /Virtualizer\.(resizeItem|measureElement|onChange)/.test(event.stack),
+        ).length,
+      historyScrollStack: (row) =>
+        (row.commitEvents ?? []).filter((event) => /handleScroll/.test(event.stack)).length,
+      scrollbarRender: (row) =>
+        (row.commitEvents ?? []).filter((event) => event.renders.TranscriptScrollbar).length,
+      composerRender: (row) =>
+        (row.commitEvents ?? []).filter((event) => event.renders.ComposerImpl).length,
+      reconcileStack: (row) =>
+        (row.commitEvents ?? []).filter((event) => /reconcileOnReconnect/.test(event.stack)).length,
+      onlineRefreshStack: (row) =>
+        (row.commitEvents ?? []).filter((event) => /refreshSessionState/.test(event.stack)).length,
     };
-    for (const row of rows) for (const event of row.commitEvents ?? []) for (const [name, count] of Object.entries(event.renders)) {
-      const current = components.get(name) ?? { renders: 0, commits: 0 };
-      current.renders += count;
-      current.commits++;
-      components.set(name, current);
-    }
+    for (const row of rows)
+      for (const event of row.commitEvents ?? [])
+        for (const [name, count] of Object.entries(event.renders)) {
+          const current = components.get(name) ?? { renders: 0, commits: 0 };
+          current.renders += count;
+          current.commits++;
+          components.set(name, current);
+        }
     table.attribution = {
-      components: [...components].map(([name, counts]) => ({ name, ...counts, rendersPerSwitch: counts.renders / rows.length })).sort((a, b) => b.renders - a.renders),
-      phaseCommits: Object.fromEntries(Object.entries(phases).map(([name, count]) => [name, stats(rows.map(count))])),
-      requestCounts: Object.fromEntries(["reconcileOnReconnect", "refreshSessionState"].map((name) => [name, stats(rows.map((row) => (row.requests ?? []).filter((request) => request.stack.includes(name)).length))])),
+      components: [...components]
+        .map(([name, counts]) => ({
+          name,
+          ...counts,
+          rendersPerSwitch: counts.renders / rows.length,
+        }))
+        .sort((a, b) => b.renders - a.renders),
+      phaseCommits: Object.fromEntries(
+        Object.entries(phases).map(([name, count]) => [name, stats(rows.map(count))]),
+      ),
+      requestCounts: Object.fromEntries(
+        ["reconcileOnReconnect", "refreshSessionState"].map((name) => [
+          name,
+          stats(
+            rows.map(
+              (row) =>
+                (row.requests ?? []).filter((request) => request.stack.includes(name)).length,
+            ),
+          ),
+        ]),
+      ),
     };
   }
   summary[scen] = table;
@@ -212,7 +261,18 @@ if (merged.scenarios.deepHistory) {
     switchBackDom: stats((d.switchBack ?? []).map((x) => x.domNodes)),
     switchBackScriptMs: stats((d.switchBack ?? []).map((x) => (x.cdp?.ScriptDuration ?? 0) * 1000)),
     idleDeep: d.idleDeep,
-    streamStats: Object.fromEntries(["taskDurationMs", "scriptDurationMs", "taskMsPerEvent", "busyPct", "longTasks", "commits", "commitsPerEvent", "droppedFrames"].map((key) => [key, stats((d.stream ?? []).map((sample) => sample[key]))])),
+    streamStats: Object.fromEntries(
+      [
+        "taskDurationMs",
+        "scriptDurationMs",
+        "taskMsPerEvent",
+        "busyPct",
+        "longTasks",
+        "commits",
+        "commitsPerEvent",
+        "droppedFrames",
+      ].map((key) => [key, stats((d.stream ?? []).map((sample) => sample[key]))]),
+    ),
     stream: (d.stream ?? []).map((x) => ({
       target: x.target,
       commits: x.commits,

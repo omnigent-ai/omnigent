@@ -20,7 +20,9 @@ const argOf = (name, fb) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : fb;
 };
 const BASE = argOf("--url", "http://127.0.0.1:5299");
-const OUT = path.resolve(argOf("--out", path.join(path.dirname(fileURLToPath(import.meta.url)), "out", "traces")));
+const OUT = path.resolve(
+  argOf("--out", path.join(path.dirname(fileURLToPath(import.meta.url)), "out", "traces")),
+);
 const CHROME = findChrome(argOf("--chrome"));
 const DBG_PORT = Number(argOf("--cdp-port", "9336"));
 
@@ -130,10 +132,17 @@ function sourcemapFor(url) {
     const mapUrl = `${url}.map`;
     const dir = path.join(OUT, "_sourcemaps");
     fs.mkdirSync(dir, { recursive: true });
-    const name = mapUrl.split("/").slice(3).join("__").replace(/[^a-zA-Z0-9._-]/g, "_");
+    const name = mapUrl
+      .split("/")
+      .slice(3)
+      .join("__")
+      .replace(/[^a-zA-Z0-9._-]/g, "_");
     const file = path.join(dir, name);
     if (!fs.existsSync(file)) {
-      fs.writeFileSync(file, execFileSync("curl", ["-s", "--max-time", "15", mapUrl], { maxBuffer: 1024 * 1024 * 1024 }));
+      fs.writeFileSync(
+        file,
+        execFileSync("curl", ["-s", "--max-time", "15", mapUrl], { maxBuffer: 1024 * 1024 * 1024 }),
+      );
     }
     const payload = JSON.parse(fs.readFileSync(file, "utf8"));
     if (payload && payload.version && payload.sources) sm = new SourceMap(payload);
@@ -148,7 +157,8 @@ function mapOrig(url, line, col) {
   if (sm && line >= 0) {
     try {
       const e = sm.findEntry(line, col ?? 0);
-      if (e && e.originalSource) return `${e.originalSource.replace(/^.*?src\//, "src/")}:${e.originalLine + 1}`;
+      if (e && e.originalSource)
+        return `${e.originalSource.replace(/^.*?src\//, "src/")}:${e.originalLine + 1}`;
     } catch {
       return null;
     }
@@ -167,14 +177,21 @@ function bottomUp(profile) {
     total += dt;
     if (!node) continue;
     const cf = node.callFrame;
-    const orig = cf.url.includes("/assets/") ? mapOrig(cf.url, cf.lineNumber, cf.columnNumber) : null;
+    const orig = cf.url.includes("/assets/")
+      ? mapOrig(cf.url, cf.lineNumber, cf.columnNumber)
+      : null;
     const key = `${cf.functionName || "(anon)"}|${orig ?? cf.url.replace(/^.*assets\//, "assets/") + ":" + (cf.lineNumber + 1)}`;
     self.set(key, (self.get(key) ?? 0) + dt);
   }
   const rows = [...self.entries()]
     .map(([k, us]) => {
       const [fn, loc] = k.split("|");
-      return { function: fn, where: loc, selfMs: Math.round(us / 100) / 10, selfPct: Math.round((us / Math.max(1, total)) * 1000) / 10 };
+      return {
+        function: fn,
+        where: loc,
+        selfMs: Math.round(us / 100) / 10,
+        selfPct: Math.round((us / Math.max(1, total)) * 1000) / 10,
+      };
     })
     .sort((a, b) => b.selfMs - a.selfMs)
     .slice(0, 80);
@@ -207,9 +224,15 @@ function analyzeTrace(traceEvents) {
       if (e.pid !== clicks[ci].pid) continue;
       const dur = e.dur ?? 0;
       const end = e.ts + dur;
-      if ((e.name === "DrawFrame" || e.name === "Paint" || e.name === "PrePaint") && e.ts >= clickTs && e.ts < paintedTs) frames++;
+      if (
+        (e.name === "DrawFrame" || e.name === "Paint" || e.name === "PrePaint") &&
+        e.ts >= clickTs &&
+        e.ts < paintedTs
+      )
+        frames++;
       if (dur <= 0) continue;
-      if (e.ts < clickTs || e.ts >= Math.min(nextClick, Math.max(settleTs, paintedTs) + 500)) continue;
+      if (e.ts < clickTs || e.ts >= Math.min(nextClick, Math.max(settleTs, paintedTs) + 500))
+        continue;
       const isPre = end <= paintedTs || e.ts < paintedTs;
       const phase = isPre ? "prePaint" : "postPaint";
       phases[phase] += dur;
@@ -219,7 +242,21 @@ function analyzeTrace(traceEvents) {
         const key = `${d.functionName || e.name}|${orig ?? (d.url ? d.url.replace(/^.*assets\//, "assets/") + ":" + ((d.lineNumber ?? -1) + 1) : "native")}`;
         const target = phase === "postPaint" ? fnPost : fnPre;
         target.set(key, (target.get(key) ?? 0) + dur);
-      } else if (/(GC|GCEvent|MinorGC|MajorGC)/.test(e.name) || ["Layout", "UpdateLayoutTree", "ParseHTML", "Paint", "PrePaint", "Layerize", "RasterTask", "CommitLoad"].includes(e.name) || e.name.startsWith("v8.compile") || e.name === "EvaluateScript") {
+      } else if (
+        /(GC|GCEvent|MinorGC|MajorGC)/.test(e.name) ||
+        [
+          "Layout",
+          "UpdateLayoutTree",
+          "ParseHTML",
+          "Paint",
+          "PrePaint",
+          "Layerize",
+          "RasterTask",
+          "CommitLoad",
+        ].includes(e.name) ||
+        e.name.startsWith("v8.compile") ||
+        e.name === "EvaluateScript"
+      ) {
         const cat = phase === "postPaint" ? catsPost : catsPre;
         cat[e.name] = (cat[e.name] ?? 0) + dur;
       }
@@ -235,8 +272,12 @@ function analyzeTrace(traceEvents) {
       framesBeforePaint: frames,
       prePaintMs: Math.round(phases.prePaint / 10) / 100,
       postPaintMs: Math.round(phases.postPaint / 10) / 100,
-      categoriesPre: Object.fromEntries(Object.entries(catsPre).map(([k, v]) => [k, Math.round(v / 10) / 100])),
-      categoriesPost: Object.fromEntries(Object.entries(catsPost).map(([k, v]) => [k, Math.round(v / 10) / 100])),
+      categoriesPre: Object.fromEntries(
+        Object.entries(catsPre).map(([k, v]) => [k, Math.round(v / 10) / 100]),
+      ),
+      categoriesPost: Object.fromEntries(
+        Object.entries(catsPost).map(([k, v]) => [k, Math.round(v / 10) / 100]),
+      ),
       topPre: top(fnPre),
       topPost: top(fnPost),
     });
@@ -283,7 +324,12 @@ async function main() {
       cdp.onEvent(h);
     });
     await cdp.send("Tracing.end");
-    await Promise.race([complete, delay(10000, undefined, { ref: false }).then(() => { throw new Error("trace completion timeout"); })]);
+    await Promise.race([
+      complete,
+      delay(10000, undefined, { ref: false }).then(() => {
+        throw new Error("trace completion timeout");
+      }),
+    ]);
     const { profile } = await cdp.send("Profiler.stop");
     // Ending a trace resets the flat session's domain state; re-enable Page
     // and Runtime so subsequent navigation keeps working.
@@ -298,7 +344,10 @@ async function main() {
     const phases = analyzeTrace(events);
     fs.writeFileSync(path.join(OUT, `${name}.trace.json`), JSON.stringify({ traceEvents: events }));
     fs.writeFileSync(path.join(OUT, `${name}.cpuprofile`), JSON.stringify(profile));
-    fs.writeFileSync(path.join(OUT, `${name}.bottomup.json`), JSON.stringify(bottomUp(profile), null, 1));
+    fs.writeFileSync(
+      path.join(OUT, `${name}.bottomup.json`),
+      JSON.stringify(bottomUp(profile), null, 1),
+    );
     fs.writeFileSync(path.join(OUT, `${name}.phases.json`), JSON.stringify(phases, null, 1));
     const pre = phases.map((p) => p.prePaintMs).sort((a, b) => a - b);
     const post = phases.map((p) => p.postPaintMs).sort((a, b) => a - b);
@@ -313,7 +362,9 @@ async function main() {
     await evalNow(cdp, `window.__waitSettled(${JSON.stringify(MARKERS[id])}, 30000, 250)`, true);
   }
   async function clickRow(title) {
-    const rect = await evalNow(cdp, `(() => {
+    const rect = await evalNow(
+      cdp,
+      `(() => {
       const wanted = ${JSON.stringify(title)};
       const btns = [...document.querySelectorAll("button, [role=button], a, li, div")].filter((el) => {
         const t = (el.getAttribute("aria-label") || el.textContent || "").trim();
@@ -325,30 +376,60 @@ async function main() {
       if (!el) return null;
       const r = el.getBoundingClientRect();
       return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 12) };
-    })()`);
+    })()`,
+    );
     if (!rect) throw new Error(`row not found: ${title}`);
-    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", ...rect, button: "left", clickCount: 1 });
-    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...rect, button: "left", clickCount: 1 });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      ...rect,
+      button: "left",
+      clickCount: 1,
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      ...rect,
+      button: "left",
+      clickCount: 1,
+    });
   }
   async function switchTo(id, requireRetained = true) {
     const marker = MARKERS[id];
-    const before = await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json());
-    if (requireRetained && !before.activeStreams[id]) throw new Error(`target ${id} is not retained`);
+    const before = await globalThis
+      .fetch(`${BASE}/__perf__/counters`)
+      .then((response) => response.json());
+    if (requireRetained && !before.activeStreams[id])
+      throw new Error(`target ${id} is not retained`);
     await evalNow(cdp, `window.__resetPerf(${JSON.stringify(marker)})`);
-    const settled = evalNow(cdp, `window.__waitSettled(${JSON.stringify(marker)}, 30000, 250)`, true);
+    const settled = evalNow(
+      cdp,
+      `window.__waitSettled(${JSON.stringify(marker)}, 30000, 250)`,
+      true,
+    );
     await clickRow(TITLES[id]);
     const result = await settled;
-    const after = await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json());
-    if (result.markerTs < 0 || (requireRetained && after.streamOpens[id] !== before.streamOpens[id])) throw new Error(`invalid warm switch to ${id}`);
+    const after = await globalThis
+      .fetch(`${BASE}/__perf__/counters`)
+      .then((response) => response.json());
+    if (
+      result.markerTs < 0 ||
+      (requireRetained && after.streamOpens[id] !== before.streamOpens[id])
+    )
+      throw new Error(`invalid warm switch to ${id}`);
   }
 
   const rotation = ["conv_perf_a", "conv_perf_b", "conv_perf_d"];
   await gotoSession(rotation[0]);
   await forEachSequential(rotation.slice(1), (id) => switchTo(id, false));
   await startTrace();
-  await forEachSequential(Array.from({ length: 9 }, (_, index) => index), (index) => switchTo(rotation[index % rotation.length]));
+  await forEachSequential(
+    Array.from({ length: 9 }, (_, index) => index),
+    (index) => switchTo(rotation[index % rotation.length]),
+  );
   const phases = await stopTrace("warm-closed");
-  fs.writeFileSync(path.join(OUT, "phases-summary.json"), JSON.stringify({ warmClosed: phases }, null, 1));
+  fs.writeFileSync(
+    path.join(OUT, "phases-summary.json"),
+    JSON.stringify({ warmClosed: phases }, null, 1),
+  );
 
   await cdp.close();
 }
@@ -358,10 +439,7 @@ try {
 } finally {
   child.kill("SIGTERM");
   if (child.exitCode === null && child.signalCode === null) {
-    await Promise.race([
-      once(child, "exit"),
-      delay(5000),
-    ]);
+    await Promise.race([once(child, "exit"), delay(5000)]);
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }
   fs.rmSync(PROFILE_DIR, { recursive: true, force: true });

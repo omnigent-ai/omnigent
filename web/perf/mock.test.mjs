@@ -12,7 +12,11 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 test("mock pages history without gaps and delays API responses", { timeout: 30000 }, async () => {
   const fixture = JSON.parse(fs.readFileSync(path.join(here, "fixtures", "items_a.json"), "utf8"));
   const output = fs.mkdtempSync(path.join(os.tmpdir(), "perf-mock-test-"));
-  const server = spawn(process.execPath, [path.join(here, "server.mjs"), "--port", "0", "--out", output, "--latency-ms", "50-60"], { stdio: ["ignore", "pipe", "inherit"] });
+  const server = spawn(
+    process.execPath,
+    [path.join(here, "server.mjs"), "--port", "0", "--out", output, "--latency-ms", "50-60"],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
   try {
     const [chunk] = await once(server.stdout, "data");
     const port = String(chunk).match(/127\.0\.0\.1:(\d+)/)?.[1];
@@ -33,9 +37,15 @@ test("mock pages history without gaps and delays API responses", { timeout: 3000
     assert.deepEqual(ids, fixture.map((item) => item.id).reverse());
     ids.length = 0;
     await readPage("", "asc");
-    assert.deepEqual(ids, fixture.map((item) => item.id));
+    assert.deepEqual(
+      ids,
+      fixture.map((item) => item.id),
+    );
     const started = performance.now();
-    const connect = await globalThis.fetch(`${base}/v1/sessions/conv_perf_a/workspace/Example/GetCapabilities`, { method: "POST", body: "{}" });
+    const connect = await globalThis.fetch(
+      `${base}/v1/sessions/conv_perf_a/workspace/Example/GetCapabilities`,
+      { method: "POST", body: "{}" },
+    );
     assert.ok(connect.ok);
     assert.ok(performance.now() - started >= 40, "Connect response was not delayed");
   } finally {

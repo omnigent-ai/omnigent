@@ -19,7 +19,8 @@ const PORT = Number(argOf("--port", 5299));
 const DIST = path.resolve(here, argOf("--dist", "dist"));
 const LOG_PATH = path.resolve(argOf("--out", path.join(here, "out")), "unmatched.log");
 const latencyArg = argOf("--latency-ms", "0");
-if (!/^\d+(?:-\d+)?$/.test(latencyArg)) throw new Error("--latency-ms must be a nonnegative number or min-max");
+if (!/^\d+(?:-\d+)?$/.test(latencyArg))
+  throw new Error("--latency-ms must be a nonnegative number or min-max");
 const [minLatency, maxLatency = minLatency] = latencyArg.split("-").map(Number);
 if (minLatency > maxLatency) throw new Error("--latency-ms minimum exceeds maximum");
 fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
@@ -108,7 +109,11 @@ function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
   if (rel === "/" || rel === "") rel = "/index.html";
   const file = path.normalize(path.join(DIST, rel));
-  if (!file.startsWith(DIST + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+  if (
+    !file.startsWith(DIST + path.sep) ||
+    !fs.existsSync(file) ||
+    fs.statSync(file).isDirectory()
+  ) {
     // SPA fallback: any unknown non-asset path serves index.html.
     const index = path.join(DIST, "index.html");
     if (fs.existsSync(index)) {
@@ -182,7 +187,13 @@ const AGENTS_RESPONSE = {
 
 const RUNNERS_RESPONSE = {
   runners: [
-    { runner_id: "runner_perf", online: true, agent_id: "ag_perf", session_id: null, label: "perf-runner" },
+    {
+      runner_id: "runner_perf",
+      online: true,
+      agent_id: "ag_perf",
+      session_id: null,
+      label: "perf-runner",
+    },
   ],
 };
 
@@ -307,13 +318,21 @@ function workspaceMethod(res, method, body) {
     const chunks = objs.map(connectEnvelope);
     const end = connectEnvelope({}); // end-of-stream marker carries no trailers
     const buf = Buffer.concat([...chunks, end]);
-    res.writeHead(200, { "content-type": "application/connect+json", "content-length": buf.length });
+    res.writeHead(200, {
+      "content-type": "application/connect+json",
+      "content-length": buf.length,
+    });
     res.end(buf);
   };
   switch (method) {
     case "GetCapabilities":
       json({
-        features: ["git", "list_directory.collapse_single_child_directories", "search_files.fuzzy", "content_search"],
+        features: [
+          "git",
+          "list_directory.collapse_single_child_directories",
+          "search_files.fuzzy",
+          "content_search",
+        ],
       });
       return;
     case "ListDirectory": {
@@ -331,7 +350,10 @@ function workspaceMethod(res, method, body) {
         if (segs.length === depth + 1) children.push(e);
       }
       const page = children.slice(token, token + pageSize);
-      json({ entries: page, next_page_token: token + pageSize < children.length ? String(token + pageSize) : "" });
+      json({
+        entries: page,
+        next_page_token: token + pageSize < children.length ? String(token + pageSize) : "",
+      });
       return;
     }
     case "StatPath": {
@@ -343,7 +365,12 @@ function workspaceMethod(res, method, body) {
       }
       json({
         exists: true,
-        entry: { name: entry.name, path: entry.path, type: entry.type, size: entry.type === "ENTRY_TYPE_FILE" ? String(entry.size ?? 0) : undefined },
+        entry: {
+          name: entry.name,
+          path: entry.path,
+          type: entry.type,
+          size: entry.type === "ENTRY_TYPE_FILE" ? String(entry.size ?? 0) : undefined,
+        },
       });
       return;
     }
@@ -351,9 +378,18 @@ function workspaceMethod(res, method, body) {
       const content = fileContentFor(req.path ?? "");
       stream([
         {
-          metadata: { path: req.path ?? "", size: String(content.length), modify_time: { seconds: String(NOW) } },
+          metadata: {
+            path: req.path ?? "",
+            size: String(content.length),
+            modify_time: { seconds: String(NOW) },
+          },
         },
-        { chunk: { data: Buffer.from(content, "utf8").toString("base64"), encoding: "CONTENT_ENCODING_UNSPECIFIED" } },
+        {
+          chunk: {
+            data: Buffer.from(content, "utf8").toString("base64"),
+            encoding: "CONTENT_ENCODING_UNSPECIFIED",
+          },
+        },
       ]);
       return;
     }
@@ -368,24 +404,45 @@ function workspaceMethod(res, method, body) {
     }
     case "ResolveWorkingCopyBase":
       json({
-        working_copy_base: { kind: "COMPARISON_KIND_LAST_COMMIT", head: "HEAD", base: "origin/main", head_is_working_copy: true },
+        working_copy_base: {
+          kind: "COMPARISON_KIND_LAST_COMMIT",
+          head: "HEAD",
+          base: "origin/main",
+          head_is_working_copy: true,
+        },
       });
       return;
     case "ListWorkingCopyChanges":
       json({ files: changes, truncated: false });
       return;
     case "ListRepositoryRefs":
-      json({ branches: [{ name: "main", commit: "a".repeat(40) }, { name: "perf-work", commit: "b".repeat(40) }] });
+      json({
+        branches: [
+          { name: "main", commit: "a".repeat(40) },
+          { name: "perf-work", commit: "b".repeat(40) },
+        ],
+      });
       return;
     case "ListBranchCommits":
-      json({ commits: [{ sha: "a".repeat(40), summary: "Example commit", author: "dev@example.com", time: { seconds: String(NOW) } }] });
+      json({
+        commits: [
+          {
+            sha: "a".repeat(40),
+            summary: "Example commit",
+            author: "dev@example.com",
+            time: { seconds: String(NOW) },
+          },
+        ],
+      });
       return;
     case "ResolveRepositoryContext":
       json({ root: "/home/dev/example-project", default_branch: "main" });
       return;
     default:
       res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ code: "unimplemented", message: `mock: ${method} not implemented` }));
+      res.end(
+        JSON.stringify({ code: "unimplemented", message: `mock: ${method} not implemented` }),
+      );
   }
 }
 
@@ -425,14 +482,26 @@ function injectStreamTurn(sessionId, opts) {
   if (!set || set.size === 0) return { ok: false, error: "no open stream" };
   const durationMs = opts.durationMs ?? 10000;
   const eventsPerSec = opts.eventsPerSec ?? 20;
-  const words = "queue widget handler pipeline snapshot parser session payload buffer ticker renderer".split(" ");
+  const words =
+    "queue widget handler pipeline snapshot parser session payload buffer ticker renderer".split(
+      " ",
+    );
   const total = Math.round((durationMs / 1000) * eventsPerSec);
   const token = randomUUID();
   const responseId = `resp_stream_${Date.now()}`;
   const callId = `call_stream_${Date.now()}`;
   for (const res of set) {
-    sseWrite(res, "response.created", { response: { id: responseId, status: "in_progress", model: "example-model", conversation: { id: sessionId } } });
-    sseWrite(res, "response.in_progress", { response: { id: responseId, status: "in_progress", model: "example-model" } });
+    sseWrite(res, "response.created", {
+      response: {
+        id: responseId,
+        status: "in_progress",
+        model: "example-model",
+        conversation: { id: sessionId },
+      },
+    });
+    sseWrite(res, "response.in_progress", {
+      response: { id: responseId, status: "in_progress", model: "example-model" },
+    });
   }
   // Schedule: 55% native text deltas (messageId → applyLiveDelta path),
   // then a tool call with 30% tool_output deltas, then the tail as text.
@@ -445,7 +514,8 @@ function injectStreamTurn(sessionId, opts) {
       const word = words[n % words.length];
       if (n < textEnd) {
         sseWrite(res, "response.output_text.delta", {
-          delta: (n % 12 === 11 ? "\n" : n % 5 === 4 ? " " : word) + (n % 7 === 3 ? `-${word}` : ""),
+          delta:
+            (n % 12 === 11 ? "\n" : n % 5 === 4 ? " " : word) + (n % 7 === 3 ? `-${word}` : ""),
           message_id: `msg_${responseId}`,
           index: n,
         });
@@ -479,7 +549,7 @@ function injectStreamTurn(sessionId, opts) {
         });
       } else {
         sseWrite(res, "response.output_text.delta", {
-          delta: (n % 5 === 4 ? " " : word),
+          delta: n % 5 === 4 ? " " : word,
           message_id: `msg_${responseId}`,
           index: n,
         });
@@ -494,10 +564,17 @@ function injectStreamTurn(sessionId, opts) {
             response_id: responseId,
             status: "completed",
             role: "assistant",
-            content: [{ type: "output_text", text: `Streamed ${total} deltas for the perf streaming scenario.` }],
+            content: [
+              {
+                type: "output_text",
+                text: `Streamed ${total} deltas for the perf streaming scenario.`,
+              },
+            ],
           },
         });
-        sseWrite(res, "response.completed", { response: { id: responseId, status: "completed", model: "example-model" } });
+        sseWrite(res, "response.completed", {
+          response: { id: responseId, status: "completed", model: "example-model" },
+        });
       }
       clearInterval(iv);
       activeTurns.delete(token);
@@ -510,7 +587,9 @@ function injectStreamTurn(sessionId, opts) {
 // ── Minimal WebSocket (RFC 6455 subset) for /v1/sessions/updates ──
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 function wsAccept(key) {
-  return createHash("sha1").update(key + WS_GUID).digest("base64");
+  return createHash("sha1")
+    .update(key + WS_GUID)
+    .digest("base64");
 }
 function wsFrame(str) {
   const payload = Buffer.from(str);
@@ -561,7 +640,14 @@ const server = http.createServer(async (req, res) => {
   try {
     // Driver control plane.
     if (p.startsWith("/__perf__/")) {
-      if (p === "/__perf__/counters") return sendJson(res, 200, { ...counters, streamOpens: Object.fromEntries(streamOpens), activeStreams: Object.fromEntries([...sseStreams].map(([id, streams]) => [id, streams.size])) });
+      if (p === "/__perf__/counters")
+        return sendJson(res, 200, {
+          ...counters,
+          streamOpens: Object.fromEntries(streamOpens),
+          activeStreams: Object.fromEntries(
+            [...sseStreams].map(([id, streams]) => [id, streams.size]),
+          ),
+        });
       if (p === "/__perf__/reset") {
         counters.requests = 0;
         counters.unmatched = 0;
@@ -599,7 +685,8 @@ const server = http.createServer(async (req, res) => {
       if (p === "/__perf__/openfile" && req.method === "POST") {
         const body = JSON.parse((await readBody(req)) || "{}");
         const set = sseStreams.get(body.session);
-        if (!set || set.size === 0) return sendJson(res, 409, { ok: false, error: "no open stream" });
+        if (!set || set.size === 0)
+          return sendJson(res, 409, { ok: false, error: "no open stream" });
         for (const sseRes of set) sseWrite(sseRes, "ui.open_file", { path: body.path });
         return sendJson(res, 200, { ok: true, path: body.path });
       }
@@ -607,15 +694,22 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Static app.
-    if (!p.startsWith("/v1/") && !p.startsWith("/health") && !p.startsWith("/auth") && !p.startsWith("/.well-known")) {
+    if (
+      !p.startsWith("/v1/") &&
+      !p.startsWith("/health") &&
+      !p.startsWith("/auth") &&
+      !p.startsWith("/.well-known")
+    ) {
       return serveStatic(req, res, p);
     }
 
     // Delay API responses, but not assets or harness control requests.
-    if (maxLatency && !p.endsWith("/stream")) await delay(minLatency + Math.random() * (maxLatency - minLatency));
+    if (maxLatency && !p.endsWith("/stream"))
+      await delay(minLatency + Math.random() * (maxLatency - minLatency));
 
     // ── REST API ──
-    if (p === "/.well-known/omnigent.json") return sendJson(res, 200, { version: "perf-mock", api: "v1" });
+    if (p === "/.well-known/omnigent.json")
+      return sendJson(res, 200, { version: "perf-mock", api: "v1" });
 
     if (p === "/health") {
       const ids = (url.searchParams.get("session_ids") ?? "").split(",").filter(Boolean);
@@ -637,11 +731,14 @@ const server = http.createServer(async (req, res) => {
     if (p === "/v1/runners") return sendJson(res, 200, RUNNERS_RESPONSE);
     if (p === "/v1/projects") return sendJson(res, 200, PROJECTS_RESPONSE);
     if (p === "/v1/projects/order") return sendJson(res, 200, { order: ["proj_perf"] });
-    if (p === "/v1/sharing") return sendJson(res, 200, { mode: "on", public_sharing_enabled: false });
+    if (p === "/v1/sharing")
+      return sendJson(res, 200, { mode: "on", public_sharing_enabled: false });
     if (p === "/v1/policies") return sendJson(res, 200, { policies: [] });
     if (p === "/v1/workflows") return sendJson(res, 200, { workflows: [] });
-    if (p === "/v1/scheduled-tasks") return sendJson(res, 200, { tasks: [], next_page_token: null });
-    if (p === "/v1/scheduled-tasks/default-timezone") return sendJson(res, 200, { timezone: "UTC" });
+    if (p === "/v1/scheduled-tasks")
+      return sendJson(res, 200, { tasks: [], next_page_token: null });
+    if (p === "/v1/scheduled-tasks/default-timezone")
+      return sendJson(res, 200, { timezone: "UTC" });
     if (p === "/v1/harnesses") {
       return sendJson(res, 200, {
         data: [{ id: "example", label: "Example", capabilities: {} }],
@@ -684,24 +781,32 @@ const server = http.createServer(async (req, res) => {
 
       if (sub === "" && req.method === "GET") {
         const s = sessionById.get(id);
-        if (!s) return sendJson(res, 404, { error: { code: "not_found", message: "no such session" } });
+        if (!s)
+          return sendJson(res, 404, { error: { code: "not_found", message: "no such session" } });
         return sendJson(res, 200, sessionSnapshot(s));
       }
 
       if (sub === "/items" && req.method === "GET") {
         const items = itemsBySession.get(id);
-        if (!items) return sendJson(res, 404, { error: { code: "not_found", message: "no such session" } });
+        if (!items)
+          return sendJson(res, 404, { error: { code: "not_found", message: "no such session" } });
         return sendJson(res, 200, sliceItems(items, url));
       }
 
       if (sub === "/stream" && req.method === "GET") {
-        if (!sessionById.has(id)) return sendJson(res, 404, { error: { code: "not_found", message: "no such session" } });
+        if (!sessionById.has(id))
+          return sendJson(res, 404, { error: { code: "not_found", message: "no such session" } });
         return openSse(res, id);
       }
 
       // Mutations the app may fire (send/interrupt/rename/…) — accepted no-ops.
       if ((sub === "/events" || sub === "/interrupt" || sub === "/stop") && req.method === "POST") {
-        return sendJson(res, 200, { ok: true, object: "response", id: "resp_noop", status: "completed" });
+        return sendJson(res, 200, {
+          ok: true,
+          object: "response",
+          id: "resp_noop",
+          status: "completed",
+        });
       }
       if (sub === "/rename" || sub === "/archive" || sub === "/unarchive" || sub === "/pin") {
         return sendJson(res, 200, { ok: true });
@@ -718,10 +823,14 @@ const server = http.createServer(async (req, res) => {
           },
         });
       }
-      if (sub === "/resources/environments/default/filesystem" || sub.startsWith("/resources/environments/default/filesystem/")) {
-        const rawPath = sub === "/resources/environments/default/filesystem"
-          ? ""
-          : decodeURIComponent(sub.slice("/resources/environments/default/filesystem/".length));
+      if (
+        sub === "/resources/environments/default/filesystem" ||
+        sub.startsWith("/resources/environments/default/filesystem/")
+      ) {
+        const rawPath =
+          sub === "/resources/environments/default/filesystem"
+            ? ""
+            : decodeURIComponent(sub.slice("/resources/environments/default/filesystem/".length));
         const knownFile = tree.find((e) => e.type === "ENTRY_TYPE_FILE" && e.path === rawPath);
         if (knownFile) {
           const content = fileContentFor(knownFile.path);
@@ -753,7 +862,10 @@ const server = http.createServer(async (req, res) => {
         }
         return sendJson(res, 200, { data: children, has_more: false, truncated: false });
       }
-      if (sub === "/resources/environments/default/search" || sub.startsWith("/resources/environments/default/search/")) {
+      if (
+        sub === "/resources/environments/default/search" ||
+        sub.startsWith("/resources/environments/default/search/")
+      ) {
         const q = (url.searchParams.get("q") ?? "").toLowerCase();
         const results = tree
           .filter((e) => e.type === "ENTRY_TYPE_FILE" && e.path.toLowerCase().includes(q))
@@ -773,7 +885,12 @@ const server = http.createServer(async (req, res) => {
           object: "list",
           data: changes.map((c) => {
             const name = c.path.split("/").at(-1);
-            const status = c.change_type === "CHANGE_TYPE_ADDED" ? "created" : c.change_type === "CHANGE_TYPE_DELETED" ? "deleted" : "modified";
+            const status =
+              c.change_type === "CHANGE_TYPE_ADDED"
+                ? "created"
+                : c.change_type === "CHANGE_TYPE_DELETED"
+                  ? "deleted"
+                  : "modified";
             return {
               path: c.path,
               name,
@@ -788,7 +905,9 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (sub?.startsWith("/resources/environments/default/diff/")) {
-        const filePath = decodeURIComponent(sub.slice("/resources/environments/default/diff/".length));
+        const filePath = decodeURIComponent(
+          sub.slice("/resources/environments/default/diff/".length),
+        );
         const content = fileContentFor(filePath);
         return sendJson(res, 200, {
           object: "session.environment.filesystem.file_diff",
@@ -799,7 +918,9 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (sub?.startsWith("/resources/github")) {
-        return sendJson(res, 404, { error: { code: "not_found", message: "Resource 'github' not found" } });
+        return sendJson(res, 404, {
+          error: { code: "not_found", message: "Resource 'github' not found" },
+        });
       }
       if (sub === "/child_sessions") {
         return sendJson(res, 200, { object: "list", data: [], has_more: false });
@@ -818,15 +939,23 @@ const server = http.createServer(async (req, res) => {
       if (sub === "/journal") return sendJson(res, 200, { entries: [], next_cursor: null });
       if (sub === "/tasks") return sendJson(res, 200, { tasks: [] });
       if (sub === "/comments") return sendJson(res, 200, { comments: [], has_more: false });
-      if (sub === "/usage") return sendJson(res, 200, { usage_by_model: {}, context_tokens: 42000, context_window: 200000 });
+      if (sub === "/usage")
+        return sendJson(res, 200, {
+          usage_by_model: {},
+          context_tokens: 42000,
+          context_window: 200000,
+        });
       if (sub === "/pull_requests") return sendJson(res, 200, { pull_requests: [] });
       if (sub === "/rewind/prompts") return sendJson(res, 200, { prompts: [] });
-      if (sub?.startsWith("/permissions")) return sendJson(res, 200, { permission_level: null, rules: [] });
+      if (sub?.startsWith("/permissions"))
+        return sendJson(res, 200, { permission_level: null, rules: [] });
     }
 
     counters.unmatched++;
     logUnmatched(req.method, req.url);
-    return sendJson(res, 404, { error: { code: "not_found", message: `mock: no handler for ${p}` } });
+    return sendJson(res, 404, {
+      error: { code: "not_found", message: `mock: no handler for ${p}` },
+    });
   } catch (err) {
     counters.unmatched++;
     logUnmatched(`ERROR ${req.method}`, `${req.url} ${err?.stack ?? err}`);

@@ -7,7 +7,14 @@ import os from "node:os";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { armOrder, cdpConnect, ensurePortFree, findChrome, forEachSequential, waitHttp } from "./cdp.mjs";
+import {
+  armOrder,
+  cdpConnect,
+  ensurePortFree,
+  findChrome,
+  forEachSequential,
+  waitHttp,
+} from "./cdp.mjs";
 
 const args = process.argv.slice(2);
 const argOf = (name, fb) => {
@@ -15,7 +22,9 @@ const argOf = (name, fb) => {
   return i >= 0 && args[i + 1] ? args[i + 1] : fb;
 };
 let BASE = argOf("--url", "http://127.0.0.1:5299");
-const OUT = path.resolve(argOf("--out", path.join(path.dirname(fileURLToPath(import.meta.url)), "out")));
+const OUT = path.resolve(
+  argOf("--out", path.join(path.dirname(fileURLToPath(import.meta.url)), "out")),
+);
 const SCENARIOS = (argOf("--scenarios", "switch") || "").split(",").filter(Boolean);
 const CYCLES = Number(argOf("--cycles", 0)) || 0;
 const CHROME = findChrome(argOf("--chrome"));
@@ -24,8 +33,24 @@ const DBG_PORT = Number(argOf("--cdp-port", "9336"));
 const DBG_PORT_B = Number(argOf("--cdp-port-b", "9337"));
 const ATTRIBUTION = args.includes("--attribution");
 const AB_URL = argOf("--ab-url", "");
-const validScenarios = ["switch", "switchEvicting", "switchFiles", "switchChanges", "switchCollapsedFile", "cold", "idle", "stream", "deepHistory", "ab"];
-if (SCENARIOS.length !== 1 || !validScenarios.includes(SCENARIOS[0]) || (SCENARIOS[0] === "ab" && !AB_URL)) throw new Error("choose exactly one valid scenario");
+const validScenarios = [
+  "switch",
+  "switchEvicting",
+  "switchFiles",
+  "switchChanges",
+  "switchCollapsedFile",
+  "cold",
+  "idle",
+  "stream",
+  "deepHistory",
+  "ab",
+];
+if (
+  SCENARIOS.length !== 1 ||
+  !validScenarios.includes(SCENARIOS[0]) ||
+  (SCENARIOS[0] === "ab" && !AB_URL)
+)
+  throw new Error("choose exactly one valid scenario");
 class WarmSampleInvalid extends Error {}
 
 const SESSIONS = ["conv_perf_a", "conv_perf_b", "conv_perf_c", "conv_perf_d", "conv_perf_e"];
@@ -254,18 +279,22 @@ const browsers = [];
 async function launchBrowser(port) {
   await ensurePortFree(port);
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "perf-bench-"));
-  const child = spawn(CHROME, [
-    `--user-data-dir=${profile}`,
-    `--remote-debugging-port=${port}`,
-    "--headless=new",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-features=Translate,BackForwardCache",
-    "--window-size=1600,1000",
-    "--enable-precise-memory-info",
-    "--disable-component-update",
-    "about:blank",
-  ], { stdio: "ignore" });
+  const child = spawn(
+    CHROME,
+    [
+      `--user-data-dir=${profile}`,
+      `--remote-debugging-port=${port}`,
+      "--headless=new",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-features=Translate,BackForwardCache",
+      "--window-size=1600,1000",
+      "--enable-precise-memory-info",
+      "--disable-component-update",
+      "about:blank",
+    ],
+    { stdio: "ignore" },
+  );
   browsers.push({ child, profile });
 }
 await launchBrowser(DBG_PORT);
@@ -288,7 +317,14 @@ async function perfMetrics(cdp) {
 }
 function metricsDelta(after, before) {
   const d = {};
-  for (const k of ["ScriptDuration", "TaskDuration", "LayoutDuration", "RecalcStyleDuration", "LayoutCount", "RecalcStyleCount"]) {
+  for (const k of [
+    "ScriptDuration",
+    "TaskDuration",
+    "LayoutDuration",
+    "RecalcStyleDuration",
+    "LayoutCount",
+    "RecalcStyleCount",
+  ]) {
     d[k] = Math.round(((after[k] ?? 0) - (before[k] ?? 0)) * 1000) / 1000;
   }
   d.JSHeapUsedSizeAfterMB = Math.round(((after.JSHeapUsedSize ?? 0) / 1048576) * 10) / 10;
@@ -313,7 +349,9 @@ async function main() {
   const consoleErrors = [];
   const recordErrors = (method, params) => {
     if (method === "Runtime.exceptionThrown") {
-      consoleErrors.push(params.exceptionDetails?.exception?.description ?? params.exceptionDetails?.text ?? "?");
+      consoleErrors.push(
+        params.exceptionDetails?.exception?.description ?? params.exceptionDetails?.text ?? "?",
+      );
     } else if (method === "Runtime.consoleAPICalled" && params.type === "error") {
       consoleErrors.push((params.args ?? []).map((a) => a.value ?? a.description ?? "").join(" "));
     }
@@ -331,7 +369,9 @@ async function main() {
       true,
     );
     if (settled && settled.markerTs > 0) return settled;
-    process.stdout.write(`gotoSession ${id} retry ${attempt}: ${JSON.stringify(settled).slice(0, 160)}\n`);
+    process.stdout.write(
+      `gotoSession ${id} retry ${attempt}: ${JSON.stringify(settled).slice(0, 160)}\n`,
+    );
     if (attempt < 2) return gotoSession(id, attempt + 1);
     throw new Error(`gotoSession: ${id} never settled`);
   }
@@ -351,8 +391,18 @@ async function main() {
       return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 12) };
     })()`);
     if (!rect) throw new Error(`sidebar row not found: ${title}`);
-    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", ...rect, button: "left", clickCount: 1 });
-    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...rect, button: "left", clickCount: 1 });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      ...rect,
+      button: "left",
+      clickCount: 1,
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      ...rect,
+      button: "left",
+      clickCount: 1,
+    });
   }
 
   async function openRail() {
@@ -373,7 +423,9 @@ async function main() {
       if (button) button.click();
     })()`);
     await delay(600);
-    const stillOpen = await page.eval(`!![...document.querySelectorAll("button")].find(x => (x.getAttribute("aria-label") || "").includes("Collapse right panel"))`);
+    const stillOpen = await page.eval(
+      `!![...document.querySelectorAll("button")].find(x => (x.getAttribute("aria-label") || "").includes("Collapse right panel"))`,
+    );
     if (stillOpen) throw new Error("could not collapse right panel");
   }
 
@@ -385,8 +437,18 @@ async function main() {
       return { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
     })()`);
     if (!rect) throw new Error(`workspace tab not found: ${label}`);
-    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", ...rect, button: "left", clickCount: 1 });
-    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...rect, button: "left", clickCount: 1 });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      ...rect,
+      button: "left",
+      clickCount: 1,
+    });
+    await cdp.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      ...rect,
+      button: "left",
+      clickCount: 1,
+    });
   }
 
   async function assertRailTab(tab) {
@@ -395,15 +457,27 @@ async function main() {
       const tab = rail?.querySelector('[data-workspace-tab="${tab}"]');
       return { hidden: rail?.getAttribute("aria-hidden"), selected: tab?.getAttribute("aria-selected") };
     })()`);
-    if (state.hidden !== "false" || state.selected !== "true") throw new Error(`workspace ${tab} tab not open: ${JSON.stringify(state)}`);
+    if (state.hidden !== "false" || state.selected !== "true")
+      throw new Error(`workspace ${tab} tab not open: ${JSON.stringify(state)}`);
   }
 
   // Shared switch measurement. Pre-condition: page settled somewhere.
   async function measureSwitch({ target, label, extraMarker = null }) {
-    const warm = ["rail-closed", "rail-files", "rail-changes", "rail-closed-file", "a", "b"].includes(label);
+    const warm = [
+      "rail-closed",
+      "rail-files",
+      "rail-changes",
+      "rail-closed-file",
+      "a",
+      "b",
+    ].includes(label);
     const evicting = label === "evicting";
-    const beforeStreams = warm || evicting ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json()) : null;
-    if (warm && !beforeStreams.activeStreams[target]) throw new WarmSampleInvalid(`target ${target} has no retained stream before warm switch`);
+    const beforeStreams =
+      warm || evicting
+        ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json())
+        : null;
+    if (warm && !beforeStreams.activeStreams[target])
+      throw new WarmSampleInvalid(`target ${target} has no retained stream before warm switch`);
     await page.eval(`window.__resetPerf()`);
     const before = await perfMetrics(cdp);
     const marker = extraMarker ?? MARKERS[target];
@@ -414,8 +488,12 @@ async function main() {
     );
     await clickSidebarRow(TITLES[target]);
     const ts = await settlePromise;
-    if (!ts || ts.timeout || ts.paintedTs < 0) throw new Error(`switch to ${target} failed: ${JSON.stringify(ts)}`);
-    await page.eval(`new Promise((resolve) => setTimeout(resolve, Math.max(0, ${ts.clickTs} + 1500 - performance.now())))`, true);
+    if (!ts || ts.timeout || ts.paintedTs < 0)
+      throw new Error(`switch to ${target} failed: ${JSON.stringify(ts)}`);
+    await page.eval(
+      `new Promise((resolve) => setTimeout(resolve, Math.max(0, ${ts.clickTs} + 1500 - performance.now())))`,
+      true,
+    );
     const snap = await page.eval(`(() => {
       const events = window.__perf.events.filter((e) => e.id > 0 && e.s >= (window.__perf.clickTs ?? 0) - 1);
       const clickEv = events.length ? events[events.length - 1] : null;
@@ -436,20 +514,51 @@ async function main() {
     })()`);
     const lts = await page.eval("window.__perf.longTasks");
     const lafs = await page.eval("window.__perf.lafs");
-    if (snap.pathname !== `/c/${target}`) throw new Error(`switch target mismatch: expected ${target}, got ${snap.pathname}`);
-    if (["rail-closed", "evicting", "a", "b"].includes(label) && snap.railHidden !== "true") throw new Error(`workspace rail is not collapsed: ${snap.railHidden}`);
-    const commitEvents = snap.commits.filter((event) => event.ts >= ts.clickTs && event.ts < ts.clickTs + 1500);
-    const pointerCommitEvents = snap.commits.filter((event) => event.ts >= snap.pointerTs && event.ts < ts.clickTs);
-    const placeholderMount = snap.placeholder.find((event) => event.kind === "mount" && event.ts >= ts.clickTs);
-    const placeholderUnmount = placeholderMount && snap.placeholder.find((event) => event.kind === "unmount" && event.ts >= placeholderMount.ts);
-    const placeholderPaint = placeholderMount && snap.placeholderPainted.find((time) => time >= placeholderMount.ts && (!placeholderUnmount || time < placeholderUnmount.ts));
-    const afterStreams = warm || evicting ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json()) : null;
-    if (warm && (afterStreams.streamOpens[target] !== beforeStreams.streamOpens[target] || !afterStreams.activeStreams[target])) throw new WarmSampleInvalid(`target ${target} re-bound during warm switch: ${JSON.stringify({ beforeStreams, afterStreams })}`);
-    if (evicting && (afterStreams.streamOpens[target] ?? 0) <= (beforeStreams.streamOpens[target] ?? 0)) throw new Error(`target ${target} did not re-bind during evicting rotation`);
+    if (snap.pathname !== `/c/${target}`)
+      throw new Error(`switch target mismatch: expected ${target}, got ${snap.pathname}`);
+    if (["rail-closed", "evicting", "a", "b"].includes(label) && snap.railHidden !== "true")
+      throw new Error(`workspace rail is not collapsed: ${snap.railHidden}`);
+    const commitEvents = snap.commits.filter(
+      (event) => event.ts >= ts.clickTs && event.ts < ts.clickTs + 1500,
+    );
+    const pointerCommitEvents = snap.commits.filter(
+      (event) => event.ts >= snap.pointerTs && event.ts < ts.clickTs,
+    );
+    const placeholderMount = snap.placeholder.find(
+      (event) => event.kind === "mount" && event.ts >= ts.clickTs,
+    );
+    const placeholderUnmount =
+      placeholderMount &&
+      snap.placeholder.find((event) => event.kind === "unmount" && event.ts >= placeholderMount.ts);
+    const placeholderPaint =
+      placeholderMount &&
+      snap.placeholderPainted.find(
+        (time) =>
+          time >= placeholderMount.ts && (!placeholderUnmount || time < placeholderUnmount.ts),
+      );
+    const afterStreams =
+      warm || evicting
+        ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json())
+        : null;
+    if (
+      warm &&
+      (afterStreams.streamOpens[target] !== beforeStreams.streamOpens[target] ||
+        !afterStreams.activeStreams[target])
+    )
+      throw new WarmSampleInvalid(
+        `target ${target} re-bound during warm switch: ${JSON.stringify({ beforeStreams, afterStreams })}`,
+      );
+    if (
+      evicting &&
+      (afterStreams.streamOpens[target] ?? 0) <= (beforeStreams.streamOpens[target] ?? 0)
+    )
+      throw new Error(`target ${target} did not re-bind during evicting rotation`);
     return {
       label,
       target,
-      ...(warm || evicting ? { streamOpens: beforeStreams.streamOpens[target], retainedStream: warm } : {}),
+      ...(warm || evicting
+        ? { streamOpens: beforeStreams.streamOpens[target], retainedStream: warm }
+        : {}),
       cold: evicting,
       clickTs: ts.clickTs,
       markerTs: ts.markerTs,
@@ -462,24 +571,46 @@ async function main() {
       // i.e. when the main thread actually finished the switch's work.
       clickToWorkDoneMs:
         ts.paintedTs > 0
-          ? Math.round((Math.max(ts.paintedTs, ts.busyEnd > ts.clickTs ? ts.busyEnd : 0) - ts.clickTs) * 10) / 10
+          ? Math.round(
+              (Math.max(ts.paintedTs, ts.busyEnd > ts.clickTs ? ts.busyEnd : 0) - ts.clickTs) * 10,
+            ) / 10
           : null,
       clickToSettledMs: ts.settleTs > 0 ? Math.round((ts.settleTs - ts.clickTs) * 10) / 10 : null,
       busyDuringSwitch: busyStats(lts, ts.clickTs, ts.settleTs > 0 ? ts.settleTs : ts.clickTs + 1),
       lafBusy: busyStats(lafs, ts.clickTs, ts.settleTs > 0 ? ts.settleTs : ts.clickTs + 1),
       interaction: snap.interactionDur,
-      interactionStartDelay: snap.interactionStart !== null ? Math.round((snap.interactionStart - ts.clickTs) * 10) / 10 : null,
+      interactionStartDelay:
+        snap.interactionStart !== null
+          ? Math.round((snap.interactionStart - ts.clickTs) * 10) / 10
+          : null,
       commits: commitEvents.length,
-      commitsToPaint: snap.commits.filter((event) => event.ts >= ts.clickTs && event.ts <= ts.paintedTs).length,
+      commitsToPaint: snap.commits.filter(
+        (event) => event.ts >= ts.clickTs && event.ts <= ts.paintedTs,
+      ).length,
       commitsPointerToClick: pointerCommitEvents.length,
       pointerToClickMs: snap.pointerTs >= 0 ? ts.clickTs - snap.pointerTs : null,
       placeholder: {
         mounted: Boolean(placeholderMount),
         painted: Boolean(placeholderPaint),
-        mountedMs: placeholderMount && placeholderUnmount && placeholderUnmount.ts !== placeholderMount.ts ? placeholderUnmount.ts - placeholderMount.ts : null,
-        visibleMs: !placeholderPaint ? 0 : placeholderUnmount ? placeholderUnmount.ts - placeholderPaint : null,
+        mountedMs:
+          placeholderMount && placeholderUnmount && placeholderUnmount.ts !== placeholderMount.ts
+            ? placeholderUnmount.ts - placeholderMount.ts
+            : null,
+        visibleMs: !placeholderPaint
+          ? 0
+          : placeholderUnmount
+            ? placeholderUnmount.ts - placeholderPaint
+            : null,
       },
-      ...(ATTRIBUTION ? { commitEvents, pointerCommitEvents, requests: snap.requests.filter((request) => request.started >= ts.clickTs && request.started < ts.clickTs + 1500) } : {}),
+      ...(ATTRIBUTION
+        ? {
+            commitEvents,
+            pointerCommitEvents,
+            requests: snap.requests.filter(
+              (request) => request.started >= ts.clickTs && request.started < ts.clickTs + 1500,
+            ),
+          }
+        : {}),
       domNodes: snap.domNodes,
       heapMB: snap.heapMB,
       cdp: metricsDelta(await perfMetrics(cdp), before),
@@ -496,7 +627,10 @@ async function main() {
     clientB.onEvent(recordErrors);
     await clientB.ready;
     const second = await clientB.send("Target.createTarget", { url: "about:blank" });
-    const attached = await clientB.send("Target.attachToTarget", { targetId: second.targetId, flatten: true });
+    const attached = await clientB.send("Target.attachToTarget", {
+      targetId: second.targetId,
+      flatten: true,
+    });
     arms.push({ name: "b", url: AB_URL, sessionId: attached.sessionId, client: clientB });
     await forEachSequential(arms, async (arm) => {
       BASE = arm.url;
@@ -507,16 +641,22 @@ async function main() {
       await cdp.send("Network.enable");
       await cdp.send("Performance.enable");
       await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_THROTTLE });
-      if (arm.name === "b") await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: INIT_SCRIPT + SETTLED_FN });
+      if (arm.name === "b")
+        await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+          source: INIT_SCRIPT + SETTLED_FN,
+        });
       await cdp.send("Page.bringToFront");
       await gotoSession(ROTATION[0]);
       await closeRail();
-      await forEachSequential(ROTATION.slice(1), (id) => measureSwitch({ target: id, label: "warmup" }));
+      await forEachSequential(ROTATION.slice(1), (id) =>
+        measureSwitch({ target: id, label: "warmup" }),
+      );
       await delay(1500);
     });
     const samples = { a: [], b: [] };
     const count = Number(argOf("--samples", "30"));
-    if (!Number.isInteger(count) || count < 1) throw new Error("--samples must be a positive integer");
+    if (!Number.isInteger(count) || count < 1)
+      throw new Error("--samples must be a positive integer");
     let discardedPairs = 0;
     async function rewarm(arm, target) {
       BASE = arm.url;
@@ -542,7 +682,8 @@ async function main() {
           await forEachSequential(arms, async (visibleArm) => {
             cdp = visibleArm.client;
             cdp.setDefaultSession(visibleArm.sessionId);
-            if (await page.eval("document.hidden")) throw new Error(`arm ${visibleArm.name} is hidden`);
+            if (await page.eval("document.hidden"))
+              throw new Error(`arm ${visibleArm.name} is hidden`);
           });
           cdp = arm.client;
           cdp.setDefaultSession(arm.sessionId);
@@ -573,16 +714,22 @@ async function main() {
     const rotation = evicting ? SESSIONS : ROTATION;
     await gotoSession(rotation[0]);
     await closeRail();
-    await forEachSequential(rotation.slice(1), (id) => measureSwitch({ target: id, label: "warmup" }));
+    await forEachSequential(rotation.slice(1), (id) =>
+      measureSwitch({ target: id, label: "warmup" }),
+    );
     await delay(1500);
 
     const samples = [];
     const cycles = cyclesFor(evicting ? 6 : 10);
-    await forEachSequential(indices(cycles), (cyc) => forEachSequential(rotation, async (id) => {
-      const s = await measureSwitch({ target: id, label: evicting ? "evicting" : "rail-closed" });
-      samples.push(s);
-      process.stdout.write(`switch cyc${cyc} ${id} marker=${s.clickToMarkerMs} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms\n`);
-    }));
+    await forEachSequential(indices(cycles), (cyc) =>
+      forEachSequential(rotation, async (id) => {
+        const s = await measureSwitch({ target: id, label: evicting ? "evicting" : "rail-closed" });
+        samples.push(s);
+        process.stdout.write(
+          `switch cyc${cyc} ${id} marker=${s.clickToMarkerMs} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms\n`,
+        );
+      }),
+    );
     results.scenarios[evicting ? "switchEvicting" : "switch"] = samples;
 
     // Cold switches via reload: fresh page binds only its own URL's session.
@@ -621,7 +768,9 @@ async function main() {
       return expand(remaining - 1);
     }
     await expand(maxExpands);
-    return page.eval(`document.querySelector('[aria-label="Workspace"]')?.querySelectorAll("button[aria-expanded]").length ?? 0`);
+    return page.eval(
+      `document.querySelector('[aria-label="Workspace"]')?.querySelectorAll("button[aria-expanded]").length ?? 0`,
+    );
   }
 
   async function setupFilesPanel(id) {
@@ -630,17 +779,22 @@ async function main() {
     await delay(1200);
     const rows = await expandAllRootDirs();
     await assertRailTab("files");
-    const expanded = await page.eval(`document.querySelector('[aria-label="Workspace"]')?.querySelectorAll('button[aria-expanded="true"]').length ?? 0`);
+    const expanded = await page.eval(
+      `document.querySelector('[aria-label="Workspace"]')?.querySelectorAll('button[aria-expanded="true"]').length ?? 0`,
+    );
     if (!expanded) throw new Error(`files tree has no expanded directories for ${id}`);
     process.stdout.write(`setupFiles ${id}: expandable rows=${rows} expanded=${expanded}\n`);
   }
 
   // Open a file through the app's own ui.open_file SSE event (runner-native).
   async function openFileViaSse(conversationId, filePath, waitMs = 2500) {
-    const ok = await globalThis.fetch(`${BASE}/__perf__/openfile`, {
-      method: "POST",
-      body: JSON.stringify({ session: conversationId, path: filePath }),
-    }).then((r) => r.json()).catch(() => ({ ok: false }));
+    const ok = await globalThis
+      .fetch(`${BASE}/__perf__/openfile`, {
+        method: "POST",
+        body: JSON.stringify({ session: conversationId, path: filePath }),
+      })
+      .then((r) => r.json())
+      .catch(() => ({ ok: false }));
     await delay(waitMs);
     const visible = await page.eval(`(() => {
       const rail = document.querySelector('[aria-label="Workspace"]');
@@ -652,28 +806,40 @@ async function main() {
   // ── Scenario: collapsed rail retaining session D's large file ──
   if (SCENARIOS.includes("switchCollapsedFile")) {
     await gotoSession(ROTATION[0]);
-    await forEachSequential(ROTATION.slice(1), (id) => measureSwitch({ target: id, label: "warmup" }));
+    await forEachSequential(ROTATION.slice(1), (id) =>
+      measureSwitch({ target: id, label: "warmup" }),
+    );
     await openRail();
     await clickRailTab("Files");
     const file = "dialog_7/stepper_00002.md";
     const opened = await openFileViaSse("conv_perf_d", file, 5000);
-    if (!opened.ok || !opened.visible) throw new Error(`could not open session D file: ${JSON.stringify(opened)}`);
+    if (!opened.ok || !opened.visible)
+      throw new Error(`could not open session D file: ${JSON.stringify(opened)}`);
     await closeRail();
     await measureSwitch({ target: "conv_perf_b", label: "warmup" });
     const samples = [];
-    await forEachSequential(indices(cyclesFor(10)), (cycle) => forEachSequential(ROTATION, async (id) => {
-      const sample = await measureSwitch({ target: id, label: "rail-closed-file" });
-      if (id === "conv_perf_d") {
-        sample.viewerRetained = await page.eval(`(() => {
+    await forEachSequential(indices(cyclesFor(10)), (cycle) =>
+      forEachSequential(ROTATION, async (id) => {
+        const sample = await measureSwitch({ target: id, label: "rail-closed-file" });
+        if (id === "conv_perf_d") {
+          sample.viewerRetained = await page.eval(`(() => {
           const rail = document.querySelector('[aria-label="Workspace"]');
           const text = rail?.textContent || "";
           return { file: text.includes("stepper_00002.md"), content: text.includes("export async function"), hidden: rail?.getAttribute("aria-hidden") === "true" };
         })()`);
-        if (!sample.viewerRetained.file || !sample.viewerRetained.content || !sample.viewerRetained.hidden) throw new Error(`session D viewer is not mounted and collapsed: ${JSON.stringify(sample.viewerRetained)}`);
-      }
-      samples.push(sample);
-      process.stdout.write(`switchCollapsedFile ${cycle} ${id}: ${sample.clickToPaintedMs}ms\n`);
-    }));
+          if (
+            !sample.viewerRetained.file ||
+            !sample.viewerRetained.content ||
+            !sample.viewerRetained.hidden
+          )
+            throw new Error(
+              `session D viewer is not mounted and collapsed: ${JSON.stringify(sample.viewerRetained)}`,
+            );
+        }
+        samples.push(sample);
+        process.stdout.write(`switchCollapsedFile ${cycle} ${id}: ${sample.clickToPaintedMs}ms\n`);
+      }),
+    );
     results.scenarios.switchCollapsedFile = samples;
   }
 
@@ -687,12 +853,16 @@ async function main() {
     await delay(1500);
     const samples = [];
     const cycles = cyclesFor(10);
-    await forEachSequential(indices(cycles), (cyc) => forEachSequential(ROTATION, async (id) => {
-      const s = await measureSwitch({ target: id, label: "rail-files" });
-      await assertRailTab("files");
-      samples.push(s);
-      process.stdout.write(`switchFiles cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`);
-    }));
+    await forEachSequential(indices(cycles), (cyc) =>
+      forEachSequential(ROTATION, async (id) => {
+        const s = await measureSwitch({ target: id, label: "rail-files" });
+        await assertRailTab("files");
+        samples.push(s);
+        process.stdout.write(
+          `switchFiles cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`,
+        );
+      }),
+    );
     results.scenarios.switchFiles = samples;
   }
 
@@ -719,12 +889,16 @@ async function main() {
     await delay(2000);
     const samples = [];
     const cycles = cyclesFor(10);
-    await forEachSequential(indices(cycles), (cyc) => forEachSequential(ROTATION, async (id) => {
-      const s = await measureSwitch({ target: id, label: "rail-changes" });
-      await assertRailTab("changes");
-      samples.push(s);
-      process.stdout.write(`switchChanges cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`);
-    }));
+    await forEachSequential(indices(cycles), (cyc) =>
+      forEachSequential(ROTATION, async (id) => {
+        const s = await measureSwitch({ target: id, label: "rail-changes" });
+        await assertRailTab("changes");
+        samples.push(s);
+        process.stdout.write(
+          `switchChanges cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`,
+        );
+      }),
+    );
     results.scenarios.switchChanges = samples;
   }
 
@@ -732,7 +906,8 @@ async function main() {
   if (SCENARIOS.includes("cold")) {
     const samples = [];
     const perSession = CYCLES || 4;
-    await forEachSequential(indices(perSession), (i) => forEachSequential(SESSIONS, async (id) => {
+    await forEachSequential(indices(perSession), (i) =>
+      forEachSequential(SESSIONS, async (id) => {
         await cdp.send("Network.clearBrowserCache");
         await page.eval(`window.__resetPerf()`).catch(() => {});
         const navStart = Date.now();
@@ -770,8 +945,11 @@ async function main() {
           domNodes: snap.domNodes,
           heapMB: snap.heapMB, // performance.memory.usedJSHeapSize (precise mode)
         });
-        process.stdout.write(`cold ${id} marker=${Math.round(settled.markerTs)} lcp=${Math.round(snap.lcp)} heap=${snap.heapMB}MB\n`);
-    }));
+        process.stdout.write(
+          `cold ${id} marker=${Math.round(settled.markerTs)} lcp=${Math.round(snap.lcp)} heap=${snap.heapMB}MB\n`,
+        );
+      }),
+    );
     results.scenarios.cold = samples;
   }
 
@@ -779,7 +957,8 @@ async function main() {
   async function idleSample(cdp2, seconds = 10) {
     await page.eval(`window.__resetPerf()`);
     const before = await perfMetrics(cdp2);
-    const sample = await page.eval(`(async () => {
+    const sample = await page.eval(
+      `(async () => {
       const t0 = performance.now();
       const lt0 = window.__perf.longTasks.length;
       let dropped = 0;
@@ -795,22 +974,34 @@ async function main() {
         longTasks: lts.length,
         droppedFrames: dropped,
       };
-    })()`, true);
+    })()`,
+      true,
+    );
     const after = await perfMetrics(cdp2);
-    const guardrails = await page.eval(`({ commits: window.__reactCommits, heapMB: (performance.memory?.usedJSHeapSize ?? 0) / 1048576 })`);
-    return { ...sample, ...guardrails, cdp: metricsDelta(after, before), taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000, scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000 };
+    const guardrails = await page.eval(
+      `({ commits: window.__reactCommits, heapMB: (performance.memory?.usedJSHeapSize ?? 0) / 1048576 })`,
+    );
+    return {
+      ...sample,
+      ...guardrails,
+      cdp: metricsDelta(after, before),
+      taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000,
+      scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000,
+    };
   }
 
   // ── Scenario: idle steady state (rail closed) ──────────────
   if (SCENARIOS.includes("idle")) {
     const samples = [];
     const iters = CYCLES || 2;
-    await forEachSequential(SESSIONS, (id) => forEachSequential(indices(iters), async (i) => {
-      await gotoSession(id);
-      await delay(2000);
-      samples.push({ target: id, iter: i, rail: "closed", ...(await idleSample(cdp)) });
-      process.stdout.write(`idle ${id} task=${Math.round(samples.at(-1).taskDurationMs)}ms\n`);
-    }));
+    await forEachSequential(SESSIONS, (id) =>
+      forEachSequential(indices(iters), async (i) => {
+        await gotoSession(id);
+        await delay(2000);
+        samples.push({ target: id, iter: i, rail: "closed", ...(await idleSample(cdp)) });
+        process.stdout.write(`idle ${id} task=${Math.round(samples.at(-1).taskDurationMs)}ms\n`);
+      }),
+    );
     results.scenarios.idle = samples;
   }
 
@@ -820,12 +1011,16 @@ async function main() {
     await delay(1500);
     await page.eval(`window.__resetPerf()`);
     const before = await perfMetrics(cdp);
-    const startRes = await globalThis.fetch(`${BASE}/__perf__/stream/start`, {
-      method: "POST",
-      body: JSON.stringify({ session: target, duration_ms: 10000, events_per_sec: 20 }),
-    }).then((r) => r.json());
-    if (!startRes.ok || !startRes.total_events) throw new Error(`stream injection failed: ${JSON.stringify(startRes)}`);
-    const sample = await page.eval(`(async () => {
+    const startRes = await globalThis
+      .fetch(`${BASE}/__perf__/stream/start`, {
+        method: "POST",
+        body: JSON.stringify({ session: target, duration_ms: 10000, events_per_sec: 20 }),
+      })
+      .then((r) => r.json());
+    if (!startRes.ok || !startRes.total_events)
+      throw new Error(`stream injection failed: ${JSON.stringify(startRes)}`);
+    const sample = await page.eval(
+      `(async () => {
       const t0 = performance.now();
       const lt0 = window.__perf.longTasks.length;
       const commit0 = window.__reactCommits;
@@ -844,28 +1039,40 @@ async function main() {
         droppedFrames: dropped,
         commits: window.__reactCommits - commit0,
       };
-    })()`, true);
-    await globalThis.fetch(`${BASE}/__perf__/stream/stop`, { method: "POST", body: JSON.stringify({ token: startRes.token }) }).catch(() => {});
+    })()`,
+      true,
+    );
+    await globalThis
+      .fetch(`${BASE}/__perf__/stream/stop`, {
+        method: "POST",
+        body: JSON.stringify({ token: startRes.token }),
+      })
+      .catch(() => {});
     const after = await perfMetrics(cdp);
     const out = {
       target,
       iter,
       injectedEvents: startRes.total_events,
       ...sample,
-      commitsPerEvent: Math.round((sample.commits / Math.max(1, startRes.total_events)) * 100) / 100,
+      commitsPerEvent:
+        Math.round((sample.commits / Math.max(1, startRes.total_events)) * 100) / 100,
       taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000,
       scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000,
       heapMB: await page.eval("(performance.memory?.usedJSHeapSize ?? 0) / 1048576"),
       cdp: metricsDelta(after, before),
       ...extra,
     };
-    process.stdout.write(`stream ${target} commits=${sample.commits} task=${Math.round(out.taskDurationMs)}ms\n`);
+    process.stdout.write(
+      `stream ${target} commits=${sample.commits} task=${Math.round(out.taskDurationMs)}ms\n`,
+    );
     return out;
   }
 
   if (SCENARIOS.includes("stream")) {
     const samples = [];
-    await forEachSequential(indices(cyclesFor(5)), async (i) => { samples.push(await streamSample("conv_perf_a", i, { history: "window-only" })); });
+    await forEachSequential(indices(cyclesFor(5)), async (i) => {
+      samples.push(await streamSample("conv_perf_a", i, { history: "window-only" }));
+    });
     results.scenarios.stream = samples;
   }
 
@@ -874,13 +1081,15 @@ async function main() {
   // scroll-up must come from trusted wheel events (CDP Input) to escape the
   // lock and let HistoryAutoLoader chain-load pages.
   async function wheelScrollUp(cdp2, times = 1) {
-    await forEachSequential(indices(times), () => cdp2.send("Input.dispatchMouseEvent", {
-      type: "mouseWheel",
-      x: 800,
-      y: 450,
-      deltaX: 0,
-      deltaY: -1200,
-    }));
+    await forEachSequential(indices(times), () =>
+      cdp2.send("Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x: 800,
+        y: 450,
+        deltaX: 0,
+        deltaY: -1200,
+      }),
+    );
   }
   async function pageInFullHistory(id, cdp2) {
     const marker = OLD_MARKERS[id];
@@ -892,7 +1101,8 @@ async function main() {
       if (attempt >= 90) return -1;
       if (attempt >= 30) await wheelScrollUp(cdp2, 3);
       await delay(attempt < 30 ? 1200 : 900);
-      if (await page.eval(`(document.body?.textContent ?? "").includes(${JSON.stringify(marker)})`)) return attempt < 30 ? attempt + 1 : attempt + 31;
+      if (await page.eval(`(document.body?.textContent ?? "").includes(${JSON.stringify(marker)})`))
+        return attempt < 30 ? attempt + 1 : attempt + 31;
       return waitForOldest(attempt + 1);
     }
     return waitForOldest(0);
@@ -911,16 +1121,31 @@ async function main() {
         return { markerSeen: (document.body?.textContent ?? "").includes(${JSON.stringify(OLD_MARKERS[id])}), scrollHeight: sc?.scrollHeight ?? null };
       })()`);
       out.load.push({ target: id, loadMs, attempts, ...probe });
-      process.stdout.write(`deepHistory load ${id}: ${loadMs}ms attempts=${attempts} seen=${probe.markerSeen} h=${probe.scrollHeight}\n`);
+      process.stdout.write(
+        `deepHistory load ${id}: ${loadMs}ms attempts=${attempts} seen=${probe.markerSeen} h=${probe.scrollHeight}\n`,
+      );
       if (!probe.markerSeen) return;
       // The deep-link scroll position can be restored after a programmatic scroll.
       // Keep the loaded session mounted and wait until the latest marker is visible.
       async function waitForLatest(attempt) {
         if (attempt >= 20) return false;
-        await page.eval(`(() => { const sc = document.querySelector('[data-virtualized-transcript]'); if (sc) sc.scrollTop = sc.scrollHeight; })()`);
-        await cdp.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: 800, y: 450, deltaX: 0, deltaY: 12000 });
+        await page.eval(
+          `(() => { const sc = document.querySelector('[data-virtualized-transcript]'); if (sc) sc.scrollTop = sc.scrollHeight; })()`,
+        );
+        await cdp.send("Input.dispatchMouseEvent", {
+          type: "mouseWheel",
+          x: 800,
+          y: 450,
+          deltaX: 0,
+          deltaY: 12000,
+        });
         await delay(1200);
-        if (await page.eval(`(document.body?.textContent ?? "").includes(${JSON.stringify(MARKERS[id])})`)) return true;
+        if (
+          await page.eval(
+            `(document.body?.textContent ?? "").includes(${JSON.stringify(MARKERS[id])})`,
+          )
+        )
+          return true;
         return waitForLatest(attempt + 1);
       }
       const latestVisible = await waitForLatest(0);
@@ -932,12 +1157,20 @@ async function main() {
       await delay(1500);
       const idleDeep = await idleSample(cdp);
       out.idleDeep.push({ target: id, ...idleDeep });
-      process.stdout.write(`deepHistory idle ${id} task=${Math.round(idleDeep.taskDurationMs)}ms\n`);
+      process.stdout.write(
+        `deepHistory idle ${id} task=${Math.round(idleDeep.taskDurationMs)}ms\n`,
+      );
 
       // (ii) streaming into the deep session
       await forEachSequential(indices(cyclesFor(2)), async (i) => {
-        const s = await streamSample(id, i, { history: "full", idleTaskMs: idleDeep.taskDurationMs });
-        s.taskMsPerEvent = Math.round(((s.taskDurationMs - idleDeep.taskDurationMs) / Math.max(1, s.injectedEvents)) * 100) / 100;
+        const s = await streamSample(id, i, {
+          history: "full",
+          idleTaskMs: idleDeep.taskDurationMs,
+        });
+        s.taskMsPerEvent =
+          Math.round(
+            ((s.taskDurationMs - idleDeep.taskDurationMs) / Math.max(1, s.injectedEvents)) * 100,
+          ) / 100;
         out.stream.push(s);
       });
     });
@@ -956,18 +1189,22 @@ try {
   const WATCHDOG_MS = Number(argOf("--watchdog-minutes", "25")) * 60_000;
   await Promise.race([
     main(),
-    delay(WATCHDOG_MS, undefined, { ref: false }).then(() => { throw new Error(`watchdog: run exceeded ${WATCHDOG_MS / 60000} min`); }),
+    delay(WATCHDOG_MS, undefined, { ref: false }).then(() => {
+      throw new Error(`watchdog: run exceeded ${WATCHDOG_MS / 60000} min`);
+    }),
   ]);
 } finally {
-  await Promise.all(browsers.map(async ({ child, profile }) => {
-    child.kill("SIGTERM");
-    if (child.exitCode === null && child.signalCode === null) {
-      await Promise.race([once(child, "exit"), delay(5000)]);
+  await Promise.all(
+    browsers.map(async ({ child, profile }) => {
+      child.kill("SIGTERM");
       if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGKILL");
-        await once(child, "exit");
+        await Promise.race([once(child, "exit"), delay(5000)]);
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+          await once(child, "exit");
+        }
       }
-    }
-    fs.rmSync(profile, { recursive: true, force: true });
-  }));
+      fs.rmSync(profile, { recursive: true, force: true });
+    }),
+  );
 }

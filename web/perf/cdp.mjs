@@ -6,7 +6,10 @@ import net from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
 export function forEachSequential(items, action) {
-  return items.reduce((previous, item, index) => previous.then(() => action(item, index)), Promise.resolve());
+  return items.reduce(
+    (previous, item, index) => previous.then(() => action(item, index)),
+    Promise.resolve(),
+  );
 }
 
 export function armOrder(index) {
@@ -16,16 +19,46 @@ export function armOrder(index) {
 export function findChrome(explicit) {
   const cache = path.join(os.homedir(), ".cache", "ms-playwright");
   const playwright = fs.existsSync(cache)
-    ? fs.readdirSync(cache).filter((name) => /^chromium-\d+$/.test(name)).sort((a, b) => Number(b.slice(9)) - Number(a.slice(9)))
-        .flatMap((name) => [path.join(cache, name, "chrome-linux", "chrome"), path.join(cache, name, "chrome-linux64", "chrome"), path.join(cache, name, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"), path.join(cache, name, "chrome-mac-arm64", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")])
+    ? fs
+        .readdirSync(cache)
+        .filter((name) => /^chromium-\d+$/.test(name))
+        .sort((a, b) => Number(b.slice(9)) - Number(a.slice(9)))
+        .flatMap((name) => [
+          path.join(cache, name, "chrome-linux", "chrome"),
+          path.join(cache, name, "chrome-linux64", "chrome"),
+          path.join(cache, name, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium"),
+          path.join(
+            cache,
+            name,
+            "chrome-mac-arm64",
+            "Google Chrome for Testing.app",
+            "Contents",
+            "MacOS",
+            "Google Chrome for Testing",
+          ),
+        ])
     : [];
-  const onPath = (name) => (process.env.PATH || "").split(path.delimiter).map((dir) => path.join(dir, name));
+  const onPath = (name) =>
+    (process.env.PATH || "").split(path.delimiter).map((dir) => path.join(dir, name));
   const chosen = explicit || process.env.CHROME;
   const candidates = chosen
-    ? (chosen.includes(path.sep) ? [chosen] : onPath(chosen))
-    : ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", ...["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"].flatMap(onPath), ...playwright];
+    ? chosen.includes(path.sep)
+      ? [chosen]
+      : onPath(chosen)
+    : [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ...["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"].flatMap(
+          onPath,
+        ),
+        ...playwright,
+      ];
   for (const candidate of candidates) {
-    try { fs.accessSync(candidate, fs.constants.X_OK); return candidate; } catch { continue; }
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      continue;
+    }
   }
   throw new Error("Chrome not found; pass --chrome or set CHROME");
 }
@@ -57,7 +90,8 @@ export function cdpConnect(wsUrl) {
       const p = pending.get(msg.id);
       if (p) {
         pending.delete(msg.id);
-        if (msg.error) p.reject(new Error(`[${p.method}] ${msg.error.message} (code ${msg.error.code})`));
+        if (msg.error)
+          p.reject(new Error(`[${p.method}] ${msg.error.message} (code ${msg.error.code})`));
         else p.resolve(msg.result);
       }
       return;
@@ -106,7 +140,9 @@ export function cdpConnect(wsUrl) {
   function close() {
     try {
       ws.close();
-    } catch { return; }
+    } catch {
+      return;
+    }
   }
 
   return {
