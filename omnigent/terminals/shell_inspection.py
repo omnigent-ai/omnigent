@@ -136,19 +136,24 @@ def sanitize_command_name(comm: str) -> str | None:
     return name[:MAX_COMMAND_NAME_LENGTH] or None
 
 
-def _parse(snapshot: str) -> list[_Row]:
-    """The snapshot's rows. A line whose first four fields aren't numbers, such as the rest of a
-    ``comm`` with a newline in it, is dropped."""
+def _parse(snapshot: str) -> list[_Row] | None:
+    """The snapshot's rows, or ``None`` when any line isn't one.
+
+    A process with an empty ``comm`` is kept, unnamed. Any other line that doesn't parse, such
+    as the rest of a ``comm`` with a newline in it, could hide a process, so nothing is trusted.
+    """
     rows: list[_Row] = []
     for line in snapshot.splitlines():
-        fields = line.split(None, 5)
-        if len(fields) < 6:
+        if not line.strip():
             continue
+        fields = line.split(None, 5)
+        if len(fields) < 5:
+            return None
         try:
             pid, ppid, pgid, tpgid = (int(value) for value in fields[:4])
         except ValueError:
-            continue
-        rows.append(_Row(pid, ppid, pgid, tpgid, fields[5]))
+            return None
+        rows.append(_Row(pid, ppid, pgid, tpgid, fields[5] if len(fields) == 6 else ""))
     return rows
 
 
@@ -219,6 +224,8 @@ def inspect_shell(
     :returns: The inspection; only names and counts, never a row.
     """
     rows = _parse(snapshot)
+    if rows is None:
+        return UNKNOWN
     by_pid = {row.pid: row for row in rows}
     # A pid listed twice means a line was forged, e.g. through a newline in a ``comm``.
     if len(by_pid) != len(rows):

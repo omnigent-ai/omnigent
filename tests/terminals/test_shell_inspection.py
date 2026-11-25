@@ -516,13 +516,30 @@ async def test_a_read_that_raises_answers_unknown_and_logs_nothing_of_it(
     assert "secret" not in caplog.text
 
 
-def test_drops_lines_whose_first_four_fields_are_not_numbers() -> None:
-    # A comm with a newline in it puts the rest on its own line, which must not parse as a row.
-    forged = PLAIN_SLEEP.replace(" sleep\n", " sleep\nzsh evil 300 300 S+ vim\n")
-    assert forged != PLAIN_SLEEP
-    assert inspect(forged) == ShellInspection(ShellState.BUSY, "sleep", 0)
-    hidden = PLAIN_IDLE.replace(" bash\n", " bash\nx 1 2 3 S+ sleep\n")
-    assert inspect(hidden) == ShellInspection(ShellState.IDLE)
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The rest of a comm with a newline in it, on its own line.
+        "zsh evil 300 300 S+ vim",
+        "x 1 2 3 S+ sleep",
+        # Too few fields to be a row.
+        "300 200",
+    ],
+    ids=["comm continuation", "numbers out of place", "short line"],
+)
+def test_a_line_that_is_not_a_row_makes_the_answer_unknown(line: str) -> None:
+    # Dropping the line could hide a process under the pane, so nothing is trusted.
+    assert inspect(PLAIN_IDLE.replace(" bash\n", f" bash\n{line}\n")) == UNKNOWN
+
+
+def test_a_child_with_an_empty_name_keeps_the_shell_busy() -> None:
+    # ``ps`` prints nothing for an empty comm: the child is still there, only unnamed.
+    text = PLAIN_IDLE + f"    300 {PANE:>7}     300 {PANE:>7} S \n"
+    assert inspect(text) == ShellInspection(ShellState.BUSY, None, 1)
+    sandboxed = SANDBOX_IDLE + "    300     203     201      -1 S\n"
+    assert inspect(sandboxed, launchers=BWRAP_LAUNCHERS) == ShellInspection(
+        ShellState.BUSY, None, None
+    )
 
 
 def test_a_pid_listed_twice_is_unknown() -> None:

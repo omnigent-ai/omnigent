@@ -142,3 +142,17 @@ async def test_a_busy_jobs_arguments_and_environment_never_reach_the_answer(
         assert secret not in wire
         assert secret not in caplog.text
     await _settles_on(bash_terminal, _IDLE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="renames itself with Linux's prctl")
+@pytest.mark.parametrize("bash_terminal", [pytest.param(None, id="plain")], indirect=True)
+async def test_a_job_with_an_empty_name_keeps_the_shell_busy(
+    bash_terminal: TerminalInstance,
+) -> None:
+    await _settles_on(bash_terminal, _IDLE)
+    # PR_SET_NAME to "", so ``ps`` prints no comm at all for the job.
+    program = "import ctypes, time; ctypes.CDLL(None).prctl(15, b'', 0, 0, 0); time.sleep(4)"
+    await bash_terminal.send(f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}")
+    await _settles_on(bash_terminal, ShellInspection(ShellState.BUSY, None, 0))
+    await _settles_on(bash_terminal, _IDLE)
