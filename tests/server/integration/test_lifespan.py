@@ -19,8 +19,12 @@ import pytest
 from fastapi import FastAPI
 
 from tests.budgets import budget
+from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
+
+# Python sizes a loop's lazily created default executor to at most 32 threads.
+_PYTHON_DEFAULT_EXECUTOR_MAX_WORKERS = 32
 
 
 @pytest.mark.parametrize("ci", [True, False])
@@ -174,3 +178,63 @@ async def test_lifespan_starts_periodic_metrics_otel_publisher(
         assert len(watchdogs) == 1
     watchdogs[0].join(timeout=budget(3))
     assert not watchdogs[0].is_alive()
+
+
+async def test_lifespan_creates_sessions_while_python_default_pool_is_occupied(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A Postgres-backed server keeps creating sessions while 32 offloads block.
+
+    The stores use SQLite; only the location that sizes the executor names Postgres.
+    """
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+    conversation_store.storage_location = "postgresql+psycopg://omnigent@db.example.com/omnigent"
+    release = threading.Event()
+
+    threads_before = set(threading.enumerate())
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            agent = await create_test_agent(client)
+            loop = asyncio.get_running_loop()
+            blocked = [
+                loop.run_in_executor(None, release.wait)
+                for _ in range(_PYTHON_DEFAULT_EXECUTOR_MAX_WORKERS)
+            ]
+            try:
+                created = await asyncio.wait_for(
+                    client.post("/v1/sessions", json={"agent_id": agent["id"]}),
+                    timeout=budget(10),
+                )
+            finally:
+                release.set()
+                await asyncio.gather(*blocked)
+        assert created.status_code == 201, created.text
+        pool_watchdogs = [
+            thread
+            for thread in set(threading.enumerate()) - threads_before
+            if thread.name == "omnigent-server-pool-watchdog"
+        ]
+        assert len(pool_watchdogs) == 1
+    pool_watchdogs[0].join(timeout=budget(3))
+    assert not pool_watchdogs[0].is_alive()
+    assert await asyncio.to_thread(release.is_set)

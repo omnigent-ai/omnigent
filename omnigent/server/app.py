@@ -11,6 +11,7 @@ import tarfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from importlib import import_module
@@ -36,6 +37,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from omnigent._platform import resolve_repo_symlink
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.db.utils import normalize_database_url
 from omnigent.debug_logging import (
     add_audit_attrs,
     audit_event_logger,
@@ -220,6 +222,7 @@ from omnigent.stores.user_settings_store import (
 )
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.event_loop_watchdog import monitor_event_loop
+from omnigent.util.thread_pool_watchdog import watch_thread_pool
 
 if TYPE_CHECKING:
     from omnigent.entities import Agent, Conversation
@@ -230,6 +233,23 @@ _logger = logging.getLogger(__name__)
 
 _RECONNECT_BINDING_BATCH_SIZE = 128
 _HOST_HOLD_SNAPSHOT_BATCH_SIZE = 128
+# Threads for sync routes and ``asyncio.to_thread``; the Postgres pool holds as many connections.
+_SERVER_THREAD_LIMIT = 200
+
+
+def _server_thread_pool_workers(conversation_store: object) -> int | None:
+    """Size the asyncio default executor; SQLite's 40-connection pool keeps Python's default.
+
+    :param conversation_store: The server's conversation store, e.g. at ``"sqlite:///chat.db"``.
+    :returns: ``_SERVER_THREAD_LIMIT``, or ``None`` for Python's default size.
+    """
+    for location in (
+        getattr(conversation_store, "storage_location", None),
+        getattr(conversation_store, "conversation_storage_location", None),
+    ):
+        if isinstance(location, str) and normalize_database_url(location).startswith("sqlite"):
+            return None
+    return _SERVER_THREAD_LIMIT
 
 
 @dataclass(frozen=True)
@@ -2332,11 +2352,18 @@ def create_app(
         :param app_inst: The FastAPI app, used to attach
             per-AP state via ``app_inst.state.*``.
         """
-        # Bump AnyIO default thread limiter from 40 → 200; every
-        # ``asyncio.to_thread`` and FastAPI sync route grabs one.
+        # FastAPI sync routes take AnyIO limiter tokens; ``asyncio.to_thread``
+        # runs on the loop's default executor, which Python caps at 32 threads.
         from anyio import to_thread as _to_thread
 
-        _to_thread.current_default_thread_limiter().total_tokens = 200
+        _to_thread.current_default_thread_limiter().total_tokens = _SERVER_THREAD_LIMIT
+        server_loop = asyncio.get_running_loop()
+        server_executor = ThreadPoolExecutor(
+            max_workers=_server_thread_pool_workers(conversation_store),
+            thread_name_prefix="server",
+        )
+        server_loop.set_default_executor(server_executor)
+        watch_thread_pool(server_executor, thread_name_prefix="server", process_role="server")
 
         # Initialise usage telemetry (fire-and-forget; no-op when disabled).
         from omnigent.telemetry import init_client as _init_telemetry
@@ -2649,6 +2676,9 @@ def create_app(
             # endpoint. Best-effort — individual close failures are logged
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
+            # Offloads after shutdown get a fresh pool; this one drains and its watchdog exits.
+            server_loop.set_default_executor(ThreadPoolExecutor(thread_name_prefix="asyncio"))
+            server_executor.shutdown(wait=False)
 
     from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
 

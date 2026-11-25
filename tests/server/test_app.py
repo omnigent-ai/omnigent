@@ -78,6 +78,33 @@ def test_server_version_reads_version_constant() -> None:
     assert server_app._server_version() == VERSION
 
 
+@pytest.mark.parametrize(
+    ("storage_location", "conversation_storage_location", "expected"),
+    [
+        ("postgresql://omnigent@db.example.com/omnigent", None, 200),
+        ("postgres://omnigent@db.example.com/omnigent", None, 200),
+        ("cockroachdb://root@db.example.com/omnigent", None, 200),
+        ("sqlite:///chat.db", None, None),
+        ("postgresql://omnigent@db.example.com/omnigent", "sqlite:///conversations.db", None),
+        (None, None, 200),
+    ],
+)
+def test_server_thread_pool_matches_the_database_connection_pool(
+    storage_location: str | None,
+    conversation_storage_location: str | None,
+    expected: int | None,
+) -> None:
+    """Server databases get 200 offload threads; SQLite keeps Python's default pool."""
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(
+        storage_location=storage_location,
+        conversation_storage_location=conversation_storage_location,
+    )
+
+    assert server_app._server_thread_pool_workers(store) == expected
+
+
 @pytest.mark.asyncio
 async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
     """GET /.well-known/omnigent.json returns the version manifest.
