@@ -1115,6 +1115,28 @@ def test_a_failed_registry_check_after_a_read_lets_the_next_poll_read_again(
     assert len(views) == 2
 
 
+def test_an_unreadable_panel_write_marker_makes_every_poll_read_the_forge(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    registry = SessionPrRegistry("session")
+    registry.update_titles({A: "Listed", B: "Selected"})
+    registry.path.with_suffix(".panel-writes").write_bytes(b"\xff\xfe not a marker")
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    assert poll()["pr"]["title"] == "Selected"
+    assert poll()["pr"]["title"] == "Selected"
+    assert len(views) == 2
+
+
 def test_a_read_without_allow_cached_reads_the_forge_even_while_a_poll_runs(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

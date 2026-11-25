@@ -146,11 +146,16 @@ class SessionPrRegistry:
         return tuple(versions)
 
     def panel_write_marker(self) -> str | None:
-        """Identify the last PR panel write any process recorded for this session, if any."""
+        """Identify the last PR panel write any process recorded for this session, if any.
+
+        An unreadable marker gives a new value each time, so no read is kept past it.
+        """
         try:
             return self._panel_writes_path.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
             return None
+        except (OSError, ValueError):
+            return uuid.uuid4().hex
 
     def note_panel_write(self) -> None:
         """Record a PR panel write, so every process serving the session drops older reads."""

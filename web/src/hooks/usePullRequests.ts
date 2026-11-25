@@ -789,7 +789,6 @@ export function usePullRequestInfoSnapshot(rawConversationId: string | undefined
   });
 }
 
-/** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
 /**
  * Read a session's PR info again from GitHub, as the panel's Refresh does. The
  * queries are invalidated first, so none of these reads takes the runner's previous answer.
@@ -806,6 +805,7 @@ export function useRefreshPullRequestInfo(rawConversationId: string | undefined)
   );
 }
 
+/** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
 export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
   const context = usePullRequestQueryContext(rawConversationId);
   return useQueries({
