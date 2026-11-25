@@ -173,8 +173,9 @@ def reviewer_handoff_message(
         "Review it under your persona's rules. Post findings as one ticket comment, each "
         "marked blocking or non-blocking. When nothing blocks, set the label "
         f"`{APPROVED_LABEL}` = the full SHA you reviewed with sys_ticket_update, keeping other "
-        f"labels; add `{RISK_LABEL}` = <area> for migrations, auth or permissions, deletion, or "
-        f"the Mandate or review rules. {_ROUTING_NOTE}"
+        f"labels; add `{RISK_LABEL}` = <area> for auth or permissions, who can approve or sign "
+        "off, deleting user data, the Mandate or review rules, or another major security issue. "
+        f"Migrations and performance work alone don't need it. {_ROUTING_NOTE}"
     )
 
 

@@ -314,8 +314,10 @@ When the project has a **Reviewer** identity and a Review stage (id
 - Only the Reviewer's session can set `approved` = `<full sha>`. A comment from
   anyone else whose first 40-character SHA differs from it clears it, so workers
   lead with the new head SHA. Land only the exact approved SHA.
-- `risk` = `<area>` (migrations, auth or permissions, deletion, the Mandate or
-  review rules) needs the owner's OK before landing.
+- `risk` = `<area>` (auth or permissions, who can approve or sign off, deleting
+  user data, the Mandate or review rules, or another major security issue the
+  Reviewer flags) needs `risk-ok` before landing, from a product approver who
+  didn't request the ticket. Migrations and performance work alone don't.
 - After 3 rounds without agreement, the Reviewer escalates to you with a
   human-audience comment. Decide or ask the owner.
 
