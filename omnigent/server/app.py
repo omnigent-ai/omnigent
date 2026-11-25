@@ -498,6 +498,16 @@ def _server_version() -> str:
     return VERSION
 
 
+#: Package spec hosts install to get this server's tools; operators running an
+#: unreleased build point it at that build, e.g. ``git+https://…/omnigent.git@<ref>``.
+HOST_INSTALL_SPEC_ENV = "OMNIGENT_HOST_INSTALL_SPEC"
+
+
+def host_install_spec() -> str:
+    """What ``uv tool install`` should install on a host to match this server."""
+    return os.environ.get(HOST_INSTALL_SPEC_ENV, "").strip() or "omnigent"
+
+
 def _register_web_mimetypes() -> None:
     """Pin Content-Type for web UI assets regardless of the OS MIME registry.
 
@@ -3719,6 +3729,17 @@ def create_app(
                 versions[host_id] = host_conn.hello.version
         return versions
 
+    def _bulk_host_project_tools(host_ids: list[str]) -> dict[str, bool]:
+        """Whether each live host relays the project board tools (``CAP_PROJECT_TOOLS``)."""
+        from omnigent.host.frames import CAP_PROJECT_TOOLS
+
+        supported: dict[str, bool] = {}
+        for host_id in set(host_ids):
+            host_conn = host_registry.get(host_id)
+            if host_conn is not None:
+                supported[host_id] = CAP_PROJECT_TOOLS in host_conn.hello.capabilities
+        return supported
+
     def _session_liveness(sid: str) -> SessionLiveness:
         """
         Resolve strict runner + host liveness for one session.
@@ -3805,6 +3826,7 @@ def create_app(
         }
         online_hosts = _bulk_hosts_online(list(host_ids_to_check))
         host_versions = _bulk_host_versions(list(host_ids_to_check))
+        host_project_tools = _bulk_host_project_tools(list(host_ids_to_check))
         result: dict[str, SessionLiveness] = {}
         for sid in ids:
             conn = connectivity.get(sid)
@@ -3813,12 +3835,14 @@ def create_app(
                 # binding, matching the legacy single-session behavior.
                 result[sid] = SessionLiveness(runner_online=True, host_online=None)
                 continue
+            project_tools: bool | None = None
             if conn.host_id is None:
                 host_online: bool | None = None
                 host_version: str | None = None
             else:
                 host_online = conn.host_id in online_hosts
                 host_version = host_versions.get(conn.host_id)
+                project_tools = host_project_tools.get(conn.host_id)
             if conn.runner_id is None:
                 # No runner binding: an in-process executor (or a session
                 # not yet dispatched) is reachable — EXCEPT sessions that have
@@ -3836,6 +3860,7 @@ def create_app(
                 runner_online=runner_online,
                 host_online=host_online,
                 host_version=host_version,
+                host_project_tools=project_tools,
             )
         return result
 
@@ -3900,13 +3925,18 @@ def create_app(
                 "runner_online": single.runner_online,
                 "host_online": single.host_online,
                 "host_version": single.host_version,
+                "host_project_tools": single.host_project_tools,
             }
+            if single.host_project_tools is False:
+                # What to install on that machine so its sessions get the board tools.
+                result["session"]["host_install_spec"] = host_install_spec()
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
                     "runner_online": (sl := _liveness_or_missing(sid)).runner_online,
                     "host_online": sl.host_online,
                     "host_version": sl.host_version,
+                    "host_project_tools": sl.host_project_tools,
                 }
                 for sid in batch_ids
             }

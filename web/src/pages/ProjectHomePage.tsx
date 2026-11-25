@@ -48,6 +48,8 @@ import {
   useNeedsYouTicketIds,
 } from "@/projectHome/needsYouFilter";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
+import { OutdatedHostBanner } from "@/projectHome/OutdatedHostBanner";
+import { useProjectAgentSession } from "@/projectHome/useProjectAgentSession";
 
 const SESSION_PANEL_DEFAULT_WIDTH_VW = 40;
 const SESSION_PANEL_MIN_WIDTH_PX = 360;
@@ -142,6 +144,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
 
   const [boardMine, setBoardMine] = useBoardRequesterFilter(projectId ?? null);
   const needsYouIds = useNeedsYouTicketIds(tickets ? (projectId ?? null) : null);
+  const leadSessionId = useProjectAgentSession(tickets ? (projectId ?? null) : null).sessionId;
   // With nothing waiting on the viewer the chip hides and the board shows its usual view.
   const needsYou = searchParams.get(NEEDS_YOU_PARAM) === NEEDS_YOU_VALUE && needsYouIds.length > 0;
   const setNeedsYou = (on: boolean) => {
@@ -220,6 +223,9 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
               />
             }
           />
+        )}
+        {tickets && !ticketFillsPage && (
+          <OutdatedHostBanner sessionId={leadSessionId} name="the Lead" className="mb-2" />
         )}
         <div className="flex min-h-0 flex-1">
           {tickets ? (

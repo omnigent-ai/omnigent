@@ -326,6 +326,7 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
         "runner_online": True,
         "host_online": None,
         "host_version": None,
+        "host_project_tools": None,
     }
     # (b) Dead runner, live host: strict runner_online is False (no
     # host-relaunch optimism), but host_online surfaces the live host so
@@ -335,18 +336,21 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
         "runner_online": False,
         "host_online": True,
         "host_version": None,
+        "host_project_tools": None,
     }
     # (c) Dead runner, offline host ⇒ both False.
     assert sessions[runner_down_host_down.id] == {
         "runner_online": False,
         "host_online": False,
         "host_version": None,
+        "host_project_tools": None,
     }
     # (d) Dead runner, no host ⇒ runner_online False, host_online None.
     assert sessions[runner_down_no_host.id] == {
         "runner_online": False,
         "host_online": None,
         "host_version": None,
+        "host_project_tools": None,
     }
     # Stopped + live host: NOT special-cased — reads exactly like (b). If
     # this regressed to False/True-with-stopped-collapse, the stopped marker
@@ -355,12 +359,14 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
         "runner_online": False,
         "host_online": True,
         "host_version": None,
+        "host_project_tools": None,
     }
     # Unknown id (no conversation row) ⇒ reachable, no host.
     assert sessions["fee171f70cf25c4cff8203046e727fd4"] == {
         "runner_online": True,
         "host_online": None,
         "host_version": None,
+        "host_project_tools": None,
     }
 
 
@@ -400,6 +406,7 @@ async def test_health_single_session_reports_both_liveness_fields(
         "runner_online": False,
         "host_online": True,
         "host_version": None,
+        "host_project_tools": None,
     }
 
 
@@ -440,12 +447,59 @@ async def test_health_reports_host_version_from_live_registry(
 
     assert resp.status_code == 200
     # host_online True (DB store) AND host_version from the live registry.
+    # The hello advertised no project_tools, so the session gets an update hint.
     assert resp.json()["session"] == {
         "id": conv.id,
         "runner_online": False,
         "host_online": True,
         "host_version": "9.9.9-test",
+        "host_project_tools": False,
+        "host_install_spec": "omnigent",
     }
+
+
+@pytest.mark.asyncio
+async def test_health_reports_whether_the_host_relays_project_tools(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host advertising ``project_tools`` needs no update; an older one gets the install spec."""
+    from omnigent.host.frames import CAP_PROJECT_TOOLS, HostHelloFrame
+
+    monkeypatch.setenv(
+        "OMNIGENT_HOST_INSTALL_SPEC", "git+https://git.example.com/omnigent.git@build"
+    )
+    wired = _build_liveness_app(db_uri, tmp_path)
+    registry = wired.app.state.host_registry
+    registry.register(
+        "2fd786c75c03cfbbec099a6820c08b62",
+        _StubWebSocket(),
+        HostHelloFrame(
+            version="9.9.9", frame_protocol_version=1, name="new", capabilities=[CAP_PROJECT_TOOLS]
+        ),
+        "alice@example.com",
+    )
+    current = wired.conversation_store.create_conversation(
+        runner_id="rnr_a", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
+    )
+    transport = httpx.ASGITransport(app=wired.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        single = (await c.get(f"/health?session_id={current.id}")).json()["session"]
+        batch = (await c.get(f"/health?session_ids={current.id}")).json()["sessions"]
+    assert single["host_project_tools"] is True and "host_install_spec" not in single
+    assert batch[current.id]["host_project_tools"] is True
+
+    registry.register(
+        "2fd786c75c03cfbbec099a6820c08b62",
+        _StubWebSocket(),
+        HostHelloFrame(version="0.23.0", frame_protocol_version=1, name="old"),
+        "alice@example.com",
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        single = (await c.get(f"/health?session_id={current.id}")).json()["session"]
+    assert single["host_project_tools"] is False
+    assert single["host_install_spec"] == "git+https://git.example.com/omnigent.git@build"
 
 
 @pytest.mark.asyncio

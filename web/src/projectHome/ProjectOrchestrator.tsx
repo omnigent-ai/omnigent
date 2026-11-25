@@ -1,3 +1,4 @@
+import { OutdatedHostBanner } from "./OutdatedHostBanner";
 import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Maximize2Icon, MessagesSquareIcon, RotateCcwIcon, XIcon } from "lucide-react";
@@ -348,6 +349,11 @@ function OrchestratorChat({
   const presentation = useMemo(() => withIntro(base, intro), [base, intro]);
   return (
     <RenderErrorBoundary name="chat" resetKey={sessionId}>
+      <OutdatedHostBanner
+        sessionId={sessionId}
+        name={persona === "Lead" ? "the Lead" : persona}
+        className="mx-3 mt-3 w-auto"
+      />
       <FullSessionChat
         sessionId={sessionId}
         sessionComposer

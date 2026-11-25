@@ -1582,11 +1582,16 @@ class SessionLiveness:
         on this replica (the version lives in the in-memory host
         registry, not the hosts table, so a host connected to another
         replica reads ``None`` here).
+    :param host_project_tools: Whether the bound host relays the project
+        board and team tools (``CAP_PROJECT_TOOLS``). ``False`` means its
+        sessions can't write to the board as themselves; ``None`` when
+        there's no host binding or the host isn't connected to this replica.
     """
 
     runner_online: bool
     host_online: bool | None
     host_version: str | None = None
+    host_project_tools: bool | None = None
 
 
 async def _apply_liveness_to_items(
