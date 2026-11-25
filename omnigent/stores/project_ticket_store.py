@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select, union_all, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
@@ -74,6 +74,9 @@ CC_SCAN_MAX = 200
 # Outputs ride along with a comment, so only these kinds count as new activity.
 NEW_COMMENT_KINDS = (EVENT_CODES["comment"], EVENT_CODES["execution"])
 NEW_UPDATE_KINDS = (EVENT_CODES["created"], EVENT_CODES["updated"])
+# A card's latest comment reads only each ticket's newest comments, then clips it.
+LATEST_COMMENT_SCAN = 10
+LATEST_COMMENT_MAX_CHARS = 300
 
 
 @dataclass(frozen=True)
@@ -875,6 +878,57 @@ class ProjectTicketStore:
                 }
         return None
 
+    @staticmethod
+    def _latest_comments(
+        session: Session, project: SqlProject, tickets: builtins.list[SqlProjectTicket]
+    ) -> dict[str, dict[str, Any]]:
+        """Each ticket's newest comment by a person or for the human, for its card.
+
+        Unlike ``latest_update``, stage moves and label edits don't replace it. Payloads
+        are encrypted, so only each ticket's newest few comments are read and decoded.
+        """
+        if not tickets:
+            return {}
+        event = SqlProjectTicketEvent
+        newest_first = (
+            func.row_number()
+            .over(partition_by=event.ticket_id, order_by=event.position.desc())
+            .label("rank")
+        )
+        ranked = (
+            select(event, newest_first)
+            .where(
+                event.workspace_id == project.workspace_id,
+                event.project_id == project.id,
+                event.ticket_id.in_([ticket.id for ticket in tickets]),
+                event.kind.in_(NEW_COMMENT_KINDS),
+            )
+            .subquery()
+        )
+        recent = aliased(event, ranked)
+        rows = session.scalars(
+            select(recent)
+            .where(ranked.c.rank <= LATEST_COMMENT_SCAN)
+            .order_by(recent.ticket_id, recent.position.desc())
+        )
+        orchestrator_session_id = _orchestrator_session_id(session, project)
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row.ticket_id in latest:
+                continue
+            by_person = row.session_id is None and row.agent_id is None
+            payload = row.payload
+            if by_person or _note_audience(row, payload, orchestrator_session_id) == "human":
+                latest[row.ticket_id] = {
+                    "text": str(payload.get("text", ""))[:LATEST_COMMENT_MAX_CHARS],
+                    "user_id": row.user_id,
+                    "session_id": row.session_id,
+                    "by_person": by_person,
+                    "position": row.position,
+                    "created_at": row.created_at,
+                }
+        return latest
+
     def list(
         self,
         project_id: str,
@@ -900,10 +954,15 @@ class ProjectTicketStore:
                 limit=limit + 1,
                 requested_by=requested_by,
             )
+            latest_comments = self._latest_comments(session, project, rows[:limit])
             page: dict[str, Any] = {
                 **configuration.model_dump(),
                 "data": [
-                    {**_ticket(row), "waiting_on": self._waiting_on(session, project, row)}
+                    {
+                        **_ticket(row),
+                        "waiting_on": self._waiting_on(session, project, row),
+                        "latest_comment": latest_comments.get(row.id),
+                    }
                     for row in rows[:limit]
                 ],
                 "has_more": len(rows) > limit,

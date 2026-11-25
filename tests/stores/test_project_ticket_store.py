@@ -207,7 +207,11 @@ def test_labels_project_existing_storage_and_history_without_rewriting_it(board,
         ).all()
     for _ in range(2):
         assert tickets.get(project.id, ticket["id"], user_id="alice") == _as_read(expected)
-        assert tickets.list(project.id, user_id="alice")["data"] == [expected]
+        listed = tickets.list(project.id, user_id="alice")["data"]
+        assert [{**row, "latest_comment": None} for row in listed] == [
+            {**expected, "latest_comment": None}
+        ]
+        assert listed[0]["latest_comment"]["text"] == expected["latest_update"]
         assert (
             tickets.events(project.id, ticket["id"], user_id="alice")["data"] == expected_history
         )
@@ -1243,3 +1247,41 @@ def test_a_ticket_says_who_its_open_ask_waits_on_until_it_is_answered(board):
     tickets.comment(project.id, ticket["id"], CommentOnTicket(text="B"), TicketActor("alice"))
 
     assert tickets.list(project.id, user_id="alice")["data"][0]["waiting_on"] is None
+
+
+def test_list_keeps_the_latest_human_comment_across_later_moves_and_label_edits(board):
+    tickets, _, project = board
+    person = TicketActor("alice")
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    ticket = tickets.create(project.id, CreateTicket(title="Card"), worker)
+    untouched = tickets.create(project.id, CreateTicket(title="Quiet"), worker)
+
+    def latest(ticket_id):
+        rows = tickets.list(project.id, user_id="alice")["data"]
+        return next(row for row in rows if row["id"] == ticket_id)
+
+    assert latest(untouched["id"])["latest_comment"] is None
+    tickets.comment(project.id, ticket["id"], CommentOnTicket(text="Ship it Friday"), person)
+    shown = latest(ticket["id"])["latest_comment"]
+    assert shown["text"] == "Ship it Friday" and shown["by_person"] is True
+    assert shown["user_id"] == "alice" and shown["session_id"] is None
+    assert shown["created_at"] > 0 and shown["position"] == 1
+
+    # A worker's agent note, a stage move and a label edit don't replace it.
+    tickets.comment(project.id, ticket["id"], CommentOnTicket(text="ran tsc"), worker)
+    tickets.update(project.id, ticket["id"], UpdateTicket(stage_id="in_progress"), worker)
+    tickets.update(project.id, ticket["id"], UpdateTicket(labels=[{"key": "kind"}]), worker)
+    row = latest(ticket["id"])
+    assert row["latest_update"] != "Ship it Friday"
+    assert row["latest_comment"]["text"] == "Ship it Friday"
+
+    # A worker's human-audience comment is the newest one for the human.
+    tickets.comment(
+        project.id,
+        ticket["id"],
+        CommentOnTicket(text="Which date works?", audience="human"),
+        worker,
+    )
+    shown = latest(ticket["id"])["latest_comment"]
+    assert shown["text"] == "Which date works?" and shown["by_person"] is False
+    assert shown["session_id"] == worker.session_id

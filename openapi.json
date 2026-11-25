@@ -25354,6 +25354,7 @@
     },
     "/v1/projects/{project_id}/tickets": {
       "get": {
+        "description": "List a page of tickets.\n\nEach ticket's `latest_comment` is its newest comment by a person or for the\nhuman (`text`, `user_id`, `session_id`, `by_person`, `position`,\n`created_at`), or null. Unlike `latest_update`, stage moves and label edits\ndon't replace it.",
         "operationId": "list_tickets_v1_projects__project_id__tickets_get",
         "parameters": [
           {

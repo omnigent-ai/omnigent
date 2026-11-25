@@ -723,6 +723,13 @@ def create_project_tickets_router(
         include_guidance: bool = False,
         mine: bool = Query(False, description="Only tickets the caller requested."),
     ) -> dict[str, Any]:
+        """List a page of tickets.
+
+        Each ticket's ``latest_comment`` is its newest comment by a person or for the
+        human (``text``, ``user_id``, ``session_id``, ``by_person``, ``position``,
+        ``created_at``), or null. Unlike ``latest_update``, stage moves and label edits
+        don't replace it.
+        """
         who = await actor(request, project_id)
         page = await asyncio.to_thread(
             store.list,
