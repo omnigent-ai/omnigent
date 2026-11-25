@@ -3517,6 +3517,7 @@ function AppShellImpl() {
             allConversations={allConversations}
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
+            projectPage={projectHomeName !== null}
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>

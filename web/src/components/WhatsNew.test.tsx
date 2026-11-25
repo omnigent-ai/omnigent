@@ -30,4 +30,16 @@ describe("WhatsNew", () => {
     render(<WhatsNew entries={entries} />);
     expect(screen.queryByText(BADGE_TEXT)).toBeNull();
   });
+
+  it("sits at the bottom on phones when asked, keeping desktop placement", () => {
+    const { rerender } = render(<WhatsNew entries={entries} />);
+    const top = screen.getByTestId("whats-new");
+    expect(top.className).toMatch(/(^| )top-\[calc\(4\.25rem/);
+    rerender(<WhatsNew entries={entries} phoneAtBottom />);
+    const bottom = screen.getByTestId("whats-new");
+    expect(bottom.className).toMatch(/(^| )bottom-\[calc\(1rem/);
+    expect(bottom.className).not.toMatch(/(^| )top-\[/);
+    expect(bottom.className).toContain("md:bottom-[calc(4.5rem");
+    expect(bottom.className).toContain("md:left-3");
+  });
 });

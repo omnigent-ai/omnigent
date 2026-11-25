@@ -29,6 +29,8 @@ export interface AppShellOverlaysProps {
   allConversations: Conversation[] | undefined;
   serverConversationId: string | undefined;
   updateOverlayHeight: number;
+  /** A project home page, whose view toolbar sits right under the phone header. */
+  projectPage?: boolean;
 }
 
 /**
@@ -48,6 +50,7 @@ export function AppShellOverlays({
   allConversations,
   serverConversationId,
   updateOverlayHeight,
+  projectPage = false,
 }: AppShellOverlaysProps) {
   // Both palettes take the same props; the flag picks one for ⌘K and the session switcher.
   const Palette = isFeatureEnabled(serverInfo, "quick_pick_palette")
@@ -59,7 +62,7 @@ export function AppShellOverlays({
           ⌘/Ctrl+/ opener); ungated so it works on every route. */}
       <KeyboardShortcutsDialog />
       {/* Release-notes pill for entries newer than this browser last saw. */}
-      {!isEmbedded && <WhatsNew />}
+      {!isEmbedded && <WhatsNew phoneAtBottom={projectPage} />}
       {/* Opens the import modal once per newly connected host. */}
       {!isEmbedded && <ImportReviewGate />}
       {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}

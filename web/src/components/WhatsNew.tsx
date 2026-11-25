@@ -7,6 +7,7 @@ import { useState } from "react";
 
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -48,7 +49,14 @@ function EntryList({ entries }: { entries: WhatsNewEntry[] }) {
   );
 }
 
-export function WhatsNew({ entries = WHATS_NEW_ENTRIES }: { entries?: WhatsNewEntry[] }) {
+export function WhatsNew({
+  entries = WHATS_NEW_ENTRIES,
+  phoneAtBottom = false,
+}: {
+  entries?: WhatsNewEntry[];
+  /** Phones: sit at the bottom, for pages whose toolbar is right under the header. */
+  phoneAtBottom?: boolean;
+}) {
   // Read once per page load: the set shown stays stable while the dialog is open.
   const [unseen] = useState(() => unseenEntries(entries, readLastSeen()));
   const [badgeVisible, setBadgeVisible] = useState(unseen.length > 0);
@@ -66,9 +74,15 @@ export function WhatsNew({ entries = WHATS_NEW_ENTRIES }: { entries?: WhatsNewEn
       {badgeVisible && (
         <div
           role="status"
-          // Phones: a one-line pill under the header. Desktop: a card at the bottom-left,
-          // above the sidebar footer, so it never sits over a page header.
-          className="fixed left-1/2 top-[calc(4.25rem+var(--omnigent-safe-top,0px))] z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md md:top-auto md:bottom-[calc(4.5rem+var(--omnigent-safe-bottom,0px))] md:left-3 md:w-72 md:translate-x-0 md:items-start md:rounded-lg md:py-2 md:pl-3"
+          // Phones: a one-line pill under the header, or at the bottom over a project's
+          // toolbar row. Desktop: a card at the bottom-left, above the sidebar footer.
+          data-testid="whats-new"
+          className={cn(
+            "fixed left-1/2 z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md md:top-auto md:bottom-[calc(4.5rem+var(--omnigent-safe-bottom,0px))] md:left-3 md:w-72 md:translate-x-0 md:items-start md:rounded-lg md:py-2 md:pl-3",
+            phoneAtBottom
+              ? "bottom-[calc(1rem+var(--omnigent-safe-bottom,0px))]"
+              : "top-[calc(4.25rem+var(--omnigent-safe-top,0px))]",
+          )}
         >
           <button
             type="button"
