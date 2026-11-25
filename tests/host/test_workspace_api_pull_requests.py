@@ -1056,7 +1056,7 @@ _HOST_THREADS = {
         {
             "id": "PRRT_1",
             "can_reply": True,
-            "comments": {"data": [{"id": "PRRC_1", "database_id": 5, "can_update": True}]},
+            "comments": {"data": [{"id": "PRRC_1", "database_id": 2**53 - 1, "can_update": True}]},
         }
     ]
 }
@@ -1081,7 +1081,13 @@ async def _threads_through(tmp_path: Path, viewer: PullRequestViewer) -> dict[st
 
 
 async def test_the_owner_reads_threads_with_the_host_accounts_rights(tmp_path: Path) -> None:
-    assert await _threads_through(tmp_path, PullRequestViewer.OWNER) == _HOST_THREADS
+    """The largest comment number the host sends survives the payload's doubles exactly."""
+    threads = await _threads_through(tmp_path, PullRequestViewer.OWNER)
+    assert threads == _HOST_THREADS
+    [thread] = threads["data"]
+    number = thread["comments"]["data"][0]["database_id"]
+    assert int(number) == number == 2**53 - 1
+    assert pb.EditCommentRequest(comment_id=int(number)).comment_id == 2**53 - 1
 
 
 async def test_anyone_else_reads_threads_through_the_api_without_the_rights(
@@ -1090,7 +1096,7 @@ async def test_anyone_else_reads_threads_through_the_api_without_the_rights(
     [thread] = (await _threads_through(tmp_path, PullRequestViewer.VIEWER))["data"]
     [comment] = thread["comments"]["data"]
     assert (thread["id"], thread["can_reply"]) == ("PRRT_1", False)
-    assert (comment["database_id"], comment["can_update"]) == (5, False)
+    assert (comment["database_id"], comment["can_update"]) == (2**53 - 1, False)
 
 
 def test_the_route_takes_the_reader_to_be_the_least_trusted_unless_told() -> None:

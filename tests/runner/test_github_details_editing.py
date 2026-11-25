@@ -736,7 +736,19 @@ def test_threads_carry_whether_the_viewer_may_resolve_them(
     monkeypatch.setattr(github, "_gh", _fake_gh(calls, [(0, json.dumps(response), "")]))
     [thread] = reviews.read_threads("/workspace", reference)["data"]
     [call] = calls
-    assert "viewerCanResolve viewerCanUnresolve" in json.loads(call.input)["query"]
+    query = json.loads(call.input)["query"]
+    assert "viewerCanResolve viewerCanUnresolve" in query
+    # Each comment's number, reactions and rights, for its edit, delete and reaction controls.
+    for field in (
+        "fullDatabaseId",
+        "viewerCanReact",
+        "viewerCanUpdate",
+        "viewerCanDelete",
+        "viewerDidAuthor",
+        "reactionGroups",
+        "viewerHasReacted",
+    ):
+        assert field in query
     assert (thread["can_resolve"], thread["can_unresolve"]) == (
         can_resolve is True,
         can_unresolve is True,
@@ -778,7 +790,7 @@ def test_thread_comments_carry_their_numeric_id_and_reactions(review_thread: dic
     """Edit, delete and reaction calls name a comment by its number; the page shows reactions."""
     [comment] = review_thread["comments"]["nodes"]
     comment.update(
-        fullDatabaseId="9007199254740999",
+        fullDatabaseId="9007199254740991",
         viewerCanReact=True,
         viewerCanUpdate=True,
         viewerCanDelete=False,
@@ -794,7 +806,7 @@ def test_thread_comments_carry_their_numeric_id_and_reactions(review_thread: dic
     shaped = reviews._thread(review_thread)
     assert shaped is not None
     [read] = shaped["comments"]["data"]
-    assert read["database_id"] == 9007199254740999
+    assert read["database_id"] == 9007199254740991
     assert read["can_react"] is True
     assert (read["can_update"], read["can_delete"]) == (True, False)
     assert read["viewer_did_author"] is True
@@ -804,8 +816,11 @@ def test_thread_comments_carry_their_numeric_id_and_reactions(review_thread: dic
     ]
 
 
-@pytest.mark.parametrize("value", [None, "", "abc", "-1", "0", 1.5, {"id": 1}])
+@pytest.mark.parametrize(
+    "value", [None, "", "abc", "-1", "0", 1.5, {"id": 1}, "9007199254740992", 2**63]
+)
 def test_a_comment_without_a_usable_number_has_none(value: object) -> None:
+    """Including one past what a double carries exactly, which a client would misread."""
     assert review_fields.database_id(value) is None
 
 
@@ -815,19 +830,6 @@ def test_a_comment_read_without_reaction_fields_shows_none(review_thread: dict) 
     [read] = shaped["comments"]["data"]
     assert (read["reactions"], read["can_react"]) == ([], False)
     assert (read["can_update"], read["can_delete"]) == (False, False)
-
-
-def test_thread_reads_ask_for_reactions_and_the_comment_number() -> None:
-    for field in (
-        "fullDatabaseId",
-        "viewerCanReact",
-        "viewerCanUpdate",
-        "viewerCanDelete",
-        "viewerDidAuthor",
-        "reactionGroups",
-        "viewerHasReacted",
-    ):
-        assert field in reviews._COMMENT_FIELDS
 
 
 @pytest.mark.parametrize("head,expected", [("a" * 40, None), ("c" * 40, "pull request changed")])
