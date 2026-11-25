@@ -101,8 +101,10 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
   const item = graph.run?.progress.get(id);
   const menuAction = item && graph.run?.menuActionFor?.(item);
   const [cardOpen, setCardOpen] = useState(false);
-  // The card steps aside while the node's menu is open.
-  const [menuOpen, setMenuOpen] = useState(false);
+  // The card steps aside while either of the node's menus is open.
+  const [limitMenuOpen, setLimitMenuOpen] = useState(false);
+  const [taskMenuOpen, setTaskMenuOpen] = useState(false);
+  const menuOpen = limitMenuOpen || taskMenuOpen;
   const goalPreview = data.goal ? markdownPreviewText(data.goal) : "";
   return (
     <>
@@ -145,7 +147,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
               goal={data.goal}
               onChange={graph.timeLimit?.onChange}
               disabled={graph.timeLimit?.paused}
-              onOpenChange={setMenuOpen}
+              onOpenChange={setLimitMenuOpen}
             />
             {menuAction && (
               <TaskMenu
@@ -153,7 +155,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
                 menuAction={menuAction}
                 testIdPrefix="workflow-step-node"
                 className={NODE_MENU_BUTTON}
-                onOpenChange={setMenuOpen}
+                onOpenChange={setTaskMenuOpen}
               />
             )}
           </div>

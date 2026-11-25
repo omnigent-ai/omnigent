@@ -149,9 +149,12 @@ describe("withStepTimeLimit", () => {
     expect(withStepTimeLimit("- Fix it.\n\n  **Details:** rerun it.", "1 hour")).toBe(
       "- Fix it.\n\n  **Time limit:** 1 hour\n\n  **Details:** rerun it.",
     );
-    expect(withStepTimeLimit("> Fix it.\n>\n> **Details:** rerun it.", "1 hour")).toBe(
+    const quoted = "> Fix it.\n>\n> **Details:** rerun it.";
+    expect(withStepTimeLimit(quoted, "1 hour")).toBe(
       "> Fix it.\n>\n> **Time limit:** 1 hour\n>\n> **Details:** rerun it.",
     );
+    // Clearing it gives back the quote as it was.
+    expect(withStepTimeLimit(withStepTimeLimit(quoted, "1 hour"), null)).toBe(quoted);
   });
 
   it("puts a new limit before Details written another way", () => {

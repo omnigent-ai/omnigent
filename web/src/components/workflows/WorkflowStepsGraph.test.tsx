@@ -249,7 +249,7 @@ describe("a step's time limit", () => {
     fireEvent.click(screen.getByRole("menuitemradio", { name: "No limit" }));
     expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "fix", limit: null });
 
-    // A save in flight pauses the menus.
+    // Paused while a save is in flight, so a second pick can't write over the first.
     rerender(
       <WorkflowStepsGraph
         steps={LIMITED}

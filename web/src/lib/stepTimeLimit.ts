@@ -170,8 +170,10 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       continue;
     }
     lines.splice(at, 1);
-    // Keep one blank line between the paragraphs on either side.
-    if (lines[at - 1]?.trim() === "" && lines[at]?.trim() === "") lines.splice(at, 1);
+    // Keep one blank line between the paragraphs on either side; in a quote, one with its marker.
+    const blank = (line: string | undefined) =>
+      line !== undefined && line.replace(/^[ \t>]*/, "") === "";
+    if (blank(lines[at - 1]) && blank(lines[at])) lines.splice(at, 1);
   }
   if (found.length === 0 && limitLine) {
     const details = matchingLines(lines, DETAILS_LINE, code)[0] ?? -1;

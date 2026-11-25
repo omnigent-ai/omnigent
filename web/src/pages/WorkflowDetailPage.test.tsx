@@ -313,8 +313,8 @@ interface StorePatch {
 }
 
 // Answers like the workflow store: steps and a description apply only while still the expected
-// ones, keeping the description's source and time. `hold` delays PATCHes, `fail` refuses them,
-// `unknown` fields get an older server's 422, and `afterRead` runs once just after a read.
+// ones. `hold` delays PATCHes, `fail` refuses them, `unknown` fields and `keepsDescriptionTime`
+// off act like an older server, and `afterRead` runs once just after a read.
 function serveLikeTheStore(initial: WorkflowDetail) {
   const held: (() => void)[] = [];
   const server = {
@@ -323,6 +323,7 @@ function serveLikeTheStore(initial: WorkflowDetail) {
     hold: false,
     fail: false,
     unknown: [] as string[],
+    keepsDescriptionTime: true,
     afterRead: undefined as (() => void) | undefined,
     release: () =>
       act(async () => {
@@ -368,9 +369,13 @@ function serveLikeTheStore(initial: WorkflowDetail) {
         description_source: describes
           ? (body.description_source ?? null)
           : stored.description_source,
-        description_updated_at: describes
-          ? now
-          : (stored.description_updated_at ?? stored.updated_at),
+        ...(server.keepsDescriptionTime
+          ? {
+              description_updated_at: describes
+                ? now
+                : (stored.description_updated_at ?? stored.updated_at),
+            }
+          : {}),
         updated_at: now,
       };
       return new Response(JSON.stringify(server.stored));
@@ -671,49 +676,44 @@ describe("WorkflowDetailPage", () => {
     ]);
   });
 
-  it("keeps offering a description that arrives while a time limit saves", async () => {
-    // The description was last written by hand, so it names no proposal it was saved from.
-    const saved = WORKFLOW.steps;
-    const { patches, server, release } = await workflowWithProposals(saved, [plan(5, saved)]);
-    server.hold = true;
-    const view = renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
-    await waitFor(() => expect(patches).toHaveLength(1));
+  const newDescription = "Finds flaky tests and fixes the worst one.";
+  it.each([
+    ["a newer proposal", true, [plan(5, WORKFLOW.steps)], plan(15, WORKFLOW.steps, newDescription)],
+    [
+      "a newer proposal",
+      false,
+      [plan(5, WORKFLOW.steps)],
+      plan(15, WORKFLOW.steps, newDescription),
+    ],
+    ["the first proposal", true, [], plan(50, WORKFLOW.steps, newDescription)],
+    ["the first proposal", false, [], plan(50, WORKFLOW.steps, newDescription)],
+  ] as [string, boolean, JournalEntry[], JournalEntry][])(
+    "keeps offering %s's description when it arrives while a time limit saves (description time kept: %s)",
+    async (_, keepsDescriptionTime, before, arriving) => {
+      // The description was last written by hand, so it names no proposal it was saved from.
+      const { patches, server, release } = await workflowWithProposals(WORKFLOW.steps, before);
+      server.hold = true;
+      // A server from before the description's time was kept knows no steps check either.
+      server.keepsDescriptionTime = keepsDescriptionTime;
+      if (!keepsDescriptionTime) server.unknown = ["expected_steps"];
+      const view = renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+      await waitFor(() => expect(patches).toHaveLength(1));
 
-    // The planning chat proposes only a new description, then the limit's save lands later.
-    const newDescription = "Finds flaky tests and fixes the worst one.";
-    mockJournal([plan(5, saved), plan(15, saved, newDescription)]);
-    view.rerender(<WorkflowDetailPage />);
-    await release();
-    // The saved limit shows once the page has the save's newer workflow.
-    await waitFor(() =>
-      expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
-    );
-
-    expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
-    expect(screen.getByText(newDescription)).toBeInTheDocument();
-  });
-
-  it("keeps offering the first proposal's description when it arrives while a time limit saves", async () => {
-    // The planning chat has no proposal yet, so the save records no description source.
-    const { patches, server, release } = await workflowWithProposals(WORKFLOW.steps, []);
-    server.hold = true;
-    const view = renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
-    await waitFor(() => expect(patches).toHaveLength(1));
-    expect(patches[0]).not.toHaveProperty("description_source");
-
-    // Its first proposal, the saved steps with a new description, comes before the save lands.
-    const newDescription = "Finds flaky tests and fixes the worst one.";
-    mockJournal([plan(50, WORKFLOW.steps, newDescription)]);
-    view.rerender(<WorkflowDetailPage />);
-    await release();
-    await waitFor(() =>
-      expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
-    );
-    expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
-    expect(screen.getByText(newDescription)).toBeInTheDocument();
-  });
+      // The proposal comes before the limit's save lands, which moves the workflow's write time.
+      mockJournal([...before, arriving]);
+      view.rerender(<WorkflowDetailPage />);
+      server.hold = false;
+      await release();
+      await waitFor(() =>
+        expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
+      );
+      expect(server.stored.updated_at).toBeGreaterThan(arriving.created_at);
+      expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
+      expect(screen.getByText(newDescription)).toBeInTheDocument();
+      expect(runButton()).toBeDisabled();
+    },
+  );
 
   it("sets a time limit in the plan as saved now, not the page's older copy", async () => {
     const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);

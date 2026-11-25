@@ -174,6 +174,19 @@ async function savePlan(workflowId: string, proposal: PlanSave): Promise<Workflo
   return savedWorkflow(res);
 }
 
+/**
+ * *saved*, a write that left the description of *read* alone, with the time the description had
+ * when read. A server that keeps no such time, or a plan with no room left for it, reports this
+ * write's time instead, which would hide a description proposal that arrived meanwhile.
+ */
+function withDescriptionTimeKept(saved: WorkflowDetail, read: WorkflowDetail): WorkflowDetail {
+  const before = read.description_updated_at ?? read.updated_at;
+  const after = saved.description_updated_at ?? saved.updated_at;
+  if (saved.description !== read.description || before === undefined || after === undefined)
+    return saved;
+  return after > before ? { ...saved, description_updated_at: before } : saved;
+}
+
 /** Tries for a save whose steps change between its read and its write. */
 const STORED_STEPS_SAVE_TRIES = 3;
 
@@ -192,7 +205,9 @@ async function saveOverStoredSteps(
   const read = (await res.json()) as WorkflowDetail;
   const stored = { ...read, steps: read.steps ?? [] };
   try {
-    return await savePlan(workflowId, { ...edit(stored), expected_steps: stored.steps });
+    const write = edit(stored);
+    const saved = await savePlan(workflowId, { ...write, expected_steps: stored.steps });
+    return write.description === undefined ? withDescriptionTimeKept(saved, stored) : saved;
   } catch (error) {
     if (!(error instanceof ApiError) || error.code !== "conflict") throw error;
     if (tries > 1) return saveOverStoredSteps(workflowId, edit, tries - 1);
