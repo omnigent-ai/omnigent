@@ -22,6 +22,7 @@ call. The size check runs on the encoded bytes, so an agent gets
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -71,6 +72,8 @@ from omnigent.entities.session_journal import (
 from omnigent.errors import StaleCursorError
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
+_logger = logging.getLogger(__name__)
+
 _PLAN_KIND = encode_journal_entry_kind("plan")
 _STATUS_KIND = encode_journal_entry_kind("status")
 _PLAN_STATUS_KIND = encode_journal_entry_kind("plan_status")
@@ -87,6 +90,8 @@ JOURNAL_COPY_BATCH = 200
 _Statement = TypeVar("_Statement", bound=Select[Any])
 # Leaves a heads row's plan progress as it is.
 _UNSET: Any = object()
+# After this many unreadable progress values in a row, a page read stops decoding them.
+_PROGRESS_DECODE_FAILURES = 3
 
 
 def _using(statement: _Statement, index: str) -> _Statement:
@@ -459,7 +464,9 @@ class SessionJournalStore:
         steps = plan.content["steps"]
         revision = plan.content.get("graph_revision")
         if not isinstance(revision, str):
-            revision = self._legacy_graph_position(plan, lambda _name: nullcontext(session))
+            revision = self._legacy_graph_position(
+                plan, lambda _name: nullcontext(session), time_limited=False
+            )
         rows = []
         if not fresh_run:
             for step in steps:
@@ -900,11 +907,45 @@ class SessionJournalStore:
             for row in rows
             if row.plan_progress and row.plan_progress_position == row.next_position
         ]
-        texts = self._decode_contents([stored for _, stored in recorded])
-        return {
-            conversation_id: json.loads(text)
-            for (conversation_id, _), text in zip(recorded, texts, strict=True)
-        }
+        progress: dict[str, dict[str, Any]] = {}
+        for (conversation_id, _), text in zip(
+            recorded, self._decode_progress([stored for _, stored in recorded]), strict=True
+        ):
+            try:
+                value = json.loads(text) if text is not None else None
+            except ValueError:
+                value = None
+            if isinstance(value, dict):
+                progress[conversation_id] = value
+        return progress
+
+    def _decode_progress(self, stored: Sequence[bytes]) -> list[str | None]:
+        """Decode a page's progress values in one batch, or one at a time if that fails.
+
+        One at a time, an unreadable value reads as ``None`` instead of hiding every
+        session's progress. Three failures in a row mean the codec itself is failing,
+        so the rest read as ``None`` without a call each.
+        """
+        try:
+            return list(self._decode_contents(stored))
+        except Exception:
+            _logger.warning("Could not decode a page of plan progress", exc_info=True)
+        texts: list[str | None] = []
+        failures = 0
+        for value in stored:
+            if failures >= _PROGRESS_DECODE_FAILURES:
+                texts.append(None)
+                continue
+            try:
+                (text,) = self._decode_contents([value])
+            except Exception:
+                _logger.debug("Skipped an unreadable plan progress value", exc_info=True)
+                failures += 1
+                texts.append(None)
+            else:
+                failures = 0
+                texts.append(text)
+        return texts
 
     def run_latest_plans(self, plans: Sequence[JournalEntry]) -> list[JournalEntry]:
         """Each run's latest plan before the next invocation, in input order.
@@ -968,7 +1009,11 @@ class SessionJournalStore:
         return revisions
 
     def _legacy_graph_position(
-        self, plan: JournalEntry, sessions: Callable[[str], AbstractContextManager[Session]]
+        self,
+        plan: JournalEntry,
+        sessions: Callable[[str], AbstractContextManager[Session]],
+        *,
+        time_limited: bool = True,
     ) -> int:
         """Where a plan without a graph revision got its graph: the position of the
         earliest plan since its run's boundary with the same steps and dependencies.
@@ -976,6 +1021,8 @@ class SessionJournalStore:
         Reads history in bounded batches and stops at a changed graph or the boundary.
 
         :param sessions: Opens a session for a named query, one per read.
+        :param time_limited: Cap each MySQL read's run time, as a page read does. A
+            write passes ``False``: a slow read must not fail the append it's part of.
         """
         entries = SqlSessionJournalEntry
         with sessions("read_plan_graph_boundary") as session:
@@ -987,12 +1034,15 @@ class SessionJournalStore:
         position = plan.position
         while True:
             with sessions("read_plan_graph_revisions") as session:
+                statement = select(entries)
+                if time_limited:
+                    statement = statement.prefix_with(
+                        "/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql"
+                    )
                 rows = list(
                     session.execute(
                         _using(
-                            select(entries)
-                            .prefix_with("/*+ MAX_EXECUTION_TIME(1000) */", dialect="mysql")
-                            .where(
+                            statement.where(
                                 entries.workspace_id == current_workspace_id(),
                                 entries.conversation_id == plan.conversation_id,
                                 entries.kind == _PLAN_KIND,

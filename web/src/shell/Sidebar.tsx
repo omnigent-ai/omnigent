@@ -241,7 +241,11 @@ import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
-import { type PlanProgressLine, planProgressLine } from "@/lib/sessionPlanProgress";
+import {
+  type PlanProgressLine,
+  planProgressLine,
+  samePlanProgress,
+} from "@/lib/sessionPlanProgress";
 import { isInClosedSidebar, registerSidebarRename } from "./sidebarRename";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -7216,7 +7220,7 @@ function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
   // So is `plan_progress`, which every streamed row carries as a new object.
   return (
     JSON.stringify(a.labels) === JSON.stringify(b.labels) &&
-    JSON.stringify(a.plan_progress) === JSON.stringify(b.plan_progress)
+    samePlanProgress(a.plan_progress, b.plan_progress)
   );
 }
 

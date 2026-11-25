@@ -175,6 +175,12 @@ describe("mergeItemsIntoPages", () => {
     expect(mergeItemsIntoPages(before, same, DEFAULT_FILTERS).data).toBe(before);
     const { data: after } = mergeItemsIntoPages(before, advanced, DEFAULT_FILTERS);
     expect(after!.pages[0].data[0].plan_progress?.done).toBe(3);
+    // The list leaves a finished plan's step out; a frame sends it as null.
+    const finished = data([conv("b", { plan_progress: { total: 2, done: 2 } })]);
+    const restated = new Map<string, SessionListWireItem>([
+      ["b", { id: "b", plan_progress: { total: 2, done: 2, step: null } }],
+    ]);
+    expect(mergeItemsIntoPages(finished, restated, DEFAULT_FILTERS).data).toBe(finished);
   });
 
   it("does not report ids absent from any page (structural additions)", () => {

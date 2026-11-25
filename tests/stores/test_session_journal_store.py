@@ -1341,3 +1341,41 @@ def test_progress_an_older_server_left_behind_is_ignored_until_rewritten(
     _status(journal, "k3", "ship", "started")
     progress = _progress(journal)
     assert (progress["done"], progress["step"]) == (1, {"name": "Ship", "state": "started"})
+
+
+class _UnreadableProgressJournal(SessionJournalStore):
+    """A codec that can't read a batch naming the step "Unreadable", or anything when broken."""
+
+    def __init__(self, storage_location: str, *, broken: bool = False) -> None:
+        super().__init__(storage_location)
+        self.broken = broken
+        self.calls = 0
+
+    def _decode_contents(self, stored: Sequence[bytes]) -> list[str]:
+        self.calls += 1
+        texts = super()._decode_contents(stored)
+        if self.broken or any("Unreadable" in text for text in texts):
+            raise ValueError("no key for this value")
+        return texts
+
+
+def test_an_unreadable_progress_value_hides_only_its_own_session(
+    journal: SessionJournalStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    journal.append(SESSION, "plan", _plan("unreadable"), idempotency_key="k0")
+    journal.append(OTHER, "plan", _plan("fine"), idempotency_key="k1")
+
+    reader = _UnreadableProgressJournal(journal.storage_location)
+
+    assert set(reader.plan_progress_by_session([SESSION, OTHER])) == {OTHER}
+
+    # A codec that reads nothing is tried value by value only a few times per page.
+    sessions = [SESSION, OTHER]
+    for index in range(4):
+        session_id = f"{index + 1:032x}"
+        conversations.create_conversation(conversation_id=session_id)
+        journal.append(session_id, "plan", _plan("fine"), idempotency_key="k")
+        sessions.append(session_id)
+    broken = _UnreadableProgressJournal(journal.storage_location, broken=True)
+    assert broken.plan_progress_by_session(sessions) == {}
+    assert broken.calls == 1 + 3

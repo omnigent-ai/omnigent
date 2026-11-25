@@ -14,6 +14,7 @@ import { scopeBoundaryRow } from "@/lib/sidebarData";
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
 import { sessionVisibility } from "@/lib/sessionVisibility";
+import { samePlanProgress, type SessionPlanProgress } from "@/lib/sessionPlanProgress";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -127,7 +128,11 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels" || key === "pull_request" || key === "family" || key === "plan_progress") {
+    if (key === "plan_progress") {
+      if (!samePlanProgress(current as SessionPlanProgress, value as SessionPlanProgress)) {
+        changed.add(key);
+      }
+    } else if (key === "labels" || key === "pull_request" || key === "family") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);

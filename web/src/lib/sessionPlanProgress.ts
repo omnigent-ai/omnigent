@@ -23,6 +23,19 @@ export interface SessionPlanProgress {
   step?: { name: string; state: PlanProgressStepState } | null;
 }
 
+/**
+ * Whether two plan progress values say the same. The session list leaves a
+ * finished plan's step out and its live updates send it as null, so those match.
+ */
+export function samePlanProgress(
+  left: SessionPlanProgress | null | undefined,
+  right: SessionPlanProgress | null | undefined,
+): boolean {
+  const key = (progress: SessionPlanProgress | null | undefined) =>
+    progress ? JSON.stringify({ ...progress, step: progress.step ?? null }) : null;
+  return key(left) === key(right);
+}
+
 /** The parts of a card's plan line, which renders them in order. */
 export interface PlanProgressLine {
   /** Finished steps, failed ones included, as the chat's task preview counts them. */
