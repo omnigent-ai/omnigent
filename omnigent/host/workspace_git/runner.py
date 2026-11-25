@@ -227,6 +227,15 @@ def _environment(*, literal_pathspecs: bool = True) -> dict[str, str]:
     return environment
 
 
+# An absolute path in Git's message, POSIX or Windows, e.g. an outside Git directory.
+_ABSOLUTE_PATH = re.compile(r"(?<![\w.~-])/[^\s'\"`:,]+|\b[A-Za-z]:[\\/][^\s'\"`:,]+")
+
+
+def _without_absolute_paths(message: str) -> str:
+    """``message`` with each absolute path replaced, so a detail never names host paths."""
+    return _ABSOLUTE_PATH.sub("<path>", message)
+
+
 def failure(output: GitOutput, command: str) -> GitError:
     """The error for a Git child that didn't succeed."""
     if output.returncode < 0:
@@ -245,7 +254,7 @@ def failure(output: GitOutput, command: str) -> GitError:
         )
     ):
         return GitError(GitProblem.MISSING_OBJECT)
-    summary = stderr.splitlines()[-1][:300] if stderr else ""
+    summary = _without_absolute_paths(stderr.splitlines()[-1])[:300] if stderr else ""
     return GitError(GitProblem.FAILED, summary or f"git {command} exited with {output.returncode}")
 
 
