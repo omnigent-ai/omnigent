@@ -13,6 +13,7 @@ import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as ShellCloseCheckModule from "./shellCloseCheck";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
@@ -288,6 +289,31 @@ vi.mock("./FilesPanelDrawer", () => ({
     />
   ),
 }));
+// What the runner says about a shell being closed; null keeps the real check, which, with
+// floating panes off as here, asks without reading anything.
+const shellCloseAnswer = vi.hoisted(() => ({
+  check: null as ShellCloseCheckModule.ShellCloseCheck | null,
+  asked: [] as string[][],
+}));
+vi.mock("./shellCloseCheck", async (importOriginal) => {
+  const actual = await importOriginal<typeof ShellCloseCheckModule>();
+  return {
+    ...actual,
+    useShellCloseCheck: (sessionId: string | null | undefined) => {
+      const real = actual.useShellCloseCheck(sessionId);
+      const answer = shellCloseAnswer.check;
+      if (answer === null) return real;
+      return (
+        terminalIds: readonly string[],
+        _trigger: ShellCloseCheckModule.ShellCloseTrigger,
+        decide: (check: ShellCloseCheckModule.ShellCloseCheck) => void,
+      ) => {
+        shellCloseAnswer.asked.push([...terminalIds]);
+        decide(answer);
+      };
+    },
+  };
+});
 vi.mock("./TerminalsPanel", () => ({
   TerminalsPanel: ({
     open,
@@ -834,6 +860,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  shellCloseAnswer.check = null;
+  shellCloseAnswer.asked = [];
   toast.dismiss();
   cleanup();
   vi.useRealTimers();
@@ -2261,6 +2289,44 @@ describe("Chat-mode terminal panel layout", () => {
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
 
     // Confirming kills the terminal by its resource id.
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
+  });
+
+  /** An owner's session with one shell tab, selected, as the close cases below need. */
+  const renderOneShellTab = () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_abc");
+  };
+
+  it("closes a shell tab the runner reads idle without asking", () => {
+    shellCloseAnswer.check = { close: "now" };
+    renderOneShellTab();
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
+    expect(shellCloseAnswer.asked).toEqual([["terminal_main"]]);
+  });
+
+  it("asks before closing a busy shell tab, naming its job", () => {
+    shellCloseAnswer.check = { close: "confirm", busy: { foreground: "vim", backgroundJobs: 0 } };
+    renderOneShellTab();
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("vim is running in main · u-1");
+    expect(deleteTerminalMutate).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
     expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
   });
