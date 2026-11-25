@@ -41,6 +41,8 @@ export interface ShortcutPageContext {
   submitWithModEnter: boolean;
   /** Touch or narrow layout, where Enter inserts a newline instead of sending. */
   preventsKeyboardSubmit: boolean;
+  /** Follow-ups sent mid-turn steer by default, so the Mod chord queues instead. */
+  alwaysSteer: boolean;
   contentSearch: boolean;
   grids: boolean;
   splitTerminal: boolean;
@@ -128,7 +130,9 @@ export function shortcutPageGroups(
         : [
             { label: "Send message", keys: sendWithMod ? [mod, "↵"] : ["↵"] },
             {
-              label: "Send now, with all queued messages",
+              label: context.alwaysSteer
+                ? "Queue message until the agent finishes"
+                : "Send now, with all queued messages",
               keys: sendWithMod ? [mod, shift, "↵"] : [mod, "↵"],
             },
             {

@@ -67,6 +67,11 @@ memory on, Claude Code launches with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, so the
 agent keeps one set of memories. Its existing notes stay on disk, unused in those
 sessions. A value already set in the runner's environment is kept.
 
+Codex has its own machine-local memory too, off unless the user enabled it. In a
+session with Omnigent memory on, Codex launches with `features.memories=false`,
+so it neither loads its notes nor writes new ones. Its existing notes stay on
+disk as well.
+
 ## Whose memory it is
 
 Memory belongs to the signed-in user. The server derives the owner from the

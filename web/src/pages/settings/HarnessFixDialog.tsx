@@ -1325,13 +1325,7 @@ function CredentialForms({
       <DialogDescription>
         Add a credential {harnessLabel} can use to authenticate on {hostName}.
       </DialogDescription>
-      <HarnessCredentialForm
-        harness={harness}
-        label={harnessLabel}
-        host={host}
-        command={null}
-        onDone={onDone}
-      />
+      <HarnessCredentialForm harness={harness} label={harnessLabel} host={host} onDone={onDone} />
     </>
   );
 }

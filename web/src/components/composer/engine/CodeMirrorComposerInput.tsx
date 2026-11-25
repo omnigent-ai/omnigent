@@ -11,6 +11,7 @@ import {
   StateField,
   Transaction,
   type Extension,
+  type TransactionSpec,
 } from "@codemirror/state";
 import {
   Decoration,
@@ -32,6 +33,7 @@ import {
   type RefObject,
 } from "react";
 
+import type { ComposerInsert, ComposerInsertAdjustment } from "@/lib/composerMentions";
 import { cn } from "@/lib/utils";
 
 import type {
@@ -41,6 +43,7 @@ import type {
   ComposerInputProps,
   ComposerKeyboardEvent,
   ComposerTextTarget,
+  ComposerTokenAt,
 } from "./composerInput";
 import { readlineKeys } from "./codeMirrorReadline";
 
@@ -56,6 +59,12 @@ export interface CodeMirrorComposerEnvironment {
   registerSurface: (surface: ComposerEditorSurface) => () => void;
   /** Where each tagged @-mention token sits in the text, in text order. */
   findMentionTokens: (text: string, tokens: readonly string[]) => readonly TokenSpan[];
+  /** Adds the space an insert needs so the painted tokens it touches stay whole. */
+  separateMentionEdges: (
+    value: string,
+    insert: ComposerInsert,
+    tokens: readonly string[],
+  ) => ComposerInsertAdjustment | null;
   /** The class that paints a mention token, shared with the textarea's mirror. */
   mentionTokenClass: string;
   /** The class that paints the leading command, shared with the textarea's mirror. */
@@ -73,6 +82,61 @@ const COMPOSER_MAX_HEIGHT_PX = 180;
 
 /** Marks a transaction that syncs the controlled value in, which isn't a user edit. */
 const controlledUpdate = Annotation.define<true>();
+
+/** The undo or redo that made these transactions' edit, if either did. */
+function historyDirectionOfTransactions(
+  transactions: readonly Transaction[],
+): "undo" | "redo" | undefined {
+  if (transactions.some((transaction) => transaction.isUserEvent("undo"))) return "undo";
+  if (transactions.some((transaction) => transaction.isUserEvent("redo"))) return "redo";
+  return undefined;
+}
+
+/**
+ * Rewrites a user input (typing, paste, completion, dictation) in the same transaction, so undo
+ * removes the insert and any space it added together. IME composition is skipped. Only the
+ * tokens this editor paints are kept whole.
+ */
+function adjustedInsertTransaction(
+  transaction: Transaction,
+  separateMentionEdges: CodeMirrorComposerEnvironment["separateMentionEdges"],
+): TransactionSpec | Transaction {
+  if (
+    !transaction.docChanged ||
+    transaction.annotation(controlledUpdate) ||
+    !transaction.isUserEvent("input") ||
+    transaction.isUserEvent("input.type.compose")
+  ) {
+    return transaction;
+  }
+  const paintedTokens = transaction.startState.facet(mentionTokensFacet);
+  if (paintedTokens.length === 0) return transaction;
+  const inserts: { start: number; end: number; text: string }[] = [];
+  transaction.changes.iterChanges((start, end, _fromB, _toB, inserted) => {
+    inserts.push({ start, end, text: inserted.toString() });
+  });
+  const insert = inserts.length === 1 ? inserts[0] : undefined;
+  if (!insert) return transaction;
+  const adjusted = separateMentionEdges(
+    transaction.startState.doc.toString(),
+    insert,
+    paintedTokens,
+  );
+  if (!adjusted) return transaction;
+  const isolation = transaction.annotation(isolateHistory);
+  const addToHistory = transaction.annotation(Transaction.addToHistory);
+  return {
+    changes: { from: insert.start, to: insert.end, insert: adjusted.text },
+    selection: EditorSelection.cursor(insert.start + adjusted.caret),
+    userEvent: transaction.annotation(Transaction.userEvent),
+    annotations: [
+      ...(isolation === undefined ? [] : [isolateHistory.of(isolation)]),
+      ...(addToHistory === undefined ? [] : [Transaction.addToHistory.of(addToHistory)]),
+    ],
+    effects: transaction.effects,
+    scrollIntoView: transaction.scrollIntoView,
+  };
+}
 
 /** The mention tokens the editor paints; reconfigured through a compartment when they change. */
 const mentionTokensFacet = Facet.define<readonly string[], readonly string[]>({
@@ -122,20 +186,39 @@ function mentionTokenField(environment: CodeMirrorComposerEnvironment): Extensio
   );
 }
 
+type CommandToken = string | ComposerTokenAt | null;
+
 /** The command token the editor paints; reconfigured through a compartment when it changes. */
-const commandTokenFacet = Facet.define<string | null, string | null>({
+const commandTokenFacet = Facet.define<CommandToken, CommandToken>({
   combine: (inputs) => inputs[inputs.length - 1] ?? null,
 });
 
-/** Where `token` sits when `text` starts with it, after any leading whitespace; else null. */
-export function leadingCommandSpan(text: string, token: string | null): TokenSpan | null {
+/**
+ * Where `token` leads `text` after any whitespace, else null; a placed token matches only at
+ * its offset.
+ */
+export function leadingCommandSpan(text: string, token: CommandToken): TokenSpan | null {
   if (!token) return null;
+  if (typeof token !== "string") {
+    const end = token.start + token.token.length;
+    return token.token && text.slice(token.start, end) === token.token
+      ? { start: token.start, end }
+      : null;
+  }
   const start = text.length - text.trimStart().length;
   const end = start + token.length;
   if (text.slice(start, end) !== token) return null;
   // A longer word that merely starts with the token, like /contexts, isn't the command.
   if (end < text.length && !/\s/.test(text[end] ?? "")) return null;
   return { start, end };
+}
+
+/** `props.commandToken` with a placed token's offset moved from the value into the document. */
+function documentCommandToken(props: ComposerInputProps): CommandToken {
+  const token = props.commandToken ?? null;
+  if (token === null || typeof token === "string") return token;
+  const start = normalizeLineBreaks((props.value ?? "").slice(0, token.start)).length;
+  return { token: token.token, start };
 }
 
 /** Paints the draft's leading command token, checked against the editor's own text. */
@@ -266,6 +349,7 @@ function attributes(
       ...(props["data-testid"] ? { "data-testid": props["data-testid"] } : {}),
       ...(props["data-has-draft"] ? { "data-has-draft": props["data-has-draft"] } : {}),
       ...(props["data-slash-command"] ? { "data-slash-command": props["data-slash-command"] } : {}),
+      ...(props["data-shell-command"] ? { "data-shell-command": props["data-shell-command"] } : {}),
     }),
   ];
 }
@@ -393,15 +477,7 @@ function CodeMirrorComposer({
   environment: CodeMirrorComposerEnvironment;
   forwardedRef: Ref<ComposerTextTarget>;
 }) {
-  const {
-    value,
-    placeholder,
-    autoFocus,
-    heightMode = "compact",
-    className,
-    mentionTokens,
-    commandToken = null,
-  } = props;
+  const { value, placeholder, autoFocus, heightMode = "compact", className, mentionTokens } = props;
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const surfaceRef = useRef<ComposerEditorSurface | null>(null);
@@ -492,22 +568,23 @@ function CodeMirrorComposer({
           keymap.of(COMPOSER_EDITING_KEYMAP),
           compartments.history.of(history()),
           EditorView.lineWrapping,
+          EditorState.transactionFilter.of((transaction) =>
+            adjustedInsertTransaction(transaction, environment.separateMentionEdges),
+          ),
           compartments.attributes.of(attributes(initial, environment)),
           compartments.placeholder.of(placeholderText(initial.placeholder ?? "")),
           compartments.theme.of(theme(initial.heightMode ?? "compact")),
           compartments.mentionTokens.of(mentionTokensFacet.of(initial.mentionTokens ?? [])),
           mentionTokenField(environment),
-          compartments.commandToken.of(commandTokenFacet.of(initial.commandToken ?? null)),
+          compartments.commandToken.of(commandTokenFacet.of(documentCommandToken(initial))),
           commandTokenField(environment),
           EditorView.updateListener.of((update) => {
             const fromUser = !update.transactions.some((transaction) =>
               transaction.annotation(controlledUpdate),
             );
             if (update.docChanged && fromUser) {
-              const fromHistory = update.transactions.some(
-                (transaction) => transaction.isUserEvent("undo") || transaction.isUserEvent("redo"),
-              );
-              latest.current.onChange?.({ ...event(), fromHistory });
+              const historyDirection = historyDirectionOfTransactions(update.transactions);
+              latest.current.onChange?.({ ...event(), historyDirection });
             }
             if ((update.docChanged || update.selectionSet) && fromUser) {
               latest.current.onSelect?.(event());
@@ -567,6 +644,7 @@ function CodeMirrorComposer({
     props["data-testid"],
     props["data-has-draft"],
     props["data-slash-command"],
+    props["data-shell-command"],
   ]);
   // In layout, so a draft that turns disabled or read-only takes no keys after the render.
   useLayoutEffect(() => {
@@ -599,11 +677,15 @@ function CodeMirrorComposer({
       ),
     });
   }, [compartments, mentionTokensKey]);
+  // Keyed by content, as a placed token is a new object each render.
+  const commandTokenKey = JSON.stringify(documentCommandToken(props));
   useLayoutEffect(() => {
     viewRef.current?.dispatch({
-      effects: compartments.commandToken.reconfigure(commandTokenFacet.of(commandToken)),
+      effects: compartments.commandToken.reconfigure(
+        commandTokenFacet.of(documentCommandToken(latest.current)),
+      ),
     });
-  }, [compartments, commandToken]);
+  }, [compartments, commandTokenKey]);
   useEffect(() => {
     if (autoFocus) viewRef.current?.focus();
   }, [autoFocus]);

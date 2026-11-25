@@ -19,7 +19,7 @@ from omnigent.tools.builtins._arguments import parse_json_object_arguments
 _SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
-        "name": "upload_file",
+        "name": "sys_files_upload",
         "description": (
             "Upload a file from the workspace so the user can download it. "
             "Takes a relative path within the workspace (e.g. 'output/chart.png'). "
@@ -75,9 +75,9 @@ class UploadFileTool(Tool):
         """
         Tool name for dispatch and schema registration.
 
-        :returns: ``"upload_file"``.
+        :returns: ``"sys_files_upload"``.
         """
-        return "upload_file"
+        return "sys_files_upload"
 
     @classmethod
     def description(cls) -> str:
@@ -145,7 +145,7 @@ def _upload(resolved: Path, *, session_id: str | None) -> str:
     if file_store is None or artifact_store is None:
         return "Error: file store not available"
     if session_id is None:
-        return "Error: upload_file requires a session id"
+        return "Error: sys_files_upload requires a session id"
 
     filename = resolved.name
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"

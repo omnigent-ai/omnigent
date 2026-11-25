@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -47,12 +48,14 @@ export function useShortcutPageGroups(): ShortcutPageGroup[] {
   const isMobileViewport = useIsMobileViewport();
   const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
+  const alwaysSteer = useAlwaysSteer();
   return shortcutPageGroups({
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
     submitWithModEnter: readSubmitWithModEnter(),
     preventsKeyboardSubmit,
+    alwaysSteer,
     contentSearch: !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
     grids: !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
     splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),

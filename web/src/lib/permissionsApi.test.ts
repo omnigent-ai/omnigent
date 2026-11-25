@@ -13,13 +13,17 @@ import * as identity from "./identity";
 import {
   LEGACY_AUTOMATION_RECREATE_REASON,
   LEGACY_AUTOMATION_SHARE_REASON,
+  LEVEL_EDIT,
   LEVEL_OWNER,
+  LEVEL_READ,
   automationShareDisabledReason,
+  canBrowseWorkspaceFiles,
   canShareAutomation,
   derivePermissionLevel,
   grantPermission,
   grantSharePermission,
   isOwnerLevel,
+  isPermissionLevelPending,
   listAutomationPermissions,
   listPermissions,
   listWorkflowPermissions,
@@ -621,6 +625,63 @@ describe("derivePermissionLevel — resolution order", () => {
   });
 });
 
+describe("isPermissionLevelPending", () => {
+  const session = { permissionLevel: null } as Session;
+  const row = (permission_level: number | null) => ({ permission_level }) as Conversation;
+
+  it.each([
+    [
+      "pending while the snapshot loads and the row has no level",
+      null,
+      true,
+      null,
+      "conv_test",
+      true,
+      true,
+    ],
+    [
+      "pending when the snapshot failed before the list loaded",
+      null,
+      false,
+      null,
+      "conv_test",
+      false,
+      true,
+    ],
+    [
+      "known once the snapshot says null (owner by default)",
+      session,
+      false,
+      null,
+      "conv_test",
+      true,
+      false,
+    ],
+    ["known when the row carries a level", null, true, row(2), "conv_test", true, false],
+    [
+      "known when the list loaded without the session (read-only)",
+      null,
+      false,
+      null,
+      "conv_test",
+      true,
+      false,
+    ],
+    ["not pending without a conversation", null, false, null, undefined, false, false],
+    [
+      "pending on a new chat's temp id before its session exists",
+      null,
+      false,
+      null,
+      "temp:abc",
+      true,
+      true,
+    ],
+  ] as const)("%s", (_label, snap, loading, conv, id, listLoaded, pending) => {
+    expect(isPermissionLevelPending(snap, loading, conv, id, listLoaded)).toBe(pending);
+  });
+});
+
 describe("isOwnerLevel — owner boundary", () => {
   it("treats the owner level and above as owner", () => {
     expect(isOwnerLevel(LEVEL_OWNER)).toBe(true);
@@ -660,5 +721,30 @@ describe("authenticatedFetch integration", () => {
     expect(spy).toHaveBeenCalledTimes(3);
 
     spy.mockRestore();
+  });
+});
+
+describe("canBrowseWorkspaceFiles", () => {
+  const session = (permissionLevel: number | null, shareWorkspaceFiles?: boolean) => ({
+    permissionLevel,
+    shareWorkspaceFiles,
+  });
+
+  it("lets editors read the workspace's files, with or without sharing", () => {
+    expect(canBrowseWorkspaceFiles(session(LEVEL_EDIT, false))).toBe(true);
+    expect(canBrowseWorkspaceFiles(session(LEVEL_OWNER))).toBe(true);
+  });
+
+  it("lets a viewer read them only when the owner shared files", () => {
+    expect(canBrowseWorkspaceFiles(session(LEVEL_READ, true))).toBe(true);
+    expect(canBrowseWorkspaceFiles(session(LEVEL_READ, false))).toBe(false);
+    expect(canBrowseWorkspaceFiles(session(LEVEL_READ))).toBe(false);
+  });
+
+  it("reads nothing until the session is known, then follows its level", () => {
+    expect(canBrowseWorkspaceFiles(null)).toBe(false);
+    expect(canBrowseWorkspaceFiles(undefined)).toBe(false);
+    // A loaded session without a level has permissions off, as in single-user mode.
+    expect(canBrowseWorkspaceFiles(session(null, false))).toBe(true);
   });
 });

@@ -99,6 +99,20 @@ _stores: dict[str, SessionJournalStore] = {}
 _stores_lock = threading.Lock()
 
 
+class WorkflowNotFoundError(OmnigentError):
+    """No saved workflow with this ID that the caller owns or that is shared with them.
+
+    :param workflow_id: The ID asked for, e.g. ``"0123456789abcdef0123456789abcdef"``.
+    """
+
+    def __init__(self, workflow_id: str) -> None:
+        super().__init__(
+            f"workflow_not_found: no saved workflow {workflow_id!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+        self.workflow_id = workflow_id
+
+
 def open_store(conversation_store: object) -> SessionJournalStore | None:
     """Return the journal store beside the session metadata, or ``None`` without SQL.
 
@@ -118,6 +132,20 @@ def open_store(conversation_store: object) -> SessionJournalStore | None:
                 return None
             _stores[location] = store
         return store
+
+
+def titled_for_workflow_run(
+    conversation_store: ConversationStore, conversation_id: str, title: str | None
+) -> bool:
+    """Whether *title* is the name of the saved workflow the session's first run follows.
+
+    :param title: The session's title, e.g. ``"Release"``.
+    """
+    store = open_store(conversation_store)
+    if store is None or title is None:
+        return False
+    run = store.first_workflow_runs([conversation_id]).get(conversation_id)
+    return run is not None and run.content.get("name") == title
 
 
 def _require_store(conversation_store: ConversationStore) -> SessionJournalStore:
@@ -228,6 +256,8 @@ async def load_workflow_for_run(
 
     :param permission_store: Lets someone a workflow is shared with run it; ``None``
         allows only the owner's.
+    :raises WorkflowNotFoundError: If the caller can't read such a workflow.
+    :raises OmnigentError: If it is a draft or its steps can't start a plan.
     """
     workflow = await _load_workflow(
         conversation_store, workflow_id, user_id=user_id, permission_store=permission_store
@@ -284,10 +314,7 @@ async def _load_workflow(
             )
             workflow = found[0] if found is not None else None
     if workflow is None:
-        raise OmnigentError(
-            f"workflow_not_found: no saved workflow {workflow_id!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise WorkflowNotFoundError(workflow_id)
     if not workflow.steps:
         raise OmnigentError(
             "workflow_is_draft: save a plan before running this workflow",

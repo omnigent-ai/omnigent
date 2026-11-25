@@ -5,8 +5,8 @@ import type { ScheduledTaskExecutionTarget } from "@/lib/scheduledTasksApi";
 /** The frequency dropdown's top-level options. */
 export type SchedulePreset = "hourly" | "daily" | "weekdays" | "weekly" | "custom";
 
-/** The frequency sub-selector shown under the "custom" preset. */
-export type CustomFreq = "minutely" | "hourly" | "daily" | "weekly" | "monthly" | "yearly";
+/** The frequency sub-selector shown under the "custom" preset; `rule` is RRULE text. */
+export type CustomFreq = "minutely" | "hourly" | "daily" | "weekly" | "monthly" | "yearly" | "rule";
 
 /** Weekday codes as used by RRULE `BYDAY` (MO..SU), in calendar order. */
 export const WEEKDAY_CODES = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
@@ -33,6 +33,8 @@ export interface ScheduleModel {
   monthDays: number[];
   /** Month 1–12 for Custom Yearly. */
   month: number;
+  /** RRULE text for `customFreq === "rule"`, without COUNT or UNTIL, which `end` holds. */
+  rule: string;
   /** Omitted for schedules that never end; UNTIL is an RFC-5545 UTC instant. */
   end?: { type: "count"; count: number } | { type: "until"; until: string };
 }
@@ -62,6 +64,7 @@ export const DEFAULT_SCHEDULE_MODEL: ScheduleModel = {
   interval: 1,
   monthDays: [1],
   month: 1,
+  rule: "",
 };
 
 /**
@@ -77,7 +80,8 @@ export function buildRRule(model: ScheduleModel): string {
   return rule;
 }
 
-function buildRecurringRule(model: ScheduleModel): string {
+/** The rule without its COUNT or UNTIL, e.g. to seed the RRULE editor. */
+export function buildRecurringRule(model: ScheduleModel): string {
   const { hour, minute } = model;
   switch (model.preset) {
     case "hourly":
@@ -98,9 +102,42 @@ function buildRecurringRule(model: ScheduleModel): string {
   }
 }
 
+/**
+ * Read a stored rule into the form. Rules the visual controls express exactly open in
+ * them; any other rule opens as RRULE text. Null only when Ends can't show its COUNT or
+ * UNTIL, e.g. a one-time `COUNT=1`.
+ */
 export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
-  const parts = parseRuleParts(rrule);
+  // The server accepts any case, a lower-case prefix and surrounding spaces.
+  const parts = parseRuleParts(normalizeRuleText(rrule));
   if (parts === null) return null;
+  const end = parseEnd(parts);
+  if (end === null) return null;
+  const recurring = new Map([...parts].filter(([key]) => key !== "COUNT" && key !== "UNTIL"));
+  const model = parseVisualRule(recurring) ?? {
+    ...DEFAULT_SCHEDULE_MODEL,
+    preset: "custom",
+    customFreq: "rule",
+    rule: [...recurring].map(([key, value]) => `${key}=${value}`).join(";"),
+  };
+  return end.value === undefined ? model : { ...model, end: end.value };
+}
+
+function parseEnd(parts: Map<string, string>): { value: ScheduleModel["end"] } | null {
+  if (parts.has("COUNT") && parts.has("UNTIL")) return null;
+  if (parts.has("COUNT")) {
+    const count = parseNumberPart(parts.get("COUNT"), 2, 2147483647);
+    return count === null ? null : { value: { type: "count", count } };
+  }
+  if (parts.has("UNTIL")) {
+    const until = parts.get("UNTIL")!;
+    return parseUntil(until) ? { value: { type: "until", until } } : null;
+  }
+  return { value: undefined };
+}
+
+/** The visual controls for a rule without COUNT or UNTIL, or null if they can't show it. */
+function parseVisualRule(parts: Map<string, string>): ScheduleModel | null {
   const frequency = parts.get("FREQ")?.toLowerCase();
   if (!["minutely", "hourly", "daily", "weekly", "monthly", "yearly"].includes(frequency ?? ""))
     return null;
@@ -119,7 +156,7 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
       ? DEFAULT_SCHEDULE_MODEL.hour
       : parseNumberPart(parts.get("BYHOUR"), 0, 23);
   if (interval === null || hour === null || minute === null) return null;
-  const allowed = ["FREQ", "INTERVAL", "COUNT", "UNTIL"];
+  const allowed = ["FREQ", "INTERVAL"];
   if (customFreq !== "minutely") allowed.push("BYMINUTE");
   if (customFreq !== "hourly" && customFreq !== "minutely") allowed.push("BYHOUR");
   if (customFreq === "weekly") allowed.push("BYDAY");
@@ -158,17 +195,6 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
     if (customFreq === "weekly" && model.weekdays.join(",") === "MO,TU,WE,TH,FR")
       model.preset = "weekdays";
   }
-  if (parts.has("COUNT") && parts.has("UNTIL")) return null;
-  if (parts.has("COUNT")) {
-    const count = parseNumberPart(parts.get("COUNT"), 2, 2147483647);
-    if (count === null) return null;
-    model.end = { type: "count", count };
-  }
-  if (parts.has("UNTIL")) {
-    const until = parts.get("UNTIL")!;
-    if (!parseUntil(until)) return null;
-    model.end = { type: "until", until };
-  }
   return validateSchedule(model, {
     allowPastEnd: true,
     sessionMode: "continue",
@@ -196,6 +222,7 @@ export function formatUntil(date: Date): string {
 
 function buildCustomRRule(model: ScheduleModel): string {
   const { hour, minute } = model;
+  if (model.customFreq === "rule") return normalizeRuleText(model.rule);
   const interval = clampInterval(model.interval);
   switch (model.customFreq) {
     case "minutely":
@@ -286,6 +313,9 @@ export function validateSchedule(
     subhourSupported?: boolean;
   } = {},
 ): string | null {
+  if (model.preset === "custom" && model.customFreq === "rule") {
+    return validateRuleText(model.rule) ?? validateEnd(model, allowPastEnd, now);
+  }
   const minutely = model.preset === "custom" && model.customFreq === "minutely";
   if (!minutely && (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59)) {
     return model.preset === "hourly" ? "Enter a valid minute from 0 to 59." : "Enter a valid time.";
@@ -334,16 +364,8 @@ export function validateSchedule(
     (!Number.isInteger(model.month) || model.month < 1 || model.month > 12)
   )
     return "Pick a valid month.";
-  if (
-    model.end?.type === "count" &&
-    (!Number.isInteger(model.end.count) || model.end.count < 2 || model.end.count > 2147483647)
-  )
-    return "Enter at least 2 occurrences (at most 2,147,483,647).";
-  if (model.end?.type === "until") {
-    const until = parseUntil(model.end.until);
-    if (!until) return "Choose a valid end date.";
-    if (!allowPastEnd && until <= now) return "Choose an end date in the future.";
-  }
+  const endError = validateEnd(model, allowPastEnd, now);
+  if (endError !== null) return endError;
   if (model.preset === "custom" && model.customFreq === "yearly") {
     const daysInMonth = new Date(Date.UTC(2016, model.month, 0)).getUTCDate();
     if (!model.monthDays.some((day) => day <= daysInMonth))
@@ -365,6 +387,67 @@ export function validateSchedule(
     if (occurrences.length < 2)
       return "Choose a recurrence that runs at least twice within eight years.";
   }
+  return null;
+}
+
+function validateEnd(model: ScheduleModel, allowPastEnd: boolean, now: Date): string | null {
+  if (
+    model.end?.type === "count" &&
+    (!Number.isInteger(model.end.count) || model.end.count < 2 || model.end.count > 2147483647)
+  )
+    return "Enter at least 2 occurrences (at most 2,147,483,647).";
+  if (model.end?.type === "until") {
+    const until = parseUntil(model.end.until);
+    if (!until) return "Choose a valid end date.";
+    if (!allowPastEnd && until <= now) return "Choose an end date in the future.";
+  }
+  return null;
+}
+
+/** RRULE editor text as the server reads it: no `RRULE:` prefix, upper case. */
+export function normalizeRuleText(rule: string): string {
+  return rule
+    .trim()
+    .replace(/^RRULE:/i, "")
+    .toUpperCase();
+}
+
+const RULE_FREQUENCIES = ["SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
+// The fields the server's parser accepts; COUNT and UNTIL belong to Ends.
+const RULE_FIELDS = new Set([
+  "FREQ",
+  "INTERVAL",
+  "WKST",
+  "BYSECOND",
+  "BYMINUTE",
+  "BYHOUR",
+  "BYDAY",
+  "BYMONTHDAY",
+  "BYYEARDAY",
+  "BYWEEKNO",
+  "BYMONTH",
+  "BYSETPOS",
+  "BYEASTER",
+]);
+
+/**
+ * Check the shape of RRULE editor text. Whether a rule runs, how often, and its value
+ * ranges are left to the server, which checks them on save and explains any problem.
+ */
+export function validateRuleText(rule: string): string | null {
+  const text = normalizeRuleText(rule);
+  if (text === "") return "Enter a recurrence rule, such as FREQ=DAILY;BYHOUR=9;BYMINUTE=0.";
+  if (/[\r\n]/.test(text))
+    return "Enter one RRULE line. Choose the timezone below instead of DTSTART;TZID.";
+  const parts = parseRuleParts(text);
+  if (parts === null)
+    return "Write the rule as NAME=VALUE pairs separated by semicolons, using each name once.";
+  if (parts.has("COUNT") || parts.has("UNTIL"))
+    return "Set when the schedule ends under Ends instead of with COUNT or UNTIL.";
+  const unknown = [...parts.keys()].find((key) => !RULE_FIELDS.has(key));
+  if (unknown !== undefined) return `${unknown} isn't a supported rule field.`;
+  if (!RULE_FREQUENCIES.includes(parts.get("FREQ") ?? ""))
+    return "Include a FREQ such as MINUTELY, HOURLY, DAILY, WEEKLY, MONTHLY or YEARLY.";
   return null;
 }
 

@@ -538,6 +538,7 @@
     isLoopbackServerUrl,
     normalizeSavedServerUrl,
     WORKSPACE_UI_PATH,
+    WORKSPACE_API_PATHS,
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,
     expandDatabricksWorkspaceUrl,

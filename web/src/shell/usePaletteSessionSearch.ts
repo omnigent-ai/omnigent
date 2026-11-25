@@ -1,5 +1,5 @@
-// ⌘K's session data: recent sessions while the query is empty, then grouped
-// server-side title and content search. Rendering stays in the palette.
+// ⌘K's session data: recent sessions, archived included, while the query is
+// empty, then grouped server-side title and content search. Rendering stays in the palette.
 
 import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useState } from "react";
@@ -12,6 +12,7 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -27,6 +28,7 @@ const SESSION_SEARCH_RESULT_LIMIT = 50;
 /** Rows per page of each search group; "Show more" loads the next page. */
 const SEARCH_GROUP_PAGE_SIZE = 8;
 const EMPTY_PROJECTS: readonly ProjectSummary[] = [];
+const EMPTY_PAGES: readonly ConversationsPage[] = [];
 
 export interface PaletteSession {
   id: string;
@@ -114,8 +116,15 @@ export function usePaletteSessionSearch({
     return () => clearTimeout(timer);
   }, [query]);
 
+  // ⌘K's recent list includes archived sessions, so one archived by mistake stays
+  // a keystroke away; Find a session filters active ones by name.
+  const recentIncludesArchived = !sessionsOnly;
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
-    useConversations("", false, { enabled: open });
+    useConversations("", recentIncludesArchived, { enabled: open });
+  // The sidebar's loaded sessions fill the recent rows until that list loads.
+  const sidebarSessions = useOptionalLoadedConversations();
+  const recentPages =
+    data?.pages ?? (recentIncludesArchived ? sidebarSessions?.pages : undefined) ?? EMPTY_PAGES;
   const serverInfo = useServerInfo();
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
@@ -171,12 +180,12 @@ export function usePaletteSessionSearch({
   const parentTitles = useMemo(
     () =>
       new Map(
-        [data, titleSearch.data, contentSearch.data]
-          .flatMap((result) => result?.pages ?? [])
+        [recentPages, titleSearch.data?.pages ?? [], contentSearch.data?.pages ?? []]
+          .flat()
           .flatMap((page) => page.data)
           .map((row) => [row.id, row.title]),
       ),
-    [data, titleSearch.data, contentSearch.data],
+    [recentPages, titleSearch.data, contentSearch.data],
   );
   const sessions = useMemo(() => {
     if (searching)
@@ -185,8 +194,13 @@ export function usePaletteSessionSearch({
         projects,
         parentTitles,
       });
-    // Rows archived after they loaded are still cached here, so drop them.
-    const out = paletteSessions(data?.pages ?? [], { newestFirst: true, projects, parentTitles });
+    // Archiving patches cached rows in place, so the active-only rows drop them here.
+    const out = paletteSessions(recentPages, {
+      includeArchived: recentIncludesArchived,
+      newestFirst: true,
+      projects,
+      parentTitles,
+    });
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out
@@ -196,7 +210,16 @@ export function usePaletteSessionSearch({
     }
     // The full first page would push Actions below the fold.
     return out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, titleSearch.data, query, searching, sessionsOnly, projects, parentTitles]);
+  }, [
+    recentPages,
+    recentIncludesArchived,
+    titleSearch.data,
+    query,
+    searching,
+    sessionsOnly,
+    projects,
+    parentTitles,
+  ]);
   // Excludes title matches again in case a rename moved a session between the
   // two groups' requests: list rows need unique ids.
   const contentSessions = useMemo(
@@ -236,11 +259,13 @@ export function usePaletteSessionSearch({
   };
 
   const queryClient = useQueryClient();
-  // Search results are dropped when the palette closes; the sidebar lists
-  // the opened session from this copy, which keeps its owner.
+  // Search results and ⌘K's archived-inclusive recent list are dropped once unobserved;
+  // the sidebar lists the opened session from this copy, which keeps its owner.
   const rememberSearchRow = (id: string): void => {
+    const paletteOwnedPages = recentIncludesArchived ? (data?.pages ?? []) : [];
     const searchRow = [titleSearch.data, contentSearch.data]
       .flatMap((results) => results?.pages ?? [])
+      .concat(paletteOwnedPages)
       .flatMap((page) => page.data)
       .find((row) => row.id === id);
     if (searchRow) rememberOpenSessionRow(queryClient, searchRow);

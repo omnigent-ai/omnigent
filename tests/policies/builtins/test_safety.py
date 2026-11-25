@@ -870,6 +870,243 @@ def test_ask_on_scheduled_task_change_keeps_full_prompt_and_settings_visible() -
 
 
 @pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (
+            "sys_scheduled_task_create",
+            {
+                "name": "nightly triage",
+                "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                "agent_id": "ag_1",
+            },
+        ),
+        ("sys_scheduled_task_update", {"scheduled_task_id": "st_1", "prompt": "Summarize."}),
+    ],
+    ids=["create", "update"],
+)
+def test_ask_on_scheduled_task_change_shows_the_saved_workflow_it_runs(
+    tool: str, arguments: dict[str, object]
+) -> None:
+    """The approval names the saved workflow the task will run, with its details in full."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    details = "Only the upload tests. " * 20
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": tool,
+            "data": {
+                "name": tool,
+                "arguments": {
+                    **arguments,
+                    "permission_mode": None,
+                    "workflow_id": "0123456789abcdef0123456789abcdef",
+                    "workflow_details": details,
+                },
+            },
+        }
+    )
+    reason = result["reason"]
+    assert result["result"] == "ASK", reason
+    assert "workflow_id=0123456789abcdef0123456789abcdef" in reason
+    instructions = reason.split("Full automation instructions:\n", 1)[1]
+    assert instructions.startswith("Runs the saved workflow 0123456789abcdef0123456789abcdef")
+    assert details in instructions
+    assert "workflow_details=" not in reason
+
+
+@pytest.mark.parametrize(
+    "workflow_id",
+    ["0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"],
+    ids=["unchanged-workflow", "another-workflow"],
+)
+def test_an_update_that_keeps_a_workflows_specifics_shows_them(workflow_id: str) -> None:
+    """Left out of the update, the current prompt's specifics stay in effect, so they show."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    saved = (
+        '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
+        "\n\nOnly the upload tests"
+    )
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": saved,
+                    "permission_mode": None,
+                    "state": "active",
+                    "workflow_id": workflow_id,
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert instructions.startswith(f"Runs the saved workflow {workflow_id}.")
+    assert "keeping the specifics of the current prompt below" in instructions
+    assert saved in instructions
+
+
+_RUN = '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
+
+
+@pytest.mark.parametrize(
+    ("prompt", "keeps", "effect"),
+    [
+        # The server, like the web form, trims only what JavaScript's trim removes.
+        (
+            f"\x1c{_RUN}\n\nRead-only: make no changes",
+            False,
+            "whose instructions no longer run",
+        ),
+        (
+            f"\N{ZERO WIDTH NO-BREAK SPACE}{_RUN}\n\nOnly the upload tests",
+            True,
+            "keeping the specifics of the current prompt",
+        ),
+        # The server rewrites no run inside other text, so it keeps or refuses.
+        (
+            f"<!-- omnigent-trigger v1 {{}} -->\n{_RUN}\n\nOnly the upload tests",
+            True,
+            "otherwise refuses the update",
+        ),
+    ],
+    ids=["unicode-separator", "byte-order-mark", "trigger-header"],
+)
+def test_an_update_says_what_the_server_keeps_of_the_prompt_it_sends(
+    prompt: str, keeps: bool, effect: str
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+    from omnigent.server.scheduled.workflow_automations import saved_workflow_run
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": prompt,
+                    "permission_mode": None,
+                    "workflow_id": "fedcba9876543210fedcba9876543210",
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert effect in instructions
+    # The server reads a run in that prompt exactly when the card says it can keep one.
+    assert (saved_workflow_run(prompt) is not None) is keeps
+
+
+@pytest.mark.parametrize(
+    ("prompt", "effect"),
+    [
+        (
+            f"{_RUN}\n\nRead-only: make no changes",
+            "with the specifics in workflow_details in place of those in the current prompt",
+        ),
+        ("Summarize overnight activity.", "runs no saved workflow, so the server refuses"),
+    ],
+    ids=["workflow-prompt", "plain-prompt"],
+)
+def test_a_details_only_update_says_what_replaces_the_current_specifics(
+    prompt: str, effect: str
+) -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": prompt,
+                    "permission_mode": None,
+                    "workflow_details": "Only the upload tests",
+                },
+            },
+        }
+    )
+    assert "Agent wants to update scheduled task st_1." in result["reason"]
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert instructions.startswith("Runs its saved workflow.")
+    assert effect in instructions
+    assert "Only the upload tests" in instructions
+
+
+def test_an_update_that_leaves_the_prompt_out_claims_no_outcome() -> None:
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "workflow_id": "0123456789abcdef0123456789abcdef",
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert "if it already runs a saved workflow" in instructions
+    assert "whose instructions no longer run" not in instructions
+
+
+def test_an_update_that_attaches_a_workflow_says_the_plain_prompt_stops_running() -> None:
+    """A plain prompt has no specifics to keep: the server writes the workflow's in its place."""
+    from omnigent.policies.builtins.safety import ask_on_scheduled_task_change
+
+    plain = "Only inspect the queue; make no modifications."
+    result = ask_on_scheduled_task_change(
+        {
+            "type": "tool_call",
+            "target": "sys_scheduled_task_update",
+            "data": {
+                "name": "sys_scheduled_task_update",
+                "arguments": {
+                    "scheduled_task_id": "st_1",
+                    "prompt": plain,
+                    "permission_mode": None,
+                    "workflow_id": "0123456789abcdef0123456789abcdef",
+                },
+            },
+        }
+    )
+    instructions = result["reason"].split("Full automation instructions:\n", 1)[1]
+    assert "whose instructions no longer run" in instructions
+    assert "keeping the specifics" not in instructions
+    assert plain in instructions
+
+
+def test_a_create_with_a_null_workflow_id_is_an_ordinary_create() -> None:
+    from omnigent.policies.builtins.safety import scheduled_task_review_error
+
+    args = {"name": "n", "prompt": "Review every issue.", "permission_mode": None}
+    assert scheduled_task_review_error({**args, "workflow_id": None}, action="create") is None
+
+
+def test_a_workflow_create_is_asked_only_for_its_permission_mode() -> None:
+    from omnigent.policies.builtins.safety import scheduled_task_review_error
+
+    error = scheduled_task_review_error(
+        {"name": "n", "workflow_id": "0123456789abcdef0123456789abcdef"}, action="create"
+    )
+    assert error is not None
+    assert "Retry with permission_mode" in error
+    assert "prompt" not in error
+
+
+@pytest.mark.parametrize(
     "extras,expected",
     [
         (

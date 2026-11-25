@@ -275,6 +275,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   browser: true,
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
+  alwaysSteer: false,
   contentSearch: true,
   grids: true,
   splitTerminal: true,
@@ -284,12 +285,19 @@ const PAGE_CONTEXT: ShortcutPageContext = {
 
 const SHOWN: SettingsAvailability = {
   globalShortcut: true,
+  floatingComposerShortcut: true,
+  widenWindowForRightSidebar: true,
   inAppBrowser: true,
+  desktopAppHandoff: true,
   adminView: true,
   accountsEnabled: true,
   archiveWorktreeCleanup: true,
   mcpServices: true,
   integrationProviders: { github: true, databricks: true },
+  projectKanban: true,
+  sessionTitleInstructions: true,
+  floatingPanes: true,
+  proactiveAgent: true,
 };
 
 describe("chord results in Settings search", () => {

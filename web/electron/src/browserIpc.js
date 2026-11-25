@@ -7,6 +7,8 @@
 
 "use strict";
 
+const { hasHostLocalAccess } = require("./hostIdentity");
+
 const crypto = require("node:crypto");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
@@ -21,8 +23,9 @@ const {
 } = require("./agentDeadline");
 const { routedGate, viewElsewhere } = require("./browserTabs");
 const { buildDesignModeScript } = require("./designModeScript");
+const { isBrowserViewFocused, registerDesignToolsIpc } = require("./designTools");
 
-const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
+const { SESSION_HOST_PROTOCOL, SSH_PREVIEW_PROTOCOL } = require("./hostIdentity");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
@@ -64,6 +67,17 @@ function flattenProfileLabel(value, fallback) {
 function buildCookieImportPrompt({ host, scope, profileName, cookieCount }) {
   const count = Number.isFinite(cookieCount) && cookieCount > 0 ? cookieCount : 0;
   const what = count > 0 ? `${count} cookie${count === 1 ? "" : "s"}` : "Chrome's cookies";
+  if (scope === chromeCookieStoreModule.ALL_SITES_SCOPE) {
+    return {
+      message: `Import ${what} for all websites into Omnigent?`,
+      detail:
+        `From Chrome profile "${flattenProfileLabel(profileName, "Unknown")}", for every website ` +
+        "it has cookies for.\n\n" +
+        "They stay available to this conversation's embedded browser tabs, including any the " +
+        "agent controls, until you quit Omnigent. The agent can act as you on every site you " +
+        "are signed in to in that profile.",
+    };
+  }
   // The scope is usually the tab's own host; name the tab too when an ancestor
   // was picked, so the prompt says which page the copy lands in.
   const where =
@@ -373,6 +387,10 @@ function makeDesignModeInputHandler(gestureState, isAgentInput = () => false) {
  * @param {(event: Electron.IpcMainInvokeEvent) => boolean} [deps.showsServerForEvent]
  *        Whether the sender's window still shows its server's page. Pushes to a
  *        window that navigated to a foreign page are dropped at send time.
+ * @param {(event: Electron.IpcMainInvokeEvent, url: string, opts: object) =>
+ *          Promise<boolean>} [deps.requestPreviewHostForEvent]
+ *        After a blocked navigation, asks whether the session's host may open
+ *        localhost pages; true asks the renderer to refresh provenance before retrying.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -381,6 +399,7 @@ function registerBrowserIpc({
   getAgentContextForEvent = () => null,
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
+  requestPreviewHostForEvent = async () => false,
   // The window with a tab's one page (browserTabs.js).
   routeViewForEvent = () => null,
   whileOpeningView = (handler) => handler, // the page's window while it opens
@@ -436,7 +455,7 @@ function registerBrowserIpc({
     if (!entry) return { error: "No browser view" };
     const context = entry.agentContext;
     if (context?.revoked) return { error: "The previous browser page is no longer available" };
-    if (context?.hostIsThisMachine === true) {
+    if (hasHostLocalAccess(context)) {
       const opts = args?.opts;
       if (
         opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
@@ -446,10 +465,7 @@ function registerBrowserIpc({
         return { error: "Current session host is required to read this browser view" };
       }
       const currentContext = getAgentContextForEvent(event, opts);
-      if (
-        opts.sourceHostId !== context.sourceHostId ||
-        currentContext?.hostIsThisMachine !== true
-      ) {
+      if (opts.sourceHostId !== context.sourceHostId || !hasHostLocalAccess(currentContext)) {
         // A tab check (browser_tabs list / select) only reads: it refuses the
         // tab but leaves its page, which may still hold the user's work.
         if (args?.action === "check_page") {
@@ -478,7 +494,8 @@ function registerBrowserIpc({
     if (pastAgentDeadline(opts)) {
       return { ok: false, created: false, superseded: false, error: PAGE_TIMEOUT_ERROR };
     }
-    const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
+    const isCurrentNavigation =
+      g.registry.beginAgentNavigation(conversationId, opts?.navigationRetryToken) ?? (() => false);
     const cancelled = {
       ok: false,
       created: false,
@@ -491,6 +508,7 @@ function registerBrowserIpc({
     // A forwarded agent navigation also ends at its caller's deadline.
     const isCurrent = () =>
       isCurrentNavigation() && isPinnedOriginSender(event) && !pastAgentDeadline(opts);
+    if (!isCurrent()) return cancelled;
     const navigate = async (registry) => {
       // Main validates the renderer-supplied host; opts only route.
       const agentContext = getAgentContextForEvent(event, opts);
@@ -529,7 +547,33 @@ function registerBrowserIpc({
         recovered = false;
       }
     }
+    // Typed URLs and links reach here too; the question names the session's host, not the page.
+    let previewAllowed = false;
+    if (
+      !r.ok &&
+      r.localhostBlocked === true &&
+      opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
+      opts?.sshPreviewProtocol === SSH_PREVIEW_PROTOCOL &&
+      !recovered &&
+      isCurrent()
+    ) {
+      try {
+        previewAllowed = (await requestPreviewHostForEvent(event, url, opts)) === true;
+      } catch {
+        previewAllowed = false;
+      }
+    }
     if (!isCurrent()) return cancelled;
+    if (previewAllowed) {
+      // Consent may outlive a session-host change; the renderer must resolve it again.
+      return {
+        ok: false,
+        created: false,
+        retryWithFreshHost: true,
+        navigationRetryToken: isCurrentNavigation.retryToken,
+        error: "Localhost access allowed; refresh the session host before retrying.",
+      };
+    }
     if (recovered) {
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.
@@ -556,12 +600,18 @@ function registerBrowserIpc({
             opts?.sourceHostId,
             opts?.rememberedArcaHostId,
             opts?.sourceIsArcaHost,
+            r.localhostBlocked === true,
+            opts?.trustedRemotePreviewProtocol,
           )
         : null;
     return {
       ok: r.ok,
       created: r.created ?? false,
       ...(r.ok ? { hostIsThisMachine: r.entry?.agentContext?.hostIsThisMachine === true } : {}),
+      ...(r.ok && r.entry?.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
+      ...(r.ok && r.entry?.agentContext?.hostIsTrustedRemotePreview
+        ? { trustedRemotePreviewHost: true }
+        : {}),
       error: hint ? `${r.error} ${hint}` : r.error,
     };
   };
@@ -589,7 +639,7 @@ function registerBrowserIpc({
     const viewId = g.registry.activeConversationId();
     if (viewId === null) return null;
     try {
-      return g.registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+      return isBrowserViewFocused(g.registry.get(viewId)) ? viewId : null;
     } catch {
       return null;
     }
@@ -722,6 +772,8 @@ function registerBrowserIpc({
     return {
       exists: true,
       hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
+      ...(entry.agentContext?.hostIsSshPreview ? { sshPreviewHost: true } : {}),
+      ...(entry.agentContext?.hostIsTrustedRemotePreview ? { trustedRemotePreviewHost: true } : {}),
       url,
       title: viewTitle(webContents), // "" once the page is gone
       ...(pendingUrl ? { pendingUrl } : {}),
@@ -749,7 +801,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goBack(entry.view.webContents);
+    if (goBack(entry.view.webContents)) g.registry.beginAgentNavigation?.(args.conversationId);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -758,7 +810,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goForward(entry.view.webContents);
+    if (goForward(entry.view.webContents)) g.registry.beginAgentNavigation?.(args.conversationId);
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -768,6 +820,7 @@ function registerBrowserIpc({
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
+      g.registry.beginAgentNavigation?.(args.conversationId);
       entry.view.webContents.reload();
     } catch {
       /* destroyed */
@@ -795,6 +848,8 @@ function registerBrowserIpc({
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
   });
+
+  registerDesignToolsIpc({ ipcMain, gateRegistry });
 
   // ── Design mode (point-and-prompt) ───────────────────────────────────────
   // Enable/disable the in-page picker and signal a submit result back to the
@@ -858,9 +913,10 @@ function registerBrowserIpc({
   });
 
   // ── Import cookies from Google Chrome (macOS) ────────────────────────────
-  // Copies only the current site's cookies into this conversation's in-memory
-  // partition: a metadata-only preview (no Keychain), then the import. The site
-  // comes from the view's real URL in main and is re-checked before writing.
+  // Copies one Chrome profile's cookies into this conversation's in-memory
+  // partition, for every website or only the current site: a metadata-only
+  // preview (no Keychain), then the import. A site scope comes from the view's
+  // real URL in main and is re-checked before writing.
 
   const siteForEntry = (entry) => {
     let parsed;
@@ -887,7 +943,14 @@ function registerBrowserIpc({
     const site = siteForEntry(entry);
     if (site.error) return { ok: false, error: site.error };
     try {
-      return await chromeCookieStore.previewSiteCookies({ host: site.host });
+      const preview = await chromeCookieStore.previewSiteCookies({ host: site.host });
+      if (!preview?.ok || typeof chromeCookieStore.previewAllSitesCookies !== "function") {
+        return preview;
+      }
+      // Additive, so a pane that predates "All websites" reads the same site preview.
+      const allSites = await chromeCookieStore.previewAllSitesCookies().catch(() => null);
+      // A failed lookup leaves the field out: an empty list would claim no website has cookies.
+      return allSites?.ok ? { ...preview, allSitesProfiles: allSites.profiles ?? [] } : preview;
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
@@ -902,6 +965,43 @@ function registerBrowserIpc({
     const { conversationId, profileId, expectedHost, scope } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    const importError = (e) => {
+      const msg = e && e.message ? e.message : String(e);
+      if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };
+      return { ok: false, error: msg };
+    };
+    if (scope === chromeCookieStoreModule.ALL_SITES_SCOPE) {
+      // Every website: nothing ties the copy to the tab's current site, so only
+      // the profile is validated. The count the user approves is still main's own.
+      if (typeof profileId !== "string" || !profileId) {
+        return { ok: false, error: "Pick a Chrome profile to import from." };
+      }
+      if (
+        typeof chromeCookieStore.previewAllSitesCookies !== "function" ||
+        typeof chromeCookieStore.importAllSitesCookies !== "function"
+      ) {
+        return { ok: false, error: "That site scope isn't available for this tab." };
+      }
+      try {
+        const preview = await chromeCookieStore.previewAllSitesCookies();
+        const profile = (preview?.profiles ?? []).find((candidate) => candidate.id === profileId);
+        if (!profile) return { ok: false, error: "That Chrome profile has no cookies to import." };
+        const approved = await confirmCookieImport({
+          host: "",
+          scope: chromeCookieStoreModule.ALL_SITES_SCOPE,
+          profileName: profile.name,
+          cookieCount: profile.cookieCount,
+          parentWindow: getWindowForEvent(event) ?? null,
+        });
+        if (!approved) return { ok: false, cancelled: true };
+        return await chromeCookieStore.importAllSitesCookies({
+          profileId,
+          cookiesApi: entry.view.webContents.session.cookies,
+        });
+      } catch (e) {
+        return importError(e);
+      }
+    }
     const site = siteForEntry(entry);
     if (site.error) return { ok: false, error: site.error };
     // Fall back to the real module only for stores that are pure stubs.
@@ -970,9 +1070,7 @@ function registerBrowserIpc({
         },
       });
     } catch (e) {
-      const msg = e && e.message ? e.message : String(e);
-      if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };
-      return { ok: false, error: msg };
+      return importError(e);
     }
   });
 

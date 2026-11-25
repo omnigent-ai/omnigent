@@ -94,7 +94,8 @@ export declare type ListDirectoryRequest = Message<"omnigent.api.workspace.v1alp
 
   /**
    * Fill each directory entry's `leaf_directory_path`, so a tree can show
-   * "a/b/c" on one row without a request per level. Hosts that don't support
+   * "a/b/c" on one row without a request per level. Offered with the
+   * "list_directory.collapse_single_child_directories" feature; hosts without
    * it leave `leaf_directory_path` empty.
    *
    * @generated from field: bool collapse_single_child_directories = 5;
@@ -336,7 +337,9 @@ export declare const StatPathResponseSchema: GenMessage<StatPathResponse>;
  */
 export declare type SearchFilesRequest = Message<"omnigent.api.workspace.v1alpha1.SearchFilesRequest"> & {
   /**
-   * A blank query returns nothing.
+   * A blank query returns nothing in substring mode. In fuzzy mode it returns
+   * files in path order, so a picker can show them before anything is typed.
+   * Feature "search_files.browse".
    *
    * @generated from field: string query = 1;
    */
@@ -1254,6 +1257,16 @@ export declare type BranchCommit = Message<"omnigent.api.workspace.v1alpha1.Bran
    * @generated from field: bool root = 5;
    */
   root: boolean;
+
+  /**
+   * The message after the subject line, trimmed: at most 4096 bytes, cut
+   * at a character boundary and ending in "…" when cut. Empty when the
+   * message is the subject alone, when the listing was too large to carry
+   * bodies, and from hosts that predate this field.
+   *
+   * @generated from field: string body = 6;
+   */
+  body: string;
 };
 
 /**
@@ -1519,7 +1532,9 @@ export enum FileSearchMode {
   UNSPECIFIED = 0,
 
   /**
-   * Ranked fuzzy match over file paths, best first. Feature "search_files.fuzzy".
+   * Ranked fuzzy match over file paths, best first; every whitespace-separated
+   * word must match, ignoring case unless the query has a capital letter.
+   * Feature "search_files.fuzzy".
    *
    * @generated from enum value: FILE_SEARCH_MODE_FUZZY = 1;
    */
