@@ -85,6 +85,8 @@ interface PendingReplay {
   target: string;
   /** URL events to pass over while waiting: the page being left, and older replays' targets. */
   ignored: ReadonlySet<string>;
+  /** The latest of those the page reported, which it may show if the replay never lands. */
+  lastIgnored?: string;
 }
 
 let requestCounter = 0;
@@ -169,7 +171,10 @@ export class BrowserTabNavigation {
     const pending = this.pending;
     if (pending) {
       // A title or load event of the page being left, or an older replay's page, isn't the landing.
-      if (event.url !== pending.target && pending.ignored.has(event.url)) return;
+      if (event.url !== pending.target && pending.ignored.has(event.url)) {
+        pending.lastIgnored = event.url;
+        return;
+      }
       // The replay's evidence: the target, or where it redirected.
       this.live = { url: event.url };
       this.adopt(event.url);
@@ -314,8 +319,15 @@ export class BrowserTabNavigation {
     const requestId = nextRequestId();
     const landed = new Promise<LandResult>((resolve) => {
       const timer = setTimeout(() => {
-        // No failure is claimed: the tab keeps the requested place.
-        if (this.pending?.requestId === requestId) this.finish(this.pending, "superseded");
+        const pending = this.pending;
+        if (pending?.requestId !== requestId) return;
+        // No failure is claimed. A page that reported nothing may still be loading, so the tab
+        // keeps the requested place; one that reported a page it shows, such as a redirect back
+        // to the page being left, settles there.
+        this.finish(pending, "superseded");
+        if (pending.lastIgnored === undefined) return;
+        this.live = { url: pending.lastIgnored };
+        this.reconcileWithLivePage();
       }, REPLAY_WAIT_MS);
       this.pending = { requestId, resolve, timer, target: url, ignored };
     });

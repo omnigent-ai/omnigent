@@ -183,6 +183,27 @@ describe("browser pages in the timeline, replay mode", () => {
     expect(describeHistory(ws.history)).toBe("[W:/a*, W:/b]");
   });
 
+  it("a replay the page redirects back to the page being left settles there once the wait ends", async () => {
+    vi.useFakeTimers();
+    const { ws, owner } = browserWorkspace("replay", "/a");
+    owner.onUrlChanged({ viewKey: "view-W", url: page("/b") });
+    const replay = await ws.back();
+    const landing = settle(replay.landing);
+    // A redirects to B: the event can't be told from B's own title event, so the wait goes on.
+    owner.onUrlChanged({ viewKey: "view-W", url: page("/b") });
+    expect(owner.isWaitingForReplay()).toBe(true);
+    await vi.advanceTimersByTimeAsync(REPLAY_WAIT_MS);
+    expect(landing.result).toBe<LandResult>("superseded");
+    expect(owner.isWaitingForReplay()).toBe(false);
+    expect(ws.tab("W").place).toEqual({ kind: "web", url: page("/b") });
+    expect(describeHistory(ws.history)).toBe("[W:/a, W:/b*]");
+    expect(ws.canGoBack()).toBe(true);
+    expect(ws.canGoForward()).toBe(false);
+    // B's later events change nothing.
+    owner.onUrlChanged({ viewKey: "view-W", url: page("/b") });
+    expect(describeHistory(ws.history)).toBe("[W:/a, W:/b*]");
+  });
+
   it("closing the tab ends the wait", async () => {
     const { ws, owner } = browserWorkspace("replay", "/a");
     owner.onUrlChanged({ viewKey: "view-W", url: page("/b") });
