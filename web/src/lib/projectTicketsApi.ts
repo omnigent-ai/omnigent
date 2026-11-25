@@ -313,6 +313,27 @@ export function listTicketEvents(
   if (kind) params.set("kind", kind);
   return request<EventPage>(`${path(projectId, ticketId)}/events?${params}`);
 }
+/** A summary of a ticket's history, shown only to the person who asked for it. */
+export interface TicketHistorySummary {
+  object: "project.ticket.summary";
+  /** Whether this server has a model for summaries. */
+  available: boolean;
+  summary: {
+    text: string;
+    through_position: number;
+    generated_at: number;
+    model: string;
+    cached: boolean;
+  } | null;
+  /** Activity followed the summary. */
+  stale: boolean;
+}
+export function getTicketHistorySummary(projectId: string, ticketId: string) {
+  return request<TicketHistorySummary>(`${path(projectId, ticketId)}/summary`);
+}
+export function summarizeTicketHistory(projectId: string, ticketId: string) {
+  return request<TicketHistorySummary>(`${path(projectId, ticketId)}/summary`, "POST");
+}
 export function listTicketSessions(projectId: string, ticketId: string, after?: string) {
   const params = new URLSearchParams({ limit: "50" });
   if (after) params.set("after", after);

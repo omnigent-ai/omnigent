@@ -7000,6 +7000,17 @@
             ],
             "description": "Display name, unique within the project, e.g. `\"PM\"`.",
             "title": "Name"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProjectRoleScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the role owns and doesn't; empty lists clear it."
           }
         },
         "title": "ProjectIdentityRequest",
@@ -7642,6 +7653,32 @@
           "ordered_project_ids"
         ],
         "title": "ProjectOrderResponse",
+        "type": "object"
+      },
+      "ProjectRoleScope": {
+        "additionalProperties": false,
+        "description": "A role's scope: what it owns and what it leaves to others.",
+        "properties": {
+          "excludes": {
+            "description": "Areas it doesn't own, e.g. `\"the roadmap\"`.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "title": "Excludes",
+            "type": "array"
+          },
+          "owns": {
+            "description": "Areas the role is accountable for, e.g. `\"visual design\"`.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "title": "Owns",
+            "type": "array"
+          }
+        },
+        "title": "ProjectRoleScope",
         "type": "object"
       },
       "ProjectRoutingRequest": {
@@ -26553,6 +26590,112 @@
           }
         },
         "summary": "Link Session",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/{ticket_id}/summary": {
+      "get": {
+        "description": "The last summary of the ticket's history, if one is cached; never calls a model.\n\n`stale` is true when activity followed it. `available` says whether\nthis server can summarize at all.",
+        "operationId": "get_ticket_summary_v1_projects__project_id__tickets__ticket_id__summary_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Ticket Summary V1 Projects  Project Id  Tickets  Ticket Id  Summary Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Ticket Summary",
+        "tags": [
+          "project tickets"
+        ]
+      },
+      "post": {
+        "description": "Summarize the ticket's history for the caller, reusing the cached one when unchanged.\n\nShown only to the person who asked; nothing is posted to the ticket.",
+        "operationId": "summarize_ticket_v1_projects__project_id__tickets__ticket_id__summary_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Summarize Ticket V1 Projects  Project Id  Tickets  Ticket Id  Summary Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Summarize Ticket",
         "tags": [
           "project tickets"
         ]

@@ -17,6 +17,7 @@ from sqlalchemy.exc import StatementError
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.entities.project_routing import LEAD_NAME
 from omnigent.entities.project_ticket import (
+    TICKET_PAGE_MAX,
     CommentOnTicket,
     CreateTicket,
     FileIntakeTicket,
@@ -34,7 +35,7 @@ from omnigent.entities.project_ticket import (
     UpdateTicketStages,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.builder import load_session_usage_and_tree
 from omnigent.runtime.project_ticket_instructions import (
@@ -76,6 +77,7 @@ from omnigent.server.ticket_review import (
     to_reviewer_message,
     to_worker_message,
 )
+from omnigent.server.ticket_summary import TicketSummarizer, build_ticket_summarizer
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore, ProjectStore
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
@@ -180,6 +182,8 @@ def intake_description(source_name: str, sender: str | None, description: str) -
         "This project's own rules and approvals apply."
     )
     return f"{note}\n\n{description}".rstrip()
+
+
 _mention_limiter = MentionRateLimiter()
 _mention_tasks: set[asyncio.Task[None]] = set()
 
@@ -1079,6 +1083,108 @@ def create_project_tickets_router(
             return await project_release.project_revert_draft(
                 project, store, who.user_id, ticket["id"], body.shas
             )
+
+    def summarizer(request: Request) -> TicketSummarizer:
+        state = request.app.state
+        existing = getattr(state, "ticket_summarizer", None)
+        if existing is None:
+            existing = build_ticket_summarizer()
+            state.ticket_summarizer = existing
+        return existing
+
+    def refuse_agent_summary(request: Request) -> None:
+        # Summaries spend the operator's model budget; agents read the ticket itself.
+        if ORCHESTRATION_SOURCE_HEADER in request.headers or (
+            RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+        ):
+            raise OmnigentError(
+                "Ticket summaries are for people; agents read the ticket directly",
+                code=ErrorCode.FORBIDDEN,
+            )
+
+    def all_events(project_id: str, ticket_id: str, user_id: str | None) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        after = -1
+        while True:
+            page = store.events(
+                project_id, ticket_id, user_id=user_id, after=after, limit=TICKET_PAGE_MAX
+            )
+            events.extend(page["data"])
+            if not page.get("has_more") or not page["data"]:
+                return events
+            after = int(page["data"][-1]["position"])
+
+    def role_names(project_id: str, user_id: str | None) -> dict[str, str]:
+        """Session ID -> role name, so the summary says who did what."""
+        if projects is None:
+            return {}
+        project = projects.get(project_id, user_id=user_id)
+        if project is None:
+            return {}
+        names = {
+            identity.active_session_id: identity.name
+            for identity in projects.list_identities(project_id, user_id=user_id)
+            if identity.active_session_id
+        }
+        for session_id in (project.main_session_id, *project.retired_main_session_ids):
+            if session_id:
+                names[session_id] = LEAD_NAME
+        return names
+
+    @router.get("/{ticket_id}/summary")
+    async def get_ticket_summary(
+        request: Request, project_id: str, ticket_id: str
+    ) -> dict[str, Any]:
+        """The last summary of the ticket's history, if one is cached; never calls a model.
+
+        ``stale`` is true when activity followed it. ``available`` says whether
+        this server can summarize at all.
+        """
+        refuse_agent_summary(request)
+        who = await actor(request, project_id)
+        ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        engine = summarizer(request)
+        latest = engine.latest(ticket["id"])
+        stale = False
+        if latest is not None:
+            newer = await asyncio.to_thread(
+                store.events,
+                project_id,
+                ticket["id"],
+                user_id=who.user_id,
+                after=latest.through_position,
+                limit=1,
+            )
+            stale = bool(newer["data"])
+        return {
+            "object": "project.ticket.summary",
+            "available": engine.available,
+            "summary": latest.as_dict(cached=True) if latest is not None else None,
+            "stale": stale,
+        }
+
+    @router.post("/{ticket_id}/summary")
+    async def summarize_ticket(
+        request: Request, project_id: str, ticket_id: str
+    ) -> dict[str, Any]:
+        """Summarize the ticket's history for the caller, reusing the cached one when unchanged.
+
+        Shown only to the person who asked; nothing is posted to the ticket.
+        """
+        refuse_agent_summary(request)
+        who = await actor(request, project_id)
+        ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        events = await asyncio.to_thread(all_events, project_id, ticket["id"], who.user_id)
+        names = await asyncio.to_thread(role_names, project_id, who.user_id)
+        summary, cached = await summarizer(request).summarize(
+            ticket["id"], events, names, user_key=who.user_id or "local"
+        )
+        return {
+            "object": "project.ticket.summary",
+            "available": True,
+            "summary": summary.as_dict(cached=cached),
+            "stale": False,
+        }
 
     @router.post("/{ticket_id}/comments", status_code=201)
     async def comment(

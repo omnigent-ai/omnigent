@@ -83,6 +83,7 @@ import { TicketSessionAvatar, TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
 import { TicketFollowUps, TicketRelatedTickets } from "./TicketRelatedTickets";
 import { TicketShipBlocker } from "./TicketShipBlocker";
+import { SUMMARY_MIN_EVENTS, TicketHistorySummary } from "./TicketHistorySummary";
 import { parseAskPosition, useTicketAsk } from "./useTicketAsk";
 import { useTicketSeen } from "./useTicketSeen";
 import {
@@ -1348,6 +1349,9 @@ function TicketActivity({ projectId, ticket }: { projectId: string; ticket: Proj
         >
           More activity
         </Button>
+      )}
+      {(query.hasNextPage || events.length > SUMMARY_MIN_EVENTS) && (
+        <TicketHistorySummary projectId={projectId} ticketId={ticket.id} nowMs={now.getTime()} />
       )}
     </section>
   );
