@@ -329,13 +329,12 @@ describe("useHosts", () => {
     expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_sandbox", "host_laptop"]);
   });
 
-  it("keeps the filtered and unfiltered lists in separate cache entries", async () => {
-    // The filtered (picker) and unfiltered (badge) calls share an
-    // endpoint but use distinct query keys. If they ever collapsed back
-    // to a bare ["hosts"] key, the second queryFn's result would clobber
-    // the first in cache and both consumers would see the same list.
-    // Mounting both in ONE QueryClient and asserting they diverge guards
-    // that regression. mockResolvedValue (persistent) feeds both fetches.
+  it("gives filtered and unfiltered consumers their own view of the shared list", async () => {
+    // The filtered (picker) and unfiltered (badge) consumers share one cached
+    // host list; each observer filters its own view. If the filter leaked into
+    // the shared entry, both consumers would see the same list. Mounting both
+    // in ONE QueryClient and asserting they diverge guards that regression.
+    // mockResolvedValue (persistent) feeds any fetch.
     fetchMock.mockResolvedValue(
       mockResponse({
         hosts: [
@@ -433,9 +432,20 @@ describe("useHosts", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ hosts: [laptop, vm, sandbox] }));
     let fetched: string[] = [];
     await act(async () => {
-      fetched = withoutSandboxHosts(await fetchHostsNow(client)).map((h) => h.host_id);
+      fetched = (await fetchHostsNow(client)).map((h) => h.host_id);
     });
-    expect(fetched).toEqual(["host_laptop", "host_vm"]);
+    // The refresh returns and caches the full list; only the picker's view drops sandboxes.
+    expect(fetched).toEqual(["host_laptop", "host_vm", "host_sandbox"]);
+    expect(
+      client
+        .getQueryData<{ host_id: string }[]>(["hosts", { includeSandbox: true }])
+        ?.map((h) => h.host_id),
+    ).toEqual(["host_laptop", "host_vm", "host_sandbox"]);
+    expect(
+      withoutSandboxHosts(client.getQueryData(["hosts", { includeSandbox: true }]) ?? []).map(
+        (h) => h.host_id,
+      ),
+    ).toEqual(["host_laptop", "host_vm"]);
     await waitFor(() =>
       expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_vm"]),
     );
