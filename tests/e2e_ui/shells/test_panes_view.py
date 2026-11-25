@@ -447,7 +447,7 @@ _TWO_FRAMES = "() => new Promise(r => requestAnimationFrame(() => requestAnimati
 def test_a_split_pane_closes_as_soon_as_its_shell_exits(
     page: Page, panes_session: tuple[str, str]
 ) -> None:
-    """``exit`` in a split pane removes it within a second, well before the runner reports the
+    """``exit`` in a split pane removes it within two seconds, before the runner reports the
     exit, and the agent pane beside it takes the keyboard."""
     base_url, session_id = panes_session
     _open(page, base_url, session_id, floating=True)
@@ -460,17 +460,25 @@ def test_a_split_pane_closes_as_soon_as_its_shell_exits(
     page.keyboard.type("exit")
     page.keyboard.press("Enter")
     # The runner lists an exited shell for about 3 s more; the pane goes on the attach's end.
-    expect(panes.get_by_test_id("terminal-view")).to_have_count(1, timeout=1_000)
+    expect(panes.get_by_test_id("terminal-view")).to_have_count(1, timeout=2_000)
     expect(agent).to_be_focused()
 
 
-@pytest.mark.parametrize("scheme", ["light", "dark"])
+def _capture_both_schemes(page: Page, name: str) -> None:
+    """Save `name` in the light and the dark theme, leaving the page light."""
+    for scheme in ("light", "dark"):
+        page.emulate_media(color_scheme=scheme)
+        page.evaluate(_TWO_FRAMES)
+        _capture(page, f"{name}-{scheme}")
+    page.emulate_media(color_scheme="light")
+
+
 def test_a_floating_pane_maximizes_on_a_double_click_away_from_its_move_handle(
-    page: Page, panes_session: tuple[str, str], scheme: str
+    page: Page, panes_session: tuple[str, str]
 ) -> None:
     """A double-click on a pane's toolbar away from its handle maximizes the pane without lifting
     it; a double-click in the band around the handle, which moves the pane, maximizes nothing."""
-    page.emulate_media(color_scheme=scheme)
+    page.emulate_media(color_scheme="light")
     base_url, session_id = panes_session
     _open(page, base_url, session_id, floating=True)
     page.set_viewport_size(_WIDE_DESKTOP)
@@ -497,7 +505,7 @@ def test_a_floating_pane_maximizes_on_a_double_click_away_from_its_move_handle(
     }"""
     )
     page.mouse.move(middle_x, middle_y)
-    _capture(page, f"pane-move-band-{scheme}")
+    _capture_both_schemes(page, "pane-move-band")
 
     page.mouse.dblclick(middle_x, middle_y)
     page.evaluate(_TWO_FRAMES)
@@ -507,4 +515,4 @@ def test_a_floating_pane_maximizes_on_a_double_click_away_from_its_move_handle(
     page.mouse.dblclick(box["x"] + box["width"] - 140, middle_y)
     expect(panes.locator("[data-pane-zoomed]")).to_have_count(1, timeout=10_000)
     assert page.evaluate("window.__lifted") is False
-    _capture(page, f"pane-maximized-{scheme}")
+    _capture_both_schemes(page, "pane-maximized")

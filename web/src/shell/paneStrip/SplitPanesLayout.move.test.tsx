@@ -755,9 +755,10 @@ describe("SplitPanesLayout: a wide row's move band", () => {
     floating.on = false;
     const toggleZoom = vi.fn();
     const { onMovePane } = setup({ toggleZoom });
-    // Outside where the band would be: it still lifts and drags, and shows no grab cursor.
+    // Without floating panes there is no band: no grab cursor over its centre.
     fireEvent.pointerMove(row("a"), { pointerId: 1, clientX: CENTRE, clientY: 10 });
     expect(row("a").hasAttribute("data-pane-strip-over-grip")).toBe(false);
+    // A press away from the centre still lifts and drags the pane.
     press("a", 20);
     expect(held("a")).toBe(true);
     moveTo(20 + PANE_DRAG_THRESHOLD_PX + 1, 10);

@@ -568,7 +568,7 @@ function MainSplitPanes({
               onFocusRequestTaken={(id) => settleTerminalFocus(conversationId, "main", id)}
               onStateChange={(state) => {
                 setTerminalConnectionState(terminal.id, state);
-                // With floating panes a pane whose shell exits closes at once.
+                // The terminals list lags a shell's exit by seconds; the attach's end is immediate.
                 if (cards) observePaneShell(paneKey, state);
               }}
               onActivity={() => markTerminalActive(terminal.id)}
