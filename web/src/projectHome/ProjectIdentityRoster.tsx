@@ -134,8 +134,8 @@ export function ProjectIdentityRoster({
                 type="button"
                 variant="ghost"
                 size={isMobile ? "icon" : "sm"}
-                // Names show only on wide screens; the avatar and tooltip identify each persona.
-                className="max-2xl:size-8 max-2xl:px-0"
+                // Names show only in a wide header; the avatar and tooltip identify each persona.
+                className="@max-[104rem]/topbar:size-8 @max-[104rem]/topbar:px-0"
                 aria-label={`Talk to ${identity.name}${busy ? " (working)" : ""}`}
                 data-testid="project-identity-button"
                 loading={pending}
@@ -143,7 +143,9 @@ export function ProjectIdentityRoster({
               >
                 <PersonaAvatar name={identity.name} size="xs" />
                 {!isMobile && (
-                  <span className="max-w-28 truncate max-2xl:hidden">{identity.name}</span>
+                  <span className="max-w-28 truncate @max-[104rem]/topbar:hidden">
+                    {identity.name}
+                  </span>
                 )}
                 {busy && <RunningDot />}
               </Button>

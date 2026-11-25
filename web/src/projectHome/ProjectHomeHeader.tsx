@@ -90,9 +90,14 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
         configReady={!projectsLoading && (projectId === null || config !== undefined)}
         small
       />
-      <h1 className="min-w-0 truncate text-lg font-medium text-foreground">{projectName}</h1>
-      <ProjectCostBadge projectId={projectId} />
-      <ProjectHomeActions projectName={projectName} />
+      {/* The name keeps a readable minimum; the actions to its right collapse first. */}
+      <h1 className="min-w-24 truncate text-lg font-medium text-foreground">{projectName}</h1>
+      <div className="shrink-0 @max-[60rem]/topbar:hidden">
+        <ProjectCostBadge projectId={projectId} />
+      </div>
+      <div className="flex shrink-0 items-center">
+        <ProjectHomeActions projectName={projectName} />
+      </div>
     </div>
   );
 }

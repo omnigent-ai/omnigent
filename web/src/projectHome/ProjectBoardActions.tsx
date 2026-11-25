@@ -37,7 +37,9 @@ export function ProjectBoardActions({
         <Button asChild variant="ghost" size={isMobile ? "icon" : "sm"}>
           <Link to={projectOrchestratorPath(projectName, search)} aria-label="Lead">
             <PersonaAvatar name={leadName} size="xs" />
-            {!isMobile && <span className="max-w-28 truncate max-xl:hidden">{leadName}</span>}
+            {!isMobile && (
+              <span className="max-w-28 truncate @max-[80rem]/topbar:hidden">{leadName}</span>
+            )}
           </Link>
         </Button>
       )}
