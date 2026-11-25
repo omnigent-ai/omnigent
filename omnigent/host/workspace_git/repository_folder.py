@@ -12,6 +12,9 @@ place on the host. A workspace inside a larger repository compares only its root
 
 from __future__ import annotations
 
+import asyncio
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,17 +58,50 @@ def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _registered_at(git_directory: Path, top_level: Path) -> bool:
+# Far beyond any path Git writes; a larger record isn't one.
+_RECORD_LIMIT_BYTES = 64 * 1024
+
+
+def _read_record(path: Path) -> str | None:
+    """The text of the record at ``path``: None unless a regular file within the limit.
+
+    Opened without blocking, so a named pipe planted there is refused rather than waited on.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as record:
+            if not stat.S_ISREG(os.fstat(record.fileno()).st_mode):
+                return None
+            data = record.read(_RECORD_LIMIT_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > _RECORD_LIMIT_BYTES:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _names_top_level(git_directory: Path, top_level: Path) -> bool:
+    recorded = (_read_record(git_directory / "gitdir") or "").strip()
+    if not recorded:
+        return False
+    try:
+        return (git_directory / recorded).resolve() == top_level / ".git"
+    except (OSError, ValueError):
+        # A NUL or another path the platform can't hold isn't a record of this folder.
+        return False
+
+
+async def _registered_at(git_directory: Path, top_level: Path) -> bool:
     """Whether Git's own record of a linked worktree, its ``gitdir`` file, names ``top_level``.
 
     A `.git` file can point at any registered worktree's metadata; only the worktree the
     record names may use it, so one elsewhere can't be compared through another folder.
+    Read on a worker thread, as the Git calls run, so a slow disk doesn't hold the loop.
     """
-    try:
-        recorded = (git_directory / "gitdir").read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return False
-    return bool(recorded) and (git_directory / recorded).resolve() == top_level / ".git"
+    return await asyncio.to_thread(_names_top_level, git_directory, top_level)
 
 
 def _places(repository: GitRepository) -> tuple[Path, Path, Path]:
@@ -130,6 +166,6 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
         raise _refuse(repository, "isn't a worktree of the workspace's repository")
     if not _is_within(top_level, workspace):
         raise _refuse(repository, "has its working tree outside the workspace")
-    if not _registered_at(git_directory, top_level):
+    if not await _registered_at(git_directory, top_level):
         raise _refuse(repository, "isn't a worktree of the workspace's repository")
     return RepositoryFolder(folder, found)

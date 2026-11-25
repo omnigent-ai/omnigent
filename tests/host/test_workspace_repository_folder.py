@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import shutil
 import sys
 from collections.abc import Awaitable, Callable
@@ -244,6 +246,44 @@ async def test_a_worktree_whose_working_tree_is_outside_the_workspace_is_refused
     message = await _refusal(workspace, ".worktrees/feature")
 
     assert message.endswith("has its working tree outside the workspace")
+
+
+def _worktree_with_record(tmp_path: Path) -> tuple[Path, Path]:
+    """A workspace with a worktree `.worktrees/feature`, and that worktree's `gitdir` record."""
+    workspace = _repository(tmp_path / "workspace")
+    _git(workspace, "worktree", "add", "-q", "-b", "feature", ".worktrees/feature")
+    record = workspace / ".git" / "worktrees" / "feature" / "gitdir"
+    assert record.read_text().strip() == str(workspace / ".worktrees" / "feature" / ".git")
+    return workspace, record
+
+
+async def test_a_worktree_record_holding_a_nul_is_refused(tmp_path: Path) -> None:
+    """A path the platform can't hold is no record of the folder, and not an internal error."""
+    workspace, record = _worktree_with_record(tmp_path)
+    record.write_text(f"{workspace / '.worktrees' / 'feature' / '.git'}\0\n")
+
+    message = await _refusal(workspace, ".worktrees/feature")
+
+    assert message.endswith("isn't a worktree of the workspace's repository")
+
+
+@pytest.mark.parametrize("planted", ["named pipe", "huge file"])
+async def test_a_worktree_record_that_isnt_a_small_file_is_refused_without_waiting(
+    tmp_path: Path, planted: str
+) -> None:
+    """A pipe would block a read, and a huge file has no place as a record: both refuse."""
+    workspace, record = _worktree_with_record(tmp_path)
+    recorded = record.read_text()
+    record.unlink()
+    if planted == "named pipe":
+        os.mkfifo(record)
+    else:
+        # The path Git wrote, padded past the limit: only the size makes it no record.
+        record.write_text(recorded + " " * (64 * 1024))
+
+    message = await asyncio.wait_for(_refusal(workspace, ".worktrees/feature"), timeout=10)
+
+    assert message.endswith("isn't a worktree of the workspace's repository")
 
 
 async def test_a_repository_in_a_workspace_outside_any_repository_is_refused(
