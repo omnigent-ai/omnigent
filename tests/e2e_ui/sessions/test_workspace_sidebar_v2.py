@@ -59,6 +59,7 @@ _TABS_CODE_MARKERS = (
     "Workspace history",
     "Open an app in this tab",
 )
+_PINNED_PAGES_KEY = "omnigent:pinned-workspace-tabs"
 _FILE = "tabs_sidebar_notes.py"
 _EDIT = "# saved from the tabs sidebar"
 _PR_TITLE = "Add the GitHub tab"
@@ -75,8 +76,16 @@ def workspace_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, st
         _cleanup_session_workdir(session_id)
 
 
-def _set_flag(page: Page, enabled: bool) -> None:
-    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``."""
+def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None:
+    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``.
+
+    With the flag on, a journey opens the tabs it needs, so its strips start with nothing
+    pinned unless ``settings_pins`` keeps Settings as shipped.
+    """
+    if enabled and not settings_pins:
+        page.add_init_script(
+            f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))"
+        )
 
     def answer(route: Route) -> None:
         response = route.fetch()
@@ -302,6 +311,24 @@ def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
     expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
 
 
+def test_a_new_strip_starts_on_the_settings_pinned_pages(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """With Settings as shipped, a session's first strip shows its pinned pages, on Files."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True, settings_pins=True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    files_tab = sidebar.get_by_role("tab", name=re.compile(r"^Files"))
+    expect(files_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    # Pull Requests and Tasks join only where the session offers them.
+    for page_name in ("Diffs", "Agents"):
+        expect(sidebar.get_by_role("tab", name=re.compile(rf"^{page_name}"))).to_have_count(1)
+    expect(sidebar.get_by_role("tab", name="New tab", exact=True)).to_have_count(0)
+
+
 def test_full_screen_chord_opens_the_sidebar_full_screen_and_leaves_it(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
@@ -354,7 +381,11 @@ def test_files_menu_copies_the_path_and_a_link_to_the_file(
 def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
-    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen."""
+    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen.
+
+    Settings stay as shipped, so the strip takes its pinned pages as the link opens; the
+    linked file keeps the selection.
+    """
     base_url, session_id = workspace_session
     anchor = "hello"
     response = httpx.post(
@@ -370,7 +401,7 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     )
     response.raise_for_status()
     comment_id = response.json()["id"]
-    _set_flag(page, True)
+    _set_flag(page, True, settings_pins=True)
     page.set_viewport_size(_VIEWPORTS["desktop"])
     page.goto(f"{base_url}/c/{session_id}?file={_FILE}&comment={comment_id}&fullscreen=1")
 
@@ -380,6 +411,10 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     expect(page.locator("[data-maximized]")).to_have_count(1)
     # The link is handed to the tab, so a reload doesn't open it again.
     expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+    expect(sidebar.get_by_role("tab", name=re.compile(r"^Agents"))).to_have_count(1)
+    file_tab = sidebar.get_by_role("tab", name=re.compile(rf"^{re.escape(_FILE)}"))
+    expect(file_tab).to_have_attribute("aria-selected", "true")
+    expect(viewer).to_contain_text("Say goodbye too")
 
 
 def test_tabs_sidebar_shell_tab_connects_then_shows_its_terminal(
