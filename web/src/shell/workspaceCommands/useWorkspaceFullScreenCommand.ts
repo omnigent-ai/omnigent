@@ -6,6 +6,7 @@ import { MaximizeIcon, MinimizeIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { isMacPlatform } from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 import { type PaletteCommand, usePaletteCommands } from "@/store/paletteCommands";
 
 import type { WorkspaceFullScreenCommand } from "./model";
@@ -20,16 +21,13 @@ interface FullScreenRuntime {
 
 let runtime: Promise<FullScreenRuntime> | null = null;
 
-// The labels and the chord live with the tabs sidebar's code, which the classic layout never loads.
+// The labels live with the tabs sidebar's code, which the classic layout never loads; the
+// chord is in the app's shortcut registry, which every page has.
 function loadRuntime(): Promise<FullScreenRuntime> {
-  runtime ??= Promise.all([
-    import("./model"),
-    import("@/shell/workspaceTabs/workspaceSidebarShortcuts"),
-  ]).then(
-    ([model, shortcuts]) => ({
+  runtime ??= import("./model").then(
+    (model) => ({
       command: (fullScreen) => model.workspaceFullScreenCommand({ fullScreen }),
-      matchesChord: (event, mac) =>
-        shortcuts.matchesShortcut(event, "workspace.toggleFullScreen", { mac }),
+      matchesChord: (event, mac) => matchesShortcut(event, "workspace.toggleFullScreen", { mac }),
     }),
     (error: unknown) => {
       // A chunk that failed to load, such as after a deploy, is tried again on the next mount.

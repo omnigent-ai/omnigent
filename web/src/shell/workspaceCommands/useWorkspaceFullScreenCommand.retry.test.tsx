@@ -7,7 +7,7 @@ const rows = () =>
   Object.values(usePaletteCommandsStore.getState().groups).flatMap((group) => group.commands);
 
 const chunk = vi.hoisted(() => ({ fails: true }));
-vi.mock("@/shell/workspaceTabs/workspaceSidebarShortcuts", async (importOriginal) => {
+vi.mock("./model", async (importOriginal) => {
   if (chunk.fails) throw new Error("chunk failed to load");
   return importOriginal();
 });
