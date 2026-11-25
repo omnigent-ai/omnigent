@@ -776,8 +776,18 @@ class OutsideAnyRepository:
 
 
 OUTSIDE_ANY_REPOSITORY = OutsideAnyRepository()
-# What a folder check found: the repository, none at all, or ``None`` when nothing was checked.
-CheckedRepository = GitRepository | OutsideAnyRepository | None
+
+
+@dataclass(frozen=True)
+class UnreadableRepository:
+    """A checked folder whose repository Git couldn't read: the comparison reports ``error``."""
+
+    error: GitError
+
+
+# What a folder check found: the repository, none at all, Git's failure to read it, or
+# ``None`` when nothing was checked.
+CheckedRepository = GitRepository | OutsideAnyRepository | UnreadableRepository | None
 
 
 async def checked_or_discovered(
@@ -786,8 +796,11 @@ async def checked_or_discovered(
     """The repository a folder check found at ``root``, else the one discovered there.
 
     A folder the check found outside any repository stays outside one, so a repository
-    created there after the check isn't picked up.
+    created there after the check isn't picked up. One Git couldn't read raises that
+    failure, so the comparison reports it as it would for the workspace itself.
     """
     if isinstance(checked, OutsideAnyRepository):
         return None
+    if isinstance(checked, UnreadableRepository):
+        raise checked.error
     return checked or await GitRepository.discover(root, deadline)

@@ -21,6 +21,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     CHANGE_STATUS_ADDED,
     CHANGE_STATUS_MODIFIED,
     COMPARISON_PROBLEM_NOT_A_REPOSITORY,
+    COMPARISON_PROBLEM_TIMEOUT,
     ListBranchCommitsRequest,
     ListRepositoryRefsRequest,
     ListWorkingCopyChangesRequest,
@@ -29,7 +30,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
 )
 from omnigent.host.workspace_git import runner
 from omnigent.host.workspace_git.repository_folder import repository_folder
-from omnigent.host.workspace_git.runner import OUTSIDE_ANY_REPOSITORY
+from omnigent.host.workspace_git.runner import OUTSIDE_ANY_REPOSITORY, GitError, GitProblem
 from omnigent.host.workspace_service import WorkspaceService
 from omnigent.workspace_fs import WorkspaceReader
 from tests.host.test_workspace_git_runner import _git, _repository
@@ -367,3 +368,27 @@ async def test_a_plain_folder_outside_any_repository_answers_not_a_repository(
 
     assert changes.base.unavailable.problem == COMPARISON_PROBLEM_NOT_A_REPOSITORY
     assert looked_in == [(workspace / "docs").resolve()]
+
+
+@pytest.mark.parametrize("repository", ["", "src"])
+async def test_git_failing_during_the_check_is_reported_as_for_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository: str
+) -> None:
+    """A named folder Git can't read answers with Git's problem, as the workspace itself does."""
+    workspace = _repository(tmp_path / "workspace")
+    (workspace / "src").mkdir()
+    looked_in: list[Path] = []
+
+    async def timing_out(working_directory: Path, deadline: runner.Deadline) -> Any:
+        looked_in.append(working_directory)
+        raise GitError(GitProblem.TIMEOUT, "Git took too long")
+
+    monkeypatch.setattr(runner.GitRepository, "discover", timing_out)
+
+    changes = await _client(workspace).list_working_copy_changes(
+        ListWorkingCopyChangesRequest(repository=repository)
+    )
+
+    assert changes.base.unavailable.problem == COMPARISON_PROBLEM_TIMEOUT
+    # The check's own failure stands: nothing looks for the repository again.
+    assert len(looked_in) == 1

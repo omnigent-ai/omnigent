@@ -22,11 +22,10 @@ from omnigent.host.workspace_git.runner import (
     Deadline,
     GitError,
     GitRepository,
+    UnreadableRepository,
 )
+from omnigent.host.workspace_git.working_copy import LISTING_DEADLINE_S
 from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
-
-# Two rev-parse calls at most; seconds means something is wrong.
-_CHECK_DEADLINE_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -36,8 +35,9 @@ class RepositoryFolder:
     :param path: The workspace root, or the resolved directory inside it.
     :param repository: The repository the checks passed for, which the Git calls reuse
         rather than looking it up again; ``OUTSIDE_ANY_REPOSITORY`` for a folder outside
-        any, which they answer as not a repository; ``None`` for the workspace root, which
-        they discover as before.
+        any, which they answer as not a repository; an ``UnreadableRepository`` when Git
+        couldn't read it, which they report as they would for the workspace; ``None`` for
+        the workspace root, which they discover as before.
     """
 
     path: Path
@@ -84,7 +84,7 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
         raise _refuse(repository, "isn't a folder in the workspace")
     if any(part.lower() == ".git" for part in folder.relative_to(workspace).parts):
         raise _refuse(repository, "is inside a Git directory")
-    deadline = Deadline(_CHECK_DEADLINE_S)
+    deadline = Deadline(LISTING_DEADLINE_S)
     try:
         found = await GitRepository.discover(folder, deadline)
         if folder == workspace:
@@ -97,7 +97,8 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
             return RepositoryFolder(folder, found)
         own = await GitRepository.discover(workspace, deadline)
     except GitError as error:
-        raise _refuse(repository, "couldn't be read with Git") from error
+        # Fails closed as well: the comparison reports Git's problem, as for the workspace.
+        return RepositoryFolder(folder, UnreadableRepository(error))
     # Metadata outside the workspace only as the workspace's own repository, whole: a `.git`
     # file aimed at the repository around the workspace, or at outside metadata whose
     # `commondir` leads back in, isn't.
