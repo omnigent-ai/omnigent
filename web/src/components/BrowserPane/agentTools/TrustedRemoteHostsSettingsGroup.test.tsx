@@ -76,6 +76,8 @@ describe("TrustedRemoteHostsSettingsGroup", () => {
     await waitFor(() =>
       expect(screen.getByText("https://server.example.com/")).toBeInTheDocument(),
     );
+    expect(screen.getByText("def456")).toBeInTheDocument();
+    expect(screen.getByLabelText("Host ID")).toHaveValue("");
   });
 
   it.each(["list", "add", "remove"] as const)(
@@ -107,6 +109,17 @@ describe("TrustedRemoteHostsSettingsGroup", () => {
         expect(screen.getByRole("button", { name: "Trust host" })).toBeEnabled();
       if (operation === "remove")
         expect(screen.getByRole("button", { name: /Remove trusted host/ })).toBeEnabled();
+      if (operation !== "list") {
+        method.mockResolvedValueOnce({ ok: false, error: "Request refused" });
+        fireEvent.click(
+          screen.getByRole("button", {
+            name: operation === "add" ? "Trust host" : /Remove trusted host/,
+          }),
+        );
+        await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Request refused"));
+        expect(screen.getByText("abc123")).toBeInTheDocument();
+        if (operation === "add") expect(screen.getByLabelText("Host ID")).toHaveValue("def456");
+      }
     },
   );
 
@@ -118,6 +131,28 @@ describe("TrustedRemoteHostsSettingsGroup", () => {
     expect(screen.queryByText(/No remote hosts trusted yet/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Trust host" })).not.toBeInTheDocument();
   });
+
+  it.each(["add", "remove"] as const)(
+    "refreshes stale rows from a refused %s result",
+    async (operation) => {
+      const bridge = installBridge();
+      const method = { add: bridge.addTrustedRemoteHost, remove: bridge.removeTrustedRemoteHost }[
+        operation
+      ];
+      method.mockResolvedValueOnce({ ok: false, hosts: [], error: "Host list changed" });
+      renderInRouter(<TrustedRemoteHostsSettingsGroup />);
+      await screen.findByText("abc123");
+      if (operation === "add") {
+        fireEvent.change(screen.getByLabelText("Host ID"), { target: { value: "def456" } });
+        fireEvent.click(screen.getByRole("button", { name: "Trust host" }));
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: /Remove trusted host/ }));
+      }
+      expect(await screen.findByRole("alert")).toHaveTextContent("Host list changed");
+      expect(screen.queryByText("abc123")).not.toBeInTheDocument();
+      expect(screen.getByText(/No remote hosts trusted yet/)).toBeInTheDocument();
+    },
+  );
 
   it("renders nothing outside the desktop app", () => {
     const { container } = renderInRouter(<TrustedRemoteHostsSettingsGroup />);

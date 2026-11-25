@@ -452,7 +452,7 @@ const trustedRemoteHostRequests = createTrustedRemoteHostRequests({
       serverUrl,
     ),
   add: (serverUrl, hostId) => {
-    const settings = loadSettings();
+    const settings = loadSettings({ strict: true });
     const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
     if (result.added) {
       settings.trusted_remote_hosts = result.entries;
@@ -2201,10 +2201,15 @@ function settingsPath() {
   return path.join(app.getPath("userData"), "settings.json");
 }
 
-function loadSettings() {
+function loadSettings({ strict = false } = {}) {
   try {
-    return JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
-  } catch {
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      throw new Error("Desktop settings must be a JSON object.");
+    }
+    return settings;
+  } catch (error) {
+    if (strict && error.code !== "ENOENT") throw error;
     // Missing/corrupt file → empty settings (first launch).
     return {};
   }
@@ -6171,13 +6176,20 @@ function registerIpc() {
     }
     const serverUrl = normalizedServerTarget(senderServerUrl(event));
     if (!serverUrl) return { ok: false, error: "This window is not connected to a server." };
-    return {
-      ok: true,
-      serverUrl,
-      hosts: serializeTrustedRemoteHosts(loadSettings().trusted_remote_hosts).filter(
-        (entry) => entry.server_url === serverUrl,
-      ),
-    };
+    try {
+      return {
+        ok: true,
+        serverUrl,
+        hosts: serializeTrustedRemoteHosts(
+          loadSettings({ strict: true }).trusted_remote_hosts,
+        ).filter((entry) => entry.server_url === serverUrl),
+      };
+    } catch {
+      return {
+        ok: false,
+        error: "Could not read desktop settings. Repair settings.json and retry.",
+      };
+    }
   };
   const requestTrustedRemoteHost = (event, serverUrl, hostId) => {
     const win = BrowserWindow.fromWebContents(event.sender);
@@ -6188,6 +6200,7 @@ function registerIpc() {
       normalizedServerTarget(senderServerUrl(event)) === serverUrl;
     return trustedRemoteHostRequests.request(serverUrl, hostId, async () => {
       if (!current()) return null;
+      loadSettings({ strict: true });
       const answer = await approveTrustedRemoteHost(win, serverUrl, hostId);
       return current() ? answer : null;
     });
@@ -6215,7 +6228,7 @@ function registerIpc() {
     if (normalizedServerTarget(serverUrl) !== listed.serverUrl) {
       return { ...listed, ok: false, error: "Manage trusted hosts from their server's window." };
     }
-    const settings = loadSettings();
+    const settings = loadSettings({ strict: true });
     const result = removeTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
     if (!result.removed) {
       return { ...listed, ok: false, error: "That trusted host was not listed." };
@@ -6500,6 +6513,7 @@ function registerIpc() {
       sourceHostId,
       rememberedArcaHostId,
       sourceIsArcaHost,
+      onRecoveryRequested,
     ) => {
       const context = arcaPreviewRecoveryContextForEvent(
         event,
@@ -6509,6 +6523,7 @@ function registerIpc() {
         sourceIsArcaHost,
       );
       if (!context) return false;
+      onRecoveryRequested?.();
       const { target } = context;
       if (pendingPreviewReconnects.has(target)) return false;
       const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;

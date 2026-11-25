@@ -890,6 +890,29 @@ describe("browser IPC localhost previews from hosts reached over SSH", () => {
 });
 
 describe("browser IPC localhost previews from trusted remote hosts", () => {
+  for (const fails of [false, true]) {
+    it(`does not offer trust after host recovery was requested (throws: ${fails})`, async () => {
+      const { state, navigate } = previewSetup({
+        protocols: { trustedRemotePreviewProtocol: 1 },
+        recover: async (
+          _event,
+          _url,
+          _host,
+          _remembered,
+          _sourceIsRecoveryHost,
+          onRecoveryRequested,
+        ) => {
+          state.calls.push("recover");
+          onRecoveryRequested();
+          if (fails) throw new Error("recovery failed");
+          return false;
+        },
+        requestTrusted: () => assert.fail("must not replace recovery with persistent trust"),
+      });
+      assert.equal((await navigate({ agent: true, sourceHostId: "host-1" })).ok, false);
+      assert.deepEqual(state.calls, ["denied", "recover"]);
+    });
+  }
   it("asks to trust the host when no SSH protocol was offered, then retries", async () => {
     const { state, navigate } = previewSetup({
       protocols: { trustedRemotePreviewProtocol: 1 },
@@ -930,6 +953,18 @@ describe("browser IPC localhost previews from trusted remote hosts", () => {
     assert.equal(result.ok, false);
     assert.equal(result.retryWithFreshHost, undefined);
     assert.deepEqual(state.calls, ["denied"]);
+  });
+
+  it("fails closed when the SSH permission request unexpectedly throws", async () => {
+    const { state, navigate } = previewSetup({
+      protocols: { sshPreviewProtocol: 1, trustedRemotePreviewProtocol: 1 },
+      request: () => {
+        throw new Error("permission check failed");
+      },
+      requestTrusted: () => assert.fail("must not bypass an unexpected permission error"),
+    });
+    assert.equal((await navigate({ sourceHostId: "host-1" })).ok, false);
+    assert.deepEqual(state.calls, ["denied", "request"]);
   });
 });
 

@@ -65,8 +65,8 @@ export function TrustedRemoteHostsSettingsGroup() {
       setError(null);
       try {
         const result = await bridge.remove(host.server_url, host.host_id);
-        if (result.ok) setHosts(result.hosts ?? []);
-        else setError(result.error ?? "Could not remove that trusted host.");
+        if (result.hosts || result.ok) setHosts(result.hosts ?? []);
+        if (!result.ok) setError(result.error ?? "Could not remove that trusted host.");
       } catch {
         setError("Could not remove that trusted host.");
       } finally {
@@ -82,8 +82,8 @@ export function TrustedRemoteHostsSettingsGroup() {
     setError(null);
     try {
       const result = await bridge.add(serverUrl.trim(), hostId.trim());
+      if (result.hosts || result.ok) setHosts(result.hosts ?? []);
       if (result.ok) {
-        setHosts(result.hosts ?? []);
         setHostId("");
       } else {
         setError(result.error ?? "Could not trust that host.");

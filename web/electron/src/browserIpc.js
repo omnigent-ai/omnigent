@@ -542,6 +542,7 @@ function registerBrowserIpc({
     let r = await navigate(g.registry);
     if (!isCurrent()) return cancelled;
     let recovered = false;
+    let recoveryRequested = false;
     if (!r.ok && opts?.agent) {
       try {
         recovered = await recoverAgentNavigationForEvent(
@@ -550,6 +551,9 @@ function registerBrowserIpc({
           opts?.sourceHostId,
           opts?.rememberedArcaHostId,
           opts?.sourceIsArcaHost,
+          () => {
+            recoveryRequested = true;
+          },
         );
       } catch {
         recovered = false;
@@ -564,6 +568,7 @@ function registerBrowserIpc({
       r.localhostBlocked === true &&
       opts?.sessionHostProtocol === SESSION_HOST_PROTOCOL &&
       !recovered &&
+      !recoveryRequested &&
       isCurrent()
     ) {
       try {

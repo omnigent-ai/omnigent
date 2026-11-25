@@ -5991,6 +5991,16 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         ),
         /can't be verified as Arca/,
       );
+      h.electron.dialog.showMessageBox = async () => ({ response: 1 });
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId,
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        true,
+        "a managed sandbox can still use explicit trust",
+      );
     });
   }
 
@@ -6041,7 +6051,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(resolvedUrl, `${resolvedOrigin}/omnigent`);
     assert.notEqual(resolvedUrl, serverUrl);
     const deps = h.browserIpcDeps();
-    const recover = deps.recoverAgentNavigationForEvent;
+    let recoveryRequested = false;
+    const recover = (...args) =>
+      deps.recoverAgentNavigationForEvent(...args, undefined, () => {
+        recoveryRequested = true;
+      });
     const hint = deps.getAgentNavigationHintForEvent;
     const event = { sender: h.webContents, senderFrame: { url: resolvedUrl } };
     let previewPrompts = 0;
@@ -6061,6 +6075,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       false,
     );
     assert.equal(previewPrompts, 0, "pending reconnect consent must not start another prompt");
+    assert.equal(recoveryRequested, true);
     assert.equal(h.calls.arcaConsentRuns.length, 1);
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
@@ -6073,7 +6088,13 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       () => /declined/.test(hint(event, "http://localhost:5173", hostId, hostId)),
       "decline cooldown hint",
     );
+    recoveryRequested = false;
     assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(
+      recoveryRequested,
+      true,
+      "a declined recovery still suppresses another trust prompt",
+    );
     assert.equal(h.calls.arcaConsentRuns.length, 1);
   });
 
@@ -8135,7 +8156,48 @@ describe("settings-based remote previews", () => {
     assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts, [other]);
   });
 
-  for (const changed of ["server", "page", "closed", "declined"]) {
+  for (const [name, contents] of [
+    ["malformed", "{"],
+    ["non-object", "null"],
+    ["array", "[]"],
+    ["unreadable", null],
+  ]) {
+    it(`refuses to manage trust when desktop settings are ${name}`, async (t) => {
+      const server = "https://server.example.com";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createBrowserRegistryForWindow(h.win);
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      if (contents === null) fs.mkdirSync(h.settingsPath);
+      else fs.writeFileSync(h.settingsPath, contents);
+      h.electron.dialog.showMessageBox = () =>
+        assert.fail("unreadable settings must not offer a grant");
+      const list = await h.ipc.get("omnigent:get-trusted-remote-hosts")(event);
+      assert.equal(list.ok, false);
+      assert.match(list.error, /Could not read desktop settings/);
+      assert.equal(
+        (await h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        (await h.ipc.get("omnigent:remove-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        await h.browserIpcDeps().requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId: "example-host",
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      if (contents === null) assert.equal(fs.statSync(h.settingsPath).isDirectory(), true);
+      else assert.equal(fs.readFileSync(h.settingsPath, "utf8"), contents);
+    });
+  }
+
+  for (const changed of ["server", "page", "closed", "declined", "settings"]) {
     it(`does not save a Settings grant when consent is ${changed}`, async (t) => {
       const server = "https://server.example.com/app";
       const h = loadNavigationHarness({ serverUrl: server });
@@ -8154,9 +8216,11 @@ describe("settings-based remote previews", () => {
       if (changed === "server") h.api.windows.get(h.win).serverUrl = `${server}/other`;
       if (changed === "page") h.setUrl("https://other.example.com");
       if (changed === "closed") h.win.isDestroyed = () => true;
+      if (changed === "settings") fs.writeFileSync(h.settingsPath, "{");
       consent.resolve({ response: changed === "declined" ? 0 : 1 });
       assert.equal((await pending).ok, false);
-      assert.equal(fs.existsSync(h.settingsPath), false);
+      if (changed === "settings") assert.equal(fs.readFileSync(h.settingsPath, "utf8"), "{");
+      else assert.equal(fs.existsSync(h.settingsPath), false);
     });
   }
 
