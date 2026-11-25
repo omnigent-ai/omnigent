@@ -83,8 +83,9 @@ def test_the_docked_tree_resizes_and_keeps_its_width(
     stepped = str(dragged - 16)
     expect(handle).to_have_attribute("aria-valuenow", stepped)
 
-    # A reload keeps the full screen and the width.
+    # A reload keeps the width.
     page.reload()
+    sidebar.get_by_role("button", name="Full screen", exact=True).click()
     handle = page.get_by_role("separator", name=_HANDLE)
     expect(handle).to_have_attribute("aria-valuenow", stepped, timeout=60_000)
 
