@@ -16214,6 +16214,46 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       expect(reads.reopens).toBe(1);
     });
 
+    it("retries a failed reconnect backfill within seconds of a same-server rotation", async () => {
+      const id = "conv_rotate_backfill_fails";
+      seedSession(id, []);
+      const sinks = routeRotatingStreamOpens(["epoch-1", "epoch-1"]);
+      const routed = fetchMock.getMockImplementation()!;
+      let failNextItemsRead = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (failNextItemsRead && url.includes(`/v1/sessions/${id}/items`)) {
+          failNextItemsRead = false;
+          return mockResponse({ detail: "unavailable" }, { ok: false, status: 503 });
+        }
+        return routed(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: id, abortController: controller });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(1);
+      await advanceWithHeartbeats(sinks[0]!, SSE_MAX_STREAM_AGE_MS - 15_000);
+      // The reconnect backfill's items read fails once.
+      failNextItemsRead = true;
+      await vi.advanceTimersByTimeAsync(15_001);
+      expect(sinks).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(failNextItemsRead).toBe(false);
+      const afterFailure = fetchMock.mock.calls.length;
+      await advanceWithHeartbeats(sinks[1]!, 15_000);
+      await vi.advanceTimersByTimeAsync(6_000);
+      const retries = fetchMock.mock.calls
+        .slice(afterFailure)
+        .filter(([input]) => String(input).includes(`/v1/sessions/${id}/items`)).length;
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+      controller.abort();
+      await loop;
+      // The 3/8/20 s status re-reads retry it; the 60 s periodic reconcile is too late.
+      expect(retries).toBeGreaterThanOrEqual(1);
+    });
+
     it.each([
       ["the stream dropped", { epochs: ["epoch-1", "epoch-1"], reopen: "drop" }],
       ["the server epoch changed", { epochs: ["epoch-1", "epoch-2"], reopen: "rotate" }],
