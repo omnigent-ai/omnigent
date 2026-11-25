@@ -20,6 +20,7 @@ import { pathToCopy } from "../fileCommands/target";
 import { FileViewerContext } from "../FileViewerContext";
 import { FilesTree, type FilesTreeProps, type FilesTreeReveal } from "./FilesTree";
 import type { TreePatterns } from "./filesTreeListings";
+import { BULK_SYNC_OPERATIONS } from "./useLazyFolderTree";
 
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
@@ -356,30 +357,36 @@ describe("FilesTree", () => {
       }));
 
     // Each test takes its own session, as the tree remembers open folders per session.
-    function renderSorted(
+    const renderSorted = (
       session: string,
       sort: ChangedSort,
       rootEntries: readonly WorkspaceFile[],
-    ) {
-      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      render(
-        <QueryClientProvider client={client}>
-          <FilesTree
-            conversationId={session}
-            browseLocation=""
-            rootEntries={rootEntries}
-            changedFiles={[]}
-            sort={sort}
-            showHidden={false}
-            showIgnored
-            refreshToken={0}
-            onFileSelect={vi.fn()}
-            reveal={null}
-            label="Workspace files"
-          />
-        </QueryClientProvider>,
+    ) => renderTree(rootEntries, vi.fn(), { conversationId: session, sort });
+
+    it("finishes a reveal through a folder chain when the deep folder's listing rebuilds the tree", async () => {
+      const deep = Array.from({ length: COUNT }, (_, index) =>
+        file(`src/deep/f${String(index).padStart(3, "0")}.ts`),
       );
-    }
+      serveListings({ "src/deep": deep });
+      const target = deep.at(-1)!.path;
+      const onActiveRevealHandled = vi.fn();
+      const onActiveRevealMissed = vi.fn();
+      const reset = vi.spyOn(FileTreeModel.prototype, "resetPaths");
+      // The root lists `src` as a chain down to `src/deep`, so the tree shows one row for both.
+      renderTree([{ ...folder("src"), leaf_directory_path: "src/deep" }], vi.fn(), {
+        activeFile: target,
+        activeReveal: { key: 1, file: target },
+        onActiveRevealHandled,
+        onActiveRevealMissed,
+      });
+      // The listing crosses the bulk threshold and rebuilds; the hidden `src/` must stay open.
+      const row = await screen.findByRole("treeitem", { name: /f599\.ts/ }, { timeout: 5000 });
+      expect(reset).toHaveBeenCalled();
+      await waitFor(() => expect(row).toHaveAttribute("aria-selected", "true"));
+      expect(onActiveRevealHandled).toHaveBeenCalledWith(1);
+      expect(onActiveRevealMissed).not.toHaveBeenCalled();
+      reset.mockRestore();
+    });
 
     /** The first rendered rows inside `parent`, in the order the tree shows them. */
     const firstRows = (parent: string, count: number) =>
@@ -413,7 +420,7 @@ describe("FilesTree", () => {
         });
         expect(
           Math.max(0, ...batch.mock.calls.map(([operations]) => operations.length)),
-        ).toBeLessThan(500);
+        ).toBeLessThan(BULK_SYNC_OPERATIONS);
         expect(reset).toHaveBeenCalledTimes(1);
       },
     );

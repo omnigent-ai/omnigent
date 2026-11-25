@@ -4,6 +4,10 @@
 
 import type { FileTreeModel } from "@/components/file-tree/vendored";
 
+/** Whether keyboard focus is on the tree in `host` or one of its rows. */
+export const hasFocusWithin = (host: HTMLElement | null): boolean =>
+  host !== null && host.contains(document.activeElement);
+
 /** The first row actually on screen in `host`, skipping overscan. */
 export function topVisibleRow(host: HTMLElement): string | null {
   const box = host.getBoundingClientRect();
@@ -15,19 +19,20 @@ export function topVisibleRow(host: HTMLElement): string | null {
 }
 
 /**
- * Makes `model` hold exactly `paths`, opening `expandedPaths`, then restores the
- * selection, focus (when the tree in `host` had it) and the top visible row.
+ * Makes `model` hold exactly `paths`, keeping every folder it has open, even one a
+ * folder chain shows under its deepest folder's row, then restores the selection,
+ * focus (when the tree in `host` had it) and the top visible row.
  */
 export function rebuildTreeInPlace(
   model: FileTreeModel,
   paths: Iterable<string>,
-  { host, expandedPaths }: { host: HTMLElement | null; expandedPaths: Iterable<string> },
+  { host }: { host: HTMLElement | null },
 ): void {
   const anchor = host ? topVisibleRow(host) : null;
   const selected = model.getSelectedPaths();
   const focused = model.getFocusedPath();
-  const hadFocus = host !== null && host.contains(document.activeElement);
-  model.resetPaths([...paths], { initialExpandedPaths: [...expandedPaths] });
+  const hadFocus = hasFocusWithin(host);
+  model.resetPaths([...paths]);
   for (const path of selected) model.getItem(path)?.select();
   if (focused && hadFocus) model.focusPath(focused);
   if (anchor) model.scrollToPath(anchor, { offset: "top", focus: false });

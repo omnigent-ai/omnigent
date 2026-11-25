@@ -47,7 +47,7 @@ import {
 } from "./filesTreeListings";
 import { treeChangeStatuses, treeIgnoredStatuses } from "./treeChangeStatus";
 import { SingleSelection } from "./treeSelection";
-import { rebuildTreeInPlace, topVisibleRow } from "./rebuildTree";
+import { hasFocusWithin, rebuildTreeInPlace, topVisibleRow } from "./rebuildTree";
 import { treeComparator, treeOrderSignature } from "./treeSort";
 import { scrollRowIntoView } from "./revealScroll";
 import { rowPathOf } from "./treeRowPath";
@@ -117,9 +117,6 @@ const parentFolder = (path: string) => {
   return slash < 0 ? "" : trimmed.slice(0, slash);
 };
 const trimFolder = (path: string) => (path.endsWith("/") ? path.slice(0, -1) : path);
-/** Whether keyboard focus is on the tree or one of its rows. */
-const hasFocusWithin = (host: HTMLElement | null): boolean =>
-  host !== null && host.contains(document.activeElement);
 
 const FILES_TREE_THEME = {
   ...FILE_TREE_THEME,
@@ -261,7 +258,6 @@ function FilesTreeRows(props: FilesTreeProps) {
       rebuild: (paths) => {
         rebuildTreeInPlace(model, paths, {
           host: treeRoot(containerRef.current),
-          expandedPaths: expandedCache.get(cacheKey) ?? [],
         });
         appliedOrder.current = orderSignature;
       },
@@ -313,9 +309,8 @@ function FilesTreeRows(props: FilesTreeProps) {
     // The sync may have changed the tree in this same commit; rebuild from what it holds now.
     rebuildTreeInPlace(model, currentPresent(), {
       host: treeRoot(containerRef.current),
-      expandedPaths: expandedCache.get(cacheKey) ?? [],
     });
-  }, [model, orderSignature, currentPresent, cacheKey]);
+  }, [model, orderSignature, currentPresent]);
 
   // The focused row is ⌘K's file, from first entry and re-entry as well as arrow moves.
   const [activePath, setActivePath] = useState<string | null>(null);
