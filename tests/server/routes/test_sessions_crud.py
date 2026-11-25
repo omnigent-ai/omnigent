@@ -9,9 +9,11 @@ the stores.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import signal
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,8 @@ from sqlalchemy import update
 
 from omnigent.db.db_models import SqlConversation
 from omnigent.db.utils import generate_agent_id, get_or_create_engine, make_managed_session_maker
-from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS, Conversation
+from omnigent.entities.pagination import PagedList
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
 from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
@@ -254,6 +257,15 @@ async def test_list_sessions_pagination(
 _SIDEBAR_LIST_PARAMS = {"order": "desc", "sort_by": "updated_at", "visibility": "mine"}
 
 
+@pytest.fixture()
+def distinct_store_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each store write a later timestamp so list order never rests on tie-breaks."""
+    ticks = itertools.count(int(time.time()))
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: next(ticks)
+    )
+
+
 def _seed_sessions_behind_side_chats(
     db_uri: str, *, visible_count: int, side_chat_count: int, labels: dict[str, str] | None = None
 ) -> set[str]:
@@ -281,6 +293,7 @@ def _seed_sessions_behind_side_chats(
         pytest.param("X", 20, 2, 20, id="project-folder"),
     ],
 )
+@pytest.mark.usefixtures("distinct_store_clock")
 async def test_list_sessions_side_chats_do_not_take_page_slots(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -296,10 +309,6 @@ async def test_list_sessions_side_chats_do_not_take_page_slots(
         side_chat_count=side_chat_count,
         labels={"omni_project": project} if project else None,
     )
-    params: dict[str, str | int] = {**_SIDEBAR_LIST_PARAMS, "limit": limit}
-    if project:
-        params["project"] = project
-
     if project:
         # A newer session outside the folder must stay out of the folder's page.
         _seed_sessions_behind_side_chats(db_uri, visible_count=1, side_chat_count=0)
@@ -332,6 +341,7 @@ def _spy_store_reads(
     return reads
 
 
+@pytest.mark.usefixtures("distinct_store_clock")
 async def test_list_sessions_side_chat_reread_is_bounded(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -361,6 +371,45 @@ async def test_list_sessions_side_chat_reread_is_bounded(
     assert reads[2:] == [(2, cursor), (4, cursor)]
 
 
+def test_side_chat_reread_keeps_earlier_read_when_wider_read_overfills() -> None:
+    """A wider read that writes overfilled leaves the earlier read's rows and cursor together."""
+    from omnigent.server.routes.sessions import routes_core
+
+    def conversation(conversation_id: str, *, side_chat: bool = False) -> Conversation:
+        labels = {SIDE_CHAT_LABEL_KEY: "1"} if side_chat else {}
+        return Conversation(
+            id=conversation_id,
+            created_at=1,
+            updated_at=1,
+            root_conversation_id=conversation_id,
+            labels=labels,
+        )
+
+    first = PagedList(
+        data=[conversation("kept"), conversation("hidden", side_chat=True)],
+        first_id="kept",
+        last_id="hidden",
+        has_more=True,
+    )
+    overfilled = PagedList(
+        data=[conversation("new-1"), conversation("new-2"), conversation("kept")],
+        first_id="new-1",
+        last_id="kept",
+        has_more=True,
+    )
+    limits: list[int] = []
+
+    def read_page(limit: int) -> PagedList[Conversation]:
+        limits.append(limit)
+        return first if len(limits) == 1 else overfilled
+
+    page = routes_core._list_page_without_side_chats(read_page, 2, allow_reread=True)
+    assert limits == [2, 3]
+    assert [conv.id for conv in page.data] == ["kept"]
+    assert (page.first_id, page.last_id, page.has_more) == ("kept", "hidden", True)
+
+
+@pytest.mark.usefixtures("distinct_store_clock")
 @pytest.mark.parametrize(
     ("order", "change"),
     [

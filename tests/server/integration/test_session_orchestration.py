@@ -3016,13 +3016,16 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
             params={"limit": 2, "agent_id": sibling.agent_id, "expand_families": True},
         )
     ).json()
-    assert filtered["last_id"] == hidden.id
+    # Unbundled, the target shares the agent, so it takes the dropped side chat's slot;
+    # otherwise the side chat stays the cursor. Either way family context is appended.
+    last_listed = sibling if bundled else store.get_conversation(target["id"])
+    assert filtered["last_id"] == (hidden.id if bundled else last_listed.id)
     assert filtered["page_boundary"] == {
-        "id": sibling_id,
-        "created_at": sibling.created_at,
-        "updated_at": sibling.updated_at,
+        "id": last_listed.id,
+        "created_at": last_listed.created_at,
+        "updated_at": last_listed.updated_at,
     }
-    assert {row["id"] for row in filtered["data"]} == {source["id"], sibling_id}
+    assert {row["id"] for row in filtered["data"]} == {source["id"], sibling_id, last_listed.id}
     pinned = await auth_client.patch(
         f"/v1/sessions/{sibling_id}", json={"labels": {"omnigent.pinned": "1"}}
     )
