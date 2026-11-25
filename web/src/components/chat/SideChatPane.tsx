@@ -1029,7 +1029,9 @@ function SideChatComposer({
   ];
   // The CodeMirror engine holds the quotes and the text in one document.
   const composerEngine = useRequestedComposerEngine();
-  const singleDocument = composerEngine === "codemirror";
+  // The engine ChatComposer renders, which lags the request while a switch waits on the user.
+  const [renderedEngine, setRenderedEngine] = useState(composerEngine);
+  const singleDocument = renderedEngine === "codemirror";
   const inputValue = singleDocument ? weaveReplyDraft({ quotes, text }) : text;
   // The editor's whole document: its quote lines are the quotes, the seed among them.
   const applyDocument = useCallback(
@@ -1613,6 +1615,7 @@ function SideChatComposer({
         draftKey={childId}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
+        onRenderedEngineChange={setRenderedEngine}
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}

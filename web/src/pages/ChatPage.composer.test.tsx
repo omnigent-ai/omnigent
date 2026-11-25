@@ -32,7 +32,11 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
-import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  codeMirrorComposerLoad,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
+import { REPLY_QUOTE_MARK } from "@/lib/replyDraftDocument";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { EditorView } from "@codemirror/view";
 import { insertComposerText } from "@/lib/composerText";
@@ -7578,6 +7582,75 @@ describe("Composer reply quotes on the CodeMirror engine", () => {
     expect(vi.mocked(props.onSend).mock.calls[0]![0]).toBe(
       "My introduction\n\n> First point\n\nMy answer",
     );
+  });
+
+  it("keeps the textarea free of the editor's document while a composition holds the switch", async () => {
+    let finishLoad!: (module: typeof CodeMirrorModule) => void;
+    const loaded = new Promise<typeof CodeMirrorModule>((resolve) => {
+      finishLoad = resolve;
+    });
+    resetCodeMirrorComposerLoadForTests(() => loaded);
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <TooltipProvider>
+          <Composer {...composerProps()} ref={ref} />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    act(() => ref.current?.appendReplyQuote("First point"));
+    fireEvent.compositionStart(textarea());
+    act(() => finishLoad(CodeMirrorModule));
+    await waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
+
+    // The switch waits for the composition: the textarea still shows its quote blocks.
+    expect(textarea().value).not.toContain(REPLY_QUOTE_MARK);
+    expect(screen.getByTestId("composer-reply-blocks")).toBeInTheDocument();
+
+    fireEvent.compositionEnd(textarea());
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
+    expect(editor.state.doc.toString()).toContain(REPLY_QUOTE_MARK);
+    expect(screen.queryByTestId("composer-reply-blocks")).toBeNull();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
+  });
+
+  it("keeps the editor's document while a composition holds a switch back to the textarea", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const composer = (info: typeof codeMirrorInfo | typeof FALLBACK_SERVER_INFO) => (
+      <CapabilitiesProvider info={info}>
+        <TooltipProvider>
+          <Composer {...composerProps()} ref={ref} />
+        </TooltipProvider>
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(composer(codeMirrorInfo));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    act(() => ref.current?.appendReplyQuote("First point"));
+    const editorNode = screen.getByLabelText("Message the agent");
+    fireEvent.compositionStart(editorNode);
+    // Turning the flag off requests the textarea; the composition holds the editor in place.
+    rerender(composer(FALLBACK_SERVER_INFO));
+
+    expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content");
+    const editor = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
+    expect(editor.state.doc.toString()).toContain(REPLY_QUOTE_MARK);
+    expect(screen.queryByTestId("composer-reply-blocks")).toBeNull();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
+
+    fireEvent.compositionEnd(editorNode);
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent").tagName).toBe("TEXTAREA"),
+    );
+    expect(textarea().value).not.toContain(REPLY_QUOTE_MARK);
+    expect(screen.getByTestId("composer-reply-blocks")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("First point");
   });
 
   it("keeps the textarea engine's quote blocks", () => {

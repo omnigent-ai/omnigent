@@ -2373,9 +2373,11 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
-  // The CodeMirror engine holds the whole draft, quotes included, in one editor.
+  // The CodeMirror engine holds the whole draft, quotes included, in one editor. It follows the
+  // engine ChatComposer renders, which lags the request while a switch waits on the user.
   const composerEngine = useRequestedComposerEngine();
-  const singleDocument = composerEngine === "codemirror";
+  const [renderedEngine, setRenderedEngine] = useState(composerEngine);
+  const singleDocument = renderedEngine === "codemirror";
   const {
     draft,
     value,
@@ -4530,6 +4532,7 @@ function ComposerImpl(
         draftKey={conversationId ?? null}
         activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
         onActiveInputChange={rebindActiveInput}
+        onRenderedEngineChange={setRenderedEngine}
         input={{
           ref: bindTailTextarea,
           value: singleDocument ? value : draft.text,

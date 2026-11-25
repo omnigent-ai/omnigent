@@ -113,6 +113,7 @@ type ChatComposerInputProps =
       draftKey?: undefined;
       activeInputId?: undefined;
       onActiveInputChange?: undefined;
+      onRenderedEngineChange?: undefined;
     }
   | {
       /** The engine to switch to; the composer hands off once that is safe. */
@@ -126,6 +127,8 @@ type ChatComposerInputProps =
       activeInputId?: string | null;
       /** The active input, on its new engine, after a switch. */
       onActiveInputChange?: (target: ComposerTextTarget) => void;
+      /** The engine actually rendered, which lags `engine` while a switch waits. */
+      onRenderedEngineChange?: (engine: ComposerInputEngine) => void;
     };
 
 type ChatComposerProps = ChatComposerBaseProps & ChatComposerInputProps;
@@ -174,6 +177,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     draftKey,
     activeInputId,
     onActiveInputChange,
+    onRenderedEngineChange,
     keyboard,
     slots,
     actions,
@@ -199,6 +203,9 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
     rootRef,
     { dictating, draftKey, activeInputId, onActiveInputChange },
   );
+  useLayoutEffect(() => {
+    onRenderedEngineChange?.(renderedEngine);
+  }, [onRenderedEngineChange, renderedEngine]);
   const [focusWithin, setFocusWithin] = useState(false);
   const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");
   const expanded =
