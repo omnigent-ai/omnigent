@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 import yaml
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -2696,7 +2696,14 @@ def create_app(
         else None
     )
 
-    app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    from omnigent.server.agent_session_scope import agent_session_scope
+
+    # On every route naming a session, so an agent can't reach another project's sessions.
+    app = FastAPI(
+        title="Omnigent Server",
+        lifespan=_lifespan,
+        dependencies=[Depends(agent_session_scope(conversation_store))],
+    )
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)

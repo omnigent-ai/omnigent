@@ -95,6 +95,7 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.agent_session_scope import agent_source, hidden_from_agent
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -3269,6 +3270,18 @@ def register_core_routes(
         # single-session snapshot, the WS stream, and the /health poll, not
         # from list rows. Skipping it here removes the session-connectivity
         # and hosts-table queries from every GET /v1/sessions.
+        source = await asyncio.to_thread(agent_source, request, conversation_store)
+        if source is not None:
+            # An agent lists only its own project's sessions, ones it started, and unfiled ones.
+            listed = [conv for batch in reads.batches for conv in batch.conversations]
+            hidden = await asyncio.to_thread(
+                lambda: {
+                    conv.id
+                    for conv in listed
+                    if hidden_from_agent(conversation_store, conv, source)
+                }
+            )
+            items = [item for item in items if item.id not in hidden]
         result = PaginatedList(
             data=[item.model_dump(exclude_none=True) for item in items],
             first_id=page.first_id,
