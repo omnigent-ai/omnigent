@@ -73,6 +73,33 @@ def _layout(tmp_path: Path) -> Path:
     # A `.git` file inside the workspace that points at a repository outside it.
     (workspace / "forged").mkdir()
     (workspace / "forged" / ".git").write_text(f"gitdir: {other / '.git'}\n")
+    # A `.git` file aimed at worktree metadata outside, whose `commondir` leads back inside.
+    _worktree_metadata(tmp_path / "outside-metadata", workspace / ".git")
+    (workspace / "metadata-back").mkdir()
+    (workspace / "metadata-back" / ".git").write_text(f"gitdir: {tmp_path / 'outside-metadata'}\n")
+    return workspace
+
+
+def _worktree_metadata(path: Path, common_directory: Path) -> Path:
+    """A linked worktree's own Git directory, sharing ``common_directory``'s objects and refs."""
+    path.mkdir(parents=True)
+    (path / "HEAD").write_text("ref: refs/heads/main\n")
+    (path / "commondir").write_text(f"{common_directory}\n")
+    return path
+
+
+def _inside_larger_layout(tmp_path: Path) -> Path:
+    """A workspace that is a plain folder of a larger repository, with `.git` files aimed out."""
+    outer = _repository(tmp_path / "outer")
+    workspace = outer / "workspace"
+    workspace.mkdir()
+    # A `.git` file aimed at the `.git` of the repository around the workspace.
+    (workspace / "outer-git").mkdir()
+    (workspace / "outer-git" / ".git").write_text(f"gitdir: {outer / '.git'}\n")
+    # Worktree metadata kept inside the workspace whose `commondir` is the outer repository's.
+    _worktree_metadata(workspace / "metadata", outer / ".git")
+    (workspace / "inner-metadata").mkdir()
+    (workspace / "inner-metadata" / ".git").write_text(f"gitdir: {workspace / 'metadata'}\n")
     return workspace
 
 
@@ -80,6 +107,12 @@ def _layout(tmp_path: Path) -> Path:
 def refusals_layout(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One layout for the refusals, which only read it."""
     return _layout(tmp_path_factory.mktemp("refusals"))
+
+
+@pytest.fixture(scope="module")
+def inside_larger_layout(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The refusals for a workspace inside a larger repository, which only read it."""
+    return _inside_larger_layout(tmp_path_factory.mktemp("inside-larger"))
 
 
 async def _refusal(workspace: Path, repository: str) -> str:
@@ -114,13 +147,19 @@ async def _refusal(workspace: Path, repository: str) -> str:
         (".worktrees/feature/.git", "isn't a folder in the workspace"),
         ("forged", "belongs to a repository outside the workspace"),
         ("elsewhere", "has its working tree outside the workspace"),
+        ("metadata-back", "belongs to a repository outside the workspace"),
+        ("INSIDE_LARGER:outer-git", "belongs to a repository outside the workspace"),
+        ("INSIDE_LARGER:inner-metadata", "belongs to a repository outside the workspace"),
     ],
 )
 async def test_a_folder_outside_the_workspace_or_in_a_git_directory_is_refused(
-    refusals_layout: Path, repository: str, reason: str
+    refusals_layout: Path, inside_larger_layout: Path, repository: str, reason: str
 ) -> None:
     """The refusal names only what the caller sent, and says why."""
     workspace = refusals_layout
+    if repository.startswith("INSIDE_LARGER:"):
+        workspace = inside_larger_layout
+        repository = repository.removeprefix("INSIDE_LARGER:")
     if repository == "ABSOLUTE_OTHER":
         repository = str(workspace.parent / "other")
 
@@ -224,7 +263,17 @@ _CALLS: dict[str, Callable[[WorkspaceServiceClient, str], Awaitable[Any]]] = {
 @pytest.mark.parametrize("method", list(_CALLS))
 @pytest.mark.parametrize(
     "repository",
-    ["..", "ABSOLUTE_OTHER", "out", "a.txt", ".git", "into-git", "forged", "elsewhere"],
+    [
+        "..",
+        "ABSOLUTE_OTHER",
+        "out",
+        "a.txt",
+        ".git",
+        "into-git",
+        "forged",
+        "elsewhere",
+        "metadata-back",
+    ],
 )
 async def test_every_git_method_refuses_a_folder_outside_the_workspace(
     refusals_layout: Path, method: str, repository: str

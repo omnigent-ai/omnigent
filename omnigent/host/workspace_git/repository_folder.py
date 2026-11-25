@@ -1,10 +1,11 @@
 """The folder a Git request compares: the workspace, or a repository inside it.
 
 A request may name a directory relative to the workspace root, such as a worktree
-checked out inside it. It is confined the way file reads are. Its repository must be
-the workspace's own or be stored inside the workspace, and its working tree must lie
-inside the workspace unless it is the workspace's own, so a crafted link, ``.git`` file
-or ``core.worktree`` can't point a comparison at another place on the host.
+checked out inside it. It is confined the way file reads are. Its repository's Git
+directory, common directory and working tree must all lie inside the workspace, unless
+the repository is exactly the workspace's own (the same Git directory and working tree),
+so a crafted link, ``.git`` file, ``commondir`` or ``core.worktree`` can't point a
+comparison at another place on the host.
 """
 
 from __future__ import annotations
@@ -52,6 +53,15 @@ def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _places(repository: GitRepository) -> tuple[Path, Path, Path]:
+    """Its Git directory, common directory and working tree, resolved."""
+    return (
+        repository.git_directory.resolve(),
+        repository.common_directory.resolve(),
+        repository.top_level.resolve(),
+    )
+
+
 async def repository_folder(reader: WorkspaceReader, repository: str) -> RepositoryFolder:
     """The folder a Git request named by ``repository`` compares, once checked.
 
@@ -59,9 +69,9 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
     :param repository: A directory relative to the workspace root; empty for the root.
     :returns: The workspace root, or the resolved directory inside it with its repository.
     :raises ConnectError: INVALID_ARGUMENT when it escapes the workspace, even through a
-        symlink, isn't a folder, lies in a Git directory, belongs to a repository stored
-        outside the workspace that isn't the workspace's own, or has its working tree
-        outside the workspace without being the workspace's own repository.
+        symlink, isn't a folder, lies in a Git directory, or belongs to a repository whose
+        Git directory, common directory or working tree lies outside the workspace without
+        it being exactly the workspace's own repository.
     """
     workspace = reader.root
     if not repository:
@@ -82,23 +92,18 @@ async def repository_folder(reader: WorkspaceReader, repository: str) -> Reposit
         if found is None:
             # Fails closed: the comparison answers NOT_A_REPOSITORY without looking again.
             return RepositoryFolder(folder, OUTSIDE_ANY_REPOSITORY)
-        common = found.common_directory.resolve()
-        top_level = found.top_level.resolve()
-        stored_inside = _is_within(common, workspace)
-        tree_inside = _is_within(top_level, workspace)
-        own = (
-            None
-            if stored_inside and tree_inside
-            else await GitRepository.discover(workspace, deadline)
-        )
+        places = _places(found)
+        if all(_is_within(place, workspace) for place in places):
+            return RepositoryFolder(folder, found)
+        own = await GitRepository.discover(workspace, deadline)
     except GitError as error:
         raise _refuse(repository, "couldn't be read with Git") from error
-    same_store = own is not None and own.common_directory.resolve() == common
-    own_whole = same_store and own is not None and own.top_level.resolve() == top_level
-    # A working tree outside the workspace only as the workspace's own repository, whole:
-    # a nested `.git` aimed by core.worktree at the repository around the workspace isn't.
-    if not tree_inside and not own_whole:
+    # Metadata outside the workspace only as the workspace's own repository, whole: a `.git`
+    # file aimed at the repository around the workspace, or at outside metadata whose
+    # `commondir` leads back in, isn't.
+    if own is not None and _places(own) == places:
+        return RepositoryFolder(folder, found)
+    git_directory, common_directory, _top_level = places
+    if _is_within(git_directory, workspace) and _is_within(common_directory, workspace):
         raise _refuse(repository, "has its working tree outside the workspace")
-    if not stored_inside and not same_store:
-        raise _refuse(repository, "belongs to a repository outside the workspace")
-    return RepositoryFolder(folder, found)
+    raise _refuse(repository, "belongs to a repository outside the workspace")
