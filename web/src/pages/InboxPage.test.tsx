@@ -84,6 +84,12 @@ vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
 vi.mock("@/hooks/useConversations", async (importActual) => ({
   ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
+  useProjects: () => ({
+    data: [
+      { id: "proj_alpha", name: "Alpha" },
+      { id: "proj_beta", name: "Beta", icon: "🚀" },
+    ],
+  }),
 }));
 vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
 vi.mock("@/hooks/useProactiveInbox", () => ({ useProactiveInbox: vi.fn() }));
@@ -2092,5 +2098,64 @@ describe("agent suggestions", () => {
 
     selectTab("Awaiting response");
     expect(screen.queryByTestId("inbox-suggestion")).toBeNull();
+  });
+});
+
+describe("InboxPage project filter", () => {
+  function openProjectFilter() {
+    fireEvent.pointerDown(screen.getByTestId("inbox-project-filter"), {
+      button: 0,
+      ctrlKey: false,
+    });
+  }
+
+  it("narrows the list to one project, in the URL and on this device", async () => {
+    // WHY: people in several projects focus on one board's asks at a time.
+    const alpha = unreadConversation({
+      id: "sess_a",
+      title: "Alpha work",
+      project_id: "proj_alpha",
+    });
+    const beta = unreadConversation({ id: "sess_b", title: "Beta work", project_id: "proj_beta" });
+    const loose = unreadConversation({ id: "sess_c", title: "Loose work" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([alpha, beta, loose]),
+    );
+    renderPage();
+    expect(await screen.findAllByTestId("inbox-unread")).toHaveLength(3);
+    expect(screen.getByTestId("inbox-project-filter")).toHaveTextContent("All projects");
+
+    openProjectFilter();
+    // Only projects with items are listed, with their counts.
+    const options = await screen.findAllByRole("menuitemradio");
+    expect(options.map((option) => option.textContent)).toEqual([
+      "All projects3",
+      "Alpha1",
+      "🚀Beta1",
+    ]);
+    fireEvent.click(options[1]!);
+
+    await waitFor(() => expect(screen.getAllByTestId("inbox-unread")).toHaveLength(1));
+    expect(screen.getByText("Alpha work")).toBeInTheDocument();
+    expect(lastLocation.search).toBe("?project=proj_alpha");
+    expect(localStorage.getItem("omnigent:inbox-project")).toBe("proj_alpha");
+  });
+
+  it("restores the last pick and offers a way back from an empty project", async () => {
+    localStorage.setItem("omnigent:inbox-project", "proj_beta");
+    const alpha = unreadConversation({
+      id: "sess_a",
+      title: "Alpha work",
+      project_id: "proj_alpha",
+    });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([alpha]));
+    renderPage();
+
+    expect(await screen.findByText("Nothing here from Beta")).toBeInTheDocument();
+    expect(lastLocation.search).toBe("?project=proj_beta");
+    fireEvent.click(screen.getByRole("button", { name: "Show all projects" }));
+    expect(await screen.findByText("Alpha work")).toBeInTheDocument();
+    expect(lastLocation.search).toBe("");
+    expect(localStorage.getItem("omnigent:inbox-project")).toBeNull();
   });
 });

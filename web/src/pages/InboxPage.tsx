@@ -58,6 +58,7 @@ import {
   CheckIcon,
   CircleAlertIcon,
   CircleCheckIcon,
+  FolderIcon,
   HandIcon,
   InboxIcon,
   LightbulbIcon,
@@ -72,6 +73,9 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useProactiveInbox } from "@/hooks/useProactiveInbox";
@@ -118,6 +122,13 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
+import {
+  INBOX_PROJECT_PARAM,
+  inboxProjectOptions,
+  readInboxProject,
+  writeInboxProject,
+  type InboxProjectOption,
+} from "@/lib/inboxProjectFilter";
 import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import {
   isComposerAltNewlineKey,
@@ -149,7 +160,7 @@ import {
   type SuggestionUpdate,
 } from "@/lib/proactiveInbox";
 import { relativeTime } from "@/lib/relativeTime";
-import { Link, useNavigate } from "@/lib/routing";
+import { Link, useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import {
   ApiError,
@@ -162,7 +173,7 @@ import {
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { FileViewerContext } from "@/shell/FileViewerContext";
-import type { Conversation } from "@/hooks/useConversations";
+import { useProjects, type Conversation } from "@/hooks/useConversations";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
@@ -266,6 +277,29 @@ export function InboxPage() {
   const serverInfo = useServerInfo();
   const taskDetailsEnabled = isFeatureEnabled(serverInfo, "automations_v2");
   const [storedFilter, setFilter] = useState<InboxFilter>(readInboxFilter);
+  // The project pick lives in the URL; a bare /inbox restores this device's last pick.
+  const [searchParams] = useSearchParams();
+  const replaceSearchParams = useReplaceSearchParams();
+  const projectFilter = searchParams.get(INBOX_PROJECT_PARAM) || null;
+  const restoredProject = useRef(false);
+  useEffect(() => {
+    if (restoredProject.current) return;
+    restoredProject.current = true;
+    const stored = readInboxProject();
+    if (projectFilter || !stored) return;
+    const next = new URLSearchParams(searchParams);
+    next.set(INBOX_PROJECT_PARAM, stored);
+    replaceSearchParams(next);
+  }, [projectFilter, searchParams, replaceSearchParams]);
+  const chooseProject = (projectId: string | null) => {
+    trackClick(projectId ? "inbox.project_filter.select" : "inbox.project_filter.clear", "button");
+    writeInboxProject(projectId);
+    const next = new URLSearchParams(searchParams);
+    if (projectId) next.set(INBOX_PROJECT_PARAM, projectId);
+    else next.delete(INBOX_PROJECT_PARAM);
+    replaceSearchParams(next);
+  };
+  const projectsQuery = useProjects();
   const {
     available: advisorAvailable,
     settings: advisorSettings,
@@ -428,13 +462,6 @@ export function InboxPage() {
         ? listedSuggestions.filter(isAdvisorItem)
         : listedSuggestions
       : [];
-  const visibleCount =
-    visibleTicketRequests.length +
-    visibleApprovals.length +
-    visibleComments.length +
-    visibleUnread.length +
-    visibleAutomations.length +
-    visibleSuggestions.length;
   const totalCount =
     ticketRequests.items.length +
     items.length +
@@ -475,49 +502,83 @@ export function InboxPage() {
     ...visibleApprovals.map((item) => item.row.id),
     ...visibleUnread.map((item) => item.row.id),
   ]);
+  const rowsById = new Map(allRows.map((row) => [row.id, row]));
+  const tabEntries: InboxEntry[] = [
+    ...visibleTicketRequests.map((item) => ({
+      kind: "ticket" as const,
+      key: `ticket:${item.reason === "cc" ? "cc:" : ""}${item.project_id}:${item.ticket_id}`,
+      at: item.raised_at,
+      item,
+    })),
+    ...visibleSuggestions.map((item) => ({
+      kind: "suggestion" as const,
+      key: `suggestion:${item.id}`,
+      at: item.createdAt,
+      item,
+    })),
+    ...visibleAutomations.map((item) => ({
+      kind: "automation" as const,
+      key: `automation:${item.runId}`,
+      at: item.finishedAt ?? item.scheduledAt,
+      item,
+    })),
+    ...visibleApprovals.map((item) => ({
+      kind: "approval" as const,
+      key: `approval:${item.elicitation.elicitationId}`,
+      at: item.row.updated_at,
+      item,
+    })),
+    ...visibleComments.map((item) => ({
+      kind: "comment" as const,
+      key: `comment:${item.comment.id}`,
+      at: item.comment.created_at,
+      item,
+    })),
+    ...visibleUnread.map((item) => ({
+      kind: "unread" as const,
+      key: `unread:${item.row.id}`,
+      at: item.row.updated_at,
+      item,
+    })),
+  ];
+  const projectOf = (entry: InboxEntry): string | null => {
+    switch (entry.kind) {
+      case "ticket":
+        return entry.item.project_id;
+      case "suggestion":
+        return rowsById.get(entry.item.sourceSessionId)?.project_id ?? null;
+      case "automation":
+        return null;
+      default:
+        return entry.item.row.project_id ?? null;
+    }
+  };
+  // Ticket rows carry their project's name, so a project missing from the
+  // folder list (e.g. one shared with the viewer) still gets a label.
+  const ticketProjectNames = new Map(
+    ticketRequests.items.map((item) => [item.project_id, item.project_name]),
+  );
+  const describeProject = (projectId: string) => {
+    const project = projectsQuery.data?.find((candidate) => candidate.id === projectId);
+    return {
+      name: project?.name ?? ticketProjectNames.get(projectId) ?? "Unknown project",
+      icon: project?.icon ?? null,
+    };
+  };
+  const projectOptions = inboxProjectOptions(tabEntries, projectOf, describeProject, projectFilter);
+  const selectedProject = projectFilter
+    ? projectOptions.find((option) => option.id === projectFilter)
+    : undefined;
+  const visibleEntries = projectFilter
+    ? tabEntries.filter((entry) => projectOf(entry) === projectFilter)
+    : tabEntries;
+  const visibleCount = visibleEntries.length;
   const groups = groupInboxEntriesByApproval<InboxEntry>(
-    [
-      ...visibleTicketRequests.map((item) => ({
-        kind: "ticket" as const,
-        key: `ticket:${item.reason === "cc" ? "cc:" : ""}${item.project_id}:${item.ticket_id}`,
-        at: item.raised_at,
-        item,
-      })),
-      ...visibleSuggestions.map((item) => ({
-        kind: "suggestion" as const,
-        key: `suggestion:${item.id}`,
-        at: item.createdAt,
-        item,
-      })),
-      ...visibleAutomations.map((item) => ({
-        kind: "automation" as const,
-        key: `automation:${item.runId}`,
-        at: item.finishedAt ?? item.scheduledAt,
-        item,
-      })),
-      ...visibleApprovals.map((item) => ({
-        kind: "approval" as const,
-        key: `approval:${item.elicitation.elicitationId}`,
-        at: item.row.updated_at,
-        item,
-      })),
-      ...visibleComments.map((item) => ({
-        kind: "comment" as const,
-        key: `comment:${item.comment.id}`,
-        at: item.comment.created_at,
-        item,
-      })),
-      ...visibleUnread.map((item) => ({
-        kind: "unread" as const,
-        key: `unread:${item.row.id}`,
-        at: item.row.updated_at,
-        item,
-      })),
-    ],
+    visibleEntries,
     (entry) =>
       entry.kind === "approval" || (entry.kind === "ticket" && isTicketApprovalRequest(entry.item)),
   );
-  const defaultExpandedKey = items[0] && `approval:${items[0].elicitation.elicitationId}`;
+  const defaultExpandedKey = visibleEntries.find((entry) => entry.kind === "approval")?.key;
 
   // A newer delivery attempt supersedes optimistic sending, even if the
   // old POST is still in flight. Other prompts retain their refresh behavior.
@@ -627,7 +688,6 @@ export function InboxPage() {
     };
   };
 
-  const rowsById = new Map(allRows.map((row) => [row.id, row]));
   const renderEntry = (entry: InboxEntry) => {
     const expanded = expandedOverrides[entry.key] ?? entry.key === defaultExpandedKey;
     const onToggle = () => {
@@ -1244,34 +1304,44 @@ export function InboxPage() {
         )}
       </div>
 
-      <Tabs
-        value={filter}
-        onValueChange={(value) => {
-          if (!isInboxFilter(value)) return;
-          setFilter(value);
-          writeInboxFilter(value);
-        }}
-        componentId="inbox.filter"
-        className="mb-4"
-      >
-        <TabsList
-          variant="pill"
-          aria-label="Inbox filter"
-          className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <Tabs
+          value={filter}
+          onValueChange={(value) => {
+            if (!isInboxFilter(value)) return;
+            setFilter(value);
+            writeInboxFilter(value);
+          }}
+          componentId="inbox.filter"
+          className="min-w-0"
         >
-          {INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab).map(
-            ({ value, label }) => (
-              <TabsTrigger
-                key={value}
-                value={value}
-                className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
-              >
-                {label}
-              </TabsTrigger>
-            ),
-          )}
-        </TabsList>
-      </Tabs>
+          <TabsList
+            variant="pill"
+            aria-label="Inbox filter"
+            className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+          >
+            {INBOX_TABS.filter(({ value }) => value !== "advisor" || advisorTab).map(
+              ({ value, label }) => (
+                <TabsTrigger
+                  key={value}
+                  value={value}
+                  className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+                >
+                  {label}
+                </TabsTrigger>
+              ),
+            )}
+          </TabsList>
+        </Tabs>
+        {(projectOptions.length > 0 || projectFilter) && (
+          <InboxProjectPicker
+            options={projectOptions}
+            selected={selectedProject ?? null}
+            allCount={tabEntries.length}
+            onChoose={chooseProject}
+          />
+        )}
+      </div>
 
       {failedSessionCount > 0 && (
         <div
@@ -1356,13 +1426,32 @@ export function InboxPage() {
           <div className="flex flex-col items-center gap-2 py-16 text-center">
             <InboxIcon className="size-8 text-muted-foreground/50" />
             <p className="text-ui font-medium">
-              {(!advisorOnly && hasNextPage) ||
-              (showUnread && automationInbox.hasNextPage) ||
-              (showSuggestions && proactiveInbox.hasNextPage)
-                ? "Nothing waiting in the loaded items"
-                : emptyState.title}
+              {selectedProject
+                ? `Nothing here from ${selectedProject.name}`
+                : (!advisorOnly && hasNextPage) ||
+                    (showUnread && automationInbox.hasNextPage) ||
+                    (showSuggestions && proactiveInbox.hasNextPage)
+                  ? "Nothing waiting in the loaded items"
+                  : emptyState.title}
             </p>
-            <p className="text-sm text-muted-foreground">{emptyState.body}</p>
+            <p className="text-sm text-muted-foreground">
+              {selectedProject
+                ? tabEntries.length > 0
+                  ? "Other projects have items waiting."
+                  : emptyState.body
+                : emptyState.body}
+            </p>
+            {selectedProject && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-2"
+                onClick={() => chooseProject(null)}
+                componentId="inbox.project_filter.show_all"
+              >
+                Show all projects
+              </Button>
+            )}
           </div>
         )}
 
@@ -1781,5 +1870,77 @@ function InboxReplyField({
         </p>
       )}
     </div>
+  );
+}
+
+/** Glyph for a project in the picker: its emoji when set, else the folder icon. */
+function ProjectGlyph({ icon }: { icon?: string | null }) {
+  return icon ? (
+    <span aria-hidden className="w-4 text-center leading-none">
+      {icon}
+    </span>
+  ) : (
+    <FolderIcon aria-hidden className="size-3.5 text-muted-foreground" />
+  );
+}
+
+/**
+ * Narrows the Inbox to one project. Lists only the projects with items in the
+ * current tab, each with its count; "All projects" clears the pick.
+ */
+function InboxProjectPicker({
+  options,
+  selected,
+  allCount,
+  onChoose,
+}: {
+  options: InboxProjectOption[];
+  selected: InboxProjectOption | null;
+  allCount: number;
+  onChoose: (projectId: string | null) => void;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          aria-label={
+            selected ? `Project filter: ${selected.name}` : "Project filter: all projects"
+          }
+          data-testid="inbox-project-filter"
+          componentId="inbox.project_filter"
+          className={cn(
+            "h-7 mobile-touch-target mobile-app:h-auto max-w-full gap-1.5 rounded-full px-3 text-ui",
+            selected
+              ? "border-foreground/30 bg-accent text-foreground"
+              : "border-button-border text-muted-foreground",
+          )}
+        >
+          {selected ? <ProjectGlyph icon={selected.icon} /> : <FolderIcon className="size-3.5" />}
+          <span className="truncate">{selected ? selected.name : "All projects"}</span>
+          <ChevronDownIcon className="size-3.5 shrink-0" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="max-h-80 min-w-56 max-w-[min(20rem,90vw)]">
+        <DropdownMenuRadioGroup
+          value={selected?.id ?? ""}
+          onValueChange={(value) => onChoose(value || null)}
+        >
+          <DropdownMenuRadioItem value="" className="gap-2">
+            <span className="flex-1">All projects</span>
+            <span className="text-xs text-muted-foreground tabular-nums">{allCount}</span>
+          </DropdownMenuRadioItem>
+          {options.length > 0 && <DropdownMenuSeparator />}
+          {options.map((option) => (
+            <DropdownMenuRadioItem key={option.id} value={option.id} className="gap-2">
+              <ProjectGlyph icon={option.icon} />
+              <span className="flex-1 truncate">{option.name}</span>
+              <span className="text-xs text-muted-foreground tabular-nums">{option.count}</span>
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
