@@ -256,24 +256,69 @@ def _status(store: SqlAlchemyInboxItemStore, item_id: str, user_id: str = "alice
     return item.status
 
 
-def test_mark_all_read_changes_only_the_owners_unread_items(
+def _ticking_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each created item its own second, so newest-first order is creation order."""
+    ticks = iter(range(1_000, 2_000))
+    monkeypatch.setattr(
+        "omnigent.stores.inbox_item_store.sqlalchemy_store.now_epoch", lambda: next(ticks)
+    )
+
+
+def _mark_all(
+    store: SqlAlchemyInboxItemStore, user_id: str, *, agent_id: str | None = None, limit: int
+) -> list[list[str]]:
+    """Run batches until the cursor runs out; each batch's marked ids, in order."""
+    batches: list[list[str]] = []
+    cursor = None
+    for _ in range(20):
+        marked, cursor = store.mark_read_batch(
+            user_id, agent_id=agent_id, after=cursor, limit=limit
+        )
+        batches.append(marked)
+        if cursor is None:
+            return batches
+    raise AssertionError("mark_read_batch kept returning a cursor")
+
+
+def test_mark_read_batches_are_bounded_and_newest_first(
+    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ticking_clock(monkeypatch)
+    ids = [store.create(_new(dedupe_key=f"v1:{n}")).id for n in range(5)]
+
+    batches = _mark_all(store, "alice", limit=2)
+
+    assert batches == [[ids[4], ids[3]], [ids[2], ids[1]], [ids[0]]]
+    assert store.count_unread("alice", limit=100) == 0
+    assert store.mark_read_batch("alice", limit=2) == ([], None)
+
+
+def test_mark_read_batches_reach_a_sparse_agent_match(
+    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ticking_clock(monkeypatch)
+    oldest = store.create(_new(dedupe_key="v1:old", agent_id="b" * 32))
+    for n in range(4):
+        store.create(_new(dedupe_key=f"v1:{n}"))
+
+    # Each batch reads two unread items; only the last one holds agent b's item.
+    assert _mark_all(store, "alice", agent_id="b" * 32, limit=2) == [[], [], [oldest.id]]
+    assert _status(store, oldest.id) == "read"
+    assert store.count_unread("alice", limit=100) == 4
+
+
+def test_mark_read_batch_changes_only_the_owners_unread_items(
     store: SqlAlchemyInboxItemStore,
 ) -> None:
     first = store.create(_new(dedupe_key="v1:first"))
-    other_agent = store.create(_new(dedupe_key="v1:other", agent_id="b" * 32))
     dismissed = store.create(_new(dedupe_key="v1:dismissed"))
     store.update(dismissed.id, "alice", status="dismissed", resolution="not_now", now=100)
     bobs = store.create(_new(dedupe_key="v1:bob", user_id="bob"))
 
-    assert store.mark_all_read("alice", agent_id="a" * 32) == 1
-    assert (_status(store, first.id), _status(store, other_agent.id)) == ("read", "unread")
-
-    assert store.mark_all_read("alice") == 1
-    assert store.count_unread("alice", limit=100) == 0
+    assert store.mark_read_batch("alice", limit=10) == ([first.id], None)
     # A resolved item stays closed, and another owner's item is untouched.
     assert _status(store, dismissed.id) == "dismissed"
     assert _status(store, bobs.id, "bob") == "unread"
-    assert store.mark_all_read("alice") == 0
 
 
 def test_update_records_the_answer_and_when_it_was_given(
@@ -318,15 +363,12 @@ def test_update_records_the_answer_and_when_it_was_given(
     )
 
 
-def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) -> None:
-    import re
-
-    from sqlalchemy import event, insert
+def _seed_mysql_plan_rows(store: SqlAlchemyInboxItemStore) -> None:
+    """Seed 10,000 rows for one owner, alternating unread and read, and analyze them."""
+    from sqlalchemy import insert
 
     from omnigent.db.db_models import SqlInboxItem
 
-    if store._engine.dialect.name != "mysql":
-        pytest.skip("MySQL execution-plan regression")
     rows = [
         {
             "workspace_id": 0,
@@ -354,6 +396,16 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
     with store._engine.begin() as connection:
         connection.execute(insert(SqlInboxItem), rows)
         connection.exec_driver_sql("ANALYZE TABLE inbox_items").all()
+
+
+def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) -> None:
+    import re
+
+    from sqlalchemy import event
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    _seed_mysql_plan_rows(store)
     plans: list[str] = []
 
     def explain(conn, cursor, statement, parameters, context, executemany):
@@ -376,3 +428,36 @@ def test_mysql_deep_pages_seek_to_the_cursor(store: SqlAlchemyInboxItemStore) ->
         # Rows each step actually read; the planner's estimates are not bounded.
         examined = [int(n) for n in re.findall(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", plan)]
         assert max(examined) <= 200, plan
+
+
+def test_mysql_mark_read_batch_reads_one_batch_for_a_sparse_agent(
+    store: SqlAlchemyInboxItemStore,
+) -> None:
+    import re
+
+    from sqlalchemy import event
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    _seed_mysql_plan_rows(store)
+    plans: list[str] = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT inbox_items."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        # No seeded row belongs to agent b, so the batch matches nothing and
+        # must still stop after one batch of the owner's unread range.
+        marked, cursor = store.mark_read_batch(
+            "plan-owner", agent_id="b" * 32, after=(100, f"{1005:032x}"), limit=50
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert marked == [] and cursor is not None
+    assert len(plans) == 1, plans
+    examined = [int(n) for n in re.findall(r"actual time=[\d.]+\.\.[\d.]+ rows=(\d+)", plans[0])]
+    assert max(examined) <= 200, plans[0]

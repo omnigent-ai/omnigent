@@ -16,7 +16,7 @@ import {
 } from "@/lib/proactiveInbox";
 import type * as ProactiveInboxModule from "@/lib/proactiveInbox";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
-import { useProactiveInbox } from "./useProactiveInbox";
+import { MARK_ALL_READ_BATCHES, useProactiveInbox } from "./useProactiveInbox";
 
 vi.mock("@/lib/proactiveInbox", async (importActual) => ({
   ...(await importActual<typeof ProactiveInboxModule>()),
@@ -29,14 +29,15 @@ vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 let client: QueryClient;
 let enabled = true;
-let markAllAvailable = false;
+// `undefined` leaves the field out, as an older server does.
+let markAllAvailable: boolean | undefined = false;
 const wrapper = ({ children }: { children: ReactNode }) => (
   <QueryClientProvider client={client}>
     <CapabilitiesProvider
       info={{
         ...FALLBACK_SERVER_INFO,
         inbox_items_available: enabled,
-        inbox_mark_all_read: markAllAvailable,
+        ...(markAllAvailable === undefined ? {} : { inbox_mark_all_read: markAllAvailable }),
       }}
     >
       <RoutingProvider value={basenamedRouting("/")}>{children}</RoutingProvider>
@@ -228,28 +229,52 @@ it("hands a failed update to the caller's onError instead of the toast", async (
   expect(showToast).not.toHaveBeenCalled();
 });
 
-it("marks every unread suggestion read in one call when the server offers it", async () => {
+/** A mark-read batch reply. */
+function batch(markedIds: string[], nextCursor: string | null, unreadCount: number) {
+  return { markedIds, nextCursor, unreadCount, unreadCountCapped: false };
+}
+
+it("marks every unread suggestion read batch by batch when the server offers it", async () => {
+  markAllAvailable = true;
+  const other: Suggestion = { ...item, id: "other", createdAt: 0 };
+  vi.mocked(listSuggestions).mockResolvedValue(page([item, other], 2));
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(2));
+  expect(result.current.canMarkAllRead).toBe(true);
+  vi.mocked(markAllSuggestionsRead)
+    .mockResolvedValueOnce(batch(["sug"], "1:sug", 1))
+    .mockResolvedValueOnce(batch(["other"], null, 0));
+  // Hold the recovery fetch, so what shows is the batches' own write.
+  vi.mocked(listSuggestions).mockImplementation(() => new Promise(() => {}));
+
+  let outcome: Promise<string> = Promise.resolve("");
+  act(() => {
+    outcome = result.current.markAllRead(null);
+  });
+
+  await expect(outcome).resolves.toBe("done");
+  expect(vi.mocked(markAllSuggestionsRead).mock.calls).toEqual([
+    [null, null],
+    [null, "1:sug"],
+  ]);
+  await waitFor(() => expect(result.current.unreadCount).toBe(0));
+  expect(result.current.items.map((entry) => entry.status)).toEqual(["read", "read"]);
+  expect(showToast).not.toHaveBeenCalled();
+});
+
+it("stops after the batch cap and reports it as partial", async () => {
   markAllAvailable = true;
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   await waitFor(() => expect(result.current.unreadCount).toBe(1));
-  expect(result.current.canMarkAllRead).toBe(true);
-  vi.mocked(markAllSuggestionsRead).mockResolvedValueOnce({
-    marked: 1,
-    unreadCount: 0,
-    unreadCountCapped: false,
-  });
-  vi.mocked(listSuggestions).mockResolvedValue(page([{ ...item, status: "read" }], 0));
+  vi.mocked(markAllSuggestionsRead).mockResolvedValue(batch([], "1:sug", 1));
 
-  let accepted: Promise<boolean> = Promise.resolve(false);
+  let outcome: Promise<string> = Promise.resolve("");
   act(() => {
-    accepted = result.current.markAllRead(null);
+    outcome = result.current.markAllRead("agent");
   });
 
-  await expect(accepted).resolves.toBe(true);
-  expect(markAllSuggestionsRead).toHaveBeenCalledWith(null);
-  await waitFor(() => expect(result.current.unreadCount).toBe(0));
-  expect(result.current.items).toEqual([{ ...item, status: "read" }]);
-  expect(showToast).not.toHaveBeenCalled();
+  await expect(outcome).resolves.toBe("partial");
+  expect(markAllSuggestionsRead).toHaveBeenCalledTimes(MARK_ALL_READ_BATCHES);
 });
 
 it("leaves a failed mark-all to the caller and reloads the list", async () => {
@@ -258,20 +283,81 @@ it("leaves a failed mark-all to the caller and reloads the list", async () => {
   await waitFor(() => expect(result.current.unreadCount).toBe(1));
   vi.mocked(markAllSuggestionsRead).mockRejectedValueOnce(new Error("offline"));
 
-  let accepted: Promise<boolean> = Promise.resolve(true);
+  let outcome: Promise<string> = Promise.resolve("");
   act(() => {
-    accepted = result.current.markAllRead("agent");
+    outcome = result.current.markAllRead("agent");
   });
 
-  await expect(accepted).resolves.toBe(false);
+  await expect(outcome).resolves.toBe("failed");
   expect(showToast).not.toHaveBeenCalled();
   await waitFor(() => expect(listSuggestions).toHaveBeenCalledTimes(2));
   expect(result.current.items).toEqual([item]);
 });
 
-it("offers mark-all only on servers that advertise it", () => {
+it.each([undefined, false])("offers mark-all only on servers that advertise it (%s)", (flag) => {
+  markAllAvailable = flag;
   const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
   expect(result.current.canMarkAllRead).toBe(false);
+});
+
+it("keeps a dismissal queued behind mark-all from subtracting again on a list that never loaded it", async () => {
+  // Agent "agent" posted the item; another agent's unread item stays unread.
+  // The Done list holds neither, but carries the same unread total.
+  markAllAvailable = true;
+  const theirs: Suggestion = { ...item, id: "theirs", agentId: "another", createdAt: 0 };
+  vi.mocked(listSuggestions).mockImplementation(async (_cursor, statuses) =>
+    statuses?.includes("done") ? page([], 2) : page([item, theirs], 2),
+  );
+  const { result } = renderHook(
+    () => ({ all: useProactiveInbox(true), done: useProactiveInbox(true, ["done"]) }),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.all.items).toEqual([item, theirs]));
+  await waitFor(() => expect(result.current.done.unreadCount).toBe(2));
+  const bulk = deferred<ReturnType<typeof batch>>();
+  const patch = deferred<SuggestionUpdateResult>();
+  vi.mocked(markAllSuggestionsRead).mockReturnValueOnce(bulk.promise);
+  vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+
+  act(() => void result.current.all.markAllRead("agent"));
+  act(() => void result.current.all.update("sug", { resolution: "not_now" }));
+  expect(result.current.all.unreadCount).toBe(1);
+  expect(result.current.done.unreadCount).toBe(1);
+
+  vi.mocked(listSuggestions).mockImplementation(() => new Promise(() => {}));
+  // The server marked the item read; only the other agent's item is unread.
+  await act(async () => bulk.resolve(batch(["sug"], null, 1)));
+  expect(result.current.all.unreadCount).toBe(1);
+  expect(result.current.done.unreadCount).toBe(1);
+
+  await act(async () =>
+    patch.resolve(saved({ ...item, status: "dismissed", resolution: "not_now" }, 1)),
+  );
+  expect(result.current.all.unreadCount).toBe(1);
+  expect(result.current.done.unreadCount).toBe(1);
+});
+
+it("runs mark-all only after a read mark already in flight settles", async () => {
+  markAllAvailable = true;
+  const { result } = renderHook(() => useProactiveInbox(true), { wrapper });
+  await waitFor(() => expect(result.current.unreadCount).toBe(1));
+  const patch = deferred<SuggestionUpdateResult>();
+  vi.mocked(updateSuggestion).mockReturnValueOnce(patch.promise);
+  vi.mocked(markAllSuggestionsRead).mockResolvedValueOnce(batch([], null, 0));
+  vi.mocked(listSuggestions).mockImplementation(() => new Promise(() => {}));
+
+  act(() => void result.current.update("sug", { status: "read" }));
+  let outcome: Promise<string> = Promise.resolve("");
+  act(() => {
+    outcome = result.current.markAllRead(null);
+  });
+  expect(result.current.unreadCount).toBe(0);
+  expect(markAllSuggestionsRead).not.toHaveBeenCalled();
+
+  await act(async () => patch.resolve(saved({ ...item, status: "read" }, 0)));
+  await expect(outcome).resolves.toBe("done");
+  expect(markAllSuggestionsRead).toHaveBeenCalledOnce();
+  expect(result.current.unreadCount).toBe(0);
 });
 
 it("keeps the item when the update and the recovery fetch both fail", async () => {

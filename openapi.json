@@ -5024,8 +5024,20 @@
       },
       "MarkAllReadRequest": {
         "additionalProperties": false,
-        "description": "Body for `POST /v1/inbox/items/mark-read`.\n\n`agent_id` limits the mark to one posting agent's items, as the web\nInbox does on that agent's tab.",
+        "description": "Body for `POST /v1/inbox/items/mark-read`.\n\n`agent_id` limits the mark to one posting agent's items, as the web\nInbox does on that agent's tab. Each call marks one bounded batch; pass the\nreply's `next_cursor` as `after` until it is `null`.",
         "properties": {
+          "after": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After"
+          },
           "agent_id": {
             "anyOf": [
               {
@@ -19950,8 +19962,8 @@
     },
     "/v1/inbox/items/mark-read": {
       "post": {
-        "description": "Mark all of the caller's unread items read, and report the unread total after.",
-        "operationId": "mark_all_inbox_items_read_v1_inbox_items_mark_read_post",
+        "description": "Mark one batch of the caller's unread items read, and report the unread total after.",
+        "operationId": "mark_inbox_items_read_v1_inbox_items_mark_read_post",
         "requestBody": {
           "content": {
             "application/json": {
@@ -19968,7 +19980,7 @@
               "application/json": {
                 "schema": {
                   "additionalProperties": true,
-                  "title": "Response Mark All Inbox Items Read V1 Inbox Items Mark Read Post",
+                  "title": "Response Mark Inbox Items Read V1 Inbox Items Mark Read Post",
                   "type": "object"
                 }
               }
@@ -19986,7 +19998,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Mark All Inbox Items Read",
+        "summary": "Mark Inbox Items Read",
         "tags": [
           "inbox_items"
         ]

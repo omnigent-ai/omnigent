@@ -2330,7 +2330,7 @@ describe("InboxPage mark all as read", () => {
   });
 
   it("uses one call for every suggestion when the server offers it", async () => {
-    const markAllRead = vi.fn().mockResolvedValue(true);
+    const markAllRead = vi.fn().mockResolvedValue("done");
     const update = vi.fn().mockResolvedValue(true);
     vi.mocked(proactiveInboxHook.useProactiveInbox).mockReturnValue(
       proactiveInboxStub({
@@ -2356,7 +2356,10 @@ describe("InboxPage mark all as read", () => {
     await waitFor(() => expect(markAllRead).toHaveBeenLastCalledWith("agent_advisor"));
   });
 
-  it("reports a failed one-call mark in one toast", async () => {
+  it.each([
+    ["failed", "Couldn’t mark every suggestion as read. Try again."],
+    ["partial", "Some suggestions are still unread. Click Mark all as read again."],
+  ])("reports a %s mark-all in one toast", async (outcome, message) => {
     const toasts: unknown[] = [];
     const onToast = (e: Event) => toasts.push((e as CustomEvent).detail.content);
     window.addEventListener("omnigent:toast", onToast);
@@ -2366,16 +2369,14 @@ describe("InboxPage mark all as read", () => {
         items: [suggestionItem({}), suggestionItem({ id: "sug_2" })],
         unreadCount: 2,
         canMarkAllRead: true,
-        markAllRead: vi.fn().mockResolvedValue(false),
+        markAllRead: vi.fn().mockResolvedValue(outcome),
       }),
     );
     renderPage();
 
     fireEvent.click(screen.getByRole("button", { name: "Mark all as read" }));
 
-    await waitFor(() =>
-      expect(toasts).toEqual(["Couldn’t mark your suggestions as read. Try again."]),
-    );
+    await waitFor(() => expect(toasts).toEqual([message]));
   });
 
   it("is offered only while the tab lists something unread", async () => {

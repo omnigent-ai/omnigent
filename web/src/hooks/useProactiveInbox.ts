@@ -17,7 +17,7 @@ import {
   reconcileMarkAllRead,
   reconcileSuggestion,
   updateSuggestion,
-  type MarkAllReadResult,
+  type MarkReadBatchResult,
   type SuggestionPage,
   type SuggestionStatus,
   type SuggestionUpdate,
@@ -73,6 +73,12 @@ interface ScopeState {
 }
 
 const scopes = new WeakMap<QueryClient, Map<string, ScopeState>>();
+
+/** Most server batches one Mark all as read runs; each reads up to 100 unread items. */
+export const MARK_ALL_READ_BATCHES = 20;
+
+/** How a Mark all as read ended: all marked, stopped at the batch cap, or a request failed. */
+export type MarkAllReadOutcome = "done" | "partial" | "failed";
 
 function scopeState(queryClient: QueryClient, scopeKeyText: string): ScopeState {
   let byKey = scopes.get(queryClient);
@@ -261,34 +267,48 @@ export function useProactiveInbox(
   );
 
   /**
-   * Mark all unread suggestions read in one call, or only *agentId*'s. It waits
-   * behind any update in flight, like they wait for each other. Resolves to
-   * whether the server accepted it; the caller reports a failure.
+   * Mark all unread suggestions read, or only *agentId*'s, one bounded server
+   * batch at a time. It waits behind any update in flight, like they wait for
+   * each other. Resolves to `"done"`, `"partial"` when it stopped after
+   * {@link MARK_ALL_READ_BATCHES} batches, or `"failed"`; the caller reports it.
    */
   const markAllRead = useCallback(
-    (agentId: string | null): Promise<boolean> => {
+    (agentId: string | null): Promise<MarkAllReadOutcome> => {
       const scope = scopeState(queryClient, scopeKeyText);
       const key = JSON.parse(scopeKeyText) as unknown[];
       scope.inFlight += 1;
       void queryClient.cancelQueries({ queryKey: key });
-      const request: Promise<boolean> = scope.chain
+      const applyBatch = (reply: MarkReadBatchResult) => {
+        const before = dataVersions(queryClient, key);
+        queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
+          data ? { ...data, pages: reconcileMarkAllRead(data.pages, reply) } : data,
+        );
+        // A change queued behind this batch builds on the status the server
+        // now holds, so lists that never loaded the item move their total right.
+        for (const id of reply.markedIds) {
+          if (scope.confirmed.has(id)) scope.confirmed.set(id, "read");
+        }
+        carryStartedVersions(scope, before, dataVersions(queryClient, key));
+      };
+      const request: Promise<MarkAllReadOutcome> = scope.chain
         .then(async () => {
-          let saved: MarkAllReadResult | null = null;
-          try {
-            saved = await markAllSuggestionsRead(agentId);
-          } catch {
-            // The caller reports the failure; the refetch below restores the list.
+          let cursor: string | null = null;
+          for (let batch = 0; batch < MARK_ALL_READ_BATCHES; batch += 1) {
+            let reply: MarkReadBatchResult;
+            try {
+              // oxlint-disable-next-line no-await-in-loop -- Each batch starts at the cursor the one before returned.
+              reply = await markAllSuggestionsRead(agentId, cursor);
+            } catch {
+              // The caller reports the failure; the refetch below restores the list.
+              return "failed";
+            }
+            // oxlint-disable-next-line no-await-in-loop -- Drop a fetch that may predate this batch.
+            await queryClient.cancelQueries({ queryKey: key });
+            applyBatch(reply);
+            cursor = reply.nextCursor;
+            if (cursor === null) return "done";
           }
-          await queryClient.cancelQueries({ queryKey: key });
-          if (saved) {
-            const reply = saved;
-            const before = dataVersions(queryClient, key);
-            queryClient.setQueriesData<Pages>({ queryKey: key }, (data) =>
-              data ? { ...data, pages: reconcileMarkAllRead(data.pages, agentId, reply) } : data,
-            );
-            carryStartedVersions(scope, before, dataVersions(queryClient, key));
-          }
-          return saved !== null;
+          return "partial";
         })
         .finally(() => {
           scope.inFlight -= 1;

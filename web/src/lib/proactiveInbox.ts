@@ -185,53 +185,63 @@ export async function updateSuggestion(
   };
 }
 
-/** The server's reply to marking every unread suggestion read. */
-export interface MarkAllReadResult {
-  marked: number;
+/** The server's reply to one mark-read batch. */
+export interface MarkReadBatchResult {
+  /** The suggestions this batch marked read. */
+  markedIds: string[];
+  /** Pass to the next call; `null` once no unread suggestion is left past this batch. */
+  nextCursor: string | null;
   unreadCount: number;
   unreadCountCapped: boolean;
 }
 
 /**
- * Mark all of the viewer's unread suggestions read in one call, or only those
- * *agentId* posted. Needs `inbox_mark_all_read` in the server info.
+ * Mark one bounded batch of the viewer's unread suggestions read, or only
+ * *agentId*'s, starting after *after*. Needs `inbox_mark_all_read` in the
+ * server info.
  */
-export async function markAllSuggestionsRead(agentId: string | null): Promise<MarkAllReadResult> {
+export async function markAllSuggestionsRead(
+  agentId: string | null,
+  after: string | null = null,
+): Promise<MarkReadBatchResult> {
+  const body: Record<string, string> = {};
+  if (agentId !== null) body.agent_id = agentId;
+  if (after !== null) body.after = after;
   const res = await authenticatedFetch("/v1/inbox/items/mark-read", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(agentId === null ? {} : { agent_id: agentId }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);
   const reply = (await res.json()) as {
-    marked: number;
+    marked_ids: string[];
+    next_cursor: string | null;
     unread_count: number;
     unread_count_capped?: boolean;
   };
   return {
-    marked: reply.marked,
+    markedIds: reply.marked_ids,
+    nextCursor: reply.next_cursor,
     unreadCount: reply.unread_count,
     unreadCountCapped: reply.unread_count_capped === true,
   };
 }
 
 /**
- * Write a mark-all-read reply into cached pages: unread items (only *agentId*'s
- * when set) read, and every page's total set to the server's count after it.
+ * Write a mark-read batch into cached pages: the items it marked read, and
+ * every page's total set to the server's count after it.
  */
 export function reconcileMarkAllRead(
   pages: SuggestionPage[],
-  agentId: string | null,
-  saved: MarkAllReadResult,
+  saved: MarkReadBatchResult,
 ): SuggestionPage[] {
+  const marked = new Set(saved.markedIds);
   return pages.map((page) => ({
     ...page,
     unreadCount: saved.unreadCount,
     unreadCountCapped: saved.unreadCountCapped,
     data: page.data.map((item) =>
-      item.status === "unread" && (agentId === null || item.agentId === agentId)
-        ? { ...item, status: "read" }
-        : item,
+      marked.has(item.id) && item.status === "unread" ? { ...item, status: "read" } : item,
     ),
   }));
 }

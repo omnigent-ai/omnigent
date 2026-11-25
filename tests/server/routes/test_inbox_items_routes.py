@@ -463,19 +463,45 @@ async def test_mark_read_marks_every_unread_item_and_reports_the_total(
     await client.patch(f"/v1/inbox/items/{ids[0]}", json={"resolution": "not_now"})
 
     other = await client.post("/v1/inbox/items/mark-read", json={"agent_id": _PLAIN_AGENT})
-    assert other.json() == {"marked": 0, "unread_count": 2, "unread_count_capped": False}
-    marked = await client.post("/v1/inbox/items/mark-read", json={"agent_id": _INBOX_AGENT})
-    assert marked.json() == {"marked": 2, "unread_count": 0, "unread_count_capped": False}
+    assert other.json() == {
+        "marked_ids": [],
+        "next_cursor": None,
+        "unread_count": 2,
+        "unread_count_capped": False,
+    }
+    marked = (
+        await client.post("/v1/inbox/items/mark-read", json={"agent_id": _INBOX_AGENT})
+    ).json()
+    assert sorted(marked["marked_ids"]) == sorted(ids[1:])
+    assert (marked["next_cursor"], marked["unread_count"]) == (None, 0)
     listed = (await client.get("/v1/inbox/items", params={"status": "read"})).json()
     assert sorted(entry["id"] for entry in listed["data"]) == sorted(ids[1:])
     # The dismissed item stays dismissed.
     dismissed = (await client.get("/v1/inbox/items", params={"status": "dismissed"})).json()
     assert [entry["id"] for entry in dismissed["data"]] == [ids[0]]
-    assert (await client.post("/v1/inbox/items/mark-read", json={})).json()["marked"] == 0
+    assert (await client.post("/v1/inbox/items/mark-read", json={})).json()["marked_ids"] == []
     assert (
         await client.post("/v1/inbox/items/mark-read", json={"agent_id": "not-an-id"})
     ).status_code == 422
+    assert (await client.post("/v1/inbox/items/mark-read", json={"after": "x"})).status_code == 400
     assert (await client.get("/v1/info")).json()["inbox_mark_all_read"] is True
+
+
+async def test_mark_read_continues_from_the_cursor(
+    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.server.routes.inbox_items.MARK_READ_BATCH_LIMIT", 1)
+    headers = _from(_session(stores))
+    for n in range(2):
+        await client.post("/v1/inbox/items", json=_body(topic=f"t{n}"), headers=headers)
+
+    first = (await client.post("/v1/inbox/items/mark-read", json={})).json()
+    assert (len(first["marked_ids"]), first["unread_count"]) == (1, 1)
+    assert first["next_cursor"] is not None
+    rest = (
+        await client.post("/v1/inbox/items/mark-read", json={"after": first["next_cursor"]})
+    ).json()
+    assert (len(rest["marked_ids"]), rest["next_cursor"], rest["unread_count"]) == (1, None, 0)
 
 
 async def test_authenticated_owners_see_only_their_items(
@@ -502,8 +528,8 @@ async def test_authenticated_owners_see_only_their_items(
             await c.patch(f"/v1/inbox/items/{item_id}", json={"status": "read"}, headers=bob)
         ).status_code == 404
         assert (await c.post("/v1/inbox/items/mark-read", json={}, headers=bob)).json()[
-            "marked"
-        ] == 0
+            "marked_ids"
+        ] == []
         assert len((await c.get("/v1/inbox/items", headers=alice)).json()["data"]) == 1
         assert (await c.get("/v1/inbox/items", headers=alice)).json()["unread_count"] == 1
 

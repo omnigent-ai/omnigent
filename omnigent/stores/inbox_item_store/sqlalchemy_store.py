@@ -6,11 +6,10 @@ import heapq
 import uuid
 from collections.abc import Callable
 from functools import partial
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
 from sqlalchemy import ColumnElement, Select, and_, func, or_, select, tuple_
 from sqlalchemy import update as sql_update
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError, StatementError
 from sqlalchemy.orm import Session
 
@@ -336,24 +335,56 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         with self._session("count_unread_inbox_items") as session:
             return int(session.execute(select(func.count()).select_from(bounded)).scalar_one())
 
-    def mark_all_read(self, user_id: str, *, agent_id: str | None = None) -> int:
-        """See base class."""
-        stmt = sql_update(SqlInboxItem).where(
-            SqlInboxItem.workspace_id == current_workspace_id(),
-            SqlInboxItem.user_id == user_id,
-            SqlInboxItem.status == encode_inbox_item_status("unread"),
-        )
-        if agent_id is not None:
-            stmt = stmt.where(SqlInboxItem.agent_id == agent_id)
-        stmt = stmt.values(status=encode_inbox_item_status("read")).execution_options(
-            synchronize_session=False
-        )
+    def mark_read_batch(
+        self,
+        user_id: str,
+        *,
+        agent_id: str | None = None,
+        after: tuple[int, str] | None = None,
+        limit: int,
+    ) -> tuple[list[str], tuple[int, str] | None]:
+        """See base class.
 
-        def write(session: Session) -> int:
+        The read seeks ``ix_inbox_items_user_status_created`` and stops after
+        ``limit + 1`` rows, so a sparse agent match costs more batches, not a
+        longer scan. It locks what it read, so the ids it returns are the ones
+        the update changed.
+        """
+        unread = encode_inbox_item_status("unread")
+
+        def write(session: Session) -> tuple[list[str], tuple[int, str] | None]:
             require_active_account(session, user_id)
-            return cast(CursorResult[tuple[object]], session.execute(stmt)).rowcount
+            stmt = select(SqlInboxItem.id, SqlInboxItem.created_at, SqlInboxItem.agent_id).where(
+                SqlInboxItem.workspace_id == current_workspace_id(),
+                SqlInboxItem.user_id == user_id,
+                SqlInboxItem.status == unread,
+            )
+            if after is not None:
+                stmt = stmt.where(self._before_cursor(after))
+            stmt = (
+                stmt.order_by(SqlInboxItem.created_at.desc(), SqlInboxItem.id.desc())
+                .limit(limit + 1)
+                .with_for_update()
+            )
+            rows = session.execute(stmt).all()
+            read = rows[:limit]
+            ids = [row.id for row in read if agent_id is None or row.agent_id == agent_id]
+            if ids:
+                session.execute(
+                    sql_update(SqlInboxItem)
+                    .where(
+                        SqlInboxItem.workspace_id == current_workspace_id(),
+                        SqlInboxItem.id.in_(ids),
+                        SqlInboxItem.user_id == user_id,
+                        SqlInboxItem.status == unread,
+                    )
+                    .values(status=encode_inbox_item_status("read"))
+                    .execution_options(synchronize_session=False)
+                )
+            next_cursor = (read[-1].created_at, read[-1].id) if len(rows) > limit else None
+            return ids, next_cursor
 
-        return run_write_transaction(self._session_immediate, "mark_all_inbox_items_read", write)
+        return run_write_transaction(self._session_immediate, "mark_inbox_items_read", write)
 
     def update(
         self,
