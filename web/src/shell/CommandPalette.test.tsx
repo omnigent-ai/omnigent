@@ -1286,9 +1286,14 @@ describe("CommandPalette — QuickPick preview bootstrap", () => {
       expect(screen.queryByRole("option", { name: label })).toBeNull();
       searchPreview();
       const command = screen.getByRole("option", { name: label });
+      let savedAtReload: string | null = null;
+      reload.mockImplementation(() => {
+        savedAtReload = localStorage.getItem(key);
+      });
       fireEvent.click(command);
       expect(localStorage.getItem(key)).toBe('{"quick_pick_palette":true}');
       expect(reload).toHaveBeenCalledOnce();
+      expect(savedAtReload).toBe('{"quick_pick_palette":true}');
     },
   );
 

@@ -112,10 +112,15 @@ describe("FeatureFlagsPicker", () => {
     expect(screen.getByRole("option", { name: /Automatic \(Off\)/ })).toHaveTextContent(
       "A Canvas page",
     );
+    let savedAtReload: string | null = null;
+    reload.mockImplementation(() => {
+      savedAtReload = localStorage.getItem(key);
+    });
     fireEvent.change(input, { target: { value: "on" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(localStorage.getItem(key)).toBe('{"canvas":true}');
     expect(reload).toHaveBeenCalledOnce();
+    expect(savedAtReload).toBe('{"canvas":true}');
   });
 
   it.each([
