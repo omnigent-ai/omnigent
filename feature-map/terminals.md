@@ -75,6 +75,13 @@ with their own terminal retain the switcher.
   pane's title strip has a menu with Close Pane. While a split shows, Chat keeps
   the panes on screen with the web chat as the agent's pane, and ⌘D from its
   composer splits again. With the flag off, the classic Terminal view above stays.
+- With `floating_panes` on as well (off by default), a split's panes float as cards. Drag a
+  pane by the band around its title strip's handle; a double-click elsewhere on the strip
+  maximizes it, and a strip too narrow for both zones moves and maximizes from anywhere. A
+  pane whose shell exits closes at once, and the pane beside it takes the keyboard. Close Pane
+  closes a shell its runner reads as idle without asking; a busy one asks and names its job,
+  such as "vim is running in zsh". When the runner can't answer within half a second, or the
+  shell was typed into meanwhile, it asks as before.
 
 **User shells:**
 
