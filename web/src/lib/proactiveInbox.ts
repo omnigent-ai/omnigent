@@ -77,6 +77,11 @@ export const OPEN_SUGGESTION_STATUSES: readonly SuggestionStatus[] = ["unread", 
 
 /** What the UI calls the proactive agent; the one place to change when it is renamed. */
 export const PROACTIVE_AGENT_DISPLAY_NAME = "Omni Advisor";
+/** What Omni Advisor's switch says it does, for the viewer's own switch and the workspace's. */
+export const PROACTIVE_AGENT_SCOPE_COPY = {
+  me: `${PROACTIVE_AGENT_DISPLAY_NAME} reads your recent sessions on a schedule and posts follow-ups, related information, and reminders to your Inbox.`,
+  workspace: `Let ${PROACTIVE_AGENT_DISPLAY_NAME} post follow-ups, related information, and reminders to each user's Inbox. Users can turn it off for themselves.`,
+} as const;
 export const SUGGESTION_PAGE_SIZE = 50;
 
 /** Reasons the Dismiss menu offers, in menu order. */

@@ -213,6 +213,7 @@ interface RawRun {
   workflow_id?: string;
   workflow_name?: string | null;
   started_by?: { session_id: string; title: string } | null;
+  automation?: { id: string; name: string } | null;
   descendant_runs?: RawRun[];
   descendant_run_count?: number;
   descendant_runs_cursor?: string | null;
@@ -244,6 +245,7 @@ function toWorkflowRun(run: RawRun): WorkflowRun {
     startedBy: run.started_by
       ? { sessionId: run.started_by.session_id, title: run.started_by.title }
       : undefined,
+    automation: run.automation ? { id: run.automation.id, name: run.automation.name } : undefined,
     workflowName: run.workflow_name,
     descendantRuns: (run.descendant_runs ?? []).map(toWorkflowRun),
     descendantRunCount: run.descendant_run_count,

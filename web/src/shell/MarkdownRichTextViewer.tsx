@@ -17,7 +17,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
-import type { Editor } from "@tiptap/core";
 import type { Transaction } from "@tiptap/pm/state";
 import type { Node } from "@tiptap/pm/model";
 import type { Comment } from "@/hooks/useComments";
@@ -45,13 +44,14 @@ import {
   type SearchDecorationState,
 } from "./TipTapSearchExtension";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
+import { MarkdownClipboard } from "./TipTapMarkdownClipboard";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { applyExternalMarkdown } from "./TipTapEditorHelpers";
 import { rememberSourceBlocks } from "./markdownSourceBlocks";
+import { savedMarkdown } from "./markdownSave";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
-  markdownKeepingSource,
 } from "./tiptapMarkdownPatches";
 
 // Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
@@ -63,14 +63,6 @@ installMarkdownSerializerPatch();
 // a bare inline child — the crash residual #2320 documented (see
 // tiptapMarkdownPatches.ts).
 installMarkdownParserPatch();
-
-// Unedited blocks keep their source (markdownSourceBlocks.ts). TipTap drops the
-// final newline and saves its trailing empty paragraph as blank lines, so end
-// the file the way it was loaded: with one newline, or none.
-function readMarkdown(editor: Editor, endsWithNewline: boolean): string {
-  const markdown = markdownKeepingSource(editor).replace(/\n+$/, "");
-  return endsWithNewline && markdown !== "" ? `${markdown}\n` : markdown;
-}
 
 // ---------------------------------------------------------------------------
 // MarkdownRichTextViewer — outer shell manages the editor key for remounting
@@ -316,7 +308,7 @@ function MarkdownRichTextViewerInner({
     const ed = editorRef.current;
     if (!ed) return "";
     savingDocRef.current = ed.state.doc;
-    const markdown = readMarkdown(ed, endsWithNewlineRef.current);
+    const markdown = savedMarkdown(ed, endsWithNewlineRef.current);
     // Document attributes can change without changing the saved Markdown.
     // The shared save hook skips the write (and markSaved) in that case.
     if (markdown === baselineRef.current) baselineDocRef.current = savingDocRef.current;
@@ -357,6 +349,7 @@ function MarkdownRichTextViewerInner({
       ...createMarkdownDocumentExtensions(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
       createSearchDecorationExtension(searchStateRef),
+      MarkdownClipboard,
     ],
     // commentStateRef is stable and a path change remounts this component
     // (editorKey), so the closed-over conversationId/path can't go stale;
@@ -385,7 +378,7 @@ function MarkdownRichTextViewerInner({
       // language change is a user edit even though it arrives blurred (the
       // picker holds focus), so isUserEditUpdate also honours its flag.
       if (baselineDocRef.current === null || !isUserEditUpdate(ed.isFocused, transaction)) {
-        baselineRef.current = readMarkdown(ed, endsWithNewlineRef.current);
+        baselineRef.current = savedMarkdown(ed, endsWithNewlineRef.current);
         baselineDocRef.current = ed.state.doc;
         setDirty(false);
         return;
@@ -397,7 +390,7 @@ function MarkdownRichTextViewerInner({
     onCreate: ({ editor: ed }) => {
       rememberSourceBlocks(ed, content);
       // Capture baseline after the initial content has been parsed.
-      baselineRef.current = readMarkdown(ed, endsWithNewlineRef.current);
+      baselineRef.current = savedMarkdown(ed, endsWithNewlineRef.current);
       baselineDocRef.current = ed.state.doc;
     },
   });
@@ -438,7 +431,7 @@ function MarkdownRichTextViewerInner({
       applyExternalMarkdown(editor, newContent);
       rememberSourceBlocks(editor, newContent);
       endsWithNewlineRef.current = newContent.endsWith("\n");
-      baselineRef.current = readMarkdown(editor, endsWithNewlineRef.current);
+      baselineRef.current = savedMarkdown(editor, endsWithNewlineRef.current);
       baselineDocRef.current = editor.state.doc;
       // Programmatic replace establishes a fresh baseline — no user edits relative to it.
       hasUserEditedRef.current = false;

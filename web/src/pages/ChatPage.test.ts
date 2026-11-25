@@ -12,6 +12,12 @@ import {
 } from "@/components/SlashCommandMenu";
 import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
+  consumePendingInitialPrompt,
+  isListeningForInitialPrompt,
+  setPendingInitialPrompt,
+  type PendingInitialPrompt,
+} from "@/store/chatStore";
+import {
   buildPendingBubbles,
   buildSlashCommandMap,
   composerOffersClear,
@@ -25,6 +31,8 @@ import {
   useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  initialPromptAgentId,
+  useInitialPromptDispatch,
   failedSessionLastError,
   isComposerReadOnly,
   isCostRoutingEligible,
@@ -42,7 +50,6 @@ import {
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
   isBackgroundTasksOnly,
-  splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
   unboundSessionResumableInApp,
@@ -1787,7 +1794,6 @@ describe("shouldSendInitialPrompt", () => {
     initialPrompt: "read the README",
     initialPromptFileCount: 0,
     promptConversationId: "conv_abc",
-    sentForConversationId: null,
     conversationId: "conv_abc",
     loadingConversation: false,
     agentId: "ag_abc123",
@@ -1827,29 +1833,6 @@ describe("shouldSendInitialPrompt", () => {
     expect(shouldSendInitialPrompt({ ...ready, initialPrompt, initialPromptFileCount: 1 })).toBe(
       true,
     );
-  });
-
-  it("does not send twice for the same conversation (once-guard)", () => {
-    // sentForConversationId mirrors the effect's ref after the first
-    // dispatch for this session. A failure means a re-render (e.g. runner
-    // re-poll) would resend into the same conversation.
-    expect(shouldSendInitialPrompt({ ...ready, sentForConversationId: "conv_abc" })).toBe(false);
-  });
-
-  it("sends again for a different conversation (per-session reset)", () => {
-    // ChatPage stays mounted across `/c/:a` → `/c/:b` (no route key), so a
-    // bare boolean once-guard would latch true after the first auto-send and
-    // silently drop the prompt for every later new chat. Keying the guard by
-    // conversation id resets it: a prompt consumed for conv_xyz still sends
-    // even though conv_abc was already dispatched.
-    expect(
-      shouldSendInitialPrompt({
-        ...ready,
-        promptConversationId: "conv_xyz",
-        sentForConversationId: "conv_abc",
-        conversationId: "conv_xyz",
-      }),
-    ).toBe(true);
   });
 
   it("waits while the conversation is still hydrating", () => {
@@ -1915,68 +1898,6 @@ describe("isSlashCommandText", () => {
     ["empty string", ""],
   ] as const)("does not treat %s as a slash command", (_label, text) => {
     expect(isSlashCommandText(text)).toBe(false);
-  });
-});
-
-describe("splitSlashCommand", () => {
-  // The composer overlay tints only `token`; `before`/`after` stay default,
-  // so the whole draft no longer goes blue once args are typed.
-  it("splits the command token from its args", () => {
-    expect(splitSlashCommand("/cross-review fix the bug")).toEqual({
-      before: "",
-      token: "/cross-review",
-      after: " fix the bug",
-    });
-  });
-
-  it("returns an empty `after` for a bare command", () => {
-    expect(splitSlashCommand("/oncall")).toEqual({
-      before: "",
-      token: "/oncall",
-      after: "",
-    });
-  });
-
-  it("preserves leading whitespace in `before`", () => {
-    expect(splitSlashCommand("  /compact")).toEqual({
-      before: "  ",
-      token: "/compact",
-      after: "",
-    });
-  });
-
-  it("keeps a plugin-namespaced skill name whole", () => {
-    expect(splitSlashCommand("/dev-productivity:simplify now")).toEqual({
-      before: "",
-      token: "/dev-productivity:simplify",
-      after: " now",
-    });
-  });
-
-  it("treats a known skill name with spaces as one token", () => {
-    const name = "/Simplified Technical English (ASD-STE100)";
-    expect(splitSlashCommand(`${name} rewrite this`, ["/compact", name])).toEqual({
-      before: "",
-      token: name,
-      after: " rewrite this",
-    });
-    // Without a catalog match only the first word reads as the command.
-    expect(splitSlashCommand(`${name} rewrite this`, ["/compact"])?.token).toBe("/Simplified");
-  });
-
-  it("matches a known skill whose first word is not command-shaped", () => {
-    const name = "/Node.js Best Practices";
-    expect(splitSlashCommand(`${name} here`, [name])).toEqual({
-      before: "",
-      token: name,
-      after: " here",
-    });
-    // Not command-shaped and not in the catalog: nothing to tint.
-    expect(splitSlashCommand(`${name} here`)).toBeNull();
-  });
-
-  it("returns null when the text isn't a command", () => {
-    expect(splitSlashCommand("just prose")).toBeNull();
   });
 });
 
@@ -2232,5 +2153,166 @@ describe("routing eligibility gates", () => {
     const child = { ...sdkSession, parentSessionId: "conv_parent" } as unknown as Session;
     expect(isCostRoutingEligible(info(true), child)).toBe(false);
     expect(isSubagentRoutingEligible(info(true), child)).toBe(false);
+  });
+});
+
+describe("useInitialPromptDispatch", () => {
+  const prompt: PendingInitialPrompt = { text: "Fix the build", skill: null };
+  interface Props {
+    conversationId: string | null;
+    loadingConversation: boolean;
+    agentId: string | null;
+  }
+  const loaded = (conversationId: string | null): Props => ({
+    conversationId,
+    loadingConversation: false,
+    agentId: "agent_1",
+  });
+  const loading = (conversationId: string): Props => ({
+    conversationId,
+    loadingConversation: true,
+    agentId: "agent_1",
+  });
+  function renderDispatch(initial: Props, options: { reactStrictMode?: boolean } = {}) {
+    const dispatch = vi.fn();
+    const rendered = renderHook(
+      (props: Props) => useInitialPromptDispatch({ ...props, dispatch }),
+      {
+        initialProps: initial,
+        ...options,
+      },
+    );
+    return { dispatch, ...rendered };
+  }
+
+  it("sends a prompt accepted while the session loads, once, after the page navigates away and back", () => {
+    const { dispatch, rerender } = renderDispatch(loading("conv_away_1"));
+    act(() => setPendingInitialPrompt("conv_away_1", prompt));
+    expect(dispatch).not.toHaveBeenCalled();
+    // Navigating away returns the prompt to the store instead of dropping it.
+    rerender(loaded("conv_elsewhere_1"));
+    expect(dispatch).not.toHaveBeenCalled();
+    rerender(loaded("conv_away_1"));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith(prompt, "agent_1");
+    // Re-renders and another visit don't send it again.
+    rerender(loaded("conv_away_1"));
+    rerender(loaded("conv_elsewhere_1"));
+    rerender(loaded("conv_away_1"));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns an unsent prompt when the page unmounts, and a later mount sends it once", () => {
+    const first = renderDispatch(loading("conv_unmount_1"));
+    act(() => setPendingInitialPrompt("conv_unmount_1", prompt));
+    first.unmount();
+    expect(first.dispatch).not.toHaveBeenCalled();
+    const second = renderDispatch(loaded("conv_unmount_1"));
+    expect(second.dispatch).toHaveBeenCalledTimes(1);
+    expect(second.dispatch).toHaveBeenCalledWith(prompt, "agent_1");
+  });
+
+  it("sends a stashed prompt once under StrictMode's double-invoked effects", () => {
+    setPendingInitialPrompt("conv_strict_1", prompt);
+    const { dispatch } = renderDispatch(loaded("conv_strict_1"), { reactStrictMode: true });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith(prompt, "agent_1");
+  });
+
+  it("sends an accepted prompt once under StrictMode's double-invoked effects", () => {
+    const { dispatch } = renderDispatch(loaded("conv_strict_2"), { reactStrictMode: true });
+    act(() => setPendingInitialPrompt("conv_strict_2", prompt));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("listens for its conversation's prompts only while mounted", () => {
+    const { unmount } = renderDispatch(loaded("conv_listen_1"));
+    expect(isListeningForInitialPrompt("conv_listen_1")).toBe(true);
+    unmount();
+    expect(isListeningForInitialPrompt("conv_listen_1")).toBe(false);
+    setPendingInitialPrompt("conv_listen_1", prompt);
+    expect(consumePendingInitialPrompt("conv_listen_1")).toEqual(prompt);
+  });
+});
+
+describe("useInitialPromptDispatch queueing", () => {
+  const first: PendingInitialPrompt = { text: "first", skill: null };
+  const second: PendingInitialPrompt = { text: "second", skill: null };
+  const loaded = (conversationId: string) => ({
+    conversationId,
+    loadingConversation: false,
+    agentId: "agent_1",
+  });
+
+  it("sends a prompt stashed after an earlier one was sent", () => {
+    const dispatch = vi.fn();
+    renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: loaded("conv_queue_after"),
+    });
+    act(() => setPendingInitialPrompt("conv_queue_after", first));
+    act(() => setPendingInitialPrompt("conv_queue_after", second));
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+
+  it("sends a prompt stashed while another is held, after it", () => {
+    const dispatch = vi.fn();
+    const { rerender } = renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: {
+        conversationId: "conv_queue_held",
+        loadingConversation: true,
+        agentId: "agent_1",
+      },
+    });
+    act(() => setPendingInitialPrompt("conv_queue_held", first));
+    act(() => setPendingInitialPrompt("conv_queue_held", second));
+    expect(dispatch).not.toHaveBeenCalled();
+    rerender(loaded("conv_queue_held"));
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+
+  it("returns both held and waiting prompts in order when the page unmounts", () => {
+    const held = renderHook((props) => useInitialPromptDispatch({ ...props, dispatch: vi.fn() }), {
+      initialProps: {
+        conversationId: "conv_queue_unmount",
+        loadingConversation: true,
+        agentId: "agent_1",
+      },
+    });
+    act(() => setPendingInitialPrompt("conv_queue_unmount", first));
+    act(() => setPendingInitialPrompt("conv_queue_unmount", second));
+    held.unmount();
+    const dispatch = vi.fn();
+    renderHook((props) => useInitialPromptDispatch({ ...props, dispatch }), {
+      initialProps: loaded("conv_queue_unmount"),
+    });
+    expect(dispatch.mock.calls.map(([prompt]) => prompt)).toEqual([first, second]);
+  });
+});
+
+describe("initialPromptAgentId", () => {
+  it("uses the session's bound agent on a session route, not the selected one from another chat", () => {
+    expect(
+      initialPromptAgentId({
+        urlConvId: "conv_1",
+        boundAgentId: "agent_bound",
+        agentId: "agent_selected",
+      }),
+    ).toBe("agent_bound");
+  });
+
+  it("uses the selected agent on the landing page", () => {
+    expect(
+      initialPromptAgentId({
+        urlConvId: null,
+        boundAgentId: "agent_bound",
+        agentId: "agent_selected",
+      }),
+    ).toBe("agent_selected");
+  });
+
+  it("falls back to the selected agent when a session has no bound agent yet", () => {
+    expect(
+      initialPromptAgentId({ urlConvId: "conv_1", boundAgentId: null, agentId: "agent_selected" }),
+    ).toBe("agent_selected");
   });
 });

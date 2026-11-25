@@ -25,7 +25,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { type SharingMode, isSingleUserMode } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentUserId,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { cn } from "@/lib/utils";
 import { type DefaultPublicSessions, useSetSharing, useSharing } from "@/hooks/useSharing";
 import {
@@ -110,11 +115,17 @@ export function SharingPage() {
   // too). Skipped in single-user mode where no auth endpoints exist.
   useEffect(() => {
     if (isSingleUser || capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
-      if (userId === null) return;
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active || userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
-    })();
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {

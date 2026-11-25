@@ -22,6 +22,7 @@ import {
   listSharedScheduledTasks,
   listAutomationFailures,
   runScheduledTaskNow,
+  reportLocalTimezone,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -380,6 +381,24 @@ describe("createScheduledTask", () => {
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
 
+  it("sends a saved workflow in place of a prompt, and reads it back", async () => {
+    const workflowId = "0123456789abcdef0123456789abcdef";
+    fetchMock.mockResolvedValue(
+      mockResponse({ ...TASK_WIRE, workflow_id: workflowId, workflow_details: "Only bugs" }),
+    );
+    const created = await createScheduledTask({
+      name: "n",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      workflowId,
+      workflowDetails: "Only bugs",
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty("prompt");
+    expect(body).toMatchObject({ workflow_id: workflowId, workflow_details: "Only bugs" });
+    expect(created).toMatchObject({ workflowId, workflowDetails: "Only bugs" });
+  });
+
   it("sends picked MCP services and omits an empty pick", async () => {
     fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
     const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
@@ -392,6 +411,17 @@ describe("createScheduledTask", () => {
 });
 
 describe("updateScheduledTask", () => {
+  it("stops running a saved workflow with an explicit null, and leaves it when omitted", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    await updateScheduledTask("st_1", { workflowId: null, prompt: "Summarize" });
+    await updateScheduledTask("st_1", { workflowDetails: "Only bugs" });
+    await updateScheduledTask("st_1", { workflowDetails: null });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0]).toEqual({ workflow_id: null, prompt: "Summarize" });
+    expect(bodies[1]).toEqual({ workflow_details: "Only bugs" });
+    expect(bodies[2]).toEqual({ workflow_details: null });
+  });
+
   it.each([undefined, null, 2.5])(
     "preserves, clears, or sets the cost limit (%s)",
     async (maxCostUsd) => {
@@ -514,6 +544,52 @@ describe("deleteScheduledTask", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/v1/scheduled-tasks/st_1");
     expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("reportLocalTimezone", () => {
+  const mockBrowserZone = (timeZone: string) =>
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      timeZone,
+    } as Intl.ResolvedDateTimeFormatOptions);
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("PUTs the browser's zone as the caller's default", async () => {
+    mockBrowserZone("America/Chicago");
+    fetchMock.mockResolvedValueOnce(mockResponse({ timezone: "America/Chicago" }));
+    await reportLocalTimezone();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/scheduled-tasks/default-timezone");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({ timezone: "America/Chicago" });
+  });
+
+  it.each(["empty", "throws"])("does not report a zone when discovery %s", async (failure) => {
+    if (failure === "throws") {
+      vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockImplementationOnce(() => {
+        throw new Error("timezone discovery unavailable");
+      });
+    } else {
+      mockBrowserZone("");
+    }
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a failed request", () => fetchMock.mockRejectedValueOnce(new TypeError("offline"))],
+    [
+      "a server that predates the endpoint",
+      () => fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 405 })),
+    ],
+  ])("ignores %s", async (_case, respond) => {
+    mockBrowserZone("America/Chicago");
+    respond();
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

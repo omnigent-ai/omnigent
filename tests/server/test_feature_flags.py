@@ -11,8 +11,11 @@ from omnigent.server.feature_flags import (
     FEATURE_DEFINITIONS,
     FEATURES_ENV_VAR,
     Feature,
+    FeatureDefinition,
     FeatureFlags,
+    FeatureIntent,
     harness_install_enabled,
+    resolve_effective_features,
     resolve_feature_flags,
 )
 
@@ -31,6 +34,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.PEER_SESSION_MESSAGING,
             Feature.PROJECT_KANBAN,
             Feature.PROJECT_REPOSITORY_CREATION,
+            Feature.SCRIPTED_SESSIONS,
             Feature.SESSION_ORCHESTRATION,
             Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
@@ -43,7 +47,6 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
-        "arca_shutdown_warnings": False,
         "import_review": False,
         "sidebar_grouping_ui": True,
         "workspace_content_search": True,
@@ -57,11 +60,16 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "project_kanban": True,
         "project_repository_creation": True,
         "quick_pick_palette": False,
+        "workspace_sidebar_v2": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
+        "floating_composer": False,
+        "sidebar_saved_views": False,
+        "floating_panes": False,
+        "shared_session_updates_socket": False,
     }
 
 
@@ -80,6 +88,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -107,6 +116,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -127,6 +137,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -149,6 +160,7 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -194,6 +206,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "peer_session_messaging",
         "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -202,11 +215,10 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     )
 
 
-def test_arca_shutdown_warnings_are_frontend_visible() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: "arca_shutdown_warnings"})
-
-    assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
-    assert flags.frontend_dict()["arca_shutdown_warnings"] is True
+def test_floating_composer_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "floating_composer"})
+    assert flags.enabled(Feature.FLOATING_COMPOSER)
+    assert flags.frontend_dict()["floating_composer"] is True
 
 
 def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
@@ -216,6 +228,97 @@ def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
 
     assert flags.enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
     assert flags.frontend_dict()["chat_composer_codemirror"] is True
+
+
+def test_workspace_sidebar_v2_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.WORKSPACE_SIDEBAR_V2)
+    assert resolve_feature_flags({}).frontend_dict()["workspace_sidebar_v2"] is False
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "workspace_sidebar_v2"})
+
+    assert flags.enabled(Feature.WORKSPACE_SIDEBAR_V2)
+    assert flags.frontend_dict()["workspace_sidebar_v2"] is True
+
+
+def test_shared_session_updates_socket_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.SHARED_SESSION_UPDATES_SOCKET)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "shared_session_updates_socket"})
+
+    assert flags.enabled(Feature.SHARED_SESSION_UPDATES_SOCKET)
+    assert flags.frontend_dict()["shared_session_updates_socket"] is True
+
+
+def test_sidebar_saved_views_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.SIDEBAR_SAVED_VIEWS)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "sidebar_saved_views"})
+
+    assert flags.enabled(Feature.SIDEBAR_SAVED_VIEWS)
+    assert flags.frontend_dict()["sidebar_saved_views"] is True
+
+
+@pytest.mark.parametrize(
+    ("override", "enabled", "intent"),
+    [
+        ("", False, FeatureIntent.AUTOMATIC),
+        ("workspace_sidebar_v2", True, FeatureIntent.AUTOMATIC),
+        ("workspace_sidebar_v2,-floating_panes", False, FeatureIntent.OFF),
+        ("-floating_panes,workspace_sidebar_v2", False, FeatureIntent.OFF),
+        ("floating_panes", True, FeatureIntent.ON),
+        ("floating_panes,-floating_panes", False, FeatureIntent.OFF),
+    ],
+)
+def test_floating_panes_follows_workspace_sidebar_v2_unless_named(
+    override: str, enabled: bool, intent: FeatureIntent
+) -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: override})
+
+    assert flags.enabled(Feature.FLOATING_PANES) is enabled
+    assert flags.frontend_dict()["floating_panes"] is enabled
+    assert flags.intent(Feature.FLOATING_PANES) is intent
+
+
+def test_a_following_feature_on_automatic_takes_its_policys_new_value() -> None:
+    # The followed feature turning on by default carries Automatic along, but not an explicit off.
+    ramped = tuple(
+        dataclasses.replace(definition, default_enabled=True)
+        if definition.feature is Feature.WORKSPACE_SIDEBAR_V2
+        else definition
+        for definition in FEATURE_DEFINITIONS
+    )
+
+    assert Feature.FLOATING_PANES in resolve_effective_features(ramped, {})
+    assert Feature.FLOATING_PANES not in resolve_effective_features(
+        ramped, {Feature.FLOATING_PANES: FeatureIntent.OFF}
+    )
+    assert Feature.FLOATING_PANES not in resolve_effective_features(FEATURE_DEFINITIONS, {})
+
+
+def test_a_followed_feature_needs_a_definition_and_no_cycle() -> None:
+    def definition(feature: Feature, follows: Feature) -> FeatureDefinition:
+        return FeatureDefinition(
+            feature=feature,
+            description="",
+            owner="web",
+            review_by_release="0.0.0",
+            follows=follows,
+        )
+
+    with pytest.raises(ValueError, match="has no definition"):
+        resolve_effective_features((definition(Feature.FLOATING_PANES, Feature.CANVAS),), {})
+    cycle = (
+        definition(Feature.FLOATING_PANES, Feature.WORKSPACE_SIDEBAR_V2),
+        definition(Feature.WORKSPACE_SIDEBAR_V2, Feature.FLOATING_PANES),
+    )
+    with pytest.raises(ValueError, match="follows itself"):
+        resolve_effective_features(cycle, {})
+    # An explicit intent doesn't read what the feature follows, so it settles either case.
+    on = {Feature.FLOATING_PANES: FeatureIntent.ON}
+    missing = (definition(Feature.FLOATING_PANES, Feature.CANVAS),)
+    assert resolve_effective_features(missing, on) == {Feature.FLOATING_PANES}
+    off = {Feature.WORKSPACE_SIDEBAR_V2: FeatureIntent.OFF}
+    assert resolve_effective_features(cycle, off) == frozenset()
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:

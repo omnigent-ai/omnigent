@@ -199,6 +199,10 @@ describe("validateSchedule — 1-hour floor + required selections", () => {
 });
 
 describe("describeSchedule", () => {
+  it("describes a withheld trigger rule as nothing", () => {
+    expect(describeSchedule(null)).toBe("");
+  });
+
   it("describes a one-time rule as once", () => {
     expect(
       describeSchedule(
@@ -246,6 +250,25 @@ describe("describeSchedule", () => {
     "FREQ=MINUTELY;INTERVAL=60;BYMONTH=3",
     "FREQ=MINUTELY;INTERVAL=10;BYSECOND=30",
   ])("preserves filters the library omits from minute summaries: %s", (rule) => {
+    expect(describeSchedule(rule)).toBe(rule);
+  });
+
+  it.each([
+    "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0,30",
+    "FREQ=DAILY;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYMONTHDAY=-1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYMONTH=1,4,7,10;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYMONTH=1,13;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYEASTER=0;BYHOUR=9;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=30",
+    "FREQ=WEEKLY;INTERVAL=2;WKST=SU;BYDAY=SU,MO;BYHOUR=9;BYMINUTE=0",
+  ])("shows a rule its phrases can't state exactly as written: %s", (rule) => {
     expect(describeSchedule(rule)).toBe(rule);
   });
 
@@ -334,6 +357,10 @@ describe("describeSchedule", () => {
 });
 
 describe("nextRunAtMs", () => {
+  it("has no next run without a rule", () => {
+    expect(nextRunAtMs(null, "UTC")).toBeNull();
+  });
+
   it("computes the next daily occurrence after now", () => {
     // 2026-01-01 06:00 UTC; a 9:00 UTC daily rule fires later the same day.
     const now = new Date("2026-01-01T06:00:00Z");

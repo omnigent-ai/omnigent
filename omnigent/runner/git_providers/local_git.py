@@ -26,15 +26,25 @@ def remote_urls(run: TextRun) -> list[tuple[str, str]]:
     before any ``url.<base>.insteadOf`` rewrite. Reads git config because
     ``git remote -v`` lines vary; a partial clone's fetch line ends with its filter.
     """
-    rc, out = run(["config", "-z", "--get-regexp", r"^remote\..*\.url$"])
-    if rc != 0:
-        return []
-    urls: dict[str, str] = {}
-    for entry in out.split("\0"):
-        key, _, url = entry.partition("\n")
-        if key.startswith("remote.") and key.endswith(".url"):
-            urls.setdefault(key[len("remote.") : -len(".url")], url)
+    urls = remote_settings(run, "url")
     return [(name, urls[name]) for name in sorted(urls, key=lambda name: name != "origin")]
+
+
+def remote_settings(run: TextRun, key: str) -> dict[str, str]:
+    """Return each remote's first ``remote.<name>.<key>`` value, keyed by remote name.
+
+    :param key: The config key under each remote, e.g. ``"url"``; matched as a regex.
+    """
+    rc, out = run(["config", "-z", "--get-regexp", rf"^remote\..*\.{key}$"])
+    if rc != 0:
+        return {}
+    suffix = f".{key}"
+    values: dict[str, str] = {}
+    for entry in out.split("\0"):
+        name, _, value = entry.partition("\n")
+        if name.startswith("remote.") and name.endswith(suffix):
+            values.setdefault(name[len("remote.") : -len(suffix)], value)
+    return values
 
 
 def resolve_diff_base(run: TextRun, base: str) -> str:

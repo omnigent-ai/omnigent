@@ -13,6 +13,7 @@ const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
 const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
+const { DESKTOP_OPEN_PORTS } = require("../src/desktopOpenServer");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
 /** Build a registry with spy-backed injected deps. Returns the registry plus
@@ -478,6 +479,26 @@ function makeEventCapturingRegistry(extra = {}) {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("invalidates continuations on page-initiated navigation, but not redirects", () => {
+    const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv", "https://example.com", undefined, { agent: true });
+    const pending = registry.beginAgentNavigation("conv");
+    fire("will-redirect", "https://example.com/redirect");
+    assert.equal(pending(), true);
+    fire("will-navigate", "https://example.com/newer");
+    assert.equal(pending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", pending.retryToken), null);
+
+    const popupPending = registry.beginAgentNavigation("conv");
+    registry.setOpenTabSupported(true);
+    windowOpen("https://example.com/background", "background-tab");
+    assert.equal(popupPending(), true, "a separate tab does not supersede this view");
+    windowOpen("https://example.com/popup", "foreground-tab");
+    assert.equal(loaded.at(-1), "https://example.com/popup");
+    assert.equal(popupPending(), false);
+    assert.equal(registry.beginAgentNavigation("conv", popupPending.retryToken), null);
+  });
+
   it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
@@ -648,6 +669,14 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(await registry.shouldCancelAgentRequest(frame), false);
     assert.equal(await registry.shouldCancelAgentResponse(frame), false);
     assert.equal(fire("will-frame-navigate", frame.url).prevented, false);
+    // A pane allowed to load a local server still can't hand a conversation to the main window.
+    for (const port of DESKTOP_OPEN_PORTS) {
+      for (const route of ["open-conversation", "status"]) {
+        const handoff = { ...frame, url: `http://127.0.0.1:${port}/${route}`, resourceType: "xhr" };
+        // oxlint-disable-next-line no-await-in-loop -- Sequential by design: one request at a time.
+        assert.equal(await registry.shouldCancelAgentRequest(handoff), true, handoff.url);
+      }
+    }
     registry.openOrNavigate("remote", "https://example.com", undefined, { agent: true });
     assert.equal(
       await registry.shouldCancelAgentRequest({ ...frame, webContentsId: idOf("remote") }),

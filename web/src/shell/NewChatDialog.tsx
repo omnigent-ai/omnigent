@@ -72,13 +72,14 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
-import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import {
-  ComposerMirror,
-  MIRRORED_TEXTAREA_CLASS,
-  renderMentionTokens,
-  useComposerMirrorAlignment,
-} from "@/components/composer/MentionTokenOverlay";
+  isComposerTextarea,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
+import {
+  SHELL_MENTION_REFUSAL,
+  useComposerHighlight,
+} from "@/components/composer/composerHighlight";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -107,8 +108,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { LaptopDbcertBanner } from "@/components/DbcertBanner";
-import { iconForAgent } from "@/components/AgentCard";
+import { iconForAgent } from "@/components/agentIcon";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -179,6 +179,7 @@ import {
   isNativeOpenCodeHarness,
   MIN_TMUX_VERSION,
   skillInvocationPrefix,
+  supportsNativeShellInput,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -292,7 +293,6 @@ import {
   smartRoutingUnavailableReason,
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
-import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   partitionAgentsByKind,
   partitionPickerEntries,
@@ -331,12 +331,14 @@ import {
 import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
-  previewIsUnsupported,
   sandboxModelOptionsKey,
-  useSandboxModelOptions,
   useSandboxUnsupportedAgents,
 } from "@/hooks/useSandboxModelOptions";
-import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
+import {
+  newSandboxModelOptions,
+  noReachableModelsMessage,
+  useNewSandboxModelCatalog,
+} from "@/hooks/useNewSandboxModelCatalog";
 import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
@@ -344,10 +346,8 @@ import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/ar
 import {
   connectArcaHost,
   controlHost,
-  checkDbcert,
   getDesktopFeatures,
   getHostIdentity,
-  hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
   type HostIdentity,
@@ -407,7 +407,6 @@ import {
 import {
   composerInlineMentions,
   expandMentionTokens,
-  findMentionTokens,
   presentMentions,
   type TaggedMentions,
   withSessionMentionHint,
@@ -422,6 +421,7 @@ import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
 import {
+  ARIA_MOD_KEY,
   composerSendShortcutKeys,
   CompactShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -1224,10 +1224,6 @@ function NewChatPickerLoading({
       <Spinner className="size-4" aria-hidden="true" />
     </span>
   );
-}
-
-function noReachableModelsMessage(name: string | undefined): string {
-  return `No models are available for ${name ?? "this harness"}. Ask an admin to enable model access.`;
 }
 
 /**
@@ -2173,6 +2169,7 @@ const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed"
 interface LandingDraftState {
   draft: LandingDraft | null;
   revision: number;
+  nestedProvisional?: ReturnType<typeof newTempConversation>;
 }
 const landingDrafts = new Map<string | null, LandingDraftState>();
 
@@ -2295,20 +2292,11 @@ function forgetKeptLinkedPrompt(
   }
 }
 
-function NewChatWorkspaceControls({
-  children,
-  disabled,
-}: {
-  children: ReactNode;
-  disabled: boolean;
-}) {
+function NewChatWorkspaceControls({ children }: { children: ReactNode }) {
   const isMobile = useIsMobileViewport();
   if (!isMobile) return children;
   return (
-    <fieldset
-      disabled={disabled}
-      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]"
-    >
+    <fieldset className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]">
       <OmniGlassSurface borderRadius={20} className="-z-10" />
       {children}
     </fieldset>
@@ -2389,7 +2377,7 @@ function NewChatLandingContent({
   projectHomeName?: string;
   onSessionStarted?: () => void;
 }) {
-  const [draftState] = useState(() => {
+  const [draftState] = useState<LandingDraftState>(() => {
     const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
     landingDrafts.set(siblingSourceId, state);
     return state;
@@ -2722,10 +2710,14 @@ function NewChatLandingContent({
   // A draft parked at link consumption is the only copy a same-commit remount can
   // read, so it follows every edit; a submitted draft stays spent.
   useEffect(() => {
-    if (!syncsParkedDraftRef.current || submittedRef.current) return;
+    if (
+      !syncsParkedDraftRef.current ||
+      submittedRef.current ||
+      (siblingSourceId && draftState.nestedProvisional !== nestedProvisionalRef.current)
+    )
+      return;
     writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
-  }, [message, draftState]);
-  const [checkingDbcert, setCheckingDbcert] = useState(false);
+  }, [message, draftState, siblingSourceId]);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
@@ -2748,6 +2740,12 @@ function NewChatLandingContent({
   // shared hook continues to grow from the one-row minimum.
   useAutoGrowTextarea(textareaRef, message, 9);
 
+  // The chip inserter comes from useMentionBrowser, set up further down.
+  const attachPastedFilesRef = useRef<
+    (files: File[], target: ComposerTextTarget, trayFiles: File[]) => File[]
+  >(() => []);
+  const chipTokensRef = useRef<() => readonly string[]>(() => []);
+
   // Attachments for the first message — same affordances as the in-session
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn. Validation
@@ -2762,12 +2760,32 @@ function NewChatLandingContent({
     addFiles,
     removeFile,
     restoreFiles,
+    appendFiles,
     onPaste,
     clearError,
   } = useComposerAttachments({
     initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
+    onPasteChips:
+      composerEngine === "codemirror"
+        ? (pasted, target, trayFiles) => attachPastedFilesRef.current(pasted, target, trayFiles)
+        : undefined,
+    chipTokens: () => chipTokensRef.current(),
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // The panel's prompt takes the keyboard each time the panel does, after any kept draft.
+  useEffect(() => {
+    if (!floating) return;
+    return floating.subscribeShown(() => {
+      const input = textareaRef.current;
+      if (!input) return;
+      const end = input.value.length;
+      input.setSelectionRange(end, end);
+      input.focus({ preventScroll: true });
+      // Setting the caret doesn't scroll, so a long draft shows its end where typing goes.
+      if (isComposerTextarea(input)) input.scrollTop = input.scrollHeight;
+      else input.revealCaret();
+    });
+  }, [floating]);
   // A cancelled native picker fires `cancel`, which React has no prop for.
   useEffect(() => {
     const input = fileInputRef.current;
@@ -2779,9 +2797,7 @@ function NewChatLandingContent({
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
-    if (!checkingDbcert) addFiles(droppedFiles);
-  });
+  const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -3103,9 +3119,7 @@ function NewChatLandingContent({
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [dbcertRequired, setDbcertRequired] = useState(false);
   const createAttemptRef = useRef<symbol | null>(null);
-  const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
@@ -3144,21 +3158,31 @@ function NewChatLandingContent({
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped once the draft is sent to a create, so the
+  // `submittedRef` is flipped once the draft is submitted, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
-  const [nestedProvisional, setNestedProvisional] = useState(newTempConversation);
+  const [nestedProvisional, setNestedProvisional] = useState(
+    () => (draftState.nestedProvisional ??= newTempConversation()),
+  );
+  const nestedProvisionalRef = useRef(nestedProvisional);
+  nestedProvisionalRef.current = nestedProvisional;
+  const clearNestedDraft = useCallback(
+    (id: string) => {
+      if (draftState.nestedProvisional?.id !== id) return;
+      draftState.nestedProvisional = undefined;
+      writeLandingDraft(draftState, null);
+      forgetKeptLinkedPrompt(siblingSourceId, null);
+    },
+    [draftState, siblingSourceId],
+  );
   const siblingSourceRef = useRef(siblingSource);
   siblingSourceRef.current = siblingSource;
   const siblingSourceKey = siblingSource?.id;
   useEffect(() => {
     const source = siblingSourceRef.current;
-    if (!source || submittedRef.current) return;
-    addNestedSessionDraft(queryClient, nestedProvisional.id, source);
-    return () => {
-      if (!submittedRef.current) removeNestedSessionDraft(queryClient, nestedProvisional.id);
-    };
-  }, [queryClient, nestedProvisional, siblingSourceKey]);
+    if (!source || draftState.nestedProvisional !== nestedProvisional) return;
+    addNestedSessionDraft(queryClient, nestedProvisional.id, source, clearNestedDraft);
+  }, [queryClient, nestedProvisional, siblingSourceKey, clearNestedDraft, draftState]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
@@ -3200,12 +3224,14 @@ function NewChatLandingContent({
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftState, draftRef.current);
+        if (!siblingSourceId || draftState.nestedProvisional === nestedProvisionalRef.current) {
+          writeLandingDraft(draftState, draftRef.current);
+        }
       } else if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }
     };
-  }, [draftState]);
+  }, [draftState, siblingSourceId]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -3761,26 +3787,24 @@ function NewChatLandingContent({
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
-  const sandboxModelCapabilities =
-    info !== "loading" && previewSandboxProvider !== null
-      ? info.sandbox_provider_capabilities?.[previewSandboxProvider]
-      : undefined;
-  const sandboxDefaultModelsOffered =
-    sandboxSelected &&
-    sandboxModelCapabilities?.default_models === true &&
-    sandboxModelCapabilities.inference_models !== true;
-  const sandboxPreviewsOffered =
-    sandboxSelected &&
-    previewSandboxProvider !== null &&
-    info !== "loading" &&
-    (sandboxModelCapabilities?.inference_models === true || sandboxDefaultModelsOffered);
-  const sandboxPreviewEnabled = sandboxPreviewsOffered && previewHarness !== null;
-  const sandboxModels = useSandboxModelOptions(
+  const {
+    preview: sandboxModels,
+    previewsOffered: sandboxPreviewsOffered,
+    previewEnabled: sandboxPreviewEnabled,
+    defaultModelsEnabled: sandboxDefaultModelsEnabled,
+    sessionCatalog: sandboxSessionCatalog,
+    inferenceConfigured: sandboxInferenceConfigured,
+    pending: sandboxCatalogPending,
+    unsupported: sandboxSelectedUnsupported,
+    boundCatalogError: sandboxBoundCatalogError,
+    defaultCatalogError: sandboxDefaultCatalogError,
+    catalog: sandboxCatalog,
+  } = useNewSandboxModelCatalog(
     previewSandboxProvider,
     previewHarness,
     effectiveAgentId,
     cacheUser,
-    sandboxPreviewEnabled,
+    sandboxSelected,
   );
   // Only harness rows gray out; agents can switch brains, so the submit check blocks them.
   const sandboxPreviewEntries = useMemo(
@@ -3809,62 +3833,14 @@ function NewChatLandingContent({
       ),
     [sandboxUnsupportedAgents, harnessEntries],
   );
-  // A harness the default catalog cannot serve keeps its ordinary picker.
-  const sandboxDefaultModelsEnabled =
-    sandboxDefaultModelsOffered && sandboxModels.data?.status !== "unconfigured";
-  // The agent's last sandbox session catalog is more accurate than the gateway preview.
-  const savedSandboxCatalog = useSavedSandboxSessionCatalog(
-    sandboxDefaultModelsOffered ? previewSandboxProvider : null,
-    previewHarness,
-    effectiveAgentId,
-  );
-  const sandboxSessionCatalog =
-    sandboxDefaultModelsEnabled && sandboxModels.data?.status !== "unsupported"
-      ? savedSandboxCatalog
-      : undefined;
-  const sandboxInferenceConfigured =
-    sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
-  const sandboxCatalogPending =
-    sandboxPreviewEnabled && sandboxModels.data === undefined && sandboxModels.isLoading;
-  // Advisory catalogs never block launch; only a provider's certain "unsupported" does.
-  const sandboxSelectedUnsupported = sandboxPreviewEnabled && previewIsUnsupported(sandboxModels);
   const sandboxBlockedName =
     selectedNativeHarness === null && pickedHarness !== null
       ? (brainHarnessLabelsAll[pickedHarness] ?? pickedHarness)
       : selectedAgent?.display_name;
   const sandboxCatalogError = sandboxSelectedUnsupported
     ? (sandboxModels.data?.error ?? noReachableModelsMessage(sandboxBlockedName))
-    : sandboxPreviewEnabled && !sandboxDefaultModelsEnabled
-      ? (sandboxModels.error?.message ??
-        (sandboxModels.data?.configured && sandboxModels.data.status !== "ready"
-          ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
-          : null))
-      : null;
-  const sandboxDefaultCatalogError =
-    sandboxDefaultModelsEnabled && sandboxSessionCatalog === undefined
-      ? (sandboxModels.error?.message ??
-        (sandboxModels.data !== undefined &&
-        ["unavailable", "empty"].includes(sandboxModels.data.status)
-          ? (sandboxModels.data.error ?? "Could not load AI Gateway models.")
-          : null))
-      : null;
-  const sandboxCatalog = useMemo(
-    () =>
-      sandboxDefaultModelsEnabled
-        ? (sandboxSessionCatalog ??
-          (sandboxDefaultCatalogError ? [] : (sandboxModels.data?.models ?? [])))
-        : sandboxInferenceConfigured
-          ? sandboxModels.data!.models
-          : undefined,
-    [
-      sandboxDefaultModelsEnabled,
-      sandboxSessionCatalog,
-      sandboxDefaultCatalogError,
-      sandboxInferenceConfigured,
-      sandboxModels.data,
-    ],
-  );
+    : sandboxBoundCatalogError;
   // Saved session rows keep the harness's in-session effort ladder.
   const sandboxEffortLevels = useCallback(
     (models: readonly NativeModelOption[], model: string | null | undefined): readonly string[] =>
@@ -3882,10 +3858,11 @@ function NewChatLandingContent({
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
-        ? (sandboxCatalog ??
-          (sandboxCatalogPending || sandboxCatalogError
-            ? []
-            : CLAUDE_NATIVE_MODELS.map((model) => ({ id: model.id, displayName: model.id }))))
+        ? newSandboxModelOptions(
+            "claude-native",
+            sandboxCatalog,
+            sandboxCatalogPending || Boolean(sandboxCatalogError),
+          )
         : (availableClaudeModels ?? []).map((option) => ({
             id: option.id,
             model: option.model,
@@ -5627,7 +5604,6 @@ function NewChatLandingContent({
     debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
     currentSessionId: null,
   });
-  const mirrorRef = useRef<HTMLDivElement>(null);
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -5643,13 +5619,16 @@ function NewChatLandingContent({
     mentionOpen,
     sessionMenu,
     mentionedItems,
-    setMentionedItems,
     attachMention,
     openMentionDir,
     mentionedSessions,
-    setMentionedSessions,
     attachSession,
+    attachPastedFiles,
+    mentionedAttachments,
     mentionTokens,
+    ownedChipTokens,
+    resetMentions,
+    noteTextChange: noteMentionTextChange,
     handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
@@ -5662,15 +5641,47 @@ function NewChatLandingContent({
     setText: setMessage,
     textareaRef,
     initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
+    onDemoteChips: appendFiles,
   });
-  clearTaggedMentionsRef.current = () => {
-    setMentionedItems([]);
-    setMentionedSessions([]);
-  };
+  clearTaggedMentionsRef.current = resetMentions;
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
-  const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
-  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown, textareaNode);
+  attachPastedFilesRef.current = attachPastedFiles;
+  chipTokensRef.current = ownedChipTokens;
+  // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the message.
+  const attachedFiles = [
+    ...files,
+    ...presentMentions(mentionedAttachments, [message]).map((attachment) => attachment.file),
+  ];
+  // The draft a sibling or new session picks up carries live chips as tray files.
+  draftRef.current.files = attachedFiles;
+  const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
+  const taggedMentions = useMemo(
+    () =>
+      presentMentions(
+        composerInlineMentions(
+          { files: mentionedItems, sessions: mentionedSessions, attachments: mentionedAttachments },
+          selectedAgent?.harness ?? null,
+        ),
+        [message],
+      ),
+    [mentionedItems, mentionedSessions, mentionedAttachments, selectedAgent?.harness, message],
+  );
+  const highlight = useComposerHighlight({
+    value: message,
+    commandNames: skillCommandNames,
+    enabled: attachedFiles.length === 0,
+    nativeShell: supportsNativeShellInput(skillsHarness) ? skillsHarness : null,
+    classifyValue: sanitizeInitialPrompt(message),
+    mentionTokens,
+    textareaRef,
+    textareaNode,
+    sendContext: { mentions: taggedMentions },
+  });
+  // However the tag goes (an edit, Backspace over its token), its refusal goes with it.
+  useEffect(() => {
+    if (highlight.refusal === null && createError === SHELL_MENTION_REFUSAL) setCreateError(null);
+  }, [highlight.refusal, createError]);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -5858,7 +5869,7 @@ function NewChatLandingContent({
         message: "This project's configured agent is unavailable — pick an agent to continue",
       };
     }
-    if (message.trim().length === 0 && files.length === 0) {
+    if (message.trim().length === 0 && attachedFiles.length === 0) {
       return { field: "other", message: "Enter a message to get started" };
     }
     if (selectedAgent == null || creating) return { field: "other", message: null };
@@ -6199,6 +6210,12 @@ function NewChatLandingContent({
   // including when they navigated away and the unmount cleanup already
   // dropped it on the strength of the submit.
   function returnDraftToUser(temporaryConversationId?: string) {
+    if (
+      siblingSource &&
+      !submittedRef.current &&
+      draftState.nestedProvisional !== nestedProvisional
+    )
+      return;
     submittedRef.current = false;
     if (submittedLinkedPromptRef.current !== null) {
       submittedKeptPromptIds.delete(submittedLinkedPromptRef.current.id);
@@ -6206,9 +6223,12 @@ function NewChatLandingContent({
     }
     submittedDraftRevisionRef.current = null;
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
-    if (siblingSource && onScreenRef.current) {
-      setNestedProvisional(newTempConversation());
+    if (siblingSource) {
+      const provisional = (draftState.nestedProvisional ??= newTempConversation());
+      addNestedSessionDraft(queryClient, provisional.id, siblingSource, clearNestedDraft);
+      if (onScreenRef.current) setNestedProvisional(provisional);
     }
+    // The relinquished message's pasted chips go with its tray files: the temporary draft holds the same Files.
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
         ? { ...draftRef.current, message: "", files: [] }
@@ -6220,16 +6240,14 @@ function NewChatLandingContent({
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
       // Merged tags, so recovered tokens still expand to their own targets.
-      if (returnedDraft.mentions) {
-        setMentionedItems(returnedDraft.mentions.files);
-        setMentionedSessions(returnedDraft.mentions.sessions);
-      }
+      if (returnedDraft.mentions) resetMentions(returnedDraft.mentions);
     } else {
       writeLandingDraft(draftState, returnedDraft);
     }
   }
 
   async function handleCreate() {
+    if (siblingSource && draftState.nestedProvisional !== nestedProvisional) return;
     // Captured before any await: a newer prompt link can replace the kept record
     // while an earlier submit is still waiting on a pre-create check.
     const submittedLinkedPrompt = keptLinkedRef.current;
@@ -6238,6 +6256,10 @@ function NewChatLandingContent({
     // a blank message, host, agent, or workspace.
     if (!canSubmit) {
       handleBlockedSubmit();
+      return;
+    }
+    if (highlight.refusal !== null) {
+      setCreateError(highlight.refusal);
       return;
     }
     if (createAttemptRef.current !== null) return;
@@ -6289,46 +6311,13 @@ function NewChatLandingContent({
       }
     };
     try {
-      if (sandboxSelected && effectiveSandboxProvider === "arclet" && hasDbcertPreflightBridge()) {
-        const skipCheck = new Promise<null>((resolve) => {
-          skipDbcertCheckRef.current = () => resolve(null);
-        });
-        setCheckingDbcert(true);
-        setDbcertRequired(false);
-        const credentials = await Promise.race([
-          getDesktopFeatures().then((features) =>
-            createAttemptRef.current === createAttempt &&
-            skipDbcertCheckRef.current !== null &&
-            onScreenRef.current &&
-            window.location.href === createLocation &&
-            features?.databricksInternalFeatures === true &&
-            features.canRefreshDbcert === true
-              ? checkDbcert()
-              : null,
-          ),
-          skipCheck,
-        ]);
-        skipDbcertCheckRef.current = null;
-        if (
-          createAttemptRef.current !== createAttempt ||
-          !onScreenRef.current ||
-          window.location.href !== createLocation
-        )
-          return;
-        setCheckingDbcert(false);
-        if (credentials !== null && !credentials.ok) {
-          setCreateError(credentials.error);
-          return;
-        }
-        const needsDbcert = credentials !== null && !credentials.valid;
-        setDbcertRequired(needsDbcert);
-        if (needsDbcert) return;
-      }
-      // Spend the draft only once provisioning starts, after the laptop credential check.
+      if (siblingSource && draftState.nestedProvisional !== nestedProvisional) return;
+      // Spend the draft only once provisioning starts.
       // A composer remounted in this commit would otherwise restore the submitted text.
       if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      draftState.nestedProvisional = undefined;
       submittedLinkedPromptRef.current = submittedLinkedPrompt;
       if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
@@ -6427,13 +6416,9 @@ function NewChatLandingContent({
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const liveMentions = presentMentions(
-        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
-        [message],
-      );
       const initialPrompt = withSessionMentionHint(
-        expandMentionTokens(sanitizeInitialPrompt(message), liveMentions),
-        liveMentions.some((m) => m.marker.startsWith("[Session: ")),
+        expandMentionTokens(sanitizeInitialPrompt(message), taggedMentions),
+        taggedMentions.some((m) => m.marker.startsWith("[Session: ")),
       );
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
@@ -6499,7 +6484,9 @@ function NewChatLandingContent({
         : matchSkillInvocation(initialPrompt, availableSkills);
       const serverOwnsInitialInput =
         sandboxSelected && info !== "loading" && info.durable_initial_input === true;
-      if (!serverOwnsInitialInput) undeliveredPrompt = { text: initialPrompt, skill, files };
+      if (!serverOwnsInitialInput) {
+        undeliveredPrompt = { text: initialPrompt, skill, files: attachedFiles };
+      }
       const initialInput =
         skill !== null
           ? {
@@ -6529,9 +6516,11 @@ function NewChatLandingContent({
         }
         const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
+        // The new sandbox's host id, minted client-side as the JSON create does.
+        const managedBundleHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
         if (sandboxSelected) {
-          // Bundle creates send no host id until the server's multipart host_id is deployed.
           metadata.host_type = "managed";
+          if (managedBundleHostId) metadata.host_id = managedBundleHostId;
           metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
           if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
           if (selectedSandboxProfile !== null) {
@@ -6576,11 +6565,13 @@ function NewChatLandingContent({
         const bundled = await createBundledSession(
           bundle,
           metadata,
-          serverOwnsInitialInput ? files : [],
+          serverOwnsInitialInput ? attachedFiles : [],
         );
         data = { id: bundled.id };
         createdSessionId = data.id;
         launchedAgentId = bundled.agentId ?? null;
+        // Route the new session's first requests by the host id it was created with.
+        if (managedBundleHostId) setSessionHost(data.id, managedBundleHostId);
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
@@ -6597,7 +6588,7 @@ function NewChatLandingContent({
           // The floating panel delivers the first message itself; no window shows a temp chat.
           localConv = floating
             ? null
-            : beginLocalConversation(initialPrompt, files, provisional, localProject, {
+            : beginLocalConversation(initialPrompt, attachedFiles, provisional, localProject, {
                 // Seed the temp session with the NORMALIZED create identity so the
                 // optimistic composer shows the model/effort/harness/routing being
                 // created, not state projected from the previously active session.
@@ -6732,10 +6723,11 @@ function NewChatLandingContent({
           smart_routing_message:
             smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
         });
-        const createForm = serverOwnsInitialInput && files.length > 0 ? new FormData() : null;
+        const createForm =
+          serverOwnsInitialInput && attachedFiles.length > 0 ? new FormData() : null;
         if (createForm !== null) {
           createForm.append("metadata", createPayload);
-          for (const file of files) createForm.append("initial_files", file, file.name);
+          for (const file of attachedFiles) createForm.append("initial_files", file, file.name);
         }
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
@@ -6943,10 +6935,13 @@ function NewChatLandingContent({
           data.id,
           effectiveAgentId,
           initialPrompt,
-          files,
+          attachedFiles,
           localConv.pendingMsgTempId,
           skill,
-          returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
+          returnToCanvas
+            ? (_to, options) => navigate(sessionLocation(data.id), options)
+            : // Still on the temporary session's page: its requests, such as a cited file, move too.
+              (to, options) => navigate(`${to}${window.location.search}`, options),
           () => stillViewingLocalSession(tempConvId),
           localProject,
           serverOwnsInitialInput,
@@ -6963,12 +6958,12 @@ function NewChatLandingContent({
             sessionId: data.id,
             text: initialPrompt,
             skill,
-            files,
+            files: attachedFiles,
             inputAccepted: serverOwnsInitialInput,
           });
         } else {
           if (!serverOwnsInitialInput)
-            setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+            setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files: attachedFiles });
           // Only the full chat delivers a pending prompt, so the project home hands off to it.
           if (
             (!onProjectHome || !serverOwnsInitialInput) &&
@@ -7009,8 +7004,6 @@ function NewChatLandingContent({
     } finally {
       if (createAttemptRef.current === createAttempt) {
         createAttemptRef.current = null;
-        skipDbcertCheckRef.current = null;
-        setCheckingDbcert(false);
         setCreating(false);
       }
     }
@@ -7152,7 +7145,7 @@ function NewChatLandingContent({
   );
 
   const workspaceControls = (
-    <NewChatWorkspaceControls disabled={checkingDbcert}>
+    <NewChatWorkspaceControls>
       {/* Keep the tray mounted while the execution target changes. */}
       {sandboxSelected && (
         <ComposerWorkspaceBar
@@ -7518,6 +7511,14 @@ function NewChatLandingContent({
     </NewChatWorkspaceControls>
   );
 
+  // The chord the panel advertises beside Send, in ARIA's spelling.
+  const sendKeyShortcuts = submitWithModEnter ? `${ARIA_MOD_KEY}+Enter` : "Enter";
+  let composerAppearance: "panel" | "glass" | "default" = "default";
+  if (floating) composerAppearance = "panel";
+  else if (isMobileViewport) composerAppearance = "glass";
+  // The panel's prompt sits under the window's top edge, so suggestions open below it.
+  const suggestionPlacement = floating ? "below" : "above";
+
   return (
     // Desktop keeps the centered composition; mobile docks the composer. The
     // project home floats just the composer over its board.
@@ -7606,7 +7607,6 @@ function NewChatLandingContent({
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <fieldset
-          disabled={checkingDbcert}
           className={cn(
             "relative flex min-w-0 flex-col gap-0",
             floating ? "min-h-0 w-full flex-1" : COMPOSER_COLUMN_WIDTH,
@@ -7619,38 +7619,38 @@ function NewChatLandingContent({
               e.preventDefault();
               void handleCreate();
             }}
-            className="relative z-30"
+            className={cn("relative z-30", floating && "flex min-h-0 flex-1 flex-col")}
           >
             <ChatComposer
               engine={composerEngine}
               dictating={dictation.hasInterim}
               onActiveInputChange={bindTextarea}
-              appearance={isMobileViewport ? "glass" : "default"}
+              appearance={composerAppearance}
               hasContent={
-                files.length > 0 ||
+                attachedFiles.length > 0 ||
                 mentionedItems.length > 0 ||
                 mentionedSessions.length > 0 ||
                 attachmentError !== null
               }
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-              className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
+              className={cn(isDragActive && "ring-2 ring-ring ring-inset", highlight.cardClassName)}
               data-testid="new-chat-landing-composer"
               input={{
                 ref: bindTextarea,
                 value: message,
+                ...highlight.input,
                 mentionTokens,
-                className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
-                onScroll: (e) => {
-                  if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
-                },
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
+                  noteMentionTextChange(e);
                   slashCompletion.onSelectionChange(e.currentTarget);
                   setMessage(e.currentTarget.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
                   if (attachmentError !== null) clearError();
+                  // The refusal names the draft as typed, so any edit makes it stale.
+                  if (createError === SHELL_MENTION_REFUSAL) setCreateError(null);
                   // Recompute the active "@"-mention from the caret each keystroke.
                   // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(
@@ -7700,11 +7700,7 @@ function NewChatLandingContent({
                 "data-testid": "new-chat-landing-input",
               }}
               slots={{
-                inputBackdrop: mentionTokensShown && (
-                  <ComposerMirror ref={mirrorRef}>
-                    {renderMentionTokens(message, mentionTokens)}
-                  </ComposerMirror>
-                ),
+                inputBackdrop: highlight.backdrop,
                 beforeInput: (
                   <>
                     {/* Skill suggestions — floats above the composer box. */}
@@ -7712,6 +7708,7 @@ function NewChatLandingContent({
                       <SlashCommandMenu
                         query={slashCompletion.query}
                         activeIndex={slashCompletion.index}
+                        placement={suggestionPlacement}
                         onSelect={applySlashSelection}
                         commands={slashCompletion.commands}
                         builtinNames={slashCompletion.builtinNames}
@@ -7729,6 +7726,7 @@ function NewChatLandingContent({
                         query={mention?.query ?? ""}
                         fileQuery={mentionFilter}
                         activeIndex={mentionIndex}
+                        placement={suggestionPlacement}
                         entries={mentionEntries}
                         loading={mentionListingPending}
                         onOpenDir={openMentionDir}
@@ -7741,6 +7739,7 @@ function NewChatLandingContent({
                 ),
                 inputHint: (
                   <>
+                    {highlight.hint}
                     {/* Gated on an empty draft so it reads as the placeholder.
                   pointer-events-none lets clicks fall through to focus the
                   textarea; the pills themselves opt back in. */}
@@ -7895,7 +7894,6 @@ function NewChatLandingContent({
                           <DropdownMenuTrigger asChild>
                             <ComposerHostTrigger
                               appearance={isMobileViewport ? "header" : "composer"}
-                              disabled={checkingDbcert}
                               label={hostChipLabel}
                               status={
                                 sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
@@ -8195,13 +8193,7 @@ function NewChatLandingContent({
                           entriesFailed={agentsError}
                           loading={pickerLoading}
                           interactiveWhileLoading={pickerInteractiveWhileLoading}
-                          disabledLabel={
-                            checkingDbcert
-                              ? "Checking certificate"
-                              : noExecutionTargetSelected
-                                ? "No host selected"
-                                : undefined
-                          }
+                          disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}
                           cacheKey={pickerCacheKey}
                           host={harnessWarningHost}
                           onSelectAgent={handleSelectAgent}
@@ -8266,6 +8258,12 @@ function NewChatLandingContent({
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
+                    {/* Plain ↵ adds a line in the panel, so its send chord stays in view. */}
+                    {floating && (
+                      <span className="px-1" data-testid="new-chat-landing-send-shortcut">
+                        <CompactShortcutKeys keys={composerSendShortcutKeys(submitWithModEnter)} />
+                      </span>
+                    )}
                     <TooltipProvider>
                       <Tooltip
                         open={submitTooltipState !== "closed"}
@@ -8306,6 +8304,7 @@ function NewChatLandingContent({
                               disabled={!canSubmit}
                               label={creating ? "Starting session" : "Start session"}
                               busy={creating}
+                              aria-keyshortcuts={floating ? sendKeyShortcuts : undefined}
                               data-testid="new-chat-landing-submit"
                             />
                           </span>
@@ -8469,31 +8468,6 @@ function NewChatLandingContent({
             <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
-          )}
-
-          {checkingDbcert && (
-            <div
-              className="flex items-center gap-2 text-sm text-muted-foreground"
-              data-testid="new-chat-landing-dbcert-status"
-            >
-              <Spinner className="size-4 shrink-0" />
-              <p role="status">Checking laptop credentials…</p>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => skipDbcertCheckRef.current?.()}
-              >
-                Skip
-              </Button>
-            </div>
-          )}
-
-          {dbcertRequired && sandboxSelected && effectiveSandboxProvider === "arclet" && (
-            <LaptopDbcertBanner
-              onReady={() => setDbcertRequired(false)}
-              onDismiss={() => setDbcertRequired(false)}
-            />
           )}
 
           {connectError && (

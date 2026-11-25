@@ -46,7 +46,12 @@ import {
   listUsers,
   resetUserPassword,
 } from "@/lib/accountsApi";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentUserId,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { withBasePath } from "@/lib/basePath";
@@ -98,25 +103,26 @@ export function MembersPage() {
     setUsers(list);
   }, []);
 
-  // Initial load: identity probe + members list. Skipped in single-user
-  // mode since no auth endpoints exist. isSingleUser is a stable boolean
-  // so it is safe as a dep without risking infinite re-renders.
+  // Follow identity recovery while this page remains open.
   useEffect(() => {
     if (isSingleUser || capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
-      if (userId === null) {
-        // Not authenticated — resolveIdentity already redirects to the
-        // provider's login URL when one exists (OIDC/accounts). Nothing
-        // more to do; leave the loading state.
-        return;
-      }
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active || userId === null) return;
       setMeId(userId);
-      const isAdmin = getCurrentIsAdmin();
-      setMeIsAdmin(isAdmin);
-      if (isAdmin) await refresh();
-    })();
-  }, [refresh, isSingleUser, capabilitiesLoading]);
+      setMeIsAdmin(getCurrentIsAdmin());
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [isSingleUser, capabilitiesLoading]);
+
+  useEffect(() => {
+    if (!isSingleUser && !capabilitiesLoading && meIsAdmin) void refresh();
+  }, [refresh, isSingleUser, capabilitiesLoading, meId, meIsAdmin]);
 
   if (isSingleUser) {
     return (

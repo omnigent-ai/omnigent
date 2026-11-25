@@ -33,6 +33,7 @@ import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
+  conversationRowFromSession,
   filtersFromConversationQueryKey,
   findCachedListRow,
   lastIdAfterFiltering,
@@ -40,6 +41,7 @@ import {
   markRecentlyCreated,
   mergeItemsIntoPages,
   overlayArchivedIntoCaches,
+  settleUpdatedAtIntoCaches,
   overlayTitleIntoCaches,
   PIN_WRITE_MUTATION_KEY,
   PINNED_LABEL_KEY,
@@ -58,10 +60,11 @@ import {
   beginMuteSave,
   clearSessionMuteState,
   hasMuteEntries,
-  isConversationMuted,
+  isSessionMuted,
   muteReadMarker,
   MUTED_LABEL_KEY,
   reconcileMuteLabel,
+  setMutedProjects,
   settleMuteSave,
 } from "@/lib/sessionMute";
 import {
@@ -79,6 +82,7 @@ import {
   deleteProject as apiDeleteProject,
   getProject as apiGetProject,
   listProjects as apiListProjects,
+  ProjectMembersNotMovedError,
   type ProjectConfig,
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
@@ -1180,6 +1184,7 @@ export function useArchiveConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
       );
+      settleUpdatedAtIntoCaches(queryClient, updated.id, updated.updated_at);
       settleOpenSessionRow(queryClient, updated.id, { archived });
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
@@ -1997,20 +2002,7 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
 
 function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | undefined {
   const session = queryClient.getQueryData<Session>(["session", id]);
-  if (!session) return undefined;
-  return {
-    id,
-    object: "conversation",
-    title: session.title,
-    created_at: session.createdAt,
-    updated_at: session.createdAt,
-    labels: session.labels ?? {},
-    permission_level: session.permissionLevel,
-    agent_id: session.agentId,
-    harness: session.harness,
-    archived: session.archived,
-    family: session.family,
-  };
+  return session ? conversationRowFromSession(session) : undefined;
 }
 
 function invalidateFamilyLists(queryClient: QueryClient) {
@@ -2389,11 +2381,11 @@ export function useSetConversationMuted() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ labels: { [MUTED_LABEL_KEY]: muted ? "1" : "" } }),
       });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) throw await apiErrorFromResponse(res);
       return (await res.json()) as { labels?: Record<string, string> };
     },
     onMutate: ({ id, muted }) => {
-      const previous = isConversationMuted({
+      const previous = isSessionMuted({
         id,
         labels: findCachedConversationRow(queryClient, id)?.labels,
       });
@@ -2413,7 +2405,10 @@ export function useSetConversationMuted() {
     },
     onSettled: (saved, error, { id, muted }, ctx) => {
       if (!ctx) return;
-      const value = error ? ctx.previous : saved?.labels ? !!saved.labels[MUTED_LABEL_KEY] : muted;
+      // A failure restores the previous value; otherwise the server's echo wins.
+      let value = muted;
+      if (error) value = ctx.previous;
+      else if (saved?.labels) value = !!saved.labels[MUTED_LABEL_KEY];
       settleMuteSave(id, value);
       overlayLabelIntoCaches(queryClient, id, MUTED_LABEL_KEY, value ? "1" : undefined);
     },
@@ -2447,6 +2442,8 @@ export interface ProjectSummary {
   /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
       folder glyph. Sourced from the project's `config.icon`. */
   icon?: string | null;
+  /** Whether the viewer muted every session in the project (`config.muted`). */
+  muted?: boolean;
 }
 
 /**
@@ -2465,6 +2462,16 @@ export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
     staleTime: 30_000,
     enabled,
   });
+}
+
+/** Feed the viewer's muted projects to the mute store every mute check reads. */
+export function useSyncMutedProjects(): void {
+  const { data } = useProjects();
+  const viewerId = useViewerId();
+  useEffect(() => {
+    // Mounted at the app root, so an unexpected reply must not throw.
+    if (Array.isArray(data)) setMutedProjects(data, viewerId);
+  }, [data, viewerId]);
 }
 
 /**
@@ -3228,7 +3235,13 @@ export function useRenameProject() {
       // omni_project label; re-file each onto project_id and clear that label so
       // the rename is coherent for both membership representations and nothing
       // is left behind in an oldName folder.
-      const members = await fetchAllProjectSessions(oldName);
+      // The name is saved by now, so callers can tell this failure from a refused rename.
+      const membersNotMoved = (error: unknown): never => {
+        throw new ProjectMembersNotMovedError(
+          error instanceof Error ? error.message : String(error),
+        );
+      };
+      const members = await fetchAllProjectSessions(oldName).catch(membersNotMoved);
       await Promise.all(
         members
           .filter(
@@ -3248,13 +3261,14 @@ export function useRenameProject() {
             // otherwise report success while leaving members behind.
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
           }),
-      );
+      ).catch(membersNotMoved);
       // Return the resolved id so a caller promoting a label-only folder can
       // target the just-created row for a follow-up write instead of passing
       // the stale `null` and re-creating it (which 409s on the duplicate name).
       return projectId;
     },
-    onSuccess: () => {
+    // A failed re-file can follow a successful rename, so refetch either way.
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
@@ -3312,7 +3326,12 @@ export function useUpdateProjectConfig() {
       // config to `{}` and drop the saved defaults on that first visit.
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
-        const summary = { id: project.id, name: project.name, icon: project.config?.icon };
+        const summary = {
+          id: project.id,
+          name: project.name,
+          icon: project.config?.icon,
+          muted: project.config?.muted === true,
+        };
         return prev.some((p) => p.name === project.name)
           ? prev.map((p) => (p.name === project.name ? summary : p))
           : [...prev, summary];

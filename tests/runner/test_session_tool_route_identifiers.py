@@ -214,7 +214,7 @@ async def test_registered_cancel_and_hard_stop_refuse_invalid_identifier() -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", ["download_file", "update_comment"])
+@pytest.mark.parametrize("tool", ["sys_files_download", "update_comment"])
 @pytest.mark.parametrize(
     "identifier", ["notes?draft", "notes#draft", "two/parts", ".", "%20", "file_ok-1"]
 )
@@ -231,7 +231,7 @@ async def test_file_and_comment_ids_remain_single_segments(tool: str, identifier
     async with httpx.AsyncClient(
         base_url="https://server.example", transport=httpx.MockTransport(respond)
     ) as client:
-        if tool == "download_file":
+        if tool == "sys_files_download":
             result = await _execute_file_tool(
                 DownloadFileTool.name(),
                 {"file_id": identifier},

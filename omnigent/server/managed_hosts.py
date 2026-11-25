@@ -458,8 +458,9 @@ def host_slice_key_enabled(labels: Mapping[str, str], host_id: str) -> bool:
     """
     Whether a session's managed host routes by its own id.
 
-    Only when the create or fork chose this host id, so the caller routes by it from
-    the start; otherwise the host stays on the caller's default replica.
+    Only when the launch requested this host id: chosen by the create or fork, or
+    minted by the server for a keyed request, so callers can route by it; otherwise
+    the host stays on the caller's default replica.
 
     :param labels: The session's labels.
     :param host_id: The session's managed host.
@@ -4039,14 +4040,16 @@ def build_owner_launcher(
     owner: str,
 ) -> SandboxHostLauncher:
     """
-    Build *entry*'s launcher, bound to *owner*'s credential when it needs one.
+    Build *entry*'s launcher, bound to *owner* and, when it needs one, to
+    *owner*'s credential.
 
     The single place a managed-host path turns a provider config into a
-    launcher. A launcher that acts as the host's owner (its
-    ``owner_credential_provider`` names a connection provider, e.g.
-    ``"databricks"``) is bound to the deployment's resolver for that provider,
-    curried with *owner*. With no resolver (the server has no connect flow for
-    that provider) the launcher stays unbound and refuses at first use with
+    launcher. The launcher is told its owner first (``bind_owner``). A launcher
+    that acts as the host's owner (its ``owner_credential_provider`` names a
+    connection provider, e.g. ``"databricks"``) is bound to the deployment's
+    resolver for that provider, curried with *owner*. With no resolver (the
+    server has no connect flow for that provider) the launcher stays unbound
+    and refuses at first use with
     :class:`~omnigent.onboarding.sandboxes.base.OwnerCredentialMissingError` —
     there is never a fallback to a shared server identity.
 
@@ -4059,6 +4062,9 @@ def build_owner_launcher(
     """
     launcher = entry.launcher_factory()
     # getattr: embedding deployments may inject duck-typed launchers.
+    bind_owner = getattr(launcher, "bind_owner", None)
+    if bind_owner is not None:
+        bind_owner(owner)
     needed = getattr(launcher, "owner_credential_provider", None)
     if needed is not None and deployment is not None:
         resolver = deployment.owner_credentials.get(needed)
