@@ -17,7 +17,16 @@ const emojiShortcodeProcessor = unified().use(remarkEmoji);
 export const MAX_EMOJI_SHORTCODE_TEXT_LENGTH = 2_000;
 
 /** Nodes whose source must stay as typed: code, raw HTML, and link syntax or URLs. */
-const LITERAL_NODE_TYPES = new Set(["code", "inlineCode", "html", "link", "image", "definition"]);
+const LITERAL_NODE_TYPES = new Set([
+  "code",
+  "inlineCode",
+  "html",
+  "link",
+  "linkReference",
+  "image",
+  "imageReference",
+  "definition",
+]);
 
 interface SourceNode {
   type: string;

@@ -47,12 +47,24 @@ describe("replaceEmojiShortcodes", () => {
       "[docs](https://example.com/:fire:) 🎉",
     ],
     ["an HTML tag", '<span title=":fire:">hot</span> :tada:', '<span title=":fire:">hot</span> 🎉'],
+    [
+      "a reference link",
+      "[docs][:fire:] :tada:\n\n[:fire:]: https://example.com/",
+      "[docs][:fire:] 🎉\n\n[:fire:]: https://example.com/",
+    ],
+    [
+      "a reference image",
+      "![logo][:fire:] :tada:\n\n[:fire:]: https://example.com/logo.png",
+      "![logo][:fire:] 🎉\n\n[:fire:]: https://example.com/logo.png",
+    ],
   ])("keeps %s literal and converts the prose around it", (_label, input, expected) => {
     expect(replaceEmojiShortcodes(input)).toBe(expected);
   });
 
-  it("leaves a body longer than the limit as written", () => {
-    const body = `:rocket: ${"x".repeat(MAX_EMOJI_SHORTCODE_TEXT_LENGTH)}`;
-    expect(replaceEmojiShortcodes(body)).toBe(body);
+  it("converts a body at the length limit and leaves a longer one as written", () => {
+    const atLimit = `:rocket:${"x".repeat(MAX_EMOJI_SHORTCODE_TEXT_LENGTH - ":rocket:".length)}`;
+    expect(atLimit).toHaveLength(MAX_EMOJI_SHORTCODE_TEXT_LENGTH);
+    expect(replaceEmojiShortcodes(atLimit)).toBe(`🚀${atLimit.slice(":rocket:".length)}`);
+    expect(replaceEmojiShortcodes(`${atLimit}x`)).toBe(`${atLimit}x`);
   });
 });
