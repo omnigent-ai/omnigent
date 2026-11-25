@@ -2,14 +2,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useShortcutPageContext } from "@/components/KeyboardShortcutsDialog";
 import type * as CuratedOutHarnessesModule from "@/hooks/useCuratedOutHarnesses";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import { writeSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 import { shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
+import { searchSettings } from "@/pages/settings/search/settingsSearchIndex";
 
 import { useSettingsSearchTargets } from "./useSettingsSearchTargets";
 
@@ -87,5 +89,25 @@ describe("useSettingsSearchTargets and the Keyboard shortcuts page", () => {
     expect(shortcutIds).toEqual(
       expect.arrayContaining(["composer.send", "slash.apply", "response.stop"]),
     );
+  });
+
+  describe("when the send preference changes while Settings is open", () => {
+    afterEach(() => writeSubmitWithModEnter(false));
+
+    it("finds Send message by the new send key on the next render", () => {
+      Object.defineProperty(navigator, "platform", { value: "MacIntel", configurable: true });
+      const hook = renderHook(() => useSettingsSearchTargets(), {
+        wrapper: settingsWrapper("loading"),
+      });
+      const firstForModEnter = () => {
+        const { targets, matchers } = hook.result.current;
+        return searchSettings("cmd enter", targets, matchers)[0]?.target.entry.shortcutId;
+      };
+      expect(firstForModEnter()).toBe("composer.sendWithQueue");
+
+      writeSubmitWithModEnter(true);
+      hook.rerender();
+      expect(firstForModEnter()).toBe("composer.send");
+    });
   });
 });

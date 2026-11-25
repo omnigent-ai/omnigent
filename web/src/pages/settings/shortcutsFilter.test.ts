@@ -24,9 +24,15 @@ const CONTEXT: ShortcutPageContext = {
   desktopCommands: false,
   alwaysSteer: false,
 };
+const OTHER: ShortcutEnvironment = { ...MAC, mac: false };
 const page = shortcutPageGroups(CONTEXT, true);
-const labels = (query: string) =>
-  filterShortcutPage(page, query, MAC).flatMap((group) => group.items.map((row) => row.label));
+const otherPage = shortcutPageGroups(CONTEXT, false);
+const labelsIn = (groups: typeof page, environment: ShortcutEnvironment) => (query: string) =>
+  filterShortcutPage(groups, query, environment).flatMap((group) =>
+    group.items.map((row) => row.label),
+  );
+const labels = labelsIn(page, MAC);
+const otherLabels = labelsIn(otherPage, OTHER);
 
 describe("filterShortcutPage", () => {
   it("lists every shortcut for an empty query", () => {
@@ -55,49 +61,27 @@ describe("filterShortcutPage", () => {
     expect(labels("esc")).not.toContain("Send message");
   });
 
-  it("finds the row a typed chord presses, written as keys or by name", () => {
-    expect(labels("⌘K")).toEqual(["Open command palette"]);
-    expect(labels("cmd+k")).toEqual(["Open command palette"]);
-  });
-
-  it("finds a row the registry doesn't bind by the chord it shows, on a Mac and elsewhere", () => {
-    expect(labels("cmd+shift+o")).toEqual(["Start a new session"]);
-    expect(labels("⌘⇧O")).toEqual(["Start a new session"]);
-    const other: ShortcutEnvironment = {
-      mac: false,
-      native: false,
-      desktopMenu: false,
-      submitWithModEnter: false,
-    };
-    const otherPage = shortcutPageGroups(CONTEXT, false);
-    const otherLabels = (query: string) =>
-      filterShortcutPage(otherPage, query, other).flatMap((group) =>
-        group.items.map((row) => row.label),
-      );
-    expect(otherLabels("ctrl+shift+o")).toEqual(["Start a new session"]);
-    expect(otherLabels("ctrl+k")).toEqual(["Open command palette"]);
-  });
-
-  it("finds an unbound row whose chord uses Option", () => {
-    expect(labels("cmd+option+a")).toEqual(["Add nested agent"]);
-    expect(labels("⌘⌥A")).toEqual(["Add nested agent"]);
+  it("finds the row a typed chord presses, written as keys or by name, on a Mac and elsewhere", () => {
+    const cases: [query: string, mac: boolean, label: string][] = [
+      ["⌘K", true, "Open command palette"],
+      ["cmd+k", true, "Open command palette"],
+      ["ctrl+k", false, "Open command palette"],
+      ["cmd+shift+o", true, "Start a new session"],
+      ["⌘⇧O", true, "Start a new session"],
+      ["ctrl+shift+o", false, "Start a new session"],
+      // Option, by name or symbol.
+      ["cmd+option+a", true, "Add nested agent"],
+      ["⌘⌥A", true, "Add nested agent"],
+    ];
+    for (const [query, mac, label] of cases) {
+      expect((mac ? labels : otherLabels)(query), query).toEqual([label]);
+    }
   });
 
   it("finds a row that lists a range of digits by any chord in the range", () => {
     expect(labels("ctrl+1")).toEqual(["Select a workspace tab"]);
     expect(labels("⌃4")).toEqual(["Select a workspace tab"]);
     expect(labels("cmd+option+3")).toEqual(["Jump to a sidebar session (1–10)"]);
-    const other: ShortcutEnvironment = {
-      mac: false,
-      native: false,
-      desktopMenu: false,
-      submitWithModEnter: false,
-    };
-    const otherPage = shortcutPageGroups(CONTEXT, false);
-    const otherLabels = (query: string) =>
-      filterShortcutPage(otherPage, query, other).flatMap((group) =>
-        group.items.map((row) => row.label),
-      );
     expect(otherLabels("alt+1")).toEqual(["Select a workspace tab"]);
   });
 

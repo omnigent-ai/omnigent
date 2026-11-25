@@ -12,7 +12,9 @@ import {
   shortcutDisplayRow,
 } from "@/lib/shortcuts/registry";
 
-import type { SettingsSearchMatcher } from "./settingsSearchIndex";
+import { MatchTier } from "@/components/ui/quick-pick/itemRanking";
+
+import { type SettingsSearchMatcher, TEXT_TIER_BASE } from "./settingsSearchIndex";
 
 type Modifier = "metaKey" | "ctrlKey" | "altKey" | "shiftKey";
 
@@ -283,6 +285,9 @@ export function rowsForChord(
 /** Ranks above every text match. */
 export const CHORD_TIER = 0;
 
+/** A bare key name, such as "tab" or "down", is more often a word: after label matches. */
+export const BARE_KEY_TIER = TEXT_TIER_BASE + MatchTier.keyword;
+
 /**
  * Finds the shortcut rows a typed chord presses, in `environment`, among the rows the page
  * lists. Other queries leave it out, so they rank by text alone.
@@ -296,11 +301,13 @@ export function chordMatcher(
     if (!input) return null;
     const rows = rowsForChord(input, environment, listedRows);
     if (rows.size === 0) return null;
+    const bare = !input.metaKey && !input.ctrlKey && !input.altKey && !input.shiftKey;
+    const tier = bare ? BARE_KEY_TIER : CHORD_TIER;
     return (target) =>
       target.part === undefined &&
       target.entry.shortcutId !== undefined &&
       rows.has(target.entry.shortcutId)
-        ? { tier: CHORD_TIER }
+        ? { tier }
         : null;
   };
 }
