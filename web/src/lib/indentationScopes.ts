@@ -36,7 +36,10 @@ export class IndentationScopes {
   private tabSize: number;
   /** By line number; `BLANK` for a line with only whitespace. Index 0 is unused. */
   private readonly indents: number[] = [0];
-  /** By line number; 0 for a line no scope encloses. */
+  /**
+   * By line number; 0 for a line no scope encloses. A blank line holds the nearest non-blank
+   * line above it instead (0 if none), whose scope it shares, so no read walks a blank run.
+   */
   private readonly parents: number[] = [0];
 
   constructor(doc: Text, tabSize: number) {
@@ -71,12 +74,16 @@ export class IndentationScopes {
     return this.filledLines >= Math.min(lineNumber, this.doc.lines);
   }
 
+  /** The nearest non-blank line at or above a filled `lineNumber`, or 0 if there's none. */
+  private nonBlankAt(lineNumber: number): number {
+    return this.indents[lineNumber] === BLANK ? this.parents[lineNumber] : lineNumber;
+  }
+
   /** The lines whose scopes enclose `lineNumber`, outermost first; none while it isn't filled. */
   enclosing(lineNumber: number): number[] {
     const chain: number[] = [];
-    if (lineNumber > this.filledLines) return chain;
-    let line = lineNumber;
-    while (line >= 1 && this.indents[line] === BLANK) line -= 1;
+    if (lineNumber < 1 || lineNumber > this.filledLines) return chain;
+    const line = this.nonBlankAt(lineNumber);
     if (line < 1) return chain;
     for (let parent = this.parents[line]; parent > 0; parent = this.parents[parent]) {
       chain.push(parent);
@@ -96,22 +103,22 @@ export class IndentationScopes {
     const last = Math.min(lineNumber, this.doc.lines, filled + limit);
     if (last <= filled) return 0;
     // The open scopes at the last known line are that line and its chain of parents.
-    let top = filled;
-    while (top >= 1 && this.indents[top] === BLANK) top -= 1;
+    let nonBlank = filled >= 1 ? this.nonBlankAt(filled) : 0;
     const open: number[] = [];
-    for (let line = top; line > 0; line = this.parents[line]) open.push(line);
+    for (let line = nonBlank; line > 0; line = this.parents[line]) open.push(line);
     open.reverse();
     let number = filled + 1;
     for (const text of this.doc.iterLines(number, last + 1)) {
       const indent = indentationOf(text, this.tabSize);
       if (indent === null) {
         this.indents[number] = BLANK;
-        this.parents[number] = 0;
+        this.parents[number] = nonBlank;
       } else {
         while (open.length > 0 && this.indents[open[open.length - 1]] >= indent) open.pop();
         this.indents[number] = indent;
         this.parents[number] = open.length > 0 ? open[open.length - 1] : 0;
         open.push(number);
+        nonBlank = number;
       }
       number += 1;
     }

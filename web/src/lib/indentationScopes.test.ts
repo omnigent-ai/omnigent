@@ -11,6 +11,22 @@ import {
 
 const LINE_HEIGHT = 10;
 
+/** Counts each line's indentation or parent link that `scopes` reads from now on. */
+function countLinkReads(scopes: IndentationScopes): () => number {
+  let reads = 0;
+  const internals = scopes as unknown as Record<"indents" | "parents", number[]>;
+  for (const field of ["indents", "parents"] as const) {
+    const counted = new Proxy(internals[field], {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    Object.defineProperty(scopes, field, { value: counted });
+  }
+  return () => reads;
+}
+
 /** Scopes with every link filled, as the shared filler leaves them once it catches up. */
 function filledScopes(doc: Text, tabSize: number): IndentationScopes {
   const scopes = new IndentationScopes(doc, tabSize);
@@ -106,22 +122,22 @@ describe("IndentationScopes", () => {
     const body = Array.from({ length: 50_000 }, (_, index) => `    statement${index};`);
     const doc = docOf(["module {", "  section {", ...body, "  }", "}"]);
     const scopes = filledScopes(doc, 4);
-    // Count each line's indentation or parent the answers read.
-    let reads = 0;
-    const internals = scopes as unknown as Record<"indents" | "parents", number[]>;
-    for (const field of ["indents", "parents"] as const) {
-      const counted = new Proxy(internals[field], {
-        get(target, key, receiver) {
-          if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
-          return Reflect.get(target, key, receiver);
-        },
-      });
-      Object.defineProperty(scopes, field, { value: counted });
-    }
+    const reads = countLinkReads(scopes);
     expect(scopes.enclosing(40_000)).toEqual([1, 2]);
     for (let line = 40_001; line < 41_000; line += 1) scopes.enclosing(line);
     // Each answer is the line's own indentation and its two parent links, then the root.
-    expect(reads).toBeLessThanOrEqual(1_000 * 4);
+    expect(reads()).toBeLessThanOrEqual(1_000 * 4);
+  });
+
+  it("answers for a line deep in a long blank run without walking back over it", () => {
+    const blanks = Array.from({ length: 50_000 }, () => "    ");
+    const doc = docOf(["module {", "  section {", "    statement;", ...blanks, "  }", "}"]);
+    const scopes = filledScopes(doc, 4);
+    const reads = countLinkReads(scopes);
+    expect(scopes.enclosing(40_000)).toEqual([1, 2]);
+    for (let line = 40_001; line < 41_000; line += 1) scopes.enclosing(line);
+    // A blank line reads its nearest non-blank line, then that line's links, as above.
+    expect(reads()).toBeLessThanOrEqual(1_000 * 6);
   });
 });
 
@@ -220,6 +236,22 @@ describe("ScopeFiller", () => {
     // Done: no further frame runs.
     frames.nextFrame();
     expect(progress).toBe(2);
+  });
+
+  it("starts each frame's slice inside a long blank run without walking back over it", () => {
+    const frames = manualFrames();
+    const filler = new ScopeFiller(1_000, frames.request);
+    const blanks = Array.from({ length: 5_000 }, () => "");
+    const scopes = new IndentationScopes(docOf(["a {", "  b {", "    c;", ...blanks, "  d;"]), 4);
+    filler.request(scopes, 5_004, noop);
+    frames.nextFrame();
+    // The next slices start mid-run: reading where to resume costs a few links, not the run.
+    const reads = countLinkReads(scopes);
+    while (!scopes.reaches(5_004)) frames.nextFrame();
+    const resumes = 5;
+    expect(reads()).toBeLessThanOrEqual(4_004 * 2 + resumes * 8);
+    expect(scopes.enclosing(5_004)).toEqual([1]);
+    expect(scopes.enclosing(3_000)).toEqual([1, 2]);
   });
 
   it("fills at most one frame's lines however many passes ask in that frame", () => {
