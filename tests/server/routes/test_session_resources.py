@@ -12155,9 +12155,15 @@ async def test_stable_id_retry_keeps_its_first_delivery(
     conv = store.create_conversation(title="Review")
     runner = _FakeRunnerClient(payload={})
     typed = [{"type": "input_text", "text": "Review this"}]
+    # A client cannot set the flag; only the server's naming decision does.
     body = SessionEventInput(
         type="message",
-        data={"role": "user", "content": typed, "stable_id": "0" * 31 + "1"},
+        data={
+            "role": "user",
+            "content": typed,
+            "stable_id": "0" * 31 + "1",
+            "sender_in_context": True,
+        },
     )
 
     item_ids = [

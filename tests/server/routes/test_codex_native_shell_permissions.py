@@ -128,6 +128,14 @@ def _message(content: list[dict[str, Any]]) -> dict[str, Any]:
     return {"type": "message", "data": {"role": "user", "content": content}}
 
 
+_NAMING = frozenset({Feature.MESSAGE_SENDER_CONTEXT})
+_FILE = {"type": "input_file", "filename": "note.txt", "file_data": "aGk="}
+
+
+def _typed(*texts: str) -> list[dict[str, Any]]:
+    return [{"type": "input_text", "text": text} for text in texts]
+
+
 @pytest.mark.parametrize("running", [False, True], ids=["initial", "live"])
 @pytest.mark.parametrize(
     ("caller", "expected_status"),
@@ -160,20 +168,24 @@ async def test_codex_shell_requires_owner_before_dispatch(
 
 
 @pytest.mark.parametrize(
+    ("codex_client", "naming"),
+    [((frozenset(), "codex-native"), False), ((_NAMING, "codex-native"), True)],
+    ids=["naming-off", "naming-on"],
+    indirect=["codex_client"],
+)
+@pytest.mark.parametrize(
     "content",
     [
-        [{"type": "input_text", "text": "Explain this code"}],
-        [{"type": "input_text", "text": "!!literal bang"}],
-        [{"type": "input_text", "text": "!printf FIRST"}, {"type": "input_text", "text": "more"}],
-        [
-            {"type": "input_text", "text": "!inspect this file"},
-            {"type": "input_file", "filename": "note.txt", "file_data": "aGk="},
-        ],
+        _typed("Explain this code"),
+        _typed("!!literal bang"),
+        _typed("!printf FIRST", "more"),
+        [*_typed("!inspect this file"), _FILE],
     ],
     ids=["ordinary", "escaped-bang", "multiple-blocks", "attachment"],
 )
 async def test_codex_editor_model_input_keeps_edit_access(
     codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],
+    naming: bool,
     content: list[dict[str, Any]],
 ) -> None:
     client, runner, _conv = codex_client
@@ -185,27 +197,19 @@ async def test_codex_editor_model_input_keeps_edit_access(
     assert response.status_code == 202, response.text
     messages = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
     assert len(messages) == 1
-    assert messages[0]["content"] == content
+    # Model input stays model input; with naming on it carries the editor's name.
+    assert messages[0]["content"] == with_message_sender(
+        content, "editor@example.com" if naming else None
+    )
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
-
-
-_NAMING = frozenset({Feature.MESSAGE_SENDER_CONTEXT})
-_FILE = {"type": "input_file", "filename": "note.txt", "file_data": "aGk="}
-
-
-def _typed(*texts: str) -> list[dict[str, Any]]:
-    return [{"type": "input_text", "text": text} for text in texts]
+    assert [row["content"] for row in pending_inputs.snapshot_for(_SESSION_ID)] == [content]
 
 
 @pytest.mark.parametrize(
     ("codex_client", "caller", "content", "named"),
     [
         ((_NAMING, "codex-native"), "owner", _typed("Explain this code"), False),
-        ((_NAMING, "codex-native"), "editor", _typed("Explain this code"), True),
         ((_NAMING, "codex-native"), "admin", _typed("Explain this code"), True),
-        ((_NAMING, "codex-native"), "editor", _typed("!!literal bang"), True),
-        ((_NAMING, "codex-native"), "editor", _typed("!printf FIRST", "more"), True),
-        ((_NAMING, "codex-native"), "editor", [*_typed("!inspect this file"), _FILE], True),
         ((_NAMING, "codex-native"), "editor", _typed("/compact"), True),
         ((_NAMING, "codex-native"), "admin", _typed("!printf authorized"), False),
         ((_NAMING, "claude-native"), "editor", _typed("Explain this code"), True),
@@ -216,11 +220,7 @@ def _typed(*texts: str) -> list[dict[str, Any]]:
     ],
     ids=[
         "codex-owner",
-        "codex-editor",
         "codex-admin",
-        "codex-escaped-bang",
-        "codex-multiple-blocks",
-        "codex-attachment",
         "codex-slash-is-a-prompt",
         "codex-shell-command",
         "claude-editor",

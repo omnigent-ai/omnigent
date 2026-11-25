@@ -518,7 +518,7 @@ def test_restore_returns_a_drained_entry_to_the_front() -> None:
     belongs to the NEXT user message): the entry was the oldest when
     drained, so it must come back ahead of everything queued after it.
     """
-    first = pending_inputs.record("conv_r", [_text_block("first")])
+    first = pending_inputs.record("conv_r", [_text_block("first")], named_sender="bob@example.com")
     second = pending_inputs.record("conv_r", [_text_block("second")])
 
     drained = pending_inputs.resolve_oldest("conv_r")
@@ -528,9 +528,10 @@ def test_restore_returns_a_drained_entry_to_the_front() -> None:
     order = [e["pending_id"] for e in pending_inputs.snapshot_for("conv_r")]
     assert order == [first, second]
 
-    # The restored entry drains again as the oldest.
+    # The restored entry drains again as the oldest, still delivered behind its sender line.
     redrained = pending_inputs.resolve_oldest("conv_r")
     assert redrained is not None and redrained.pending_id == first
+    assert redrained.named_sender == "bob@example.com"
 
 
 def test_interrupted_flag_survives_nonheld_resolve_and_restore() -> None:
@@ -697,7 +698,7 @@ def test_resolve_matching_text_drops_only_generated_leading_markers() -> None:
 
 
 def test_resolve_matching_text_compares_entries_as_delivered() -> None:
-    """An echo matches the entry whose sender line the server typed, not a look-alike."""
+    """An echo matches its entry as delivered; a tie with typed look-alike text is ambiguous."""
     bob, alice = "bob@example.com", "alice@example.com"
     line = '[Message sender: "bob@example.com"]'
     with_image = pending_inputs.record(
@@ -718,22 +719,20 @@ def test_resolve_matching_text_compares_entries_as_delivered() -> None:
     image = pending_inputs.resolve_matching_text(
         "conv_a", f"[Attached: /tmp/x.png]\n\n{line}\n\nlook"
     )
-    bobs = pending_inputs.resolve_matching_text("conv_a", f"{line}\n\nsame")
+    # Bob's echo, or Alice's literal text after Bob's echo was lost: they read the same.
+    tie = pending_inputs.resolve_matching_text("conv_a", f"{line}\n\nsame")
     alices = pending_inputs.resolve_matching_text("conv_a", f"{line}\nsame")
     untagged = pending_inputs.resolve_matching_text("conv_a", "same")
 
     assert other.matched is None
     assert image.matched is not None and image.matched.pending_id == with_image
     assert image.match_method == "attachment_normalized_text"
-    for drain, entry, author in [
-        (bobs, named, bob),
-        (alices, look_alike, alice),
-        (untagged, plain, alice),
-    ]:
+    assert tie.matched is not None and tie.matched.pending_id == named
+    assert tie.match_method == pending_inputs.AMBIGUOUS_MATCH
+    for drain, entry in [(tie, named), (alices, look_alike), (untagged, plain)]:
         assert drain.matched is not None and drain.matched.pending_id == entry
-        assert drain.matched.created_by == author
         assert drain.skipped == [] and drain.uncertain == []
-    assert bobs.matched is not None and bobs.matched.named_sender == bob
+    assert alices.match_method == untagged.match_method == "normalized_text"
     assert pending_inputs.snapshot_for("conv_a") == []
 
 

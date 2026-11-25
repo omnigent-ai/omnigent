@@ -144,5 +144,38 @@ async def test_native_echo_is_stored_as_typed(
 
     [item] = store.list_items(conv.id, type="message").data
     assert item.data.content == typed
+    assert item.data.sender_in_context is (named_sender is not None)
     assert item.created_by == author
     assert pending_inputs.snapshot_for(conv.id) == []
+
+
+@pytest.mark.asyncio
+async def test_tied_echo_keeps_its_text_and_proves_no_author(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a collaborator's echo is lost, typed look-alike text is not taken for theirs."""
+    line = '[Message sender: "bob@example.com"]'
+    typed = [_text(f"{line}\nsame")]
+    transcript = tmp_path / "session.jsonl"
+    record = {
+        "uuid": "native-record",
+        "type": "user",
+        "message": {"role": "user", "content": _content_to_text(typed, tmp_path)},
+    }
+    transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    [parsed] = read_transcript_items_since(transcript, 0, agent_name="Claude")[2]
+    body = SessionEventInput.model_validate(_external_conversation_item_event(parsed))
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Review")
+    pending_inputs.record(
+        conv.id, [_text("same")], created_by="bob@example.com", named_sender="bob@example.com"
+    )
+    pending_inputs.record(conv.id, typed, created_by="alice@example.com")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+
+    await _persist_external_conversation_item(conv.id, conv, body, store)
+
+    [item] = store.list_items(conv.id, type="message").data
+    assert item.data.content == typed
+    assert item.data.sender_in_context is False
+    assert item.created_by is None

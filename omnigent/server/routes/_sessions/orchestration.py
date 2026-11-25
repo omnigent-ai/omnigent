@@ -3677,20 +3677,21 @@ async def _persist_external_conversation_item_unlocked(
                 # The mirror's true owner may be any entry still queued, so none
                 # of them can be declared undelivered later.
                 pending_inputs.mark_uncertain(session_id)
+        elif drained is not None and match_method == pending_inputs.AMBIGUOUS_MATCH:
+            # Either tied entry may own the mirror, so neither is declared undelivered later.
+            pending_inputs.mark_uncertain(session_id)
+        # Only an unambiguous text match shows whose message the mirror is.
+        proven = match_method not in ("fifo_fallback", pending_inputs.AMBIGUOUS_MATCH)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-            if drained.named_sender is not None and match_method != "fifo_fallback":
+            if drained.named_sender is not None and proven:
                 # The echo carries the sender line typed for the agent; store what was typed.
                 typed = {"content": drained.content, "sender_in_context": True}
                 item = item.model_copy(update={"data": item.data.model_copy(update=typed)})
             item = _merge_pending_file_blocks(item, drained.content)
             # A text match preserves the sender recorded at POST time. FIFO
             # settlement alone does not establish authorship of the mirror.
-            if (
-                drained.created_by is not None
-                and item.created_by is None
-                and match_method != "fifo_fallback"
-            ):
+            if drained.created_by is not None and item.created_by is None and proven:
                 item = item.model_copy(update={"created_by": drained.created_by})
             # A web client that sends stable_id gets store-level idempotency:
             # use it directly as the item id so the append is a no-op on retry.

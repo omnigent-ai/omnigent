@@ -143,6 +143,10 @@ _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 # Words Claude Code's composer treats as /exit when sent on their own.
 _CLAUDE_EXIT_WORDS = frozenset({"exit", "quit", ":q", ":q!", ":wq", ":wq!"})
 
+# ``match_method`` of a text match that two queued entries fit equally, one with a
+# server-added sender line and one without: the drain cannot vouch for author or text.
+AMBIGUOUS_MATCH = "ambiguous_text"
+
 NativeInputCauseClass = Literal[
     "rejected_before_handoff",
     "rejected_by_native",
@@ -899,9 +903,10 @@ def resolve_matching_text(
         interrupted = [entry.interrupted for _pid, entry in ordered]
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
+        candidates = [index for index, queued in enumerate(texts) if queued == exact_needle]
         if match_index is None:
             match_method = "attachment_normalized_text"
-            marker_matches: list[int] = []
+            candidates = []
             for index, (_pid, entry) in enumerate(ordered):
                 attachments = 0 if shell_command else _attachment_count(entry.content)
                 if attachments == 0 or not texts[index]:
@@ -910,10 +915,14 @@ def resolve_matching_text(
                     _collapse_whitespace(_strip_generated_markers(text, attachments))
                     == texts[index]
                 ):
-                    marker_matches.append(index)
-            match_index = _prefer_live(marker_matches, interrupted)
+                    candidates.append(index)
+            match_index = _prefer_live(candidates, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
+        # Typed text can read exactly like a sender line the server added, so a tie
+        # between a named and an unnamed entry does not show whose echo this is.
+        if len({ordered[index][1].named_sender is None for index in candidates}) > 1:
+            match_method = AMBIGUOUS_MATCH
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an
