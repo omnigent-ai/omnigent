@@ -1,6 +1,8 @@
 // Where a dragged pane or tab would land among the session's panes: the half it would take,
 // edged in the accent on the side it meets.
 
+import { useLayoutEffect, useState } from "react";
+
 import type { TerminalPaneSide } from "@/lib/paneSplitLayout";
 import { cn } from "@/lib/utils";
 
@@ -46,9 +48,8 @@ export function PaneDropPreview({
  */
 export function LoneChatPaneDropPreview({ conversationId }: { conversationId: string }) {
   const drop = usePendingAppPaneDrop(conversationId);
-  const root = drop ? splitPanesRoot(conversationId) : null;
-  if (!drop || !root) return null;
-  const box = root.getBoundingClientRect();
+  const box = useHiddenPanesBox(drop ? conversationId : null);
+  if (!drop || !box) return null;
   return (
     <div
       aria-hidden
@@ -59,4 +60,31 @@ export function LoneChatPaneDropPreview({ conversationId }: { conversationId: st
       <PaneDropPreview drop={drop} />
     </div>
   );
+}
+
+/**
+ * Where `conversationId`'s hidden panes view sits on screen, kept current while a drop is
+ * pending, as the window, a sidebar or a scroll moves it; null without one.
+ */
+function useHiddenPanesBox(conversationId: string | null): DOMRect | null {
+  const [box, setBox] = useState<DOMRect | null>(null);
+  useLayoutEffect(() => {
+    const root = conversationId ? splitPanesRoot(conversationId) : null;
+    if (!root) {
+      setBox(null);
+      return;
+    }
+    const measure = () => setBox(root.getBoundingClientRect());
+    measure();
+    const resizes = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    resizes?.observe(root);
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    return () => {
+      resizes?.disconnect();
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
+    };
+  }, [conversationId]);
+  return box;
 }

@@ -20,8 +20,10 @@ afterEach(() => {
 function hiddenPanes(conversationId: string) {
   const root = document.createElement("div");
   root.dataset.splitPanes = conversationId;
-  root.getBoundingClientRect = () => ({ left: 100, top: 50, width: 800, height: 600 }) as DOMRect;
+  const box = { left: 100, top: 50, width: 800, height: 600 };
+  root.getBoundingClientRect = () => ({ ...box }) as DOMRect;
   document.body.appendChild(root);
+  return box;
 }
 
 describe("LoneChatPaneDropPreview", () => {
@@ -42,6 +44,19 @@ describe("LoneChatPaneDropPreview", () => {
     expect(preview.style).toMatchObject({ left: "50%", width: "50%" });
     act(() => setPendingAppPaneDrop("c1", null));
     expect(document.querySelector("[data-pane-drop]")).toBeNull();
+  });
+
+  it("follows the hidden panes when the window resizes during the drag", () => {
+    const box = hiddenPanes("c1");
+    render(<LoneChatPaneDropPreview conversationId="c1" />);
+    act(() => setPendingAppPaneDrop("c1", RIGHT_HALF));
+    box.left = 300;
+    box.width = 600;
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    const frame = document.querySelector<HTMLElement>("[data-lone-chat-pane-drop]")!;
+    expect(frame.style).toMatchObject({ left: "300px", width: "600px" });
   });
 
   it("draws nothing for another session's drop, or without the session's panes", () => {
