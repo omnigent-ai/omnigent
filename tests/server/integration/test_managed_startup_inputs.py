@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -34,8 +35,10 @@ from omnigent.server.scheduled.telemetry import scheduled_run_scope
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.session_delivery import deliver_to_session
 from omnigent.server.startup_inputs import (
+    _RECEIPT_TIMEOUT_S,
     AUTOMATIC_TTL_ENV,
     EXPIRED_AUTOMATIC_LABEL,
+    SENT_AT_LABEL,
     STARTUP_LABEL,
     ManagedStartupInputs,
     StartupInputContext,
@@ -1493,7 +1496,7 @@ async def test_unconfirmed_native_submission_stops_holding_later_inputs(
     woken: list[str] = []
     monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", woken.append)
     await startup._deliver(env.app, session_id, entry)
-    await asyncio.gather(*startup._receipt_watches)
+    await asyncio.gather(*startup._receipt_watches.values())
 
     [failed] = env.conv_store.list_pending_inputs(session_id)
     assert failed.id == entry.id and failed.status == "failed"
@@ -1503,6 +1506,80 @@ async def test_unconfirmed_native_submission_stops_holding_later_inputs(
     assert isinstance(notice.data, ErrorData) and notice.data.code == "startup_input_failed"
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and woken == [conv.host_id]
+
+
+@pytest.mark.parametrize("elapsed", [30.0, 3600.0], ids=["within-timeout", "past-timeout"])
+async def test_unconfirmed_native_submission_times_out_after_a_server_restart(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, elapsed: float
+) -> None:
+    """A restart drops the receipt watch; recovery re-arms it from the recorded send time."""
+    env = startup_env
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name)
+    host_id = uuid4().hex
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    connection = _connect_host(env, host_id)
+    original = env.app.state.startup_inputs
+    first = env.conv_store.list_pending_inputs(session_id)[0]
+    await original.enqueue(
+        session_id,
+        SessionEventInput.model_validate(
+            {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "Next"}]},
+            }
+        ),
+        user_id=None,
+        headers=Headers(),
+        first=False,
+    )
+    sent: list[str] = []
+
+    async def dispatch(context: StartupInputContext, session_id: str, event: SessionEventInput):
+        assert await context.claim(env.conv_store, session_id)
+        sent.append(event.data["content"][-1]["text"])
+        return {"queued": True, "pending_id": f"pending_{len(sent)}"}
+
+    original.dispatch = dispatch
+    await original._deliver(env.app, session_id, first)
+    assert sent == [_TEXT]
+    # The restart: the watch and in-memory pending inputs are gone.
+    await original.shutdown()
+    pending_inputs.reset_for_tests()
+    sent_label = env.conv_store.get_conversation(session_id).labels[SENT_AT_LABEL]
+    assert sent_label.startswith(f"{first.id}:")
+    env.conv_store.set_labels(session_id, {SENT_AT_LABEL: f"{first.id}:{time.time() - elapsed}"})
+    restarted = ManagedStartupInputs(env.conv_store, original.hosts)
+    restarted.dispatch = dispatch
+    monkeypatch.setattr("omnigent.server.startup_inputs.wake_startup_worker", lambda _: None)
+
+    try:
+        await restarted._recover_session(env.app, session_id, connection)
+        [watch] = restarted._receipt_watches.values()
+        if elapsed < _RECEIPT_TIMEOUT_S:
+            await asyncio.sleep(0.05)
+            assert not watch.done()
+            assert [item.status for item in env.conv_store.list_pending_inputs(session_id)] == [
+                "incomplete",
+                "in_progress",
+            ]
+            assert sent == [_TEXT]
+            return
+        await asyncio.wait_for(watch, timeout=5)
+        await restarted._recover_session(env.app, session_id, connection)
+        await asyncio.gather(*restarted._deliveries.values())
+        assert sent == [_TEXT, "Next"]
+        [failed, delivered] = env.conv_store.list_pending_inputs(session_id)
+        assert failed.id == first.id and failed.status == "failed"
+        assert delivered.status == "incomplete"
+        notices = [
+            item.data.code
+            for item in env.conv_store.list_items(session_id).data
+            if isinstance(item.data, ErrorData)
+        ]
+        assert notices == ["startup_input_failed"]
+    finally:
+        await restarted.shutdown()
 
 
 async def test_confirmed_native_submission_is_not_failed_by_its_receipt_watch(
@@ -1524,7 +1601,7 @@ async def test_confirmed_native_submission_is_not_failed_by_its_receipt_watch(
     assert env.conv_store.list_pending_inputs(session_id) == []
 
     monkeypatch.setattr("omnigent.server.startup_inputs._RECEIPT_TIMEOUT_S", 0)
-    await startup._expire_unconfirmed(session_id, entry.id, "pending")
+    await startup._expire_unconfirmed(session_id, entry.id, "pending", delay=0)
     assert not [
         item
         for item in env.conv_store.list_items(session_id).data

@@ -92,7 +92,7 @@ def test_bound_pending_read_and_failed_claim_does_not_change_history(db_uri):
     store = SqlAlchemyConversationStore(db_uri)
     session = store.create_conversation()
     saved = store.append(session.id, [_input() for _ in range(MAX_PENDING_INPUTS)])
-    with pytest.raises(OmnigentError, match="Too many messages"):
+    with pytest.raises(OmnigentError, match="queue is full"):
         store.append(session.id, [_input()])
     assert not store.transition_pending_input(
         session.id, saved[0].id, expected="failed", status="completed"

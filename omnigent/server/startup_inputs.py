@@ -67,6 +67,9 @@ _FAILED_INPUT_NOTE = (
 # recording it (e.g. a slash command Claude Code answers only in its TUI), and then
 # no echo comes. Matches the in-memory pending-input TTL.
 _RECEIPT_TIMEOUT_S = 600.0
+# "<item id>:<unix time>" of the input last submitted to a native harness, so the
+# receipt timeout survives a server restart.
+SENT_AT_LABEL = "omnigent.startup.sent"
 
 AUTOMATIC_TTL_ENV = "OMNIGENT_AUTOMATIC_MESSAGE_TTL_SECONDS"
 _DEFAULT_AUTOMATIC_TTL_S = 720.0
@@ -202,6 +205,7 @@ class StartupInputContext:
     user_id: str | None
     input_id: str
     submitted: bool = False
+    submitted_at: float | None = None
 
     async def is_disconnected(self) -> bool:
         return False
@@ -218,6 +222,7 @@ class StartupInputContext:
             status="incomplete",
         )
         if self.submitted:
+            self.submitted_at = time.time()
             start_fire_stage("prompt_send", session_id=session_id)
         return self.submitted
 
@@ -259,7 +264,7 @@ class ManagedStartupInputs:
         ] = {}
         self._deliveries: dict[tuple[int, str], asyncio.Task[Any]] = {}
         self._runner_workers: dict[tuple[int, str], tuple[asyncio.Task[None], asyncio.Event]] = {}
-        self._receipt_watches: set[asyncio.Task[None]] = set()
+        self._receipt_watches: dict[tuple[int, str, str], asyncio.Task[None]] = {}
 
     async def enqueue(
         self,
@@ -576,6 +581,8 @@ class ManagedStartupInputs:
                             return
                         if head.status == "in_progress":
                             await self._deliver(app, session_id, head)
+                        elif head.status == "incomplete":
+                            self._watch_receipt(current, head)
                     except Exception:
                         _logger.exception("Unable to recover saved inputs for %s", session_id)
                     with contextlib.suppress(TimeoutError):
@@ -624,6 +631,8 @@ class ManagedStartupInputs:
                     self._deliver(app, session_id, head), name=f"startup-input-{session_id}"
                 )
                 self._deliveries[key] = task
+            elif head.status == "incomplete":
+                self._watch_receipt(conv, head)
             return head.status == "in_progress"
         if state == "pending" and conv.runner_id is None:
             # The launch bound this host on a replica without its tunnel, so it
@@ -753,14 +762,16 @@ class ManagedStartupInputs:
                         cleared_pending_id=pending_inputs.make_pending_id(session_id, item.id),
                     )
                 elif pending_id := response.get("pending_id"):
-                    watch = asyncio.create_task(
-                        self._expire_unconfirmed(session_id, item.id, str(pending_id)),
-                        name=f"startup-input-receipt-{session_id}",
+                    self._start_receipt_watch(
+                        session_id, item.id, str(pending_id), _RECEIPT_TIMEOUT_S
                     )
-                    self._receipt_watches.add(watch)
-                    watch.add_done_callback(self._receipt_watches.discard)
                 await asyncio.to_thread(
-                    self.conversations.set_labels, session_id, {STARTUP_LABEL: "ready"}
+                    self.conversations.set_labels,
+                    session_id,
+                    {
+                        STARTUP_LABEL: "ready",
+                        SENT_AT_LABEL: f"{item.id}:{context.submitted_at or time.time()}",
+                    },
                 )
                 if kind == CATCH_UP:
                     await asyncio.to_thread(
@@ -851,9 +862,59 @@ class ManagedStartupInputs:
         _logger.info("Saved message for session %s waits for /clear to finish", session_id)
         return True
 
-    async def _expire_unconfirmed(self, session_id: str, item_id: str, pending_id: str) -> None:
+    def _start_receipt_watch(
+        self, session_id: str, item_id: str, pending_id: str, delay: float
+    ) -> None:
+        key = (current_workspace_id(), session_id, item_id)
+        existing = self._receipt_watches.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        watch = asyncio.create_task(
+            self._expire_unconfirmed(session_id, item_id, pending_id, delay=delay),
+            name=f"startup-input-receipt-{session_id}",
+        )
+        self._receipt_watches[key] = watch
+
+        def forget(done: asyncio.Task[None]) -> None:
+            if self._receipt_watches.get(key) is done:
+                self._receipt_watches.pop(key, None)
+
+        watch.add_done_callback(forget)
+
+    def _watch_receipt(self, conv: Conversation, item: ConversationItem) -> None:
+        """
+        Time out a submitted input found awaiting its echo with no watch here.
+
+        After a restart the in-memory watch is gone; the timeout runs from the
+        recorded send time, or from now when none was recorded.
+        """
+        key = (current_workspace_id(), conv.id, item.id)
+        if key in self._receipt_watches:
+            return
+        now = time.time()
+        sent_at = now
+        recorded_id, _, raw_time = (conv.labels.get(SENT_AT_LABEL) or "").partition(":")
+        if recorded_id == item.id:
+            with contextlib.suppress(ValueError):
+                sent_at = min(now, float(raw_time))
+        _logger.info(
+            "Saved input %s for session %s awaits its receipt; timing out in %.0fs",
+            item.id,
+            conv.id,
+            max(0.0, sent_at + _RECEIPT_TIMEOUT_S - now),
+        )
+        self._start_receipt_watch(
+            conv.id,
+            item.id,
+            pending_inputs.make_pending_id(conv.id, item.id),
+            max(0.0, sent_at + _RECEIPT_TIMEOUT_S - now),
+        )
+
+    async def _expire_unconfirmed(
+        self, session_id: str, item_id: str, pending_id: str, *, delay: float
+    ) -> None:
         """Fail a submitted input whose transcript echo never came, freeing the ones behind it."""
-        await asyncio.sleep(_RECEIPT_TIMEOUT_S)
+        await asyncio.sleep(delay)
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
             return
@@ -1054,7 +1115,7 @@ class ManagedStartupInputs:
             *(task for _, task, _ in self._workers.values()),
             *(task for task, _ in self._runner_workers.values()),
             *self._deliveries.values(),
-            *self._receipt_watches,
+            *self._receipt_watches.values(),
         ]
         for task in tasks:
             task.cancel()
