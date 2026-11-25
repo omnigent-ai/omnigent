@@ -48,6 +48,8 @@ import { OttoDoneMark, TidePoolScene } from "@/components/TidePool";
 import { usePlayfulTouches } from "@/lib/playfulTouchesPreferences";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
 import { NEEDS_YOU_PARAM } from "./needsYouFilter";
+import { STALLED_PARAM, ticketStalled } from "./ticketStall";
+import { TicketStallFooter } from "./TicketStallFooter";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { needsWhom } from "./ticketWaitingOn";
 import { collapsedLanes, useContentWidth, useLanePreferences } from "./boardLaneLayout";
@@ -73,7 +75,10 @@ export function ProjectTicketBoard({
   ticketIds = NO_TICKET_FILTER,
   isNewTicket = NOT_NEW,
   requesterFilterInHeader = false,
+  stalledOnly = false,
 }: {
+  /** Lanes show only their stalled cards. */
+  stalledOnly?: boolean;
   /** The page shows the All tickets / Yours filter in its tab row, so the board doesn't. */
   requesterFilterInHeader?: boolean;
   projectName: string;
@@ -100,6 +105,7 @@ export function ProjectTicketBoard({
         overlayClearance={overlayClearance}
         ticketIds={ticketIds}
         requesterFilterInHeader={requesterFilterInHeader}
+        stalledOnly={stalledOnly && ticketIds.length === 0}
       />
     </NewTicketContext.Provider>
   );
@@ -112,6 +118,7 @@ function TicketBoard({
   overlayClearance,
   ticketIds,
   requesterFilterInHeader,
+  stalledOnly,
 }: {
   projectId: string | null;
   projectName: string;
@@ -119,6 +126,7 @@ function TicketBoard({
   overlayClearance?: string;
   ticketIds: string[];
   requesterFilterInHeader: boolean;
+  stalledOnly: boolean;
 }) {
   const [search] = useSearchParams();
   const [selectionLimit, setSelectionLimit] = useState(25);
@@ -134,6 +142,7 @@ function TicketBoard({
   const unfilteredSearch = new URLSearchParams(search);
   unfilteredSearch.delete("tickets");
   unfilteredSearch.delete(NEEDS_YOU_PARAM);
+  unfilteredSearch.delete(STALLED_PARAM);
   const [mine, setMine] = useBoardRequesterFilter(projectId);
   const [dragged, setDragged] = useState<ProjectTicket | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
@@ -299,6 +308,7 @@ function TicketBoard({
               }
               selectionPending={selectionPending}
               mine={mine}
+              stalledOnly={stalledOnly}
               projectEmpty={projectEmpty}
               onCountChange={reportLaneCount}
             />
@@ -396,6 +406,7 @@ function TicketColumn({
   filteredTickets,
   selectionPending,
   mine,
+  stalledOnly,
   projectEmpty = false,
   onCountChange,
   phone,
@@ -419,6 +430,8 @@ function TicketColumn({
   selectionPending: boolean;
   /** Only the viewer's tickets. */
   mine: boolean;
+  /** Only the lane's stalled cards, among those loaded. */
+  stalledOnly: boolean;
   /** The project has no tickets at all. */
   projectEmpty?: boolean;
   /** This lane's ticket count, or null while unknown or filtered. */
@@ -430,16 +443,21 @@ function TicketColumn({
 }) {
   const [search] = useSearchParams();
   const playful = usePlayfulTouches();
+  const now = useNow();
   const query = useTickets(projectId, stage.id, filteredTickets === undefined, mine);
-  const tickets = filteredTickets ?? query.data?.pages.flatMap((page) => page.data) ?? [];
-  const hasNextPage = filteredTickets === undefined && query.hasNextPage;
+  const loaded = filteredTickets ?? query.data?.pages.flatMap((page) => page.data) ?? [];
+  const tickets = stalledOnly
+    ? loaded.filter((ticket) => ticketStalled(ticket, now.getTime()))
+    : loaded;
+  const hasNextPage = filteredTickets === undefined && !stalledOnly && query.hasNextPage;
   const laneCount =
-    filteredTickets !== undefined || mine || query.data === undefined
+    filteredTickets !== undefined || mine || stalledOnly || query.data === undefined
       ? null
       : (query.data.pages[0]?.total ?? (hasNextPage ? null : tickets.length));
   useEffect(() => onCountChange?.(stage.id, laneCount), [onCountChange, stage.id, laneCount]);
   // The server's total for the lane; older servers only report what has loaded, plus "+".
-  const total = filteredTickets === undefined ? query.data?.pages[0]?.total : undefined;
+  const total =
+    filteredTickets === undefined && !stalledOnly ? query.data?.pages[0]?.total : undefined;
   const count = total ?? `${tickets.length}${hasNextPage ? "+" : ""}`;
   const countKnown = filteredTickets !== undefined || query.data !== undefined;
   useEffect(() => {
@@ -618,43 +636,49 @@ function TicketCard({
   finished?: boolean;
 }) {
   const [search] = useSearchParams();
+  const now = useNow().getTime();
+  const stalled = ticketStalled(ticket, now);
   const { setNodeRef, listeners, attributes, isDragging } = useDraggable({
     id: ticket.id,
     data: { ticket },
     disabled,
   });
   return (
-    <div className="relative">
-      <Link
-        ref={setNodeRef}
-        {...attributes}
-        {...listeners}
-        role="link"
-        to={ticketPanelSearch(ticket.id, search)}
-        aria-label={`Open ticket: ${ticket.title}`}
-        data-related-highlight={related || undefined}
-        onMouseEnter={() => onHover(ticket.id)}
-        onMouseLeave={() => onHover(null)}
-        onFocus={() => onFocus(ticket.id)}
-        onBlur={() => onFocus(null)}
-        onClick={(event) => {
-          if (suppressClick()) event.preventDefault();
-        }}
-        className={cn(
-          "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
-          related && "border-muted-foreground/50",
-          // Cards waiting on the viewer stand out in a lane, until they answer.
-          needsWhom(ticket.waiting_on, getCurrentUserId())?.kind === "you" &&
-            // Important: dark mode's glass-card rule resets every card border.
-            "border-l-4! border-l-brand-accent!",
-          selected && "border-primary ring-1 ring-primary/20",
-          isDragging && "opacity-40",
-        )}
-      >
-        <TicketCardContent ticket={ticket} finished={finished} />
-      </Link>
-      {/* Over the card's footer corner, outside the link so each icon stays its own control. */}
-      <TicketAgentIcons ticket={ticket} className="absolute right-3.5 bottom-3" />
+    <div className={cn(isDragging && "opacity-40")}>
+      <div className="relative">
+        <Link
+          ref={setNodeRef}
+          {...attributes}
+          {...listeners}
+          role="link"
+          to={ticketPanelSearch(ticket.id, search)}
+          aria-label={`Open ticket: ${ticket.title}`}
+          data-related-highlight={related || undefined}
+          onMouseEnter={() => onHover(ticket.id)}
+          onMouseLeave={() => onHover(null)}
+          onFocus={() => onFocus(ticket.id)}
+          onBlur={() => onFocus(null)}
+          onClick={(event) => {
+            if (suppressClick()) event.preventDefault();
+          }}
+          className={cn(
+            "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
+            related && "border-muted-foreground/50",
+            // Cards waiting on the viewer stand out in a lane, until they answer.
+            needsWhom(ticket.waiting_on, getCurrentUserId())?.kind === "you" &&
+              // Important: dark mode's glass-card rule resets every card border.
+              "border-l-4! border-l-brand-accent!",
+            selected && "border-primary ring-1 ring-primary/20",
+            stalled && "rounded-b-none",
+          )}
+        >
+          <TicketCardContent ticket={ticket} finished={finished} />
+        </Link>
+        {/* Over the card's footer corner, outside the link so each icon stays its own control. */}
+        <TicketAgentIcons ticket={ticket} className="absolute right-3.5 bottom-3" />
+      </div>
+      {/* Outside the link too: Wake the Lead is its own control. */}
+      <TicketStallFooter ticket={ticket} nowMs={now} />
     </div>
   );
 }
@@ -704,6 +728,7 @@ function TicketCardContent({
           >
             {relativeTime(ticket.updated_at * 1000, now.getTime())}
           </time>
+          <TicketWorking ticket={ticket} nowMs={now.getTime()} />
           <TicketRequester ticket={ticket} />
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -750,6 +775,32 @@ function TicketStatusLine({ ticket }: { ticket: ProjectTicket }) {
       {text}
     </p>
   );
+}
+
+/** "Platform Engineer · working 12m" while a worker runs on the ticket. */
+function TicketWorking({ ticket, nowMs }: { ticket: ProjectTicket; nowMs: number }) {
+  const working = ticket.working;
+  if (!working || ticket.has_running_agents !== true) return null;
+  const elapsed = working.since !== null ? workingFor(nowMs / 1000 - working.since) : "";
+  return (
+    <span
+      data-testid="ticket-working"
+      className="min-w-0 truncate"
+      title={
+        working.since !== null ? `Working since ${absoluteTime(working.since * 1000)}` : undefined
+      }
+    >
+      {working.name || "An agent"} · working{elapsed && ` ${elapsed}`}
+    </span>
+  );
+}
+
+/** "12m", "1h 5m"; empty under a minute. */
+export function workingFor(seconds: number): string {
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 1) return "";
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 /** Who asked for a ticket, when it wasn't the viewer: a shared member or an outside PR author. */

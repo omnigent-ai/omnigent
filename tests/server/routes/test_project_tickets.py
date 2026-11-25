@@ -1285,6 +1285,35 @@ async def test_ticket_running_projection_batches_links_and_respects_access(
     assert (await client.get(base, headers=_as_user(BOB))).status_code == 404
 
 
+async def test_board_cards_carry_a_stall_clock_and_who_is_working(
+    project_client, db_uri, monkeypatch
+):
+    project = (await project_client.post("/v1/projects", json={"name": "Stalls"})).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Started"})).json()
+    backlog = (await project_client.post(base, json={"title": "Not started"})).json()
+    await project_client.patch(f"{base}/{ticket['id']}", json={"stage_id": "in_progress"})
+    worker = SqlAlchemyConversationStore(db_uri).create_conversation(
+        project_id=project["id"], agent_id=PROJECT_AGENT_ID
+    )
+    await project_client.post(f"{base}/{ticket['id']}/sessions", json={"session_id": worker.id})
+    monkeypatch.setattr(ticket_routes, "_session_status_cache", {worker.id: "idle"})
+    monkeypatch.setattr(ticket_routes, "_session_running_since", {worker.id: 1_700_000_000.0})
+
+    def card(ticket_id):
+        return next(row for row in page if row["id"] == ticket_id)
+
+    page = (await project_client.get(base)).json()["data"]
+    assert card(ticket["id"])["stall"]["after_s"] == 2 * 3600
+    assert card(ticket["id"])["working"] is None
+    # A ticket nobody has started isn't stalled; it's waiting its turn.
+    assert card(backlog["id"])["stall"] is None
+    ticket_routes._session_status_cache[worker.id] = "running"
+    page = (await project_client.get(base)).json()["data"]
+    assert card(ticket["id"])["stall"] is None
+    assert card(ticket["id"])["working"] == {"name": "project-agent", "since": 1_700_000_000}
+
+
 async def test_lifecycle_related_and_session_links_api(project_client, db_uri):
     project = (await project_client.post("/v1/projects", json={"name": "Lifecycle"})).json()
     base = f"/v1/projects/{project['id']}/tickets"

@@ -642,6 +642,8 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# Epoch seconds a session's current ``running`` stretch began, seen on this replica.
+_session_running_since: WorkspaceScopedCache[str, float] = WorkspaceScopedCache()
 
 
 @dataclass
@@ -1319,6 +1321,7 @@ __all__ = [
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
     "_session_mcp_startup_cache",
+    "_session_running_since",
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",

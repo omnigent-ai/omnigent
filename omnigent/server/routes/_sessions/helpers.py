@@ -258,6 +258,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_tasks_cache,
     _session_blocked_on_cache,
     _session_mcp_startup_cache,
+    _session_running_since,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -5245,6 +5246,10 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    if status != "running":
+        _session_running_since.pop(session_id, None)
+    elif previous_status != "running":
+        _session_running_since[session_id] = time.time()
     if status not in ("running", "waiting"):
         session_live_state.record_child_status(
             session_id, None, status, handoffs=session_live_state.handoff_count(session_id)

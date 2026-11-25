@@ -65,10 +65,15 @@ from omnigent.server.persona_mentions import (
     split_mentions,
 )
 from omnigent.server.project_landing import RISK_OK_LABEL, could_supersede, is_pure_rebase
+from omnigent.server.project_reliability import settings as reliability_settings
+from omnigent.server.project_router import router_session_ids
 from omnigent.server.project_status_spend import project_total_cents
 from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_access, require_user
-from omnigent.server.routes._sessions.common import _session_status_cache
+from omnigent.server.routes._sessions.common import (
+    _session_running_since,
+    _session_status_cache,
+)
 from omnigent.server.routes._sessions.helpers import (
     _permission_level_from_grants,
     _resolve_harness,
@@ -87,6 +92,13 @@ from omnigent.server.ticket_review import (
     superseding_sha,
     to_reviewer_message,
     to_worker_message,
+)
+from omnigent.server.ticket_stall import (
+    BoardStall,
+    WorkerState,
+    card_stall_after,
+    ticket_stall,
+    ticket_working,
 )
 from omnigent.server.ticket_summary import TicketSummarizer, build_ticket_summarizer
 from omnigent.server.usage_events import record_usage_event
@@ -649,7 +661,14 @@ def create_project_tickets_router(
             is not None
         ]
 
-    async def enrich(project_id: str, tickets: list[dict[str, Any]], who: TicketActor) -> None:
+    async def enrich(
+        project_id: str,
+        tickets: list[dict[str, Any]],
+        who: TicketActor,
+        *,
+        board: BoardStall | None = None,
+    ) -> None:
+        """Add agents, running state and seen state; with *board*, the stall and working fields."""
         if not tickets:
             return
         links = await asyncio.to_thread(
@@ -727,6 +746,49 @@ def create_project_tickets_router(
                 for name, harness, persona in distinct
             ]
             ticket["agents_has_more"] = linked.has_more
+            if board is not None:
+                workers = [
+                    WorkerState(
+                        status=_session_status_cache.get(sid, sessions[sid].live_status),
+                        updated_at=int(sessions[sid].updated_at or 0),
+                        name=(metadata[sid][2] or metadata[sid][0]) if sid in metadata else "",
+                        running_since=_session_running_since.get(sid),
+                    )
+                    for sid in linked.session_ids
+                    if sid not in board.router_session_ids
+                    and sid in sessions
+                    and not sessions[sid].archived
+                ]
+                known = not linked.has_more and all(
+                    sid in board.router_session_ids
+                    or (sid in sessions and sessions[sid].archived is not None)
+                    for sid in linked.session_ids
+                )
+                ticket["stall"] = ticket_stall(
+                    ticket,
+                    card_stall_after(board.stages, ticket["stage_id"], board.settings),
+                    workers,
+                    workers_known=known,
+                )
+                ticket["working"] = ticket_working(workers)
+
+    async def board_stall(
+        request: Request, page: dict[str, Any], who: TicketActor
+    ) -> BoardStall | None:
+        """The project's stall settings and router sessions, for a page of board cards."""
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        if notifications is None or not page["data"]:
+            return None
+        project = await asyncio.to_thread(
+            notifications.projects.get, page["data"][0]["project_id"], user_id=who.user_id
+        )
+        if project is None:
+            return None
+        return BoardStall(
+            stages=page.get("stages") or [],
+            settings=reliability_settings(project.config),
+            router_session_ids=frozenset(await router_session_ids(request.app, project)),
+        )
 
     @router.get("")
     async def list_tickets(
@@ -758,7 +820,7 @@ def create_project_tickets_router(
         # Project sessions already carry this guidance in their instructions.
         if include_guidance and who.session_id is not None:
             page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
-        await enrich(project_id, page["data"], who)
+        await enrich(project_id, page["data"], who, board=await board_stall(request, page, who))
         return page
 
     async def text_mentions(

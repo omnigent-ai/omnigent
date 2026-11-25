@@ -105,8 +105,21 @@ export interface ProjectTicket {
   sign_offs?: TicketLabel[];
   /** Who the open needs-human ask waits on, routed as in the Inbox; null once answered. */
   waiting_on?: TicketWaitingOn | null;
+  /**
+   * Board lists: the stall clock when the card can stall (no open ask, no running worker,
+   * a watched working stage). It reads as stalled once `after_s` passes since `idle_since`.
+   */
+  stall?: TicketStall | null;
+  /** Board lists: a worker at work on the ticket; `since` is null when unknown. */
+  working?: { name: string; since: number | null } | null;
   /** Whether the landed commit runs in this server; absent when unknown. Single-ticket reads. */
   ship_status?: TicketShipStatus | null;
+}
+export interface TicketStall {
+  /** Unix seconds the ticket and its workers last changed. */
+  idle_since: number;
+  /** Seconds idle before the card reads as stalled, for its stage. */
+  after_s: number;
 }
 export interface TicketShipStatus {
   /** `live`: in the running code. `waiting_restart`: landed, but the server hasn't restarted. */

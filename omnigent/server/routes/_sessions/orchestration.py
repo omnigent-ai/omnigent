@@ -259,6 +259,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_tasks_cache,
     _session_blocked_on_cache,
     _session_mcp_startup_cache,
+    _session_running_since,
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
@@ -4780,6 +4781,7 @@ async def _publish_runner_recovered_status_impl(
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
     _session_status_cache[session_id] = "idle"
+    _session_running_since.pop(session_id, None)
     session_live_state.persist_live_status(session_id, "idle")
     event = SessionStatusEvent(
         type="session.status",

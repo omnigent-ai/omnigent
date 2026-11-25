@@ -84,7 +84,7 @@ LOOP_AGENT_ID = uuid.uuid5(uuid.NAMESPACE_URL, "omnigent:project-reliability-loo
 REVIEW_STAGE_IDS = ("code_review", "review")
 
 
-def _ship_stage(stages: list[dict[str, Any]]) -> str | None:
+def ship_stage_id(stages: list[dict[str, Any]]) -> str | None:
     """The stage holding finished work waiting to ship, or ``None``.
 
     That is the last stage before completion when a review stage comes before it,
@@ -601,7 +601,7 @@ class ReliabilityLoop:
         if len(stages) < 2:
             return
         working = {stage["id"]: stage["name"] for stage in stages[1:-1]}
-        ship_stage = _ship_stage(stages)
+        ship_stage = ship_stage_id(stages)
         excluded = await router_session_ids(self.app, project)
         seen: set[str] = set()
         newest = 0

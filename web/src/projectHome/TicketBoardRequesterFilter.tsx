@@ -60,12 +60,15 @@ export function TicketBoardRequesterFilter({
   mine,
   onChange,
   needsYou,
+  stalled,
   compact = false,
 }: {
   mine: boolean;
   onChange: (mine: boolean) => void;
   /** Shown in the compact chips while anything waits on the viewer. */
   needsYou?: NeedsYouChip;
+  /** "N stalled", shown in the compact chips while any loaded card is stalled. */
+  stalled?: NeedsYouChip;
   /** A small segmented switch, for the end of the page's tab row. */
   compact?: boolean;
 }) {
@@ -73,7 +76,10 @@ export function TicketBoardRequesterFilter({
     { value: false, label: "All tickets" },
     { value: true, label: "Your tickets" },
   ];
-  if (compact) return <RequesterFilterChips mine={mine} onChange={onChange} needsYou={needsYou} />;
+  if (compact)
+    return (
+      <RequesterFilterChips mine={mine} onChange={onChange} needsYou={needsYou} stalled={stalled} />
+    );
   return (
     <ButtonGroup aria-label="Filter tickets by requester" data-testid="ticket-requester-filter">
       {options.map((option) => (
@@ -98,12 +104,16 @@ function RequesterFilterChips({
   mine,
   onChange,
   needsYou,
+  stalled,
 }: {
   mine: boolean;
   onChange: (mine: boolean) => void;
   needsYou?: NeedsYouChip;
+  stalled?: NeedsYouChip;
 }) {
   const needsYouActive = needsYou?.active === true;
+  // Either narrowing chip deselects All tickets and Yours.
+  const narrowed = needsYouActive || stalled?.active === true;
   const viewerId = useViewerId();
   const chip = (selected: boolean) =>
     cn(
@@ -121,19 +131,19 @@ function RequesterFilterChips({
     >
       <button
         type="button"
-        aria-pressed={!mine && !needsYouActive}
+        aria-pressed={!mine && !narrowed}
         onClick={() => onChange(false)}
-        className={chip(!mine && !needsYouActive)}
+        className={chip(!mine && !narrowed)}
       >
         <span className="text-optical">All tickets</span>
       </button>
       <button
         type="button"
-        aria-pressed={mine && !needsYouActive}
+        aria-pressed={mine && !narrowed}
         aria-label="Your tickets"
         title="Only tickets you requested"
         onClick={() => onChange(true)}
-        className={cn(chip(mine && !needsYouActive), viewerId && "pl-1")}
+        className={cn(chip(mine && !narrowed), viewerId && "pl-1")}
       >
         {viewerId && (
           <span
@@ -156,6 +166,22 @@ function RequesterFilterChips({
           className={chip(needsYouActive)}
         >
           <span className="text-optical">Needs you ({needsYou.count})</span>
+        </button>
+      )}
+      {stalled && stalled.count > 0 && (
+        <button
+          type="button"
+          aria-pressed={stalled.active}
+          title="Only cards no one has worked on for a while"
+          data-testid="ticket-stalled-filter"
+          onClick={stalled.onSelect}
+          className={cn(
+            chip(stalled.active),
+            !stalled.active &&
+              "text-amber-800 ring-amber-500/40 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-300",
+          )}
+        >
+          <span className="text-optical">{stalled.count} stalled</span>
         </button>
       )}
     </div>

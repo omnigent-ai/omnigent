@@ -50,6 +50,8 @@ import {
   NEEDS_YOU_VALUE,
   useNeedsYouTicketIds,
 } from "@/projectHome/needsYouFilter";
+import { STALLED_PARAM, STALLED_VALUE, useStalledTicketIds } from "@/projectHome/ticketStall";
+import { useNow } from "@/hooks/useNow";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { OutdatedHostBanner } from "@/projectHome/OutdatedHostBanner";
 import { useProjectAgentSession } from "@/projectHome/useProjectAgentSession";
@@ -150,11 +152,22 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   const leadSessionId = useProjectAgentSession(tickets ? (projectId ?? null) : null).sessionId;
   // With nothing waiting on the viewer the chip hides and the board shows its usual view.
   const needsYou = searchParams.get(NEEDS_YOU_PARAM) === NEEDS_YOU_VALUE && needsYouIds.length > 0;
-  const setNeedsYou = (on: boolean) => {
+  const now = useNow();
+  const stalledIds = useStalledTicketIds(
+    tickets ? (projectId ?? null) : null,
+    boardMine,
+    now.getTime(),
+  );
+  // Like Needs you, the filter drops once nothing on the board is stalled.
+  const stalledOnly = searchParams.get(STALLED_PARAM) === STALLED_VALUE && stalledIds.length > 0;
+  /** Show one of the board's narrowing chips, or neither. */
+  const setBoardFilter = (filter: "needs-you" | "stalled" | null) => {
     const next = new URLSearchParams(searchParams);
     next.delete("tickets");
-    if (on) next.set(NEEDS_YOU_PARAM, NEEDS_YOU_VALUE);
-    else next.delete(NEEDS_YOU_PARAM);
+    next.delete(NEEDS_YOU_PARAM);
+    next.delete(STALLED_PARAM);
+    if (filter === "needs-you") next.set(NEEDS_YOU_PARAM, NEEDS_YOU_VALUE);
+    if (filter === "stalled") next.set(STALLED_PARAM, STALLED_VALUE);
     replaceSearchParams(next);
   };
   const view: ProjectHomeView = tickets && !orchestrator ? projectHomeView(searchParams) : "board";
@@ -233,13 +246,18 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
               <TicketBoardRequesterFilter
                 mine={boardMine}
                 onChange={(mine) => {
-                  if (needsYou) setNeedsYou(false);
+                  if (needsYou || stalledOnly) setBoardFilter(null);
                   setBoardMine(mine);
                 }}
                 needsYou={{
                   count: needsYouIds.length,
                   active: needsYou,
-                  onSelect: () => setNeedsYou(true),
+                  onSelect: () => setBoardFilter("needs-you"),
+                }}
+                stalled={{
+                  count: stalledIds.length,
+                  active: stalledOnly,
+                  onSelect: () => setBoardFilter("stalled"),
                 }}
                 compact
               />
@@ -261,6 +279,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
                 isNewTicket={isNewTicket}
                 ticketIds={needsYou ? needsYouIds : ticketSelectionIds(searchParams)}
                 requesterFilterInHeader={!ticketFillsPage}
+                stalledOnly={stalledOnly}
                 overlayClearance={composerOpen ? "10rem" : undefined}
               />
             </div>

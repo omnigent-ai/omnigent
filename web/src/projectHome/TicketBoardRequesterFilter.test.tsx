@@ -32,6 +32,28 @@ describe("TicketBoardRequesterFilter", () => {
     expect(window.localStorage.getItem("omnigent.ticketBoard.mine.p1")).toBe("1");
   });
 
+  it("presses only the stalled chip while it narrows the board", () => {
+    const onSelect = vi.fn();
+    render(
+      <TicketBoardRequesterFilter
+        mine={false}
+        onChange={() => {}}
+        needsYou={{ count: 1, active: false, onSelect }}
+        stalled={{ count: 2, active: true, onSelect }}
+        compact
+      />,
+    );
+    expect(screen.getByRole("button", { name: "2 stalled" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByTestId("ticket-needs-you-filter")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "All tickets" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
   it("ignores another project's change", () => {
     window.localStorage.clear();
     render(

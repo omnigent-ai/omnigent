@@ -1,0 +1,114 @@
+"""When a board card reads as stalled, and who is at work on a running one.
+
+A card is stalled when its ticket sits in a watched working stage with no open
+ask for a person, no deliberate ``waiting`` wake-up and no linked worker running,
+and neither the ticket nor those workers have changed for the card's threshold.
+The stages and thresholds follow the reliability loop's (see
+:mod:`omnigent.server.project_reliability`), but a card waits at least
+:data:`CARD_STALL_MIN_S`, past the loop's own nudge, restart and escalation, so
+it only flags work the automatic checks didn't get moving. The router's sessions
+(the Lead's) don't count as the ticket's workers: they hear about every ticket.
+
+The server sends the idle start and the threshold; the board compares them with
+the clock, so a card turns stalled without another request.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from omnigent.server.project_reliability import (
+    WAITING_LABEL,
+    Settings,
+    ship_stage_id,
+)
+
+#: A card never reads as stalled sooner than this, whatever the stage's loop threshold.
+CARD_STALL_MIN_S = 2 * 3600
+_NEEDS_HUMAN_LABEL = "needs-human"
+
+
+@dataclass(frozen=True)
+class BoardStall:
+    """What a page of cards needs to judge stalls.
+
+    :param stages: The project's stages, in board order.
+    :param settings: Its reliability settings.
+    :param router_session_ids: The router's sessions, which aren't any ticket's worker.
+    """
+
+    stages: Sequence[Mapping[str, Any]]
+    settings: Settings
+    router_session_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
+class WorkerState:
+    """One linked session, as the board sees it.
+
+    :param status: Its live status: ``"running"``, ``"waiting"``, ``"idle"`` or
+        ``"failed"``, or ``None`` when unknown.
+    :param updated_at: Epoch seconds the session last changed.
+    :param name: Who it works as, e.g. ``"Platform Engineer"``.
+    :param running_since: Epoch seconds its current run began, when known.
+    """
+
+    status: str | None
+    updated_at: int
+    name: str
+    running_since: float | None = None
+
+
+def card_stall_after(
+    stages: Sequence[Mapping[str, Any]], stage_id: str, config: Settings
+) -> float | None:
+    """Seconds without activity before a card in *stage_id* reads as stalled.
+
+    ``None`` for stages the loop doesn't watch: the first (not started), the
+    completed one and any whose ``stage_minutes`` is 0. The stage holding
+    finished work waiting to ship uses the loop's ship reminder wait instead.
+    """
+    working = [stage["id"] for stage in stages[1:-1]]
+    if stage_id not in working or stage_id in config.unwatched_stages:
+        return None
+    if stage_id == ship_stage_id(list(stages)):
+        return max(CARD_STALL_MIN_S, config.ship_wait_s)
+    return max(CARD_STALL_MIN_S, config.threshold(stage_id))
+
+
+def ticket_stall(
+    ticket: Mapping[str, Any],
+    after_s: float | None,
+    workers: Collection[WorkerState],
+    *,
+    workers_known: bool,
+) -> dict[str, int] | None:
+    """The card's stall clock, ``{"idle_since", "after_s"}``, or ``None`` when it can't stall.
+
+    :param ticket: The ticket as listed, with ``labels``, ``waiting_on`` and ``updated_at``.
+    :param after_s: Its stage's threshold from :func:`card_stall_after`.
+    :param workers: Its linked sessions, without the router's.
+    :param workers_known: Whether every linked session was read; when not, a
+        worker might be running, so the card doesn't claim a stall.
+    """
+    if after_s is None or not workers_known or ticket.get("waiting_on"):
+        return None
+    keys = {label.get("key") for label in ticket.get("labels") or []}
+    if _NEEDS_HUMAN_LABEL in keys or WAITING_LABEL in keys:
+        return None
+    # A waiting worker is blocked on an approval or its background agents, not idle.
+    if any(worker.status not in ("idle", "failed") for worker in workers):
+        return None
+    idle_since = max([int(ticket.get("updated_at") or 0), *(w.updated_at for w in workers)])
+    return {"idle_since": idle_since, "after_s": int(after_s)}
+
+
+def ticket_working(workers: Sequence[WorkerState]) -> dict[str, Any] | None:
+    """The first running worker, ``{"name", "since"}``; ``since`` is ``None`` when unknown."""
+    for worker in workers:
+        if worker.status == "running":
+            since = int(worker.running_since) if worker.running_since is not None else None
+            return {"name": worker.name, "since": since}
+    return None
