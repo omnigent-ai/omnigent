@@ -1,9 +1,7 @@
-// Go to File: find a file in the open session's workspace by name or path, or a line by its
-// text, and open it, or find a session by its name or messages. Before a query Files lists the
-// files recently opened from it; the workspace's own search answers each query, and the footer
-// says when that answer isn't the whole story. All tabs search the same typed text.
+// Go to File: a file by name or path, a line by its text, or a session; every tab searches the
+// same typed text, and the footer says when an answer isn't the whole story.
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 
 import { CompactShortcutKeys } from "@/components/ui/kbd";
@@ -53,6 +51,21 @@ const MODES: Record<GoToFileMode, { tab: string; shortcut?: "palette.files" | "p
   files: { tab: "Files", shortcut: "palette.files" },
   text: { tab: "Text", shortcut: "palette.text" },
   sessions: { tab: SESSION_SEARCH_COPY.tab },
+};
+
+/** Each mode's dialog title, field label and placeholder. */
+const MODE_COPY: Record<GoToFileMode, { title: string; label: string; placeholder: string }> = {
+  files: {
+    title: GO_TO_FILE_LABEL,
+    label: "Go to a file",
+    placeholder: "Go to a file in this session…",
+  },
+  text: {
+    title: "Search Text in Workspace",
+    label: "Search text in files",
+    placeholder: "Search text in this session's files…",
+  },
+  sessions: SESSION_SEARCH_COPY,
 };
 
 /** What a finder row opens: a file, at a line for a text match, or a session. */
@@ -205,41 +218,24 @@ function OpenGoToFileDialog({
     filtering,
     onFilteringChange: setFiltering,
   };
-  // The options' Alt keys work while the keyboard is anywhere in this dialog.
-  useTextSearchOptionKeys(
-    () =>
-      text
-        ? (document.querySelector(`[data-testid="${INPUT_TEST_ID}"]`)?.closest("[role=dialog]") ??
-          null)
-        : null,
-    controls,
-  );
+  // The options' Alt keys work while the keyboard is anywhere in this dialog, found from its
+  // toggles, which show only in Text.
+  const togglesRef = useRef<HTMLSpanElement>(null);
+  useTextSearchOptionKeys(() => togglesRef.current?.closest("[role=dialog]") ?? null, controls);
 
   // Sessions: ⌘K's session search, over the sessions the user can see.
   const sessionsView = useSessionsFinderView(sessions, query);
 
-  const view: {
-    items: QuickPickItem<FinderTarget>[];
-    emptyMessage: string;
-    status: string | null;
-  } = sessions
-    ? { items: sessionsView.items, emptyMessage: sessionsView.emptyMessage, status: null }
-    : text
-      ? textView
-      : filesView;
-  const copy = sessions
-    ? SESSION_SEARCH_COPY
-    : text
-      ? {
-          title: "Search Text in Workspace",
-          label: "Search text in files",
-          placeholder: "Search text in this session's files…",
-        }
-      : {
-          title: GO_TO_FILE_LABEL,
-          label: "Go to a file",
-          placeholder: "Go to a file in this session…",
-        };
+  const views: Record<
+    GoToFileMode,
+    { items: QuickPickItem<FinderTarget>[]; emptyMessage: string; status: string | null }
+  > = {
+    files: filesView,
+    text: textView,
+    sessions: { items: sessionsView.items, emptyMessage: sessionsView.emptyMessage, status: null },
+  };
+  const view = views[mode];
+  const copy = MODE_COPY[mode];
   return (
     <QuickPickDialog<FinderTarget>
       open={open}
@@ -262,7 +258,13 @@ function OpenGoToFileDialog({
       segments={[{ sourceId: `go-to-file:${mode}`, ranking: "provider", items: view.items }]}
       emptyMessage={view.emptyMessage}
       summary={() => view.status}
-      inputEnd={text ? <TextSearchToggles {...controls} /> : undefined}
+      inputEnd={
+        text ? (
+          <span ref={togglesRef} className="contents">
+            <TextSearchToggles {...controls} />
+          </span>
+        ) : undefined
+      }
       belowInput={
         text && (filtering || hasFileFilter(input)) ? (
           <TextSearchFilters {...controls} />
