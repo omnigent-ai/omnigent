@@ -558,6 +558,7 @@ describe("startGadgetBridge", () => {
       ["params that are not an object", { action: "run_card", params: ["c1"] }],
       ["an extra parameter", { action: "run_card", session: "s1" }],
       ["an operation ID with a space", { action: "run_card", operationId: "req 1" }],
+      ["an operation ID starting with punctuation", { action: "run_card", operationId: "_req" }],
       [
         "an operation ID over the length limit",
         { action: "run_card", operationId: "r".repeat(129) },

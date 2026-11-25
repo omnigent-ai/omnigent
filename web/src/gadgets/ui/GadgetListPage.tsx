@@ -2,6 +2,7 @@
  * Gadget page (`/gadget`): the viewer's gadgets and those shared with them, laid out like the
  * Automations page. New opens the New gadget dialog; a row opens its gadget full screen.
  */
+import { toast } from "sonner";
 import { type FormEvent, useId, useMemo, useRef, useState } from "react";
 import {
   Loader2Icon,
@@ -131,7 +132,17 @@ function GadgetRow({
             )}
             {pinned !== undefined && (
               <DropdownMenuItem
-                onSelect={() => pin.mutate({ gadgetId: gadget.id, pinned: !pinned })}
+                onSelect={() =>
+                  pin.mutate(
+                    { gadgetId: gadget.id, pinned: !pinned },
+                    {
+                      onError: () =>
+                        toast.error(
+                          pinned ? "Couldn’t unpin the gadget" : "Couldn’t pin the gadget",
+                        ),
+                    },
+                  )
+                }
               >
                 {pinned ? <PinOffIcon className="size-4" /> : <PinIcon className="size-4" />}
                 {pinned ? "Unpin from sidebar" : "Pin to sidebar"}

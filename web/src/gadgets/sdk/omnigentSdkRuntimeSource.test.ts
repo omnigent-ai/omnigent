@@ -369,6 +369,18 @@ describe("omnigent SDK runtime", () => {
       await expect(result).resolves.toEqual(document);
     });
 
+    it("refuses an idempotency key the host would refuse", async () => {
+      const runtime = loadRuntime();
+      const { client } = await connected(runtime);
+      await Promise.all(
+        ["_starts-with-punctuation", "has space", ""].map((key) =>
+          expect(
+            client.data.collection("cards").create({ title: "x" }, { idempotencyKey: key }),
+          ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" }),
+        ),
+      );
+    });
+
     it("preserves an error code the SDK does not know", async () => {
       const runtime = loadRuntime();
       const { hostPort, client } = await connected(runtime);

@@ -31,7 +31,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
   var PROTOCOL = config.protocol;
   var METHOD_CAPABILITY = config.methodCapability;
   var MUTATING = config.mutatingMethods;
-  var KEY_PATTERN = /^[A-Za-z0-9_.:-]+$/;
+  var KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
   var RETRYABLE_CODES = ['UNAVAILABLE', 'DEADLINE_EXCEEDED', 'RESOURCE_EXHAUSTED'];
   var TERMINAL_WATCH_CODES = ['PERMISSION_DENIED', 'UNSUPPORTED', 'REVISION_CHANGED', 'INVALID_ARGUMENT', 'UNAUTHENTICATED'];
   var trustedSources = [window.parent];
@@ -374,7 +374,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       return randomKey();
     }
     if (typeof key !== 'string' || key.length === 0 || key.length > LIMITS.maxOperationIdLength || !KEY_PATTERN.test(key)) {
-      throw new OmnigentError('INVALID_ARGUMENT', 'idempotencyKey must be 1-' + LIMITS.maxOperationIdLength + ' characters of A-Z, a-z, 0-9, _ . : -');
+      throw new OmnigentError('INVALID_ARGUMENT', 'idempotencyKey must be 1-' + LIMITS.maxOperationIdLength + ' characters of A-Z, a-z, 0-9, _ . : -, starting with a letter or digit');
     }
     return key;
   }

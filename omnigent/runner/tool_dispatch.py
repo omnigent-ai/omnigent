@@ -489,7 +489,7 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # Priority 5l.2: The session journal — the runner proxies the server's
 # /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
 _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
-# Priority 5l.2: Gadgets — the runner proxies the server's /v1/gadgets routes
+# Gadgets: the runner proxies the server's /v1/gadgets routes
 # (see omnigent/runner/gadget_tools.py). Registered when the server enables gadgets.
 _GADGET_TOOLS = GADGET_TOOL_NAMES
 # Priority 5l.2: Owner Inbox — the runner proxies /v1/inbox/items. Registered

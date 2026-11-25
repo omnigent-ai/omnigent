@@ -1464,6 +1464,150 @@ def test_a_rebuild_over_many_unique_keys_keeps_the_collection_writable(gadgets: 
     )
 
 
+def test_rules_published_over_more_unique_keys_than_fit_still_allow_deletes(
+    gadgets: Fixture,
+) -> None:
+    # 340 long IDs under a unique rule are more keys than the rule state holds: the rule is
+    # published anyway, deletes still land, other writes are refused until deletes make room,
+    # and then the next write recounts and the rule holds again.
+    service = gadgets.service()
+    app = publish_ruled_board(service, [])
+    created = [
+        rpc(
+            service,
+            app,
+            "create",
+            id=f"r{index:063d}",
+            value={"title": f"t{index:04d}", "column": "todo"},
+            operation_id=f"c-{index}",
+        )
+        for index in range(340)
+    ]
+    rule = {"name": "one_title", "kind": "unique", "collection": "cards", "fields": ["title"]}
+    app = _republish(service, app, ruled_revision(service, app["id"], [rule]))
+
+    def delete(index: int) -> None:
+        document = created[index]
+        rpc(
+            service,
+            app,
+            "delete",
+            id=document["id"],
+            if_version=document["version"],
+            operation_id=f"d-{index}",
+        )
+
+    delete(0)
+    assert rpc(service, app, "get", id=created[0]["id"]) is None
+    with pytest.raises(CapacityExceeded) as full:
+        rpc(
+            service,
+            app,
+            "create",
+            id="new",
+            value={"title": "fresh", "column": "todo"},
+            operation_id="c-new",
+        )
+    assert full.value.details == {"reason": "rule_state_full"}
+    for index in range(1, 100):
+        delete(index)
+    rpc(
+        service,
+        app,
+        "create",
+        id="new",
+        value={"title": "fresh", "column": "todo"},
+        operation_id="c-new-2",
+    )
+    with pytest.raises(ConstraintViolation):
+        rpc(
+            service,
+            app,
+            "create",
+            id="dup",
+            value={"title": "t0200", "column": "todo"},
+            operation_id="c-dup",
+        )
+
+
+@pytest.mark.parametrize("replacement", [[], 7, "text"])
+def test_a_ruled_record_replaced_by_a_value_that_is_not_an_object_names_nothing(
+    gadgets: Fixture, replacement: object
+) -> None:
+    # A collection schema without "type": "object" accepts any JSON value: a record that
+    # stops being an object stops naming its target, and the rules keep working after it.
+    service = gadgets.service()
+    app = service.create("Synthetic loose schema")
+    revision = service.create_revision(
+        app["id"],
+        {
+            "html": "<main>Synthetic loose schema</main>",
+            "sdk_version": 1,
+            "capabilities": ["data.read", "data.write"],
+            "collections": {
+                "cards": _RULED_COLLECTIONS["cards"],
+                "tasks": {"properties": {"project": {"type": "string"}}},
+            },
+            "constraints": [
+                {
+                    "name": "task_card",
+                    "kind": "reference",
+                    "collection": "tasks",
+                    "field": "project",
+                    "target": "cards",
+                    "on_delete": "restrict",
+                }
+            ],
+        },
+    )["id"]
+    app = service.publish(app["id"], {"revision_id": revision, "if_version": None})
+    target = card(service, app, "p1", "todo")
+    task = rpc(
+        service,
+        app,
+        "create",
+        collection="tasks",
+        id="t1",
+        value={"project": "p1"},
+        operation_id="t1",
+    )
+    replaced = rpc(
+        service,
+        app,
+        "replace",
+        collection="tasks",
+        id="t1",
+        value=replacement,
+        if_version=task["version"],
+        operation_id="t1-loose",
+    )
+    assert replaced["value"] == replacement
+    # Another ruled write lands, and the record no longer holds its old target back.
+    rpc(
+        service,
+        app,
+        "create",
+        collection="tasks",
+        id="t2",
+        value={"project": "p1"},
+        operation_id="t2",
+    )
+    with pytest.raises(ConstraintViolation):
+        rpc(service, app, "delete", id="p1", if_version=target["version"], operation_id="d-p1")
+    second = rpc(service, app, "get", collection="tasks", id="t2")
+    rpc(
+        service,
+        app,
+        "delete",
+        collection="tasks",
+        id="t2",
+        if_version=second["version"],
+        operation_id="d-t2",
+    )
+    rpc(service, app, "delete", id="p1", if_version=target["version"], operation_id="d-p1-2")
+    assert rpc(service, app, "get", id="p1") is None
+
+
 def test_deleting_a_referenced_record_reads_only_the_records_that_name_it(
     gadgets: Fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

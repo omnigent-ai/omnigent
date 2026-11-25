@@ -29,7 +29,10 @@ times that limit (10,000 times 10 million revisions by default, about two per wr
 bounds how many guarded writes a gadget can ever take. Its state, with a change in flight,
 must fit in ``MAX_GUARD_BYTES``: each unique key costs its digest plus the holding
 record's ID, so how many records a ``unique`` rule allows depends on their IDs and on
-the size of the record being written, not only on the collection's record limit.
+the size of the record being written, not only on the collection's record limit. Rules
+published over more data than that are live but over capacity: the state keeps no counts
+or keys, deletes (with their reference rules) still work, and other writes are refused
+until a delete makes room, when the next write recounts.
 
 A ``unique`` value that data from before the rule already repeats keeps every record
 holding it, so those records stay editable as long as they keep that value, and the value
@@ -105,6 +108,10 @@ _EPOCH = re.compile(r"^e[0-9]{6,12}$")
 _GENERATION = re.compile(r"^g([0-9]{1,12})$")
 _GUARD_COLLECTION = "epochs"
 _STALE = "stale"
+OVER_CAPACITY_MESSAGE = (
+    "This collection has more records under its rules than a gadget can track. Delete "
+    "some records, or publish a version without the unique or count rule."
+)
 _INITIAL_STATE = {"rules": _STALE, "counts": {}, "unique": {}, "pending": None, "writes": 0}
 # The guard's own records; tests shrink it.
 GUARD_LIMITS: StoreLimits = DEFAULT_LIMITS
@@ -290,6 +297,15 @@ def validate_constraints(value: Any, collections: dict) -> list[dict]:
     return rules
 
 
+def _canonical_size(value: Any) -> int:
+    return len(_canonical(value))
+
+
+def _field(value: Any, name: str) -> Any:
+    """*name* of a record value, or ``None``: a value that isn't an object has no fields."""
+    return value.get(name) if isinstance(value, dict) else None
+
+
 def _holders(entry: Any) -> list[str]:
     """The records holding a unique value: one ID, or a list when earlier data repeats it."""
     if isinstance(entry, str):
@@ -357,6 +373,7 @@ class ConstraintGuard:
         lost = 0
         attempts = 0
         rebuild_steps = 0
+        recounted = False
         while attempts < GUARD_ATTEMPTS:
             epoch, state = self._current()
             current = state.value
@@ -374,6 +391,17 @@ class ConstraintGuard:
                 if rebuild_steps > REBUILD_STEPS_PER_WRITE:
                     break
                 self._rebuild_step(epoch, state)
+                continue
+            full = current.get("over_capacity")
+            if isinstance(full, dict) and method != "delete":
+                # Only a delete can bring the derived state back within its limit: recount
+                # once if one landed since it went over, otherwise refuse straight away.
+                if recounted or not full.get("deletes"):
+                    raise CapacityExceeded(
+                        OVER_CAPACITY_MESSAGE, details={"reason": "rule_state_full"}
+                    )
+                recounted = True
+                self.mark_stale()
                 continue
             attempts += 1
             if self._rotation_due(epoch, current):
@@ -415,6 +443,14 @@ class ConstraintGuard:
                 "pending": plan.operations,
                 "writes": current.get("writes", 0) + 1,
             }
+            if isinstance(full, dict):
+                # Over its limit, the state keeps no counts or keys, only how many deletes
+                # might have made room since.
+                pending.update(
+                    counts={},
+                    unique={},
+                    over_capacity={"deletes": int(full.get("deletes", 0)) + 1},
+                )
             if len(_canonical(pending)) > MAX_GUARD_BYTES:
                 raise CapacityExceeded("This change is too large for a collection with rules")
             try:
@@ -558,7 +594,7 @@ class ConstraintGuard:
 
     @staticmethod
     def _reference_of(rule: dict, value: Any) -> str | None:
-        target = value.get(rule["field"]) if isinstance(value, dict) else None
+        target = _field(value, rule["field"])
         return target if isinstance(target, str) and _IDENTIFIER.fullmatch(target) else None
 
     def _index_root(self) -> str:
@@ -708,7 +744,7 @@ class ConstraintGuard:
                 if record_id not in seen and _IDENTIFIER.fullmatch(record_id)
                 else None
             )
-            if record is not None and record.value.get(rule["field"]) == target_id:
+            if record is not None and _field(record.value, rule["field"]) == target_id:
                 seen.add(record_id)
                 found.append(record)
                 continue
@@ -787,6 +823,9 @@ class ConstraintGuard:
             return self._apply_again(operation)
         # Older pending plans named one field.
         fields = set(operation.get("fields") or [operation["field"]])
+        if not isinstance(source.value, dict):
+            # Not an object, so it names nothing: whatever the plan saw is no longer there.
+            return self._apply_again(operation)
         value = {key: item for key, item in source.value.items() if key not in fields}
         try:
             return self.data.replace(
@@ -813,7 +852,7 @@ class ConstraintGuard:
             if not held:
                 return
             current = self.data.get(collection, record_id)
-            if current is not None and current.value.get(field) == target_id:
+            if current is not None and _field(current.value, field) == target_id:
                 return
             with contextlib.suppress(NotFound):
                 self.files.delete_tree(f"{directory}/ids/{record_id}")
@@ -845,8 +884,10 @@ class ConstraintGuard:
             return {}  # The planned version's history is gone: the record was removed since.
         if planned != self.data.incarnation(collection, record_id):
             return {}
-        naming = [field for field, target in targets.items() if current.value.get(field) == target]
-        if not naming:
+        naming = [
+            field for field, target in targets.items() if _field(current.value, field) == target
+        ]
+        if not naming or not isinstance(current.value, dict):
             return {}
         operation_id = f"{operation['operation_id']}.{_digest(current.version)[:16]}"
         if operation["kind"] == "delete":
@@ -940,7 +981,7 @@ class ConstraintGuard:
                 self.guard.replace(
                     _GUARD_COLLECTION,
                     epoch,
-                    {**current, "rules": _STALE, "rebuild": None},
+                    {**current, "rules": _STALE, "rebuild": None, "over_capacity": None},
                     state.version,
                     self._guard_operation(state, "stale"),
                     self.actor,
@@ -984,6 +1025,14 @@ class ConstraintGuard:
                 )
                 for record in page.items:
                     self._rebuild_record(progress, collection, record)
+                if (
+                    not progress.get("over")
+                    and _canonical_size({**value, "counts": {}, "unique": {}, "rebuild": progress})
+                    > MAX_GUARD_BYTES
+                ):
+                    # More unique keys than the state can hold: keep rebuilding the
+                    # reference index, which lives outside it, and stop counting.
+                    progress.update(over=True, counts={}, unique={})
                 if page.next_cursor is not None:
                     progress["cursor"] = page.next_cursor
                 else:
@@ -1006,10 +1055,16 @@ class ConstraintGuard:
                 "ref_generation": progress["generation"],
                 "rebuild": None,
                 "pending": None,
+                "over_capacity": None,
                 "writes": writes,
             }
-        if len(_canonical(updated)) > MAX_GUARD_BYTES:
-            raise CapacityExceeded("The gadget's unique keys exceed their storage limit")
+            if progress.get("over") or _canonical_size(updated) > MAX_GUARD_BYTES:
+                # The rules are live, but their counts and keys don't fit: deletes still
+                # work (the reference index is complete), and other writes are refused
+                # until deletes make room. See ``write``.
+                updated.update(counts={}, unique={}, over_capacity={"deletes": 0})
+        if _canonical_size(updated) > MAX_GUARD_BYTES:
+            raise CapacityExceeded("The gadget's rule state exceeds its storage limit")
         with contextlib.suppress(Conflict):  # Another writer took the step.
             self.guard.replace(
                 _GUARD_COLLECTION,
@@ -1047,8 +1102,11 @@ class ConstraintGuard:
                         self.files.delete_tree(f"{root}/{name}")
 
     def _rebuild_record(self, progress: dict, collection: str, record: Document) -> None:
+        counting = not progress.get("over")
         for rule in self.rules:
             if rule["collection"] != collection:
+                continue
+            if rule["kind"] in ("max_records", "unique") and not counting:
                 continue
             if rule["kind"] == "max_records" and self._matches(rule, record.value):
                 progress["counts"][rule["name"]] += 1

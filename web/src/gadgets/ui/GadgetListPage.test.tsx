@@ -1,4 +1,5 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -22,6 +23,7 @@ vi.mock("@/gadgets/api/gadgetApi", async (importOriginal) => ({
 }));
 // The template thumbnails run real gadgets; their frame has its own tests.
 vi.mock("@/gadgets/host/GadgetFrame", () => ({ GadgetFrame: () => null }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
 
 const BOARD = gadgetFixture({ id: "board", name: "Launch board" });
 const DRAFT = gadgetFixture({
@@ -147,6 +149,17 @@ describe("Gadget page", () => {
     fireEvent.click(await screen.findByRole("menuitem", { name: "Pin to sidebar" }));
     await waitFor(() => expect(pinGadget).toHaveBeenCalledWith("board", true));
     expect(await screen.findByText("Published · Pinned to sidebar")).toBeInTheDocument();
+  });
+
+  it("says so when pinning a gadget from its row fails", async () => {
+    vi.mocked(pinGadget).mockRejectedValue(new Error("Synthetic outage"));
+    renderWithGadgets(<GadgetListPage />, { path: "/gadget" });
+
+    const menu = await screen.findByRole("button", { name: "Actions for Launch board" });
+    await waitFor(() => expect(getGadgetShelf).toHaveBeenCalled());
+    fireEvent.pointerDown(menu, { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Pin to sidebar" }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Couldn’t pin the gadget"));
   });
 
   it("leaves out Shared with you where nothing can be shared", async () => {
