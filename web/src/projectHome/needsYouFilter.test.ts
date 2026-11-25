@@ -20,11 +20,12 @@ function request(ticketId: string, overrides: Partial<TicketRequest> = {}): Tick
 }
 
 describe("needsYouTicketIds", () => {
-  it("keeps this project's asks, without cc's or duplicates", () => {
+  it("keeps this project's asks, without cc's, the viewer's answers or duplicates", () => {
     const requests = [
       request("a"),
       request("b", { reason: "product-ok" }),
       request("c", { reason: "cc" }),
+      request("e", { reason: "answered" }),
       request("d", { project_id: "p2" }),
       request("a"),
     ];

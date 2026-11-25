@@ -13,7 +13,13 @@ export function needsYouTicketIds(
 ): string[] {
   if (!projectId) return [];
   const ids = requests
-    .filter((request) => request.project_id === projectId && request.reason !== "cc")
+    // A cc informs and an answered entry is a receipt; neither waits on the viewer.
+    .filter(
+      (request) =>
+        request.project_id === projectId &&
+        request.reason !== "cc" &&
+        request.reason !== "answered",
+    )
     .map((request) => request.ticket_id);
   return [...new Set(ids)];
 }

@@ -30,19 +30,26 @@ def create_ticket_requests_router(
     @router.get("")
     async def list_ticket_requests(request: Request) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
-        asks, cc = await asyncio.gather(
+        asks, cc, answered = await asyncio.gather(
             asyncio.to_thread(store.human_requests, user_id=user_id),
             asyncio.to_thread(store.ticket_cc, user_id=user_id),
+            asyncio.to_thread(store.recent_answers, user_id=user_id),
         )
         # A cc is informational (reason "cc") and sorts in with the asks by time; a
-        # ticket that also asks the viewer shows once, as the ask.
+        # ticket that also asks the viewer shows once, as the ask. So does one the viewer
+        # answered and that asks them again.
         asked = {(item["project_id"], item["ticket_id"]) for item in asks["data"]}
         cc = [item for item in cc if (item["project_id"], item["ticket_id"]) not in asked]
-        data = sorted([*asks["data"], *cc], key=lambda item: item["raised_at"], reverse=True)
+        answered = [
+            item for item in answered if (item["project_id"], item["ticket_id"]) not in asked
+        ]
+        # Open asks and cc's take the cap first, so answered entries never push them out.
+        open_items = sorted([*asks["data"], *cc], key=lambda item: item["raised_at"], reverse=True)
+        data = [*open_items[:HUMAN_REQUEST_MAX], *answered]
         return {
             **asks,
-            "data": data[:HUMAN_REQUEST_MAX],
-            "has_more": asks["has_more"] or len(data) > HUMAN_REQUEST_MAX,
+            "data": data,
+            "has_more": asks["has_more"] or len(open_items) > HUMAN_REQUEST_MAX,
         }
 
     @router.get("/sessions")

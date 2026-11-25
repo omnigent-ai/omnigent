@@ -1,3 +1,4 @@
+import type { TicketAnswerReceipt } from "./projectTicketsApi";
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
@@ -13,9 +14,11 @@ export interface TicketRequest {
    * `risk` ticket still awaiting its sign-off; `"owner"` for other asks; `"cc"` when a
    * person cc'd the viewer in a comment they haven't read yet.
    */
-  reason: "product-ok" | "risk-ok" | "owner" | "cc";
+  reason: "product-ok" | "risk-ok" | "owner" | "cc" | "answered";
   /** "question" for a plain question to the viewer, "sign-off" for an approval. */
   ask_kind?: "question" | "sign-off";
+  /** For `answered`: the viewer's answer and what became of it. */
+  answer?: TicketAnswerReceipt;
   /** Everyone the ask is routed to; any one of them answering clears it for all. */
   responders: string[];
   /** Activity position of the ask's question (or of the label change), to scroll to. */

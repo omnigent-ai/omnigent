@@ -96,6 +96,7 @@ import { useSidebarData } from "@/hooks/useSidebarData";
 import { useSessionTickets } from "@/hooks/useTicketRequests";
 import type { SessionTicket, TicketRequest } from "@/lib/ticketRequestsApi";
 import { markTicketSeen } from "@/lib/projectTicketsApi";
+import { answerReceiptLine } from "@/projectHome/answerReceipt";
 import {
   TICKET_ASK_PARAM,
   projectHomePath,
@@ -450,7 +451,13 @@ export function InboxPage() {
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
   const visibleAutomations = showUnread ? automationInbox.items : [];
-  const visibleTicketRequests = showApprovals ? ticketRequests.items : [];
+  // The viewer's own recent answers are receipts: listed only under All.
+  const openTicketRequests = ticketRequests.items.filter((item) => item.reason !== "answered");
+  const visibleTicketRequests = showApprovals
+    ? filter === "all"
+      ? ticketRequests.items
+      : openTicketRequests
+    : [];
   const listedSuggestionIds = new Set(proactiveInbox.items.map((item) => item.id));
   // Only the Unread list drops a suggestion once it is read; elsewhere a
   // dismissal or action hides the card at once.
@@ -466,14 +473,14 @@ export function InboxPage() {
         : listedSuggestions
       : [];
   const totalCount =
-    ticketRequests.items.length +
+    openTicketRequests.length +
     items.length +
     commentInbox.items.length +
     unreadItems.length +
     automationInbox.items.length +
     proactiveInbox.items.length;
   const ticketCcs = ticketRequests.items.filter((item) => item.reason === "cc");
-  const ticketAsks = ticketRequests.items.filter((item) => item.reason !== "cc");
+  const ticketAsks = openTicketRequests.filter((item) => item.reason !== "cc");
   const summary = [
     ticketAsks.length > 0 &&
       (ticketAsks.length === 1
@@ -509,7 +516,7 @@ export function InboxPage() {
   const tabEntries: InboxEntry[] = [
     ...visibleTicketRequests.map((item) => ({
       kind: "ticket" as const,
-      key: `ticket:${item.reason === "cc" ? "cc:" : ""}${item.project_id}:${item.ticket_id}`,
+      key: `ticket:${item.reason === "cc" || item.reason === "answered" ? `${item.reason}:` : ""}${item.project_id}:${item.ticket_id}`,
       at: item.raised_at,
       item,
     })),
@@ -582,6 +589,7 @@ export function InboxPage() {
       entry.kind === "approval" || (entry.kind === "ticket" && isTicketApprovalRequest(entry.item)),
     undefined,
     (entry) => entry.kind === "ticket" && isTicketQuestion(entry.item),
+    (entry) => entry.kind === "ticket" && entry.item.reason === "answered",
   );
   const defaultExpandedKey = visibleEntries.find((entry) => entry.kind === "approval")?.key;
 
@@ -842,6 +850,40 @@ export function InboxPage() {
             </Button>
             <Button asChild size="xs" className={PRIMARY_ACTION}>
               <Link to={ticketLocation(item, item.ask_position)} componentId="inbox.ticket_cc.open">
+                Open ticket <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
+    if (entry.kind === "ticket" && entry.item.reason === "answered" && entry.item.answer) {
+      const { item } = entry;
+      const receipt = item.answer!;
+      // The Inbox spans projects, so it names no role; the ticket's receipt does.
+      const asker = "the agent";
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-ticket-answered"
+          dataKind="answered"
+          tile={<KindTile icon={CheckIcon} tone="gray" />}
+          kindLabel="You answered"
+          title={item.title}
+          preview={answerReceiptLine(receipt, asker, Date.now())}
+          at={entry.at}
+          unread={false}
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.title}</p>
+          <p className="text-ui whitespace-pre-wrap text-muted-foreground">{receipt.text}</p>
+          <p className="text-sm text-muted-foreground" data-testid="inbox-answer-receipt">
+            {answerReceiptLine(receipt, asker, Date.now())}
+          </p>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link to={ticketLocation(item, item.ask_position)} componentId="inbox.answered.open">
                 Open ticket <ArrowRightIcon className="size-3.5" />
               </Link>
             </Button>

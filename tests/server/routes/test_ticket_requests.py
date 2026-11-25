@@ -19,7 +19,10 @@ PATH = "/v1/inbox/ticket-requests"
 async def _requests(client, user: str) -> list[str]:
     response = await client.get(PATH, headers=_as_user(user))
     assert response.status_code == 200, response.text
-    return sorted(item["title"] for item in response.json()["data"])
+    # The viewer's own recent answers are receipts, not asks.
+    return sorted(
+        item["title"] for item in response.json()["data"] if item["reason"] != "answered"
+    )
 
 
 async def test_needs_human_asks_reach_only_their_responders_and_clear_for_all(
@@ -592,3 +595,49 @@ async def test_a_plain_question_on_a_feature_goes_to_the_requester_not_the_appro
     assert [item["ask_kind"] for item in inbox] == ["question"]
     assert await _requests(client, BOB) == ["Whimsy"]
     assert await _requests(client, carol) == ["Launch"]
+
+
+async def test_an_answer_keeps_a_receipt_of_what_became_of_it(multi_user_client, db_uri):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Receipt"}, headers=_as_user(ALICE))
+    ).json()
+    await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=_as_user(ALICE)
+    )
+    store = ProjectTicketStore(db_uri)
+    worker = TicketActor(ALICE, uuid4().hex, uuid4().hex)
+    ticket = store.create(project["id"], CreateTicket(title="Charts"), TicketActor(BOB))
+    store.update(
+        project["id"],
+        ticket["id"],
+        UpdateTicket(labels=[{"key": "needs-human"}], comment="Charts in the PDF? A) yes B) no"),
+        worker,
+    )
+    path = f"/v1/projects/{project['id']}/tickets/{ticket['id']}"
+
+    async def receipt() -> dict | None:
+        return (await client.get(path, headers=_as_user(BOB))).json()["my_answer"]
+
+    assert await receipt() is None
+    answered = await client.post(
+        f"{path}/comments", json={"text": "Decision: A"}, headers=_as_user(BOB)
+    )
+    assert answered.status_code == 201, answered.text
+    got = await receipt()
+    assert got["text"] == "Decision: A" and got["asker_session_id"] == worker.session_id
+    assert got["delivery"] == "waiting" and got["replied_at"] is None
+    # The Inbox keeps it under the viewer's recent answers.
+    [entry] = (await client.get(PATH, headers=_as_user(BOB))).json()["data"]
+    assert entry["reason"] == "answered" and entry["answer"]["delivery"] == "waiting"
+    # Nudge waits for the timeout.
+    nudged = await client.post(f"{path}/nudge", headers=_as_user(BOB))
+    assert nudged.json() == {"delivered": False, "reason": "too soon"}
+
+    events = (await client.get(f"{path}/events", headers=_as_user(BOB))).json()["data"]
+    [answer] = [event for event in events if event["position"] == got["position"]]
+    store.mark_notified(project["id"], ticket["id"], answer["id"])
+    assert (await receipt())["delivery"] == "sent"
+    store.comment(project["id"], ticket["id"], CommentOnTicket(text="On it"), worker)
+    got = await receipt()
+    assert got["delivery"] == "replied" and got["replied_by_session_id"] == worker.session_id

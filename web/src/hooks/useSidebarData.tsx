@@ -258,7 +258,8 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     sumPendingApprovals(inboxRows) + ticketRequests.items.filter(isTicketApprovalRequest).length;
   const inboxCount =
     sumPendingApprovals(inboxRows) +
-    ticketRequests.items.length +
+    // The viewer's recent answers are receipts, not things waiting on them.
+    ticketRequests.items.filter((item) => item.reason !== "answered").length +
     comments.items.length +
     automationInbox.items.length +
     proactiveInbox.unreadCount;

@@ -234,6 +234,7 @@ export function isTicketApprovalRequest(item: { reason: string }): boolean {
 
 export const NEEDS_APPROVAL_GROUP = "Needs your approval" as const;
 export const QUESTIONS_GROUP = "Questions for you" as const;
+export const ANSWERED_GROUP = "Recently answered" as const;
 
 /** Whether a ticket request is a plain question to the viewer rather than a sign-off. */
 export function isTicketQuestion(item: { reason: string; ask_kind?: string }): boolean {
@@ -249,8 +250,10 @@ export function groupInboxEntriesByApproval<T extends { at: number }>(
   needsApproval: (entry: T) => boolean,
   now: Date = new Date(),
   isQuestion: (entry: T) => boolean = () => false,
+  isAnswered: (entry: T) => boolean = () => false,
 ): {
-  label: InboxTimeGroup | typeof NEEDS_APPROVAL_GROUP | typeof QUESTIONS_GROUP;
+  label:
+    InboxTimeGroup | typeof NEEDS_APPROVAL_GROUP | typeof QUESTIONS_GROUP | typeof ANSWERED_GROUP;
   approval: boolean;
   entries: T[];
 }[] {
@@ -259,8 +262,9 @@ export function groupInboxEntriesByApproval<T extends { at: number }>(
   const approvals = entries
     .filter((entry) => !isQuestion(entry) && needsApproval(entry))
     .sort(newestFirst);
+  const answered = entries.filter(isAnswered).sort(newestFirst);
   const rest = groupInboxEntries(
-    entries.filter((entry) => !isQuestion(entry) && !needsApproval(entry)),
+    entries.filter((entry) => !isQuestion(entry) && !needsApproval(entry) && !isAnswered(entry)),
     now,
   ).map((group) => ({ ...group, approval: false }));
   return [
@@ -269,5 +273,6 @@ export function groupInboxEntriesByApproval<T extends { at: number }>(
       ? [{ label: NEEDS_APPROVAL_GROUP, approval: true, entries: approvals }]
       : []),
     ...rest,
+    ...(answered.length ? [{ label: ANSWERED_GROUP, approval: false, entries: answered }] : []),
   ];
 }

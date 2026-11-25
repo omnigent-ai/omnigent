@@ -417,6 +417,15 @@ describe("groupInboxEntriesByApproval", () => {
       ["Needs your approval", ["sign-off"]],
       ["Just now", ["reply"]],
     ]);
+    const withAnswer = groupInboxEntriesByApproval(
+      [...entries, { id: "answer", at: at - 2, ask_kind: undefined }],
+      (entry) => entry.ask_kind !== undefined,
+      now,
+      (entry) => entry.ask_kind === "question",
+      (entry) => entry.id === "answer",
+    );
+    expect(withAnswer.at(-1)).toMatchObject({ label: "Recently answered", approval: false });
+    expect(withAnswer.at(-1)?.entries.map((entry) => entry.id)).toEqual(["answer"]);
   });
 
   it("puts what needs approval first, newest first, and keeps the rest in time groups", () => {

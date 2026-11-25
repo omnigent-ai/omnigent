@@ -105,6 +105,8 @@ export interface ProjectTicket {
   sign_offs?: TicketLabel[];
   /** Every sign-off still owed and who may give it; single-ticket reads. */
   pending_sign_offs?: TicketPendingSignOff[];
+  /** The viewer's latest answer to an ask in the last day; single-ticket reads. */
+  my_answer?: TicketAnswerReceipt | null;
   /** Who the open needs-human ask waits on, routed as in the Inbox; null once answered. */
   waiting_on?: TicketWaitingOn | null;
   /**
@@ -166,6 +168,22 @@ export interface TicketWaitingOn {
   question?: string | null;
   /** "question" is answered in words; "sign-off" by adding a label. Absent on older servers. */
   ask_kind?: "question" | "sign-off";
+}
+/**
+ * What became of the viewer's latest answer to an ask, from stored delivery state:
+ * `waiting` (not handed over yet), `sent` (handed to the asking session or the Lead),
+ * `escalated` (no reply in time; the Lead was told) or `replied`.
+ */
+export interface TicketAnswerReceipt {
+  position: number;
+  text: string;
+  answered_at: number;
+  asker_session_id: string | null;
+  delivery: "waiting" | "sent" | "escalated" | "replied";
+  replied_at: number | null;
+  replied_by_session_id: string | null;
+  /** The asking session's relay-reported turn status, e.g. "running". */
+  asker_status?: string | null;
 }
 /** A sign-off the ticket still owes, and the people who may give it. */
 export interface TicketPendingSignOff {
@@ -400,6 +418,14 @@ export function updateTicket(
 export function commentOnTicket(projectId: string, ticketId: string, body: TicketComment) {
   return request<ProjectTicket>(`${path(projectId, ticketId)}/comments`, "POST", body).then(
     normalizeTicket,
+  );
+}
+/** Re-deliver the viewer's unanswered answer to the session that asked. */
+export function nudgeTicket(projectId: string, ticketId: string) {
+  return request<{ delivered: boolean; reason?: string }>(
+    `${path(projectId, ticketId)}/nudge`,
+    "POST",
+    {},
   );
 }
 export function markTicketSeen(projectId: string, ticketId: string, seenPosition: number) {

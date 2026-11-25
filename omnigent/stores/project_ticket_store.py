@@ -85,6 +85,10 @@ CC_SCAN_MAX = 200
 # Outputs ride along with a comment, so only these kinds count as new activity.
 NEW_COMMENT_KINDS = (EVENT_CODES["comment"], EVENT_CODES["execution"])
 NEW_UPDATE_KINDS = (EVENT_CODES["created"], EVENT_CODES["updated"])
+# A person's answer to an ask keeps its receipt, and an Inbox entry, for a day.
+ANSWER_RECEIPT_SECONDS = 24 * 3600
+# How many of a person's recent comments per ticket (and tickets per project) to check.
+ANSWER_SCAN = 50
 # How many of an ask raiser's newest comments to check for the question it asks.
 ASK_QUESTION_SCAN = 20
 # A card's latest comment reads only each ticket's newest comments, then clips it.
@@ -3094,6 +3098,165 @@ class ProjectTicketStore:
                 "asker": open_ask.session_id if open_ask is not None else None,
                 "commenters": builtins.list(dict.fromkeys(authors)),
             }
+
+    @staticmethod
+    def _answer_receipt(
+        session: Session,
+        ticket: SqlProjectTicket,
+        answer: SqlProjectTicketEvent,
+        asks: builtins.list[_HumanAsk],
+    ) -> dict[str, Any]:
+        """What became of a person's answer to an ask, from stored delivery state only.
+
+        ``delivery`` is ``waiting`` (not handed over yet), ``sent`` (handed to the asking
+        session or the Lead), ``escalated`` (no reply in time, the Lead was told) or
+        ``replied`` (the asking session commented after it).
+        """
+        ask = next(
+            (
+                ask
+                for ask in reversed(asks)
+                if ask.start < answer.position and (ask.end is None or ask.end >= answer.position)
+            ),
+            None,
+        )
+        asker = ask.session_id if ask is not None else None
+        reply = session.scalar(
+            select(SqlProjectTicketEvent)
+            .where(
+                SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                SqlProjectTicketEvent.project_id == ticket.project_id,
+                SqlProjectTicketEvent.ticket_id == ticket.id,
+                SqlProjectTicketEvent.kind.in_(NEW_COMMENT_KINDS),
+                SqlProjectTicketEvent.position > answer.position,
+                SqlProjectTicketEvent.session_id == asker
+                if asker is not None
+                else SqlProjectTicketEvent.session_id.is_not(None),
+            )
+            .order_by(SqlProjectTicketEvent.position)
+            .limit(1)
+        )
+        state = answer.notification_state
+        if reply is not None:
+            delivery = "replied"
+        elif state == NOTIFICATION_ESCALATED:
+            delivery = "escalated"
+        elif state in (NOTIFICATION_AWAITING_WORKER, NOTIFICATION_QUEUED):
+            delivery = "sent"
+        else:
+            delivery = "waiting"
+        return {
+            "position": answer.position,
+            "text": str(answer.payload.get("text") or "")[:500],
+            "answered_at": answer.created_at,
+            "asker_session_id": asker,
+            "delivery": delivery,
+            "replied_at": reply.created_at if reply is not None else None,
+            "replied_by_session_id": reply.session_id if reply is not None else None,
+        }
+
+    def _recent_answer_rows(
+        self, session: Session, ticket: SqlProjectTicket, user_id: str, since: int
+    ) -> builtins.list[SqlProjectTicketEvent]:
+        """The person's own comments on *ticket* since *since* that answered an ask."""
+        rows = session.scalars(
+            select(SqlProjectTicketEvent)
+            .where(
+                SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                SqlProjectTicketEvent.project_id == ticket.project_id,
+                SqlProjectTicketEvent.ticket_id == ticket.id,
+                SqlProjectTicketEvent.kind == EVENT_CODES["comment"],
+                SqlProjectTicketEvent.session_id.is_(None),
+                SqlProjectTicketEvent.agent_id.is_(None),
+                SqlProjectTicketEvent.user_id == user_id,
+                SqlProjectTicketEvent.created_at >= since,
+            )
+            .order_by(SqlProjectTicketEvent.position.desc())
+            .limit(ANSWER_SCAN)
+        )
+        return [row for row in rows if row.payload.get("cleared_needs_human") is True]
+
+    def my_answer(
+        self, project_id: str, ticket_id: str, *, user_id: str | None
+    ) -> dict[str, Any] | None:
+        """The viewer's latest answer to an ask on this ticket in the last day, and its receipt."""
+        if user_id is None:
+            return None
+        with self._session("get_ticket_answer_receipt") as session:
+            self._project(session, project_id, user_id)
+            ticket = self._row(session, project_id, ticket_id)
+            rows = self._recent_answer_rows(
+                session, ticket, user_id, now_epoch() - ANSWER_RECEIPT_SECONDS
+            )
+            if not rows:
+                return None
+            return self._answer_receipt(
+                session, ticket, rows[0], self._human_asks(session, ticket)
+            )
+
+    def recent_answers(self, *, user_id: str | None) -> builtins.list[dict[str, Any]]:
+        """The viewer's answers to asks across their projects in the last day, for the Inbox."""
+        if user_id is None or user_id == RESERVED_USER_LOCAL:
+            return []
+        since = now_epoch() - ANSWER_RECEIPT_SECONDS
+        event, ticket_row = SqlProjectTicketEvent, SqlProjectTicket
+        entries: builtins.list[dict[str, Any]] = []
+        with self._session("list_viewer_recent_answers") as session:
+            projects = session.scalars(
+                select(SqlProject).where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id.in_(accessible_project_ids(user_id)),
+                )
+            ).all()
+            for project in projects:
+                ticket_ids = session.scalars(
+                    select(event.ticket_id)
+                    .where(
+                        event.workspace_id == project.workspace_id,
+                        event.project_id == project.id,
+                        event.kind == EVENT_CODES["comment"],
+                        event.session_id.is_(None),
+                        event.user_id == user_id,
+                        event.created_at >= since,
+                    )
+                    .distinct()
+                    .limit(ANSWER_SCAN)
+                ).all()
+                stages = _stages(project)
+                for ticket_id in ticket_ids:
+                    ticket = session.scalar(
+                        select(ticket_row).where(
+                            ticket_row.workspace_id == project.workspace_id,
+                            ticket_row.project_id == project.id,
+                            ticket_row.id == ticket_id,
+                        )
+                    )
+                    if ticket is None:
+                        continue
+                    rows = self._recent_answer_rows(session, ticket, user_id, since)
+                    if not rows:
+                        continue
+                    receipt = self._answer_receipt(
+                        session, ticket, rows[0], self._human_asks(session, ticket)
+                    )
+                    entries.append(
+                        {
+                            "project_id": project.id,
+                            "project_name": project.name,
+                            "ticket_id": ticket.id,
+                            "title": ticket.title,
+                            "stage": _stage_snapshot(_stage(stages, _stage_id(ticket))),
+                            "reason": "answered",
+                            "responders": [user_id],
+                            "ask_position": receipt["position"],
+                            "raised_at": receipt["answered_at"],
+                            "raised_by_session_id": receipt["asker_session_id"],
+                            "raised_by_user_id": user_id,
+                            "question": receipt["text"],
+                            "answer": receipt,
+                        }
+                    )
+        return entries
 
     def mark_awaiting_worker(self, project_id: str, ticket_id: str, event_id: str) -> None:
         """A person's comment reached the ticket's workers; hold it until one replies."""

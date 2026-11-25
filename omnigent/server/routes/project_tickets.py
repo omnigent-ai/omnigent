@@ -271,6 +271,9 @@ def _spawn_mention_delivery(
     task.add_done_callback(_mention_tasks.discard)
 
 
+# How long an answer waits for its asker before Nudge is offered, and how often it may be.
+NUDGE_AFTER_SECONDS = 600
+
 _review_limiter = RouteLimiter()
 # Reviewer rounds since the ticket last entered Review, for the escalation reminder.
 _review_rounds: dict[str, int] = {}
@@ -1177,9 +1180,65 @@ def create_project_tickets_router(
         who = await actor(request, project_id)
         project = await load_project(request, project_id, who)
         with _storage_errors():
-            return await project_deploy_status.project_deploy_status(
-                project, store, who.user_id
-            )
+            return await project_deploy_status.project_deploy_status(project, store, who.user_id)
+
+    async def answer_receipt(
+        project_id: str, ticket_id: str, user_id: str | None
+    ) -> dict[str, Any] | None:
+        """The viewer's latest answer here and its receipt, with the asking session's status."""
+        receipt = await asyncio.to_thread(store.my_answer, project_id, ticket_id, user_id=user_id)
+        asker = receipt.get("asker_session_id") if receipt else None
+        if receipt is not None and asker is not None:
+            conversation = await asyncio.to_thread(conversations.get_conversation, asker)
+            # The relay-observed turn status; None when the session never reported one.
+            receipt["asker_status"] = conversation.live_status if conversation else None
+        return receipt
+
+    @router.post("/{ticket_id}/nudge")
+    async def nudge(request: Request, project_id: str, ticket_id: str) -> dict[str, Any]:
+        """Re-deliver the viewer's unanswered answer to the session that asked.
+
+        Allowed once ``NUDGE_AFTER_SECONDS`` have passed since the answer with no reply,
+        and at most once per that window. Returns ``{"delivered": bool, "reason"?: str}``.
+        """
+        from omnigent.db.utils import now_epoch
+
+        who = await actor(request, project_id)
+        if who.session_id is not None:
+            raise OmnigentError("Only a person can nudge", code=ErrorCode.FORBIDDEN)
+        receipt = await answer_receipt(project_id, ticket_id, who.user_id)
+        if receipt is None or receipt["delivery"] == "replied":
+            return {"delivered": False, "reason": "nothing to nudge"}
+        if now_epoch() - receipt["answered_at"] < NUDGE_AFTER_SECONDS:
+            return {"delivered": False, "reason": "too soon"}
+        asker = receipt["asker_session_id"]
+        notifications = getattr(request.app.state, "project_ticket_notifications", None)
+        if asker is None or notifications is None:
+            return {"delivered": False, "reason": "no session to nudge"}
+        project = await load_project(request, project_id, who)
+        ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        window = now_epoch() // NUDGE_AFTER_SECONDS
+        delivered = await notifications.deliver_to_session(
+            request.app,
+            project,
+            asker,
+            stable_id=hashlib.sha256(
+                f"nudge:{ticket_id}:{receipt['position']}:{window}".encode()
+            ).hexdigest()[:32],
+            text=(
+                f"Nudge on ticket {ticket_id} ({ticket['title']}): a person answered your "
+                f"question at activity position {receipt['position']} and is waiting for you "
+                f"to pick it up. Their answer: {receipt['text']}"
+            ),
+        )
+        return (
+            {"delivered": bool(delivered)}
+            if delivered
+            else {
+                "delivered": False,
+                "reason": "the session couldn't take it",
+            }
+        )
 
     @router.get("/{ticket_id}")
     async def get_ticket(
@@ -1187,6 +1246,8 @@ def create_project_tickets_router(
     ) -> dict[str, Any]:
         who = await actor(request, project_id)
         ticket = await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
+        if who.session_id is None:
+            ticket["my_answer"] = await answer_receipt(project_id, ticket_id, who.user_id)
         if include_guidance and who.session_id is not None:
             ticket["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION
         # The only people whose `product-ok` counts, so agents ask them and nobody else.

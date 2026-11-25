@@ -80,6 +80,7 @@ import { SessionImage } from "@/components/SessionImage";
 import { MentionTextarea } from "./MentionTextarea";
 import { TicketDecisionBox } from "./TicketDecisionBox";
 import { needsWhom } from "./ticketWaitingOn";
+import { TicketAnswerReceipt } from "./TicketAnswerReceipt";
 import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessions";
 import { chipMentions, payloadCc, payloadMentions, type PersonaMention } from "./personaMentions";
 import { MentionFormsContext, TicketCommentBody } from "./TicketCommentBody";
@@ -691,6 +692,15 @@ function TicketDetails({
                 />
               </div>
               <TicketError error={configuration.error} />
+              {ticket.my_answer &&
+                !(ticket.waiting_on && needsWhom(ticket.waiting_on, viewerId)?.kind === "you") && (
+                  <TicketAnswerReceipt
+                    projectId={projectId}
+                    ticketId={ticketId}
+                    receipt={ticket.my_answer}
+                    personaLookup={personaLookup}
+                  />
+                )}
               {ticket.waiting_on && (
                 <TicketDecisionBox
                   projectId={projectId}
