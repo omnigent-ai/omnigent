@@ -878,6 +878,8 @@ async def test_board_api_lifecycle_and_no_deletion(project_client):
         "final_update": None,
         "needs_final_update": True,
         "product_approvers": [],
+        # A person's read lists the sign-offs they may give an open ask; none here.
+        "sign_offs": [],
         **NOTHING_NEW,
     }
     assert (await project_client.get(path + "/events")).json() == events_before
@@ -960,6 +962,8 @@ async def test_custom_stage_api_and_ticket_tools_share_real_project_definitions(
         "final_update": None,
         "needs_final_update": False,
         "product_approvers": [],
+        # A person's read lists the sign-offs they may give an open ask; none here.
+        "sign_offs": [],
         **NOTHING_NEW,
     }
     assert (await project_client.get(f"{base}/{ticket['id']}/events")).json() == events_before
