@@ -106,6 +106,8 @@ export function* matchesIn(
       const range = scope[rangeIndex];
       yield range && result.from >= range.from && result.to <= range.to ? result : NOTHING_FOUND;
     }
+    // A context with no matches still took time, so the caller can pause before the next.
+    yield NOTHING_FOUND;
   }
 }
 

@@ -157,11 +157,13 @@ export function plainMatches(
   const haystack = foldedText(doc, query.caseSensitive);
   if (haystack === null) return null;
   const accepts = query.wholeWord ? wordTest(foldedDocument(doc).text, from, to) : () => true;
+  // Ends the search at `to`, so a scoped range never reads the rest of the file after it.
+  const searched = to < haystack.length ? haystack.slice(0, to) : haystack;
   return (function* () {
     let position = from;
     for (;;) {
-      const found = haystack.indexOf(needle, position);
-      if (found < 0 || found + needle.length > to) return;
+      const found = searched.indexOf(needle, position);
+      if (found < 0) return;
       const end = found + needle.length;
       if (accepts(found, end)) {
         yield { from: found, to: end, precise: true };

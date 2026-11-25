@@ -245,6 +245,60 @@ describe("plainMatches", () => {
       expect(scanned).toBeLessThan(10 * text.length);
     });
 
+    // Every other line of a long file scoped, as a column selection does, and a literal absent.
+    function scopedLines(count: number) {
+      const doc = docOf(Array.from({ length: count }, (_, index) => `line ${index}`).join("\n"));
+      const scope = Array.from({ length: count / 2 }, (_, index) => {
+        const line = doc.line(index * 2 + 1);
+        return { from: line.from, to: line.to };
+      });
+      return { doc, scope };
+    }
+
+    it("reads each scoped line only, not the rest of the file after it", () => {
+      const { doc, scope } = scopedLines(4_000);
+      const text = doc.toString();
+      foldedText(doc, true);
+      let scanned = 0;
+      const { indexOf } = String.prototype;
+      vi.spyOn(String.prototype, "indexOf").mockImplementation(function (
+        this: string,
+        needle,
+        from,
+      ) {
+        const found = indexOf.call(this, needle, from);
+        scanned += (found < 0 ? this.length : found) - (from ?? 0);
+        return found;
+      });
+      const collector = new MatchCollector(doc, {
+        search: "absent",
+        caseSensitive: true,
+        wholeWord: false,
+        regexp: false,
+        scope,
+      });
+      const batch = collector.step(60_000, () => 0);
+      vi.restoreAllMocks();
+      expect(batch).toMatchObject({ froms: [], done: true });
+      expect(scanned).toBeLessThan(2 * text.length);
+    });
+
+    it("lets a time-boxed step pause between scoped lines that match nothing", () => {
+      const { doc, scope } = scopedLines(400);
+      const collector = new MatchCollector(doc, {
+        search: "absent",
+        caseSensitive: true,
+        wholeWord: false,
+        regexp: false,
+        scope,
+      });
+      let time = 0;
+      const expiring = () => (time += 100);
+      let steps = 0;
+      while (!collector.step(1, expiring).done) steps += 1;
+      expect(steps).toBeGreaterThanOrEqual(scope.length - 1);
+    });
+
     it("lets a time-boxed step pause after each candidate it turns down", () => {
       const collector = new MatchCollector(docOf("cats ".repeat(10_000)), {
         search: "cat",
