@@ -970,6 +970,48 @@ def test_a_write_without_a_token_runs_where_no_login_is_chosen_or_in_a_sandbox(
     assert tokens[-1] is None
 
 
+_ENTERPRISE_PR = PullRequestRef.from_url("https://ghe.example.com/example-org/example-repo/pull/7")
+
+
+def _pull_request_on(host: str, repository: str) -> PullRequestRef:
+    return PullRequestRef(
+        provider="github",
+        host=host,
+        repository=repository,
+        number=7,
+        url=f"https://{host}/{repository}/pull/7",
+    )
+
+
+@pytest.mark.parametrize(
+    ("host", "repository", "stderr"),
+    [
+        ("sso", "example-org/example-repo", "error connecting to sso"),
+        ("sso", "example-org/example-repo", "dial tcp: lookup sso: i/o timeout"),
+        ("github.com", "sso/example-repo", "talking to sso: connection reset by peer"),
+        ("github.com", "example-org/missing-scope", "missing-scope: unexpected EOF"),
+    ],
+    ids=["dotless-host", "dotless-host-lookup", "owner", "repository"],
+)
+def test_a_failure_naming_the_pull_requests_own_host_or_repository_is_an_unknown_outcome(
+    host: str, repository: str, stderr: str
+) -> None:
+    """A dotless Enterprise host, an owner or a repository named like a refusal's wording."""
+    reference = _pull_request_on(host, repository)
+    failure = github_failures.write_failure(stderr, reference=reference, action="x")
+    assert isinstance(failure, UnknownOutcomeError)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    ["gh: Not Found (HTTP 404)", "gh: Resource protected by organization SAML enforcement."],
+)
+def test_a_refusal_from_a_pull_request_named_like_one_is_still_a_refusal(stderr: str) -> None:
+    reference = _pull_request_on("sso", "sso/missing-scope")
+    failure = github_failures.write_failure(stderr, reference=reference, action="x")
+    assert not isinstance(failure, UnknownOutcomeError)
+
+
 def test_failure_classes_name_the_host_and_never_the_token() -> None:
     # Each input carries the token, as a verbose gh might print it.
     cases = {
@@ -979,7 +1021,7 @@ def test_failure_classes_name_the_host_and_never_the_token() -> None:
         "signed out": f"Bad token {TOKEN}. To get started, please run: gh auth login",
     }
     messages = {
-        key: str(github_failures.refusal(stderr, host="ghe.example.com", action="x"))
+        key: str(github_failures.refusal(stderr, reference=_ENTERPRISE_PR, action="x"))
         for key, stderr in cases.items()
     }
     assert "needs the `repo` scope" in messages["needs the repo scope"]

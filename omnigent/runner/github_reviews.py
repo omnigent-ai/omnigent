@@ -540,7 +540,7 @@ def _read_comment(
         token=github._pr_token(root, reference),
     )
     if rc != 0:
-        raise github_failures.refusal(err, host=reference.host, action="read this comment")
+        raise github_failures.refusal(err, reference=reference, action="read this comment")
     try:
         comment = json.loads(output)
     except ValueError as exc:
@@ -605,7 +605,7 @@ def _rest_write(
         if github._gh_timed_out.get() or rc is None:
             raise github_failures.unknown_outcome()
     if rc != 0:
-        raise github_failures.write_failure(err, host=reference.host, action=action)
+        raise github_failures.write_failure(err, reference=reference, action=action)
     return output
 
 
