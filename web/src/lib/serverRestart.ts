@@ -4,6 +4,9 @@
 
 export const SERVER_RESTART_MESSAGE = "Omnigent is restarting. Your session will resume shortly.";
 
+/** Failure-card code for a send that failed because the server is restarting. */
+export const SERVER_RESTARTING_CODE = "server_restarting";
+
 /** Fired on `window` whenever a request fails because the server is restarting. */
 export const SERVER_RESTART_EVENT = "omnigent:server-restart";
 

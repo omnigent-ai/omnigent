@@ -114,6 +114,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   harness_not_configured: "The harness isn't set up on the host, so this session can't start.",
   queue_full: "This session's queue is full",
   startup_input_failed: "This message wasn't delivered after a restart. Send it again.",
+  server_restarting: "Omnigent is restarting. Your session will resume shortly.",
 };
 
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";

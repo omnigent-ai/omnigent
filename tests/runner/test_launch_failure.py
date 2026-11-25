@@ -931,6 +931,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("codex_provider_auth_failed", "model provider's sign-in command"),
         ("harness_not_configured", "isn't set up on the host"),
         ("startup_input_failed", "wasn't delivered after a restart"),
+        ("server_restarting", "Omnigent is restarting"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

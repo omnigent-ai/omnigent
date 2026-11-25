@@ -25,8 +25,17 @@ describe("isServerRestartError", () => {
   it("describes a send that never reached the server as a restart", () => {
     expect(describeSendFailure(new TypeError("Failed to fetch"))).toEqual({
       message: SERVER_RESTART_MESSAGE,
-      code: "",
+      code: "server_restarting",
     });
+    // A gateway answer keeps its status detail and gets the same card code.
+    expect(describeSendFailure(new ApiError(serverRestartMessage(502), 502, null))).toEqual({
+      message: serverRestartMessage(502),
+      code: "server_restarting",
+    });
+    // The app's own coded errors keep their code.
+    expect(describeSendFailure(new ApiError("Queue full", 429, "queue_full")).code).toBe(
+      "queue_full",
+    );
     expect(describeSendFailure(new Error("boom")).message).toBe("boom");
   });
 });

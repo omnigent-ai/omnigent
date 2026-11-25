@@ -550,6 +550,20 @@ describe("ErrorBanner", () => {
     expect(screen.getByTestId("error-headline")).not.toHaveTextContent("Something went wrong");
   });
 
+  it("titles a send lost to a restarting server with the restart message", () => {
+    render(
+      <ErrorBanner
+        message="Omnigent is restarting. Your session will resume shortly. (HTTP 502)"
+        source=""
+        code="server_restarting"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Omnigent is restarting. Your session will resume shortly.",
+    );
+    expect(screen.getByTestId("error-headline")).not.toHaveTextContent("Something went wrong");
+  });
+
   it("dismisses only the visible banner", () => {
     render(
       <div>

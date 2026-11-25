@@ -727,6 +727,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "harness_not_configured": "The harness isn't set up on the host, so this session can't start.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
     "startup_input_failed": "This message wasn't delivered after a restart. Send it again.",
+    "server_restarting": "Omnigent is restarting. Your session will resume shortly.",
 }
 
 
