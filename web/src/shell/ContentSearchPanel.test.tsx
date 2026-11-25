@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
+import { requestTextSearchFocus } from "@/store/fileFinder";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -329,4 +330,68 @@ it("refuses whole-word expressions that could escape the boundaries", async () =
   const url = new URL(String(vi.mocked(authenticatedFetch).mock.calls[0][0]), "http://test");
   expect(url.searchParams.get("q")).toBe("foo)|(bar");
   expect(url.searchParams.get("regex")).toBe("true");
+});
+
+it("shows a search handed over from Go to File, whether or not the page already shows", async () => {
+  const { handSearchToSearchPage } = await import("./contentSearchCache");
+  const client = new QueryClient();
+  const handed = {
+    query: "needle",
+    caseSensitive: true,
+    regex: false,
+    wholeWord: false,
+    include: "src/**",
+    exclude: "",
+  };
+  const found = {
+    matches: [
+      { path: "src/a.ts", line: 3, column: 1, text: "needle", match_start: 0, match_end: 6 },
+    ],
+    truncated: false,
+    warning: null,
+  };
+  // Handed over before the page shows: it opens on that search and its lines.
+  handSearchToSearchPage(client, "session-one", handed, found);
+  render(
+    <QueryClientProvider client={client}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("searchbox")).toHaveValue("needle");
+  expect(screen.getByRole("checkbox", { name: "Match case" })).toBeChecked();
+  expect(screen.getByLabelText("Include")).toBeVisible();
+  expect(screen.getByLabelText("Include")).toHaveValue("src/**");
+  expect(screen.getByRole("button", { name: "Open src/a.ts at line 3" })).toBeInTheDocument();
+  expect(authenticatedFetch).not.toHaveBeenCalled();
+
+  // Handed over while it shows: it takes the new search in place of what was typed.
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "typed here" } });
+  act(() =>
+    handSearchToSearchPage(
+      client,
+      "session-one",
+      { ...handed, query: "other", include: "" },
+      {
+        ...found,
+        matches: [{ ...found.matches[0]!, path: "src/b.ts", text: "other" }],
+      },
+    ),
+  );
+  await waitFor(() => expect(screen.getByRole("searchbox")).toHaveValue("other"));
+  expect(screen.getByRole("button", { name: "Open src/b.ts at line 3" })).toBeInTheDocument();
+});
+
+it("takes the keyboard when a text search asks this session's page for it", () => {
+  const client = new QueryClient();
+  render(
+    <QueryClientProvider client={client}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("searchbox")).not.toHaveFocus();
+  // Another session's request leaves the field alone.
+  act(() => requestTextSearchFocus("session-two"));
+  expect(screen.getByRole("searchbox")).not.toHaveFocus();
+  act(() => requestTextSearchFocus("session-one"));
+  expect(screen.getByRole("searchbox")).toHaveFocus();
 });

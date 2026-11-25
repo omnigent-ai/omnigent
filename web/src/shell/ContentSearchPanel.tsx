@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useId, useState } from "react";
+import { type RefObject, useEffect, useId, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
 import {
@@ -6,7 +6,8 @@ import {
   fetchContentSearch,
   fitsContentSearchLimit,
   type ContentMatch,
-  type ContentSearchResult,
+  type ContentSearchInput,
+  EMPTY_CONTENT_SEARCH,
   wholeWordRegexProblem,
 } from "@/lib/contentSearch";
 import { Button } from "@/components/ui/button";
@@ -14,16 +15,14 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import type { OpenFileOptions } from "./FileViewerContext";
 import { cn } from "@/lib/utils";
+import { useTextSearchFocus } from "@/store/fileFinder";
 
-interface ContentSearchInput {
-  query: string;
-  caseSensitive: boolean;
-  regex: boolean;
-  /** Optional so an input cached before this option existed still reads as off. */
-  wholeWord?: boolean;
-  include: string;
-  exclude: string;
-}
+import {
+  type ContentSearchAnswer,
+  contentSearchHandOffKey,
+  contentSearchInputKey,
+  contentSearchResultKey,
+} from "./contentSearchCache";
 
 export function ContentSearchPanel({
   conversationId,
@@ -34,22 +33,21 @@ export function ContentSearchPanel({
   onFileSelect: (path: string, options?: OpenFileOptions) => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }) {
+  const ownInputRef = useRef<HTMLInputElement | null>(null);
+  const fieldRef = inputRef ?? ownInputRef;
+  // A text search's chord, ⌘K row or "Open in Search" shows this page ready to type into.
+  useTextSearchFocus(conversationId, fieldRef);
   const queryClient = useQueryClient();
   const cachedInput = useQuery<ContentSearchInput>({
-    queryKey: ["content-search-input", conversationId],
-    initialData: {
-      query: "",
-      caseSensitive: false,
-      regex: false,
-      wholeWord: false,
-      include: "",
-      exclude: "",
-    },
+    queryKey: contentSearchInputKey(conversationId),
+    initialData: EMPTY_CONTENT_SEARCH,
     enabled: false,
     gcTime: Infinity,
   });
   const [input, setInput] = useState(cachedInput.data);
-  const [showFilters, setShowFilters] = useState(false);
+  const [showFilters, setShowFilters] = useState(
+    () => cachedInput.data.include.trim() !== "" || cachedInput.data.exclude.trim() !== "",
+  );
   const filtersId = useId();
   const { query, caseSensitive, regex, include, exclude } = input;
   const wholeWord = input.wholeWord === true;
@@ -59,16 +57,30 @@ export function ContentSearchPanel({
   // Such an expression could escape the Whole word wrapper and lose its boundaries.
   const regexProblem = wholeWord && regex ? wholeWordRegexProblem(query) : null;
   const canSearch = query.trim() !== "" && !tooLong && regexProblem === null;
+  // A search handed over while the page shows, such as Go to File's "Open in Search",
+  // replaces what was typed here.
+  const handOff = useQuery<ContentSearchInput | null>({
+    queryKey: contentSearchHandOffKey(conversationId),
+    initialData: null,
+    enabled: false,
+  });
+  const handedInput = handOff.data;
   useEffect(() => {
-    queryClient.setQueryData(["content-search-input", conversationId], input);
+    if (!handedInput) return;
+    setInput(handedInput);
+    if (handedInput.include.trim() || handedInput.exclude.trim()) setShowFilters(true);
+    queryClient.setQueryData(contentSearchHandOffKey(conversationId), null);
+  }, [conversationId, handedInput, queryClient]);
+  useEffect(() => {
+    queryClient.setQueryData(contentSearchInputKey(conversationId), input);
   }, [conversationId, input, queryClient]);
   const search = useQuery({
-    queryKey: ["content-search-result", conversationId],
+    queryKey: contentSearchResultKey(conversationId),
     enabled: false,
     gcTime: Infinity,
     retry: false,
     // Keep the latest search, including in-flight work, when its panel unmounts.
-    queryFn: async (): Promise<ContentSearchResult & { query: string }> => {
+    queryFn: async (): Promise<ContentSearchAnswer> => {
       const result = await fetchContentSearch(conversationId, sent.pattern, {
         caseSensitive,
         regex: sent.regex,
@@ -97,7 +109,7 @@ export function ContentSearchPanel({
         <div className="flex gap-2">
           <div className="flex flex-1">
             <Input
-              ref={inputRef}
+              ref={fieldRef}
               aria-label="Search file contents"
               placeholder="Search file contents"
               type="search"
