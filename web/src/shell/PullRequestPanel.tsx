@@ -80,7 +80,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { useCanEdit } from "@/hooks/usePermissions";
+import { useCanEdit, useIsSessionOwner } from "@/hooks/usePermissions";
 import {
   RunnerOfflineError,
   useWorkspaceAsleep,
@@ -806,7 +806,12 @@ function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string |
 
 type Associations = Pick<
   PullRequestInfo,
-  "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
+  | "prs"
+  | "tracking_available"
+  | "selected_pr_url"
+  | "provider"
+  | "provider_display"
+  | "owner_only_changes"
 >;
 export type PullRequestSubtab = "summary" | "comments" | "changes";
 
@@ -1143,6 +1148,7 @@ export function PullRequestPanel({
   // then only supplies the selected PR's details.
   const storesPrs = storesSessionPullRequests(useServerInfo());
   const stored = useSessionPullRequests(conversationId, info.data);
+  const sessionOwner = useIsSessionOwner(conversationId);
   const hostOffline = useHostOffline(conversationId, info);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
   const sandboxStarting = useSandboxStarting(conversationId);
@@ -1154,10 +1160,24 @@ export function PullRequestPanel({
   }>();
   useEffect(() => {
     if (info.data) {
-      const { prs, tracking_available, selected_pr_url, provider, provider_display } = info.data;
+      const {
+        prs,
+        tracking_available,
+        selected_pr_url,
+        provider,
+        provider_display,
+        owner_only_changes,
+      } = info.data;
       setKnownAssociations({
         sessionId: conversationId,
-        data: { prs, tracking_available, selected_pr_url, provider, provider_display },
+        data: {
+          prs,
+          tracking_available,
+          selected_pr_url,
+          provider,
+          provider_display,
+          owner_only_changes,
+        },
       });
     }
   }, [conversationId, info.data]);
@@ -1318,6 +1338,11 @@ export function PullRequestPanel({
       </div>
     ) : undefined;
   const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
+  // Only the session's owner links, unlinks or changes its PRs; the server refuses anyone else.
+  // Without live info (host offline, a selection loading), the session says who owns it.
+  const ownerOnlyChanges =
+    live?.owner_only_changes === true || (live === undefined && sessionOwner === false);
+  const canChangeTracking = showTrackingControls && !ownerOnlyChanges;
   const showsList =
     (listedPrs.length > 1 || (!!onOpenPullRequest && listedPrs.length > 0)) && !showingDetails;
   // A host's list, without tracking controls, still needs the panel's title and Refresh.
@@ -1327,7 +1352,7 @@ export function PullRequestPanel({
       <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
         {refreshIcon}
       </IconButton>
-      {showTrackingControls && (
+      {canChangeTracking && (
         <IconButton
           label={linkNeedsHost ? "Link a PR (needs the host online)" : "Link a PR"}
           disabled={linkNeedsHost}
@@ -1336,7 +1361,7 @@ export function PullRequestPanel({
           <PlusIcon className="size-3.5" aria-hidden="true" />
         </IconButton>
       )}
-      {showTrackingControls && selectedPr && showingDetails && (
+      {canChangeTracking && selectedPr && showingDetails && (
         <IconButton
           label="Unlink PR"
           disabled={unlink.isPending}
@@ -1389,7 +1414,7 @@ export function PullRequestPanel({
           {refreshButton}
         </div>
       ) : null}
-      {showTrackingControls && (linking || update.isError) && (
+      {canChangeTracking && (linking || update.isError) && (
         <div className="shrink-0 border-b border-border p-2 [&>:first-child]:mt-0">
           {linkControls}
         </div>
@@ -1397,6 +1422,15 @@ export function PullRequestPanel({
       {unlink.isError && (
         <p role="alert" className="shrink-0 border-b border-border p-2 text-ui text-destructive">
           Couldn’t unlink: {unlink.error.message}
+        </p>
+      )}
+      {ownerOnlyChanges && (
+        <p
+          role="status"
+          className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
+        >
+          Only the session’s owner can change its {copy.requestName}s here. Open the{" "}
+          {copy.requestName} on {copy.id ? copy.label : "its site"} to make changes.
         </p>
       )}
       {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
@@ -1425,7 +1459,9 @@ export function PullRequestPanel({
                 sandboxAsleep={sandboxAsleep}
                 unlinkPending={unlink.isPending}
                 onUnlink={
-                  associations?.tracking_available && !branchPr ? () => unlinkPr(pr.url) : undefined
+                  associations?.tracking_available && !branchPr && !ownerOnlyChanges
+                    ? () => unlinkPr(pr.url)
+                    : undefined
                 }
                 onSelect={() => {
                   if (onOpenPullRequest) onOpenPullRequest(pr.url);
@@ -1447,7 +1483,7 @@ export function PullRequestPanel({
             showHeading={!inMobileDrawer && !showTrackingControls}
             refreshButton={!inMobileDrawer && !showTrackingControls ? refreshButton : undefined}
             emptyStateAction={
-              associations?.tracking_available && linkInEmptyState ? (
+              associations?.tracking_available && linkInEmptyState && !ownerOnlyChanges ? (
                 <div className="mt-2 w-full max-w-sm">
                   {linkNeedsHost ? (
                     <p role="status" className="text-ui text-muted-foreground">

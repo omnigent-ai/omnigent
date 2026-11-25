@@ -3963,7 +3963,7 @@ async def test_unlink_on_the_wrong_replica_asks_the_client_to_re_address(
 @pytest.mark.parametrize(
     ("level", "list_status", "unlink_status"),
     # Without a grant the session reads as missing.
-    [(None, 404, 404), (LEVEL_READ, 200, 403), (LEVEL_EDIT, 200, 200)],
+    [(None, 404, 404), (LEVEL_READ, 200, 403), (LEVEL_EDIT, 200, 403), (LEVEL_OWNER, 200, 200)],
 )
 async def test_stored_pull_request_routes_check_session_access(
     runner_globals_reset: None,
