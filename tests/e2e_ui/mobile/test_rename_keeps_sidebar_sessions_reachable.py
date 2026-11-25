@@ -42,6 +42,7 @@ from playwright.sync_api import Browser, BrowserContext, CDPSession, Locator, Pa
 
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.sessions._archived_sessions import delete_sessions
 
 # iPhone-13-class portrait profile with touch.
 _VIEWPORT = {"width": 390, "height": 844}
@@ -265,7 +266,7 @@ def test_rename_keeps_sidebar_sessions_reachable(
         runner-bound session.
     """
     base_url, session_id = seeded_session
-    _seed_filler_sessions(base_url, _FILLER_COUNT)
+    filler_ids = _seed_filler_sessions(base_url, _FILLER_COUNT)
 
     context = _new_phone_context(browser)
     try:
@@ -373,6 +374,8 @@ def test_rename_keeps_sidebar_sessions_reachable(
         )
     finally:
         context.close()
+        # The server is shared across the shard; leftover rows break later sidebar checks.
+        delete_sessions(base_url, filler_ids)
 
 
 # Distinct from the reachability journey's titles so both can share one server.
@@ -419,7 +422,7 @@ def test_rename_scrolls_edit_row_into_view_above_keyboard(
         runner-bound session.
     """
     base_url, session_id = seeded_session
-    _seed_filler_sessions(base_url, _FILLER_COUNT, title_prefix=_KEYBOARD_ROW_PREFIX)
+    filler_ids = _seed_filler_sessions(base_url, _FILLER_COUNT, title_prefix=_KEYBOARD_ROW_PREFIX)
 
     context = _new_phone_context(browser)
     try:
@@ -465,3 +468,5 @@ def test_rename_scrolls_edit_row_into_view_above_keyboard(
         )
     finally:
         context.close()
+        # The server is shared across the shard; leftover rows break later sidebar checks.
+        delete_sessions(base_url, filler_ids)
