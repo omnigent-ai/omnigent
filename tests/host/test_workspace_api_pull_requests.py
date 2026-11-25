@@ -41,7 +41,11 @@ from omnigent.workspace_fs import WorkspaceReader
 from tests._helpers.polling import poll_until_async
 from tests.host import test_workspace_pull_requests as host_tests
 from tests.host import test_workspace_service as service_tests
-from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS, _PULL_REQUEST_READS
+from tests.host.test_workspace_methods import (
+    _PULL_REQUEST_OWNER_METHODS,
+    _PULL_REQUEST_READS,
+    _PULL_REQUEST_WRITES,
+)
 
 _SESSION = service_tests._SESSION
 _PR = "https://github.com/example/app/pull/7"
@@ -506,6 +510,7 @@ def _tunnel(tmp_path: Path, *, refuse_send: bool = False) -> _Tunnel:
 _MERGE = host_tests._OWNER_CALLS["MergePullRequest"][0]
 _COMMENT_UNCONFIRMED = "Could not confirm comment posting. Check GitHub before retrying."
 _CHANGE_UNCONFIRMED = "Could not confirm the pull request change. Check GitHub before retrying."
+_COMMENT_METHODS = {"CreateComment", "CreateReviewThread", "ReplyToReviewThread"}
 
 
 @pytest.mark.parametrize(
@@ -552,6 +557,53 @@ async def test_an_unavailable_answer_after_the_frame_leaves_the_change_unconfirm
         await call
 
     assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _CHANGE_UNCONFIRMED)
+
+
+_WRITES = sorted(_PULL_REQUEST_WRITES)
+
+
+async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str) -> ConnectError:
+    """The error a call gets when the host ends it with ``code`` after the frame went out."""
+    call = asyncio.create_task(tunnel.call(method, request))
+    await tunnel.frame_sent()
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[-1].request_id,
+            done=True,
+            error_code=code,
+            error_message="Workspace call failed",
+        ),
+    )
+    with pytest.raises(ConnectError) as ended:
+        await call
+    return ended.value
+
+
+def test_every_write_has_a_request_case() -> None:
+    assert set(_WRITES) <= set(host_tests._OWNER_CALLS)
+    assert len(_WRITES) == 10
+
+
+@pytest.mark.parametrize("method", _WRITES)
+async def test_a_host_failure_after_a_change_was_sent_is_unconfirmed(
+    tmp_path: Path, method: str
+) -> None:
+    """A host error shaping GitHub's answer may follow a change GitHub made."""
+    unconfirmed = _COMMENT_UNCONFIRMED if method in _COMMENT_METHODS else _CHANGE_UNCONFIRMED
+    tunnel = _tunnel(tmp_path)
+    error = await _end_after_frame(tunnel, method, host_tests._OWNER_CALLS[method][0], "internal")
+
+    assert (error.code, error.message) == (Code.UNKNOWN, unconfirmed)
+
+
+@pytest.mark.parametrize("method", ["GetMergeOptions", "ListPullRequestFiles"])
+async def test_a_host_failure_on_a_read_stays_internal(tmp_path: Path, method: str) -> None:
+    tunnel = _tunnel(tmp_path)
+    request = WORKSPACE_METHODS[method].request_type(pr_url=_PR)
+    error = await _end_after_frame(tunnel, method, request, "internal")
+
+    assert (error.code, error.message) == (Code.INTERNAL, "Workspace call failed")
 
 
 async def test_a_change_whose_answer_times_out_is_unconfirmed(
