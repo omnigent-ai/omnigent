@@ -17465,6 +17465,129 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
+  it.each(
+    [
+      { path: "ordinary backfill", gapLength: 5 },
+      { path: "fresh-window fallback", gapLength: 100 },
+    ].flatMap((path) =>
+      [
+        { liveAck: "receipt" },
+        { liveAck: "receipt", identicalAlreadyPending: true },
+        { liveAck: "shell input" },
+        { liveAck: "shell input", identicalAlreadyPending: true },
+        { liveAck: "receipt", retryRead: true },
+        { liveAck: "shell input", identicalAlreadyPending: true, recoverSecond: true },
+      ].map((scenario) => ({
+        ...path,
+        identicalAlreadyPending: false,
+        retryRead: false,
+        recoverSecond: false,
+        ...scenario,
+      })),
+    ),
+  )(
+    "keeps a new identical command through $path after a live $liveAck (another pending: $identicalAlreadyPending; retry: $retryRead; second recovered: $recoverSecond)",
+    async ({ gapLength, liveAck, identicalAlreadyPending, retryRead, recoverSecond }) => {
+      const id = "conv_shell_receipt_first";
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const queued = (tempId: string, text: string) => ({
+        tempId,
+        pendingId: `pending_${tempId}`,
+        content: [{ type: "input_text" as const, text }],
+        posted: true,
+      });
+      const later = [
+        ...(identicalAlreadyPending ? [queued("second", "!ls")] : []),
+        queued("next", "next"),
+      ];
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks(windowItems),
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+        pendingUserMessages: [queued("old", "!ls"), ...later],
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+
+      const oldInput: ConversationItem = {
+        id: "old_shell_input",
+        response_id: "old_shell_turn",
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "ls",
+      };
+      const oldReceipt = userMessage("old_shell_receipt", "!ls");
+      const shellFrame = sse("response.output_item.done", { item: oldInput });
+      const receiptFrame = sse("session.input.consumed", {
+        data: {
+          item_id: oldReceipt.id,
+          type: "message",
+          cleared_pending_id: "pending_old",
+          data: { role: "user", content: [{ type: "input_text", text: "!ls" }] },
+        },
+      });
+      const filler = Array.from({ length: gapLength }, (_, i) =>
+        assistantMessage(`shell_gap_${i}`, "working"),
+      );
+      seedSessionItems(id, [
+        ...preGap,
+        ...filler,
+        oldInput,
+        oldReceipt,
+        ...(recoverSecond ? [{ ...oldInput, id: "second_shell_input" }] : []),
+      ]);
+      if (retryRead) {
+        const route = fetchMock.getMockImplementation()!;
+        let failSnapshot = true;
+        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          if (failSnapshot && String(input).split("?")[0] === `/v1/sessions/${id}`) {
+            failSnapshot = false;
+            return mockResponse({ detail: "temporarily unavailable" }, { ok: false, status: 503 });
+          }
+          return route(input, init);
+        });
+      }
+      const releaseSnapshot = holdNextSessionSnapshot(id);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      sinks[1]!.push(liveAck === "receipt" ? receiptFrame : shellFrame);
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual(later);
+
+      const pending = [...later, queued("new", "!ls")];
+      const expected = pending.filter((p) => !recoverSecond || p.tempId !== "second");
+      useChatStore.setState({ pendingUserMessages: pending });
+      releaseSnapshot();
+      await drainAsync();
+      if (retryRead) {
+        expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).not.toContain(oldInput.id);
+        sinks[1]!.error();
+        await drainAsync();
+        expect(sinks).toHaveLength(3);
+      }
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(oldInput.id);
+      expect(useChatStore.getState().pendingUserMessages).toEqual(expected);
+
+      sinks.at(-1)!.push(shellFrame);
+      sinks.at(-1)!.push(receiptFrame);
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual(expected);
+
+      sinks.at(-1)!.push("data: [DONE]\n\n");
+      sinks.at(-1)!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
   it.each([
     ...[
       { timing: "during the gap", shellCount: 1, receiptCount: 1 },

@@ -6328,6 +6328,7 @@ async function rehydrateWindowOnReconnect(
   id: string,
   session: Session,
   preGapIds: Set<string>,
+  pendingBeforeFetch: PendingUserMessage[],
   preGapElicitations: ReturnType<typeof captureElicitationIdsByStatus>,
   set: Setter,
   get: Getter,
@@ -6376,7 +6377,7 @@ async function rehydrateWindowOnReconnect(
     );
     const statusPatch = statusPatchFor(s);
     const unseen = gapBlocks.filter((b) => !tailIds.has(b.ctx.itemId!));
-    const shellSettled = settleRecoveredShellInputs(s, unseen);
+    const shellSettled = settleRecoveredShellInputs(s, unseen, pendingBeforeFetch);
     const recovered = recoveredUserAcks(unseen, shellSettled.settledShellInputs);
     const blocks =
       reconcileElicitationBlocks(
@@ -6444,9 +6445,11 @@ async function reconcileOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
   settleStatus = true,
+  pendingBeforeRecovery?: PendingUserMessage[],
 ): Promise<ReconnectBackfill> {
   if (queryClient === null) return "skipped";
   const stateBeforeFetch = get();
+  const pendingCandidates = pendingBeforeRecovery ?? stateBeforeFetch.pendingUserMessages;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   const turnEdgesBeforeFetch = streamTurnEdgeRevisions.get(id) ?? 0;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
@@ -6536,6 +6539,7 @@ async function reconcileOnReconnect(
       id,
       session,
       preGapIds,
+      pendingCandidates,
       preGapElicitations,
       set,
       get,
@@ -6567,7 +6571,7 @@ async function reconcileOnReconnect(
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement. Shell inputs never
     // get one: settle their `!cmd` bubbles by command first.
-    const shellSettled = settleRecoveredShellInputs(s, unseen);
+    const shellSettled = settleRecoveredShellInputs(s, unseen, pendingCandidates);
     const recovered = recoveredUserAcks(unseen, shellSettled.settledShellInputs);
     if (recovered.settledShellInputs !== s.settledShellInputs) {
       patch.settledShellInputs = recovered.settledShellInputs;
@@ -6731,6 +6735,7 @@ export async function startStreamPump(
   // The open currently live, so routing changes and missed events can recycle it.
   let liveAttempt: AbortController | null = null;
   let backfillRuns = 0;
+  let pendingBeforeBackfill: PendingUserMessage[] | null = null;
   const missedEventRecovery: MissedEventRecovery = {
     recycleStream: () => {
       if (liveAttempt === null || !hasConnected) return false;
@@ -6743,15 +6748,26 @@ export async function startStreamPump(
     backfill: async (settleStatus) => {
       backfillRuns += 1;
       const run = backfillRuns;
+      // Failed reads still owe the same gap. Retain acknowledged submissions
+      // as reservations, then append sends eligible for the retry's newer read.
+      const retainedIds = new Set(pendingBeforeBackfill?.map((p) => p.tempId));
+      pendingBeforeBackfill = [
+        ...(pendingBeforeBackfill ?? []),
+        ...get().pendingUserMessages.filter((p) => !retainedIds.has(p.tempId)),
+      ].slice(0, MAX_SETTLED_SHELL_INPUTS);
       const outcome = await reconcileOnReconnect(
         id,
         set,
         get,
         ignoredNativeMessageIds,
         settleStatus,
+        pendingBeforeBackfill,
       );
       // A slower earlier run must not overwrite the latest run's outcome.
-      if (run === backfillRuns) missedEventRecovery.backfillOwed = outcome === "failed";
+      if (run === backfillRuns) {
+        missedEventRecovery.backfillOwed = outcome === "failed";
+        if (outcome !== "failed") pendingBeforeBackfill = null;
+      }
     },
   };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so
@@ -8627,9 +8643,13 @@ function settleShellInput(
   state: ShellInputSettlement,
   itemId: string,
   command: string,
+  candidates: PendingUserMessage[] = state.pendingUserMessages,
 ): ShellInputSettlement {
   if (state.settledShellInputs.some((entry) => entry.itemId === itemId)) return state;
-  const at = state.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
+  const candidate = candidates.find((p) => isShellCommandBubble(p, command));
+  const at = candidate
+    ? state.pendingUserMessages.findIndex((p) => p.tempId === candidate.tempId)
+    : -1;
   const popped = state.pendingUserMessages[at];
   return {
     pendingUserMessages: popped
@@ -8639,8 +8659,9 @@ function settleShellInput(
       ...state.settledShellInputs,
       {
         itemId,
-        tempId: popped?.tempId,
-        pendingId: popped?.pendingId,
+        tempId: candidate?.tempId,
+        pendingId: popped?.pendingId ?? candidate?.pendingId,
+        // A receipt that already removed this submission owns no further credit.
         contentKey: popped ? contentKeyOf(popped.content) : undefined,
       },
     ].slice(-MAX_SETTLED_SHELL_INPUTS),
@@ -8656,14 +8677,23 @@ function settleShellInput(
 function settleRecoveredShellInputs(
   state: ShellInputSettlement,
   recovered: AnyBlock[],
+  pendingBeforeFetch: PendingUserMessage[],
 ): ShellInputSettlement {
-  return recovered.reduce(
-    (next, block) =>
-      isTerminalCommandInput(block) && block.ctx.itemId
-        ? settleShellInput(next, block.ctx.itemId, block.input)
-        : next,
-    state,
-  );
+  // Reserve submissions from the read's start, including ones a live receipt
+  // settled meanwhile. Old history must never match a newly submitted command.
+  const settledTempIds = new Set(state.settledShellInputs.map((entry) => entry.tempId));
+  let candidates = pendingBeforeFetch.filter((p) => !settledTempIds.has(p.tempId));
+  let next = state;
+  for (const block of recovered) {
+    if (!isTerminalCommandInput(block) || !block.ctx.itemId) continue;
+    const settled = next.settledShellInputs.find((entry) => entry.itemId === block.ctx.itemId);
+    const candidate = settled
+      ? undefined
+      : candidates.find((p) => isShellCommandBubble(p, block.input));
+    next = settleShellInput(next, block.ctx.itemId, block.input, candidate ? [candidate] : []);
+    if (candidate) candidates = candidates.filter((p) => p.tempId !== candidate.tempId);
+  }
+  return next;
 }
 
 /** Match one legacy receipt per settled command, retaining identities for replay. */
