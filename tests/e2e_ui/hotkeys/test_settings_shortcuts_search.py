@@ -12,20 +12,7 @@ import sys
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette
-
-_HIGHLIGHT = "data-settings-highlight"
-
-
-def _search_field(page: Page):
-    return page.get_by_role("combobox", name="Search settings")
-
-
-def _expect_revealed(page: Page, row_id: str) -> None:
-    """The row is on screen and highlighted, and the highlight then fades."""
-    row = page.locator(f'[data-settings-item="{row_id}"]')
-    expect(row).to_be_in_viewport()
-    expect(row).to_have_attribute(_HIGHLIGHT, "")
-    expect(row).not_to_have_attribute(_HIGHLIGHT, "", timeout=5_000)
+from tests.e2e_ui._settings_search import expect_settings_row_revealed, settings_search_field
 
 
 def test_keyboard_shortcuts_search_filters_the_table(page: Page, live_server: str) -> None:
@@ -62,17 +49,17 @@ def test_keyboard_shortcuts_search_filters_the_table(page: Page, live_server: st
 
     # A Settings search result for a row the filter hides still reveals it.
     filter_field.fill("model")
-    _search_field(page).fill("Open command palette")
+    settings_search_field(page).fill("Open command palette")
     expect(page.get_by_role("option").first).to_contain_text("Open command palette")
     page.keyboard.press("Enter")
     expect(filter_field).to_have_value("")
-    _expect_revealed(page, "shortcut.palette.commands")
+    expect_settings_row_revealed(page, "shortcut.palette.commands")
 
     # Every row the page lists is a search result, the composer's own keys included.
-    _search_field(page).fill("Send message")
+    settings_search_field(page).fill("Send message")
     expect(page.get_by_role("option").first).to_contain_text("Send message")
     page.keyboard.press("Enter")
-    _expect_revealed(page, "shortcut.composer.send")
+    expect_settings_row_revealed(page, "shortcut.composer.send")
 
 
 def test_flag_off_keeps_the_shortcuts_page_without_a_field(page: Page, live_server: str) -> None:
