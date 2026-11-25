@@ -1,8 +1,9 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Maximize2Icon, MessagesSquareIcon, RotateCcwIcon, XIcon } from "lucide-react";
 import { FullSessionChat } from "@/components/chat/FullSessionChat";
 import { useAgentChatPresentation } from "@/components/chat/useAgentChatPresentation";
+import type { ChatPresentation } from "@/components/chat/assistantPresentation";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
@@ -173,10 +174,13 @@ export function ProjectOrchestrator({
 export function ProjectPersonaChat({
   sessionId,
   name,
+  charter,
   onClose,
 }: {
   sessionId: string;
   name: string;
+  /** One line on what this team member does, shown while the chat is empty. */
+  charter?: string | null;
   onClose: () => void;
 }) {
   return (
@@ -200,8 +204,85 @@ export function ProjectPersonaChat({
           <XIcon />
         </Button>
       </header>
-      <OrchestratorChat key={sessionId} sessionId={sessionId} />
+      <OrchestratorChat
+        key={sessionId}
+        sessionId={sessionId}
+        persona={name}
+        intro={<TeamMemberChatIntro sessionId={sessionId} name={name} charter={charter} />}
+      />
     </section>
+  );
+}
+
+/** First questions for a team member; each fills the composer to send or finish. */
+export const TEAM_MEMBER_STARTERS: readonly { label: string; text: string }[] = [
+  { label: "What are you working on?", text: "What are you working on right now?" },
+  {
+    label: "What's assigned to you?",
+    text: "Which tickets are assigned to you, and where is each one?",
+  },
+  { label: "Review ticket…", text: "Review ticket " },
+];
+
+/** The first sentence of a team member's instructions, as its one-line charter. */
+export function teamMemberCharter(instructions: string | null | undefined): string | null {
+  const text = (instructions ?? "").trim().replace(/\s+/g, " ");
+  if (!text) return null;
+  const sentences = text.match(/[^.!?]+[.!?]+(?=\s|$)|[^.!?]+$/g) ?? [text];
+  // "You are the designer." says little; carry on into the next sentence.
+  const first = sentences[0].trim();
+  const sentence = first.length < 40 && sentences[1] ? `${first} ${sentences[1].trim()}` : first;
+  return sentence.length > 200 ? `${sentence.slice(0, 199).trimEnd()}…` : sentence;
+}
+
+/** What an empty team-member chat shows: its charter and a few ways to start. */
+function TeamMemberChatIntro({
+  sessionId,
+  name,
+  charter,
+}: {
+  sessionId: string;
+  name: string;
+  charter?: string | null;
+}) {
+  return (
+    <div className="mx-auto flex max-w-md flex-col items-center gap-3 px-4 text-center">
+      {charter && (
+        <p className="text-sm text-muted-foreground" data-testid="team-member-charter">
+          {charter}
+        </p>
+      )}
+      <div
+        role="group"
+        aria-label={`Ways to start with ${name}`}
+        className="flex flex-wrap justify-center gap-2"
+      >
+        {TEAM_MEMBER_STARTERS.map((starter) => (
+          <Button
+            key={starter.label}
+            type="button"
+            variant="outline"
+            size="sm"
+            className="rounded-full"
+            onClick={() => {
+              const existing = getSessionDraft(sessionId) ?? { text: "", files: [] };
+              setSessionDraft(sessionId, { ...existing, text: starter.text });
+              // Put the cursor at the end so the prompt can be sent or finished.
+              requestAnimationFrame(() => {
+                const composer = document.querySelector<HTMLTextAreaElement>(
+                  "[data-project-session-panel] textarea",
+                );
+                if (!composer) return;
+                composer.focus();
+                composer.setSelectionRange(composer.value.length, composer.value.length);
+              });
+            }}
+          >
+            {starter.label}
+          </Button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -238,9 +319,33 @@ function LeadSideChatButton({ sessionId }: { sessionId: string }) {
   );
 }
 
-function OrchestratorChat({ sessionId }: { sessionId: string }) {
+/** Shows *intro* under the chat's header while the transcript is empty. */
+function withIntro(base: ChatPresentation, intro: ReactNode): ChatPresentation {
+  if (!intro) return base;
+  const header = base.header;
+  return {
+    ...base,
+    header: (empty) => (
+      <>
+        {header?.(empty)}
+        {empty && intro}
+      </>
+    ),
+  };
+}
+
+function OrchestratorChat({
+  sessionId,
+  intro,
+  persona = "Lead",
+}: {
+  sessionId: string;
+  intro?: ReactNode;
+  persona?: string;
+}) {
   const agent = useSessionAgent(sessionId);
-  const presentation = useAgentChatPresentation(agent.isError ? undefined : agent.data, "Lead");
+  const base = useAgentChatPresentation(agent.isError ? undefined : agent.data, persona);
+  const presentation = useMemo(() => withIntro(base, intro), [base, intro]);
   return (
     <RenderErrorBoundary name="chat" resetKey={sessionId}>
       <FullSessionChat

@@ -27,7 +27,11 @@ import { ProjectSessionPanel } from "@/projectHome/ProjectSessionPanel";
 import { ProjectTicketBoard } from "@/projectHome/ProjectTicketBoard";
 import { useMarkProjectTicketsSeen, useNewTicketsOnOpen } from "@/projectHome/projectTicketsSeen";
 import { ProjectTicketPanel } from "@/projectHome/ProjectTicketPanel";
-import { ProjectOrchestrator, ProjectPersonaChat } from "@/projectHome/ProjectOrchestrator";
+import {
+  ProjectOrchestrator,
+  ProjectPersonaChat,
+  teamMemberCharter,
+} from "@/projectHome/ProjectOrchestrator";
 import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
 import { ProjectViewTools } from "@/projectHome/ProjectBoardActions";
@@ -80,10 +84,10 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
   useEffect(() => setTicketExpanded(false), [projectName, panelTicketId]);
   const replaceSearchParams = useReplaceSearchParams();
   const { projectId } = useTicketProject(projectName);
-  const personaName =
-    useProjectIdentities(personaSessionId ? projectId : null).data?.find(
-      (identity) => identity.active_session_id === personaSessionId,
-    )?.name ?? "Team member";
+  const persona = useProjectIdentities(personaSessionId ? projectId : null).data?.find(
+    (identity) => identity.active_session_id === personaSessionId,
+  );
+  const personaName = persona?.name ?? "Team member";
   const isNewTicket = useNewTicketsOnOpen(projectId, panelTicketId);
   useMarkProjectTicketsSeen(projectId, tickets && !hideBoard);
   const closePanel = useCallback(() => {
@@ -251,6 +255,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
                   key={personaSessionId}
                   sessionId={personaSessionId}
                   name={personaName}
+                  charter={teamMemberCharter(persona?.instructions)}
                   onClose={closePanel}
                 />
               ) : (
