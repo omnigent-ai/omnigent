@@ -208,6 +208,19 @@ implements them separately, so a fix for one harness does not reach the others.
   more opens Harnesses and dismisses the modal. Import sessions contains only
   session imports.
 
+## Status reports for attached terminals
+
+Native Claude and Codex terminals always forward validated OSC 7501 reports
+through tmux to the attached terminal emulator. Terminal emulators that support
+OSC 7501 can use them to display agent and child-task status. Omnigent's web
+terminal does not interpret these forwarded reports.
+
+The `claude_osc_status` flag controls only Omnigent's own Claude root-status
+observation. Turning it off leaves forwarding enabled, and the relay writes no
+status file. Hosted launches select forwarding by native harness role. The
+local Codex launcher requests it with `forward_program_status`. Both paths
+forward reports regardless of app name or child-task ID.
+
 ## How to get to it (user POV)
 
 **Web:** start a new session, choose the harness in the harness picker, open its
@@ -561,6 +574,12 @@ Remove the file afterwards.
 
 Cross-harness journeys:
 
+- **`attached-terminal-status` (parser and real tmux):** run
+  `uv run --no-sync pytest tests/terminals/test_program_status.py tests/runner/test_terminal_program_status_forwarding.py --reruns 0 -n 0`.
+  Scripted producers verify discovery, ordered root/child/foreign-app reports,
+  explicit clears, and exit behavior with Claude observation both on and off.
+  Parser tests reject malformed fields and discard child-supplied tmux wrappers.
+  No provider credentials are needed.
 - **`working-status`, Claude (component and real-process checks):** run with
   plain `uv run --no-sync pytest`, `--reruns 0 -n 0`:
   `tests/runner/test_resource_registry.py::test_claude_program_status_real_launch_and_fallback`,
@@ -592,7 +611,7 @@ Cross-harness journeys:
   across completion and check it runs once. Compare Chat with the session REST
   status and keep a recording plus terminal transcript. Restart the isolated
   runner and repeat with `OMNIGENT_FEATURES=-claude_osc_status` (the kill
-  switch), and separately with a pre-2.1.295 CLI under the default. Record each version, gate, sandbox and surface separately.
+  switch for observation), and separately with a pre-2.1.295 CLI under the default. Record each version, gate, sandbox and surface separately.
   Machine-managed Claude provider settings can prevent the scripted endpoint
   from being used: report that blocker or use an isolated test container.
   Do not change machine policy to obtain a passing run.
