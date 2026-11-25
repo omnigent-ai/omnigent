@@ -221,6 +221,47 @@ describe("assistant workspace markdown images", () => {
     expect(document.querySelector("img")).toBeNull();
   });
 
+  it("opens an image outside the workspace in the file viewer only when clicked", async () => {
+    VIEWER.openFile.mockClear();
+    renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open shot.png" }));
+
+    expect(VIEWER.openFile).toHaveBeenCalledWith("/workspace/project-worktrees/worker/shot.png");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(document.querySelector("img")).toBeNull();
+  });
+
+  it("opens a workspace image whose preview failed in the file viewer", async () => {
+    VIEWER.openFile.mockClear();
+    fetchMock.mockResolvedValue(new Response("missing", { status: 404 }));
+    renderMarkdown("![Screenshot](/workspace/project/shots/shot.png)");
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    fireEvent.click(await screen.findByRole("button", { name: "Open shot.png" }));
+
+    expect(VIEWER.openFile).toHaveBeenCalledWith("shots/shot.png");
+  });
+
+  it.each(["../shot.png", "/workspace/project/../shot.png"])(
+    "keeps an unresolvable image path %s inert",
+    async (path) => {
+      renderMarkdown(`![Screenshot](${path})`);
+      expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveTextContent("shot.png");
+      expect(screen.queryByRole("button", { name: "Open shot.png" })).toBeNull();
+    },
+  );
+
+  it("keeps a side chat's unpreviewable image inert in its parent's viewer", async () => {
+    workspaceEnvironment.mockReturnValue({ data: { root: "/workspace/side", home: "/home/user" } });
+    fetchMock.mockResolvedValue(new Response("missing", { status: 404 }));
+    renderMarkdown("![Screenshot](/workspace/side/shot.png)", { scopedId: "session-side" });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveTextContent("shot.png");
+    expect(screen.queryByRole("button", { name: "Open shot.png" })).toBeNull();
+  });
+
   it("keeps images disabled for other markdown surfaces", async () => {
     renderMarkdown("![Screenshot](shot.png)", { enabled: false });
     expect(await screen.findByText("[Image blocked: Screenshot]")).toBeVisible();

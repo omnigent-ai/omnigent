@@ -4,7 +4,12 @@ import { ZoomableImage } from "@/components/ImageLightbox";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
 import { resolveChatFilePath, useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
-import { useFileViewerConversationId, useWorkspacePaths } from "@/shell/FileViewerContext";
+import { cn } from "@/lib/utils";
+import {
+  useFileViewer,
+  useFileViewerConversationId,
+  useWorkspacePaths,
+} from "@/shell/FileViewerContext";
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const RASTER_IMAGE_TYPES_BY_EXTENSION = new Map([
@@ -30,6 +35,13 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   const home = usesViewerWorkspace ? viewerPaths.home : (environment.data?.home ?? null);
   const resolved = root ? resolveChatFilePath(path.replace(/^(\.\/)+/, ""), root, home) : null;
   const relativePath = resolved && !resolved.path.startsWith("/") ? resolved.path : null;
+  const openFile = useFileViewer();
+  // The viewer opens paths in its own session, so another session's image stays inert. A path
+  // outside the workspace (e.g. a worker's worktree) opens on click only; previews never read it.
+  const openInViewer =
+    openFile && conversationId && usesViewerWorkspace && resolved
+      ? () => openFile(resolved.path)
+      : null;
   const imageKey = `${conversationId ?? ""}\0${root ?? ""}\0${relativePath ?? ""}`;
   const [loaded, setLoaded] = useState<{
     key: string;
@@ -75,15 +87,33 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   }, [conversationId, relativePath, imageKey]);
 
   if (loaded?.key !== imageKey || loaded.signal.aborted || failedKey === imageKey) {
-    return (
-      <span
-        className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 align-middle text-sm text-muted-foreground"
-        title={path}
-        role="img"
-        aria-label={alt || filename}
-      >
+    const chipClassName =
+      "inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 align-middle text-sm text-muted-foreground";
+    const chipContent = (
+      <>
         <ImageIcon className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="truncate">{filename}</span>
+      </>
+    );
+    if (openInViewer) {
+      return (
+        <button
+          type="button"
+          className={cn(
+            chipClassName,
+            "cursor-pointer transition-colors hover:bg-accent hover:text-foreground",
+          )}
+          title={path}
+          aria-label={`Open ${filename}`}
+          onClick={openInViewer}
+        >
+          {chipContent}
+        </button>
+      );
+    }
+    return (
+      <span className={chipClassName} title={path} role="img" aria-label={alt || filename}>
+        {chipContent}
       </span>
     );
   }
