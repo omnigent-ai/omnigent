@@ -11,6 +11,7 @@ import { insertComposerText } from "@/lib/composerText";
 import { useMentionBrowser, type MentionBrowser } from "@/hooks/useMentionBrowser";
 import type { MentionState } from "@/lib/composerMentions";
 import type { ComposerTextTarget } from "./composerInput";
+import { replyQuoteLine } from "@/lib/replyDraftDocument";
 
 vi.hoisted(() => {
   const mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131";
@@ -243,5 +244,16 @@ describe("a locked CodeMirror composer", () => {
 
     expect(box.target!.value).toBe("keep this ");
     expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("CodeMirrorComposerInput reply cards with the macOS readline keys", () => {
+  it("removes a card with ⌃K before it, and ⌃Y yanks the break back", () => {
+    const quoted = replyQuoteLine({ id: "q1", text: "Quoted line" });
+    const { target, press } = mount(`Intro\n${quoted}\nReply`, "Intro".length);
+    press({ key: "k", code: "KeyK", ctrlKey: true });
+    expect(target().value).toBe("Intro\nReply");
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+    expect(target().value).toBe("Intro\n\nReply");
   });
 });

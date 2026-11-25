@@ -170,6 +170,8 @@ export interface ComposerInputProps {
   inputId?: string;
   /** Tagged @-mention tokens to present as one unit, such as "@README.md". */
   mentionTokens?: readonly string[];
+  /** The first reply card is the side chat's seed: text typed above it goes below it. */
+  pinnedFirstCard?: boolean;
   /** Leading command to tint, such as "/context"; a `{token, start}` pins it to an offset. */
   commandToken?: string | ComposerTokenAt | null;
   onChange?: (event: ComposerInputEvent) => void;

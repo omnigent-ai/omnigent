@@ -13,6 +13,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import { insertComposerText } from "@/lib/composerText";
+import { parseReplyQuoteLine, replyQuoteLine } from "@/lib/replyDraftDocument";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
@@ -653,3 +654,232 @@ describe("leadingCommandSpan", () => {
     expect(leadingCommandSpan("\x01! ls", "!")).toBeNull();
   });
 });
+
+describe("CodeMirrorComposerInput reply cards", () => {
+  // CodeMirror measures text for caret motion; jsdom has no layout.
+  const originalRangeRects = {
+    getClientRects: Range.prototype.getClientRects,
+    getBoundingClientRect: Range.prototype.getBoundingClientRect,
+  };
+  beforeAll(() => {
+    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => new DOMRect();
+  });
+  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+
+  const card = (text: string, id = "card") => replyQuoteLine({ id, text });
+  const mountDocument = (value: string, props: Partial<Parameters<typeof mount>[0]> = {}) => {
+    const mounted = mount({ value, ...props });
+    return { ...mounted, editor: EditorView.findFromDOM(mounted.content)! };
+  };
+  const caret = (editor: EditorView, offset: number) =>
+    act(() => void editor.dispatch({ selection: { anchor: offset } }));
+  const typeAt = (editor: EditorView, from: number, insert: string, to = from) =>
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from, to, insert },
+          userEvent: "input.type",
+        }),
+    );
+  const pasteAt = (editor: EditorView, from: number, insert: string, to = from) =>
+    act(
+      () =>
+        void editor.dispatch({
+          changes: { from, to, insert },
+          userEvent: "input.paste",
+        }),
+    );
+  const key = (content: HTMLElement, init: KeyboardEventInit) =>
+    act(() => void fireEvent.keyDown(content, init));
+
+  it("paints each card with a truncated preview and the full text for screen readers", () => {
+    const long = "x".repeat(130);
+    const { container } = mountDocument(`Opener\n${card(long)}\nWhy`);
+    const row = container.querySelector<HTMLElement>('[data-testid="composer-reply-quote"]')!;
+    const quote = row.querySelector("blockquote")!;
+    expect(quote.getAttribute("title")).toBe(long);
+    expect(quote.querySelector('[aria-hidden="true"]')!.textContent).toBe(`${"x".repeat(120)}…`);
+    expect(quote.querySelector(".sr-only")!.textContent).toBe(long);
+    expect(row.querySelector('button[aria-label="Remove quote"]')).not.toBeNull();
+  });
+
+  it("disables a card's X while the draft is read-only", () => {
+    const { container } = mountDocument(`${card("Quoted")}\nWhy`, { readOnly: true });
+    const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove quote"]')!;
+    expect(remove.disabled).toBe(true);
+  });
+
+  it("lets a long card shrink inside the editor, so its X stays on screen", () => {
+    const { content } = mountDocument(`${card("Quoted")}\nWhy`);
+    expect(getComputedStyle(content).minWidth).toBe("0px");
+  });
+
+  it("steps the arrow keys over a card, to the text on either side", () => {
+    const value = `Opener\n${card("Quoted")}\nWhy`;
+    const { content, editor } = mountDocument(value);
+    caret(editor, value.indexOf("Why"));
+    key(content, { key: "ArrowLeft" });
+    expect(editor.state.selection.main.head).toBe("Opener".length);
+    key(content, { key: "ArrowRight" });
+    expect(editor.state.selection.main.head).toBe(value.indexOf("Why"));
+  });
+
+  it("puts typed text at a card's start or end on its own line", () => {
+    const quoted = card("Quoted");
+    const value = `Opener\n${quoted}\nWhy`;
+    const start = value.indexOf(quoted);
+    const end = start + quoted.length;
+    const first = mountDocument(value);
+    typeAt(first.editor, start, "x");
+    expect(first.target().value).toBe(`Opener\nx\n${quoted}\nWhy`);
+    const last = mountDocument(value);
+    typeAt(last.editor, end, "x");
+    expect(last.target().value).toBe(`Opener\n${quoted}\nx\nWhy`);
+  });
+
+  it("puts typed text at offset 0 on its own line above the first card", () => {
+    const quoted = card("Quoted");
+    const { editor } = mountDocument(`${quoted}\nWhy`);
+    typeAt(editor, 0, "x");
+    expect(editor.state.doc.toString()).toBe(`x\n${quoted}\nWhy`);
+  });
+
+  it("puts pasted text at a card's start or end on its own line", () => {
+    const quoted = card("Quoted");
+    const value = `Opener\n${quoted}\nWhy`;
+    const { editor } = mountDocument(value);
+    pasteAt(editor, value.indexOf(quoted) + quoted.length, "pasted");
+    expect(editor.state.doc.toString()).toBe(`Opener\n${quoted}\npasted\nWhy`);
+  });
+
+  it("drops a card pasted as text, so no duplicate card appears", () => {
+    const { editor } = mountDocument(`Opener\nWhy`);
+    pasteAt(editor, "Opener\n".length, card("Pasted", "copy"));
+    expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+  });
+
+  it("removes a card when typing over it, and keeps the card when typing over the break beside it", () => {
+    const quoted = card("Quoted");
+    const { editor } = mountDocument(`Opener\n${quoted}\nWhy`);
+    typeAt(editor, "Opener\n".length, "x", "Opener\n".length + quoted.length);
+    expect(editor.state.doc.toString()).toBe("Opener\nx\nWhy");
+
+    const kept = mountDocument(`Intro\n${quoted}\nReply`);
+    typeAt(kept.editor, "Intro".length, "x", "Intro\n".length);
+    expect(kept.editor.state.doc.toString()).toBe(`Introx\n${quoted}\nReply`);
+  });
+
+  it("keeps a card whole when a compound edit touches it, and the rest of the edit lands", () => {
+    const quoted = card("Quoted");
+    const value = `Opener\n${quoted}\nWhy`;
+    const { editor } = mountDocument(value);
+    const start = value.indexOf(quoted);
+    act(
+      () =>
+        void editor.dispatch({
+          changes: [
+            { from: start + 1, to: start + 3, insert: "" },
+            { from: value.length, insert: "!" },
+          ],
+          userEvent: "input.type",
+        }),
+    );
+    expect(editor.state.doc.toString()).toBe(`Opener\n${quoted}\nWhy!`);
+  });
+
+  it("keeps the text of an insert whose range ends inside a card", () => {
+    const quoted = card("Quoted");
+    const { editor } = mountDocument(`Opener\n${quoted}\nWhy`);
+    act(() => insertComposerText(editorTarget(editor), "X", 0, "Opener\n".length + 2));
+    expect(editor.state.doc.toString()).toContain("X");
+    expect(editor.state.doc.toString().split("\n").filter(isCard)).toHaveLength(1);
+  });
+
+  it("removes a card with Backspace at the start of the line after it", () => {
+    const value = `Opener\n${card("Quoted")}\nWhy`;
+    const { content, editor } = mountDocument(value);
+    caret(editor, value.indexOf("Why"));
+    key(content, { key: "Backspace" });
+    expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+  });
+
+  it("removes a card with Delete at the end of the line before it", () => {
+    const value = `Opener\n${card("Quoted")}\nWhy`;
+    const { content, editor } = mountDocument(value);
+    caret(editor, "Opener".length);
+    key(content, { key: "Delete" });
+    expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+  });
+
+  it("removes a card with its X", () => {
+    const value = `Opener\n${card("Quoted")}\nWhy`;
+    const { container, target } = mountDocument(value);
+    const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove quote"]')!;
+    act(() => void fireEvent.click(remove));
+    expect(target().value).toBe("Opener\nWhy");
+  });
+
+  it("brings a removed card back with its text on undo, and removes it again on redo", () => {
+    const quoted = card("Quoted");
+    const value = `Opener\n${quoted}\nWhy`;
+    const { content, editor } = mountDocument(value);
+    caret(editor, value.indexOf("Why"));
+    key(content, { key: "Backspace" });
+    expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+    act(() => void undo(editor));
+    expect(editor.state.doc.toString()).toBe(value);
+    act(() => void redo(editor));
+    expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+  });
+
+  it("turns cards into markdown quotes in the text copy, cut and drag take", () => {
+    const quoted = card("one\ntwo");
+    const value = `Opener\n${quoted}\nWhy`;
+    const { editor } = mountDocument(value);
+    // jsdom has no DOM selection for CodeMirror's copy handler, so read the filter it applies.
+    const filters = editor.state.facet(EditorView.clipboardOutputFilter);
+    const copied = filters.reduce((text, filter) => filter(text, editor.state), value);
+    expect(copied).toBe("Opener\n> one\n> two\nWhy");
+  });
+
+  it("keeps the seed card first: text typed above it lands below it", () => {
+    const seed = card("Seed");
+    const { editor, target } = mountDocument(`${seed}\nRest`, { pinnedFirstCard: true });
+    typeAt(editor, 0, "x");
+    expect(target().value).toBe(`${seed}\nx\nRest`);
+    expect(editor.state.selection.main.head).toBe(seed.length + 2);
+  });
+
+  it("removes the seed card with its X and keeps the text after it", () => {
+    const seed = card("Seed");
+    const onChange = vi.fn();
+    const { container, target } = mountDocument(`${seed}\nRest`, {
+      pinnedFirstCard: true,
+      onChange,
+    });
+    const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove quote"]')!;
+    act(() => void fireEvent.click(remove));
+    expect(target().value).toBe("Rest");
+  });
+});
+
+function isCard(line: string): boolean {
+  return parseReplyQuoteLine(line) !== null;
+}
+
+function editorTarget(editor: EditorView) {
+  return {
+    get value() {
+      return editor.state.doc.toString();
+    },
+    insertText: (text: string, start: number, end: number) =>
+      editor.dispatch({ changes: { from: start, to: end, insert: text } }),
+    get selectionStart() {
+      return editor.state.selection.main.from;
+    },
+    get selectionEnd() {
+      return editor.state.selection.main.to;
+    },
+  } as unknown as ComposerTextTarget;
+}

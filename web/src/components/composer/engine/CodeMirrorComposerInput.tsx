@@ -2,7 +2,6 @@
 
 import { history, historyKeymap, isolateHistory, standardKeymap } from "@codemirror/commands";
 import {
-  Annotation,
   Compartment,
   EditorSelection,
   EditorState,
@@ -46,6 +45,7 @@ import type {
   ComposerTokenAt,
 } from "./composerInput";
 import { readlineKeys } from "./codeMirrorReadline";
+import { controlledUpdate, pinnedFirstCard, replyQuoteExtensions } from "./codeMirrorReplyQuotes";
 
 /** What the editor takes from the app, handed in by the loader. */
 export interface CodeMirrorComposerEnvironment {
@@ -79,9 +79,6 @@ export interface TokenSpan {
 
 /** The draft's height cap before it scrolls, matching the textarea's. */
 const COMPOSER_MAX_HEIGHT_PX = 180;
-
-/** Marks a transaction that syncs the controlled value in, which isn't a user edit. */
-const controlledUpdate = Annotation.define<true>();
 
 /** The undo or redo that made these transactions' edit, if either did. */
 function historyDirectionOfTransactions(
@@ -274,7 +271,8 @@ function theme(heightMode: ComposerInputHeightMode): Extension {
     "&[data-scrolled] .cm-scroller": {
       maskImage: "linear-gradient(to bottom, transparent, black 18px)",
     },
-    ".cm-content": { padding: "0", caretColor: "currentColor", minHeight: "1lh" },
+    // A long card truncates inside the editor, so its X stays on screen.
+    ".cm-content": { padding: "0", minWidth: "0", caretColor: "currentColor", minHeight: "1lh" },
     ".cm-content:focus-visible": { outline: "none" },
     ".cm-line": { padding: "0" },
     ".cm-placeholder": { color: "var(--muted-foreground)" },
@@ -495,6 +493,7 @@ function CodeMirrorComposer({
       theme: new Compartment(),
       mentionTokens: new Compartment(),
       commandToken: new Compartment(),
+      pinnedCard: new Compartment(),
     }),
     [],
   );
@@ -578,6 +577,8 @@ function CodeMirrorComposer({
           mentionTokenField(environment),
           compartments.commandToken.of(commandTokenFacet.of(documentCommandToken(initial))),
           commandTokenField(environment),
+          compartments.pinnedCard.of(pinnedFirstCard.of(initial.pinnedFirstCard ?? false)),
+          replyQuoteExtensions,
           EditorView.updateListener.of((update) => {
             const fromUser = !update.transactions.some((transaction) =>
               transaction.annotation(controlledUpdate),
@@ -686,6 +687,12 @@ function CodeMirrorComposer({
       ),
     });
   }, [compartments, commandTokenKey]);
+  const pinnedFirst = props.pinnedFirstCard === true;
+  useLayoutEffect(() => {
+    viewRef.current?.dispatch({
+      effects: compartments.pinnedCard.reconfigure(pinnedFirstCard.of(pinnedFirst)),
+    });
+  }, [compartments, pinnedFirst]);
   useEffect(() => {
     if (autoFocus) viewRef.current?.focus();
   }, [autoFocus]);

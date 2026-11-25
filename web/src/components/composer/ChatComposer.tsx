@@ -512,6 +512,7 @@ export function ComposerEngineInput({
     className,
     mentionTokens,
     commandToken,
+    pinnedFirstCard,
     autoFocus,
     ...rest
   } = input;
@@ -538,6 +539,7 @@ export function ComposerEngineInput({
         heightMode={heightMode}
         mentionTokens={mentionTokens}
         commandToken={commandToken}
+        pinnedFirstCard={pinnedFirstCard}
         autoFocus={autoFocusOnMount}
         onKeyDown={handleKeyDown}
       />
