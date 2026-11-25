@@ -372,11 +372,24 @@ describe("a saved workflow's response", () => {
         stored = { ...stored, description: body.description, updated_at: 120 };
         return Response.json(stored);
       });
-      const { result } = renderQuery(() => ({
-        shown: useWorkflow("workflow"),
-        limit: useSaveStepTimeLimit("workflow"),
-        describe: useSaveWorkflowDescription("workflow"),
-      }));
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      // Every description the workflow's entry holds, in order.
+      const held: unknown[] = [];
+      client.getQueryCache().subscribe((event) => {
+        const data = event.query.state.data as { description?: string } | undefined;
+        if (event.query.queryKey[0] === "workflow" && data) held.push(data.description);
+      });
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const { result } = renderHook(
+        () => ({
+          shown: useWorkflow("workflow"),
+          limit: useSaveStepTimeLimit("workflow"),
+          describe: useSaveWorkflowDescription("workflow"),
+        }),
+        { wrapper },
+      );
       await act(() => vi.advanceTimersByTimeAsync(1));
       expect(result.current.shown.data?.description).toBe("Old words.");
 
@@ -389,7 +402,7 @@ describe("a saved workflow's response", () => {
       await act(() => result.current.describe.mutateAsync("New words."));
       await act(() => vi.advanceTimersByTimeAsync(1));
       expect(result.current.shown.data?.description).toBe("New words.");
-      // A response from the same second as the shown one goes in, and the workflow is read again.
+      // A response from the same second as the shown one has the workflow read again instead.
       await act(async () => {
         answerLimit();
         await limitSaved;
@@ -398,6 +411,8 @@ describe("a saved workflow's response", () => {
       await act(() => vi.advanceTimersByTimeAsync(1));
       expect(result.current.shown.data?.description).toBe("New words.");
       expect(result.current.shown.data?.steps[0]?.goal).toBe("Read it.\n\n**Time limit:** 1 hour");
+      // The older words never came back, even for a moment.
+      expect(held.slice(held.indexOf("New words."))).not.toContain("Old words.");
     },
   );
 });

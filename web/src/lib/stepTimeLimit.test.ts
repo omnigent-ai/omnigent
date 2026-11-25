@@ -72,9 +72,11 @@ describe("timeLimitMinutes and shortTimeLimit", () => {
     expect(timeLimitLength("an afternoon")).toBeNull();
   });
 
-  it("goes by whole minutes, and has no length under one", () => {
+  it("goes by whole minutes, and has no length under one or too long to count", () => {
     expect(timeLimitMinutes("1.333h")).toBe(80);
     expect(timeLimitMinutes("0.001 minutes")).toBeNull();
+    expect(timeLimitMinutes(`${"9".repeat(310)} hours`)).toBeNull();
+    expect(shortTimeLimit(`${"9".repeat(310)} hours`)).toBeNull();
   });
 
   it("has no length for words it can't read, or for none at all", () => {

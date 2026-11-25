@@ -142,7 +142,7 @@ function leadingLength(limit: string): { text: string; minutes: number } | null 
   }
   // In whole minutes, as the menu offers them and a timer counts.
   const whole = Math.round(minutes);
-  if (end === 0 || whole < 1) return null;
+  if (end === 0 || whole < 1 || !Number.isFinite(whole)) return null;
   return { text: text.slice(0, end), minutes: whole };
 }
 

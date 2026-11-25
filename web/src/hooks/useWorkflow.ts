@@ -99,8 +99,8 @@ async function refusedFields(res: Response): Promise<unknown[]> {
 
 /**
  * Show a saved workflow, unless the page already shows a later write: a response that comes
- * after a later write's is left out. One from the same second goes in, and the workflow is
- * read again, since the two can't be told apart.
+ * after a later write's is left out. For one from the same second, which can't be told apart,
+ * the workflow is read again instead.
  */
 function useWorkflowSaved() {
   const queryClient = useQueryClient();
@@ -108,10 +108,9 @@ function useWorkflowSaved() {
     const key = ["workflow", workflow.id];
     const shown = queryClient.getQueryData<WorkflowDetail>(key)?.updated_at;
     const written = workflow.updated_at;
-    if (shown === undefined || written === undefined || written >= shown)
+    if (shown === undefined || written === undefined || written > shown)
       queryClient.setQueryData(key, workflow);
-    if (written !== undefined && written === shown)
-      void queryClient.invalidateQueries({ queryKey: key });
+    else if (written === shown) void queryClient.invalidateQueries({ queryKey: key });
     void queryClient.invalidateQueries({ queryKey: ["saved-workflows"] });
   };
 }
@@ -187,16 +186,15 @@ async function savePlan(
   const path = workflowPath(workflowId);
   const res = await sendWorkflow(path, "PATCH", proposal);
   const refused = await refusedFields(res);
+  if (checkedOnly && refused.includes("expected_steps")) throw new UncheckedStepsError();
   // A server from before conditional descriptions gets the steps alone, so its description stays.
   if (
     proposal.expected_description !== undefined &&
     refused.some((field) => field === "expected_description" || field === "description_source")
   )
     return writeWorkflow(path, "PATCH", { steps: proposal.steps });
-  // One from before `expected_steps` writes the steps without that check, unless the write
-  // must be checked: then nothing is written.
+  // One from before `expected_steps` writes the steps without that check.
   if (refused.includes("expected_steps")) {
-    if (checkedOnly) throw new UncheckedStepsError();
     const { expected_steps: _, ...unchecked } = proposal;
     return savePlan(workflowId, unchecked);
   }
