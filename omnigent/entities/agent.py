@@ -32,6 +32,8 @@ class Agent:
         admin-only to mutate.
     :param kind: ``"server"`` for agents the operator registered (built-ins,
         ``--agent``), ``"user"`` for agents users upload or install.
+    :param project_id: The project a role's agent belongs to; ``None`` for
+        every other agent.
     """
 
     id: str
@@ -44,6 +46,7 @@ class Agent:
     session_id: str | None = None  # a conversation using it; None for server agents
     created_by: str | None = None
     kind: str = "server"
+    project_id: str | None = None
 
     @property
     def operator_authored(self) -> bool:

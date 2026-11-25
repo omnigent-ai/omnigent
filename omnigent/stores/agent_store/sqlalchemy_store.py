@@ -530,8 +530,8 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         List *owner*'s own agents, newest first (see :meth:`AgentStore.list_user_agents`).
 
-        One keyset seek on ``ix_agents_kind_owner_created`` reading at most
-        ``_USER_AGENT_READ_CAP`` rows.
+        One keyset seek on ``ix_agents_owner_project_created`` reading at most
+        ``_USER_AGENT_READ_CAP`` rows. Project role agents are excluded.
 
         :param owner: Owning user id, or ``None`` on an auth-less server.
         :param limit: Maximum agents to return, e.g. ``50``.
@@ -539,16 +539,82 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: The page; ``last_id`` is the last row read.
         :raises StaleCursorError: When the *after* row no longer exists.
         """
-        mine = (
+        return self._owned_agent_page(
+            "list_user_agents", owner, None, limit, after, originals_only=True
+        )
+
+    def create_project_agent(
+        self,
+        agent_id: str,
+        name: str,
+        bundle_location: str,
+        *,
+        owner: str | None,
+        project_id: str,
+        description: str | None = None,
+    ) -> Agent:
+        """Insert a project role's agent (see :meth:`AgentStore.create_project_agent`)."""
+        created_at = now_epoch()
+
+        def write(session: Session) -> Agent:
+            row = SqlAgent(
+                id=agent_id,
+                created_at=created_at,
+                name=name,
+                bundle_location=bundle_location,
+                version=1,
+                kind=encode_agent_kind("user"),
+                description=description,
+                created_by=owner,
+                project_id=project_id,
+            )
+            session.add(row)
+            return sql_agent_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "create_project_agent", write)
+
+    def list_project_agents(
+        self,
+        owner: str | None,
+        project_id: str,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> PagedList[Agent]:
+        """
+        List *owner*'s agents in *project_id*, newest first.
+
+        One keyset seek on ``ix_agents_owner_project_created``.
+
+        :raises StaleCursorError: When the *after* row no longer exists.
+        """
+        return self._owned_agent_page(
+            "list_project_agents", owner, project_id, limit, after, originals_only=False
+        )
+
+    def _owned_agent_page(
+        self,
+        operation: str,
+        owner: str | None,
+        project_id: str | None,
+        limit: int,
+        after: str | None,
+        *,
+        originals_only: bool,
+    ) -> PagedList[Agent]:
+        """One owner's user agents in one scope (personal when *project_id* is ``None``)."""
+        owned = (
             SqlAgent.workspace_id == current_workspace_id(),
             SqlAgent.kind == encode_agent_kind("user"),
             SqlAgent.created_by == owner,
+            SqlAgent.project_id.is_(None)
+            if project_id is None
+            else SqlAgent.project_id == project_id,
         )
-        with self._session("list_user_agents") as session:
-            stmt = select(SqlAgent).where(*mine)
+        with self._session(operation) as session:
+            stmt = select(SqlAgent).where(*owned)
             if after:
                 cursor_at = session.execute(
-                    select(SqlAgent.created_at).where(*mine, SqlAgent.id == after)
+                    select(SqlAgent.created_at).where(*owned, SqlAgent.id == after)
                 ).scalar_one_or_none()
                 if cursor_at is None:
                     raise StaleCursorError(after)
@@ -561,15 +627,16 @@ class SqlAlchemyAgentStore(AgentStore):
                     ),
                 )
             stmt = stmt.order_by(desc(SqlAgent.created_at), desc(SqlAgent.id))
-            rows = list(session.execute(stmt.limit(_USER_AGENT_READ_CAP + 1)).scalars())
-            read = rows[:_USER_AGENT_READ_CAP]
+            read_cap = _USER_AGENT_READ_CAP if originals_only else limit
+            rows = list(session.execute(stmt.limit(read_cap + 1)).scalars())
+            read = rows[:read_cap]
             kept: builtins.list[Agent] = []
             consumed = 0
             for row in read:
                 if len(kept) >= limit:
                     break
                 consumed += 1
-                if _is_original(row):
+                if not originals_only or _is_original(row):
                     kept.append(sql_agent_to_entity(row))
             last_read = read[consumed - 1].id if consumed else None
         return PagedList(

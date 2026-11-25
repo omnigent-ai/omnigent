@@ -252,3 +252,43 @@ class AgentStore(ABC):
         """
         del owner, limit, after
         return PagedList(data=[], first_id=None, last_id=None, has_more=False)
+
+    def create_project_agent(
+        self,
+        agent_id: str,
+        name: str,
+        bundle_location: str,
+        *,
+        owner: str | None,
+        project_id: str,
+        description: str | None = None,
+    ) -> Agent:
+        """
+        Insert a project role's agent: a user agent owned by *owner*, scoped to *project_id*.
+
+        :param name: The role's name, e.g. ``"Reviewer"``.
+        :param owner: The project owner, or ``None`` on an auth-less server.
+        :param project_id: The project the role belongs to.
+        :returns: The created :class:`Agent`.
+        :raises NotImplementedError: When the store doesn't support user agents.
+        """
+        raise NotImplementedError("this agent store does not support project agents")
+
+    def list_project_agents(
+        self,
+        owner: str | None,
+        project_id: str,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> PagedList[Agent]:
+        """
+        List *owner*'s agents in *project_id*, newest first.
+
+        :param owner: The project owner, or ``None`` on an auth-less server.
+        :param project_id: The project whose role agents to list.
+        :param limit: Maximum agents to return, e.g. ``50``.
+        :param after: ``last_id`` of the previous page.
+        :returns: The page; empty when the store doesn't support user agents.
+        """
+        del owner, project_id, limit, after
+        return PagedList(data=[], first_id=None, last_id=None, has_more=False)

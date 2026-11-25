@@ -1001,3 +1001,37 @@ def test_agent_updates_are_workspace_scoped(agent_store: SqlAlchemyAgentStore) -
     assert updated is not None and updated.version == 3
     with workspace_scope(42):
         assert agent_store.get(agent.id) == other
+
+
+def test_project_agents_list_by_project_and_stay_out_of_my_agents(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    """A role's agent belongs to its project; the owner's personal list never shows it."""
+    project, other_project = uuid.uuid4().hex, uuid.uuid4().hex
+    mine = _user_agent(agent_store, "orion")
+    created = []
+    for name in ("Reviewer", "PM", "Designer"):
+        agent_id = uuid.uuid4().hex
+        created.append(
+            agent_store.create_project_agent(
+                agent_id, name, f"{agent_id}/{_SHA}", owner=_OWNER, project_id=project
+            )
+        )
+    agent_id = uuid.uuid4().hex
+    agent_store.create_project_agent(
+        agent_id, "Elsewhere", f"{agent_id}/{_SHA}", owner=_OWNER, project_id=other_project
+    )
+
+    fetched = agent_store.get(created[0].id)
+    assert fetched is not None
+    assert (fetched.project_id, fetched.created_by, fetched.kind) == (project, _OWNER, "user")
+    assert not fetched.operator_authored
+    assert [a.id for a in agent_store.list_user_agents(_OWNER).data] == [mine.id]
+
+    page = agent_store.list_project_agents(_OWNER, project, limit=2)
+    assert (_names(page), page.has_more) == (["Designer", "PM"], True)
+    rest = agent_store.list_project_agents(_OWNER, project, limit=2, after=page.last_id)
+    assert (_names(rest), rest.has_more) == (["Reviewer"], False)
+    assert agent_store.list_project_agents("bob@example.com", project).data == []
+    with pytest.raises(StaleCursorError):
+        agent_store.list_project_agents(_OWNER, other_project, after=created[0].id)

@@ -30,4 +30,5 @@ def sql_agent_to_entity(row: SqlAgent, session_id: str | None = None) -> Agent:
         session_id=None if row.kind == AGENT_KIND["server"] else session_id,
         created_by=row.created_by,
         kind=decode_agent_kind(row.kind),
+        project_id=row.project_id,
     )
