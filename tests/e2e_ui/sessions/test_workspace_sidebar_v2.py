@@ -18,9 +18,11 @@ lists its shell, then shows its terminal.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -332,22 +334,35 @@ def test_a_new_strip_starts_on_the_settings_pinned_pages(
 def test_full_screen_chord_opens_the_sidebar_full_screen_and_leaves_it(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
-    """⇧⌘F fills the window with the workspace and leaves it again."""
+    """⇧⌘F opens a closed sidebar straight into full screen, and leaves it again."""
     base_url, session_id = workspace_session
     _set_flag(page, True)
     _open_session(page, base_url, session_id, "desktop")
     sidebar = page.get_by_role("complementary", name="Workspace")
-    full_screen = page.get_by_role("button", name=re.compile(r"full screen", re.IGNORECASE))
-    expect(page.locator("[data-maximized]")).to_have_count(0)
-    # The chord loads with the tabs sidebar's code, which the open sidebar has shown by now.
-    expect(full_screen).to_be_visible(timeout=60_000)
+    collapse = sidebar.get_by_role("button", name="Collapse right panel")
+    expect(collapse).to_be_visible(timeout=60_000)
+    collapse.click()
+    expect(sidebar).to_have_count(0)
+    # The session remembers the closed rail, so it reloads without the sidebar ever showing.
+    page.reload()
+    expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=60_000)
+    expect(sidebar).to_have_count(0)
 
-    page.keyboard.press("ControlOrMeta+Shift+F")
+    maximized = page.locator("[data-maximized]")
+    # The chord binds once its code loads, which the closed rail doesn't wait for.
+    deadline = time.monotonic() + 60
+    while maximized.count() == 0:
+        assert time.monotonic() < deadline, "⇧⌘F never opened the sidebar"
+        page.keyboard.press("ControlOrMeta+Shift+F")
+        with contextlib.suppress(AssertionError):
+            expect(maximized).to_have_count(1, timeout=1_000)
     expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    full_screen = page.get_by_role("button", name=re.compile(r"full screen", re.IGNORECASE))
     expect(full_screen).to_have_attribute("aria-pressed", "true")
 
     page.keyboard.press("ControlOrMeta+Shift+F")
     expect(full_screen).to_have_attribute("aria-pressed", "false")
+    expect(maximized).to_have_count(0)
 
 
 def test_files_menu_copies_the_path_and_a_link_to_the_file(
