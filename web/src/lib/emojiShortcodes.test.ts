@@ -15,10 +15,7 @@ describe("replaceEmojiShortcodes", () => {
     ["no shortcode", "a plain comment"],
     ["inline code", "use `:rocket:` literally"],
     ["fenced code", "```\nkey: :tada:\n```"],
-    ["a fence closed by a longer run", "```\n:rocket:\n````"],
     ["an unclosed fence", "```\n:rocket:"],
-    ["a tilde fence", "~~~\n:tada:\n~~~"],
-    ["CRLF fenced code", "```\r\n:tada:\r\n```"],
   ])("keeps %s as written", (_label, input) => {
     expect(replaceEmojiShortcodes(input)).toBe(input);
   });
@@ -33,7 +30,10 @@ describe("replaceEmojiShortcodes", () => {
       "```\n:rocket:\n``\n~~~\n:rocket:",
       "```\n:rocket:\n``\n~~~\n:rocket:",
     ],
-    ["a closed fence", "```\n:rocket:\n```\nafter :rocket:", "```\n:rocket:\n```\nafter 🚀"],
+    ["a closed fence", "```\n:rocket:\n```\nafter :tada:", "```\n:rocket:\n```\nafter 🎉"],
+    ["a longer closing run", "```\n:rocket:\n````\nafter :tada:", "```\n:rocket:\n````\nafter 🎉"],
+    ["a tilde fence", "~~~\n:rocket:\n~~~\nafter :tada:", "~~~\n:rocket:\n~~~\nafter 🎉"],
+    ["CRLF lines", "```\r\n:rocket:\r\n```\r\nafter :tada:", "```\r\n:rocket:\r\n```\r\nafter 🎉"],
     ["a backtick run with a backtick after it", "```a` :rocket:", "```a` 🚀"],
   ])("ends code only at a matching fence: %s", (_label, input, expected) => {
     expect(replaceEmojiShortcodes(input)).toBe(expected);
