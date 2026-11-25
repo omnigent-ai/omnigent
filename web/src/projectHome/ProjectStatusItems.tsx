@@ -80,17 +80,26 @@ export function ProjectStatusItemsDialog({
               : "What's behind this number."}
           </DialogDescription>
         </DialogHeader>
-        {items.isPending ? (
+        <TicketLoadError
+          error={items.error}
+          hasData={items.data !== undefined}
+          onRetry={() => void items.refetch()}
+        />
+        {items.data ? (
+          items.data.available ? (
+            <StatusItemsBody
+              items={items.data}
+              projectName={projectName}
+              memberNames={memberNames}
+            />
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              This server doesn&rsquo;t track the items behind this number.
+            </p>
+          )
+        ) : items.isPending ? (
           <Spinner aria-label="Loading items" />
-        ) : items.isError ? (
-          <TicketLoadError error={items.error} onRetry={() => void items.refetch()} />
-        ) : !items.data.available ? (
-          <p className="text-sm text-muted-foreground">
-            This server doesn&rsquo;t track the items behind this number.
-          </p>
-        ) : (
-          <StatusItemsBody items={items.data} projectName={projectName} memberNames={memberNames} />
-        )}
+        ) : null}
       </DialogContent>
     </Dialog>
   );

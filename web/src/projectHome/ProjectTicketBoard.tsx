@@ -26,7 +26,7 @@ import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { getCurrentUserId } from "@/lib/identity";
 import { requesterLabel, type ProjectTicket, type TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
-import { TicketError, TicketLabels, TicketLoadError } from "./TicketControls";
+import { shownLoadError, TicketError, TicketLabels, TicketLoadError } from "./TicketControls";
 import { TicketShipBlocker } from "./TicketShipBlocker";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import { TicketAgentIcons } from "./TicketAgentIcons";
@@ -135,8 +135,12 @@ function TicketBoard({
   const [search] = useSearchParams();
   const [selectionLimit, setSelectionLimit] = useState(25);
   const selected = useTicketSelection(projectId, ticketIds.slice(0, selectionLimit));
-  const selectedTickets = selected.flatMap((query) =>
-    query.data && !query.isError ? [query.data] : [],
+  // A restart keeps the tickets already shown; another failure drops them.
+  const selectionErrors = selected.map((query) =>
+    shownLoadError(query.error, query.data !== undefined),
+  );
+  const selectedTickets = selected.flatMap((query, index) =>
+    query.data && !selectionErrors[index] ? [query.data] : [],
   );
   const selectionPending = selected.some((query) => query.isPending);
   const unfilteredSearch = new URLSearchParams(search);
@@ -177,7 +181,7 @@ function TicketBoard({
           {selectionPending && (
             <Spinner aria-label="Loading selected tickets" className="size-3.5" />
           )}
-          <TicketError error={selected.find((query) => query.isError)?.error ?? null} />
+          <TicketError error={selectionErrors.find(Boolean) ?? null} />
           {selectionLimit < ticketIds.length && (
             <Button
               variant="ghost"
@@ -194,11 +198,12 @@ function TicketBoard({
           <TicketBoardRequesterFilter mine={mine} onChange={setMine} />
         </div>
       )}
-      {(update.error || configuration.error) && (
+      {(update.error || shownLoadError(configuration.error, configuration.data !== undefined)) && (
         <div className="flex shrink-0 flex-col gap-2 px-4 pt-3 pb-2">
-          <TicketLoadError error={update.error} />
+          <TicketLoadError error={update.error} action />
           <TicketLoadError
             error={configuration.error}
+            hasData={configuration.data !== undefined}
             onRetry={() => void configuration.refetch()}
           />
         </div>
@@ -308,7 +313,10 @@ function TicketColumn({
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
   const [collapsedPreference, toggleCollapsed] = useStageCollapsed(projectId, stage);
   const collapsed = collapsedPreference && !filteredTickets?.length;
-  const loadError = filteredTickets === undefined && query.isError ? query.error : null;
+  const loadError =
+    filteredTickets === undefined && query.isError
+      ? shownLoadError(query.error, query.data !== undefined)
+      : null;
   if (collapsed) {
     return (
       <section
@@ -393,6 +401,7 @@ function TicketColumn({
         ) : null}
         <TicketLoadError
           error={filteredTickets === undefined ? query.error : null}
+          hasData={query.data !== undefined}
           onRetry={() => void query.refetch()}
         />
         {tickets.map((ticket) => (
@@ -408,7 +417,8 @@ function TicketColumn({
           />
         ))}
         {!selectionPending &&
-          (filteredTickets !== undefined || (!query.isError && (!projectId || query.isSuccess))) &&
+          (filteredTickets !== undefined ||
+            (!loadError && (!projectId || query.data !== undefined))) &&
           tickets.length === 0 && (
             <p className="px-2 py-4 text-sm text-muted-foreground">No tickets</p>
           )}

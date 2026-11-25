@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { getCurrentUserId } from "@/lib/identity";
@@ -202,24 +203,50 @@ export function TicketError({ error }: { error: Error | null }) {
   ) : null;
 }
 
+/** Hides a restart's failure while earlier data is still on screen; the banner covers it. */
+export function shownLoadError(error: Error | null, hasData: boolean): Error | null {
+  return error && hasData && isServerRestartError(error) ? null : error;
+}
+
 /**
- * A calm notice for a view that failed to load. A restart reads as neutral,
- * since the app is coming back; other failures get a soft red.
+ * A calm notice for a view that failed to load. During a restart a background
+ * load shows nothing over earlier data, or a quiet wait when there is none; the
+ * banner says why and refetches once the app is back. A failed *action* still
+ * shows its message. Other failures get a soft red.
  */
 export function TicketLoadError({
   error,
   message,
   onRetry,
   className,
+  hasData = false,
+  action = false,
 }: {
   error: Error | null;
   /** Shown instead of the error's own message. */
   message?: string;
   onRetry?: () => void;
   className?: string;
+  /** The view still shows earlier data. */
+  hasData?: boolean;
+  /** The error came from something the user just did, such as a save. */
+  action?: boolean;
 }) {
   if (!error) return null;
   const restarting = isServerRestartError(error);
+  if (restarting && !action) {
+    if (hasData) return null;
+    return (
+      <div
+        role="status"
+        data-tone="restart"
+        className={cn("flex items-center gap-2 py-2 text-sm text-muted-foreground", className)}
+      >
+        <Spinner aria-hidden className="size-3.5" />
+        Waiting for Omnigent to come back…
+      </div>
+    );
+  }
   const Icon = restarting ? RefreshCwIcon : CircleAlertIcon;
   return (
     <div

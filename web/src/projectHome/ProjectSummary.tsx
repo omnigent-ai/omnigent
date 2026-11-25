@@ -1,6 +1,12 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { AlignLeftIcon, ArrowDownIcon, ArrowUpIcon, PencilIcon, SquareKanbanIcon } from "lucide-react";
+import {
+  AlignLeftIcon,
+  ArrowDownIcon,
+  ArrowUpIcon,
+  PencilIcon,
+  SquareKanbanIcon,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -55,11 +61,12 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
           <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Status</h2>
           <WindowPicker value={statusWindow} onChange={setStatusWindow} />
         </div>
-        {summary.isPending ? (
-          <Spinner aria-label="Loading summary" />
-        ) : summary.isError ? (
-          <TicketLoadError error={summary.error} onRetry={() => void summary.refetch()} />
-        ) : (
+        <TicketLoadError
+          error={summary.error}
+          hasData={summary.data !== undefined}
+          onRetry={() => void summary.refetch()}
+        />
+        {summary.data ? (
           <>
             <HeadlineNumbers summary={summary.data} onDrill={setDrilldown} />
             <p className="text-xs text-muted-foreground">
@@ -68,21 +75,23 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
                 : `All time to ${summary.data.today_utc}, UTC`}
             </p>
           </>
-        )}
+        ) : summary.isPending ? (
+          <Spinner aria-label="Loading summary" />
+        ) : null}
       </section>
       <ProjectKpiTiles projectId={projectId} onDrill={setDrilldown} />
       <section aria-label="Members" className="space-y-3">
         <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Members</h2>
-        {summary.isPending ? (
-          <Spinner aria-label="Loading members" />
-        ) : summary.isError ? (
-          <p className="text-sm text-muted-foreground">Members are unavailable right now.</p>
-        ) : (
+        {summary.data ? (
           <MembersTable
             members={summary.data.members}
             statusWindow={statusWindow}
             onDrill={setDrilldown}
           />
+        ) : summary.isPending ? (
+          <Spinner aria-label="Loading members" />
+        ) : (
+          <p className="text-sm text-muted-foreground">Members are unavailable right now.</p>
         )}
       </section>
       {drilldown && (

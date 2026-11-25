@@ -160,18 +160,30 @@ describe("ProjectSummary", () => {
     expect(await screen.findByText("$12.34")).toBeTruthy();
   });
 
-  it("shows a restart as a calm notice, and a real failure in soft red", async () => {
+  it("waits quietly through a restart and shows a real failure in soft red", async () => {
     vi.mocked(statusApi.getProjectStatusSummary).mockRejectedValue(
       new TypeError("Failed to fetch"),
     );
     renderSummary();
-    const notice = await screen.findByRole("alert");
-    expect(notice.dataset.tone).toBe("restart");
-    expect(within(notice).getByRole("button", { name: "Try again" })).toBeTruthy();
+    expect(await screen.findByText("Waiting for Omnigent to come back…")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
     cleanup();
     vi.mocked(statusApi.getProjectStatusSummary).mockRejectedValue(new Error("Server is down"));
     renderSummary();
     expect((await screen.findByRole("alert")).dataset.tone).toBe("error");
+  });
+
+  it("keeps loaded numbers on screen when a refetch hits a restart", async () => {
+    renderSummary();
+    expect(await screen.findByText("$12.34")).toBeTruthy();
+    vi.mocked(statusApi.getProjectStatusSummary).mockRejectedValue(
+      new TypeError("Failed to fetch"),
+    );
+    await clients.at(-1)!.refetchQueries();
+    expect(screen.getByText("$12.34")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("Waiting for Omnigent to come back…")).toBeNull();
   });
 
   it("marks a metric without a source as not tracked, not zero", async () => {

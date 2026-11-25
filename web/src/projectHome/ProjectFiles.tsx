@@ -38,7 +38,7 @@ export function ProjectFiles({ projectId }: { projectId: string | null }) {
           <div className="flex justify-center p-4">
             <Spinner />
           </div>
-        ) : files.error ? (
+        ) : files.error && !files.data ? (
           <TicketLoadError error={files.error} className="m-3" />
         ) : files.data?.length ? (
           <ul className="max-h-96 divide-y divide-border/60 overflow-y-auto">
