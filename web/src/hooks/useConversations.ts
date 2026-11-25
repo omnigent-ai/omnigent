@@ -2128,12 +2128,13 @@ function overlayFamilyIntoCaches(
         }
       : old,
   );
-  const headOverlay = { family, ...(headLabels ? { labels: headLabels } : {}) };
-  queryClient.setQueryData<Conversation | null>(["conversation-backfill", headId], (old) =>
-    old ? { ...old, ...headOverlay } : old,
-  );
+  for (const [key, row] of queryClient.getQueriesData<Conversation | null>({
+    queryKey: ["conversation-backfill"],
+  })) {
+    if (row?.family?.id === family.id) queryClient.setQueryData(key, { ...row, ...overlay(row) });
+  }
   queryClient.setQueryData<Session>(["session", headId], (old) =>
-    old ? { ...old, ...headOverlay } : old,
+    old ? { ...old, family, ...(headLabels ? { labels: headLabels } : {}) } : old,
   );
 }
 
@@ -2147,30 +2148,29 @@ function unpinFamilyInCaches(
   headLabels: Record<string, string>,
   family: SessionFamily,
 ) {
-  const head = findCachedConversationRow(queryClient, headId);
   const unpinned = { ...family, pinned: false, pinned_at: null };
+  const leavesPinned = (row: Conversation) =>
+    row.family?.id === family.id && (row.id === headId || row.labels?.[PINNED_LABEL_KEY] == null);
+  const listedOnlyAsPinned =
+    queryClient
+      .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+      ?.conversations.filter(
+        (row) => leavesPinned(row) && !findCachedListRow(queryClient, row.id),
+      ) ?? [];
   overlayFamilyIntoCaches(queryClient, unpinned, headId, headLabels);
-  // An open head that only the Pinned section listed is fetched once it leaves;
-  // seed that row so a fetch before the write commits can't restore the pin.
-  const backfillKey = ["conversation-backfill", headId];
-  if (head && queryClient.getQueryData(backfillKey) === undefined) {
-    queryClient.setQueryData<Conversation>(backfillKey, {
-      ...head,
-      labels: headLabels,
+  // An open session the Pinned section alone listed is fetched once it leaves;
+  // seed its row so a fetch before the write commits can't restore the pin.
+  for (const row of listedOnlyAsPinned) {
+    const key = ["conversation-backfill", row.id];
+    if (queryClient.getQueryData(key) !== undefined) continue;
+    queryClient.setQueryData<Conversation>(key, {
+      ...row,
       family: unpinned,
+      ...(row.id === headId ? { labels: headLabels } : {}),
     });
   }
   queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
-    old
-      ? {
-          ...old,
-          conversations: old.conversations.filter(
-            (row) =>
-              row.family?.id !== family.id ||
-              (row.id !== headId && row.labels?.[PINNED_LABEL_KEY] != null),
-          ),
-        }
-      : old,
+    old ? { ...old, conversations: old.conversations.filter((row) => !leavesPinned(row)) } : old,
   );
 }
 
