@@ -18,6 +18,7 @@ are in the component tests (``useTerminalPaneHotkeys``, ``terminalPaneActions``,
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterator
 
@@ -323,3 +324,15 @@ def test_a_split_resizes_through_a_whole_drag(
         assert ends[1] != "pointerup:Resize terminal panes", ends
     expect(divider).not_to_have_attribute("aria-valuenow", "50")
     assert unsaved == []
+    # The release saved the size, rather than leaving a preview: the session's stored split
+    # holds the ratio the divider shows.
+    saved = page.wait_for_function(
+        """id => {
+            const stored = JSON.parse(localStorage.getItem("omnigent:pane-splits") ?? "{}");
+            const ratio = stored.sessions?.[id]?.layout?.ratio;
+            return typeof ratio === "number" && ratio !== 0.5 ? ratio : null;
+        }""",
+        arg=session_id,
+    ).json_value()
+    # As the divider rounds it: Math.round, halves up.
+    expect(divider).to_have_attribute("aria-valuenow", str(math.floor(saved * 100 + 0.5)))
