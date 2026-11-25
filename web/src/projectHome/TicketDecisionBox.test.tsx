@@ -126,6 +126,15 @@ describe("decisionOptions", () => {
     expect(decisionOptions("A. Done the export.\nB. Done the import.")).toEqual([]);
   });
 
+  it("keeps a numbered plan in the stem beside lettered choices", () => {
+    const mixed =
+      "Plan:\n1. Build the table\n2. Backfill\n\nWhich rollout?\nA. All at once\nB. Behind a flag";
+    expect(labels(mixed)).toEqual(["A. All at once", "B. Behind a flag"]);
+    expect(questionStem(mixed, true)).toBe(
+      "Plan:\n1. Build the table\n2. Backfill\n\nWhich rollout?",
+    );
+  });
+
   it("shows only the question's stem once its choices are buttons", () => {
     expect(questionStem(QUESTION, true)).toBe(
       "Should human reviewers get a note when there's no new data that week?",

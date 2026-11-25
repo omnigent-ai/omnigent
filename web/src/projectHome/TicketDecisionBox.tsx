@@ -66,46 +66,59 @@ const REPLY_WITH_NUMBER = /\b(?:reply|answer|respond|pick|choose)\b[^\n]*\b\d\b/
  * ever guessed.
  */
 export function decisionOptions(question: string): DecisionOption[] {
+  return decisionChoices(question).options;
+}
+
+/** The buttons a question offers, and the lines of the ask they were read from. */
+function decisionChoices(question: string): { options: DecisionOption[]; lines: string[] } {
   const asks = question.includes("?") || REPLY_WITH_NUMBER.test(question);
   const pick = (pattern: RegExp, marker: (key: string) => string) => {
     const seen = new Set<string>();
-    return [...question.matchAll(pattern)]
-      .map(([, key = "", text = ""]) => splitOption(marker(key), text))
-      .filter((option) => !seen.has(option.label) && seen.add(option.label));
+    const options: DecisionOption[] = [];
+    const lines: string[] = [];
+    for (const [line, key = "", text = ""] of question.matchAll(pattern)) {
+      const option = splitOption(marker(key), text);
+      lines.push(line);
+      if (seen.has(option.label)) continue;
+      seen.add(option.label);
+      options.push(option);
+    }
+    return { options, lines };
   };
   if (asks) {
-    for (const options of [
+    for (const choices of [
       pick(NAMED, (key) => `Option ${key.toUpperCase()}:`),
       pick(LETTERED, (key) => `${key.toUpperCase()}.`),
-      REPLY_WITH_NUMBER.test(question) ? pick(NUMBERED, (key) => `${key}.`) : [],
+      REPLY_WITH_NUMBER.test(question) ? pick(NUMBERED, (key) => `${key}.`) : null,
     ])
-      if (options.length >= 2) return options;
+      if (choices && choices.options.length >= 2) return choices;
   }
   if (/\byes\s*(?:or|\/)\s*no\b/i.test(question))
-    return [
-      { label: "Yes", detail: "" },
-      { label: "No", detail: "" },
-    ];
-  return [];
+    return {
+      options: [
+        { label: "Yes", detail: "" },
+        { label: "No", detail: "" },
+      ],
+      lines: [],
+    };
+  return { options: [], lines: [] };
 }
 
 /**
  * The question to show: its text without embedded media. When the choices became
- * buttons, their lines and a "Reply with 1 or 2" line are left out; each button keeps
- * its option's full text, and "See the full ask" still shows every detail.
+ * buttons, the lines they came from and a "Reply with 1 or 2" line are left out; other
+ * lists, such as a numbered plan beside lettered choices, stay. Each button keeps its
+ * option's full text, and "See the full ask" still shows every detail.
  */
 export function questionStem(question: string, hasOptions: boolean): string {
   const text = splitTicketImages(question)
     .map((segment) => (segment.kind === "markdown" ? segment.text : ""))
     .join("\n");
   if (!hasOptions) return text.trim();
-  const optionLine = (line: string) =>
-    new RegExp(LETTERED.source, "m").test(line) ||
-    new RegExp(NAMED.source, "im").test(line) ||
-    new RegExp(NUMBERED.source, "m").test(line);
+  const optionLines = new Set(decisionChoices(text).lines.map((line) => line.trim()));
   return text
     .split("\n")
-    .filter((line) => !optionLine(line) && !/^\s*reply with\b/i.test(line))
+    .filter((line) => !optionLines.has(line.trim()) && !/^\s*reply with\b/i.test(line))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
