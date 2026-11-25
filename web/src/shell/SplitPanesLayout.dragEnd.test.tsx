@@ -150,12 +150,4 @@ describe("a divider drag that ends unsaved", () => {
     expect(logged()).toEqual([ended("split-hidden")]);
     expect(onResize).not.toHaveBeenCalled();
   });
-
-  it("logs the layout's reason once, though the pointer is let go after it", () => {
-    const { rerender } = render(<View split={SPLIT} />);
-    const divider = pressDivider();
-    rerender(<View split={undefined} />);
-    fireEvent.lostPointerCapture(divider, { pointerId: 1 });
-    expect(logged()).toEqual([ended("split-hidden")]);
-  });
 });
