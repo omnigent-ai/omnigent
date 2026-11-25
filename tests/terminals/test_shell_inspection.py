@@ -474,17 +474,41 @@ async def test_a_slow_tmux_is_unknown_within_the_budget() -> None:
     assert time.monotonic() - started < INSPECTION_TIMEOUT_SECONDS + 1
 
 
+class _EndlessProcess:
+    """A subprocess whose output passes the cap and never ends, until it is killed."""
+
+    def __init__(self) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(b"x" * (shell_inspection._MAX_OUTPUT_BYTES + 1))
+        self.returncode: int | None = None
+        self.killed = asyncio.Event()
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self.killed.set()
+
+    async def wait(self) -> int:
+        await self.killed.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+
 @pytest.mark.asyncio
-async def test_output_past_the_cap_stops_the_read_without_waiting_for_the_rest() -> None:
-    # 12 MiB, then a pause: the read gives up at the cap instead of buffering all of it.
-    flood = [
-        sys.executable,
-        "-I",
-        "-c",
-        "import sys, time; sys.stdout.write('x' * (12 << 20)); sys.stdout.flush(); time.sleep(30)",
-    ]
+async def test_output_past_the_cap_stops_the_read_without_waiting_for_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _EndlessProcess()
+
+    async def start(*argv: str, **options: object) -> _EndlessProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    # The output never ends, so the read can only finish by giving up at the cap; the bound
+    # only stops a regression that waits for the rest from hanging the run.
     with pytest.raises(shell_inspection._CommandFailed):
-        await asyncio.wait_for(shell_inspection._run(flood, os.environ["PATH"]), 10)
+        await asyncio.wait_for(shell_inspection._run(["ps"], "/usr/bin"), 60)
+    assert process.killed.is_set()
+    assert not process.stdout.at_eof()
 
 
 class _Clock:
