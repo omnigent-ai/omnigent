@@ -876,6 +876,74 @@ async def test_managed_session_create_rejects_a_taken_host_id(
     assert env.conv_store.list_conversations(limit=100) == sessions_before
 
 
+@pytest.mark.parametrize(
+    ("sharded", "slice_key", "keyed"),
+    [
+        (True, "f00dfeedf00dfeedf00dfeedf00dfeed", True),
+        (True, None, False),
+        (False, "f00dfeedf00dfeedf00dfeedf00dfeed", False),
+    ],
+)
+async def test_managed_create_without_host_id_keys_the_host_for_a_keyed_sharded_request(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    sharded: bool,
+    slice_key: str | None,
+    keyed: bool,
+) -> None:
+    """
+    A keyed create that names no host id gets one minted on a host-sharded
+    server, so its host keys by it instead of joining the default replica.
+    A keyless create keeps an unkeyed host, the only one its requests reach.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch
+
+    env = managed_session_env
+    monkeypatch.setattr(_host_launch, "_host_sharded", sharded)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+    agent = await create_test_agent(env.client, name="managed-keyed-create-agent")
+
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+        headers={OMNIGENT_SLICE_KEY_HEADER: slice_key} if slice_key else {},
+    )
+
+    assert resp.status_code == 201, resp.text
+    conv = await _wait_for_managed_binding(env, resp.json()["id"])
+    tunnels = [await future for future in host_futures]
+    label = conv.labels.get(REQUESTED_HOST_ID_LABEL_KEY)
+    slice_key_config = render_host_config_write_command({"host": {"slice_key_enabled": True}})
+    if keyed:
+        assert label == conv.host_id
+        assert label != slice_key
+        assert fake.host_starts[0].host_id == conv.host_id
+        assert fake.commands.count(slice_key_config) == 1
+    else:
+        assert label is None
+        assert fake.commands.count(slice_key_config) == 0
+    del tunnels
+
+
 @pytest.mark.parametrize("requested_host_id", [None, "0123456789abcdef0123456789abcdef"])
 async def test_managed_multipart_bundle_create_end_to_end(
     managed_session_env: ManagedSessionEnv,
@@ -2077,6 +2145,52 @@ async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
         "feature/x",
         None,
     )
+    assert env.app.state.managed_launches.get(session_id) is None
+
+
+async def test_keyed_move_failing_at_detach_leaves_no_requested_host_id(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A keyed move that names no host id and fails while detaching the old host
+    rolls back without a requested host id, so routing keeps to the old host.
+
+    Clients route a host-less session by that label, so one left behind would
+    steer them to a sandbox host that never launched.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch
+
+    env = managed_session_env
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+    session_id = await _session_released_from_laptop(env, agent_name="keyed-move-detach-agent")
+    clear_host_binding = env.conv_store.clear_host_binding
+
+    def failing_detach(conversation_id: str, **kwargs: Any) -> Conversation:
+        if kwargs.get("keep_runner"):
+            raise RuntimeError("detach failed")
+        return clear_host_binding(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "clear_host_binding", failing_detach)
+
+    with pytest.raises(RuntimeError, match="detach failed"):
+        await env.client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={OMNIGENT_SLICE_KEY_HEADER: _LAPTOP_HOST_ID},
+        )
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.workspace, conv.git_branch, conv.runner_id) == (
+        _LAPTOP_HOST_ID,
+        "/Users/alice/repo",
+        "feature/x",
+        None,
+    )
+    assert REQUESTED_HOST_ID_LABEL_KEY not in conv.labels
     assert env.app.state.managed_launches.get(session_id) is None
 
 
