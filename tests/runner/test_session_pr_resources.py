@@ -993,36 +993,6 @@ def test_a_failed_shared_read_reaches_every_waiting_poll_and_the_next_poll_retri
     assert len(reads_started) == 2
 
 
-def test_a_panel_write_by_another_process_makes_the_next_poll_read_again(
-    tracked: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The host serves edits while the runner is offline; the runner must not undo them."""
-    views: list[list[str]] = []
-
-    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        if _is_panel_view(args):
-            views.append(args)
-        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
-
-    monkeypatch.setattr(github, "_gh", gh)
-    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
-    poll = functools.partial(
-        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
-    )
-    poll()
-    poll()
-    assert len(views) == 1
-    # Another process, such as the host, records its write without touching this one's count.
-    SessionPrRegistry("session").note_panel_write()
-    poll()
-    assert len(views) == 2
-    # This process's writes record the marker for the other processes too.
-    marker = SessionPrRegistry("session").panel_write_marker()
-    with suppress(ValueError, KeyError):
-        pr_resource.create_pr_comment(tracked, session_id="session", pr_url=B, body="Done")
-    assert SessionPrRegistry("session").panel_write_marker() not in (None, marker)
-
-
 def test_panel_writes_and_new_tracked_prs_make_the_next_poll_read_again(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1115,32 +1085,10 @@ def test_a_failed_registry_check_after_a_read_lets_the_next_poll_read_again(
     assert len(views) == 2
 
 
-def test_an_unreadable_panel_write_marker_makes_every_poll_read_the_forge(
-    tracked: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    views: list[list[str]] = []
-
-    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        if _is_panel_view(args):
-            views.append(args)
-        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
-
-    monkeypatch.setattr(github, "_gh", gh)
-    registry = SessionPrRegistry("session")
-    registry.update_titles({A: "Listed", B: "Selected"})
-    registry.path.with_suffix(".panel-writes").write_bytes(b"\xff\xfe not a marker")
-    poll = functools.partial(
-        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
-    )
-    assert poll()["pr"]["title"] == "Selected"
-    assert poll()["pr"]["title"] == "Selected"
-    assert len(views) == 2
-
-
 async def test_a_reconnected_runner_reads_the_forge_after_an_edit_it_could_not_see(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The host serves panel edits while this runner is offline, even if it can't record them."""
+    """The host serves panel edits while this runner is offline, so reconnecting drops older reads."""
     from omnigent.runner._entry import _on_tunnel_reconnect
 
     views: list[list[str]] = []
@@ -1158,7 +1106,7 @@ async def test_a_reconnected_runner_reads_the_forge_after_an_edit_it_could_not_s
     poll()
     poll()
     assert len(views) == 1
-    # The host's edit left the marker unchanged, as when it can't be written.
+    # The host served an edit that this process never saw.
     caught_up: list[bool] = []
 
     async def catch_up_scan() -> None:
@@ -1169,16 +1117,6 @@ async def test_a_reconnected_runner_reads_the_forge_after_an_edit_it_could_not_s
     assert len(views) == 2
     assert caught_up == [True]
     await _on_tunnel_reconnect(None)()
-
-
-def test_a_read_only_panel_write_marker_is_still_replaced(tracked: str) -> None:
-    registry = SessionPrRegistry("session")
-    registry.note_panel_write()
-    before = registry.panel_write_marker()
-    marker = registry.path.with_suffix(".panel-writes")
-    marker.chmod(0o444)
-    registry.note_panel_write()
-    assert registry.panel_write_marker() not in (None, before)
 
 
 def test_a_read_without_allow_cached_reads_the_forge_even_while_a_poll_runs(
@@ -1325,6 +1263,8 @@ async def test_a_poll_reads_the_forge_after_another_process_writes_through_the_p
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The host serves panel edits while the runner is offline, in its own process."""
+    from omnigent.runner._entry import _on_tunnel_reconnect
+
     views: list[list[str]] = []
 
     def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -1353,6 +1293,8 @@ async def test_a_poll_reads_the_forge_after_another_process_writes_through_the_p
             timeout=budget(60),
         )
         reads_before = len(views)
+        # The runner was offline while the host served the edit, so it reconnects first.
+        await _on_tunnel_reconnect(None)()
         after = await client.get(path, params=poll)
     assert other_process.returncode == 0, other_process.stderr
     assert after.status_code == 200, after.text
