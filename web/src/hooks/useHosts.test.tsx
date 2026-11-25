@@ -371,6 +371,45 @@ describe("useHosts", () => {
     expect(result.current.all.data?.map((h) => h.host_id)).toEqual(["host_sandbox", "host_laptop"]);
   });
 
+  it("polls /v1/hosts once for filtered and unfiltered consumers", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    fetchMock.mockImplementation(async () =>
+      mockResponse({
+        hosts: [
+          {
+            host_id: "host_sandbox",
+            name: "managed-abc123",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: "lakebox",
+          },
+        ],
+      }),
+    );
+    try {
+      const { result } = renderHook(
+        () => ({
+          filtered: useHosts(),
+          sourced: useHosts({ sourceHostId: "host_sandbox" }),
+          all: useHosts({ includeSandbox: true }),
+        }),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.all.isSuccess).toBe(true));
+      expect(result.current.filtered.data).toEqual([]);
+      expect(result.current.sourced.data?.map((h) => h.host_id)).toEqual(["host_sandbox"]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // One 60 s poll tick refetches the shared list once.
+      await act(async () => vi.advanceTimersByTimeAsync(60_000));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      await act(async () => vi.advanceTimersByTimeAsync(1_000));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("refetches on window focus so a missed readiness push recovers on tab return", async () => {
     // The common `omni setup` flow is: open the setup dialog, alt-tab to a
     // terminal to run the command, then tab back. If the hosts_changed WS push

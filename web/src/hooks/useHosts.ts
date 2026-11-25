@@ -5,7 +5,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
@@ -78,14 +78,17 @@ export async function fetchHosts(
   const res = await authenticatedFetch("/v1/hosts", signal ? { signal } : undefined);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
-  // Hide server-managed sandbox hosts from every host picker: they
-  // are launch targets the server creates on demand (and relaunches
-  // at will), not user-connectable machines, so offering them as
-  // manual targets is misleading. Hosts from older servers lack the
-  // field and are kept. `includeSandbox` opts a caller (the chat-header
-  // HostBadge) back into seeing them so it can label sandbox sessions.
-  if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider || h.host_id === sourceHostId);
+  return includeSandbox ? body.hosts : withoutSandboxHosts(body.hosts, sourceHostId);
+}
+
+// Hide server-managed sandbox hosts from every host picker: they
+// are launch targets the server creates on demand (and relaunches
+// at will), not user-connectable machines, so offering them as
+// manual targets is misleading. Hosts from older servers lack the
+// field and are kept. `includeSandbox` opts a caller (the chat-header
+// HostBadge) back into seeing them so it can label sandbox sessions.
+function withoutSandboxHosts(hosts: Host[], sourceHostId?: string | null): Host[] {
+  return hosts.filter((h) => !h.sandbox_provider || h.host_id === sourceHostId);
 }
 
 interface UseHostsOptions {
@@ -103,12 +106,17 @@ export function useHosts(options: UseHostsOptions = {}) {
   const enabled = options.enabled ?? true;
   const includeSandbox = options.includeSandbox ?? false;
   const refetchOnFocus = options.refetchOnFocus ?? false;
+  const sourceHostId = options.sourceHostId;
+  const select = useCallback(
+    (hosts: Host[]) => withoutSandboxHosts(hosts, sourceHostId),
+    [sourceHostId],
+  );
   return useQuery({
-    // Distinct cache key per filtering mode so the picker's filtered
-    // list and the header's unfiltered list don't overwrite each other.
-    // A bare ["hosts"] invalidation still prefix-matches both.
-    queryKey: ["hosts", { includeSandbox, sourceHostId: options.sourceHostId }],
-    queryFn: () => fetchHosts(includeSandbox, options.sourceHostId),
+    // Every consumer shares the one unfiltered list, so a page mixing pickers
+    // and badges polls /v1/hosts once; pickers filter it in `select`.
+    queryKey: ["hosts", { includeSandbox: true }],
+    queryFn: () => fetchHosts(true),
+    select: includeSandbox ? undefined : select,
     enabled,
     // Readiness is pushed live via WS (hosts_changed → invalidate in
     // SessionUpdatesProvider), so the badge normally clears within seconds of
