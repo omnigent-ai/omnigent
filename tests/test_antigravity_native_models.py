@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import textwrap
+import time
+from pathlib import Path
 
 import pytest
 
@@ -80,17 +84,14 @@ def test_list_agy_cli_model_options_invokes_resolved_binary(
         captured.update(kwargs)
         return subprocess.CompletedProcess(argv, 0, stdout="model-a\tModel A\n", stderr="")
 
-    monkeypatch.setattr(models.subprocess, "run", _run)
+    monkeypatch.setattr(models, "_run_discovery", _run)
 
     assert models.list_agy_cli_model_options(env={"PATH": "/bin"}, timeout_s=3.5) == [
         {"id": "model-a", "displayName": "Model A", "isDefault": False}
     ]
     assert captured == {
         "argv": ["/opt/agy", "models"],
-        "check": True,
-        "capture_output": True,
-        "text": True,
-        "timeout": 3.5,
+        "timeout_s": 3.5,
         "env": {"PATH": "/bin"},
     }
 
@@ -110,7 +111,7 @@ def test_list_agy_cli_model_options_maps_missing_binary_to_os_error(
 
 
 def _capture_agy_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
-    """Stub the agy binary and record the discovery ``subprocess.run`` call."""
+    """Stub the agy binary and record the discovery command call."""
     captured: dict[str, object] = {}
     monkeypatch.setattr(models, "agy_binary_path", lambda: "/opt/agy")
 
@@ -119,7 +120,7 @@ def _capture_agy_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         captured.update(kwargs)
         return subprocess.CompletedProcess(argv, 0, stdout="model-a\tModel A\n", stderr="")
 
-    monkeypatch.setattr(models.subprocess, "run", _run)
+    monkeypatch.setattr(models, "_run_discovery", _run)
     return captured
 
 
@@ -159,7 +160,7 @@ def test_list_agy_cli_model_options_routes_databricks_profile_through_gateway(
     env = captured["env"]
     assert isinstance(env, dict)
     assert "OMNIGENT_AGY_DATABRICKS_PROFILE" not in env
-    assert captured["timeout"] == 30.0
+    assert captured["timeout_s"] == models._DISCOVERY_TIMEOUT_S
 
 
 def test_list_agy_cli_model_options_reports_credential_repair_without_details(
@@ -176,3 +177,93 @@ def test_list_agy_cli_model_options_reports_credential_repair_without_details(
     with pytest.raises(ValueError, match="run omni setup") as raised:
         models.list_agy_cli_model_options()
     assert "detail from the saved config" not in str(raised.value)
+
+
+def test_discovery_timeout_fits_the_host_model_options_deadline() -> None:
+    """Discovery plus its termination grace ends before the host request expires."""
+    from omnigent.server.routes import hosts
+
+    budget = models._DISCOVERY_TIMEOUT_S + models._TERMINATE_GRACE_S
+    assert budget + 2.0 <= hosts._MODEL_OPTIONS_TIMEOUT_S
+
+
+@pytest.mark.parametrize("timeout_s", [3.5, None], ids=["explicit", "default"])
+def test_gateway_discovery_never_raises_the_caller_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeout_s: float | None
+) -> None:
+    """The Databricks route keeps the caller's (or default) discovery budget."""
+    monkeypatch.setattr(
+        agy_credentials,
+        "resolve_antigravity_credentials",
+        lambda: agy_credentials.AntigravityCredentials(
+            "omnigent-adapter-pending", "https://workspace.example", profile="team"
+        ),
+    )
+    captured = _capture_agy_run(monkeypatch)
+
+    if timeout_s is None:
+        models.list_agy_cli_model_options()
+    else:
+        models.list_agy_cli_model_options(timeout_s=timeout_s)
+
+    assert captured["timeout_s"] == (timeout_s or models._DISCOVERY_TIMEOUT_S)
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether *pid* is a live (non-zombie) process."""
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.parent.parent.is_dir() and Path("/proc/self").exists():
+        try:
+            return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        except FileNotFoundError:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_discovery_timeout_removes_the_wrapped_process_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timed-out wrapper and the agy it started both stop, even ignoring SIGTERM."""
+    monkeypatch.setattr(models, "_TERMINATE_GRACE_S", 0.2)
+    pid_file = tmp_path / "child.pid"
+    wrapper = tmp_path / "wrapper.py"
+    wrapper.write_text(
+        textwrap.dedent(
+            f"""
+            import pathlib, signal, subprocess, sys, time
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            stubborn = "import signal, time; signal.signal(15, signal.SIG_IGN); time.sleep(60)"
+            child = subprocess.Popen([sys.executable, "-c", stubborn])
+            pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))
+            time.sleep(60)
+            """
+        )
+    )
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        models._run_discovery([sys.executable, str(wrapper)], env=None, timeout_s=1.0)
+    assert time.monotonic() - started < 10
+
+    child_pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while _process_alive(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _process_alive(child_pid)
+
+
+def test_discovery_reports_a_failed_command() -> None:
+    """A non-zero exit surfaces as ``CalledProcessError`` with its output."""
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        models._run_discovery(
+            [sys.executable, "-c", "import sys; print('out'); sys.exit(3)"],
+            env=None,
+            timeout_s=10,
+        )
+    assert raised.value.returncode == 3
+    assert raised.value.output == "out\n"

@@ -97,7 +97,7 @@ def test_saved_gateway_drives_model_discovery_and_catalog_provider(
         captured["env"] = kwargs["env"]
         return subprocess.CompletedProcess(argv, 0, stdout="gemini-x\tGemini X\n", stderr="")
 
-    monkeypatch.setattr(models.subprocess, "run", _run)
+    monkeypatch.setattr(models, "_run_discovery", _run)
 
     assert [row["id"] for row in models.list_agy_cli_model_options()] == ["gemini-x"]
     assert captured["argv"] == ["/test/agy", "models"]

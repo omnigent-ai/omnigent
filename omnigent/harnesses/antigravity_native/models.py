@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from collections.abc import Mapping
 from typing import TypedDict
@@ -10,9 +11,11 @@ from typing import TypedDict
 from omnigent.errors import OmnigentError
 from omnigent.harnesses.antigravity_native.launch import agy_binary_path
 
-# Discovery through the Databricks gateway also resolves a token and the
-# workspace's Gemini services before agy lists its models.
-_GATEWAY_DISCOVERY_TIMEOUT_S = 30.0
+# Discovery must finish inside the host model-options request deadline (15s),
+# including the termination grace below, or the result is lost to a 504.
+_DISCOVERY_TIMEOUT_S = 10.0
+# Time a timed-out discovery tree gets to exit after SIGTERM before SIGKILL.
+_TERMINATE_GRACE_S = 2.0
 
 # Orchestrator slugs carry a label (e.g. "Orchestrator (Carbon)") that does not
 # identify the planner model they run, so they are left out of the catalog.
@@ -93,10 +96,61 @@ def _launch_credential_environment() -> dict[str, str]:
     return credentials.environment() if credentials is not None else {}
 
 
+def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
+    """Signal *process* and everything it spawned, falling back to the process."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(process.pid, sig)
+        else:
+            process.send_signal(sig)
+    except ProcessLookupError:
+        pass
+
+
+def _run_discovery(
+    argv: list[str], *, env: dict[str, str] | None, timeout_s: float
+) -> subprocess.CompletedProcess[str]:
+    """Run a discovery command, removing its whole process tree on timeout.
+
+    The Databricks route runs agy under a gateway wrapper; killing only the
+    wrapper would leave agy running, so the command gets its own session.
+
+    :param argv: Command to run.
+    :param env: Complete environment, or ``None`` to inherit.
+    :param timeout_s: Maximum time to wait for the command.
+    :returns: The completed process with captured text output.
+    :raises subprocess.TimeoutExpired: If the command outlives *timeout_s*.
+    :raises subprocess.CalledProcessError: If the command exits non-zero.
+    """
+    with subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _signal_process_group(process, signal.SIGTERM)
+            try:
+                process.communicate(timeout=_TERMINATE_GRACE_S)
+            except subprocess.TimeoutExpired:
+                _signal_process_group(process, signal.SIGKILL)
+                process.communicate()
+            # Reap anything the wrapper left behind in the group.
+            _signal_process_group(process, signal.SIGKILL)
+            raise subprocess.TimeoutExpired(argv, timeout_s) from None
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, argv, stdout, stderr)
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def list_agy_cli_model_options(
     *,
     env: Mapping[str, str] | None = None,
-    timeout_s: float = 10.0,
+    timeout_s: float = _DISCOVERY_TIMEOUT_S,
 ) -> list[AntigravityModelOption]:
     """Discover launchable picker rows from the installed ``agy`` CLI.
 
@@ -124,19 +178,9 @@ def list_agy_cli_model_options(
         if overrides:
             from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
 
-            wrapped = wrap_agy_gateway_launch(argv, overrides)
-            if wrapped != argv:
-                timeout_s = max(timeout_s, _GATEWAY_DISCOVERY_TIMEOUT_S)
-            argv = wrapped
+            argv = wrap_agy_gateway_launch(argv, overrides)
         run_env: dict[str, str] | None = {**os.environ, **overrides} if overrides else None
     else:
         run_env = dict(env)
-    completed = subprocess.run(
-        argv,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-        env=run_env,
-    )
+    completed = _run_discovery(argv, env=run_env, timeout_s=timeout_s)
     return parse_agy_model_options(completed.stdout)

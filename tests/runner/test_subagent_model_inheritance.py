@@ -345,7 +345,7 @@ async def test_antigravity_native_inherits_only_exact_live_catalog_ids(
             stdout=f"Fetching available models...\n{advertised_model}\tModel\n",
         )
     )
-    monkeypatch.setattr(models.subprocess, "run", probe)
+    monkeypatch.setattr(models, "_run_discovery", probe)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("antigravity-native"),
@@ -373,8 +373,8 @@ async def test_antigravity_native_never_inherits_gateway_model_id(
     gateway_id = "databricks-claude-sonnet-4-6"
     monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
     monkeypatch.setattr(
-        models.subprocess,
-        "run",
+        models,
+        "_run_discovery",
         Mock(
             return_value=subprocess.CompletedProcess(
                 ["/test/agy", "models"], 0, stdout=f"{gateway_id}\tModel\n"
@@ -414,7 +414,7 @@ async def test_antigravity_native_discovery_failure_keeps_worker_default(
             ["/test/agy", "models"], 0, stdout="Fetching available models...\n"
         ),
     )
-    monkeypatch.setattr(models.subprocess, "run", probe)
+    monkeypatch.setattr(models, "_run_discovery", probe)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("antigravity-native"),
@@ -448,7 +448,7 @@ async def test_antigravity_sdk_native_split_inherits_advertised_model(
             stdout="Fetching available models...\ngemini-3.5-pro\tGemini 3.5 Pro\n",
         )
     )
-    monkeypatch.setattr(models.subprocess, "run", probe)
+    monkeypatch.setattr(models, "_run_discovery", probe)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker(child_harness),
