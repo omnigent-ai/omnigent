@@ -224,17 +224,25 @@ def _refuse_member_agent_choice(project: Project, user_id: str | None, changed: 
         )
 
 
+def _is_agent_call(request: Request) -> bool:
+    """Whether an agent's runner made the call: it carries a source or a runner token header."""
+    return (
+        ORCHESTRATION_SOURCE_HEADER in request.headers
+        or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+    )
+
+
 def _refuse_agent_mandate_write(request: Request, mandate: str | None) -> None:
-    """Keep the mandate owner-written: agents it bounds may only propose additions.
+    """Keep the mandate person-written: agents it bounds may only propose changes.
 
     :param request: The incoming request; agent tools mark theirs with
         :data:`ORCHESTRATION_SOURCE_HEADER`.
     :param mandate: The requested mandate, or ``None`` when unchanged.
     :raises OmnigentError: 403 for an agent-originated mandate write.
     """
-    if mandate is not None and ORCHESTRATION_SOURCE_HEADER in request.headers:
+    if mandate is not None and _is_agent_call(request):
         raise OmnigentError(
-            "Only the project owner can change a project's mandate; propose an addition "
+            "Agents can't change a project's mandate; propose an addition "
             "with sys_project_mandate_propose instead",
             code=ErrorCode.FORBIDDEN,
         )
@@ -659,9 +667,9 @@ def create_projects_router(
         request: Request, project_id: str, proposal_id: str, *, accept: bool
     ) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
-        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+        if _is_agent_call(request):
             raise OmnigentError(
-                "Only the project owner can accept or dismiss a mandate proposal",
+                "Agents can't accept or dismiss a mandate proposal; a person must",
                 code=ErrorCode.FORBIDDEN,
             )
         project = await asyncio.to_thread(

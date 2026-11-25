@@ -12,6 +12,8 @@ const projects = vi.hoisted(() => ({
   refetch: vi.fn(),
 }));
 vi.mock("@/hooks/useConversations", () => ({ useProjects: () => projects }));
+const viewer = vi.hoisted(() => ({ id: "member@example.com" as string | null }));
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => viewer.id }));
 vi.mock("@/lib/projectsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof api>()),
   createProject: vi.fn(),
@@ -302,5 +304,50 @@ describe("Project mandate editor", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Project not found");
     expect(screen.queryByLabelText("Project mandate")).toBeNull();
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+  });
+});
+
+describe("Project mandate for a shared member", () => {
+  it("shows the mandate and proposals read-only, with no edit, save or accept", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      shared: true,
+      mandate: "Only edit docs/.",
+      mandate_proposals: [PROPOSAL],
+    });
+    renderDialog();
+    expect(await screen.findByTestId("project-mandate-read-only")).toHaveTextContent(
+      "Only the project owner or a product approver can change the Mandate.",
+    );
+    expect(screen.getByTestId("project-mandate-preview")).toHaveTextContent("Only edit docs/.");
+    expect(screen.getByTestId("project-mandate-proposal")).toHaveTextContent(PROPOSAL.text);
+    expect(screen.queryByTestId("project-mandate-edit-tab")).toBeNull();
+    expect(screen.queryByTestId("project-mandate-save")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+  });
+
+  it("lets a member who is a product approver edit and accept", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({
+      id: "project",
+      name: "Shipping",
+      shared: true,
+      mandate: "Only edit docs/.",
+      mandate_proposals: [PROPOSAL],
+      config: { product_approvers: ["member@example.com"] },
+    });
+    renderDialog();
+    expect(await screen.findByTestId("project-mandate-edit-tab")).toBeTruthy();
+    expect(screen.getByTestId("project-mandate-save")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.queryByTestId("project-mandate-read-only")).toBeNull();
+  });
+
+  it("opens a blank mandate as an empty preview instead of the editor", async () => {
+    vi.mocked(api.getProject).mockResolvedValue({ id: "project", name: "Shipping", shared: true });
+    renderDialog();
+    expect(await screen.findByText("No mandate yet.")).toBeTruthy();
+    expect(screen.queryByLabelText("Project mandate")).toBeNull();
   });
 });

@@ -1537,6 +1537,50 @@ async def test_shared_members_read_the_description_but_cannot_edit_it(
     assert renamed.json()["description"] == "Mission."
 
 
+async def test_only_the_owner_changes_the_mandate_over_rest(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """Members and agents are refused; a member's other edits and unchanged resends still work."""
+    client = multi_user_client
+    owner, bob = _as_user(ALICE), _as_user(BOB)
+    created = (
+        await client.post("/v1/projects", json={"name": "M", "mandate": "Rules."}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    await client.post(f"{path}/shares", json={"user_id": BOB}, headers=owner)
+
+    refused = await client.patch(path, json={"mandate": "Bob's."}, headers=bob)
+    assert refused.status_code == 403
+    assert "Only the project owner or a product approver can change the Mandate" in refused.text
+    agent = await client.patch(
+        path, json={"mandate": "Agent's."}, headers={**owner, ORCHESTRATION_SOURCE_HEADER: "x"}
+    )
+    assert agent.status_code in (403, 404), agent.text
+    resent = await client.patch(path, json={"name": "M2", "mandate": "Rules."}, headers=bob)
+    assert resent.status_code == 200, resent.text
+    assert (resent.json()["name"], resent.json()["mandate"]) == ("M2", "Rules.")
+    assert (await client.get(path, headers=bob)).json()["mandate"] == "Rules."
+    changed = await client.patch(path, json={"mandate": "New."}, headers=owner)
+    assert changed.json()["mandate"] == "New."
+    token_only = await client.patch(
+        path, json={"mandate": "Agent's."}, headers={**owner, RUNNER_TUNNEL_TOKEN_HEADER: "x"}
+    )
+    assert token_only.status_code == 403, token_only.text
+    # A Manager who isn't a product approver still only reads it.
+    carol = "carol@example.com"
+    await client.post(f"{path}/shares", json={"user_id": carol, "role": "manager"}, headers=owner)
+    manager = await client.patch(path, json={"mandate": "Carol's."}, headers=_as_user(carol))
+    assert manager.status_code == 403, manager.text
+    # A product approver who is a member may change it.
+    approvers = await client.patch(
+        path, json={"config": {"product_approvers": [BOB]}}, headers=owner
+    )
+    assert approvers.status_code == 200, approvers.text
+    approved = await client.patch(path, json={"mandate": "Bob's."}, headers=bob)
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["mandate"] == "Bob's."
+
+
 async def test_side_chats_of_the_lead_and_a_persona_carry_the_role_but_not_hold_it(
     project_client: httpx.AsyncClient,
 ) -> None:

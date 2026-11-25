@@ -426,6 +426,21 @@ def _decode_order(raw: bytes | str | memoryview | None) -> ProjectOrderPreferenc
         return default
 
 
+MANDATE_EDIT_REFUSAL = "Only the project owner or a product approver can change the Mandate"
+
+
+def _may_edit_mandate(row: SqlProject, role: ProjectRole | None, user_id: str | None) -> bool:
+    """The owner, or a member on the project's ``product_approvers`` list, edits the mandate."""
+    if role == "owner":
+        return True
+    if role is None or user_id is None:
+        return False
+    approvers = _decode_config(row.config).get("product_approvers")
+    return isinstance(approvers, list) and user_id in {
+        entry.strip() for entry in approvers if isinstance(entry, str)
+    }
+
+
 class SqlAlchemyProjectStore(ProjectStore):
     """
     SQLAlchemy-backed implementation of :class:`ProjectStore`.
@@ -593,7 +608,10 @@ class SqlAlchemyProjectStore(ProjectStore):
         ``None`` leaves a field unchanged. Returns ``None`` if the project does
         not exist or is not owned by ``user_id``. A ``config`` of ``{}`` clears
         the stored defaults (distinct from ``None`` = leave unchanged), and a
-        blank ``mandate`` clears the stored mandate.
+        blank ``mandate`` clears the stored mandate. Only the owner or a product
+        approver may change it.
+
+        :raises OmnigentError: ``FORBIDDEN`` when any other member changes the mandate.
 
         A rename re-checks ``_name_taken``, which — as on ``create`` — is the
         only uniqueness guard, so concurrent renames to the same name can both
@@ -608,8 +626,16 @@ class SqlAlchemyProjectStore(ProjectStore):
             row = session.get(
                 SqlProject, (current_workspace_id(), project_id), with_for_update=True
             )
-            if row is None or project_role(session, row, user_id) is None:
+            role = project_role(session, row, user_id)
+            if row is None or role is None:
                 return None
+            if (
+                mandate is not None
+                and row.mandate != stored_mandate
+                and not _may_edit_mandate(row, role, user_id)
+            ):
+                # Members may resend the stored mandate unchanged with a whole-form save.
+                raise OmnigentError(MANDATE_EDIT_REFUSAL, code=ErrorCode.FORBIDDEN)
             changed = False
             current_main = row.main_session_id or row.legacy_orchestrator_session_id
             if main_session_id is not None and current_main != main_session_id:
@@ -785,15 +811,25 @@ class SqlAlchemyProjectStore(ProjectStore):
     def resolve_mandate_proposal(
         self, project_id: str, proposal_id: str, *, user_id: str | None, accept: bool
     ) -> Project | None:
-        """Accept (append to the mandate) or dismiss a pending proposal."""
+        """Accept (apply to the mandate) or dismiss a pending proposal.
+
+        Only the owner or a product approver may; ``FORBIDDEN`` for other members.
+        """
 
         def write(session: Session) -> Project | None:
             require_active_account(session, user_id)
             row = session.get(
                 SqlProject, (current_workspace_id(), project_id), with_for_update=True
             )
-            if row is None or project_role(session, row, user_id) is None:
+            role = project_role(session, row, user_id)
+            if row is None or role is None:
                 return None
+            if not _may_edit_mandate(row, role, user_id):
+                raise OmnigentError(
+                    "Only the project owner or a product approver can accept or dismiss "
+                    "a mandate proposal",
+                    code=ErrorCode.FORBIDDEN,
+                )
             pending = _decode_proposals(row.mandate_proposals)
             proposal = next((entry for entry in pending if entry.id == proposal_id), None)
             if proposal is None:

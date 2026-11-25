@@ -37,7 +37,8 @@ import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTi
 import { ProjectBoardActions } from "./ProjectBoardActions";
 import { ProjectCostBadge } from "./ProjectCost";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
-import { ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
+import { useViewerId } from "@/hooks/useViewerId";
+import { canEditMandate, ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
 interface ProjectComposerState {
@@ -130,6 +131,12 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
   const { projectId, config } = useProjectHomeConfig(projectName);
+  // Members other than the owner and product approvers only read the mandate.
+  const viewerId = useViewerId();
+  const mandateReadOnly = !canEditMandate(
+    useProjectMandate(projectId, mandateEnabled).data,
+    viewerId,
+  );
   const { actions, dialogs } = useProjectFolderMenu(
     projectName,
     projectId,
@@ -215,7 +222,7 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
               onSelect={() => setEditingMandate(true)}
             >
               <ScrollTextIcon className="size-3.5" />
-              Edit mandate
+              {mandateReadOnly ? "View mandate" : "Edit mandate"}
             </DropdownMenuItem>
           )}
           {descriptionEnabled && (

@@ -819,6 +819,36 @@ def test_manager_invites_and_removes_members_but_not_managers(
     assert denied.value.code == ErrorCode.FORBIDDEN
 
 
+def test_only_the_owner_changes_the_mandate(store: SqlAlchemyProjectStore) -> None:
+    """A member reads the mandate and may resend it unchanged, but never changes it."""
+    pid = _uid("mandated")
+    store.create(pid, "Mandated", "alice@example.com", mandate="Owner rules.")
+    store.add_share(pid, "bob@example.com", user_id="alice@example.com")
+    for attempt in ("Bob's rules.", ""):
+        with pytest.raises(OmnigentError) as denied:
+            store.update(pid, user_id="bob@example.com", mandate=attempt)
+        assert denied.value.code == ErrorCode.FORBIDDEN
+    kept = store.update(pid, user_id="bob@example.com", name="Renamed", mandate=" Owner rules. ")
+    assert kept is not None and (kept.name, kept.mandate) == ("Renamed", "Owner rules.")
+    owned = store.update(pid, user_id="alice@example.com", mandate="New rules.")
+    assert owned is not None and owned.mandate == "New rules."
+    # A product approver edits it and resolves proposals; other members can't resolve them.
+    store.add_share(pid, "carol@example.com", user_id="alice@example.com")
+    store.update(
+        pid, user_id="alice@example.com", config={"product_approvers": ["carol@example.com"]}
+    )
+    edited = store.update(pid, user_id="carol@example.com", mandate="Carol's rules.")
+    assert edited is not None and edited.mandate == "Carol's rules."
+    _, proposal = store.propose_mandate_addition(pid, "Add this.", user_id="alice@example.com")
+    with pytest.raises(OmnigentError) as denied:
+        store.resolve_mandate_proposal(pid, proposal.id, user_id="bob@example.com", accept=True)
+    assert denied.value.code == ErrorCode.FORBIDDEN
+    accepted = store.resolve_mandate_proposal(
+        pid, proposal.id, user_id="carol@example.com", accept=True
+    )
+    assert accepted is not None and "Add this." in (accepted.mandate or "")
+
+
 def test_members_edit_the_leads_session_defaults_but_only_the_owner_its_charter(
     store: SqlAlchemyProjectStore,
 ) -> None:

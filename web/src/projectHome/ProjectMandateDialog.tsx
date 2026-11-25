@@ -25,6 +25,7 @@ import {
   type MandateProposal,
   type Project,
 } from "@/lib/projectsApi";
+import { useViewerId } from "@/hooks/useViewerId";
 import { TicketError } from "./TicketControls";
 import { useTicketProject } from "./useProjectTickets";
 
@@ -84,6 +85,13 @@ function ProposalDiff({ proposal }: { proposal: MandateProposal }) {
   );
 }
 
+/** The owner and the project's product approvers edit the mandate; other members read it. */
+export function canEditMandate(project: Project | undefined, viewerId: string | null): boolean {
+  if (project === undefined || project.shared !== true) return true;
+  const approvers = project.config?.product_approvers ?? [];
+  return viewerId !== null && approvers.includes(viewerId);
+}
+
 /** The project's mandate and pending proposals; agents' proposals refresh it live. */
 export function useProjectMandate(projectId: string | null, enabled = true) {
   return useQuery<Project>({
@@ -94,7 +102,10 @@ export function useProjectMandate(projectId: string | null, enabled = true) {
   });
 }
 
-/** Edits the guidance every agent session in the project receives as its bounds. */
+/**
+ * Edits the guidance every agent session in the project receives as its bounds.
+ * The owner and product approvers change it; other members read it and its proposals.
+ */
 export function ProjectMandateDialog({
   projectName,
   onClose,
@@ -155,6 +166,8 @@ export function ProjectMandateDialog({
     },
   });
   const proposals = query.data?.mandate_proposals ?? [];
+  const viewerId = useViewerId();
+  const readOnly = !canEditMandate(query.data, viewerId);
   const busy = save.isPending || resolve.isPending;
   const bytes = draft === null ? 0 : mandateBytes(draft);
   const tooLarge = bytes > PROJECT_MANDATE_MAX_BYTES;
@@ -177,6 +190,11 @@ export function ProjectMandateDialog({
         <DialogHeader>
           <DialogTitle>Mandate</DialogTitle>
           <DialogDescription>
+            {readOnly && (
+              <span className="mb-1 block font-medium" data-testid="project-mandate-read-only">
+                Only the project owner or a product approver can change the Mandate.{" "}
+              </span>
+            )}
             Bounds every agent in <span className="font-medium">{projectName}</span> follows,
             including the Lead and its workers. It overrides conflicting repo instructions such as
             CLAUDE.md, but never safety rules or approval prompts. Running sessions may keep the
@@ -193,7 +211,9 @@ export function ProjectMandateDialog({
               >
                 <h3 className="font-medium text-ui">Proposed changes</h3>
                 <p className="text-sm text-muted-foreground">
-                  Agents suggested these from your feedback. They apply only once you accept them.
+                  {readOnly
+                    ? "Agents suggested these. They apply only once the owner accepts them."
+                    : "Agents suggested these from your feedback. They apply only once you accept them."}
                 </p>
                 {proposals.map((proposal) => {
                   const label = proposalLabel(proposal);
@@ -229,43 +249,47 @@ export function ProjectMandateDialog({
                           <ProposalDiff proposal={proposal} />
                         </div>
                       )}
-                      <div className="flex shrink-0 gap-1">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          disabled={busy}
-                          onClick={() => resolve.mutate({ proposal, accept: false })}
-                        >
-                          Dismiss
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          disabled={busy || proposal.stale || blockedByEdits}
-                          onClick={() => resolve.mutate({ proposal, accept: true })}
-                        >
-                          Accept
-                        </Button>
-                      </div>
+                      {!readOnly && (
+                        <div className="flex shrink-0 gap-1">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            disabled={busy}
+                            onClick={() => resolve.mutate({ proposal, accept: false })}
+                          >
+                            Dismiss
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={busy || proposal.stale || blockedByEdits}
+                            onClick={() => resolve.mutate({ proposal, accept: true })}
+                          >
+                            Accept
+                          </Button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
                 <TicketError error={resolve.error} />
               </section>
             )}
-            <Tabs value={mode} onValueChange={(value) => setMode(value as "preview" | "edit")}>
-              <TabsList aria-label="Mandate view">
-                <TabsTrigger value="preview" data-testid="project-mandate-preview-tab">
-                  Preview
-                </TabsTrigger>
-                <TabsTrigger value="edit" data-testid="project-mandate-edit-tab">
-                  Edit
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
-            {mode === "edit" ? (
+            {!readOnly && (
+              <Tabs value={mode} onValueChange={(value) => setMode(value as "preview" | "edit")}>
+                <TabsList aria-label="Mandate view">
+                  <TabsTrigger value="preview" data-testid="project-mandate-preview-tab">
+                    Preview
+                  </TabsTrigger>
+                  <TabsTrigger value="edit" data-testid="project-mandate-edit-tab">
+                    Edit
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+            )}
+            {mode === "edit" && !readOnly ? (
               <Textarea
                 aria-label="Project mandate"
                 data-testid="project-mandate-input"
@@ -293,7 +317,7 @@ export function ProjectMandateDialog({
                   </FilePathAwareMessageResponse>
                 ) : (
                   <p className="text-sm text-muted-foreground">
-                    No mandate yet. Choose Edit to write one.
+                    {readOnly ? "No mandate yet." : "No mandate yet. Choose Edit to write one."}
                   </p>
                 )}
               </div>
@@ -309,16 +333,18 @@ export function ProjectMandateDialog({
             <TicketError error={save.error} />
             <DialogFooter className="border-t-0 bg-transparent">
               <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
-                Cancel
+                {readOnly ? "Close" : "Cancel"}
               </Button>
-              <Button
-                type="submit"
-                data-testid="project-mandate-save"
-                loading={save.isPending}
-                disabled={tooLarge || resolve.isPending}
-              >
-                Save
-              </Button>
+              {!readOnly && (
+                <Button
+                  type="submit"
+                  data-testid="project-mandate-save"
+                  loading={save.isPending}
+                  disabled={tooLarge || resolve.isPending}
+                >
+                  Save
+                </Button>
+              )}
             </DialogFooter>
           </form>
         ) : (
