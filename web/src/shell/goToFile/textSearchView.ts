@@ -12,8 +12,14 @@ export type TextSearchState =
   | { phase: "idle" }
   /** The search can't run as typed; `problem` says how to fix it. */
   | { phase: "invalid"; problem: string }
-  /** A newer search runs; `previous` is the last answer, shown meanwhile. */
-  | { phase: "searching"; previous: ContentSearchResult | undefined }
+  /**
+   * A newer search runs; `previous` is the last answer, shown meanwhile and marked for the
+   * search that produced it rather than what is typed now.
+   */
+  | {
+      phase: "searching";
+      previous: { result: ContentSearchResult; input: ContentSearchInput } | undefined;
+    }
   | { phase: "error"; message: string }
   | { phase: "settled"; result: ContentSearchResult };
 
@@ -41,7 +47,9 @@ export function textSearchView(state: TextSearchState, input: ContentSearchInput
       };
     case "searching":
       return {
-        items: state.previous ? textSearchItems(state.previous.matches, input) : [],
+        items: state.previous
+          ? textSearchItems(state.previous.result.matches, state.previous.input)
+          : [],
         emptyMessage: TEXT_SEARCH_SEARCHING,
         status: TEXT_SEARCH_SEARCHING,
       };

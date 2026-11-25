@@ -20,7 +20,12 @@ export interface GoToFileTextSearch {
   state: TextSearchState;
   /** The last answer, for "Open in Search" to show without searching again. */
   result: ContentSearchResult | undefined;
-  retry: () => void;
+}
+
+/** An answer with the search that produced it, so its lines are marked for that search. */
+interface SearchedAnswer {
+  result: ContentSearchResult;
+  input: ContentSearchInput;
 }
 
 export function useGoToFileTextSearch(
@@ -34,21 +39,23 @@ export function useGoToFileTextSearch(
     enabled && searched.query.trim() !== "" && contentSearchProblem(searched) === null;
   const search = useQuery({
     queryKey: ["go-to-file-text-search", sessionId, searched],
-    queryFn: ({ signal }) => runContentSearch(sessionId, searched, signal),
+    queryFn: async ({ signal }): Promise<SearchedAnswer> => ({
+      result: await runContentSearch(sessionId, searched, signal),
+      input: searched,
+    }),
     enabled: runnable,
     retry: false,
     staleTime: 30_000,
     gcTime: 60_000,
     placeholderData: keepPreviousData,
   });
-  const retry = () => void search.refetch();
-  if (input.query.trim() === "") return { state: { phase: "idle" }, result: undefined, retry };
-  if (problem) return { state: { phase: "invalid", problem }, result: undefined, retry };
+  if (input.query.trim() === "") return { state: { phase: "idle" }, result: undefined };
+  if (problem) return { state: { phase: "invalid", problem }, result: undefined };
   if (searched !== input || search.isFetching || search.isPlaceholderData || search.isPending) {
-    return { state: { phase: "searching", previous: search.data }, result: undefined, retry };
+    return { state: { phase: "searching", previous: search.data }, result: undefined };
   }
   if (search.isError) {
-    return { state: { phase: "error", message: search.error.message }, result: undefined, retry };
+    return { state: { phase: "error", message: search.error.message }, result: undefined };
   }
-  return { state: { phase: "settled", result: search.data }, result: search.data, retry };
+  return { state: { phase: "settled", result: search.data.result }, result: search.data.result };
 }

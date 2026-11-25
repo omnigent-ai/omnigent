@@ -32,13 +32,24 @@ describe("textSearchView", () => {
 
   it("keeps the last answer's lines while a newer search runs", () => {
     const view = textSearchView(
-      { phase: "searching", previous: result([match("a.ts", 3)]) },
+      { phase: "searching", previous: { result: result([match("a.ts", 3)]), input } },
       input,
     );
     expect(view.items.map((item) => item.value)).toEqual([
       { path: "a.ts", line: 3, column: 1, endColumn: 7 },
     ]);
     expect(view.status).toBe(TEXT_SEARCH_SEARCHING);
+  });
+
+  it("marks the last answer's lines for its own search, not for what is typed now", () => {
+    const previous = { result: result([match("a.ts", 3)]), input };
+    // "here" is typed meanwhile; the old lines still mark only "needle", where it was found.
+    const typing = { ...input, query: "here" };
+    const view = textSearchView({ phase: "searching", previous }, typing);
+    const settled = textSearchView({ phase: "settled", result: previous.result }, input);
+    expect(view.items.map((item) => item.highlights)).toEqual(
+      settled.items.map((item) => item.highlights),
+    );
   });
 
   it("counts the lines and files found", () => {
