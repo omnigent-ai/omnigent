@@ -56,6 +56,28 @@ export function navigationHostOptions(hostId: string | null): BrowserHostOptions
   return hostId ? { sourceHostId: hostId, sessionHostProtocol: SESSION_HOST_PROTOCOL } : {};
 }
 
+/** A chord as physical keys, which main matches against a focused embedded page's key presses. */
+export interface BrowserForwardedChord {
+  key?: string;
+  code?: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+}
+
+/** An app chord a focused embedded page handed over, as keydown fields. */
+export interface BrowserForwardedKeydown {
+  type: "keydown";
+  key: string;
+  code: string;
+  ctrlKey: boolean;
+  shiftKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  repeat: boolean;
+}
+
 export interface BrowserRecentSessionInput {
   type: "keydown" | "keyup";
   key: "Tab" | "Control" | "Escape";
@@ -295,6 +317,11 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   /** Clear native key interception when the recent-session gesture was declined. */
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+  /** Optional capability: the app chords a focused embedded page hands to this renderer. */
+  browserSetForwardedChords?: (
+    chords: BrowserForwardedChord[],
+  ) => Promise<{ ok: boolean; count?: number; error?: string }>;
+  onBrowserForwardedInput?: (callback: (input: BrowserForwardedKeydown) => void) => () => void;
   /**
    * Inspect the local Google Chrome profiles for cookies in the site tree the
    * conversation's view is on, and across every website. Metadata only (profile
@@ -936,6 +963,43 @@ export async function setBrowserRecentSessionSwitchSupported(supported: boolean)
     await electron.browserSetRecentSessionSwitchSupported(supported);
   } catch (err) {
     console.warn("[nativeBridge] browser recent-session support update failed:", err);
+  }
+}
+
+/** Whether a focused embedded page can hand app chords (such as ⌘K) to this renderer. */
+export function browserForwardsChords(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.browserSetForwardedChords === "function" &&
+    typeof electron.onBrowserForwardedInput === "function"
+  );
+}
+
+/** List the app chords a focused embedded page should hand over; an empty list hands over none. */
+export async function setBrowserForwardedChords(chords: BrowserForwardedChord[]): Promise<void> {
+  const electron = electronApi();
+  if (!electron?.browserSetForwardedChords) return;
+  try {
+    const result = await electron.browserSetForwardedChords(chords);
+    if (result?.ok === false) {
+      console.warn("[nativeBridge] browser forwarded chords update refused:", result.error);
+    }
+  } catch (err) {
+    console.warn("[nativeBridge] browser forwarded chords update failed:", err);
+  }
+}
+
+/** Subscribe to app chords forwarded from a focused embedded page. */
+export function onBrowserForwardedInput(
+  callback: (input: BrowserForwardedKeydown) => void,
+): () => void {
+  const subscribe = electronApi()?.onBrowserForwardedInput;
+  if (typeof subscribe !== "function") return () => {};
+  try {
+    return subscribe(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] browser forwarded input subscription failed:", err);
+    return () => {};
   }
 }
 

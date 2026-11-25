@@ -546,6 +546,7 @@ function makeRegistry(conversationId, webContents) {
   const suppressedCalls = []; // booleans passed to setSuppressed, in order
   const recentSessionSupportCalls = [];
   const openTabSupportCalls = [];
+  const forwardedChordCalls = [];
   let recentSessionCancelCount = 0;
   return {
     get: (id) => entries.get(id) ?? null,
@@ -575,10 +576,15 @@ function makeRegistry(conversationId, webContents) {
       openTabSupportCalls.push(supported);
       return { ok: true };
     },
+    setForwardedChords: (chords) => {
+      forwardedChordCalls.push(chords);
+      return { ok: true, count: Array.isArray(chords) ? chords.length : 0 };
+    },
     close: () => ({ ok: true, removed: true }),
     suppressedCalls,
     recentSessionSupportCalls,
     openTabSupportCalls,
+    forwardedChordCalls,
     recentSessionCancelCount: () => recentSessionCancelCount,
   };
 }
@@ -1070,6 +1076,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-set-suppressed",
       "omnigent:browser-set-recent-session-switch-supported",
       "omnigent:browser-set-open-tab-supported",
+      "omnigent:browser-set-forwarded-chords",
       "omnigent:browser-cancel-recent-session-switch",
       "omnigent:browser-resize",
       "omnigent:browser-screenshot",
@@ -1194,6 +1201,28 @@ describe("browserIpc — modifier-click new tabs", () => {
 
     assert.equal(result.ok, false);
     assert.deepEqual(registry.openTabSupportCalls, []);
+  });
+});
+
+describe("browserIpc — forwarded app chords", () => {
+  const COMMAND_K = { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+
+  it("hands the trusted renderer's chords to the registry", async () => {
+    const { ipcMain, registry, event } = setup();
+    await ipcMain.invoke("omnigent:browser-set-forwarded-chords", event, { chords: [COMMAND_K] });
+    await ipcMain.invoke("omnigent:browser-set-forwarded-chords", event, {});
+
+    assert.deepEqual(registry.forwardedChordCalls, [[COMMAND_K], undefined]);
+  });
+
+  it("rejects an unpinned sender, so it can't take a page's keys", async () => {
+    const { ipcMain, registry, event } = setup({ pinned: false });
+    const result = await ipcMain.invoke("omnigent:browser-set-forwarded-chords", event, {
+      chords: [COMMAND_K],
+    });
+
+    assert.equal(result.ok, false);
+    assert.deepEqual(registry.forwardedChordCalls, []);
   });
 });
 

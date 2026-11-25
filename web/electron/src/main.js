@@ -4859,6 +4859,9 @@ function createBrowserRegistryForWindow(win) {
       }
     },
     isHostFocused: () => !win.isDestroyed() && win.isFocused(),
+    focusHost: () => {
+      if (!win.isDestroyed()) win.webContents.focus();
+    },
     // Renderer measures in CSS px; convert to window DIPs using the host
     // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
     getHostZoomFactor: () => {
@@ -4874,12 +4877,24 @@ function createBrowserRegistryForWindow(win) {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
   });
+  // A reloaded or replaced renderer asks again for the page keys it handles; an older
+  // bundle never asks, so pages keep them.
   win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isMainFrame && !isInPlace) {
       registry.setRecentSessionSwitchSupported(false);
+      registry.holdForwardedChords();
       registry.setOpenTabSupported(false);
     }
   });
+  // A new document, or an error page, asks for its own keys. A navigation that stopped
+  // without one, such as a cancelled reload, left the old renderer, which keeps them.
+  win.webContents.on("did-navigate", () => registry.releaseForwardedChords(false));
+  win.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
+    if (isMainFrame && errorCode !== ERR_ABORTED) registry.releaseForwardedChords(false);
+  });
+  win.webContents.on("did-stop-loading", () => registry.releaseForwardedChords(true));
+  // A crashed renderer can't take the keys it asked for.
+  win.webContents.on("render-process-gone", () => registry.setForwardedChords([]));
   return registry;
 }
 

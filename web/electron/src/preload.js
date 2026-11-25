@@ -599,6 +599,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   browserSetRecentSessionSwitchSupported: (supported) =>
     ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
   /**
+   * The app chords (physical modifiers plus `code` or `key`) a focused embedded
+   * page should hand to this renderer; an empty list hands over none.
+   * @param {{ key?: string, code?: string, metaKey: boolean, ctrlKey: boolean, altKey: boolean, shiftKey: boolean }[]} chords
+   */
+  browserSetForwardedChords: (chords) =>
+    ipcRenderer.invoke("omnigent:browser-set-forwarded-chords", { chords }),
+  /**
+   * A forwarded app chord from a focused embedded page, as keydown fields.
+   * @param {(payload: Record<string, unknown>) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserForwardedInput: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-forwarded-input", listener);
+    return () => ipcRenderer.removeListener("browser-forwarded-input", listener);
+  },
+  /**
    * Subscribe to page links Cmd/Ctrl- or middle-clicked in an embedded browser
    * view (`{conversationId, url}`, where conversationId is the clicked view's id).
    * @param {(payload: { conversationId: string, url: string }) => void} callback

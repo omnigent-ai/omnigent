@@ -686,6 +686,14 @@ function registerBrowserIpc({
     return g.registry.setRecentSessionSwitchSupported(!!args?.supported);
   });
 
+  // The app chords a focused page hands to this renderer. Like Ctrl+Tab, none
+  // are taken from the page until a renderer that handles them asks.
+  ipcMain.handle("omnigent:browser-set-forwarded-chords", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.setForwardedChords(args?.chords);
+  });
+
   // Turn Cmd/Ctrl-clicked page links into new tabs only while a compatible
   // renderer handles `browser-open-tab`; older server UIs keep in-place loads.
   ipcMain.handle("omnigent:browser-set-open-tab-supported", (event, args) => {
