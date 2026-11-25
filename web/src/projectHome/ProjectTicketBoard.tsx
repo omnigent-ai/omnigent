@@ -479,7 +479,8 @@ function TicketCard({
           related && "border-muted-foreground/50",
           // Cards waiting on the viewer stand out in a lane, until they answer.
           needsWhom(ticket.waiting_on, getCurrentUserId())?.kind === "you" &&
-            "border-l-4 border-l-brand-accent",
+            // Important: dark mode's glass-card rule resets every card border.
+            "border-l-4! border-l-brand-accent!",
           selected && "border-primary ring-1 ring-primary/20",
           isDragging && "opacity-40",
         )}

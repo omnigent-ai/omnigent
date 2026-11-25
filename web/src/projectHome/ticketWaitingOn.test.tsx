@@ -48,7 +48,7 @@ describe("the needs-human tag", () => {
       <TicketLabels labels={labels} compact waitingOn={ask(["kasey@example.com"])} />,
     );
     expect(screen.getByTestId("needs-you")).toHaveTextContent("Needs you");
-    expect(screen.getByTestId("needs-you")).toHaveClass("bg-brand-accent");
+    expect(screen.getByTestId("needs-you")).toHaveClass("text-white");
     unmount();
     render(<TicketLabels labels={labels} compact waitingOn={ask(["corey@example.com"])} />);
     expect(screen.getByTestId("needs-other")).toHaveTextContent("Needs Corey");
