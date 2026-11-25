@@ -45,9 +45,7 @@ export function ContentSearchPanel({
     gcTime: Infinity,
   });
   const [input, setInput] = useState(cachedInput.data);
-  const [showFilters, setShowFilters] = useState(
-    () => cachedInput.data.include.trim() !== "" || cachedInput.data.exclude.trim() !== "",
-  );
+  const [showFilters, setShowFilters] = useState(false);
   const filtersId = useId();
   const { query, caseSensitive, regex, include, exclude } = input;
   const wholeWord = input.wholeWord === true;

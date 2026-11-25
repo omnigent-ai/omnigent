@@ -5,7 +5,9 @@ import { StrictMode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import { requestTextSearchFocus } from "@/store/fileFinder";
+import { EMPTY_CONTENT_SEARCH } from "@/lib/contentSearch";
 import { ContentSearchPanel } from "./ContentSearchPanel";
+import { contentSearchInputKey } from "./contentSearchCache";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 afterEach(() => {
@@ -394,4 +396,21 @@ it("takes the keyboard when a text search asks this session's page for it", () =
   expect(screen.getByRole("searchbox")).not.toHaveFocus();
   act(() => requestTextSearchFocus("session-one"));
   expect(screen.getByRole("searchbox")).toHaveFocus();
+});
+
+it("keeps remembered filters folded when nothing was handed over, as with the flag off", () => {
+  const client = new QueryClient();
+  client.setQueryData(contentSearchInputKey("session-one"), {
+    ...EMPTY_CONTENT_SEARCH,
+    query: "needle",
+    include: "src/**",
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("searchbox")).toHaveValue("needle");
+  expect(screen.getByLabelText("Include")).not.toBeVisible();
+  expect(authenticatedFetch).not.toHaveBeenCalled();
 });
