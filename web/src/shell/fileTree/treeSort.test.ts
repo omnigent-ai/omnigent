@@ -132,7 +132,7 @@ describe("treeComparator", () => {
   it("places a folder by its own type, not a subfolder's", () => {
     const meta = new Map<string, TreeEntryMeta>([
       ["lib.b", { bytes: null, modified_at: 1 }],
-      // No extension, so under the old order this subfolder pulled `lib.b` first.
+      // The extensionless child must not change its parent's type order.
       ["lib.b/plain", { bytes: null, modified_at: 1 }],
       ["lib.b/plain/x.ts", { bytes: 1, modified_at: 1 }],
       ["lib.b/y.ts", { bytes: 1, modified_at: 1 }],
