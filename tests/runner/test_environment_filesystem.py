@@ -2481,6 +2481,25 @@ def test_split_glob_list_matches_the_web_client(case: dict[str, Any]) -> None:
     assert split_glob_list(case["raw"]) == case["patterns"]
 
 
+@pytest.mark.parametrize(
+    "case",
+    json.loads(
+        (
+            Path(__file__).resolve().parents[2] / "web/src/lib/__fixtures__/globMatches.json"
+        ).read_text(encoding="utf-8")
+    )["cases"],
+    ids=lambda case: f"{case['pattern']} {case['path']}",
+)
+def test_glob_to_regex_matches_the_web_client(case: dict[str, Any]) -> None:
+    """The web Files tree reads a glob alone as this search does with a name."""
+    import re
+
+    from omnigent.runner.environment_filesystem import _glob_to_regex
+
+    regex = re.compile(_glob_to_regex(case["pattern"]), re.IGNORECASE)
+    assert bool(regex.match(case["path"])) is case["matches"]
+
+
 # The web panel's Whole word cases, shared with its unit test, run through real ripgrep.
 _WHOLE_WORD_FIXTURE = json.loads(
     (

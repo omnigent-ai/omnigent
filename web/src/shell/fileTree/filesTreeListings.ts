@@ -3,6 +3,7 @@
 // metadata its sort reads.
 
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { globToRegExp, splitGlobList } from "@/lib/globList";
 import type { FolderListing } from "../folderTreeSync";
 import { activeFileTreePath } from "./activeFileTreePath";
 import type { TreeEntryMeta } from "./treeSort";
@@ -17,71 +18,42 @@ export interface TreePatterns {
 
 export const NO_TREE_PATTERNS: TreePatterns = { include: "", exclude: "" };
 
-/** One pattern, compiled; `folderOnly` when it names a folder, which a file never matches. */
+/** One pattern, compiled; `folder` when it ends in `/` or `/**`, so it covers a whole folder. */
 interface PatternMatcher {
   regex: RegExp;
-  folderOnly: boolean;
-}
-
-/**
- * One pattern as a matcher for tree paths. `*` and `?` stay within a name and `**`
- * crosses folders. A leading or middle `/` anchors the pattern at the browsed folder;
- * without one it matches a name at any depth. A trailing `/` or `/**` names a folder,
- * which also covers everything in it.
- */
-function patternMatcher(pattern: string): PatternMatcher | null {
-  const written = pattern.trim();
-  const trimmed = written.replace(/^\.?\/+/, "");
-  let glob = trimmed.replace(/(?:\/\*\*)+\/?$|\/+$/, "");
-  if (!glob) return null;
-  const folderOnly = glob !== trimmed;
-  // As in gitignore, a leading or middle `/` anchors, decided before either end is trimmed:
-  // `/src/` and `src/**` are the top-level `src`, while `src/` is any `src` folder.
-  const anchored = trimmed !== written || trimmed.replace(/\/+$/, "").includes("/");
-  if (!anchored) glob = `**/${glob}`;
-  let source = "";
-  for (let index = 0; index < glob.length; index++) {
-    const char = glob[index];
-    if (char === "*" && glob[index + 1] === "*") {
-      const crossesFolder = glob[index + 2] === "/";
-      source += crossesFolder ? "(?:.*/)?" : ".*";
-      index += crossesFolder ? 2 : 1;
-    } else if (char === "*") {
-      source += "[^/]*";
-    } else if (char === "?") {
-      source += "[^/]";
-    } else {
-      source += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-    }
-  }
-  return { regex: new RegExp(`^${source}$`), folderOnly };
+  folder: boolean;
 }
 
 function patternMatchers(list: string): PatternMatcher[] {
-  return list.split(",").flatMap((pattern) => patternMatcher(pattern) ?? []);
+  return splitGlobList(list).map((pattern) => ({
+    regex: globToRegExp(pattern),
+    folder: /\/(?:\*\*)?$/.test(pattern),
+  }));
 }
 
-/** Whether `path`, or a folder holding it, matches one of `matchers`. */
-function matchesWithin(
+// Stands for "anything inside", to ask whether a folder pattern covers a folder's contents.
+const INSIDE = "/\u0000";
+
+/** Whether an exclude hides `path`: it, or a folder holding it, matches. */
+function excludedBy(
   path: string,
   type: WorkspaceFile["type"],
   matchers: readonly PatternMatcher[],
 ): boolean {
   for (let prefix = path; prefix; prefix = prefix.slice(0, Math.max(0, prefix.lastIndexOf("/")))) {
-    // Every prefix but the path itself is a folder holding it.
     const isFolder = prefix !== path || type === "directory";
-    if (matchers.some(({ regex, folderOnly }) => (isFolder || !folderOnly) && regex.test(prefix))) {
-      return true;
+    for (const { regex, folder } of matchers) {
+      if (regex.test(prefix) || (isFolder && folder && regex.test(prefix + INSIDE))) return true;
     }
   }
   return false;
 }
 
 /**
- * Whether the tree shows a path, under the hidden-files setting and the patterns.
- * An exclude hides what it matches, folders with their contents. An include keeps
- * only the files it matches, and every folder, since a folder's files aren't known
- * until it opens.
+ * Whether the tree shows a path, under the hidden-files setting and the patterns, which
+ * read as the name search reads them (see `globToRegExp`). An exclude hides what it
+ * matches, folders with their contents. An include keeps only the files it matches, and
+ * every folder, since a folder's files aren't known until it opens.
  */
 export function treePathFilter(
   showHidden: boolean,
@@ -91,8 +63,12 @@ export function treePathFilter(
   const included = patternMatchers(patterns.include);
   return (path, type) => {
     if (!showHidden && isHidden(path.slice(path.lastIndexOf("/") + 1))) return false;
-    if (matchesWithin(path, type, excluded)) return false;
-    return type === "directory" || included.length === 0 || matchesWithin(path, type, included);
+    if (excludedBy(path, type, excluded)) return false;
+    return (
+      type === "directory" ||
+      included.length === 0 ||
+      included.some(({ regex }) => regex.test(path))
+    );
   };
 }
 

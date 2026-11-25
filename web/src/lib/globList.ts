@@ -43,3 +43,48 @@ export function splitGlobList(raw: string): string[] {
   patterns.push(current);
   return patterns.map(stripLikePython).filter((pattern) => pattern !== "");
 }
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * One glob as the runner's `_glob_to_regex` reads it, matched case-insensitively: `*` and
+ * `?` stay within a name, `**` crosses folders, `{a,b}` takes either literal, a pattern
+ * without `/` matches a name at any depth, and a trailing `/` covers everything below.
+ */
+export function globToRegExp(pattern: string): RegExp {
+  let glob = pattern;
+  if (!glob.includes("/")) glob = `**/${glob}`;
+  else if (glob.endsWith("/")) glob = `${glob}**`;
+  // Repeated `**/` match what one does; collapsing them keeps the regex linear.
+  glob = glob.replace(/(?:\*\*\/)+/g, "**/");
+  let source = "";
+  for (let index = 0; index < glob.length; index++) {
+    const character = glob[index]!;
+    if (character === "*" && glob[index + 1] === "*") {
+      // `**/` can also match no folders, so `**/foo` matches a top-level `foo`.
+      if (glob[index + 2] === "/") {
+        source += "(?:.*/)?";
+        index += 2;
+      } else {
+        source += ".*";
+        index += 1;
+      }
+    } else if (character === "*") {
+      source += "[^/]*";
+    } else if (character === "?") {
+      source += "[^/]";
+    } else if (character === "{") {
+      const close = glob.indexOf("}", index);
+      if (close === -1) {
+        source += escapeRegExp(character);
+      } else {
+        const alternatives = glob.slice(index + 1, close).split(",");
+        source += `(?:${alternatives.map(escapeRegExp).join("|")})`;
+        index = close;
+      }
+    } else {
+      source += escapeRegExp(character);
+    }
+  }
+  return new RegExp(`^${source}$`, "i");
+}

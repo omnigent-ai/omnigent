@@ -88,7 +88,10 @@ describe("treePathFilter", () => {
     ["node_modules", "a/node_modules/x/index.js", true],
     ["build/", "build/out.js", true],
     ["src/**", "src/a/b.ts", true],
-    ["./src/*.ts", "src/a.ts", true],
+    ["./src/*.ts", "src/a.ts", false],
+    ["*.{lock,log}", "out.log", true],
+    ["*.LOCK", "pnpm.lock", true],
+    ["**/**/**/*.lock", "a/b/pnpm.lock", true],
     ["a.b", "axb", false],
   ])("exclude %j hides %j: %s", (exclude, path, hidden) => {
     expect(shows("", exclude, path, "file")).toBe(!hidden);
@@ -109,31 +112,39 @@ describe("treePathFilter", () => {
     if (type === "file") expect(shows(pattern, "", path, type)).toBe(matches);
   });
 
-  // A leading or middle `/` anchors a pattern at the browsed folder; without one it matches at
-  // any depth. A trailing `/` alone doesn't anchor, as in gitignore and the name search's globs.
+  // As the name search reads them: a pattern without `/` matches a name at any depth, and any
+  // `/` anchors it at the browsed folder. An exclude hides a file under a folder it matches;
+  // an include keeps only the files it matches itself.
   it.each([
-    ["/src/", "src/main.ts", true],
-    ["/src/", "vendor/src/main.ts", false],
-    ["/README.md", "README.md", true],
-    ["/README.md", "docs/README.md", false],
-    ["src/", "src/main.ts", true],
-    ["a/b", "a/b", true],
-    ["a/b", "x/a/b", false],
-    ["a/b", "a/b/c.ts", true],
-    ["src/**", "src/main.ts", true],
-    ["src/**", "vendor/src/main.ts", false],
-    ["src/", "vendor/src/main.ts", true],
-    ["src/*.ts", "vendor/src/main.ts", false],
-    ["src", "vendor/src/main.ts", true],
-    ["**/src/**", "vendor/src/main.ts", true],
-  ])("%j matches %j: %s", (pattern, path, matches) => {
-    expect(shows("", pattern, path, "file")).toBe(!matches);
-    expect(shows(pattern, "", path, "file")).toBe(matches);
-  });
+    // [pattern, path, exclude hides it, include keeps it]
+    ["src/", "src/main.ts", true, true],
+    ["src/", "vendor/src/main.ts", false, false],
+    ["src/**", "src/main.ts", true, true],
+    ["src/**", "vendor/src/main.ts", false, false],
+    ["src/*.ts", "vendor/src/main.ts", false, false],
+    ["**/src/**", "vendor/src/main.ts", true, true],
+    ["a/b", "a/b", true, true],
+    ["a/b", "x/a/b", false, false],
+    ["a/b", "a/b/c.ts", true, false],
+    ["src", "vendor/src/main.ts", true, false],
+    ["*.{ts,tsx}", "app.tsx", true, true],
+    ["*.MD", "docs/app.md", true, true],
+    // Paths are relative to the browsed folder, so a leading `/` matches nothing.
+    ["/README.md", "README.md", false, false],
+  ] as const)(
+    "%j against %j: exclude hides %s, include keeps %s",
+    (pattern, path, hides, keeps) => {
+      expect(shows("", pattern, path, "file")).toBe(!hides);
+      expect(shows(pattern, "", path, "file")).toBe(keeps);
+    },
+  );
 
-  it("reads a comma-separated list, ignoring blanks and spaces", () => {
+  it("reads a comma-separated list, ignoring blanks and spaces, keeping a brace's commas", () => {
     expect(shows("", " *.lock , ,*.log ", "out.log", "file")).toBe(false);
     expect(shows("", " *.lock , ,*.log ", "a.ts", "file")).toBe(true);
+    expect(shows("*.{ts,tsx}, docs/**", "", "app.ts", "file")).toBe(true);
+    expect(shows("*.{ts,tsx}, docs/**", "", "docs/a.md", "file")).toBe(true);
+    expect(shows("*.{ts,tsx}, docs/**", "", "app.js", "file")).toBe(false);
   });
 
   it("lets an include through the files inside a matching folder", () => {

@@ -1,0 +1,134 @@
+{
+  "cases": [
+    {
+      "pattern": "*.lock",
+      "path": "pnpm.lock",
+      "matches": true
+    },
+    {
+      "pattern": "*.lock",
+      "path": "web/pnpm.lock",
+      "matches": true
+    },
+    {
+      "pattern": "*.lock",
+      "path": "pnpm.lock.bak",
+      "matches": false
+    },
+    {
+      "pattern": "web/*.lock",
+      "path": "web/pnpm.lock",
+      "matches": true
+    },
+    {
+      "pattern": "web/*.lock",
+      "path": "web/sub/pnpm.lock",
+      "matches": false
+    },
+    {
+      "pattern": "web/**/*.lock",
+      "path": "web/pnpm.lock",
+      "matches": true
+    },
+    {
+      "pattern": "web/**/*.lock",
+      "path": "web/sub/deep/pnpm.lock",
+      "matches": true
+    },
+    {
+      "pattern": "file?.ts",
+      "path": "file1.ts",
+      "matches": true
+    },
+    {
+      "pattern": "file?.ts",
+      "path": "file10.ts",
+      "matches": false
+    },
+    {
+      "pattern": "node_modules",
+      "path": "a/node_modules",
+      "matches": true
+    },
+    {
+      "pattern": "build/",
+      "path": "build/out.js",
+      "matches": true
+    },
+    {
+      "pattern": "build/",
+      "path": "build",
+      "matches": false
+    },
+    {
+      "pattern": "src/**",
+      "path": "src/a/b.ts",
+      "matches": true
+    },
+    {
+      "pattern": "src/",
+      "path": "vendor/src/a.ts",
+      "matches": false
+    },
+    {
+      "pattern": "**/src/**",
+      "path": "vendor/src/a.ts",
+      "matches": true
+    },
+    {
+      "pattern": "./src/*.ts",
+      "path": "src/a.ts",
+      "matches": false
+    },
+    {
+      "pattern": "/README.md",
+      "path": "README.md",
+      "matches": false
+    },
+    {
+      "pattern": "a.b",
+      "path": "axb",
+      "matches": false
+    },
+    {
+      "pattern": "a+b(c)",
+      "path": "a+b(c)",
+      "matches": true
+    },
+    {
+      "pattern": "*.{ts,tsx}",
+      "path": "src/app.tsx",
+      "matches": true
+    },
+    {
+      "pattern": "*.{ts,tsx}",
+      "path": "src/app.js",
+      "matches": false
+    },
+    {
+      "pattern": "{x",
+      "path": "{x",
+      "matches": true
+    },
+    {
+      "pattern": "*.MD",
+      "path": "docs/app.md",
+      "matches": true
+    },
+    {
+      "pattern": "SRC/**",
+      "path": "src/a.ts",
+      "matches": true
+    },
+    {
+      "pattern": "**/**/**/x",
+      "path": "a/b/x",
+      "matches": true
+    },
+    {
+      "pattern": "**/**/**/x",
+      "path": "x",
+      "matches": true
+    }
+  ]
+}
