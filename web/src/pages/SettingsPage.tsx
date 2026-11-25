@@ -125,6 +125,7 @@ import {
   HIDE_UNCONFIGURED_HARNESSES_ENTRY,
   PEER_SESSION_MESSAGES_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
+  PLAYFUL_TOUCHES_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
@@ -256,6 +257,12 @@ import {
   DEFAULT_CODE_BLOCK_WORD_WRAP,
   writeCodeBlockWordWrap,
 } from "@/lib/codeWrapPreferences";
+import {
+  notifyPlayfulTouchesChanged,
+  PLAYFUL_TOUCHES_STORAGE_KEY,
+  usePlayfulTouches,
+  writePlayfulTouches,
+} from "@/lib/playfulTouchesPreferences";
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
@@ -1160,6 +1167,24 @@ function FoldAssistantNarrationControl() {
   );
 }
 
+/** On by default: Otto's welcome, Done marks, friendly empty lanes and milestone notes. */
+function PlayfulTouchesControl() {
+  const enabled = usePlayfulTouches();
+  return (
+    <SettingsItem entry={PLAYFUL_TOUCHES_ENTRY} className="flex items-start justify-between gap-6">
+      <SettingsEntryLabel entry={PLAYFUL_TOUCHES_ENTRY} />
+      <Switch
+        {...settingsControlProps(PLAYFUL_TOUCHES_ENTRY)}
+        checked={enabled}
+        onCheckedChange={writePlayfulTouches}
+        data-testid="playful-touches-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.playful_touches"
+      />
+    </SettingsItem>
+  );
+}
+
 /** On by default: expanded project folders list a page of sessions behind "Show more". */
 function ProjectFolderPaginationControl() {
   const collapse = useProjectFolderCollapse();
@@ -1294,6 +1319,7 @@ function AppearanceSection() {
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          PLAYFUL_TOUCHES_STORAGE_KEY,
           PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
           PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
           SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
@@ -1306,6 +1332,7 @@ function AppearanceSection() {
       }
       // As with import: a same-tab write fires no storage event.
       notifyHiddenPickerAgentsChanged();
+      notifyPlayfulTouchesChanged();
     }
     applyStoredUiFontSize();
 
@@ -1357,6 +1384,9 @@ function AppearanceSection() {
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <ColorThemeControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <PlayfulTouchesControl />
             </div>
           </SettingsGroup>
 

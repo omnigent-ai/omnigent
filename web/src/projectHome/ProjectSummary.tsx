@@ -34,6 +34,7 @@ import { useProjectMandate } from "./ProjectMandateDialog";
 import { type ProjectHomeView, projectRulesPath } from "./projectHomeNavigation";
 import { TicketLoadError } from "./TicketControls";
 import { TicketMarkdown } from "./ticketImages";
+import { ProjectMilestoneNote } from "./ProjectMilestoneNote";
 import { useTicketProject } from "./useProjectTickets";
 
 /** The project's Summary tab: its charter, headline numbers, KPIs and per-member table. */
@@ -64,6 +65,7 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
     );
   return (
     <div className="mx-auto w-full max-w-5xl space-y-8 px-1 pb-10" data-testid="project-summary">
+      <ProjectMilestoneNote projectId={projectId} />
       <ProjectCharter projectName={projectName} projectId={projectId} summary={summary.data} />
       <section aria-label="Headline numbers" className="space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">

@@ -188,6 +188,15 @@ export const SHOW_FINAL_ANSWER_ENTRY = settingsEntry({
   keywords: ["fold", "progress", "narration", "worked", "transcript", "collapse"],
 });
 
+export const PLAYFUL_TOUCHES_ENTRY = settingsEntry({
+  id: "playful-touches",
+  section: "appearance",
+  label: "Playful touches",
+  description:
+    "Show Otto's small touches: a welcome on a new project's board, a Done mark on finished tickets you asked for, friendlier empty lanes and milestone notes.",
+  keywords: ["playful", "whimsy", "otto", "mascot", "fun", "celebration", "milestone"],
+});
+
 export const WORKSPACE_PANEL_DEFAULT_ENTRY = settingsEntry({
   id: "workspace-panel-default",
   section: "appearance",
@@ -270,6 +279,7 @@ export const APPEARANCE_SETTINGS = [
   PICKER_VISIBILITY_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
   PEER_SESSION_MESSAGES_ENTRY,
+  PLAYFUL_TOUCHES_ENTRY,
   WORKSPACE_PANEL_DEFAULT_ENTRY,
   WORKSPACE_TABS_ENTRY,
   DEFAULT_WORKSPACE_TAB_ENTRY,

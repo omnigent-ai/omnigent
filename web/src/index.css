@@ -2372,6 +2372,25 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+/* A finished ticket's Otto wiggles once, then rests. The reduced-motion gate below stops it. */
+@keyframes otto-wiggle {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(-12deg);
+  }
+  60% {
+    transform: rotate(9deg);
+  }
+}
+
+.otto-wiggle {
+  transform-origin: 50% 60%;
+  animation: otto-wiggle 0.7s ease-in-out 0.3s 1;
+}
+
 .otto-working .otto-eye {
   /* fill-box puts the origin at each eye's own center so the blink collapses in place. */
   transform-box: fill-box;

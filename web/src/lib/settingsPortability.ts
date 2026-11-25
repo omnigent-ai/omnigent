@@ -17,6 +17,10 @@ import {
   notifyFoldAssistantNarrationChanged,
 } from "./foldNarrationPreferences";
 import {
+  notifyPlayfulTouchesChanged,
+  PLAYFUL_TOUCHES_STORAGE_KEY,
+} from "./playfulTouchesPreferences";
+import {
   notifyPeerSessionMessageDisplayChanged,
   PEER_SESSION_MESSAGES_STORAGE_KEY,
 } from "./peerSessionMessagePreferences";
@@ -60,6 +64,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  PLAYFUL_TOUCHES_STORAGE_KEY,
   PEER_SESSION_MESSAGES_STORAGE_KEY,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
@@ -190,6 +195,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyHiddenPickerAgentsChanged();
   notifyProjectFolderPaginationChanged();
   notifyFoldAssistantNarrationChanged();
+  notifyPlayfulTouchesChanged();
   notifyCodeBlockWordWrapChanged();
   notifyPeerSessionMessageDisplayChanged();
   notifySessionRowQuickActionsChanged();

@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -31,6 +31,8 @@ import { shownLoadError, TicketError, TicketLabels, TicketLoadError } from "./Ti
 import { TicketShipBlocker } from "./TicketShipBlocker";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import { TicketAgentIcons, TicketAgentIconsSpace } from "./TicketAgentIcons";
+import { OttoDoneMark, TidePoolScene } from "@/components/TidePool";
+import { usePlayfulTouches } from "@/lib/playfulTouchesPreferences";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
 import { NEEDS_YOU_PARAM } from "./needsYouFilter";
 import { ticketPanelSearch } from "./projectHomeNavigation";
@@ -125,6 +127,16 @@ function TicketBoard({
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const lifecycle = useTicketLifecycleEnabled();
   const configuration = useTicketStages(projectId);
+  // Each lane reports how many tickets it holds, from the query it already runs; a project
+  // whose lanes are all empty gets the first-job welcome. No extra request.
+  const [laneCounts, setLaneCounts] = useState<Record<string, number | null>>({});
+  const reportLaneCount = useCallback(
+    (stageId: string, count: number | null) =>
+      setLaneCounts((current) => (current[stageId] === count ? current : { ...current, [stageId]: count })),
+    [],
+  );
+  const stageIds = configuration.data?.stages.map((stage) => stage.id) ?? [];
+  const projectEmpty = stageIds.length > 0 && stageIds.every((id) => laneCounts[id] === 0);
   const stages = configuration.data?.stages ?? [];
   const boardRef = useRef<HTMLDivElement>(null);
   const boardWidth = useContentWidth(boardRef);
@@ -239,6 +251,8 @@ function TicketBoard({
               }
               selectionPending={selectionPending}
               mine={mine}
+              projectEmpty={projectEmpty}
+              onCountChange={reportLaneCount}
             />
           ))}
         </div>
@@ -274,6 +288,8 @@ function TicketColumn({
   filteredTickets,
   selectionPending,
   mine,
+  projectEmpty = false,
+  onCountChange,
 }: {
   projectId: string | null;
   stage: TicketStage;
@@ -293,11 +309,21 @@ function TicketColumn({
   selectionPending: boolean;
   /** Only the viewer's tickets. */
   mine: boolean;
+  /** The project has no tickets at all. */
+  projectEmpty?: boolean;
+  /** This lane's ticket count, or null while unknown or filtered. */
+  onCountChange?: (stageId: string, count: number | null) => void;
 }) {
   const [search] = useSearchParams();
+  const playful = usePlayfulTouches();
   const query = useTickets(projectId, stage.id, filteredTickets === undefined, mine);
   const tickets = filteredTickets ?? query.data?.pages.flatMap((page) => page.data) ?? [];
   const hasNextPage = filteredTickets === undefined && query.hasNextPage;
+  const laneCount =
+    filteredTickets !== undefined || mine || query.data === undefined
+      ? null
+      : (query.data.pages[0]?.total ?? (hasNextPage ? null : tickets.length));
+  useEffect(() => onCountChange?.(stage.id, laneCount), [onCountChange, stage.id, laneCount]);
   // The server's total for the lane; older servers only report what has loaded, plus "+".
   const total = filteredTickets === undefined ? query.data?.pages[0]?.total : undefined;
   const count = total ?? `${tickets.length}${hasNextPage ? "+" : ""}`;
@@ -410,14 +436,20 @@ function TicketColumn({
             related={relatedIds.has(ticket.id)}
             onHover={onHover}
             onFocus={onFocus}
+            finished={stage.is_complete}
           />
         ))}
         {!selectionPending &&
           (filteredTickets !== undefined ||
             (!loadError && (!projectId || query.data !== undefined))) &&
-          tickets.length === 0 && (
-            <p className="px-2 py-4 text-sm text-muted-foreground">No tickets</p>
-          )}
+          tickets.length === 0 &&
+          (playful && initial && projectEmpty && filteredTickets === undefined && !mine ? (
+            <NewProjectWelcome />
+          ) : (
+            <p className="px-2 py-4 text-sm text-muted-foreground">
+              {playful ? emptyLaneLine(stage, initial) : "No tickets"}
+            </p>
+          ))}
         {hasNextPage && (
           <Button
             variant="ghost"
@@ -448,6 +480,7 @@ function TicketCard({
   related,
   onHover,
   onFocus,
+  finished = false,
 }: {
   ticket: ProjectTicket;
   selected: boolean;
@@ -456,6 +489,8 @@ function TicketCard({
   related: boolean;
   onHover: (id: string | null) => void;
   onFocus: (id: string | null) => void;
+  /** In the project's completed stage. */
+  finished?: boolean;
 }) {
   const [search] = useSearchParams();
   const { setNodeRef, listeners, attributes, isDragging } = useDraggable({
@@ -491,7 +526,7 @@ function TicketCard({
           isDragging && "opacity-40",
         )}
       >
-        <TicketCardContent ticket={ticket} />
+        <TicketCardContent ticket={ticket} finished={finished} />
       </Link>
       {/* Over the card's footer corner, outside the link so each icon stays its own control. */}
       <TicketAgentIcons ticket={ticket} className="absolute right-3.5 bottom-3" />
@@ -499,8 +534,10 @@ function TicketCard({
   );
 }
 
-function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
+function TicketCardContent({ ticket, finished = false }: { ticket: ProjectTicket; finished?: boolean }) {
   const now = useNow();
+  const playful = usePlayfulTouches();
+  const showDone = playful && finished && isRecentlyFinishedForViewer(ticket, now.getTime());
   const isNew = useContext(NewTicketContext)(ticket);
   return (
     <>
@@ -539,6 +576,7 @@ function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
           <TicketRequester ticket={ticket} />
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {showDone && <OttoDoneMark />}
           <TicketCommentCount ticket={ticket} />
           {/* Room for the agent icons drawn over this corner. */}
           <TicketAgentIconsSpace ticket={ticket} />
@@ -596,6 +634,38 @@ function TicketRequester({ ticket }: { ticket: ProjectTicket }) {
     >
       by {label}
     </span>
+  );
+}
+
+/** How long a finished ticket you asked for keeps Otto's Done mark. */
+export const DONE_MARK_MS = 24 * 60 * 60 * 1000;
+
+/** A ticket the viewer asked for that reached the completed stage within the last day. */
+export function isRecentlyFinishedForViewer(ticket: ProjectTicket, nowMs: number): boolean {
+  const viewer = getCurrentUserId();
+  if (!viewer || ticket.requested_by !== viewer) return false;
+  return nowMs - ticket.updated_at * 1000 < DONE_MARK_MS;
+}
+
+/** A neutral line for an empty lane; it says where the lane sits, never that work is late. */
+export function emptyLaneLine(stage: TicketStage, initial: boolean): string {
+  if (stage.is_complete) return "Nothing finished yet.";
+  if (initial) return "Nothing new right now.";
+  return `Nothing in ${stage.name} right now.`;
+}
+
+function NewProjectWelcome() {
+  return (
+    <div
+      className="flex flex-col items-center gap-2 px-2 pt-4 pb-2 text-center"
+      data-testid="new-project-welcome"
+    >
+      <TidePoolScene className="w-44" />
+      <p className="font-semibold text-foreground">Your factory is ready</p>
+      <p className="max-w-56 text-sm text-muted-foreground">
+        Describe the first job, and the factory takes it from there.
+      </p>
+    </div>
   );
 }
 
