@@ -1,0 +1,28 @@
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("./GoToFileDialog", () => ({ GoToFileDialog: () => null }));
+const { nextOpenRequest } = await import("./GoToFileHost");
+
+const files = { id: 1, kind: "files" as const };
+const text = { id: 2, kind: "text" as const };
+
+describe("nextOpenRequest", () => {
+  it("opens on the mode asked for, with the request's text", () => {
+    expect(nextOpenRequest(null, { ...text, query: "needle" })).toEqual({
+      key: 2,
+      query: "needle",
+      mode: "text",
+    });
+  });
+
+  it("switches to the other mode in place, keeping the opening", () => {
+    const open = nextOpenRequest(null, files)!;
+    expect(nextOpenRequest(open, { ...text, toggle: true })).toEqual({ ...open, mode: "text" });
+  });
+
+  it("closes from the showing mode's chord, and stays open for its ⌘K row", () => {
+    const open = nextOpenRequest(null, text)!;
+    expect(nextOpenRequest(open, { ...text, id: 3, toggle: true })).toBeNull();
+    expect(nextOpenRequest(open, { ...text, id: 3 })).toBe(open);
+  });
+});
