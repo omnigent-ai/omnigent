@@ -3578,7 +3578,8 @@ describe("chatStore — send (first-send ordering)", () => {
       // The stream stays up meanwhile, partway through a reply.
       streams[0]!.push(previewDelta("Hello ", 0));
       streams[0]!.push(previewDelta("wor", 1));
-      await vi.advanceTimersByTimeAsync(10);
+      // Later chunks commit on the next animation frame.
+      await vi.advanceTimersByTimeAsync(20);
       const preview = () =>
         entry
           .getState()
@@ -20476,6 +20477,83 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     expect(prov?.fullText).toBe("Hello world");
     expect(useChatStore.getState().blocks.filter((b) => b.type === "text_chunk")).toEqual([]);
 
+    controller.abort();
+  });
+
+  it("keeps every chunk in order when a frame's chunks commit together", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_order",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_order");
+    sink.push(sse("response.created", { id: "resp_o", status: "in_progress", output: [] }));
+    const chunks = ["# Title\n\n", "- one ", "- two ", "```py\n", "x = 1\n", "```\n"];
+    chunks.forEach((chunk, index) => sink.push(nativeDelta("m1", index, chunk, false)));
+    await tick();
+    manual.fire();
+
+    expect(provisional()).toMatchObject({
+      fullText: chunks.join(""),
+      streamIndex: chunks.length - 1,
+      hasCodeBlocks: true,
+    });
+    expect(provisional()?.previewInterrupted).toBeUndefined();
+
+    sink.push(nativeDelta("m1", chunks.length, "done", true));
+    await tick();
+    expect(provisional()?.fullText).toBe(`${chunks.join("")}done`);
+    controller.abort();
+  });
+
+  it("commits a frame's later chunks in one store update", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_frame",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_frame");
+    sink.push(nativeDelta("m1", 0, "a ", false));
+    await tick();
+    // The first chunk paints without waiting for a frame.
+    expect(provisional()?.fullText).toBe("a ");
+
+    let commits = 0;
+    const unsubscribe = useChatStore.subscribe(() => {
+      commits += 1;
+    });
+    for (const [index, chunk] of ["b ", "c ", "d "].entries()) {
+      sink.push(nativeDelta("m1", index + 1, chunk, false));
+    }
+    await tick();
+    expect(commits).toBe(0);
+    manual.fire();
+    unsubscribe();
+    expect(commits).toBe(1);
+    expect(provisional()?.fullText).toBe("a b c d ");
+    controller.abort();
+  });
+
+  it("lands buffered chunks before the authoritative item replaces the preview", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_buffered_done",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_buffered_done");
+    sink.push(sse("response.created", { id: "resp_d", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "one ", false));
+    sink.push(nativeDelta("m1", 1, "two ", false));
+    sink.push(nativeDelta("m1", 2, "three", false));
+    sink.push(messageDone("ci_1", "resp_d", "one two three", "m1"));
+    await tick();
+    manual.fire();
+
+    // The committed item replaces the preview, and no later frame recreates it.
+    expect(provisional()).toBeUndefined();
+    const text = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
+    expect(text).toHaveLength(1);
+    expect(text[0]).toMatchObject({ ctx: { itemId: "ci_1" }, fullText: "one two three" });
     controller.abort();
   });
 
