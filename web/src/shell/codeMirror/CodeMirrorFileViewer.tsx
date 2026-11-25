@@ -86,11 +86,12 @@ import {
 } from "./useCodeMirrorCommentLayer";
 import { shikiDecorations } from "./shikiDecorations";
 import { viewportHighlighting } from "./viewportHighlighting";
+import { FIND_AND_REPLACE_LABEL, FIND_IN_FILE_LABEL } from "./editorContextMenuEntries";
+import { EditorContextMenu } from "./EditorContextMenu";
 import { columnSelection } from "./columnSelection";
 import { matchingBrackets } from "./codeMirrorBracketMatching";
 
-export const FIND_IN_FILE_LABEL = "Find in file";
-export const FIND_AND_REPLACE_LABEL = "Find and replace in file";
+export { FIND_AND_REPLACE_LABEL, FIND_IN_FILE_LABEL };
 
 // The file viewer routes Cmd+F to the find bar itself and steps matches through
 // its index below; the editor keeps the other search keys (Mod-d, Escape).
@@ -255,6 +256,15 @@ export function CodeMirrorFileViewer({
       openSearchPanel(target);
     }
     return true;
+  };
+  // Find from the right-click menu: opens the bar, or refocuses its query when it is open.
+  const openFindFromMenu = (target: EditorView) => {
+    if (!searchPanelOpen(target.state)) {
+      openSearchPanel(target);
+      return;
+    }
+    setFindFocusTarget("query");
+    setFindFocusRequest((request) => request + 1);
   };
   // The editor's keymap is built once, so it reaches the latest handlers through refs.
   const openGoToLineRef = useRef(openGoToLine);
@@ -645,6 +655,15 @@ export function CodeMirrorFileViewer({
         )}
       </div>
       {commentLayer.actions}
+      <EditorContextMenu
+        view={editorView}
+        conversationId={conversationId}
+        editable={editable}
+        selectionActions={commentLayer.selectionActions}
+        onFind={openFindFromMenu}
+        onFindAndReplace={(target) => openFindAndReplaceRef.current(target)}
+        onGoToLine={(target) => openGoToLineRef.current(target)}
+      />
       {findHost &&
         view &&
         findIndex &&

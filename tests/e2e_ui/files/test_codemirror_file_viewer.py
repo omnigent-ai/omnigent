@@ -8,6 +8,7 @@ stronger. Seeded via the filesystem PUT endpoint (no agent run); the edge cases 
 the unit tests (``columnSelection``, ``codeMirrorBracketMatching``, ``indentGuides``).
 Scrolled into a nested block, the lines opening its scopes stay pinned at the top, and
 clicking one scrolls back to it (``indentationScopes``, ``codeMirrorStickyScroll``).
+Right-click opens the editor's own menu of the ⌘K commands (``EditorContextMenu``).
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ _NESTED_SOURCE = "\n".join(
         "    return None",
     ]
 )
+_MENU_PATH = "src/menu.py"
+_MENU_SOURCE = 'def greet(name):\n    return "hello " + name\n'
 # Larger than the server's 10 MiB read cap, so the file arrives truncated and opens read-only.
 _LARGE_PATH = "src/generated_tables.ts"
 _LARGE_SOURCE = "\n".join(
@@ -60,6 +63,7 @@ _SEEDED = {
     _COLUMNS_PATH: _COLUMNS_SOURCE,
     _BLOCKS_PATH: _BLOCKS_SOURCE,
     _NESTED_PATH: _NESTED_SOURCE,
+    _MENU_PATH: _MENU_SOURCE,
 }
 
 
@@ -194,6 +198,18 @@ def test_a_nested_block_pins_its_scopes_and_a_click_scrolls_back_to_one(
     expect(pinned).to_have_count(0)
     expect(editor.locator(".cm-activeLine")).to_have_text("class Inventory:")
 
+    # A right-click on a pinned row targets that line too, not the hidden text under it.
+    scroller.evaluate("(node) => { node.scrollTop = 1500; }")
+    expect(pinned).to_have_count(3)
+    pinned.nth(1).click(button="right")
+    menu = page.get_by_test_id("file-editor-context-menu")
+    expect(menu).to_be_visible()
+    expect(editor.locator(".cm-activeLine")).to_have_text(re.compile(r"def restock"))
+    page.keyboard.press("Escape")
+    expect(menu).to_have_count(0)
+    # Line 2 goes back under line 1's row, which is the top of the file here.
+    page.wait_for_function("(node) => node.scrollTop < 10", arg=scroller.element_handle())
+
 
 def test_sticky_scroll_follows_the_saved_choice(page: Page, code_session: tuple[str, str]) -> None:
     """A device that turned sticky scroll off pins nothing, however deep the text scrolls."""
@@ -218,3 +234,22 @@ def test_sticky_scroll_follows_the_saved_choice(page: Page, code_session: tuple[
     )
     assert "self.count[item] +=" in top_line, top_line
     expect(editor.locator(".cm-stickyScroll-line")).to_have_count(0)
+
+
+def test_right_click_lists_the_editors_commands(page: Page, code_session: tuple[str, str]) -> None:
+    """Right-click lists the editor's commands; Toggle line comment acts on the clicked line."""
+    base_url, session_id = code_session
+    editor = _open_file(page, base_url, session_id, _MENU_PATH)
+    lines = editor.locator(".cm-line")
+    expect(lines.nth(1)).to_have_text('    return "hello " + name', timeout=30_000)
+    menu = page.get_by_test_id("file-editor-context-menu")
+
+    # Right-click moves the cursor to the line, and Toggle line comment acts there.
+    lines.nth(1).click(button="right")
+    expect(menu).to_be_visible()
+    menu.get_by_role("menuitem", name=re.compile("^Toggle line comment")).click()
+    expect(menu).to_have_count(0)
+    expect(lines.nth(1)).to_have_text('    # return "hello " + name')
+    expect(editor.locator(".cm-content")).to_be_focused()
+
+    _wait_for_persisted(base_url, session_id, _MENU_PATH, '    # return "hello " + name')
