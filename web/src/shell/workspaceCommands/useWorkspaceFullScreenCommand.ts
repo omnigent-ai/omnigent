@@ -25,11 +25,18 @@ function loadRuntime(): Promise<FullScreenRuntime> {
   runtime ??= Promise.all([
     import("./model"),
     import("@/shell/workspaceTabs/workspaceSidebarShortcuts"),
-  ]).then(([model, shortcuts]) => ({
-    command: (fullScreen) => model.workspaceFullScreenCommand({ fullScreen }),
-    matchesChord: (event, mac) =>
-      shortcuts.matchesShortcut(event, "workspace.toggleFullScreen", { mac }),
-  }));
+  ]).then(
+    ([model, shortcuts]) => ({
+      command: (fullScreen) => model.workspaceFullScreenCommand({ fullScreen }),
+      matchesChord: (event, mac) =>
+        shortcuts.matchesShortcut(event, "workspace.toggleFullScreen", { mac }),
+    }),
+    (error: unknown) => {
+      // A chunk that failed to load, such as after a deploy, is tried again on the next mount.
+      runtime = null;
+      throw error;
+    },
+  );
   return runtime;
 }
 
@@ -54,9 +61,12 @@ export function useWorkspaceFullScreenCommand(
   useEffect(() => {
     if (!available || loaded) return;
     let current = true;
-    void loadRuntime().then((next) => {
-      if (current) setLoaded(next);
-    });
+    loadRuntime().then(
+      (next) => {
+        if (current) setLoaded(next);
+      },
+      (error: unknown) => console.warn("[workspace] full screen is unavailable:", error),
+    );
     return () => {
       current = false;
     };
