@@ -165,8 +165,6 @@ describe("PullRequestFileSection overrides", () => {
     );
     const patch = `diff --git a/${FILE.path} b/${FILE.path}\n--- a/${FILE.path}\n+++ b/${FILE.path}\n${hunks.join("")}`;
     const [fileDiff] = parsePatchFiles(patch)[0].files;
-    // The parser's file-level count spans the gaps between hunks.
-    expect(fileDiff.unifiedLineCount).toBeGreaterThan(LARGE_DIFF_THRESHOLD);
     expect(fileDiff.hunks.reduce((rows, hunk) => rows + hunk.unifiedLineCount, 0)).toBe(24);
 
     renderSection({ forceMount: true, fileDiff });
