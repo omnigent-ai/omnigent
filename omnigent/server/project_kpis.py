@@ -354,7 +354,7 @@ def load_series(
                 SeriesItem(
                     None if merge.merged_at is None else int(merge.merged_at),
                     merge.key,
-                    "ticket" if merge.key.startswith("ticket:") else "pull_request",
+                    "pull_request",
                     member=getattr(merge, "member", None),
                     claimed_by=tuple(getattr(merge, "claimed_by", ())),
                 )

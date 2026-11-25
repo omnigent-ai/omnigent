@@ -5,11 +5,10 @@ Two sources, deduplicated by canonical PR URL:
 - **Session PRs:** pull requests linked to the project's sessions (the session
   Pull Requests panel), once a host fetch has found them merged. The merge time is
   that first fetch, so it can trail the real merge by the host's polling interval.
-- **Merged tickets:** tickets currently in a project's completed stage when that
-  stage is the Merged stage (id or name ``merged``). A ticket's ``pull_request``
-  outputs count as its PRs; a ticket without one counts once as itself. The merge
-  time is its latest move into that stage. In a project whose completed stage is
-  something else (e.g. "Done"), only tickets with PR outputs count.
+- **Merged tickets:** tickets currently in a project's completed stage (e.g.
+  "Merged" or "Done"). A ticket's ``pull_request`` outputs count as its PRs, dated
+  by its latest move into that stage. A ticket without one counts nothing here:
+  analysis and decision tickets finish without a PR.
 
 **Attribution** (via :func:`project_status.member_key_for_session`, on the root
 session): a PR in a session's panel goes to the session that ``created`` it, else
@@ -90,7 +89,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-MERGED_STAGE = "merged"
 # Rows older than this are recomputed in the background on the next read.
 _STALE_AFTER_S = 900
 # A burst of writes to one project waits this long so it costs one recompute.
@@ -98,6 +96,8 @@ _REFRESH_COALESCE_S = 2.0
 _PR_KEY_MAX_CHARS = 512
 # Stored rows removed per DELETE, under SQLite's bound-parameter limit.
 _DELETE_CHUNK = 500
+# Rows stored for PR-less tickets before they stopped counting; the next refresh deletes them.
+_COUNTED_ROW = ~SqlProjectMergedPr.pr_key.startswith("ticket:")
 _PR_PATH = re.compile(
     r"^/(?P<repo>[^/]+/[^/]+(?:/[^/]+)*?)/(?:pull|pulls|merge_requests|-/merge_requests)/(?P<number>\d+)"
 )
@@ -130,18 +130,17 @@ class SessionMergedPr:
 
 @dataclass(frozen=True)
 class MergedTicket:
-    """A ticket in the Merged stage (or with PR outputs in a completed stage)."""
+    """A ticket in the completed stage with its PR outputs."""
 
     ticket_id: str
     merged_at: int
     pr_urls: tuple[str, ...]
     linked_session_ids: tuple[str, ...]
-    counts_without_pr: bool
 
 
 @dataclass(frozen=True)
 class MergedItem:
-    """One counted merge: a PR by canonical URL, or ``ticket:<id>`` for a PR-less ticket."""
+    """One counted merge: a PR by its canonical URL."""
 
     key: str
     merged_at: float | None
@@ -185,10 +184,7 @@ def combine(
             ),
             None,
         )
-        keys = [canonical_pr_url(url) for url in ticket.pr_urls]
-        if not keys and ticket.counts_without_pr:
-            keys = [f"ticket:{ticket.ticket_id}"]
-        for key in keys:
+        for key in (canonical_pr_url(url) for url in ticket.pr_urls):
             known = items.get(key)
             if known is None:
                 items[key] = MergedItem(key, ticket.merged_at, worker, (ticket.ticket_id,))
@@ -271,6 +267,7 @@ class ProjectPrsMergedSource:
                     SqlProjectMergedPr.workspace_id == current_workspace_id(),
                     SqlProjectMergedPr.project_id == _hex(project.id),
                     in_window,
+                    _COUNTED_ROW,
                 )
                 .group_by(SqlProjectMergedPr.member_key)
             ).all()
@@ -304,6 +301,7 @@ class ProjectPrsMergedSource:
                     SqlProjectMergedPr.workspace_id == current_workspace_id(),
                     SqlProjectMergedPr.project_id == _hex(project.id),
                     dated,
+                    _COUNTED_ROW,
                 )
             ).all()
         return [
@@ -446,10 +444,6 @@ class ProjectPrsMergedSource:
         completed = next((stage for stage in reversed(stages) if stage.get("is_complete")), None)
         if completed is None:
             return []
-        is_merged_stage = MERGED_STAGE in (
-            str(completed["id"]).lower(),
-            str(completed["name"]).lower(),
-        )
         project_hex = _hex(project.id)
         # Move dates from the indexed stage-move table, so only PR outputs need decoding.
         latest_moves = self._tickets.latest_moves_into(
@@ -528,11 +522,10 @@ class ProjectPrsMergedSource:
                 moved_at[ticket_id],
                 tuple(pr_urls.get(ticket_id, ())),
                 tuple(linked.get(ticket_id, ())),
-                counts_without_pr=is_merged_stage,
             )
             for ticket_id in ticket_ids
             # A ticket stored in the stage without a recorded move (imported, legacy) is undated.
-            if ticket_id in moved_at
+            if ticket_id in moved_at and ticket_id in pr_urls
         ]
 
     def _member_resolver(self, project: Project) -> Callable[[str], MemberKey | None]:

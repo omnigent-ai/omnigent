@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import time
 from types import SimpleNamespace
 from uuid import uuid4
@@ -60,7 +61,7 @@ def test_one_pr_in_both_sources_counts_once_for_its_creator() -> None:
     members = {"creator": "user:a", "attacher": "user:b", "worker": "identity:w"}
     items = combine(
         [_session_pr("attacher", "attached", 50.0), _session_pr("creator", "created", 60.0)],
-        [MergedTicket("t1", 70, (PR + "/files",), ("worker",), counts_without_pr=True)],
+        [MergedTicket("t1", 70, (PR + "/files",), ("worker",))],
         members.get,
     )
     assert [(item.key, item.merged_at, item.member) for item in items] == [(PR, 50.0, "user:a")]
@@ -68,29 +69,34 @@ def test_one_pr_in_both_sources_counts_once_for_its_creator() -> None:
     assert items[0].claimed_by == ("attacher", "creator", "t1")
 
 
-def test_tickets_credit_their_first_non_lead_session_or_nobody() -> None:
+def test_ticket_prs_credit_their_first_non_lead_session_or_nobody() -> None:
     members = {"lead": LEAD_MEMBER_KEY, "worker": "identity:w"}
+    first, second = PR.replace("/7", "/1"), PR.replace("/7", "/2")
     items = combine(
         [],
         [
-            MergedTicket("t1", 10, (), ("lead", "worker"), counts_without_pr=True),
-            MergedTicket("t2", 10, (), ("lead",), counts_without_pr=True),
-            MergedTicket("t3", 10, (), ("worker",), counts_without_pr=False),
+            MergedTicket("t1", 10, (first,), ("lead", "worker")),
+            MergedTicket("t2", 10, (second,), ("lead",)),
         ],
         members.get,
     )
     assert [(item.key, item.member) for item in items] == [
-        ("ticket:t1", "identity:w"),
-        ("ticket:t2", None),
+        (first, "identity:w"),
+        (second, None),
     ]
+
+
+def test_a_completed_ticket_without_a_pr_counts_no_merge() -> None:
+    items = combine([], [MergedTicket("decision", 10, (), ("worker",))], {"worker": "user:a"}.get)
+    assert items == []
 
 
 def test_window_counts_dated_items_and_undated_ones_only_for_all_time() -> None:
     items = combine(
         [_session_pr("s", "created", None)],
         [
-            MergedTicket("old", NOW - 30 * DAY, (), (), True),
-            MergedTicket("new", NOW, (), (), True),
+            MergedTicket("old", NOW - 30 * DAY, (PR.replace("/7", "/10"),), ()),
+            MergedTicket("new", NOW, (PR.replace("/7", "/11"),), ()),
         ],
         {"s": "user:a"}.get,
     )
@@ -122,7 +128,13 @@ def setup(db_uri: str):
     return projects.get(project.id, user_id="alice"), tickets, conversations, state, db_uri
 
 
-def _merge_ticket(tickets, project, session_id, *, pr_url=None):
+_pr_numbers = itertools.count(1000)
+
+
+def _merge_ticket(tickets, project, session_id, *, pr_url: str | None = ""):
+    """Merge a new ticket linked to *session_id*; with ``pr_url=None`` it has no PR."""
+    if pr_url == "":
+        pr_url = f"https://github.com/example/repo/pull/{next(_pr_numbers)}"
     actor = TicketActor("alice", session_id)
     ticket = tickets.create(project.id, CreateTicket(title="Work"), actor)
     tickets.link_session(project.id, ticket["id"], session_id, "attach", actor)
@@ -353,6 +365,8 @@ def test_overlong_pr_keys_are_stored_hashed() -> None:
 def test_a_refresh_writes_only_the_rows_that_changed(setup, monkeypatch) -> None:
     project, tickets, _conversations, state, db_uri = setup
     _person, other = _seed(setup)
+    reopened_pr, added_pr = PR.replace("/7", "/70"), PR.replace("/7", "/71")
+    reopened = _merge_ticket(tickets, project, other, pr_url=reopened_pr)
     source = build_source(state)
     source.refresh(project)
 
@@ -370,15 +384,56 @@ def test_a_refresh_writes_only_the_rows_that_changed(setup, monkeypatch) -> None
     before = stored()
     later = int(time.time()) + 100
     monkeypatch.setattr(project_status_prs.time, "time", lambda: later)
-    reopened = next(key for key in before if key.startswith("ticket:")).removeprefix("ticket:")
+    assert reopened_pr in before
     tickets.update(project.id, reopened, UpdateTicket(stage_id="open"), TicketActor("alice"))
-    added = _merge_ticket(tickets, project, other)
+    _merge_ticket(tickets, project, other, pr_url=added_pr)
     source.refresh(project)
     after = stored()
-    assert f"ticket:{reopened}" not in after
-    assert after[f"ticket:{added}"][1] == later
-    unchanged = before.keys() - {f"ticket:{reopened}"}
+    assert reopened_pr not in after
+    assert after[added_pr][1] == later
+    unchanged = before.keys() - {reopened_pr}
     assert {key: after[key] for key in unchanged} == {key: before[key] for key in unchanged}
     assert sorted(source.merged_items(project), key=lambda item: item.key) == sorted(
         source.compute_items(project), key=lambda item: item.key
     )
+
+
+def test_a_no_pr_ticket_in_merged_counts_nothing_and_old_rows_for_one_are_ignored(setup) -> None:
+    project, tickets, conversations, state, db_uri = setup
+    worker = uuid4().hex
+    conversations.create_conversation(conversation_id=worker, project_id=project.id)
+    decision = _merge_ticket(tickets, project, worker, pr_url=None)
+    shipped = _merge_ticket(tickets, project, worker, pr_url=PR)
+    source = build_source(state)
+    every = status_period("all", NOW + 60)
+    assert source.prs_merged(project, every).total == 1
+    assert [item.key for item in source.merged_items(project)] == [PR]
+    assert [item.claimed_by for item in source.compute_items(project)] == [(shipped,)]
+    # A row an older server stored for the PR-less ticket doesn't count, and a refresh drops it.
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            sa.insert(SqlProjectMergedPr).values(
+                workspace_id=current_workspace_id(),
+                project_id=project.id,
+                pr_key=f"ticket:{decision}",
+                merged_at=NOW,
+                member_key=None,
+                claimed_by=decision,
+                updated_at=NOW,
+            )
+        )
+    project_status_cache.clear()
+    assert source.prs_merged(project, every).total == 1
+    assert [item.key for item in source.merged_items(project)] == [PR]
+    source.refresh(project)
+    with get_or_create_engine(db_uri).connect() as connection:
+        keys = (
+            connection.execute(
+                sa.select(SqlProjectMergedPr.pr_key).where(
+                    SqlProjectMergedPr.project_id == project.id
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert keys == [PR]
