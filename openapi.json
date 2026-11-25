@@ -6434,6 +6434,55 @@
         "title": "PermissionObject",
         "type": "object"
       },
+      "PersonActivity": {
+        "properties": {
+          "messages_to_lead": {
+            "format": "int64",
+            "title": "Messages To Lead",
+            "type": "integer"
+          },
+          "messages_to_roles": {
+            "format": "int64",
+            "title": "Messages To Roles",
+            "type": "integer"
+          },
+          "sessions_started": {
+            "format": "int64",
+            "title": "Sessions Started",
+            "type": "integer"
+          },
+          "side_chats_opened": {
+            "format": "int64",
+            "title": "Side Chats Opened",
+            "type": "integer"
+          },
+          "ticket_comments": {
+            "format": "int64",
+            "title": "Ticket Comments",
+            "type": "integer"
+          },
+          "tickets_filed": {
+            "format": "int64",
+            "title": "Tickets Filed",
+            "type": "integer"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "sessions_started",
+          "tickets_filed",
+          "messages_to_lead",
+          "messages_to_roles",
+          "side_chats_opened",
+          "ticket_comments"
+        ],
+        "title": "PersonActivity",
+        "type": "object"
+      },
       "PickerInfo": {
         "description": "How a deployment curates what the New Chat picker shows.\n\nDisplay only: it narrows the picker, never what exists. Every agent stays\nseeded, forkable and reachable through the API.",
         "properties": {
@@ -8528,6 +8577,90 @@
         "title": "ProjectStatusTotals",
         "type": "object"
       },
+      "ProjectTelemetry": {
+        "description": "One project's telemetry over a UTC window, from data Omnigent already keeps.",
+        "properties": {
+          "object": {
+            "const": "project.telemetry",
+            "title": "Object",
+            "type": "string"
+          },
+          "people": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PersonActivity"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "All people for the owner, the caller's own row for a member, null for agents.",
+            "title": "People"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "project_name": {
+            "title": "Project Name",
+            "type": "string"
+          },
+          "role_interaction": {
+            "$ref": "#/components/schemas/RoleInteraction"
+          },
+          "since_day_utc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Day Utc"
+          },
+          "team_building": {
+            "$ref": "#/components/schemas/TeamBuilding"
+          },
+          "throughput": {
+            "$ref": "#/components/schemas/Throughput"
+          },
+          "today_utc": {
+            "title": "Today Utc",
+            "type": "string"
+          },
+          "window": {
+            "enum": [
+              "7d",
+              "30d",
+              "all"
+            ],
+            "title": "Window",
+            "type": "string"
+          },
+          "work_start": {
+            "$ref": "#/components/schemas/WorkStart"
+          }
+        },
+        "required": [
+          "object",
+          "project_id",
+          "project_name",
+          "window",
+          "since_day_utc",
+          "today_utc",
+          "work_start",
+          "role_interaction",
+          "team_building",
+          "throughput",
+          "people"
+        ],
+        "title": "ProjectTelemetry",
+        "type": "object"
+      },
       "ProposeMandateRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/projects/{project_id}/mandate/proposals`.",
@@ -9191,6 +9324,86 @@
           "error"
         ],
         "title": "RetryEvent",
+        "type": "object"
+      },
+      "RoleInteraction": {
+        "description": "How people talk to the Lead and roles. Message counts are null in single-user mode.",
+        "properties": {
+          "messages_to_lead": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messages To Lead"
+          },
+          "messages_to_roles": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Messages To Roles"
+          },
+          "people_messaging_roles": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "People Messaging Roles"
+          },
+          "people_ticket_only": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "People who commented on tickets but never chatted with the Lead or a role.",
+            "title": "People Ticket Only"
+          },
+          "side_chats_opened": {
+            "format": "int64",
+            "title": "Side Chats Opened",
+            "type": "integer"
+          },
+          "side_chats_with_roles": {
+            "format": "int64",
+            "title": "Side Chats With Roles",
+            "type": "integer"
+          },
+          "ticket_comments_by_people": {
+            "format": "int64",
+            "title": "Ticket Comments By People",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "messages_to_lead",
+          "messages_to_roles",
+          "people_messaging_roles",
+          "side_chats_opened",
+          "side_chats_with_roles",
+          "ticket_comments_by_people",
+          "people_ticket_only"
+        ],
+        "title": "RoleInteraction",
         "type": "object"
       },
       "RoutingDecisionData": {
@@ -17084,6 +17297,115 @@
         "title": "StoreHarnessCredentialRequest",
         "type": "object"
       },
+      "TeamBuilding": {
+        "description": "How the team of roles was built and adapted.",
+        "properties": {
+          "median_hours_to_last_role_edit": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Creation to last edit, over edited roles; earlier edits aren't kept yet.",
+            "title": "Median Hours To Last Role Edit"
+          },
+          "roles": {
+            "format": "int64",
+            "title": "Roles",
+            "type": "integer"
+          },
+          "roles_created_by_hand": {
+            "format": "int64",
+            "title": "Roles Created By Hand",
+            "type": "integer"
+          },
+          "roles_created_by_lead": {
+            "format": "int64",
+            "title": "Roles Created By Lead",
+            "type": "integer"
+          },
+          "roles_created_in_window": {
+            "format": "int64",
+            "title": "Roles Created In Window",
+            "type": "integer"
+          },
+          "roles_created_in_window_by_lead": {
+            "format": "int64",
+            "title": "Roles Created In Window By Lead",
+            "type": "integer"
+          },
+          "roles_edited_after_creation": {
+            "format": "int64",
+            "title": "Roles Edited After Creation",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "roles",
+          "roles_created_by_lead",
+          "roles_created_by_hand",
+          "roles_created_in_window",
+          "roles_created_in_window_by_lead",
+          "roles_edited_after_creation",
+          "median_hours_to_last_role_edit"
+        ],
+        "title": "TeamBuilding",
+        "type": "object"
+      },
+      "TelemetryOverview": {
+        "description": "Telemetry for every project the caller owns.",
+        "properties": {
+          "object": {
+            "const": "telemetry.overview",
+            "title": "Object",
+            "type": "string"
+          },
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectTelemetry"
+            },
+            "title": "Projects",
+            "type": "array"
+          },
+          "since_day_utc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Day Utc"
+          },
+          "today_utc": {
+            "title": "Today Utc",
+            "type": "string"
+          },
+          "window": {
+            "enum": [
+              "7d",
+              "30d",
+              "all"
+            ],
+            "title": "Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "window",
+          "since_day_utc",
+          "today_utc",
+          "projects"
+        ],
+        "title": "TelemetryOverview",
+        "type": "object"
+      },
       "TerminalCommandData": {
         "description": "Data payload for a runner-side terminal command (`!cmd`) observed\nin a harness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nClaude Code writes two sibling transcript records per `!cmd`\ninvocation: one `<bash-input>` record and one combined\n`<bash-stdout>`/`<bash-stderr>` record. Each maps to one\n`terminal_command` item with `kind=\"input\"` or\n`kind=\"output\"` respectively.",
         "properties": {
@@ -17137,6 +17459,101 @@
           "kind"
         ],
         "title": "TerminalCommandData",
+        "type": "object"
+      },
+      "Throughput": {
+        "description": "What the project shipped in the window; null when a source isn't on this server.",
+        "properties": {
+          "merged_prs": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Merged Prs"
+          },
+          "review_rounds_per_shipped_ticket": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Moves into a review stage per shipped ticket. A review stage is one whose ID or name contains 'review'; null when the project has none.",
+            "title": "Review Rounds Per Shipped Ticket"
+          },
+          "rework_tickets": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rework Tickets"
+          },
+          "spend_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spend Usd"
+          },
+          "stalled_tickets": {
+            "description": "In a working stage (not the first or a completed one) whose ticket hasn't been updated for 3+ days; any update, including a label change, resets the clock.",
+            "format": "int64",
+            "title": "Stalled Tickets",
+            "type": "integer"
+          },
+          "tickets_shipped": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tickets Shipped"
+          },
+          "time_to_merged_median_hours": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time To Merged Median Hours"
+          }
+        },
+        "required": [
+          "tickets_shipped",
+          "merged_prs",
+          "rework_tickets",
+          "time_to_merged_median_hours",
+          "spend_usd",
+          "review_rounds_per_shipped_ticket",
+          "stalled_tickets"
+        ],
+        "title": "Throughput",
         "type": "object"
       },
       "TicketLabel": {
@@ -18786,6 +19203,59 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "WorkStart": {
+        "description": "How people start work: sessions vs tickets.",
+        "properties": {
+          "people": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "description": "People who only started sessions, only filed tickets, or did both.",
+            "propertyNames": {
+              "enum": [
+                "session_first",
+                "ticket_first",
+                "both"
+              ]
+            },
+            "title": "People",
+            "type": "object"
+          },
+          "sessions_started_by_people": {
+            "format": "int64",
+            "title": "Sessions Started By People",
+            "type": "integer"
+          },
+          "tickets_filed_by_agents": {
+            "description": "Filed by the Lead, a role or a worker.",
+            "format": "int64",
+            "title": "Tickets Filed By Agents",
+            "type": "integer"
+          },
+          "tickets_filed_directly": {
+            "description": "Filed by a person on the board.",
+            "format": "int64",
+            "title": "Tickets Filed Directly",
+            "type": "integer"
+          },
+          "tickets_filed_from_a_chat": {
+            "description": "Filed by an agent in a person's chat.",
+            "format": "int64",
+            "title": "Tickets Filed From A Chat",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sessions_started_by_people",
+          "tickets_filed_directly",
+          "tickets_filed_from_a_chat",
+          "tickets_filed_by_agents",
+          "people"
+        ],
+        "title": "WorkStart",
         "type": "object"
       },
       "WorkflowDeleted": {
@@ -24646,6 +25116,66 @@
           }
         },
         "summary": "Project Status Summary",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/telemetry": {
+      "get": {
+        "description": "How people work in a project: starting work, talking to roles, building the team.\n\nAny project member may read the totals. Per-person rows go to the owner;\na member gets only their own, and agents get none.",
+        "operationId": "project_telemetry_v1_projects__project_id__telemetry_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectTelemetry"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Project Telemetry",
         "tags": [
           "projects"
         ]
@@ -33848,6 +34378,57 @@
         "summary": "Get Skills",
         "tags": [
           "skills"
+        ]
+      }
+    },
+    "/v1/telemetry": {
+      "get": {
+        "description": "Telemetry for every project the caller owns, side by side.\n\nProjects shared with the caller aren't included; each owner sees only their own.\nAgents are refused: an agent works in one project and reads that project's view.",
+        "operationId": "telemetry_overview_v1_telemetry_get",
+        "parameters": [
+          {
+            "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryOverview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Telemetry Overview",
+        "tags": [
+          "projects"
         ]
       }
     },

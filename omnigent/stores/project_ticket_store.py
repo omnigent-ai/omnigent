@@ -547,6 +547,59 @@ class ProjectTicketStore:
                 )
             return histories
 
+    def activity_actors(
+        self, project_id: str, *, user_id: str | None, since_epoch: int | None
+    ) -> builtins.list[dict[str, Any]]:
+        """Who created tickets and commented since *since_epoch*: no payloads.
+
+        Readable by any project member. Rows are ``{"ticket_id", "kind", "user_id",
+        "session_id", "created_at"}`` with ``kind`` ``"created"`` or ``"comment"``.
+        """
+        codes = {EVENT_CODES["created"]: "created", EVENT_CODES["comment"]: "comment"}
+        with self._session("list_ticket_activity_actors") as session:
+            self._project(session, project_id, user_id)
+            stmt = select(
+                SqlProjectTicketEvent.ticket_id,
+                SqlProjectTicketEvent.kind,
+                SqlProjectTicketEvent.user_id,
+                SqlProjectTicketEvent.session_id,
+                SqlProjectTicketEvent.created_at,
+            ).where(
+                SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                SqlProjectTicketEvent.project_id == _identifier(project_id),
+                SqlProjectTicketEvent.kind.in_(tuple(codes)),
+            )
+            if since_epoch is not None:
+                stmt = stmt.where(SqlProjectTicketEvent.created_at >= since_epoch)
+            return [
+                {
+                    "ticket_id": ticket_id,
+                    "kind": codes[kind],
+                    "user_id": actor,
+                    "session_id": session_id,
+                    "created_at": created_at,
+                }
+                for ticket_id, kind, actor, session_id, created_at in session.execute(
+                    stmt.order_by(SqlProjectTicketEvent.created_at)
+                )
+            ]
+
+    def ticket_stage_ages(
+        self, project_id: str, *, user_id: str | None
+    ) -> builtins.list[tuple[str, str | None, int]]:
+        """Every ticket's ``(id, stage_id, updated_at)``, for stalled-work counts."""
+        with self._session("list_ticket_stage_ages") as session:
+            self._project(session, project_id, user_id)
+            rows = session.execute(
+                select(
+                    SqlProjectTicket.id, SqlProjectTicket.stage_id, SqlProjectTicket.updated_at
+                ).where(
+                    SqlProjectTicket.workspace_id == current_workspace_id(),
+                    SqlProjectTicket.project_id == _identifier(project_id),
+                )
+            ).all()
+            return [(ticket_id, stage_id, updated_at) for ticket_id, stage_id, updated_at in rows]
+
     def ticket_titles(
         self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None
     ) -> dict[str, str]:

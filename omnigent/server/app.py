@@ -4706,6 +4706,24 @@ def create_app(
                     prefix="/v1",
                     tags=["projects"],
                 )
+            if conversation_store is not None and getattr(
+                conversation_store, "storage_location", None
+            ):
+                from omnigent.server.routes.project_telemetry import (
+                    create_project_telemetry_router,
+                )
+
+                app.include_router(
+                    create_project_telemetry_router(
+                        project_store,
+                        ticket_store,
+                        conversation_store,
+                        permission_store,
+                        auth_provider=auth_provider,
+                    ),
+                    prefix="/v1",
+                    tags=["projects"],
+                )
             from omnigent.server.routes.ticket_requests import create_ticket_requests_router
 
             app.include_router(
