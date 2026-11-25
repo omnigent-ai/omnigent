@@ -187,6 +187,20 @@ describe("shortcut registry", () => {
     });
     expect(matchesShortcut(altGraph, "session.rename", other)).toBe(false);
   });
+
+  it("opens Search Text and Go to File off the Mac on their own keys, never on AltGr", () => {
+    const searchText = { key: "o", code: "KeyO", ctrlKey: true, altKey: true };
+    const goToFile = { key: "P", code: "KeyP", ctrlKey: true, altKey: true, shiftKey: true };
+    expect(matchesShortcut(press(searchText), "palette.text", other)).toBe(true);
+    expect(matchesShortcut(press(goToFile), "palette.files", other)).toBe(true);
+    // AltGr+O types ó on a Polish layout, and reports as Control+Alt.
+    expect(
+      matchesShortcut(press({ ...searchText, key: "ó", altGraph: true }), "palette.text", other),
+    ).toBe(false);
+    expect(matchesShortcut(press({ ...goToFile, altGraph: true }), "palette.files", other)).toBe(
+      false,
+    );
+  });
 });
 
 describe("General and Navigation bindings", () => {
