@@ -418,6 +418,30 @@ export function NewProjectButton({
     );
   };
 
+  // A fresh dialog each time it opens.
+  const openDialog = () => {
+    submissionGeneration.current += 1;
+    setName("");
+    setIcon(undefined);
+    setRunOn(hostId);
+    runOnPicked.current = false;
+    setSourceMode("folder");
+    setWorkspace(null);
+    setCreatedWorkspace(null);
+    setWorkspacePickerOpen(false);
+    setCreateWorkspaceFolder(false);
+    setRepositories([]);
+    setPendingRepoUrl("");
+    setPendingRepoBranch("");
+    setCloneParent("~");
+    setDestinationOverride(null);
+    setParentPickerOpen(false);
+    setCheckout(null);
+    setRepositorySubmitting(false);
+    setSubmitError(null);
+    setOpen(true);
+  };
+
   const dialog = (
     <Dialog
       open={open}
@@ -803,26 +827,7 @@ export function NewProjectButton({
             className="text-muted-foreground mobile-touch-target"
             onClick={(e) => {
               e.stopPropagation();
-              submissionGeneration.current += 1;
-              setName("");
-              setIcon(undefined);
-              setRunOn(hostId);
-              runOnPicked.current = false;
-              setSourceMode("folder");
-              setWorkspace(null);
-              setCreatedWorkspace(null);
-              setWorkspacePickerOpen(false);
-              setCreateWorkspaceFolder(false);
-              setRepositories([]);
-              setPendingRepoUrl("");
-              setPendingRepoBranch("");
-              setCloneParent("~");
-              setDestinationOverride(null);
-              setParentPickerOpen(false);
-              setCheckout(null);
-              setRepositorySubmitting(false);
-              setSubmitError(null);
-              setOpen(true);
+              openDialog();
             }}
           >
             <PlusIcon className="size-3.5" />
