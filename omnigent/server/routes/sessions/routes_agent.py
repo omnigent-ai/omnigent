@@ -29,6 +29,7 @@ from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, s
 from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.policies.registry import LOCAL_SINGLE_USER_HEADER, POLICY_MODULES_HEADER
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -105,6 +106,9 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
+
+# User-Agent products of Omnigent clients that read bundles as written (see agent/contents).
+_SELF_NAMED_CLIENTS = ("omnigent-cli/", "omnigent-runner/", "omnigent-harness/")
 
 
 def register_agent_routes(
@@ -292,17 +296,29 @@ def register_agent_routes(
                 bundle_bytes,
                 operator_authored=agent.operator_authored,
             )
-        # Only a runner loading the spec gets the compatibility copy: runners have asked for
-        # the MCP selection since before these groups existed, and one that names no
-        # accepted groups predates them. Every other caller (an export, sys_agent_download,
-        # a host reading skills) gets the bundle as written, opt-outs included.
+        # Only a caller that parses the spec gets the compatibility copy, and only when it
+        # names no accepted groups (it predates them):
+        # - a runner loading the spec, which has asked for the MCP selection since before
+        #   these groups existed;
+        # - a host reading the session's skills: an Omnigent process (the internal Origin)
+        #   that is not a runner's tool call (no runner tunnel token) and does not name
+        #   itself as a CLI, runner or harness, which current clients do in User-Agent.
+        # Every other caller (a browser or CLI export, sys_agent_download from a runner) gets
+        # the bundle as written, opt-outs included. A CLI from before clients named
+        # themselves is taken for a host, and its export loses an opt-out that the runners it
+        # predates could not read anyway.
         runner_spec_fetch = request.headers.get(MCP_SELECTION_HEADER) == "1"
+        host_skill_read = (
+            request.headers.get("Origin") == OMNIGENT_INTERNAL_WS_ORIGIN
+            and RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
+            and not request.headers.get("User-Agent", "").startswith(_SELF_NAMED_CLIENTS)
+        )
         accepted = {
             group.strip()
             for group in request.headers.get(ACCEPTED_TOOL_GROUPS_HEADER, "").split(",")
         }
         unknown_groups = NEGOTIATED_TOOL_GROUPS - accepted
-        if runner_spec_fetch and unknown_groups:
+        if (runner_spec_fetch or host_skill_read) and unknown_groups:
             bundle_bytes = await asyncio.to_thread(
                 bundle_without_tool_groups, bundle_bytes, frozenset(unknown_groups)
             )

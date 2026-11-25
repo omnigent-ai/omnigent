@@ -4282,10 +4282,19 @@ class HostProcess:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
 
+        from omnigent.automations_availability import (
+            ACCEPTED_TOOL_GROUPS_HEADER,
+            NEGOTIATED_TOOL_GROUPS,
+        )
+
         path = quote(frame.session_id or "", safe="")
         return httpx.get(
             f"{self._server_url}/v1/sessions/{path}/agent/contents",
-            headers=self._build_connect_headers(),
+            # This host parses every tool group, so it reads the bundle as written.
+            headers={
+                **self._build_connect_headers(),
+                ACCEPTED_TOOL_GROUPS_HEADER: ",".join(sorted(NEGOTIATED_TOOL_GROUPS)),
+            },
             timeout=10.0,
             # httpx's default context reads SSL_CERT_FILE eagerly and fails on a
             # deleted bundle; verify like the host tunnel does instead.

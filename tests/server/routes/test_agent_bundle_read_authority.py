@@ -268,6 +268,7 @@ def test_only_an_older_runner_loading_the_spec_gets_the_tool_group_opt_out_dropp
 
     from omnigent.automations_availability import ACCEPTED_TOOL_GROUPS_HEADER
     from omnigent.mcp_selection import MCP_SELECTION_HEADER
+    from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_TUNNEL_TOKEN_HEADER
 
     monkeypatch.setattr(routes_agent, "local_single_user_enabled", lambda: False)
     uri = f"sqlite:///{tmp_path / 'agent-bundle.db'}"
@@ -321,16 +322,51 @@ def test_only_an_older_runner_loading_the_spec_gets_the_tool_group_opt_out_dropp
             current_runner = client.get(
                 path, headers={MCP_SELECTION_HEADER: "1", ACCEPTED_TOOL_GROUPS_HEADER: "gadgets"}
             )
+            # A host reading the session's skills parses the spec too: one from before the
+            # group sends neither header, only its first-party Origin.
+            older_host = client.get(path, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN})
+            current_host = client.get(
+                path,
+                headers={
+                    "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+                    ACCEPTED_TOOL_GROUPS_HEADER: "gadgets",
+                },
+            )
+            # A runner's own tool calls (sys_agent_download) carry its tunnel token, and a
+            # CLI export names the CLI.
+            runner_tool = client.get(
+                path,
+                headers={
+                    "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+                    RUNNER_TUNNEL_TOKEN_HEADER: "synthetic-binding-token",
+                },
+            )
+            cli_export = client.get(
+                path,
+                headers={
+                    "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+                    "User-Agent": "omnigent-cli/0.0.0 python-httpx/0.0.0",
+                },
+            )
         assert exported.status_code == 200, exported.text
         assert exported.content == bundle
         assert current_runner.content == bundle
         assert tool_groups(older_runner.content) is None
+        assert older_host.status_code == 200, older_host.text
+        assert tool_groups(older_host.content) is None
+        assert current_host.content == bundle
+        assert runner_tool.content == bundle
+        assert cli_export.content == bundle
 
         async def download_via_tool() -> dict[str, object]:
+            # Named the way the runner's own server client names itself.
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
-                headers={"X-Forwarded-Email": "author@example.com"},
+                headers={
+                    "X-Forwarded-Email": "author@example.com",
+                    "User-Agent": "omnigent-runner/0.0.0 python-httpx/0.0.0",
+                },
             ) as server_client:
                 result = await _execute_agent_tool(
                     "sys_agent_download",
