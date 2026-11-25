@@ -1,7 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -21,7 +20,7 @@ import {
 import { formatMessageTimestamp } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 import { projectHomePath, ticketPanelSearch } from "./projectHomeNavigation";
-import { TicketError } from "./TicketControls";
+import { TicketLoadError } from "./TicketControls";
 
 /** What opened the drill-down: the metric, its range and, for a member cell, the member. */
 export interface StatusDrilldown extends StatusItemsQuery {
@@ -84,12 +83,7 @@ export function ProjectStatusItemsDialog({
         {items.isPending ? (
           <Spinner aria-label="Loading items" />
         ) : items.isError ? (
-          <div className="space-y-2">
-            <TicketError error={items.error} />
-            <Button variant="ghost" size="sm" onClick={() => void items.refetch()}>
-              Try again
-            </Button>
-          </div>
+          <TicketLoadError error={items.error} onRetry={() => void items.refetch()} />
         ) : !items.data.available ? (
           <p className="text-sm text-muted-foreground">
             This server doesn&rsquo;t track the items behind this number.

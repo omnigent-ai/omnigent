@@ -10,6 +10,7 @@ import { absoluteTime, formatUploadTime } from "@/lib/relativeTime";
 import { Link, useSearchParams } from "@/lib/routing";
 import { WorkspaceFileIcon } from "@/shell/WorkspaceFileIcon";
 import { ticketPanelSearch } from "./projectHomeNavigation";
+import { TicketLoadError } from "./TicketControls";
 
 /** Documents, screenshots and evidence that agents and the owner saved to the project. */
 export function ProjectFiles({ projectId }: { projectId: string | null }) {
@@ -38,7 +39,7 @@ export function ProjectFiles({ projectId }: { projectId: string | null }) {
             <Spinner />
           </div>
         ) : files.error ? (
-          <p className="p-3 text-sm text-destructive">{files.error.message}</p>
+          <TicketLoadError error={files.error} className="m-3" />
         ) : files.data?.length ? (
           <ul className="max-h-96 divide-y divide-border/60 overflow-y-auto">
             {newestFirst(files.data).map((file) => (

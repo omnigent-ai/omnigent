@@ -21,7 +21,7 @@ import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { ProjectKpiTiles } from "./ProjectKpis";
 import { ProjectStatusItemsDialog, type StatusDrilldown } from "./ProjectStatusItems";
 import { useProjectMandate } from "./ProjectMandateDialog";
-import { TicketError } from "./TicketControls";
+import { TicketLoadError } from "./TicketControls";
 import { TicketMarkdown } from "./ticketImages";
 import { useTicketProject } from "./useProjectTickets";
 
@@ -42,7 +42,11 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
   );
   if (projects.isLoading) return <Spinner aria-label="Loading project" />;
   if (projectId === null)
-    return <TicketError error={projects.error ?? new Error("Project not found.")} />;
+    return (
+      <div className="mx-auto w-full max-w-5xl px-1 pt-3">
+        <TicketLoadError error={projects.error ?? new Error("Project not found.")} />
+      </div>
+    );
   return (
     <div className="mx-auto w-full max-w-5xl space-y-8 px-1 pb-10" data-testid="project-summary">
       <ProjectCharter projectName={projectName} projectId={projectId} summary={summary.data} />
@@ -54,12 +58,7 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
         {summary.isPending ? (
           <Spinner aria-label="Loading summary" />
         ) : summary.isError ? (
-          <div className="space-y-2">
-            <TicketError error={summary.error} />
-            <Button variant="ghost" size="sm" onClick={() => void summary.refetch()}>
-              Try again
-            </Button>
-          </div>
+          <TicketLoadError error={summary.error} onRetry={() => void summary.refetch()} />
         ) : (
           <>
             <HeadlineNumbers summary={summary.data} onDrill={setDrilldown} />

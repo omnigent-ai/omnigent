@@ -160,6 +160,20 @@ describe("ProjectSummary", () => {
     expect(await screen.findByText("$12.34")).toBeTruthy();
   });
 
+  it("shows a restart as a calm notice, and a real failure in soft red", async () => {
+    vi.mocked(statusApi.getProjectStatusSummary).mockRejectedValue(
+      new TypeError("Failed to fetch"),
+    );
+    renderSummary();
+    const notice = await screen.findByRole("alert");
+    expect(notice.dataset.tone).toBe("restart");
+    expect(within(notice).getByRole("button", { name: "Try again" })).toBeTruthy();
+    cleanup();
+    vi.mocked(statusApi.getProjectStatusSummary).mockRejectedValue(new Error("Server is down"));
+    renderSummary();
+    expect((await screen.findByRole("alert")).dataset.tone).toBe("error");
+  });
+
   it("marks a metric without a source as not tracked, not zero", async () => {
     renderSummary();
     const headline = await screen.findByRole("region", { name: "Headline numbers" });

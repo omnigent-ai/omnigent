@@ -10,6 +10,7 @@ import {
 } from "@/lib/projectFileScope";
 import { useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { FileViewer } from "@/shell/FileViewer";
+import { TicketLoadError } from "./TicketControls";
 import { ApiError } from "@/lib/sessionsApi";
 
 /** The project home's query parameter naming the project file open in the viewer. */
@@ -109,7 +110,11 @@ export function ProjectFileDialog({
             onCloseTab={onClose}
           />
         ) : file.error ? (
-          <p className="p-4 text-sm text-destructive">{projectFileErrorText(file.error)}</p>
+          <TicketLoadError
+            error={file.error}
+            message={projectFileErrorText(file.error)}
+            className="m-4"
+          />
         ) : (
           <div className="flex flex-1 items-center justify-center">
             <Spinner />

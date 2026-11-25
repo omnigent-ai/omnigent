@@ -1,9 +1,17 @@
 import { useId } from "react";
-import { BadgeCheckIcon, CircleCheckIcon, UserRoundIcon } from "lucide-react";
+import {
+  BadgeCheckIcon,
+  CircleAlertIcon,
+  CircleCheckIcon,
+  RefreshCwIcon,
+  UserRoundIcon,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { getCurrentUserId } from "@/lib/identity";
+import { isServerRestartError } from "@/lib/serverRestart";
 import type { TicketLabel, TicketWaitingOn } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 
@@ -192,6 +200,48 @@ export function TicketError({ error }: { error: Error | null }) {
       {error.message}
     </p>
   ) : null;
+}
+
+/**
+ * A calm notice for a view that failed to load. A restart reads as neutral,
+ * since the app is coming back; other failures get a soft red.
+ */
+export function TicketLoadError({
+  error,
+  message,
+  onRetry,
+  className,
+}: {
+  error: Error | null;
+  /** Shown instead of the error's own message. */
+  message?: string;
+  onRetry?: () => void;
+  className?: string;
+}) {
+  if (!error) return null;
+  const restarting = isServerRestartError(error);
+  const Icon = restarting ? RefreshCwIcon : CircleAlertIcon;
+  return (
+    <div
+      role="alert"
+      data-tone={restarting ? "restart" : "error"}
+      className={cn(
+        "flex items-start gap-2 rounded-lg border px-3 py-2 text-sm",
+        restarting
+          ? "border-border/60 bg-muted/40 text-muted-foreground"
+          : "border-destructive/20 bg-destructive/5 text-destructive/90",
+        className,
+      )}
+    >
+      <Icon aria-hidden className="mt-0.5 size-4 shrink-0" />
+      <span className="min-w-0 flex-1 wrap-anywhere">{message ?? error.message}</span>
+      {onRetry && (
+        <Button variant="ghost" size="xs" className="-my-0.5 shrink-0" onClick={onRetry}>
+          Try again
+        </Button>
+      )}
+    </div>
+  );
 }
 
 /** "Needs you" in the strong accent, someone else's ask in quiet grey. */

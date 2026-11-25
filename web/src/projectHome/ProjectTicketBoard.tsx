@@ -26,7 +26,7 @@ import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { getCurrentUserId } from "@/lib/identity";
 import { requesterLabel, type ProjectTicket, type TicketStage } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
-import { TicketError, TicketLabels } from "./TicketControls";
+import { TicketError, TicketLabels, TicketLoadError } from "./TicketControls";
 import { TicketShipBlocker } from "./TicketShipBlocker";
 import { TicketStageBadge } from "./TicketStageAppearance";
 import { TicketAgentIcons } from "./TicketAgentIcons";
@@ -98,8 +98,8 @@ export function ProjectTicketBoard({
   if (projects.isLoading) return <Spinner className="m-6" aria-label="Loading project" />;
   if (projects.error)
     return (
-      <div className="p-6">
-        <TicketError error={projects.error} />
+      <div className="px-4 pt-3">
+        <TicketLoadError error={projects.error} />
       </div>
     );
   return (
@@ -194,14 +194,16 @@ function TicketBoard({
           <TicketBoardRequesterFilter mine={mine} onChange={setMine} />
         </div>
       )}
-      <TicketError error={update.error} />
-      {configuration.isPending && <Spinner className="m-6" aria-label="Loading stages" />}
-      <TicketError error={configuration.error} />
-      {configuration.isError && (
-        <Button variant="ghost" onClick={() => void configuration.refetch()}>
-          Try again
-        </Button>
+      {(update.error || configuration.error) && (
+        <div className="flex shrink-0 flex-col gap-2 px-4 pt-3 pb-2">
+          <TicketLoadError error={update.error} />
+          <TicketLoadError
+            error={configuration.error}
+            onRetry={() => void configuration.refetch()}
+          />
+        </div>
       )}
+      {configuration.isPending && <Spinner className="m-6" aria-label="Loading stages" />}
       <DndContext
         sensors={sensors}
         onDragStart={({ active }) => setDragged(active.data.current?.ticket ?? null)}
@@ -389,12 +391,10 @@ function TicketColumn({
         {projectId && filteredTickets === undefined && query.isPending ? (
           <Spinner aria-label="Loading tickets" className="mx-auto my-4" />
         ) : null}
-        <TicketError error={filteredTickets === undefined ? query.error : null} />
-        {filteredTickets === undefined && query.isError && (
-          <Button variant="ghost" onClick={() => void query.refetch()}>
-            Try again
-          </Button>
-        )}
+        <TicketLoadError
+          error={filteredTickets === undefined ? query.error : null}
+          onRetry={() => void query.refetch()}
+        />
         {tickets.map((ticket) => (
           <TicketCard
             key={ticket.id}
