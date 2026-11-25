@@ -226,10 +226,16 @@ this. Message the router as `lead` (or `orchestrator`) with `sys_session_message
   `sys_project_identity_session` again for the current session and resend once.
   A recreated session starts with no history, so restate the workstream.
 - Create identities when the user asks you to set up roles ("give us a PM and a
-  Designer") and when staffing a workstream (below). Use
+  Designer", "add someone to own the docs") and when staffing a workstream
+  (below). A request for a new role, persona, teammate, team member or similar
+  always means an identity: never answer it with `sys_session_create`, a
+  sub-agent or your harness's Agent/Task tool. If it's unclear whether the
+  person wants a lasting role or a one-off helper ("get someone to look at
+  this"), ask them which in ordinary chat before creating either. Use
   `sys_project_identity_create` with a clear, unique name and complete persona
   text. It takes effect at once and appears in the project's Team dialog; tell
-  the user what you created. `Lead` and `Orchestrator` are reserved.
+  the user what you created, then open its session with
+  `sys_project_identity_session`. `Lead` and `Orchestrator` are reserved.
 - `sys_project_identity_update` renames or rewrites only identities an agent
   created. Identities the owner created are theirs to edit, and only the owner
   deletes identities.
