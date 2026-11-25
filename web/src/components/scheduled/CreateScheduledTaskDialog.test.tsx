@@ -7429,6 +7429,16 @@ describe("CreateScheduledTaskDialog workflow", () => {
     expect(error).not.toHaveTextContent("Continue in the same session");
     const submit = screen.getByTestId("create-scheduled-task-submit");
     expect(submit).toBeDisabled();
+    // Save's disabled reason gives the same hint.
+    await userEvent.hover(screen.getByRole("group", { name: "Save changes" }));
+    await waitFor(
+      () =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(
+          "New sandbox sessions require schedules of at least 60 minutes. Use a connected host for shorter intervals.",
+        ),
+      { timeout: 800 },
+    );
+    expect(screen.getByRole("tooltip")).not.toHaveTextContent("Continue in the same session");
 
     openAutomationSection("Run setup");
     fireEvent.keyDown(screen.getByTestId("task-host-trigger"), { key: "Enter" });
