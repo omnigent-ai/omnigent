@@ -3628,6 +3628,35 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(preview()).toEqual(["Hello world!"]);
     });
 
+    it("shows only the replayed reply when retried right after a chunk arrives", async () => {
+      // Holds whether chunks commit on arrival or on the next frame: a retry
+      // must never let the replaced stream's latest chunk reach the new preview.
+      vi.useFakeTimers();
+      seedSession("conv_down_late", []);
+      const { streams } = failSnapshots("conv_down_late", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_down_late");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+      const entry = conversationRegistry.peek("conv_down_late")!;
+      streams[0]!.push(previewDelta("Hello ", 0));
+      await vi.advanceTimersByTimeAsync(20);
+      streams[0]!.push(previewDelta("wor", 1));
+      await vi.advanceTimersByTimeAsync(1);
+
+      await retryConversationLoad("conv_down_late");
+      await vi.advanceTimersByTimeAsync(20);
+      streams[1]!.push(previewDelta("Hello world!", 2));
+      await vi.advanceTimersByTimeAsync(20);
+
+      const preview = entry
+        .getState()
+        .blocks.filter((block) => block.ctx.itemId === "live:m1")
+        .map((block) => (block.type === "text_done" ? block.fullText : block.type));
+      expect(entry.getState().conversationLoadError).toBeNull();
+      expect(preview).toEqual(["Hello world!"]);
+    });
+
     it("keeps the stream slot while the replacing bind waits on the session's host", async () => {
       vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
       const slots = makeFakeSlotManager();
