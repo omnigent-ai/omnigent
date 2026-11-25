@@ -469,7 +469,7 @@ it("keeps a handed search over the page's own search that answers later", async 
   expect(screen.queryByRole("button", { name: "Open src/old.ts at line 2" })).toBeNull();
 });
 
-it("clears the page's older answer when a search is handed over without one", async () => {
+it("runs a search handed over without its answer, in place of the page's older one", async () => {
   const { handSearchToSearchPage } = await import("./contentSearchCache");
   const client = new QueryClient();
   const older = { path: "src/old.ts", line: 5, column: 1, text: "old", match_start: 0 };
@@ -479,13 +479,19 @@ it("clears the page's older answer when a search is handed over without one", as
     { ...EMPTY_CONTENT_SEARCH, query: "old" },
     { matches: [{ ...older, match_end: 3 }], truncated: false, warning: null },
   );
+  let answer = (_response: Response) => {};
+  vi.mocked(authenticatedFetch).mockReturnValue(
+    new Promise<Response>((resolve) => {
+      answer = resolve;
+    }),
+  );
   render(
     <QueryClientProvider client={client}>
       <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
     </QueryClientProvider>,
   );
   expect(screen.getByRole("button", { name: "Open src/old.ts at line 5" })).toBeInTheDocument();
-  // Go to File's own search hadn't answered yet, so only the query comes over.
+  // Go to File's own search hadn't answered yet, so only the query comes over, and runs here.
   await act(() =>
     handSearchToSearchPage(
       client,
@@ -496,5 +502,38 @@ it("clears the page's older answer when a search is handed over without one", as
   );
   await waitFor(() => expect(screen.getByRole("searchbox")).toHaveValue("new"));
   expect(screen.queryByRole("button", { name: "Open src/old.ts at line 5" })).toBeNull();
-  expect(authenticatedFetch).not.toHaveBeenCalled();
+  await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+  const url = new URL(String(vi.mocked(authenticatedFetch).mock.calls[0][0]), "http://test");
+  expect(url.searchParams.get("q")).toBe("new");
+  const found = { path: "src/new.ts", line: 2, column: 1, text: "new", match_start: 0 };
+  act(() =>
+    answer(
+      new Response(
+        JSON.stringify({ matches: [{ ...found, match_end: 3 }], truncated: false, warning: null }),
+      ),
+    ),
+  );
+  expect(
+    await screen.findByRole("button", { name: "Open src/new.ts at line 2" }),
+  ).toBeInTheDocument();
+});
+
+it("runs a search handed over without its answer once the page opens", async () => {
+  const { handSearchToSearchPage } = await import("./contentSearchCache");
+  const client = new QueryClient();
+  await handSearchToSearchPage(
+    client,
+    "session-one",
+    { ...EMPTY_CONTENT_SEARCH, query: "later" },
+    undefined,
+  );
+  render(
+    <QueryClientProvider client={client}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("searchbox")).toHaveValue("later");
+  await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+  const url = new URL(String(vi.mocked(authenticatedFetch).mock.calls[0][0]), "http://test");
+  expect(url.searchParams.get("q")).toBe("later");
 });

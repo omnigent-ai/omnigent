@@ -12,6 +12,12 @@ export const contentSearchInputKey = (sessionId: string) =>
   ["content-search-input", sessionId] as const;
 export const contentSearchResultKey = (sessionId: string) =>
   ["content-search-result", sessionId] as const;
+/** A search handed to the page, which runs it itself when its answer didn't come over. */
+export interface ContentSearchHandOff {
+  input: ContentSearchInput;
+  run: boolean;
+}
+
 /** A search handed to the page while it may already show; it takes it once, then clears it. */
 export const contentSearchHandOffKey = (sessionId: string) =>
   ["content-search-hand-off", sessionId] as const;
@@ -19,7 +25,7 @@ export const contentSearchHandOffKey = (sessionId: string) =>
 /**
  * Gives `sessionId`'s Search page this search, and its answer when there is one. A search the
  * page still runs is cancelled first, so its late answer can't replace the handed one; with no
- * answer handed over, the page's older one goes rather than showing under the new query.
+ * answer handed over, the page drops its older one and runs the handed search itself.
  */
 export async function handSearchToSearchPage(
   queryClient: QueryClient,
@@ -35,5 +41,8 @@ export async function handSearchToSearchPage(
   } else {
     await queryClient.resetQueries({ queryKey: resultKey, exact: true });
   }
-  queryClient.setQueryData(contentSearchHandOffKey(sessionId), { ...input });
+  queryClient.setQueryData<ContentSearchHandOff>(contentSearchHandOffKey(sessionId), {
+    input: { ...input },
+    run: !result,
+  });
 }

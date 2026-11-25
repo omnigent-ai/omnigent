@@ -59,11 +59,15 @@ vi.mock("../codeMirror/CodeMirrorFileViewer", () => ({
 }));
 
 // The workspace's text search finds "needle" on two lines of src/widget.ts.
-const textSearches = vi.hoisted(() => ({ calls: [] as unknown[] }));
+const textSearches = vi.hoisted(() => ({
+  calls: [] as unknown[],
+  held: null as Promise<void> | null,
+}));
 vi.mock("@/lib/contentSearch", async (importOriginal) => ({
   ...(await importOriginal<typeof ContentSearchModule>()),
   runContentSearch: async (_sessionId: string, input: { query: string }) => {
     textSearches.calls.push(input);
+    await textSearches.held;
     return {
       matches: input.query.includes("needle")
         ? [
@@ -92,7 +96,8 @@ vi.mock("@/lib/contentSearch", async (importOriginal) => ({
 }));
 
 const { GoToFileHost } = await import("./GoToFileHost");
-const { contentSearchInputKey, contentSearchResultKey } = await import("../contentSearchCache");
+const { contentSearchHandOffKey, contentSearchInputKey, contentSearchResultKey } =
+  await import("../contentSearchCache");
 
 const SESSION = "conv_files";
 
@@ -131,6 +136,7 @@ beforeEach(() => {
   workspace.serveable = true;
   window.localStorage.clear();
   textSearches.calls = [];
+  textSearches.held = null;
 });
 
 afterEach(() => {
@@ -284,6 +290,24 @@ describe("GoToFileHost", () => {
     });
     // The page it shows takes the keyboard.
     expect(useFileFinderStore.getState().textSearchFocus).toMatchObject({ sessionId: SESSION });
+  });
+
+  it("hands a search that hasn't answered yet to the Search page to run there", async () => {
+    textSearches.held = new Promise(() => {});
+    const { showTextSearch, queryClient } = renderHost();
+    act(() => void requestTextSearch(SESSION));
+    const field = await screen.findByRole("combobox", { name: "Search text in files" });
+    await userEvent.type(field, "needle");
+    await waitFor(() => expect(textSearches.calls).not.toHaveLength(0));
+    await userEvent.click(screen.getByRole("button", { name: /Open in Search/ }));
+    await waitFor(() => expect(showTextSearch).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(queryClient.getQueryData(contentSearchHandOffKey(SESSION))).toMatchObject({
+        input: { query: "needle" },
+        run: true,
+      }),
+    );
+    expect(queryClient.getQueryData(contentSearchResultKey(SESSION))).toBeUndefined();
   });
 
   it("offers no Search Text where the session's files can't be searched for text", () => {

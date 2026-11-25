@@ -17,6 +17,7 @@ import { useTextSearchFocus } from "@/store/fileFinder";
 
 import {
   type ContentSearchAnswer,
+  type ContentSearchHandOff,
   contentSearchHandOffKey,
   contentSearchInputKey,
   contentSearchResultKey,
@@ -52,18 +53,21 @@ export function ContentSearchPanel({
   const canSearch = query.trim() !== "" && problem === null;
   // A search handed over while the page shows, such as Go to File's "Open in Search",
   // replaces what was typed here.
-  const handOff = useQuery<ContentSearchInput | null>({
+  const handOff = useQuery<ContentSearchHandOff | null>({
     queryKey: contentSearchHandOffKey(conversationId),
     initialData: null,
     enabled: false,
   });
-  const handedInput = handOff.data;
+  const handed = handOff.data;
+  // Set with the handed input, so the search runs once the page holds it.
+  const [runHanded, setRunHanded] = useState(false);
   useEffect(() => {
-    if (!handedInput) return;
-    setInput(handedInput);
-    if (handedInput.include.trim() || handedInput.exclude.trim()) setShowFilters(true);
+    if (!handed) return;
+    setInput(handed.input);
+    if (handed.input.include.trim() || handed.input.exclude.trim()) setShowFilters(true);
+    if (handed.run) setRunHanded(true);
     queryClient.setQueryData(contentSearchHandOffKey(conversationId), null);
-  }, [conversationId, handedInput, queryClient]);
+  }, [conversationId, handed, queryClient]);
   useEffect(() => {
     queryClient.setQueryData(contentSearchInputKey(conversationId), input);
   }, [conversationId, input, queryClient]);
@@ -78,6 +82,12 @@ export function ContentSearchPanel({
       return { ...result, query };
     },
   });
+  const refetchSearch = search.refetch;
+  useEffect(() => {
+    if (!runHanded) return;
+    setRunHanded(false);
+    if (canSearch) void refetchSearch();
+  }, [runHanded, canSearch, refetchSearch]);
   const files = new Map<string, ContentMatch[]>();
   for (const match of search.data?.matches ?? []) {
     const matches = files.get(match.path) ?? [];
