@@ -342,6 +342,11 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   isStreaming?: boolean;
   /** Render sent review snapshots as cards; nested comment bodies remain ordinary Markdown. */
   renderLocalReviewComment?: (comment: Comment) => ReactNode;
+  /**
+   * Rehype plugins that run once sanitizing and hardening are done, for markup the caller's own
+   * components draw, such as GitHub's alerts in a pull request comment. Pass a stable array.
+   */
+  rehypePluginsAfterSanitizing?: NonNullable<StreamdownProps["rehypePlugins"]>;
 };
 
 const LocalReviewCommentRendererContext =
@@ -766,6 +771,7 @@ export const MessageResponse = memo(
     allowShellCommands = false,
     isStreaming = false,
     renderLocalReviewComment,
+    rehypePluginsAfterSanitizing,
     ...props
   }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
@@ -787,11 +793,20 @@ export const MessageResponse = memo(
 
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
-    let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
-    if (allowWorkspaceImages) rehypePlugins = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
-    else if (markFileLinks) rehypePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
-    else if (allowGitHubAttachmentImages)
-      rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
+    const rehypePlugins = useMemo(() => {
+      let secured = SECURE_STREAMDOWN_REHYPE_PLUGINS;
+      if (allowWorkspaceImages) secured = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
+      else if (markFileLinks) secured = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
+      else if (allowGitHubAttachmentImages) secured = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
+      return rehypePluginsAfterSanitizing?.length
+        ? [...secured, ...rehypePluginsAfterSanitizing]
+        : secured;
+    }, [
+      allowWorkspaceImages,
+      markFileLinks,
+      allowGitHubAttachmentImages,
+      rehypePluginsAfterSanitizing,
+    ]);
 
     return (
       <MarkdownErrorBoundary source={props.children}>

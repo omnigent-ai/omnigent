@@ -1,4 +1,5 @@
 import userEvent from "@testing-library/user-event";
+import type { Element as HastElement, Root as HastRoot } from "hast";
 import {
   cleanup,
   fireEvent,
@@ -124,6 +125,41 @@ describe("MessageResponse", () => {
 
     expect(document.querySelector('img[src^="https://attacker.example"]')).toBeNull();
     expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
+  });
+
+  describe("rehypePluginsAfterSanitizing", () => {
+    // Puts a remote image where the text says IMAGE, which hardening would otherwise block.
+    const addImage = () => (tree: HastRoot) => {
+      const replace = (parent: HastRoot | HastElement) => {
+        parent.children = parent.children.map((child) =>
+          child.type === "text" && child.value === "IMAGE"
+            ? {
+                type: "element",
+                tagName: "img",
+                properties: { src: "https://example.com/added.png", alt: "added" },
+                children: [],
+              }
+            : child,
+        ) as typeof parent.children;
+        for (const child of parent.children) if (child.type === "element") replace(child);
+      };
+      replace(tree);
+    };
+    const PLUGINS = [addImage];
+
+    it("runs the caller's plugins once sanitizing and hardening are done", async () => {
+      render(<MessageResponse rehypePluginsAfterSanitizing={PLUGINS}>IMAGE</MessageResponse>);
+      expect(await screen.findByRole("img", { name: "added" })).toHaveAttribute(
+        "src",
+        "https://example.com/added.png",
+      );
+    });
+
+    it("renders as before without them", async () => {
+      render(<MessageResponse>IMAGE</MessageResponse>);
+      expect(await screen.findByText("IMAGE")).toBeTruthy();
+      expect(screen.queryByRole("img")).toBeNull();
+    });
   });
 
   describe("allowGitHubAttachmentImages", () => {
