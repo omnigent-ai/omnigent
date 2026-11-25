@@ -204,6 +204,26 @@ class CreateTicket(BaseModel):
         return labels
 
 
+# Room left in a ticket description for the "From the <project>" note on intake tickets.
+INTAKE_DESCRIPTION_MAX_LENGTH = 2600
+
+
+class FileIntakeTicket(BaseModel):
+    """An agent in one project files a ticket on another project's board."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=INTAKE_DESCRIPTION_MAX_LENGTH)
+
+    @field_validator("title")
+    @classmethod
+    def trim_title(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("title must not be empty")
+        return value.strip()
+
+
 TicketCommentAudience = Literal["human", "agents"]
 AUDIENCE_DESCRIPTION = (
     "Who the comment is for. Omit for the default: comments from people and the project "

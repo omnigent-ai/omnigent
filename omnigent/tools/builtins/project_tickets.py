@@ -13,6 +13,7 @@ from omnigent.entities.project_kpi import SetProjectKpis
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    FileIntakeTicket,
     ImportPullRequest,
     LandTicketRequest,
     LinkRelatedTicket,
@@ -586,6 +587,31 @@ class SysProjectKpisSetTool(_TicketTool):
     arguments = SetProjectKpis
 
 
+class FileTicketInProject(FileIntakeTicket):
+    project: str = Field(
+        min_length=1,
+        max_length=160,
+        description="The other project's name or ID, as it appears in your project list.",
+    )
+
+
+class SysProjectTicketFileTool(_TicketTool):
+    tool_name = "sys_project_ticket_file"
+    help_text = (
+        "File a ticket on another project's board, one shared with the person you work for "
+        "(they own it or are a member). Use it to ask that project for help or report "
+        "something to it, instead of opening a session inside it. The ticket starts in its "
+        "first stage, marked as coming from your project; that project's Lead and its own "
+        "rules and approvals take it from there. You can't set labels or read its board, and "
+        "you get back only the new ticket's ID. Up to 10 per hour into one project."
+    )
+    arguments = FileTicketInProject
+
+    @classmethod
+    def description(cls) -> str:
+        return cls.help_text
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -608,6 +634,7 @@ TICKET_TOOL_CLASSES = (
     SysProjectFileViewTool,
     SysProjectKpisGetTool,
     SysProjectKpisSetTool,
+    SysProjectTicketFileTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}
 READ_ONLY_TICKET_TOOLS: tuple[str, ...] = tuple(

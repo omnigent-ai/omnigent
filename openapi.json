@@ -3968,6 +3968,29 @@
         "title": "FailedResponseObject",
         "type": "object"
       },
+      "FileIntakeTicket": {
+        "additionalProperties": false,
+        "description": "An agent in one project files a ticket on another project's board.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 2600,
+            "title": "Description",
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "FileIntakeTicket",
+        "type": "object"
+      },
       "FilesystemAttachmentsInfo": {
         "description": "Which uploads native sessions receive as files, for client-side checks.",
         "properties": {
@@ -25003,6 +25026,61 @@
           }
         },
         "summary": "Import Pull Request",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/intake": {
+      "post": {
+        "description": "File a ticket on this board from an agent session in another project.\n\nFor a project shared with the person whose session calls: owner or member.\nThe ticket starts in the first stage with no labels, `requested_by` is\n`project:<source project id>` so this project's own gates apply, and the\nresponse returns only the new ticket's ID, title and stage. Each source project\nmay file `INTAKE_TICKETS_PER_HOUR` per hour on one board.",
+        "operationId": "file_intake_ticket_v1_projects__project_id__tickets_intake_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FileIntakeTicket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response File Intake Ticket V1 Projects  Project Id  Tickets Intake Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "File Intake Ticket",
         "tags": [
           "project tickets"
         ]

@@ -19,6 +19,7 @@ from omnigent.entities.project_routing import LEAD_NAME
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    FileIntakeTicket,
     ImportPullRequest,
     LandTicketRequest,
     LinkRelatedTicket,
@@ -165,6 +166,20 @@ def _has_running_agents(
 
 
 _logger = logging.getLogger(__name__)
+
+# Intake tickets one project may file on another project's board per rolling hour.
+INTAKE_TICKETS_PER_HOUR = 10
+INTAKE_REQUESTER_PREFIX = "project:"
+
+
+def intake_description(source_name: str, sender: str | None, description: str) -> str:
+    """Prefix an intake ticket's description with where it came from."""
+    on_behalf = f" on behalf of {sender}" if sender else ""
+    note = (
+        f"> **From the {source_name} project.** Filed by one of its agents{on_behalf}. "
+        "This project's own rules and approvals apply."
+    )
+    return f"{note}\n\n{description}".rstrip()
 _mention_limiter = MentionRateLimiter()
 _mention_tasks: set[asyncio.Task[None]] = set()
 
@@ -737,6 +752,101 @@ def create_project_tickets_router(
             ticket = await asyncio.to_thread(store.create, project_id, body, who)
         wake(request)
         return ticket
+
+    @router.post("/intake", status_code=201)
+    async def file_intake_ticket(
+        request: Request, project_id: str, body: FileIntakeTicket
+    ) -> dict[str, Any]:
+        """File a ticket on this board from an agent session in another project.
+
+        For a project shared with the person whose session calls: owner or member.
+        The ticket starts in the first stage with no labels, ``requested_by`` is
+        ``project:<source project id>`` so this project's own gates apply, and the
+        response returns only the new ticket's ID, title and stage. Each source project
+        may file :data:`INTAKE_TICKETS_PER_HOUR` per hour on one board.
+        """
+        user_id = require_user(request, auth_provider)
+        raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        if raw_source is None:
+            raise OmnigentError(
+                "Intake tickets come from an agent session in another project; "
+                "people file tickets on the board",
+                code=ErrorCode.FORBIDDEN,
+            )
+        await asyncio.to_thread(
+            refuse_role_side_chat,
+            request,
+            action="Filing tickets in another project",
+            user_id=user_id,
+            conversations=conversations,
+            projects=projects,
+        )
+        await asyncio.to_thread(
+            require_named_source_private, request, user_id, conversations, permissions
+        )
+        try:
+            source_id = uuid_to_bytes(raw_source).hex()
+            target_id = uuid_to_bytes(project_id).hex()
+        except InvalidUuidError:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND) from None
+        source = await asyncio.to_thread(conversations.get_conversation, source_id)
+        if source is None or source.archived or not source.project_id:
+            raise OmnigentError(
+                "File this session into a project before filing tickets elsewhere",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if source.project_id == target_id:
+            raise OmnigentError(
+                "This is your own project's board; use sys_ticket_create",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        source_project = (
+            await asyncio.to_thread(projects.get, source.project_id, user_id=user_id)
+            if projects is not None
+            else None
+        )
+        if source_project is None:
+            raise OmnigentError(
+                "The calling session's project is not available", code=ErrorCode.FORBIDDEN
+            )
+        requested_by = INTAKE_REQUESTER_PREFIX + source_project.id
+        since = int((datetime.now(UTC) - timedelta(hours=1)).timestamp())
+        with _storage_errors():
+            recent = await asyncio.to_thread(
+                store.count_requested_since, target_id, requested_by, since, user_id=user_id
+            )
+        if recent >= INTAKE_TICKETS_PER_HOUR:
+            raise OmnigentError(
+                f"{source_project.name} already filed {recent} tickets on this board in the "
+                f"last hour (limit {INTAKE_TICKETS_PER_HOUR}); try again later",
+                code=ErrorCode.QUEUE_FULL,
+            )
+        create = CreateTicket(
+            title=body.title,
+            description=intake_description(source_project.name, user_id, body.description),
+        )
+        # A person-shaped actor: the sender's session gets no reply channel into this board.
+        with _storage_errors():
+            ticket = await asyncio.to_thread(
+                store.create,
+                target_id,
+                create,
+                TicketActor(user_id),
+                requested_by=requested_by,
+                source={
+                    "project_id": source_project.id,
+                    "project_name": source_project.name,
+                    "session_id": source.id,
+                },
+            )
+        wake(request)
+        return {
+            "object": "project.intake_ticket",
+            "id": ticket["id"],
+            "project_id": target_id,
+            "title": ticket["title"],
+            "stage_id": ticket["stage_id"],
+        }
 
     @router.post("/import-pr", status_code=201)
     async def import_pull_request(

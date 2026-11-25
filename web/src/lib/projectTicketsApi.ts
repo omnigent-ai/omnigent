@@ -517,5 +517,7 @@ export function requesterLabel(
 ): string | null {
   if (!requestedBy) return null;
   if (requestedBy.startsWith("github:")) return `@${requestedBy.slice(7)} (GitHub PR)`;
+  // An agent in another shared project filed it; the description names the project.
+  if (requestedBy.startsWith("project:")) return "another project (agent)";
   return requestedBy === viewer ? "you" : requestedBy;
 }

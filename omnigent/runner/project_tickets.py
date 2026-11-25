@@ -5,6 +5,7 @@ import base64
 import json
 import mimetypes
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,46 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools.builtins.project_tickets import TICKET_TOOLS
 from omnigent.tools.builtins.upload_file import safe_resolve
-from omnigent.util.uuid import uuid_to_bytes
+from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
+
+
+async def _file_in_other_project(
+    body: dict[str, Any],
+    own_project_id: str,
+    request: Callable[..., Awaitable[dict[str, Any]]],
+) -> str:
+    """File an intake ticket on another project's board, found by name or ID."""
+    wanted = body.pop("project").strip()
+    listed = (await request("GET", "/v1/projects")).get("data", [])
+    try:
+        wanted_id = uuid_to_bytes(wanted).hex()
+    except InvalidUuidError:
+        wanted_id = None
+    matches = [
+        project
+        for project in listed
+        if (wanted_id is not None and project.get("id") == wanted_id)
+        or str(project.get("name", "")).casefold() == wanted.casefold()
+    ]
+    if not matches:
+        return json.dumps(
+            {"error": f"No project named {wanted!r} is shared with the person you work for"}
+        )
+    if len(matches) > 1:
+        return json.dumps(
+            {
+                "error": f"Several projects are named {wanted!r}; pass one ID instead",
+                "project_ids": [project.get("id") for project in matches],
+            }
+        )
+    target_id = matches[0]["id"]
+    if target_id == own_project_id:
+        return json.dumps({"error": "That's this session's own project; use sys_ticket_create"})
+    created = await request("POST", f"/v1/projects/{target_id}/tickets/intake", json=body)
+    return json.dumps(
+        {**created, "note": "Filed. That project's Lead triages it under its own rules."},
+        ensure_ascii=False,
+    )
 
 
 async def execute_ticket_tool(
@@ -96,6 +136,8 @@ async def execute_ticket_tool(
             return await _update_identity(body, project_id, request)
         if name == "sys_project_identity_session":
             return await _open_identity_session(body, project_id, request, client, source_id)
+        if name == "sys_project_ticket_file":
+            return await _file_in_other_project(body, project_id, request)
         path = f"/v1/projects/{project_id}/tickets"
         if ticket_id is not None:
             path += f"/{ticket_id}"

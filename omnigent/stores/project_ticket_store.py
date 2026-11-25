@@ -704,8 +704,13 @@ class ProjectTicketStore:
         actor: TicketActor,
         *,
         requested_by: str | None = None,
+        source: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a ticket; ``requested_by`` defaults to the creating user and never changes."""
+        """Create a ticket; ``requested_by`` defaults to the creating user and never changes.
+
+        :param source: Where an intake ticket from another project came from, recorded on
+            its created event: ``project_id``, ``project_name`` and ``session_id``.
+        """
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
@@ -735,11 +740,35 @@ class ProjectTicketStore:
                 row,
                 actor,
                 "created",
-                {**body.model_dump(exclude_none=True), "stage": _stage_snapshot(stage)},
+                {
+                    **body.model_dump(exclude_none=True),
+                    "stage": _stage_snapshot(stage),
+                    **({"source": source} if source else {}),
+                },
             )
             return {**_ticket(row), "waiting_on": self._waiting_on(session, project, row)}
 
         return run_write_transaction(self._write, "create_ticket", write)
+
+    def count_requested_since(
+        self, project_id: str, requested_by: str, since: int, *, user_id: str | None
+    ) -> int:
+        """How many of the project's tickets *requested_by* filed at or after *since*."""
+        with self._session("count_requested_tickets") as session:
+            project = self._project(session, project_id, user_id)
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(SqlProjectTicket)
+                    .where(
+                        SqlProjectTicket.workspace_id == project.workspace_id,
+                        SqlProjectTicket.project_id == project.id,
+                        SqlProjectTicket.requested_by == requested_by,
+                        SqlProjectTicket.created_at >= since,
+                    )
+                )
+                or 0
+            )
 
     def get(self, project_id: str, ticket_id: str, *, user_id: str | None) -> dict[str, Any]:
         with self._session("get_ticket") as session:
