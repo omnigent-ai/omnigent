@@ -256,12 +256,14 @@ describe("CodeMirrorComposerInput reply cards with the macOS readline keys", () 
     expect(target().value).toBe("Opener\nWhy");
   });
 
-  it("removes a card with ⌃K before it, and ⌃Y yanks the break back", () => {
+  it("does nothing on ⌃K at the line before a card, and ⌃Y yanks nothing back", () => {
+    // A kill never removes a card: at the boundary it is a no-op, as the textarea's inputs are.
     const quoted = replyQuoteLine({ id: "q1", text: "Quoted line" });
-    const { target, press } = mount(`Intro\n${quoted}\nReply`, "Intro".length);
+    const value = `Intro\n${quoted}\nReply`;
+    const { target, press } = mount(value, "Intro".length);
     press({ key: "k", code: "KeyK", ctrlKey: true });
-    expect(target().value).toBe("Intro\nReply");
+    expect(target().value).toBe(value);
     press({ key: "y", code: "KeyY", ctrlKey: true });
-    expect(target().value).toBe("Intro\n\nReply");
+    expect(target().value).toBe(value);
   });
 });

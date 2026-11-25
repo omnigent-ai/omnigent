@@ -290,11 +290,28 @@ function normalizeCards(
   ) {
     const above = startCards.find((card) => card.to === only.from);
     const below = startCards.find((card) => card.from === only.to);
-    if (transaction.isUserEvent("delete.backward") && above) {
-      removal = { from: above.from, to: above.to };
-    } else if (transaction.isUserEvent("delete.forward") && below) {
-      // The card below moves up to the break's position once the break is gone.
-      removal = { from: only.from, to: only.from + (below.to - below.from) };
+    const target = transaction.isUserEvent("delete.backward")
+      ? above
+      : transaction.isUserEvent("delete.forward")
+        ? below
+        : undefined;
+    if (target) {
+      // The card goes with the blank line that separates it, as its X removes it. The span is
+      // mapped into the new document, where the break is already gone.
+      const span = cardRemoval(
+        transaction.startState.doc,
+        transaction.startState.doc.lineAt(target.from).number,
+      );
+      if (span) {
+        // The span keeps the break the key removed. When it doesn't (Delete at a card with no
+        // blank line above), the break before the card goes instead, so the break after it stays.
+        const whole = span.from <= only.from && only.to <= span.to;
+        const range = whole ? span : { from: only.from, to: target.to };
+        removal = {
+          from: transaction.changes.mapPos(range.from, 1),
+          to: transaction.changes.mapPos(range.to, -1),
+        };
+      }
     }
   }
   const breaks = new Set<number>();

@@ -49,7 +49,10 @@ export function useReplyDraft(singleDocument = false) {
           if (id !== null) return current;
           const document = typedDocumentFor(current.draft, current.typed);
           // The editor's rules apply to edits made here too, so a card keeps its own line.
-          const edited = settleReplyDocument(typeof next === "function" ? next(document) : next);
+          const edited = settleReplyDocument(
+            typeof next === "function" ? next(document) : next,
+            document,
+          );
           return { draft: unweaveReplyDraft(edited), typed: edited };
         }
         const update = (text: string) => (typeof next === "function" ? next(text) : next);
@@ -79,12 +82,10 @@ export function useReplyDraft(singleDocument = false) {
     (text: string) => {
       setState((current) => {
         if (singleDocument) {
-          const edited = settleReplyDocument(
-            appendQuoteToDocument(typedDocumentFor(current.draft, current.typed), {
-              id: nanoid(),
-              text: text.replace(/\r\n?/g, "\n"),
-            }),
-          );
+          const edited = appendQuoteToDocument(typedDocumentFor(current.draft, current.typed), {
+            id: nanoid(),
+            text: text.replace(/\r\n?/g, "\n"),
+          });
           return { draft: unweaveReplyDraft(edited), typed: edited };
         }
         return { draft: appendReplyQuote(current.draft, text), typed: null };
@@ -99,9 +100,8 @@ export function useReplyDraft(singleDocument = false) {
         if (singleDocument) {
           const index = current.draft.quotes.findIndex((quote) => quote.id === id);
           if (index < 0) return current;
-          const edited = settleReplyDocument(
-            removeReplyQuoteAt(typedDocumentFor(current.draft, current.typed), index),
-          );
+          const document = typedDocumentFor(current.draft, current.typed);
+          const edited = settleReplyDocument(removeReplyQuoteAt(document, index), document);
           return { draft: unweaveReplyDraft(edited), typed: edited };
         }
         return { draft: removeReplyQuote(current.draft, id), typed: null };

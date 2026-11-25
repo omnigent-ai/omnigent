@@ -768,7 +768,7 @@ describe("CodeMirrorComposerInput reply cards", () => {
     const { editor } = mountDocument(value);
     typeAt(editor, offset, "x");
     expect(editor.state.doc.toString()).toBe(
-      settleReplyDocument(value.slice(0, offset) + "x" + value.slice(offset)),
+      settleReplyDocument(value.slice(0, offset) + "x" + value.slice(offset), value),
     );
   });
 
@@ -815,6 +815,28 @@ describe("CodeMirrorComposerInput reply cards", () => {
     caret(editor, value.indexOf("Why"));
     key(content, { key: "Backspace" });
     expect(editor.state.doc.toString()).toBe("Opener\nWhy");
+  });
+
+  it("removes a card with its blank separator, by Backspace, Delete and its X", () => {
+    const first = card("First", "c1");
+    const second = card("Second", "c2");
+    const value = `A\n${first}\n\n${second}\nB`;
+    const backspace = mountDocument(value);
+    caret(backspace.editor, value.indexOf("B"));
+    key(backspace.content, { key: "Backspace" });
+    expect(backspace.editor.state.doc.toString()).toBe(`A\n${first}\nB`);
+
+    const forward = mountDocument(value);
+    caret(forward.editor, value.indexOf(second) - 1);
+    key(forward.content, { key: "Delete" });
+    expect(forward.editor.state.doc.toString()).toBe(`A\n${first}\nB`);
+
+    const x = mountDocument(value);
+    const removers = x.container.querySelectorAll<HTMLButtonElement>(
+      'button[aria-label="Remove quote"]',
+    );
+    act(() => void fireEvent.click(removers[1]!));
+    expect(x.target().value).toBe(`A\n${first}\nB`);
   });
 
   it("removes a card with Delete at the end of the line before it", () => {
@@ -948,5 +970,6 @@ describe("CodeMirrorComposerInput reply cards", () => {
     const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove quote"]')!;
     act(() => void fireEvent.click(remove));
     expect(target().value).toBe("Rest");
+    expect(onChange).toHaveBeenCalledOnce();
   });
 });

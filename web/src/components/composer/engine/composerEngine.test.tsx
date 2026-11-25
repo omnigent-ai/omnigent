@@ -323,6 +323,8 @@ describe("autofocus across an engine switch", () => {
 });
 
 describe("reporting the engine at mount", () => {
+  afterEach(() => resetCodeMirrorComposerLoadForTests());
+
   it("tells the owner the textarea is rendered while the editor chunk is still loading", () => {
     resetCodeMirrorComposerLoadForTests(() => new Promise(() => {}));
     const onRenderedEngineChange = vi.fn();
@@ -338,7 +340,6 @@ describe("reporting the engine at mount", () => {
     expect(onRenderedEngineChange).toHaveBeenLastCalledWith("textarea");
     expect(document.querySelector(".cm-content")).toBeNull();
     expect(screen.getByLabelText("Message the agent")).toHaveValue("pasted");
-    resetCodeMirrorComposerLoadForTests();
   });
 });
 

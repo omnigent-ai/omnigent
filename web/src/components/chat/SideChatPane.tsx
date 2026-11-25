@@ -1089,9 +1089,7 @@ function SideChatComposer({
   );
   // Read the store at call time: the seed is cleared when the document loses it.
   const applyDocument = useCallback(
-    (edited: string) => {
-      // A dictated or programmatic edit gets the editor's rules: each card keeps its own line.
-      const next = settleReplyDocument(edited);
+    (next: string) => {
       typedDocumentRef.current = next;
       setTypedDocument(next);
       const parsed = unweaveReplyDraft(next);
@@ -1117,8 +1115,13 @@ function SideChatComposer({
   // single-document mode, where the tail's `text` is only the part after the quotes.
   const editorText = singleDocument ? replyDocument : text;
   const setEditorText = useCallback(
-    (next: string) => (singleDocument ? applyDocument(next) : setText(next)),
-    [applyDocument, setText, singleDocument],
+    (next: string) => {
+      if (!singleDocument) return setText(next);
+      const current =
+        useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
+      applyDocument(settleReplyDocument(next, tailValueOf(current)));
+    },
+    [applyDocument, composerKey, setText, singleDocument, tailValueOf],
   );
   const reconcileVoiceEdits = useCallback(
     (current: SideChatComposerDraft) => {
@@ -1149,14 +1152,14 @@ function SideChatComposer({
     (edited: string) => {
       // The single document is the tail, so its dictation is recorded and undone as the tail's.
       const id = singleDocument ? null : activeTextId;
-      // Recorded as the document it becomes, so the dictation's undo still owns it.
-      const next = singleDocument ? settleReplyDocument(edited) : edited;
       const current =
         useChatStore.getState().sideChatComposers[composerKey] ?? EMPTY_SIDE_CHAT_COMPOSER;
       reconcileVoiceEdits(current);
       const before =
         id === null ? tailValueOf(current) : current.quotes?.find((item) => item.id === id)?.before;
       if (before === undefined) return;
+      // Recorded as the document it becomes, so the dictation's undo still owns it.
+      const next = singleDocument ? settleReplyDocument(edited, before) : edited;
       const previous = voiceEditsRef.current.get(id);
       voiceEditsRef.current.set(id, {
         before: previous?.before ?? before,

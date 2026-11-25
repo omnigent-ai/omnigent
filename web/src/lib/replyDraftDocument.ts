@@ -187,29 +187,38 @@ export function removeReplyQuoteAt(document: string, index: number): string {
 }
 
 /**
- * A document with the editor's rules applied to an edit made in code: text beside a card goes on
- * its own line, plain lines hold no marks or damaged tokens, and a card is never the last line.
+ * A document with the editor's rules applied to an edit made in code. Only a token that `previous`
+ * already holds stays a card, so a value from code can't forge one; any other mark is removed with
+ * its payload. Text beside a card goes on its own line, and a card is never the last line.
  */
-export function settleReplyDocument(document: string): string {
+export function settleReplyDocument(document: string, previous: string): string {
+  const known = new Set(
+    replyQuoteTokenRanges(previous).map((token) => previous.slice(token.start, token.end)),
+  );
   const lines: string[] = [];
   const pushText = (segment: string) => {
     const plain = withoutReplyQuoteMarks(segment);
     if (plain !== "") lines.push(plain);
   };
   for (const line of document.split("\n")) {
-    const tokens = replyQuoteTokenRanges(line);
-    if (tokens.length === 0) {
-      lines.push(withoutReplyQuoteMarks(line));
+    if (!hasReplyQuoteMark(line)) {
+      lines.push(line);
       continue;
     }
+    // Text around a dropped token joins up, so a foreign token leaves its line whole.
+    let text = "";
     let rest = 0;
-    for (const token of tokens) {
-      pushText(line.slice(rest, token.start));
+    for (const token of replyQuoteTokenRanges(line)) {
+      text += line.slice(rest, token.start);
       const card = line.slice(token.start, token.end);
-      if (parseReplyQuoteLine(card) !== null) lines.push(card);
+      if (known.has(card)) {
+        pushText(text);
+        text = "";
+        lines.push(card);
+      }
       rest = token.end;
     }
-    pushText(line.slice(rest));
+    pushText(text + line.slice(rest));
   }
   if (lines.length > 0 && parseReplyQuoteLine(lines[lines.length - 1]!) !== null) lines.push("");
   return lines.join("\n");

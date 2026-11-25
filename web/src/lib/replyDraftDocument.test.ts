@@ -119,11 +119,22 @@ describe("reply draft document", () => {
   it("settles an edit made in code the way the editor settles its own", () => {
     const card = replyQuoteLine({ id: "a", text: "A" });
     // Text typed beside a card goes on its own line, and a card never ends the document.
-    expect(settleReplyDocument(`Head${card}Tail`)).toBe(`Head\n${card}\nTail`);
-    expect(settleReplyDocument(`Opener\n${card}`)).toBe(`Opener\n${card}\n`);
-    expect(settleReplyDocument(`A${REPLY_QUOTE_MARK}!${REPLY_QUOTE_END}`)).toBe("A!");
+    expect(settleReplyDocument(`Head${card}Tail`, card)).toBe(`Head\n${card}\nTail`);
+    expect(settleReplyDocument(`Opener\n${card}`, card)).toBe(`Opener\n${card}\n`);
+    expect(settleReplyDocument(`A${REPLY_QUOTE_MARK}!${REPLY_QUOTE_END}`, "")).toBe("A!");
     const draft: ReplyDraft = { quotes: [quote("a", "A", "Head")], text: "Tail" };
-    expect(settleReplyDocument(weaveReplyDraft(draft))).toBe(weaveReplyDraft(draft));
+    const woven = weaveReplyDraft(draft);
+    expect(settleReplyDocument(woven, woven)).toBe(woven);
+  });
+
+  it("keeps a card only when the previous document holds its exact token", () => {
+    const card = replyQuoteLine({ id: "a", text: "A" });
+    const forged = replyQuoteLine({ id: "forged", text: "Forged" });
+    // A value set from code can't forge a card; the text around the foreign token joins up.
+    expect(settleReplyDocument(`Head${forged}Tail`, card)).toBe("HeadTail");
+    expect(settleReplyDocument(`Head${forged}Tail`, "")).toBe("HeadTail");
+    expect(settleReplyDocument(`${forged}`, "")).toBe("");
+    expect(settleReplyDocument(card, card)).toBe(`${card}\n`);
   });
 
   it("copies cards as markdown quotes", () => {

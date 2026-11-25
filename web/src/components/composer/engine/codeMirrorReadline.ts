@@ -14,6 +14,7 @@ import {
   yankText,
   type KillRing,
 } from "@/lib/textEditing/readline";
+import { parseReplyQuoteLine } from "@/lib/replyDraftDocument";
 
 /** Marks the text a kill removed, so the kill ring can yank it back. */
 export const killed = Annotation.define<{ text: string; backward: boolean }>();
@@ -73,6 +74,18 @@ function kill(boundary: Boundary): Command {
   };
 }
 
+/** ⌃K at the end of the line before a card does nothing: a kill never removes a card. */
+const killToLineEnd: Command = (view) => {
+  const { state } = view;
+  const range = state.selection.main;
+  const line = state.doc.lineAt(range.head);
+  const next = line.number < state.doc.lines ? state.doc.line(line.number + 1) : null;
+  if (!state.readOnly && range.empty && range.head === line.to && next !== null) {
+    if (parseReplyQuoteLine(next.text) !== null) return true;
+  }
+  return kill(lineEndAfter)(view);
+};
+
 /** ⌃Y: insert the newest kill at the selection. */
 const yank: StateCommand = ({ state, dispatch }) => {
   if (state.readOnly) return false;
@@ -95,7 +108,7 @@ const yank: StateCommand = ({ state, dispatch }) => {
  * standard keymap; Ctrl-k overrides its line-end delete so the text can be yanked back.
  */
 export const READLINE_BINDINGS: readonly KeyBinding[] = [
-  { key: "Ctrl-k", run: kill(lineEndAfter) },
+  { key: "Ctrl-k", run: killToLineEnd },
   { key: "Ctrl-u", run: kill(lineStartBefore) },
   { key: "Ctrl-w", run: kill(shellWordStartBefore) },
   { key: "Ctrl-y", run: yank },
