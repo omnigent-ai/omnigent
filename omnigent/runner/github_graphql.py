@@ -13,6 +13,7 @@ from omnigent.runner.pull_request_errors import PullRequestChangedError, Unknown
 from omnigent.runner.session_prs import PullRequestRef
 
 _LOAD_FAILED = "GitHub could not load this pull request. Refresh to retry."
+AUTHENTICATION_TIMED_OUT = "GitHub authentication timed out. Nothing was sent; try again."
 
 
 def pull_request_node(root: str, reference: PullRequestRef, selection: str) -> dict[str, Any]:
@@ -76,12 +77,12 @@ def mutate(
     timeout, a 5xx, a reset connection or an unreadable answer are an unknown outcome: the
     write is never retried.
     """
-    host = github._host_args(root, reference)
-    token = github._pr_token(root, reference)
     with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+        host = github._host_args(root, reference)
+        token = github._pr_token(root, reference)
         if github._gh_timed_out.get():
-            # Nothing was sent: the token lookup used up the deadline.
-            raise ValueError("GitHub authentication timed out. Refresh to retry.")
+            # The selected account's token is unknown, so the write must not run as another.
+            raise ValueError(AUTHENTICATION_TIMED_OUT)
         rc, output, err = github._pr_json_write(
             root,
             host=host,
