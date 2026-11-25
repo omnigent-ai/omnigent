@@ -7,17 +7,16 @@ and roles, over the Summary's UTC windows. Nothing is recorded for telemetry her
   is counted separately, never as a person.
 - **Sessions started by people** are top-level sessions that aren't the Lead's, a
   role's, a side chat, an agent worker's or a sub-agent, credited to their owner.
-- **Messages to the Lead or a role** are messages a person wrote in the Lead's or a
-  role's session, or in a side chat with either. Single-user mode stores no author
-  for messages, so these are ``None`` (not measured) there. Messages an agent
-  relays from another session aren't counted.
+- **Messages to the Lead or a role** need to know a person typed them. Stored
+  messages can't tell that: the server's own notices (ticket updates, reminders,
+  handoffs) are stored the same way as a person's words. So these counts are
+  ``None`` (not measured) until the usage log records each message as it's sent.
 - **Roles by the Lead vs by hand:** a role an agent created records its session;
   the owner's records none. Deleted roles aren't counted.
 """
 
 from __future__ import annotations
 
-import json
 import statistics
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -27,12 +26,10 @@ from sqlalchemy import select
 
 from omnigent.db.db_models import (
     SqlConversation,
-    SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import ITEM_TYPE
 from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.server.auth import LEVEL_OWNER
@@ -48,8 +45,6 @@ if TYPE_CHECKING:
     from omnigent.stores import ConversationStore, PermissionStore
 
 SessionKind = Literal["personal", "lead", "role", "side_chat", "worker", "sub_agent"]
-#: The prefix the server puts on a message one session sends another.
-PEER_MESSAGE_PREFIX = "[Message from session "
 #: A ticket in a working stage with no activity for this long counts as stalled.
 STALLED_AFTER_SECONDS = 3 * 86_400
 #: An edit this long after a role's creation counts as adapting it.
@@ -86,8 +81,9 @@ class PersonRow:
     user_id: str
     sessions_started: int = 0
     tickets_filed: int = 0
-    messages_to_lead: int = 0
-    messages_to_roles: int = 0
+    #: ``None`` while people's messages aren't measured.
+    messages_to_lead: int | None = 0
+    messages_to_roles: int | None = 0
     side_chats_opened: int = 0
     ticket_comments: int = 0
 
@@ -99,7 +95,7 @@ class TelemetryInputs:
     project: Project
     period: StatusPeriod
     sessions: Callable[[], list[ProjectSession]]
-    #: ``None`` when message authors aren't recorded (single-user mode).
+    #: ``None`` when people's messages aren't measured.
     person_messages: Callable[[list[ProjectSession]], list[PersonMessage] | None]
     activity: Callable[[], list[dict[str, Any]]]
     identities: Callable[[], list[ProjectIdentity]]
@@ -125,20 +121,6 @@ def classify_session(
     if family_id is not None and family_id != session_id:
         return "worker"
     return "personal"
-
-
-def is_person_message(data: str) -> bool:
-    """Whether a stored message item is a person's own text, not a relayed peer message."""
-    try:
-        payload = json.loads(data)
-    except ValueError:
-        return False
-    if not isinstance(payload, dict) or payload.get("role", "user") != "user":
-        return False
-    content = payload.get("content")
-    first = content[0] if isinstance(content, list) and content else None
-    text = first.get("text") if isinstance(first, dict) else content
-    return not (isinstance(text, str) and text.startswith(PEER_MESSAGE_PREFIX))
 
 
 def _person(user_id: str | None, project: Project) -> str:
@@ -208,6 +190,9 @@ def compute_telemetry(inputs: TelemetryInputs) -> dict[str, Any]:
         )
 
     rows = sorted(people.values(), key=lambda person: person.user_id)
+    if messages is None:
+        for person in rows:
+            person.messages_to_lead = person.messages_to_roles = None
     mix = {"session_first": 0, "ticket_first": 0, "both": 0}
     for person in rows:
         if person.sessions_started and person.tickets_filed:
@@ -393,33 +378,6 @@ class ProjectTelemetryReader:
                 )
             )
         return result
-
-    def person_messages(
-        self, sessions: list[ProjectSession], since_epoch: int | None
-    ) -> list[PersonMessage]:
-        """Messages people wrote in the Lead's, roles' and side-chat sessions."""
-        targets = [s.id for s in sessions if s.kind in ("lead", "role", "side_chat")]
-        if not targets:
-            return []
-        with self._items_db("list_person_messages_for_telemetry") as session:
-            stmt = select(
-                SqlConversationItem.conversation_id,
-                SqlConversationItem.created_by,
-                SqlConversationItem.created_at,
-                SqlConversationItem.data,
-            ).where(
-                SqlConversationItem.workspace_id == current_workspace_id(),
-                SqlConversationItem.conversation_id.in_(targets),
-                SqlConversationItem.type == ITEM_TYPE["message"],
-                SqlConversationItem.created_by.is_not(None),
-            )
-            if since_epoch is not None:
-                stmt = stmt.where(SqlConversationItem.created_at >= since_epoch)
-            return [
-                PersonMessage(conversation_id, created_by, created_at)
-                for conversation_id, created_by, created_at, data in session.execute(stmt)
-                if is_person_message(data)
-            ]
 
     def _owners(self, session_ids: list[str]) -> dict[str, str]:
         if self._permissions is None:

@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
-from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.project_kpis import KpiInputs, compute_metrics
 from omnigent.server.project_status import (
     StatusSources,
@@ -58,7 +57,12 @@ class WorkStart(BaseModel):
 
 
 class RoleInteraction(BaseModel):
-    """How people talk to the Lead and roles. Message counts are null in single-user mode."""
+    """How people talk to the Lead and roles.
+
+    Message counts, and the people counts derived from them, are null until the usage
+    log measures them: stored messages don't distinguish a person's words from the
+    server's automatic notices.
+    """
 
     messages_to_lead: int | None
     messages_to_roles: int | None
@@ -111,8 +115,8 @@ class PersonActivity(BaseModel):
     user_id: str
     sessions_started: int
     tickets_filed: int
-    messages_to_lead: int
-    messages_to_roles: int
+    messages_to_lead: int | None = Field(description="Null until people's messages are measured.")
+    messages_to_roles: int | None = Field(description="Null until people's messages are measured.")
     side_chats_opened: int
     ticket_comments: int
 
@@ -216,15 +220,12 @@ def create_project_telemetry_router(
         stages = functools.cache(
             lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
         )
-        # Single-user mode records no author for messages, so they can't be counted.
-        authors_recorded = user_id not in (None, RESERVED_USER_LOCAL)
         inputs = TelemetryInputs(
             project=project,
             period=period,
             sessions=lambda: reader.sessions(project),
-            person_messages=lambda sessions: (
-                reader.person_messages(sessions, period.since_epoch) if authors_recorded else None
-            ),
+            # People's messages are measured once the usage log records them as sent.
+            person_messages=lambda _sessions: None,
             activity=lambda: ticket_store.activity_actors(
                 project.id, user_id=user_id, since_epoch=period.since_epoch
             ),

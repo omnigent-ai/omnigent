@@ -6437,14 +6437,30 @@
       "PersonActivity": {
         "properties": {
           "messages_to_lead": {
-            "format": "int64",
-            "title": "Messages To Lead",
-            "type": "integer"
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null until people's messages are measured.",
+            "title": "Messages To Lead"
           },
           "messages_to_roles": {
-            "format": "int64",
-            "title": "Messages To Roles",
-            "type": "integer"
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null until people's messages are measured.",
+            "title": "Messages To Roles"
           },
           "sessions_started": {
             "format": "int64",
@@ -9327,7 +9343,7 @@
         "type": "object"
       },
       "RoleInteraction": {
-        "description": "How people talk to the Lead and roles. Message counts are null in single-user mode.",
+        "description": "How people talk to the Lead and roles.\n\nMessage counts, and the people counts derived from them, are null until the usage\nlog measures them: stored messages don't distinguish a person's words from the\nserver's automatic notices.",
         "properties": {
           "messages_to_lead": {
             "anyOf": [

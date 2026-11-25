@@ -23,7 +23,6 @@ from omnigent.server.project_telemetry import (
     TelemetryInputs,
     classify_session,
     compute_telemetry,
-    is_person_message,
     review_rounds_and_stalled,
     visible_people,
 )
@@ -42,7 +41,7 @@ def _message(text: str, role: str = "user") -> str:
     return json.dumps({"role": role, "content": [{"type": "input_text", "text": text}]})
 
 
-def test_sessions_are_classified_and_relayed_messages_are_not_a_persons() -> None:
+def test_sessions_are_classified() -> None:
     project = SimpleNamespace(main_session_id="lead", retired_main_session_ids=["old"])
 
     def kind(session_id, root=None, family=None, labels=None):
@@ -55,10 +54,6 @@ def test_sessions_are_classified_and_relayed_messages_are_not_a_persons() -> Non
     assert kind("w", family="lead") == "worker"
     assert kind("sub", root="lead") == "sub_agent"
     assert kind("mine", family="mine") == "personal"
-    assert is_person_message(_message("Please add a PM role."))
-    assert not is_person_message(_message("[Message from session abc]\nDone."))
-    assert not is_person_message(_message("Here you go.", role="assistant"))
-    assert not is_person_message("not json")
 
 
 def _inputs(**overrides) -> TelemetryInputs:
@@ -175,6 +170,10 @@ def test_message_counts_are_not_measured_without_authors() -> None:
     assert interaction["messages_to_lead"] is None
     assert interaction["people_ticket_only"] is None
     assert interaction["side_chats_opened"] == 1
+    # A person's row says "not measured", not "never messaged".
+    assert {
+        (row["messages_to_lead"], row["messages_to_roles"]) for row in result["people_rows"]
+    } == {(None, None)}
 
 
 def test_review_rounds_and_stalled_work() -> None:
@@ -245,9 +244,9 @@ async def test_telemetry_endpoints_count_real_activity_and_respect_access(
     await multi_user_client.patch(
         f"{path}/tickets/{ticket['id']}", json={"stage_id": done}, headers=owner
     )
-    # The owner writes to the Lead, and the Lead relays a peer message.
+    # An automatic notice the server stores like a person's message, attributed to the owner.
     with Session(sa.create_engine(db_uri)) as session:
-        for position, text in enumerate(["Add a PM role.", "[Message from session x]\nDone."]):
+        for position, text in enumerate(["Automatic ticket update for project p."]):
             session.add(
                 SqlConversationItem(
                     workspace_id=0,
@@ -269,9 +268,11 @@ async def test_telemetry_endpoints_count_real_activity_and_respect_access(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["work_start"]["tickets_filed_directly"] == 1
-    assert body["role_interaction"]["messages_to_lead"] == 1
+    # Stored messages can't tell a person's words from the server's notices: not measured.
+    assert body["role_interaction"]["messages_to_lead"] is None
+    assert body["role_interaction"]["messages_to_roles"] is None
     assert body["role_interaction"]["ticket_comments_by_people"] == 1
-    assert body["role_interaction"]["people_ticket_only"] == 1
+    assert body["role_interaction"]["people_ticket_only"] is None
     assert body["team_building"]["roles_created_by_hand"] == 1
     assert body["throughput"]["tickets_shipped"] == 1
     assert {row["user_id"] for row in body["people"]} == {OWNER, MEMBER}
