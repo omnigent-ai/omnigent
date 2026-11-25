@@ -485,6 +485,50 @@ def test_a_page_of_owned_gadgets_reads_a_bounded_part_of_a_large_account(
     ]
 
 
+def test_retiring_a_first_segment_probes_a_bounded_number_of_missing_ones(
+    store: LocalGadgetStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first segment stays alive while many after it fill and empty; when it finally
+    # empties, one request skips at most _HEAD_PROBES_PER_CALL missing segments and records
+    # how far it got, and later pages carry on from there.
+    monkeypatch.setattr(local_module, "_OWNER_SEGMENT_SIZE", 1)
+    first = store.create(ALICE, "First").id
+    passing = [store.create(ALICE, f"Passing {n}").id for n in range(30)]
+    kept = store.create(ALICE, "Kept").id
+    for gadget_id in passing:
+        store.delete(gadget_id)
+    owner_dir = next((tmp_path / "gadgets" / "owners").iterdir())
+    probes = 0
+    real_exists = Path.exists
+
+    def counting_exists(self: Path, *args: object, **kwargs: object) -> bool:
+        nonlocal probes
+        if self.parent == owner_dir and self.name.startswith("s"):
+            probes += 1
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", counting_exists)
+    store.delete(first)
+    assert probes <= local_module._HEAD_PROBES_PER_CALL
+    first_after, last = store._read_head(owner_dir)
+    assert 0 < first_after < last
+    # Each page probes no more than the bound, however many pages it takes.
+    real_page = store.list_owned_page
+    most = 0
+
+    def page(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal probes, most
+        probes = 0
+        result = real_page(*args, **kwargs)  # type: ignore[arg-type]
+        most = max(most, probes)
+        return result
+
+    monkeypatch.setattr(store, "list_owned_page", page)
+    seen = [gadget_id for page in _owned_pages(store, ALICE, limit=10) for gadget_id in page]
+    assert seen == [kept]
+    assert most <= local_module._HEAD_PROBES_PER_CALL
+
+
 def test_emptied_segments_and_markers_a_deletion_left_dont_count_as_owned(
     store: LocalGadgetStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -558,18 +602,18 @@ def test_an_owner_registration_is_its_own_account(store: LocalGadgetStore) -> No
 def test_a_deleted_gadgets_files_are_removed_a_bounded_number_at_a_time(
     store: LocalGadgetStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(local_module, "_TRASH_ENTRIES_PER_CALL", 5)
+    monkeypatch.setattr(local_module, "_TRASH_ENTRIES_PER_CALL", 12)
     big = store.create(ALICE, "Board")
     files = store.gadget_files(big.id)
     files.mkdirs("data")
-    for n in range(12):
+    for n in range(40):
         files.create_json(f"data/{n:02d}.json", {"n": n})
     trash = tmp_path / "gadgets" / ".trash"
 
     def left() -> int:
         return sum(len(names) + len(dirs) for _, dirs, names in os.walk(trash))
 
-    # The gadget is gone at once; its files go five at a time, with each later deletion.
+    # The gadget is gone at once; its files go a few at a time, with each later deletion.
     assert store.delete(big.id) is True
     assert store.get(big.id) is None
     assert left() > 0
@@ -577,6 +621,52 @@ def test_a_deleted_gadgets_files_are_removed_a_bounded_number_at_a_time(
         before = left()
         store.delete(store.create(ALICE, "Scratch").id)
         assert left() < before
+
+
+def test_draining_a_huge_trash_directory_reads_only_its_budget_of_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One detached gadget with a huge directory (frontend revisions have no lifetime bound):
+    # each step looks at no more entries than its budget, wherever they are in the tree.
+    trash = tmp_path / ".trash"
+    huge = trash / "tree-1" / "files" / "revisions"
+    huge.mkdir(parents=True)
+    for n in range(300):
+        (huge / f"{n:04d}.json").write_text("{}")
+    examined = 0
+    real_scandir = os.scandir
+
+    class CountingScandir:
+        def __init__(self, path: object) -> None:
+            self._it = real_scandir(path)
+
+        def __enter__(self) -> CountingScandir:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._it.close()
+
+        def __iter__(self) -> CountingScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            nonlocal examined
+            entry = next(self._it)
+            examined += 1
+            return entry
+
+    monkeypatch.setattr(local_module.os, "scandir", CountingScandir)
+    steps = 0
+    while trash.exists() and any(trash.iterdir()):
+        examined = 0
+        removed = local_module._drain_trash(trash, budget=20)
+        assert removed > 0
+        # The budget, plus the levels walked back down after removing a directory.
+        assert examined <= 20 + 4
+        steps += 1
+        assert steps < 100
+    assert steps >= 300 // 20
+    assert list(trash.iterdir()) == []
 
 
 def test_a_store_opened_without_maintenance_touches_nothing_until_written(tmp_path: Path) -> None:

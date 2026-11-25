@@ -78,6 +78,8 @@ _TRASH_ENTRIES_PER_CALL = 2000
 _ORPHAN_AGE_S = 60 * 60
 # Creation notes looked at per cleanup step (each create and each start runs one).
 _SWEEP_NOTES_PER_STEP = 32
+# Missing owner segments one retirement skips before recording how far it got.
+_HEAD_PROBES_PER_CALL = 8
 
 
 def _user_key(user_id: str, registration: str | None = None) -> str:
@@ -126,28 +128,52 @@ def _replace_file(tmp_dir: Path, target: Path, value: dict) -> None:
 
 
 def _drain_trash(trash: Path, budget: int | None = None) -> int:
-    """Remove up to *budget* files and directories from *trash*; how many went.
+    """Remove files and directories from *trash*, looking at no more than *budget* directory
+    entries; how many went.
 
     Deleting moves things into the trash in one rename, so they disappear at once; their
     files then go a bounded number at a time, on later deletions and starts, so one request
-    never removes a large tree.
+    never removes a large tree. Entries are read one at a time and the first directory met is
+    entered, so a huge directory costs no more than the budget; what went is gone, so the next
+    call carries on where the tree still has entries.
     """
     budget = _TRASH_ENTRIES_PER_CALL if budget is None else budget
-    removed = 0
-    for directory, _dirnames, filenames in os.walk(trash, topdown=False):
-        for name in filenames:
-            if removed >= budget:
-                return removed
-            with contextlib.suppress(OSError):
-                os.unlink(os.path.join(directory, name))
-            removed += 1
-        if directory == str(trash):
+    top = str(trash)
+    # The directories entered so far, from the top: an emptied one is removed and its parent
+    # read again, which now starts past it.
+    path = [top]
+    removed = examined = 0
+    while path and examined < budget:
+        child = None
+        try:
+            with os.scandir(path[-1]) as entries:
+                for entry in entries:
+                    examined += 1
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        child = entry.path
+                        break
+                    with contextlib.suppress(OSError):
+                        os.unlink(entry.path)
+                    removed += 1
+                    if examined >= budget:
+                        return removed
+        except (FileNotFoundError, NotADirectoryError):
+            path.pop()
             continue
-        if removed >= budget:
-            return removed
+        if child is not None:
+            path.append(child)
+            continue
+        if len(path) == 1:
+            return removed  # The trash itself is empty.
+        examined += 1
         with contextlib.suppress(OSError):
-            os.rmdir(directory)
-        removed += 1
+            os.rmdir(path[-1])
+            removed += 1
+        path.pop()
     return removed
 
 
@@ -524,11 +550,18 @@ class LocalGadgetStore(GadgetStore):
             except OSError:
                 return  # A gadget was added to it meanwhile.
             if number == first:
+                # At most _HEAD_PROBES_PER_CALL missing segments are skipped per call, and the
+                # head records how far this got: a later page starting at a missing first
+                # segment finds it empty and moves the head on again.
                 following = first + 1
+                probes = 0
                 while (
-                    following < last and not (owner_dir / self._segment_name(following)).exists()
+                    following < last
+                    and probes < _HEAD_PROBES_PER_CALL
+                    and not (owner_dir / self._segment_name(following)).exists()
                 ):
                     following += 1
+                    probes += 1
                 self._write_head(owner_dir, following, last)
 
     def list_owned_page(
