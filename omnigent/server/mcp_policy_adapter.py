@@ -10,6 +10,12 @@ from fastapi import HTTPException, Request, Response
 
 from omnigent.entities import Conversation
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.board_mcp import (
+    BOARD_SERVICE_ID,
+    board_tool_schemas,
+    bound_runner_token,
+    execute_board_tool,
+)
 from omnigent.server.mcp_gateway import gateway_backend
 from omnigent.server.mcp_identity import mcp_policy_actor
 from omnigent.server.mcp_registry import McpRegistry, McpService
@@ -27,7 +33,8 @@ from omnigent.stores.permission_store import PermissionStore
 class McpPolicyContext:
     conversation: Conversation
     config: MCPServerConfig
-    service: McpService
+    #: ``None`` for the server-run project board.
+    service: McpService | None
     credential_user: str
     policy_actor: dict[str, str] | None
 
@@ -58,6 +65,8 @@ class McpPolicyAdapter:
         if conv is None or conv.archived:
             raise HTTPException(404, "MCP session is unavailable")
         spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, self.agent_store)
+        if service_id == BOARD_SERVICE_ID:
+            return self._authorize_board(request, conv, spec, caller)
         config = (
             next(
                 (
@@ -84,9 +93,28 @@ class McpPolicyAdapter:
             conv, config, service, user, mcp_policy_actor(request, conv, caller)
         )
 
+    def _authorize_board(
+        self, request: Request, conv: Conversation, spec: Any, caller: str | None
+    ) -> McpPolicyContext:
+        """Only the session's own runner may use the board, and only in a project."""
+        if conv.project_id is None or spec is None or not spec.tool_groups.projects:
+            raise HTTPException(403, "The project board isn't available to this session")
+        if bound_runner_token(request, conv) is None:
+            raise HTTPException(403, "The project board requires the session's bound runner")
+        user = registry_user(_build_actor(caller))
+        return McpPolicyContext(
+            conv,
+            MCPServerConfig(name=BOARD_SERVICE_ID, transport="registry"),
+            None,
+            user,
+            mcp_policy_actor(request, conv, caller),
+        )
+
     async def list_tools(
         self, request: Request, context: McpPolicyContext
     ) -> list[dict[str, Any]]:
+        if context.service is None:
+            return board_tool_schemas()
         backend = gateway_backend(request.app.state.mcp_registry, request.app.state)
         tools = await backend.list_tools(context.service, context.credential_user)
         return [
@@ -103,9 +131,14 @@ class McpPolicyAdapter:
         rpc_id: int | str | None,
         params: dict[str, Any],
     ) -> Response:
-        name = f"{context.service.id}__{params['name']}"
+        service_id = context.service.id if context.service else BOARD_SERVICE_ID
+        name = f"{service_id}__{params['name']}"
 
         async def execute(arguments: dict[str, Any]) -> dict[str, Any]:
+            if context.service is None:
+                return await execute_board_tool(
+                    request, context.conversation, params["name"], arguments
+                )
             return await execute_registry_tool(
                 request,
                 context.conversation,

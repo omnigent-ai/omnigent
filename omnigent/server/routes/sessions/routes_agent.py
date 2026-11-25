@@ -17,6 +17,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.automations_availability import AUTOMATIONS_HEADER, USER_INBOX_HEADER
+from omnigent.entities import Conversation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -191,6 +192,17 @@ def register_agent_routes(
         )
         return result
 
+    async def _wants_board_service(conv: Conversation) -> bool:
+        from omnigent.server.board_mcp import board_service_wanted
+        from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+
+        host = host_registry.get(conv.host_id) if host_registry and conv.host_id else None
+        capabilities = getattr(getattr(host, "hello", None), "capabilities", None)
+        if capabilities is None or conv.project_id is None:
+            return False
+        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+        return board_service_wanted(conv, spec, set(capabilities))
+
     @router.get(
         "/sessions/{session_id}/agent/contents",
         response_class=Response,
@@ -283,13 +295,17 @@ def register_agent_routes(
             )
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":
-            selection_headers[MCP_SELECTION_HEADER] = json.dumps(
-                {
-                    key: value
-                    for key, value in conv.labels.items()
-                    if key.startswith(MCP_SELECTION_PREFIX)
-                }
-            )
+            selection = {
+                key: value
+                for key, value in conv.labels.items()
+                if key.startswith(MCP_SELECTION_PREFIX)
+            }
+            if await _wants_board_service(conv):
+                from omnigent.server.board_mcp import BOARD_SERVICE_ID
+
+                # A host without the board tools reaches them as a server-run service.
+                selection[MCP_SELECTION_PREFIX + BOARD_SERVICE_ID] = "1"
+            selection_headers[MCP_SELECTION_HEADER] = json.dumps(selection)
         automations_available = getattr(request.app.state, "automations_available", None)
         if automations_available is not None:
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
