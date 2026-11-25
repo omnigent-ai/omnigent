@@ -13,7 +13,7 @@ from omnigent.server.feature_flags import FEATURE_DEFINITIONS, Feature
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _OVERRIDES_SOURCE = _REPO_ROOT / "web" / "src" / "lib" / "uiFeatureOverrides.ts"
 _SERVER_SOURCE = _REPO_ROOT / "omnigent"
-_DEFINITIONS_FILE = _SERVER_SOURCE / "server" / "feature_flags.py"
+_DEFINITIONS_FILE = Path("server/feature_flags.py")
 # Mentions that name a feature without gating anything: (feature, file, line text).
 _NOT_GATES = {
     # The SPA's route prefixes, so `/canvas` falls back to index.html.
@@ -87,35 +87,55 @@ def test_listed_feature_does_not_follow_another_feature(name: str) -> None:
     assert follows is None, f"{name} follows {follows} on the server, so it can't be overridden"
 
 
-@cache
-def _server_readers() -> dict[str, list[str]]:
+def _scan_server_readers(
+    root: Path, names: list[str], not_gates: set[tuple[str, str, str]]
+) -> dict[str, list[str]]:
     patterns = {
         name: (
             re.compile(rf"\bFeature\.{Feature(name).name}\b"),
             re.compile(rf"[\"']{name}[\"']"),
         )
-        for name in _overridable_features()
+        for name in names
     }
     readers: dict[str, list[str]] = {name: [] for name in patterns}
-    for path in sorted(_SERVER_SOURCE.rglob("*.py")):
-        if path == _DEFINITIONS_FILE:
+    for path in sorted(root.rglob("*.py")):
+        if path == root / _DEFINITIONS_FILE:
             continue
-        relative = path.relative_to(_SERVER_SOURCE).as_posix()
+        relative = path.relative_to(root).as_posix()
         for line in path.read_text(encoding="utf-8").splitlines():
             for name, (enum_reference, quoted) in patterns.items():
                 if not (enum_reference.search(line) or quoted.search(line)):
                     continue
-                if (name, relative, line.strip()) in _NOT_GATES:
+                if (name, relative, line.strip()) in not_gates:
                     continue
                 readers[name].append(f"{relative}: {line.strip()}")
     return readers
 
 
-def test_server_readers_are_cached_for_all_listed_features() -> None:
-    readers = _server_readers()
-    assert set(readers) == set(_overridable_features())
-    assert _server_readers() is readers
-    assert _server_readers.cache_info().misses == 1
+@cache
+def _server_readers() -> dict[str, list[str]]:
+    return _scan_server_readers(_SERVER_SOURCE, _overridable_features(), _NOT_GATES)
+
+
+def test_server_reader_scan_detects_references_and_only_exempts_the_route(tmp_path: Path) -> None:
+    (tmp_path / "enum_reference.py").write_text("enabled = Feature.CANVAS\n", encoding="utf-8")
+    (tmp_path / "quoted_reference.py").write_text('flag = "canvas"\n"canvas",\n', encoding="utf-8")
+    server = tmp_path / "server"
+    server.mkdir()
+    (server / "app.py").write_text('routes = [\n    "canvas",\n]\n', encoding="utf-8")
+    (server / "feature_flags.py").write_text("feature = Feature.CANVAS\n", encoding="utf-8")
+
+    readers = _scan_server_readers(
+        tmp_path, ["canvas", "session_overview"], {("canvas", "server/app.py", '"canvas",')}
+    )
+    assert readers == {
+        "canvas": [
+            "enum_reference.py: enabled = Feature.CANVAS",
+            'quoted_reference.py: flag = "canvas"',
+            'quoted_reference.py: "canvas",',
+        ],
+        "session_overview": [],
+    }
 
 
 @pytest.mark.parametrize("name", _overridable_features())
