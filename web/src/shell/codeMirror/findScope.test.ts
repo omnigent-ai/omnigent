@@ -349,4 +349,41 @@ describe("find in selection's time budget", () => {
     while (slices.length > 0) slices.shift()!();
     expect(view.state.doc.toString()).toBe(`${text.slice(0, lastLine.from)}hitX`);
   });
+
+  it.each([
+    ["turns off", (view: EditorView) => toggleFindInSelection(view, false)],
+    [
+      "moves to other text",
+      (view: EditorView) => {
+        view.dispatch({ selection: { anchor: 0, head: 10 }, userEvent: "select" });
+        toggleFindInSelection(view, true);
+      },
+    ],
+  ])("stops a pending Replace all, without an edit, when the scope %s", (_label, change) => {
+    const view = new EditorView({
+      parent: document.body,
+      state: EditorState.create({ doc: text, extensions: [search(), history(), findScope] }),
+    });
+    views.push(view);
+    query(view, "(hit)\\s?", true, "$1X");
+    view.dispatch({ selection: { anchor: lastLine.from, head: lastLine.to }, userEvent: "select" });
+    toggleFindInSelection(view, true);
+    const slices: (() => void)[] = [];
+    const scheduler: FindScheduler = {
+      schedule: (task) => {
+        slices.push(task);
+        return () => slices.splice(slices.indexOf(task), 1);
+      },
+      now: expiring(),
+    };
+    const replacer = new FindReplacer(indexFor(view), scheduler);
+    replacer.replaceAll(view);
+    slices.shift()!();
+    expect(replacer.busy).toBe(true);
+
+    change(view);
+    while (slices.length > 0) slices.shift()!();
+    expect(replacer.busy).toBe(false);
+    expect(view.state.doc.toString()).toBe(text);
+  });
 });
