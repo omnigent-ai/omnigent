@@ -13,6 +13,8 @@ is refused without ``--force``.
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 from click.testing import CliRunner
 from sqlalchemy import select
@@ -480,6 +482,82 @@ def test_cli_reports_a_user_refused_for_their_gadgets(db_uri: str, tmp_path) -> 
     assert result.exit_code == 0, result.output
     assert "REFUSED (has gadgets" in result.output
     assert account_store.get_user("alice") is not None
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_cli_refuses_a_gadget_dir_that_is_not_a_directory(
+    db_uri: str, tmp_path, kind: str
+) -> None:
+    """A mistyped ``--gadget-dir`` fails before anything changes, instead of skipping the
+    gadget check and cutting a gadget owner off from their gadgets."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+    wrong = tmp_path / "gadgetz"
+    if kind == "file":
+        wrong.write_text("not a directory")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--gadget-dir",
+            str(wrong),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--gadget-dir" in result.output
+    assert account_store.get_user("alice") is not None
+    assert account_store.get_user("alice@example.com") is None
+    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+    assert not wrong.is_dir()
+
+
+def test_cli_dry_run_writes_nothing_in_the_gadget_dir(db_uri: str, tmp_path) -> None:
+    """The gadget check only reads: a dry run leaves the directory byte for byte as it was,
+    stale index entries included."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    root = tmp_path / "gadgets"
+    store = LocalGadgetStore(str(root))
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("bob", hash_password("password123"))
+    service = _gadget_service(db_uri, store, "bob")
+    # A marker whose gadget is gone: an ordinary owner page would repair it away.
+    gone = service.create("Synthetic gone")
+    shutil.rmtree(root / "gadgets" / gone["id"])
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes() if path.is_file() else b"<dir>"
+            for path in sorted(root.rglob("*"))
+        }
+
+    before = snapshot()
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--gadget-dir",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert snapshot() == before
 
 
 def test_cli_requires_a_mapping(db_uri: str) -> None:

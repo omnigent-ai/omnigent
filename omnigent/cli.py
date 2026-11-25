@@ -13256,7 +13256,8 @@ def debug_db_upgrade(url: str) -> None:
     default=None,
     metavar="DIR",
     help="The server's gadget directory (its config's gadget_location), checked so users "
-    "with gadgets are refused rather than cut off from them. Defaults to <data dir>/gadgets.",
+    "with gadgets are refused rather than cut off from them. Defaults to <data dir>/gadgets, "
+    "skipped when that doesn't exist; a directory given here must exist.",
 )
 def debug_migrate_accounts_to_oidc(
     url: str,
@@ -13318,13 +13319,20 @@ def debug_migrate_accounts_to_oidc(
         if not mapping:
             raise click.UsageError("nothing to migrate: pass --domain DOMAIN and/or --map OLD=NEW")
 
+        # A directory named on purpose must be one: a typo would otherwise skip the
+        # gadget check and cut its users off from their gadgets. The default may be absent
+        # on a server that never kept gadgets.
+        if gadget_dir is not None and not Path(gadget_dir).is_dir():
+            raise click.BadParameter(
+                f"{gadget_dir!r} is not a directory", param_hint="'--gadget-dir'"
+            )
         gadget_location = gadget_dir or _default_gadget_location()
         gadget_store = None
         if Path(gadget_location).is_dir():
             from omnigent.stores.gadget_store.local import LocalGadgetStore
 
-            # Read only: no cleanup step and no directories made.
-            gadget_store = LocalGadgetStore(gadget_location, maintain=False)
+            # Read only: no cleanup step, no directories made and no index repairs.
+            gadget_store = LocalGadgetStore(gadget_location, maintain=False, read_only=True)
         report = remap_identities(
             engine, mapping, dry_run=not commit, force=force, gadget_store=gadget_store
         )

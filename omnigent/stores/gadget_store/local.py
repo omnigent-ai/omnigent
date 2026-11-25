@@ -329,16 +329,21 @@ class LocalGadgetFiles(GadgetFiles):
 class LocalGadgetStore(GadgetStore):
     """Gadgets as JSON files under a local directory (see module docstring)."""
 
-    def __init__(self, storage_location: str, *, maintain: bool = True) -> None:
+    def __init__(
+        self, storage_location: str, *, maintain: bool = True, read_only: bool = False
+    ) -> None:
         """
         :param storage_location: The root directory, e.g.
             ``"/home/alice/.omnigent/gadgets"``; created if missing.
         :param maintain: Create the root and run a cleanup step now. ``False`` for a server
             with gadgets off, which only notes deleted accounts' cleanups: it touches
             nothing until something is written.
+        :param read_only: Reads repair nothing: owner pages leave stale index entries and
+            emptied segments as they are. For tools that only inspect a server's gadgets.
         """
         super().__init__(storage_location)
         self._root = Path(storage_location)
+        self._read_only = read_only
         self._tmp_dir = self._root / ".tmp"
         # Renames read and rewrite the metadata file, and a deletion moves it away;
         # serialize them in this process.
@@ -601,7 +606,7 @@ class LocalGadgetStore(GadgetStore):
             last_read = start_id if number == start_number else ""
             if last_read:
                 names = [n for n in names if n > last_read]
-            elif not names:
+            elif not names and not self._read_only:
                 self._drop_empty_segment(owner_dir, segment)
             for gadget_id in names:
                 if len(owned) == limit or reads_left == 0:
@@ -615,7 +620,7 @@ class LocalGadgetStore(GadgetStore):
                     and gadget.owner_registration == owner_registration
                 ):
                     owned.append(gadget)
-                else:
+                elif not self._read_only:
                     with contextlib.suppress(FileNotFoundError):
                         (owner_dir / segment / gadget_id).unlink()
             if number < last and (len(owned) == limit or reads_left == 0 or number > start_number):
