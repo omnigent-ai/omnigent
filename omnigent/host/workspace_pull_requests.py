@@ -19,7 +19,13 @@ from connectrpc.errors import ConnectError
 
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import PullRequestVouch
-from omnigent.runner import pr_resource
+from omnigent.host.workspace_pull_request_input import PullRequestRefused
+from omnigent.runner import pr_actions, pr_resource
+from omnigent.runner.pull_request_errors import (
+    InvalidPullRequestInput,
+    PullRequestError,
+    UnknownOutcomeError,
+)
 from omnigent.workspace_fs import WorkspaceReader
 
 
@@ -70,7 +76,9 @@ def _root(reader: WorkspaceReader) -> str:
     return str(reader.root)
 
 
-def _anchor(request: pb.CreateReviewThreadRequest) -> dict[str, Any] | None:
+def _anchor(
+    request: pb.CreateReviewThreadRequest | pb.AddPendingReviewCommentRequest,
+) -> dict[str, Any] | None:
     if not request.HasField("anchor"):
         return None
     anchor = request.anchor
@@ -126,6 +134,62 @@ def _merge_as(
         expected_head=_optional(request.expected_head_oid),
         account=request.account,
     )
+
+
+def _named(action: Callable[..., dict[str, Any]], *fields: str) -> PullRequestOp:
+    """An op that passes the session, the PR and the request's ``fields`` to ``action``."""
+
+    def run(reader: WorkspaceReader, call: PullRequestCall, request: Any) -> dict[str, Any]:
+        return action(
+            _root(reader),
+            session_id=call.session_id,
+            pr_url=_url(request),
+            **{field: getattr(request, field) for field in fields},
+        )
+
+    return run
+
+
+# The session owner's review and comment changes, and the pending review they work on.
+_REVIEW_OPS: dict[str, PullRequestOp] = {
+    "GetPendingReview": _named(pr_actions.get_pending_review),
+    "StartPendingReview": _named(pr_actions.start_pending_review, "commit_oid"),
+    "AddPendingReviewComment": lambda reader, call, request: pr_actions.add_pending_review_comment(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        body=request.body,
+        anchor=_anchor(request),
+        pending_review_id=request.pending_review_id,
+        expected_head=request.expected_head_oid,
+        in_reply_to_thread_id=request.in_reply_to_thread_id,
+    ),
+    "UpdatePendingReviewComment": _named(
+        pr_actions.update_pending_review_comment,
+        "comment_node_id",
+        "body",
+        "expected_body_sha256",
+        "pending_review_id",
+    ),
+    "DeletePendingReviewComment": _named(
+        pr_actions.delete_pending_review_comment, "comment_node_id", "pending_review_id"
+    ),
+    "SubmitPendingReview": _named(
+        pr_actions.submit_pending_review, "event", "body", "commit_oid", "pending_review_id"
+    ),
+    "DiscardPendingReview": _named(pr_actions.discard_pending_review, "pending_review_id"),
+    "SubmitReview": _named(pr_actions.submit_review, "event", "body", "commit_oid"),
+    "SubmitReviewVerdict": _named(pr_actions.submit_review_verdict, "event", "body", "commit_oid"),
+    "SetReviewThreadResolved": _named(
+        pr_actions.set_review_thread_resolved, "thread_id", "resolved"
+    ),
+    "EditComment": _named(
+        pr_actions.edit_comment, "kind", "comment_id", "body", "expected_body_sha256"
+    ),
+    "DeleteComment": _named(pr_actions.delete_comment, "kind", "comment_id"),
+    "AddReaction": _named(pr_actions.add_reaction, "kind", "comment_id", "content"),
+    "RemoveReaction": _named(pr_actions.remove_reaction, "kind", "comment_id", "content"),
+}
 
 
 PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
@@ -211,6 +275,7 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "DisableAutoMerge": lambda reader, call, request: pr_resource.disable_pr_auto_merge(
         _root(reader), session_id=call.session_id, pr_url=_url(request)
     ),
+    **_REVIEW_OPS,
 }
 
 
@@ -222,11 +287,23 @@ def run_pull_request_op(
     Blocking: call it on the worker thread, since the vouch is a context variable that
     a new thread doesn't inherit.
 
-    :raises ConnectError: FAILED_PRECONDITION for a PR the session doesn't link.
+    :raises PullRequestRefused: FAILED_PRECONDITION for a PR the session doesn't link, or
+        another refusal with its code and reason; UNKNOWN for a change GitHub never confirmed.
     """
     vouch = call.vouch or PullRequestVouch()
     with pr_resource.server_tracking(vouch.server_tracked is True, vouch.default_pr_url):
         try:
             return PULL_REQUEST_OPS[name](reader, call, request)
         except ValueError as exc:
-            raise ConnectError(Code.FAILED_PRECONDITION, str(exc)) from exc
+            raise _refusal(exc) from exc
+
+
+def _refusal(exc: ValueError) -> PullRequestRefused:
+    """The Connect error for a failed operation, with the reason a client reads."""
+    reason = exc.reason if isinstance(exc, PullRequestError) else None
+    if isinstance(exc, UnknownOutcomeError):
+        # The change may have been made: never a refusal a client would retry past.
+        return PullRequestRefused(Code.UNKNOWN, str(exc), None)
+    if isinstance(exc, InvalidPullRequestInput):
+        return PullRequestRefused(Code.INVALID_ARGUMENT, str(exc), reason)
+    return PullRequestRefused(Code.FAILED_PRECONDITION, str(exc), reason)

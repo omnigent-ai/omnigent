@@ -559,7 +559,8 @@ async def test_an_unavailable_answer_after_the_frame_leaves_the_change_unconfirm
     assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _CHANGE_UNCONFIRMED)
 
 
-_WRITES = sorted(_PULL_REQUEST_WRITES)
+# The pull request changes; the review changes have their own cases below.
+_WRITES = sorted(_PULL_REQUEST_WRITES - set(host_tests._REVIEW_CALLS))
 
 
 async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str) -> ConnectError:
