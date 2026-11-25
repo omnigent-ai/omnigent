@@ -21,7 +21,9 @@ next call moves it into the queue. Deleting also leaves a permanent mark for the
 registration. A write that was already on its way for that registration (a create, a shelf
 change) can land after the cleanup finished;
 :meth:`DeletedAccountGadgets.after_registration_write` sees the mark and queues the cleanup
-again, so nothing of a deleted registration stays behind.
+again, so nothing of a deleted registration stays behind; when the cleanup is still queued,
+it marks it to look again, so a cleanup that last looked before the write never finishes
+over it.
 """
 
 from __future__ import annotations
@@ -55,6 +57,8 @@ _CLEANUP_REGISTRATION = "omnigent:internal"
 _QUEUE = "queue"
 _HEADS = f"{_QUEUE}/heads"
 _INCOMING = "incoming"
+# Registrations a write landed for while their cleanup was queued.
+_AGAIN = "again"
 
 HEAD_PAGES = 8
 """Pages of head versions one read goes through to find the newest. Every head write removes
@@ -82,8 +86,9 @@ class _CleanupQueue:
 
     ``keys/<key>.json`` says which segment holds a registration's note (so it is queued once),
     ``deleted/<key>.json`` marks a deleted registration for good, and ``incoming/<key>.json``
-    holds an intent not yet queued. The head is written, and segments are appended to, only
-    under the queue's lock.
+    holds an intent not yet queued. ``again/<key>.json`` says a write landed for a queued
+    registration, so its cleanup looks again before it finishes. The head is written, and
+    segments are appended to, only under the queue's lock.
 
     The head is a create-only version under ``queue/heads/``: a new version is written before
     the older ones are removed, and reads take the newest, so a write stopped at any point
@@ -140,12 +145,28 @@ class _CleanupQueue:
                 self._files.delete_tree(f"{_HEADS}/{old}")
 
     def _queued_at(self, key: str) -> int | None:
+        """The segment holding the registration's note, or ``None`` when none does.
+
+        A key whose note is gone (a stop between removing the two) is dropped here, so it
+        never keeps a later cleanup from being queued.
+        """
         try:
             raw = self._files.read_json(f"keys/{key}.json")
         except NotFound:
             return None
         segment = raw.get("segment")
-        return segment if type(segment) is int else None
+        if type(segment) is not int:
+            return None
+        try:
+            self._files.read_json(f"{_segment(segment)}/{key}.json")
+        except NotFound:
+            if self._files.supports_delete:
+                with contextlib.suppress(NotFound):
+                    self._files.delete_tree(f"keys/{key}.json")
+            return None
+        except CorruptData:
+            pass  # Still a note: the cleanup that reads it deals with it.
+        return segment
 
     def _append_locked(self, key: str, note: dict, *, after: int | None = None) -> None:
         """Queue *note* in the newest segment, or a new one past it when that is full or is
@@ -189,6 +210,12 @@ class _CleanupQueue:
                 self._append_locked(
                     key, {"user_id": user_id, "registration": registration, "workspace": workspace}
                 )
+            elif self._files.supports_delete:
+                # Queued already, maybe by a cleanup about to finish: the mark tells it a
+                # write landed after it last looked, so it looks again instead of finishing.
+                self._files.mkdirs(_AGAIN)
+                with contextlib.suppress(Conflict):
+                    self._files.create_json(f"{_AGAIN}/{key}.json", {})
             # Queued now, so the intent has done its job.
             if self._files.supports_delete:
                 with contextlib.suppress(NotFound):
@@ -268,17 +295,39 @@ class _CleanupQueue:
     def read(self, number: int, name: str) -> dict:
         return self._files.read_json(f"{_segment(number)}/{name}")
 
-    def done(self, number: int, name: str) -> None:
-        """Drop a finished note, and the key saying it is queued."""
+    def done(self, number: int, name: str) -> bool:
+        """Drop a finished note, and the key saying it is queued.
+
+        A write that landed after the cleanup last looked (:meth:`add` marked it) sends the
+        note to the back instead, so the next call looks again.
+
+        :returns: Whether the note was dropped.
+        """
         key = name.removesuffix(".json")
         if not self._files.supports_delete:
-            return
+            return False
         with self._locked():
-            with contextlib.suppress(NotFound):
-                self._files.delete_tree(f"{_segment(number)}/{name}")
+            again = f"{_AGAIN}/{key}.json"
+            try:
+                self._files.read_json(again)
+            except NotFound:
+                pass
+            else:
+                note = self.read(number, name)
+                self._append_locked(key, note, after=number)
+                with contextlib.suppress(NotFound):
+                    self._files.delete_tree(f"{_segment(number)}/{name}")
+                with contextlib.suppress(NotFound):
+                    self._files.delete_tree(again)
+                return False
+            # The key goes first: a stop in between leaves a note without a key, which the
+            # next call finishes, never a key saying a gone note is queued.
             if self._queued_at(key) == number:
                 with contextlib.suppress(NotFound):
                     self._files.delete_tree(f"keys/{key}.json")
+            with contextlib.suppress(NotFound):
+                self._files.delete_tree(f"{_segment(number)}/{name}")
+            return True
 
     def to_back(self, number: int, name: str, note: dict) -> None:
         """Send a note worked on to the back, so the notes behind it get their turn."""

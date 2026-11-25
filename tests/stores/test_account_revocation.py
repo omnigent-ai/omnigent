@@ -1722,6 +1722,84 @@ def test_a_write_on_its_way_when_the_account_is_deleted_is_cleaned_up_after_it_l
     assert store.get(kept["id"]) is not None
 
 
+def _reopened_cleanup(db_uri: str, tmp_path):
+    """The store and cleanup a restarted server would have, on the same files."""
+    from omnigent.gadgets.access import PermissionStoreGadgetAccess
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    access = PermissionStoreGadgetAccess(store, SqlAlchemyPermissionStore(db_uri))
+    return store, DeletedAccountGadgets(store, access)
+
+
+def test_a_write_landing_after_the_cleanups_last_look_is_cleaned_up_too(
+    db_uri: str, tmp_path, monkeypatch
+) -> None:
+    """A create lands after the cleanup found nothing left but before it said so; the
+    cleanup must look again rather than finish over it."""
+    from omnigent.gadgets import accounts as cleanup_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    registration = alice.registration
+    alice.create("Board")
+    real_done = cleanup_module._CleanupQueue.done
+    landed: list[str] = []
+
+    def done_after_a_late_write(queue, number, name):  # type: ignore[no-untyped-def]
+        if not landed:
+            gadget = store.create("alice", "Late board", owner_registration=registration)
+            landed.append(gadget.id)
+            cleanup_module.DeletedAccountGadgets.after_registration_write(
+                store, "alice", registration
+            )
+        return real_done(queue, number, name)
+
+    monkeypatch.setattr(cleanup_module._CleanupQueue, "done", done_after_a_late_write)
+    assert accounts.delete_user("alice") is True
+    monkeypatch.setattr(cleanup_module._CleanupQueue, "done", real_done)
+    assert store.get(landed[0]) is not None
+
+    store, cleanup = _reopened_cleanup(db_uri, tmp_path)
+    for _ in range(3):
+        cleanup.resume()
+    assert store.get(landed[0]) is None
+    assert list(store.iter_owned("alice", owner_registration=registration)) == []
+
+
+def test_a_key_left_without_its_note_never_keeps_a_later_cleanup_from_queueing(
+    db_uri: str, tmp_path
+) -> None:
+    """A stop between removing a finished note and its key leaves the key alone; a write
+    that lands later for the deleted registration still gets its cleanup queued."""
+    from omnigent.gadgets import accounts as cleanup_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    store, _, service = _gadgets(db_uri, tmp_path, accounts)
+    accounts.create_user_with_password("alice", "alice-hash")
+    alice = service("alice")
+    registration = alice.registration
+    alice.create("Board")
+    assert accounts.delete_user("alice") is True
+    scope = store._user_dir(cleanup_module._CLEANUP_SCOPE, cleanup_module._CLEANUP_REGISTRATION)
+    key = cleanup_module._key("alice", registration)
+    # The state such a stop leaves: the key, naming a segment, without its note.
+    (scope / "keys").mkdir(parents=True, exist_ok=True)
+    (scope / "keys" / f"{key}.json").write_text('{"segment": 0}')
+    assert not (scope / "queue" / "s00000000" / f"{key}.json").exists()
+
+    late = store.create("alice", "Late board", owner_registration=registration)
+    cleanup_module.DeletedAccountGadgets.after_registration_write(store, "alice", registration)
+
+    store, cleanup = _reopened_cleanup(db_uri, tmp_path)
+    for _ in range(3):
+        cleanup.resume()
+    assert store.get(late.id) is None
+
+
 def test_a_gadget_whose_create_stopped_before_its_owner_marker_leaves_nothing_behind(
     db_uri: str, tmp_path
 ) -> None:

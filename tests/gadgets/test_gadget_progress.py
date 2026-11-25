@@ -816,3 +816,29 @@ def test_routine_action_delivery_never_runs_out_of_viewer_state(
     for n in range(6):
         request_and_deliver(service, app, f"c{n}")
     assert len(service.list_actions(app["id"])["items"]) == 6
+
+
+@pytest.mark.parametrize("length", [123, 124, 128])
+def test_an_action_with_an_operation_id_at_the_length_limit_is_tracked_and_delivered_once(
+    gadgets: Fixture, clock: dict, length: int
+) -> None:
+    conversations = FakeConversations()
+    conversations.add("s_gadget")
+    service = progress_service(gadgets, conversations)
+    app = publish_actions_board(service)
+    service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
+    request = {
+        "action": "run_card",
+        "params": {"cardId": "c1"},
+        "operation_id": "r" + "x" * (length - 1),
+    }
+
+    action = service.request_action(app["id"], request)
+    assert action["delivered"] is False
+    service.record_delivery(app["id"], action["id"], {"session_id": "s_gadget"})
+    assert status(service, app, action["id"]) == ("queued", None)
+
+    replay = service.request_action(app["id"], request)
+    assert replay["id"] == action["id"]
+    assert replay["delivered"] is True
+    assert [item["id"] for item in service.list_actions(app["id"])["items"]] == [action["id"]]

@@ -1307,7 +1307,9 @@ class GadgetService:
             return {**document.to_dict(), "merged": False, "delivered": True}
         if not tracked:
             record = {"id": document.id, "digest": digest, "requested_at": int(time.time())}
-            self._save_viewer(gadget, viewer, [*still_open, record], "open-" + operation_id)
+            # Bounded and stable per request: the caller's operation ID may already use the
+            # store's whole length limit.
+            self._save_viewer(gadget, viewer, [*still_open, record], f"open-{record_id}")
             delivered = False
         else:
             # A retry of this request: report the delivery its first attempt recorded.
