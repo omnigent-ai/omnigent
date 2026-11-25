@@ -233,6 +233,24 @@ describe("usePaletteSessionSearch", () => {
       },
     );
 
+    it.each([
+      [undefined, ["c2", "c1"]],
+      [false, ["c1"]],
+    ])(
+      "matches archived loaded sessions at once where the search keeps them (includeArchived=%s)",
+      (includeArchived, expected) => {
+        loaded(conv("c1", "Kestrel plan"), { ...conv("c2", "Kestrel"), archived: true });
+        const { result } = renderSearch({
+          open: true,
+          sessionsOnly: false,
+          matchLoaded: true,
+          includeArchived,
+        });
+        act(() => result.current.setQuery("kestrel"));
+        expect(ids(result.current.sessions)).toEqual(expected);
+      },
+    );
+
     it("lists only the new query's loaded matches until the server answers it", () => {
       loaded(conv("c1", "Kestrel plan"));
       titleHits(conv("s1", "Kestrel notes"));
@@ -312,7 +330,7 @@ describe("usePaletteSessionSearch", () => {
         expect(shown(result).sessions).toEqual(["kestrel-local", "parser-local"]);
       });
 
-      it("keeps the classic palette's matches while it waits, as it did", () => {
+      it("keeps the classic palette's last server matches until the new query is answered", () => {
         const { result } = renderSearch({ open: true, sessionsOnly: false });
         act(() => result.current.setQuery("kestrel"));
         settle();

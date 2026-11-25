@@ -180,7 +180,7 @@ export function usePaletteSessionSearch({
   const serverInfo = useServerInfo();
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
-  // A pull request reference is looked up among the loaded sessions only.
+  // The server's text search can't resolve a PR reference, so only loaded rows answer it.
   const pullRequestLookup = matchLoaded && isPullRequestLookup(query);
   const searching = !sessionsOnly && debouncedQuery !== "" && !pullRequestLookup;
   // Loaded sessions match at once, without waiting for the debounce or the server.
@@ -259,11 +259,12 @@ export function usePaletteSessionSearch({
       : [];
     if (matchingLoaded) {
       // The sidebar's pinned, folder and scoped rows too, which this list's window can miss.
-      // Rows archived after they loaded are still cached here, so leave them out.
+      // Its lists are active-only, so a row archived after it loaded is left out; the recent
+      // list and the server follow the search's archived policy.
       const loaded = uniqueRows([
         ...recentPages.flatMap((page) => page.data),
-        ...(sidebarRows ?? []),
-      ]).filter((row) => includeArchived === true || !row.archived);
+        ...(sidebarRows ?? []).filter((row) => !row.archived),
+      ]).filter((row) => searchIncludesArchived || !row.archived);
       // A server group's page, so a short query doesn't list every loaded session; the
       // session switcher keeps its own bound, applied below.
       const allMatches = matchSessions(loaded, query);
@@ -271,7 +272,7 @@ export function usePaletteSessionSearch({
       const rangesById = new Map(matches.map((match) => [match.session.id, match.labelRanges]));
       const local = paletteRows(
         matches.map((match) => match.session),
-        { includeArchived, projects, parentTitles },
+        { includeArchived: searchIncludesArchived, projects, parentTitles },
       ).map((session) => ({ ...session, labelRanges: rangesById.get(session.id) }));
       const listed = new Set(local.map((session) => session.id));
       return [...local, ...serverMatches.filter((session) => !listed.has(session.id))];
@@ -302,7 +303,6 @@ export function usePaletteSessionSearch({
     showingServerMatches,
     matchingLoaded,
     sessionsOnly,
-    includeArchived,
     searchIncludesArchived,
     projects,
     parentTitles,
