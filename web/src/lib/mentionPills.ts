@@ -17,16 +17,31 @@ export function mentionPillMarkdown(mention: SentMention): string {
   return `[${label}](#mention "${MENTION_TITLE_PREFIX}file:${encodeURIComponent(mention.path)}")`;
 }
 
+/** Inline markdown that renders ``@name`` as a person or team-member pill. */
+export function personMentionMarkdown(name: string): string {
+  const label = `@${name}`.replace(MARKDOWN_SPECIAL_RE, "\\$&");
+  return `[${label}](#mention "${MENTION_TITLE_PREFIX}person:${encodeURIComponent(name)}")`;
+}
+
 /** What a mention link's title encodes, or ``null`` for an ordinary link. */
 export type MentionPillTarget =
   | { kind: "session"; id: string; isSubagent: boolean }
-  | { kind: "file"; path: string; isDir: boolean; lineSpan?: string };
+  | { kind: "file"; path: string; isDir: boolean; lineSpan?: string }
+  | { kind: "person"; name: string };
 
 export function parseMentionPillTitle(title: unknown): MentionPillTarget | null {
   if (typeof title !== "string" || !title.startsWith(MENTION_TITLE_PREFIX)) return null;
   const rest = title.slice(MENTION_TITLE_PREFIX.length);
   const session = /^session:(yes|no):([A-Za-z0-9_:-]+)$/.exec(rest);
   if (session) return { kind: "session", id: session[2], isSubagent: session[1] === "yes" };
+  if (rest.startsWith("person:")) {
+    try {
+      const name = decodeURIComponent(rest.slice("person:".length));
+      return name ? { kind: "person", name } : null;
+    } catch {
+      return null;
+    }
+  }
   if (!rest.startsWith("file:")) return null;
   let raw: string;
   try {

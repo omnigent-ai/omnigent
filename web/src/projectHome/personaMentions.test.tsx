@@ -4,8 +4,10 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/lib/projectsApi";
 import { MentionTextarea } from "./MentionTextarea";
+import { parseMentionPillTitle } from "@/lib/mentionPills";
+import { mentionForms } from "./useProjectPeople";
 import {
-  emphasizeMentions,
+  chipMentions,
   insertMention,
   mentionQueryAt,
   payloadCc,
@@ -43,12 +45,34 @@ describe("persona mention helpers", () => {
     expect(insertMention("cc @p", 5, 3, "PM")).toEqual({ text: "cc @PM ", caret: 7 });
   });
 
-  it("bolds recorded mentions outside code and reads them from a payload", () => {
+  it("reads recorded mentions from a payload", () => {
     const mentions = payloadMentions({ mentions: [{ id: "pm", name: "PM" }, { bad: 1 }] });
     expect(mentions).toEqual([{ id: "pm", name: "PM" }]);
-    expect(emphasizeMentions("cc @pm and `@PM` and @PMs", mentions)).toBe(
-      "cc **@pm** and `@PM` and @PMs",
-    );
+  });
+
+  it("pills resolved mentions outside code and leaves other @text plain", () => {
+    const forms = mentionForms(["PM"], ["owner@example.com", "elise.gonzales@example.com"]);
+    const text =
+      "@Elise Gonzales and @elise.gonzales@example.com, ask @pm; not `@PM`, @PMs or @Nobody";
+    const out = chipMentions(text, forms);
+    const pills = [...out.matchAll(/\[(.+?)\]\(#mention "(.+?)"\)/g)].map((match) => [
+      match[1],
+      parseMentionPillTitle(match[2]),
+    ]);
+    expect(pills).toEqual([
+      ["@Elise Gonzales", { kind: "person", name: "Elise Gonzales" }],
+      ["@Elise Gonzales", { kind: "person", name: "Elise Gonzales" }],
+      ["@PM", { kind: "person", name: "PM" }],
+    ]);
+    expect(out).toContain("`@PM`");
+    expect(out).toContain("@PMs or @Nobody");
+  });
+
+  it("matches a first name only while it names one person", () => {
+    const shared = mentionForms([], ["ann.lee@example.com", "ann.ray@example.com"]);
+    expect(shared.some(({ form }) => form === "Ann")).toBe(false);
+    const alone = mentionForms([], ["ann.lee@example.com"]);
+    expect(alone).toContainEqual({ form: "Ann", label: "Ann Lee" });
   });
 });
 

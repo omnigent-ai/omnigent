@@ -54,6 +54,7 @@ import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { parseMentionPillTitle } from "@/lib/mentionPills";
+import { PersonaAvatar } from "@/components/PersonaAvatar";
 import {
   useFileViewer,
   useFileViewerConversationId,
@@ -680,6 +681,7 @@ function FileMentionPill({
 function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
   const target = parseMentionPillTitle(props.title);
   if (!target) return <WorkspaceFileLink {...props} />;
+  if (target.kind === "person") return <PersonMentionPill name={target.name} />;
   if (target.kind === "file") {
     return (
       <FileMentionPill path={target.path} isDir={target.isDir} lineSpan={target.lineSpan}>
@@ -691,6 +693,15 @@ function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) 
     <SessionMentionPill id={target.id} isSubagent={target.isSubagent}>
       {props.children}
     </SessionMentionPill>
+  );
+}
+
+/** A person or team member tagged in a ticket, like a chat app's @mention. */
+function PersonMentionPill({ name }: { name: string }) {
+  return (
+    <span data-testid="person-mention-pill" className={cn(MENTION_PILL_CLASS, "cursor-default")}>
+      <PersonaAvatar name={name} size="xs" />@{name}
+    </span>
   );
 }
 

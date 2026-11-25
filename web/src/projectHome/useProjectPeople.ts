@@ -1,7 +1,9 @@
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useViewerId } from "@/hooks/useViewerId";
 import { listProjectShares } from "@/lib/projectsApi";
-import { personDisplayName } from "./personaMentions";
+import { personDisplayName, type MentionForm } from "./personaMentions";
+import { useProjectIdentities } from "./useProjectIdentities";
 
 /** A project member the viewer can cc, and the `@` form to insert for them. */
 export interface ProjectPerson {
@@ -53,4 +55,58 @@ export function useProjectPeople(projectId: string | null, personaNames: readonl
 
 function localPart(userId: string): string {
   return userId.split("@", 1)[0] ?? userId;
+}
+
+/**
+ * Every `@` form that names one of the project's team members or people, for rendering
+ * mentions as pills. Mirrors the server's matching: a person matches their sign-in ID
+ * and its local part, and their display and first name only when nobody else shares
+ * them; a team member's name always wins.
+ */
+export function useMentionForms(projectId: string | null): MentionForm[] {
+  const identities = useProjectIdentities(projectId);
+  const shares = useQuery({
+    queryKey: ["project-shares", projectId],
+    queryFn: () => listProjectShares(projectId as string),
+    enabled: projectId !== null,
+    staleTime: 60_000,
+    retry: false,
+  });
+  return useMemo(() => {
+    const personas = (identities.data ?? []).map((identity) => identity.name);
+    const ids = shares.data
+      ? [shares.data.owner_user_id, ...shares.data.data.map((share) => share.user_id)]
+      : [];
+    return mentionForms(
+      personas,
+      ids.filter((id): id is string => !!id),
+    );
+  }, [identities.data, shares.data]);
+}
+
+/** See {@link useMentionForms}; exported for tests. */
+export function mentionForms(
+  personas: readonly string[],
+  people: readonly string[],
+): MentionForm[] {
+  const taken = new Set(personas.map((name) => name.toLowerCase()));
+  const forms = new Map<string, string[]>();
+  for (const id of new Set(people)) {
+    const display = personDisplayName(id);
+    forms.set(id, [...new Set([id, localPart(id), display, display.split(" ", 1)[0] ?? display])]);
+  }
+  const owners = new Map<string, Set<string>>();
+  for (const [id, names] of forms)
+    for (const name of names) {
+      const key = name.toLowerCase();
+      owners.set(key, (owners.get(key) ?? new Set()).add(id));
+    }
+  const result: MentionForm[] = personas.map((name) => ({ form: name, label: name }));
+  for (const [id, names] of forms)
+    for (const name of names) {
+      const key = name.toLowerCase();
+      if (taken.has(key) || (owners.get(key)?.size ?? 0) > 1) continue;
+      result.push({ form: name, label: personDisplayName(id) });
+    }
+  return result;
 }

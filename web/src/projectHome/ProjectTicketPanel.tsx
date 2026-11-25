@@ -81,8 +81,9 @@ import { MentionTextarea } from "./MentionTextarea";
 import { TicketDecisionBox } from "./TicketDecisionBox";
 import { needsWhom } from "./ticketWaitingOn";
 import { usePersonaForSession, useProjectPersonaLookup } from "./usePersonaSessions";
-import { payloadCc, payloadMentions, type PersonaMention } from "./personaMentions";
-import { TicketCommentBody } from "./TicketCommentBody";
+import { chipMentions, payloadCc, payloadMentions, type PersonaMention } from "./personaMentions";
+import { MentionFormsContext, TicketCommentBody } from "./TicketCommentBody";
+import { useMentionForms } from "./useProjectPeople";
 import { TicketFileLinks } from "./TicketFileLinks";
 import {
   TicketImageAttachButton,
@@ -490,6 +491,7 @@ function TicketDetails({
   const { update, comment } = useTicketActions(projectId);
   const viewerId = useViewerId();
   const personaLookup = useProjectPersonaLookup(projectId);
+  const mentionForms = useMentionForms(projectId);
   // "Answer in a comment" puts the asker's mention in the composer and focuses it.
   const [composerPrefill, setComposerPrefill] = useState<ComposerPrefill | null>(null);
   // Title and description edit separately, each in place.
@@ -530,224 +532,33 @@ function TicketDetails({
       </Panel>
     );
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <div
-        hidden={chatting}
-        className={chatting ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col"}
-      >
-        <Panel
-          title={ticket.title}
-          heading={`Ticket · ${stages.find((stage) => stage.id === ticket.stage_id)?.name ?? ticket.stage_id}`}
-          actions={<TicketCopyLinkButton projectName={projectName} ticketId={ticketId} />}
-          onClose={onClose}
-          expanded={expanded}
-          onExpandedChange={onExpandedChange}
-          footer={
-            <TicketCommentComposer
-              projectId={projectId}
-              ticketId={ticketId}
-              comment={comment}
-              prefill={composerPrefill}
-            />
-          }
+    <MentionFormsContext.Provider value={mentionForms}>
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div
+          hidden={chatting}
+          className={chatting ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col"}
         >
-          <div className="space-y-4">
-            {editing === "title" ? (
-              <TicketEditor
-                ticket={ticket}
-                fields="title"
-                resolveProjectId={async () => projectId}
-                pending={update.isPending}
-                error={update.error}
-                onCancel={() => setEditing(null)}
-                onSave={(changes) =>
-                  update.mutate({ id: ticketId, changes }, { onSuccess: () => setEditing(null) })
-                }
-              />
-            ) : (
-              <div className="flex items-start gap-2">
-                <h3 className="min-w-0 flex-1 text-xl leading-snug font-semibold text-pretty wrap-anywhere">
-                  {ticket.title}
-                </h3>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      size="icon-sm"
-                      variant="ghost"
-                      className="text-muted-foreground"
-                      aria-label="Edit title"
-                      onClick={() => {
-                        update.reset();
-                        setEditing("title");
-                      }}
-                    >
-                      <PencilIcon aria-hidden />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Edit title</TooltipContent>
-                </Tooltip>
-              </div>
-            )}
-            <TicketShipBlocker projectId={projectId} ticketId={ticketId} variant="panel" />
-            {lifecycle && <TicketFollowUps projectId={projectId} ticket={ticket} />}
-            <TicketSignOffs
-              ticket={ticket}
-              pending={update.isPending || comment.isPending}
-              onApprove={(label) => {
-                update.reset();
-                // Add just this label, and only while a fresh read still asks for it, so a
-                // withdrawn ask isn't answered and other label edits are left alone.
-                void getTicket(projectId, ticketId)
-                  .then((fresh) => {
-                    const stillOffered = (fresh.sign_offs ?? []).some(
-                      (offer) =>
-                        offer.key === label.key && (offer.value ?? null) === (label.value ?? null),
-                    );
-                    if (!stillOffered) return void query.refetch();
-                    update.mutate({
-                      id: ticketId,
-                      changes: { add_labels: [label] },
-                    });
-                  })
-                  .catch(() => void query.refetch());
-              }}
-              onDecline={(label) =>
-                comment.mutate({
-                  id: ticketId,
-                  body: { text: `Not adding \`${label.key}\` yet.` },
-                })
-              }
-            />
-            <div
-              data-testid="ticket-panel-meta"
-              className="flex flex-wrap items-center gap-x-2 gap-y-1.5"
-            >
-              <Select
-                value={ticket.stage_id}
-                disabled={update.isPending || configuration.isPending || configuration.isError}
-                onValueChange={(value) => {
-                  update.reset();
-                  const stage = stages.find((candidate) => candidate.id === value);
-                  if (!stage) return;
-                  update.mutate({ id: ticketId, changes: { stage_id: value } });
-                }}
-              >
-                <SelectTrigger
-                  size="sm"
-                  aria-label="Ticket stage"
-                  className="h-7 shrink-0 border-border/60 bg-muted/30"
-                >
-                  <SelectValue placeholder={ticket.stage_id} />
-                </SelectTrigger>
-                <SelectContent>
-                  {stages.map((stage) => (
-                    <SelectItem key={stage.id} value={stage.id}>
-                      <TicketStageIcon stage={stage} />
-                      {stage.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {stages.length > 1 && stages.at(-1)?.id === ticket.stage_id && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={update.isPending}
-                  title={`Move back to ${stages[0].name}`}
-                  onClick={() => {
-                    update.reset();
-                    update.mutate({ id: ticketId, changes: { stage_id: stages[0].id } });
-                  }}
-                >
-                  <RotateCcwIcon aria-hidden />
-                  Reopen
-                </Button>
-              )}
-              <TicketCostBadge projectId={projectId} ticketId={ticketId} />
-              <TicketAssigneePicker
-                projectId={projectId}
-                value={ticketAssignee(ticket.labels)}
-                disabled={update.isPending}
-                onChange={(name) => {
-                  update.reset();
-                  update.mutate({ id: ticketId, changes: assigneeChanges(name) });
-                }}
-              />
-              {ticket.labels.length > 0 && (
-                <TicketLabels labels={ticket.labels} waitingOn={ticket.waiting_on} />
-              )}
-              {ticket.ship_status && <TicketShipStatusBadge status={ticket.ship_status} />}
-              <LabelEditor
-                labels={ticket.labels}
-                disabled={update.isPending}
-                error={update.error}
-                onChange={(labels) =>
-                  update.mutate({ id: ticketId, changes: labelChanges(ticket.labels, labels) })
-                }
-              />
-            </div>
-            <TicketError error={configuration.error} />
-            {ticket.waiting_on && (
-              <TicketDecisionBox
+          <Panel
+            title={ticket.title}
+            heading={`Ticket · ${stages.find((stage) => stage.id === ticket.stage_id)?.name ?? ticket.stage_id}`}
+            actions={<TicketCopyLinkButton projectName={projectName} ticketId={ticketId} />}
+            onClose={onClose}
+            expanded={expanded}
+            onExpandedChange={onExpandedChange}
+            footer={
+              <TicketCommentComposer
                 projectId={projectId}
                 ticketId={ticketId}
-                waitingOn={ticket.waiting_on}
-                viewerId={viewerId}
-                personaLookup={personaLookup}
-                answering={comment.isPending}
-                signOffOffered={(ticket.sign_offs ?? []).length > 0}
-                onAnswer={(text) => comment.mutate({ id: ticketId, body: { text, outputs: [] } })}
-                onAnswerInComment={(mention) =>
-                  setComposerPrefill((previous) => ({
-                    text: mention,
-                    nonce: (previous?.nonce ?? 0) + 1,
-                  }))
-                }
-                onShowAsk={(position) =>
-                  document
-                    .querySelector(`[data-ticket-event-position="${position}"]`)
-                    ?.scrollIntoView({ block: "center", behavior: "smooth" })
-                }
+                comment={comment}
+                prefill={composerPrefill}
               />
-            )}
-            <div className="space-y-1">
-              <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
-              {ticket.requested_by && (
-                <p className="text-xs text-muted-foreground" data-testid="ticket-panel-requester">
-                  Requested by{" "}
-                  <RequesterName requestedBy={ticket.requested_by} viewer={getCurrentUserId()} />
-                </p>
-              )}
-            </div>
-            <section aria-label="Description" className="space-y-2">
-              <div className="flex items-center gap-2">
-                <h3 className="flex-1 text-[length:calc(var(--text-ui)+2px)] font-bold">
-                  Description
-                </h3>
-                {editing !== "description" && ticket.description && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        size="icon-sm"
-                        variant="ghost"
-                        className="text-muted-foreground"
-                        aria-label="Edit description"
-                        onClick={() => {
-                          update.reset();
-                          setEditing("description");
-                        }}
-                      >
-                        <PencilIcon aria-hidden />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Edit description</TooltipContent>
-                  </Tooltip>
-                )}
-              </div>
-              {editing === "description" ? (
+            }
+          >
+            <div className="space-y-4">
+              {editing === "title" ? (
                 <TicketEditor
                   ticket={ticket}
-                  fields="description"
+                  fields="title"
                   resolveProjectId={async () => projectId}
                   pending={update.isPending}
                   error={update.error}
@@ -756,48 +567,249 @@ function TicketDetails({
                     update.mutate({ id: ticketId, changes }, { onSuccess: () => setEditing(null) })
                   }
                 />
-              ) : ticket.description ? (
-                <TicketFileLinks sessionId={projectSessionId}>
-                  <TicketMarkdown className="text-ui leading-relaxed">
-                    {ticket.description}
-                  </TicketMarkdown>
-                </TicketFileLinks>
               ) : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="-ml-2 text-muted-foreground"
-                  onClick={() => {
+                <div className="flex items-start gap-2">
+                  <h3 className="min-w-0 flex-1 text-xl leading-snug font-semibold text-pretty wrap-anywhere">
+                    {ticket.title}
+                  </h3>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        size="icon-sm"
+                        variant="ghost"
+                        className="text-muted-foreground"
+                        aria-label="Edit title"
+                        onClick={() => {
+                          update.reset();
+                          setEditing("title");
+                        }}
+                      >
+                        <PencilIcon aria-hidden />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Edit title</TooltipContent>
+                  </Tooltip>
+                </div>
+              )}
+              <TicketShipBlocker projectId={projectId} ticketId={ticketId} variant="panel" />
+              {lifecycle && <TicketFollowUps projectId={projectId} ticket={ticket} />}
+              <TicketSignOffs
+                ticket={ticket}
+                pending={update.isPending || comment.isPending}
+                onApprove={(label) => {
+                  update.reset();
+                  // Add just this label, and only while a fresh read still asks for it, so a
+                  // withdrawn ask isn't answered and other label edits are left alone.
+                  void getTicket(projectId, ticketId)
+                    .then((fresh) => {
+                      const stillOffered = (fresh.sign_offs ?? []).some(
+                        (offer) =>
+                          offer.key === label.key &&
+                          (offer.value ?? null) === (label.value ?? null),
+                      );
+                      if (!stillOffered) return void query.refetch();
+                      update.mutate({
+                        id: ticketId,
+                        changes: { add_labels: [label] },
+                      });
+                    })
+                    .catch(() => void query.refetch());
+                }}
+                onDecline={(label) =>
+                  comment.mutate({
+                    id: ticketId,
+                    body: { text: `Not adding \`${label.key}\` yet.` },
+                  })
+                }
+              />
+              <div
+                data-testid="ticket-panel-meta"
+                className="flex flex-wrap items-center gap-x-2 gap-y-1.5"
+              >
+                <Select
+                  value={ticket.stage_id}
+                  disabled={update.isPending || configuration.isPending || configuration.isError}
+                  onValueChange={(value) => {
                     update.reset();
-                    setEditing("description");
+                    const stage = stages.find((candidate) => candidate.id === value);
+                    if (!stage) return;
+                    update.mutate({ id: ticketId, changes: { stage_id: value } });
                   }}
                 >
-                  <PlusIcon aria-hidden />
-                  Add description
-                </Button>
+                  <SelectTrigger
+                    size="sm"
+                    aria-label="Ticket stage"
+                    className="h-7 shrink-0 border-border/60 bg-muted/30"
+                  >
+                    <SelectValue placeholder={ticket.stage_id} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {stages.map((stage) => (
+                      <SelectItem key={stage.id} value={stage.id}>
+                        <TicketStageIcon stage={stage} />
+                        {stage.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {stages.length > 1 && stages.at(-1)?.id === ticket.stage_id && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={update.isPending}
+                    title={`Move back to ${stages[0].name}`}
+                    onClick={() => {
+                      update.reset();
+                      update.mutate({ id: ticketId, changes: { stage_id: stages[0].id } });
+                    }}
+                  >
+                    <RotateCcwIcon aria-hidden />
+                    Reopen
+                  </Button>
+                )}
+                <TicketCostBadge projectId={projectId} ticketId={ticketId} />
+                <TicketAssigneePicker
+                  projectId={projectId}
+                  value={ticketAssignee(ticket.labels)}
+                  disabled={update.isPending}
+                  onChange={(name) => {
+                    update.reset();
+                    update.mutate({ id: ticketId, changes: assigneeChanges(name) });
+                  }}
+                />
+                {ticket.labels.length > 0 && (
+                  <TicketLabels labels={ticket.labels} waitingOn={ticket.waiting_on} />
+                )}
+                {ticket.ship_status && <TicketShipStatusBadge status={ticket.ship_status} />}
+                <LabelEditor
+                  labels={ticket.labels}
+                  disabled={update.isPending}
+                  error={update.error}
+                  onChange={(labels) =>
+                    update.mutate({ id: ticketId, changes: labelChanges(ticket.labels, labels) })
+                  }
+                />
+              </div>
+              <TicketError error={configuration.error} />
+              {ticket.waiting_on && (
+                <TicketDecisionBox
+                  projectId={projectId}
+                  ticketId={ticketId}
+                  waitingOn={ticket.waiting_on}
+                  viewerId={viewerId}
+                  personaLookup={personaLookup}
+                  answering={comment.isPending}
+                  signOffOffered={(ticket.sign_offs ?? []).length > 0}
+                  onAnswer={(text) => comment.mutate({ id: ticketId, body: { text, outputs: [] } })}
+                  onAnswerInComment={(mention) =>
+                    setComposerPrefill((previous) => ({
+                      text: mention,
+                      nonce: (previous?.nonce ?? 0) + 1,
+                    }))
+                  }
+                  onShowAsk={(position) =>
+                    document
+                      .querySelector(`[data-ticket-event-position="${position}"]`)
+                      ?.scrollIntoView({ block: "center", behavior: "smooth" })
+                  }
+                />
               )}
-            </section>
-            {ticket.final_update && (
-              <TicketFinalUpdateSection
-                update={ticket.final_update}
-                fallbackSessionId={projectSessionId}
-              />
-            )}
-          </div>
-          {!editing && <TicketError error={update.error} />}
-          <TicketOutputs projectId={projectId} ticketId={ticketId} />
-          {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
-          <TicketActivity key={ticket.id} projectId={projectId} ticket={ticket} />
-        </Panel>
+              <div className="space-y-1">
+                <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
+                {ticket.requested_by && (
+                  <p className="text-xs text-muted-foreground" data-testid="ticket-panel-requester">
+                    Requested by{" "}
+                    <RequesterName requestedBy={ticket.requested_by} viewer={getCurrentUserId()} />
+                  </p>
+                )}
+              </div>
+              <section aria-label="Description" className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <h3 className="flex-1 text-[length:calc(var(--text-ui)+2px)] font-bold">
+                    Description
+                  </h3>
+                  {editing !== "description" && ticket.description && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="icon-sm"
+                          variant="ghost"
+                          className="text-muted-foreground"
+                          aria-label="Edit description"
+                          onClick={() => {
+                            update.reset();
+                            setEditing("description");
+                          }}
+                        >
+                          <PencilIcon aria-hidden />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Edit description</TooltipContent>
+                    </Tooltip>
+                  )}
+                </div>
+                {editing === "description" ? (
+                  <TicketEditor
+                    ticket={ticket}
+                    fields="description"
+                    resolveProjectId={async () => projectId}
+                    pending={update.isPending}
+                    error={update.error}
+                    onCancel={() => setEditing(null)}
+                    onSave={(changes) =>
+                      update.mutate(
+                        { id: ticketId, changes },
+                        { onSuccess: () => setEditing(null) },
+                      )
+                    }
+                  />
+                ) : ticket.description ? (
+                  <TicketFileLinks sessionId={projectSessionId}>
+                    <TicketMarkdown className="text-ui leading-relaxed">
+                      {chipMentions(ticket.description, mentionForms)}
+                    </TicketMarkdown>
+                  </TicketFileLinks>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="-ml-2 text-muted-foreground"
+                    onClick={() => {
+                      update.reset();
+                      setEditing("description");
+                    }}
+                  >
+                    <PlusIcon aria-hidden />
+                    Add description
+                  </Button>
+                )}
+              </section>
+              {ticket.final_update && (
+                <TicketFinalUpdateSection
+                  update={ticket.final_update}
+                  fallbackSessionId={projectSessionId}
+                />
+              )}
+            </div>
+            {!editing && <TicketError error={update.error} />}
+            <TicketOutputs projectId={projectId} ticketId={ticketId} />
+            {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
+            <TicketActivity key={ticket.id} projectId={projectId} ticket={ticket} />
+          </Panel>
+        </div>
+        {chatSessionId ? (
+          <ProjectSessionPanel sessionId={chatSessionId} />
+        ) : (
+          orchestratorChat && (
+            <ProjectOrchestratorPanel
+              projectName={projectName}
+              onClose={closeChat}
+              ticket={ticket}
+            />
+          )
+        )}
       </div>
-      {chatSessionId ? (
-        <ProjectSessionPanel sessionId={chatSessionId} />
-      ) : (
-        orchestratorChat && (
-          <ProjectOrchestratorPanel projectName={projectName} onClose={closeChat} ticket={ticket} />
-        )
-      )}
-    </div>
+    </MentionFormsContext.Provider>
   );
 }
 

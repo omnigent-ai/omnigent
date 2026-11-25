@@ -1,13 +1,17 @@
-import { useId, useMemo, useState } from "react";
+import { createContext, useContext, useId, useMemo, useState } from "react";
 import { parseMarkdownIntoBlocks } from "streamdown";
 import { Button } from "@/components/ui/button";
 import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
-import { emphasizeMentions, type PersonaMention } from "./personaMentions";
+import { chipMentions, type MentionForm, type PersonaMention } from "./personaMentions";
 import { TicketMarkdown } from "./ticketImages";
 
 const PREVIEW_CHARACTERS = 600;
 const NO_MENTIONS: PersonaMention[] = [];
+const NO_FORMS: MentionForm[] = [];
+
+/** The open ticket's project `@` forms, so its comments render mentions as pills. */
+export const MentionFormsContext = createContext<readonly MentionForm[]>(NO_FORMS);
 const PREVIEW_LINES = 8;
 
 /** A presentation excerpt, never a replacement for the author's full comment. */
@@ -47,13 +51,23 @@ function commentPreview(body: string): { text: string; markdown: boolean } | nul
 export function TicketCommentBody({
   body: text,
   mentions = NO_MENTIONS,
+  mentionForms,
 }: {
   body: string;
   mentions?: PersonaMention[];
+  /** The project's `@` forms; each one the text uses renders as a pill. */
+  mentionForms?: readonly MentionForm[];
 }) {
   const [expanded, setExpanded] = useState(false);
   const contentId = useId();
-  const body = useMemo(() => emphasizeMentions(text, mentions), [text, mentions]);
+  // A recorded mention still renders when the project's forms haven't loaded yet.
+  const projectForms = useContext(MentionFormsContext);
+  const known = mentionForms ?? projectForms;
+  const forms = useMemo(
+    () => [...known, ...mentions.map((m) => ({ form: m.name, label: m.name }))],
+    [known, mentions],
+  );
+  const body = useMemo(() => chipMentions(text, forms), [text, forms]);
   const preview = useMemo(() => commentPreview(body), [body]);
   const visible = !expanded && preview ? preview : { text: body, markdown: true };
   return (

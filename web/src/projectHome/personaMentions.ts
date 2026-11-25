@@ -1,3 +1,5 @@
+import { personMentionMarkdown } from "@/lib/mentionPills";
+
 /** A persona cc'd in a ticket comment, as the server records it. */
 export interface PersonaMention {
   id: string;
@@ -21,15 +23,35 @@ export function payloadMentions(payload: Record<string, unknown>): PersonaMentio
   );
 }
 
-/** Bold each recorded `@Name` outside code, so the mention stands out in rendered markdown. */
-export function emphasizeMentions(text: string, mentions: PersonaMention[]): string {
-  if (!mentions.length) return text;
-  const names = [...mentions].sort((a, b) => b.name.length - a.name.length).map((m) => m.name);
-  const pattern = new RegExp(`(?<![\\w@*])@(${names.map(escapeRegExp).join("|")})(?![\\w])`, "gi");
+/** A way to write an @mention (a name, sign-in name or ID) and the name its pill shows. */
+export interface MentionForm {
+  form: string;
+  label: string;
+}
+
+/**
+ * Turn each `@form` that names someone in *forms* into a mention pill, outside code.
+ * Forms match case-insensitively and whole-word, longest first; other `@text` stays.
+ */
+export function chipMentions(text: string, forms: readonly MentionForm[]): string {
+  if (!forms.length || !text.includes("@")) return text;
+  const labels = new Map(forms.map(({ form, label }) => [form.toLowerCase(), label]));
+  const sorted = [...forms.map(({ form }) => form)].sort((a, b) => b.length - a.length);
+  const pattern = new RegExp(
+    `(?<![\\w@\\[])@(${sorted.map(escapeRegExp).join("|")})(?![\\w@])`,
+    "gi",
+  );
   // Odd segments are fenced or inline code; leave those untouched.
   return text
     .split(/(```[\s\S]*?```|`[^`\n]*`)/)
-    .map((segment, index) => (index % 2 ? segment : segment.replace(pattern, "**@$1**")))
+    .map((segment, index) =>
+      index % 2
+        ? segment
+        : segment.replace(pattern, (match, form: string) => {
+            const label = labels.get(form.toLowerCase());
+            return label ? personMentionMarkdown(label) : match;
+          }),
+    )
     .join("");
 }
 
