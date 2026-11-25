@@ -196,7 +196,7 @@ import { replaceThemePicker } from "@/store/themePicker";
 import { replaceFeatureFlagsPicker } from "@/store/featureFlagsPicker";
 import { commandViewForPath, useCommandSession } from "./commandContext";
 import { CloseShellDialog } from "./CloseShellDialog";
-import { type ShellBusy, useShellCloseCheck } from "./shellCloseCheck";
+import { joinShellTabsCloses, type ShellTabsClose, useShellCloseRequest } from "./shellCloseCheck";
 import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -1090,15 +1090,6 @@ function AppShellImpl() {
   // ``inventoryTerminals``).
   const hideTerminalsTab = isClaudeNativeSubagent;
   const deleteTerminalMutation = useDeleteTerminal(conversationId ?? "");
-  // Tab key awaiting a close confirmation, or null. Closing a tab kills the
-  // terminal, so a user-initiated close routes through a confirm modal first.
-  const [terminalPendingClose, setTerminalPendingClose] = useState<{
-    keys: string[];
-    callbacks?: ShellCloseCallbacks;
-  } | null>(null);
-  // What the shell awaiting that confirmation runs, when its runner said.
-  const [terminalPendingCloseBusy, setTerminalPendingCloseBusy] = useState<ShellBusy | null>(null);
-  const checkShellClose = useShellCloseCheck(conversationId);
   // While a close is in flight, grey the tabs being killed so the delay between
   // confirming and a tab disappearing (the DELETE round-trip + its
   // ``resource.deleted``) reads as "closing", not frozen. A bulk close kills
@@ -1487,9 +1478,6 @@ function AppShellImpl() {
     setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
-    // An open "Close shell?" dialog would target a terminal absent from the
-    // new session's list.
-    setTerminalPendingClose(null);
     setFileNavigation(undefined);
     setRightPanelVisibilityAnimating(false);
     if (!conversationId) {
@@ -2760,10 +2748,8 @@ function AppShellImpl() {
     }
   }, [openTerminals, openTerminalTab]);
 
-  // Kill the tabs' terminals (DELETE). The `session.resource.deleted` delta + the
-  // mutation's cache prune drop them from the list, so their tabs disappear. If the
-  // active tab closes, move focus to a kept neighbor (prefer the previous, else the
-  // next) so the rail doesn't snap back to Files; when none remain the selection clears.
+  // Kill the tabs' terminals; if the active one closes, focus the previous kept neighbor,
+  // else the next, so the rail doesn't snap back to Files.
   const closeTerminalTabs = useCallback(
     (keys: string[], callbacks?: ShellCloseCallbacks) => {
       setSelectedTerminalKey((active) => {
@@ -2791,10 +2777,21 @@ function AppShellImpl() {
     },
     [openTerminals, terminals, conversationId, deleteTerminalMutation],
   );
-  const latestCloseTerminalTabs = useRef(closeTerminalTabs);
-  latestCloseTerminalTabs.current = closeTerminalTabs;
-  // User closed shell tabs. Closing a tab kills its terminal, so idle shells close at
-  // once and anything else asks first; a bulk close asks once for all of its shells.
+  // Closing a tab kills its terminal: the rail's shell tabs close through the "Close shell?" flow.
+  const closeShell = useShellCloseRequest<ShellTabsClose>(
+    conversationId,
+    "rail_tab_close",
+    (closes) => {
+      const { keys, callbacks } = joinShellTabsCloses(closes);
+      closeTerminalTabs(keys, callbacks);
+    },
+  );
+  const terminalPendingClose = closeShell.pending
+    ? joinShellTabsCloses(closeShell.pending.items)
+    : null;
+  // User closed shell tabs. Idle shells close at once and anything else asks first; a bulk close
+  // asks once for all of its shells.
+  const requestCloseShell = closeShell.request;
   const requestCloseTerminals = useCallback(
     (keys: string[], callbacks?: ShellCloseCallbacks) => {
       if (keys.length === 0) return;
@@ -2802,32 +2799,14 @@ function AppShellImpl() {
         const info = terminals.find((t) => terminalTabKey(t) === key);
         return info ? [info.id] : [];
       });
-      if (ids.length !== keys.length) {
-        setTerminalPendingCloseBusy(null);
-        setTerminalPendingClose({ keys, callbacks });
-        return;
-      }
-      checkShellClose(ids, "rail_tab_close", (check) => {
-        if (check.close === "now") {
-          latestCloseTerminalTabs.current(keys, callbacks);
-          return;
-        }
-        setTerminalPendingCloseBusy(check.busy);
-        setTerminalPendingClose({ keys, callbacks });
-      });
+      requestCloseShell({ keys, callbacks }, ids.length === keys.length ? ids : null);
     },
-    [terminals, checkShellClose],
+    [terminals, requestCloseShell],
   );
   const requestCloseTerminal = useCallback(
     (key: string, callbacks?: ShellCloseCallbacks) => requestCloseTerminals([key], callbacks),
     [requestCloseTerminals],
   );
-  const confirmCloseTerminal = useCallback(() => {
-    if (terminalPendingClose === null) return;
-    const { keys, callbacks } = terminalPendingClose;
-    setTerminalPendingClose(null);
-    closeTerminalTabs(keys, callbacks);
-  }, [terminalPendingClose, closeTerminalTabs]);
 
   // The active shell selection is sticky: it changes only on explicit user
   // action (opening a shell/file, switching a nav tab, closing the active
@@ -3903,9 +3882,9 @@ function AppShellImpl() {
               if (!info) return null;
               return terminalDisplayLabel(info);
             })()}
-            busy={terminalPendingCloseBusy}
-            onConfirm={confirmCloseTerminal}
-            onCancel={() => setTerminalPendingClose(null)}
+            busy={closeShell.pending?.busy}
+            onConfirm={closeShell.confirm}
+            onCancel={closeShell.cancel}
           />
           <CloseWindowDialog
             prompt={closeWindowPrompt}

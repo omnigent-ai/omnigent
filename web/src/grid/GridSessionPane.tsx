@@ -61,7 +61,11 @@ import {
   isDefaultWorkspaceTab,
 } from "@/lib/workspaceTabPreferences";
 import { CloseShellDialog } from "@/shell/CloseShellDialog";
-import { useShellCloseRequest } from "@/shell/shellCloseCheck";
+import {
+  joinShellTabsCloses,
+  type ShellTabsClose,
+  useShellCloseRequest,
+} from "@/shell/shellCloseCheck";
 import {
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
@@ -270,32 +274,29 @@ export function GridSessionPane({
   const updateWorkspace = useCallback((patch: SessionWorkspaceState) => {
     setWorkspace((previous) => ({ ...previous, ...patch }));
   }, []);
-  const closeShell = useShellCloseRequest<{ keys: string[]; callbacks?: ShellCloseCallbacks }>(
-    sessionId,
-    "grid_close",
-    ({ keys, callbacks }) => {
-      callbacks?.onConfirmed?.();
-      for (const terminal of terminals.filter((each) => keys.includes(terminalTabKey(each)))) {
-        const key = terminalTabKey(terminal);
-        setKillingTerminalIds((ids) => [...ids, terminal.id]);
-        // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
-        deleteTerminal
-          .mutateAsync(terminal.id)
-          .then(
-            // Read the selection when the delete lands, so a shell selected meanwhile stays selected.
-            () =>
-              setWorkspace((previous) =>
-                previous.selectedTerminalKey === key
-                  ? { ...previous, selectedTerminalKey: null }
-                  : previous,
-              ),
-            () => callbacks?.onFailed?.(key),
-          )
-          .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== terminal.id)));
-      }
-    },
-  );
-  const pendingClose = closeShell.pending?.item ?? null;
+  const closeShell = useShellCloseRequest<ShellTabsClose>(sessionId, "grid_close", (closes) => {
+    const { keys, callbacks } = joinShellTabsCloses(closes);
+    callbacks.onConfirmed?.();
+    for (const terminal of terminals.filter((each) => keys.includes(terminalTabKey(each)))) {
+      const key = terminalTabKey(terminal);
+      setKillingTerminalIds((ids) => [...ids, terminal.id]);
+      // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+      deleteTerminal
+        .mutateAsync(terminal.id)
+        .then(
+          // Read the selection when the delete lands, so a shell selected meanwhile stays selected.
+          () =>
+            setWorkspace((previous) =>
+              previous.selectedTerminalKey === key
+                ? { ...previous, selectedTerminalKey: null }
+                : previous,
+            ),
+          () => callbacks.onFailed?.(key),
+        )
+        .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== terminal.id)));
+    }
+  });
+  const pendingClose = closeShell.pending ? joinShellTabsCloses(closeShell.pending.items) : null;
   const terminalsToClose = terminals.filter((terminal) =>
     pendingClose?.keys.includes(terminalTabKey(terminal)),
   );

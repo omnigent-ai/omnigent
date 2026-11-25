@@ -7,6 +7,8 @@ import { authenticatedFetch } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { lastTerminalInputAt } from "@/lib/terminalInputTimes";
 
+import type { ShellCloseCallbacks } from "./WorkspacePanel";
+
 /** How long a close waits for the runner's reading before it asks anyway. */
 export const SHELL_CLOSE_CHECK_MS = 500;
 /** The longest command name the dialog shows; the server already caps it the same. */
@@ -243,20 +245,27 @@ export function useShellCloseCheck(
   );
 }
 
-/** A close a surface's dialog is asking about, and what the shell runs when its runner said. */
+/** The closes a surface's dialog is asking about, and what the shell runs when its runner said. */
 export interface PendingShellClose<Item> {
-  item: Item;
+  items: readonly Item[];
   busy: ShellBusy | null;
 }
 
+/** The closes a surface is still checking, and their shells. */
+interface CheckingShellClose<Item> {
+  items: readonly Item[];
+  terminalIds: readonly string[];
+}
+
 /**
- * One surface's "Close shell?" flow: `request` closes an idle shell at once through `close`, and
- * otherwise holds `pending` for the dialog, whose `confirm` then closes it.
+ * One surface's "Close shell?" flow: `request` closes idle shells at once through `close`, and
+ * otherwise holds `pending` for the dialog, whose `confirm` then closes them. A close requested
+ * while another is still checking joins it, so the two close or ask together.
  */
 export function useShellCloseRequest<Item>(
   sessionId: string | null | undefined,
   trigger: ShellCloseTrigger,
-  close: (item: Item) => void,
+  close: (items: readonly Item[]) => void,
 ): {
   pending: PendingShellClose<Item> | null;
   /** Close `item`, asking first unless its shells, `terminalIds`, are idle; null always asks. */
@@ -264,30 +273,82 @@ export function useShellCloseRequest<Item>(
   confirm: () => void;
   cancel: () => void;
 } {
-  const [pending, setPending] = useState<PendingShellClose<Item> | null>(null);
+  // Held with its session: a dialog about another session's shells doesn't show.
+  const [asked, setAsked] = useState<{
+    sessionId: string | null | undefined;
+    pending: PendingShellClose<Item>;
+  } | null>(null);
+  const pending = asked && asked.sessionId === sessionId ? asked.pending : null;
+  const setPending = useCallback(
+    (next: PendingShellClose<Item> | null) => setAsked(next && { sessionId, pending: next }),
+    [sessionId],
+  );
   const latestClose = useRef(close);
   latestClose.current = close;
   const latestPending = useRef(pending);
   latestPending.current = pending;
+  const checking = useRef<CheckingShellClose<Item> | null>(null);
   const checkClose = useShellCloseCheck(sessionId);
   const request = useCallback(
     (item: Item, terminalIds: readonly string[] | null) => {
+      const earlier = checking.current;
+      checking.current = null;
+      const items = [...(earlier?.items ?? []), item];
       if (terminalIds === null) {
-        setPending({ item, busy: null });
+        setPending({ items, busy: null });
         return;
       }
-      checkClose(terminalIds, trigger, (check) => {
-        if (check.close === "now") latestClose.current(item);
-        else setPending({ item, busy: check.busy });
-      });
+      const joined: CheckingShellClose<Item> = {
+        items,
+        terminalIds: [...new Set([...(earlier?.terminalIds ?? []), ...terminalIds])],
+      };
+      checking.current = joined;
+      checkClose(
+        joined.terminalIds,
+        trigger,
+        (check) => {
+          if (checking.current !== joined) return;
+          checking.current = null;
+          if (check.close === "now") latestClose.current(items);
+          else setPending({ items, busy: check.busy });
+        },
+        // Another server or session: these shells aren't the ones it shows any more.
+        () => {
+          if (checking.current === joined) checking.current = null;
+        },
+      );
     },
-    [checkClose, trigger],
+    [checkClose, trigger, setPending],
   );
   const confirm = useCallback(() => {
-    const asked = latestPending.current;
+    const confirmed = latestPending.current;
     setPending(null);
-    if (asked) latestClose.current(asked.item);
-  }, []);
-  const cancel = useCallback(() => setPending(null), []);
+    if (confirmed) latestClose.current(confirmed.items);
+  }, [setPending]);
+  const cancel = useCallback(() => setPending(null), [setPending]);
   return { pending, request, confirm, cancel };
+}
+
+/** A request to close shell tabs by key, and what to tell its caller. */
+export interface ShellTabsClose {
+  keys: readonly string[];
+  callbacks?: ShellCloseCallbacks;
+}
+
+/** Closes that were asked about together, as one close telling each caller about its own tabs. */
+export function joinShellTabsCloses(closes: readonly ShellTabsClose[]): {
+  keys: string[];
+  callbacks: ShellCloseCallbacks;
+} {
+  return {
+    keys: [...new Set(closes.flatMap((each) => each.keys))],
+    callbacks: {
+      onConfirmed: () => {
+        for (const each of closes) each.callbacks?.onConfirmed?.();
+      },
+      onFailed: (key) => {
+        for (const each of closes) if (each.keys.includes(key)) each.callbacks?.onFailed?.(key);
+      },
+    },
+  };
 }

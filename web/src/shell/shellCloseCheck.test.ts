@@ -6,6 +6,7 @@ import { noteTerminalInput, resetTerminalInputTimes } from "@/lib/terminalInputT
 import {
   checkShellClose,
   SHELL_CLOSE_CHECK_MS,
+  joinShellTabsCloses,
   useShellCloseCheck,
   useShellCloseRequest,
   type ShellCloseCheck,
@@ -244,19 +245,19 @@ describe("useShellCloseCheck", () => {
 describe("useShellCloseRequest", () => {
   it("closes an idle shell at once, and holds a busy one for the dialog", async () => {
     vi.spyOn(console, "info").mockImplementation(() => {});
-    const close = vi.fn<(key: string) => void>();
+    const close = vi.fn<(items: readonly string[]) => void>();
     const { result } = renderHook(() => useShellCloseRequest("conv_a", "grid_close", close));
 
     runnerSays({ terminal_zsh_s1: json({ state: "idle" }) });
     act(() => result.current.request("tab-1", ["terminal_zsh_s1"]));
-    await vi.waitFor(() => expect(close).toHaveBeenCalledExactlyOnceWith("tab-1"));
+    await vi.waitFor(() => expect(close).toHaveBeenCalledExactlyOnceWith(["tab-1"]));
     expect(result.current.pending).toBeNull();
 
     runnerSays({ terminal_zsh_s1: json({ state: "busy", foreground: "top", background_jobs: 0 }) });
     act(() => result.current.request("tab-1", ["terminal_zsh_s1"]));
     await vi.waitFor(() =>
       expect(result.current.pending).toEqual({
-        item: "tab-1",
+        items: ["tab-1"],
         busy: { foreground: "top", backgroundJobs: 0 },
       }),
     );
@@ -266,12 +267,98 @@ describe("useShellCloseRequest", () => {
   });
 
   it("asks at once for a shell it can't name", () => {
-    const close = vi.fn<(key: string) => void>();
+    const close = vi.fn<(items: readonly string[]) => void>();
     const { result } = renderHook(() => useShellCloseRequest("conv_a", "grid_close", close));
     act(() => result.current.request("tab-1", null));
-    expect(result.current.pending).toEqual({ item: "tab-1", busy: null });
+    expect(result.current.pending).toEqual({ items: ["tab-1"], busy: null });
     act(() => result.current.cancel());
     expect(close).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("joins a close requested while another is checking, closing both when both are idle", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const close = vi.fn<(items: readonly string[]) => void>();
+    const { result } = renderHook(() => useShellCloseRequest("conv_a", "grid_close", close));
+    let answer = () => {};
+    const held = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    runnerSays({
+      terminal_one: async () => {
+        await held;
+        return json({ state: "idle" });
+      },
+      terminal_two: json({ state: "idle" }),
+    });
+    act(() => result.current.request("tab-1", ["terminal_one"]));
+    act(() => result.current.request("tab-2", ["terminal_two"]));
+    act(() => answer());
+    await vi.waitFor(() => expect(close).toHaveBeenCalledExactlyOnceWith(["tab-1", "tab-2"]));
+  });
+
+  it("asks once about both when the joined close finds one busy", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const close = vi.fn<(items: readonly string[]) => void>();
+    const { result } = renderHook(() => useShellCloseRequest("conv_a", "grid_close", close));
+    runnerSays({
+      terminal_one: json({ state: "idle" }),
+      terminal_two: json({ state: "busy", foreground: "vim", background_jobs: 0 }),
+    });
+    act(() => {
+      result.current.request("tab-1", ["terminal_one"]);
+      result.current.request("tab-2", ["terminal_two"]);
+    });
+    await vi.waitFor(() =>
+      expect(result.current.pending).toEqual({ items: ["tab-1", "tab-2"], busy: null }),
+    );
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("asks about a close it can't check together with one still checking", () => {
+    const close = vi.fn<(items: readonly string[]) => void>();
+    const { result } = renderHook(() => useShellCloseRequest("conv_a", "grid_close", close));
+    runnerSays({ terminal_one: async () => new Promise<Response>(() => {}) });
+    act(() => result.current.request("tab-1", ["terminal_one"]));
+    act(() => result.current.request("tab-2", null));
+    expect(result.current.pending).toEqual({ items: ["tab-1", "tab-2"], busy: null });
+  });
+
+  it("drops its question, and what it was checking, when the surface shows another session", async () => {
+    const close = vi.fn<(items: readonly string[]) => void>();
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useShellCloseRequest(sessionId, "grid_close", close),
+      { initialProps: { sessionId: "conv_a" } },
+    );
+    act(() => result.current.request("tab-1", null));
+    rerender({ sessionId: "conv_b" });
+    expect(result.current.pending).toBeNull();
+
+    runnerSays({ terminal_one: async () => new Promise<Response>(() => {}) });
+    act(() => result.current.request("tab-b", ["terminal_one"]));
+    rerender({ sessionId: "conv_c" });
+    runnerSays({ terminal_two: json({ state: "idle" }) });
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    act(() => result.current.request("tab-c", ["terminal_two"]));
+    await vi.waitFor(() => expect(close).toHaveBeenCalledExactlyOnceWith(["tab-c"]));
+  });
+});
+
+describe("joinShellTabsCloses", () => {
+  it("closes every tab once, telling each caller about its own", () => {
+    const first = { onConfirmed: vi.fn(), onFailed: vi.fn() };
+    const second = { onConfirmed: vi.fn(), onFailed: vi.fn() };
+    const joined = joinShellTabsCloses([
+      { keys: ["a", "b"], callbacks: first },
+      { keys: ["b", "c"], callbacks: second },
+      { keys: ["d"] },
+    ]);
+    expect(joined.keys).toEqual(["a", "b", "c", "d"]);
+    joined.callbacks.onConfirmed?.();
+    expect(first.onConfirmed).toHaveBeenCalledTimes(1);
+    expect(second.onConfirmed).toHaveBeenCalledTimes(1);
+    joined.callbacks.onFailed?.("a");
+    expect(first.onFailed).toHaveBeenCalledExactlyOnceWith("a");
+    expect(second.onFailed).not.toHaveBeenCalled();
   });
 });

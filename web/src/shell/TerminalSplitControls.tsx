@@ -56,14 +56,16 @@ export function TerminalSplitControls({
   const create = useCreateTerminal(conversationId);
   const deleteTerminal = useDeleteTerminal(conversationId);
   const split = useTerminalSplitPanes(conversationId);
-  // The shell a pending close targets, fixed when the dialog opens.
+  // The shells a pending close targets, fixed when the dialog opens.
   const closeShell = useShellCloseRequest<TerminalInfo>(
     conversationId,
     "split_controls_close",
-    // MainTerminalView prunes the pane once the terminal leaves the list.
-    (terminal) => deleteTerminal.mutate(terminal.id),
+    // MainTerminalView prunes each pane once its terminal leaves the list.
+    (closing) => {
+      for (const terminal of closing) deleteTerminal.mutate(terminal.id);
+    },
   );
-  const closeTarget = closeShell.pending?.item ?? null;
+  const closing = closeShell.pending?.items ?? [];
   const agentTerminal = findAgentTerminal(terminals);
   const declaredShells = agent?.terminals ?? [];
   if (
@@ -164,8 +166,9 @@ export function TerminalSplitControls({
         </HeaderTooltip>
       )}
       <CloseShellDialog
-        open={closeTarget !== null}
-        shellLabel={closeTarget && terminalDisplayLabel(closeTarget)}
+        open={closeShell.pending !== null}
+        shellCount={closing.length}
+        shellLabel={closing.length === 1 ? terminalDisplayLabel(closing[0]) : null}
         busy={closeShell.pending?.busy}
         onCancel={closeShell.cancel}
         onConfirm={closeShell.confirm}
