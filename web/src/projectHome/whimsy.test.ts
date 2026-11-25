@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import type * as identity from "@/lib/identity";
 import type { ProjectTicket, TicketStage } from "@/lib/projectTicketsApi";
 import { milestoneToShow } from "./ProjectMilestoneNote";
 import { DONE_MARK_MS, emptyLaneLine, isRecentlyFinishedForViewer } from "./ProjectTicketBoard";
 
 vi.mock("@/lib/identity", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/identity")>()),
+  ...(await importOriginal<typeof identity>()),
   getCurrentUserId: () => "kasey@example.com",
 }));
 
