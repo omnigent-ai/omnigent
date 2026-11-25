@@ -194,3 +194,37 @@ async def test_a_program_that_replaced_the_shell_and_named_itself_bash_is_unknow
     for _ in range(5):
         assert await bash_terminal.inspect_shell() == UNKNOWN
         await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="reads the pane's file from /proc")
+@pytest.mark.parametrize("bash_terminal", [pytest.param(None, id="plain")], indirect=True)
+async def test_a_copy_of_another_program_named_bash_in_place_of_the_shell_is_unknown(
+    bash_terminal: TerminalInstance, tmp_path: Path
+) -> None:
+    await _settles_on(bash_terminal, _IDLE)
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    copy = tmp_path / "copies" / "bash"
+    copy.parent.mkdir()
+    shutil.copy(sleep, copy)
+    await bash_terminal.send(f"exec {shlex.quote(str(copy))} 20")
+    pane = bash_terminal.pane_pid_sync()
+    assert pane is not None
+    copied = copy.stat()
+
+    async def replaced() -> None:
+        while True:
+            try:
+                running = Path(f"/proc/{pane}/exe").stat()
+            except OSError:
+                running = None
+            if running and (running.st_dev, running.st_ino) == (copied.st_dev, copied.st_ino):
+                return
+            await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(replaced(), timeout=30)
+    # Childless and named bash, but it runs a copy of sleep, not the bash the command finds.
+    for _ in range(5):
+        assert await bash_terminal.inspect_shell() == UNKNOWN
+        await asyncio.sleep(0.1)

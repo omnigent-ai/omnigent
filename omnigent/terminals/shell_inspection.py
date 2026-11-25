@@ -41,8 +41,6 @@ _READ_CHUNK_BYTES = 64 * 1024
 ELIGIBLE_SHELLS = frozenset({"bash", "zsh", "sh", "dash", "ksh", "mksh", "fish", "tcsh", "csh"})
 # Linux keeps this many characters of an executable's name in ``comm``.
 _LINUX_COMM_LENGTH = 15
-# A shell's executable file, as installed: ``bash``, ``zsh-5.9`` or ``ksh93``.
-_SHELL_EXECUTABLE = re.compile(r"(?:bash|zsh|sh|dash|ksh|mksh|fish|tcsh|csh)(?:-?\d[\d.]*)?")
 
 _ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 
@@ -196,9 +194,42 @@ def _darwin_process_path(pid: int) -> str | None:
     return buffer.value.decode(errors="replace")
 
 
-def is_shell_executable(path: str | None) -> bool:
-    """Whether ``path`` is a shell's executable, by its file name: ``/bin/sh`` resolves to dash."""
-    return path is not None and _SHELL_EXECUTABLE.fullmatch(os.path.basename(path)) is not None
+# A file, by the device and inode it lives at: a copy or a rename can't take its place.
+FileIdentity = tuple[int, int]
+
+
+def _file_identity(path: str) -> FileIdentity | None:
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_dev, status.st_ino)
+
+
+def process_file_identity(pid: int) -> FileIdentity | None:
+    """The file ``pid`` runs, by device and inode, from the kernel.
+
+    On Linux this follows ``/proc/<pid>/exe``, which reaches the running file even from outside
+    a sandbox's mount namespace.
+
+    :param pid: A process this runner may inspect, e.g. a pane's shell.
+    :returns: ``(st_dev, st_ino)``, or ``None`` when the platform can't tell.
+    """
+    if sys.platform.startswith("linux"):
+        return _file_identity(f"/proc/{pid}/exe")
+    path = process_executable(pid)
+    return None if path is None else _file_identity(path)
+
+
+def configured_shell_identity(shell_command: str, path: str) -> FileIdentity | None:
+    """The file the terminal's command starts, found as its launch finds it, by identity.
+
+    :param shell_command: The terminal's configured command, e.g. ``"bash"`` or ``"/bin/zsh"``.
+    :param path: The search path, e.g. :func:`trusted_search_path`.
+    :returns: ``(st_dev, st_ino)``, following symlinks, or ``None`` when it isn't found.
+    """
+    found = shutil.which(shell_command, path=path)
+    return None if found is None else _file_identity(found)
 
 
 def _shell_name(command: str) -> str | None:
@@ -245,19 +276,21 @@ def inspect_shell(
     pane_pid: int,
     shell_command: str,
     launchers: Sequence[LauncherStep] = (),
-    executable_of: Callable[[int], str | None] = process_executable,
+    shell_identity: FileIdentity | None = None,
+    identity_of: Callable[[int], FileIdentity | None] = process_file_identity,
 ) -> ShellInspection:
     """Decide whether the pane's login shell is idle, from one ``ps`` snapshot.
 
     The pane's process must be a child of its own tmux server in this same snapshot, else its
     pid may have been reused and the answer is unknown. The terminal's command must be an
     :data:`ELIGIBLE_SHELLS` shell, and the pane must hold exactly the framework's
-    ``launchers`` and then that shell, whose executable file is a shell's; any other layout,
-    such as a program that replaced the shell, even one that renamed itself ``bash``, answers
-    unknown. So does any other process on the pane's tmux server, in another pane or window,
-    since closing the terminal ends the whole server. The shell is idle
-    when nothing runs under it and nothing else runs anywhere under the pane. A sandbox's
-    namespace init adopts work its shell left running, and closing the pane ends that too.
+    ``launchers`` and then that shell, running the very file the command resolves to. Any
+    other layout answers unknown, such as a program that replaced the shell, even one that
+    renamed itself ``bash`` or a copy of another program named bash. So does any other
+    process on the pane's tmux server, in another pane or window, since closing the terminal
+    ends the whole server. The shell is idle when nothing runs under it and nothing else runs
+    anywhere under the pane. A sandbox's namespace init adopts work its shell left running,
+    and closing the pane ends that too.
 
     Idle means no other process, not that the shell waits at its prompt: a loop of shell
     builtins, such as ``while :; do :; done``, starts no process and reads idle.
@@ -268,8 +301,11 @@ def inspect_shell(
     :param shell_command: The terminal's configured command, e.g. ``"zsh"``.
     :param launchers: The framework's launchers between the pane and the shell, from
         :func:`sandbox_launchers`.
-    :param executable_of: The file a pid runs, e.g. :func:`process_executable`. The shell's
-        must be a shell's, since a process can give itself any ``comm``.
+    :param shell_identity: The file the configured shell resolves to, from
+        :func:`configured_shell_identity`; ``None`` answers unknown.
+    :param identity_of: The file a pid runs, e.g. :func:`process_file_identity`. The shell's
+        must be ``shell_identity``, since a process can give itself any ``comm`` and a copy of
+        another program can carry a shell's name.
     :returns: The inspection; only names and counts, never a row.
     """
     rows = _parse(snapshot)
@@ -294,7 +330,7 @@ def inspect_shell(
     if wanted is None or wanted not in ELIGIBLE_SHELLS:
         return UNKNOWN
     shell = _shell_after_launchers(pane, launchers, wanted, children)
-    if shell is None or not is_shell_executable(executable_of(shell.pid)):
+    if shell is None or shell_identity is None or identity_of(shell.pid) != shell_identity:
         return UNKNOWN
 
     jobs = _descendants(shell, children)
@@ -454,7 +490,8 @@ async def read_pane_shell(
             pane_pid=int(fields[1]),
             shell_command=shell_command,
             launchers=launchers,
-            executable_of=process_executable,
+            shell_identity=configured_shell_identity(shell_command, path),
+            identity_of=process_file_identity,
         )
 
     try:

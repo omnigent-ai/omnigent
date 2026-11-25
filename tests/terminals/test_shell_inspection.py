@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -44,14 +45,19 @@ def snapshot(*rows: tuple[int, int, int, int, str, str]) -> str:
 BWRAP_LAUNCHERS = (frozenset({"bwrap"}), frozenset({"bwrap"}), frozenset({"python"}))
 
 
-def honest_executables(text: str) -> dict[int, str]:
-    """Each pid's executable as its ``comm`` names it, as for processes that didn't rename."""
-    executables: dict[int, str] = {}
+def file_of(name: str) -> tuple[int, int]:
+    """A stand-in device and inode for the installed program ``name``."""
+    return (1, sum(ord(char) * 31**index for index, char in enumerate(name)))
+
+
+def honest_files(text: str) -> dict[int, tuple[int, int]]:
+    """Each pid's file as its ``comm`` names it, as for processes that didn't rename."""
+    files: dict[int, tuple[int, int]] = {}
     for line in text.splitlines():
         fields = line.split(None, 5)
         if len(fields) == 6 and fields[0].isdigit():
-            executables[int(fields[0])] = "/usr/bin/" + fields[5].lstrip("-").rsplit("/", 1)[-1]
-    return executables
+            files[int(fields[0])] = file_of(fields[5].lstrip("-").rsplit("/", 1)[-1])
+    return files
 
 
 def inspect(
@@ -60,16 +66,17 @@ def inspect(
     shell: str = "bash",
     pane: int = PANE,
     launchers: tuple[frozenset[str], ...] = (),
-    executables: dict[int, str] | None = None,
+    files: dict[int, tuple[int, int]] | None = None,
 ) -> ShellInspection:
-    known = honest_executables(text) if executables is None else executables
+    known = honest_files(text) if files is None else files
     return inspect_shell(
         text,
         tmux_server_pid=TMUX,
         pane_pid=pane,
         shell_command=shell,
         launchers=launchers,
-        executable_of=known.get,
+        shell_identity=file_of(shell.rsplit("/", 1)[-1]),
+        identity_of=known.get,
     )
 
 
@@ -217,34 +224,49 @@ def test_a_shell_below_a_program_that_is_not_a_launcher_is_unknown() -> None:
 
 
 @pytest.mark.parametrize(
-    "executable",
-    ["/usr/bin/python3.12", "/usr/bin/vim", None],
-    ids=["python renamed bash", "vim renamed bash", "executable unreadable"],
+    "running",
+    [file_of("python3.12"), file_of("vim"), file_of("sleep"), None],
+    ids=["python renamed bash", "vim renamed bash", "copy of sleep named bash", "file unreadable"],
 )
-def test_a_shell_named_process_whose_executable_is_not_a_shell_is_unknown(
-    executable: str | None,
+def test_a_shell_named_process_that_runs_another_file_is_unknown(
+    running: tuple[int, int] | None,
 ) -> None:
-    # A program that replaced the shell can name itself ``bash``; the kernel's file can't lie.
-    executables = {} if executable is None else {PANE: executable}
-    assert inspect(PLAIN_IDLE, executables=executables) == UNKNOWN
+    # A process can name itself ``bash``, and a copy of another program can be named bash too;
+    # only the configured shell's own file counts.
+    files = {} if running is None else {PANE: running}
+    assert inspect(PLAIN_IDLE, files=files) == UNKNOWN
 
 
-@pytest.mark.parametrize(
-    "path",
-    ["/usr/bin/bash", "/usr/bin/dash", "/usr/bin/zsh-5.9", "/bin/ksh93", "/opt/homebrew/bin/fish"],
-)
-def test_a_shell_executable_is_told_by_its_file_name(path: str) -> None:
-    assert shell_inspection.is_shell_executable(path)
-    assert not shell_inspection.is_shell_executable(path.replace("/", "/x", 1) + "-wrapper")
+def test_a_shell_command_that_resolves_to_nothing_is_unknown() -> None:
+    text = snapshot((PANE, TMUX, PANE, PANE, "Ss+", "bash"))
+    answer = inspect_shell(
+        text,
+        tmux_server_pid=TMUX,
+        pane_pid=PANE,
+        shell_command="bash",
+        shell_identity=None,
+        identity_of=honest_files(text).get,
+    )
+    assert answer == UNKNOWN
 
 
-def test_reads_this_processs_own_executable() -> None:
-    # The interpreter running this test: a real lookup, not the name it was started under.
-    executable = shell_inspection.process_executable(os.getpid())
-    if sys.platform.startswith("linux") or sys.platform == "darwin":
-        assert executable is not None
-        assert os.path.samefile(executable, sys.executable)
-    assert shell_inspection.process_executable(2**22 + 12345) is None
+def test_reads_the_file_a_real_process_runs(tmp_path) -> None:
+    # A copy of ``sleep`` named bash runs a different file than the bash the command finds.
+    copy = tmp_path / "bash"
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    shutil.copy(sleep, copy)
+    process = subprocess.Popen([str(copy), "30"])
+    try:
+        running = shell_inspection.process_file_identity(process.pid)
+        assert running is not None
+        assert running == shell_inspection.configured_shell_identity(str(copy), "")
+        assert running != shell_inspection.configured_shell_identity("bash", os.defpath)
+    finally:
+        process.kill()
+        process.wait()
+    assert shell_inspection.process_file_identity(2**22 + 12345) is None
+    assert shell_inspection.configured_shell_identity("no-such-shell", os.defpath) is None
 
 
 @pytest.mark.parametrize("command", ["vim", "python3", "sleep", "/usr/bin/less", "bash -l"])
@@ -636,7 +658,10 @@ async def test_ps_is_never_asked_for_arguments_or_the_environment(
         return PLAIN_IDLE
 
     monkeypatch.setattr(shell_inspection, "_run", fake_run)
-    monkeypatch.setattr(shell_inspection, "process_executable", lambda pid: "/usr/bin/bash")
+    monkeypatch.setattr(shell_inspection, "process_file_identity", lambda pid: (1, 2))
+    monkeypatch.setattr(
+        shell_inspection, "configured_shell_identity", lambda command, path: (1, 2)
+    )
     assert await read_pane_shell(["tmux"], "main", "bash") == ShellInspection(ShellState.IDLE)
     # Exactly these arguments: no `-E` environment, no `args` or `command` column.
     assert calls[-1][1:] == ["-e", "-o", PS_COLUMNS]
