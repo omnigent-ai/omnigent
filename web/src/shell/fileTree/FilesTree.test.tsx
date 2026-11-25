@@ -116,7 +116,11 @@ function renderTree(
   };
 }
 
-afterEach(cleanup);
+// Restores every `vi.spyOn` spy, even after a failed assertion; module mocks keep theirs.
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 /** The viewer context of a session whose workspace is at /repo. */
 const REPO_VIEWER = {
@@ -256,7 +260,6 @@ describe("FilesTree", () => {
     expect(asked).toEqual(["big", "big"]);
     // Both pages arrive as one listing, so the tree rebuilds once, not per page.
     expect(reset).toHaveBeenCalledTimes(1);
-    reset.mockRestore();
   });
 
   it("says when a folder's listing stopped with more entries past it", async () => {
@@ -417,7 +420,6 @@ describe("FilesTree", () => {
       await waitFor(() => expect(row).toHaveAttribute("aria-selected", "true"));
       expect(onActiveRevealHandled).toHaveBeenCalledWith(1);
       expect(onActiveRevealMissed).not.toHaveBeenCalled();
-      reset.mockRestore();
     });
 
     /** The first rendered rows inside `parent`, in the order the tree shows them. */
@@ -426,8 +428,6 @@ describe("FilesTree", () => {
         .map((row) => row.getAttribute("data-item-path") ?? "")
         .filter((path) => path.startsWith(`${parent}/`) && path !== `${parent}/`)
         .slice(0, count);
-
-    afterEach(() => vi.restoreAllMocks());
 
     it.each<[ChangedSort, (a: WorkspaceFile, b: WorkspaceFile) => number]>([
       ["alpha", (a, b) => a.path.localeCompare(b.path)],

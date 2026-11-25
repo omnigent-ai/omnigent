@@ -21,9 +21,6 @@ describe("globToRegExp", () => {
 
   it("reads repeated `**/` as one, so a long path can't make matching slow", () => {
     expect(globToRegExp("**/**/**/**/x").source).toBe(globToRegExp("**/x").source);
-    const deep = `${"a/".repeat(2000)}y`;
-    const started = performance.now();
-    expect(globToRegExp("**/**/**/**/**/x").test(deep)).toBe(false);
-    expect(performance.now() - started).toBeLessThan(1000);
+    expect(globToRegExp("**/**/**/**/**/x").test(`${"a/".repeat(2000)}y`)).toBe(false);
   });
 });

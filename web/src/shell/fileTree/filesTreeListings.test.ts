@@ -75,17 +75,6 @@ describe("treePathFilter", () => {
   const shows = (include: string, exclude: string, path: string, type: "file" | "directory") =>
     treePathFilter(true, { include, exclude })(path, type);
 
-  // Syntax lives in globMatches.json; these check the tree's wiring of it.
-  it.each([
-    ["*.lock", "web/pnpm.lock", true],
-    ["*.lock", "pnpm.lock.bak", false],
-    ["node_modules", "a/node_modules/x/index.js", true],
-    ["build/", "build/out.js", true],
-    ["*.{lock,log}", "out.log", true],
-  ])("exclude %j hides %j: %s", (exclude, path, hidden) => {
-    expect(shows("", exclude, path, "file")).toBe(!hidden);
-  });
-
   // A trailing `/` or `/**` names a folder: never a file of the same name.
   it.each([
     ["build/", "build", "file", false],
@@ -101,25 +90,13 @@ describe("treePathFilter", () => {
     if (type === "file") expect(shows(pattern, "", path, type)).toBe(matches);
   });
 
-  // As the name search reads them: a pattern without `/` matches a name at any depth, and any
-  // `/` anchors it at the browsed folder. An exclude hides a file under a folder it matches;
-  // an include keeps only the files it matches itself.
+  // Glob syntax lives in globMatches.json. What the tree adds: an exclude hides a file under
+  // a folder it matches, while an include keeps only the files it matches itself.
   it.each([
     // [pattern, path, exclude hides it, include keeps it]
-    ["src/", "src/main.ts", true, true],
-    ["src/", "vendor/src/main.ts", false, false],
-    ["src/**", "src/main.ts", true, true],
-    ["src/**", "vendor/src/main.ts", false, false],
-    ["src/*.ts", "vendor/src/main.ts", false, false],
-    ["**/src/**", "vendor/src/main.ts", true, true],
-    ["a/b", "a/b", true, true],
-    ["a/b", "x/a/b", false, false],
-    ["a/b", "a/b/c.ts", true, false],
+    ["node_modules", "a/node_modules/x/index.js", true, false],
     ["src", "vendor/src/main.ts", true, false],
-    ["*.{ts,tsx}", "app.tsx", true, true],
-    ["*.MD", "docs/app.md", true, true],
-    // Paths are relative to the browsed folder, so a leading `/` matches nothing.
-    ["/README.md", "README.md", false, false],
+    ["a/b", "a/b/c.ts", true, false],
   ] as const)(
     "%j against %j: exclude hides %s, include keeps %s",
     (pattern, path, hides, keeps) => {
