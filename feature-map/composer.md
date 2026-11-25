@@ -28,6 +28,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that leaves the editor (switching sessions, a new-session handoff, a recovered
   send) keeps each chip's file as a tray attachment with its `@name` text
   unchanged.
+- `reply-quote-cards`: with the CodeMirror editor (see `codemirror-input`), a
+  reply's quotes sit in the one editor as cards, each on its own line. Arrow keys
+  step over a card, and the caret never rests inside one. Backspace at the start
+  of the line after a card, Delete at the end of the line before it, or the
+  card's X removes it; undo brings it back with its text. After Reply the caret
+  is on the empty line under the new card. Copy, cut and drag give a quote as
+  `> ` markdown. A pending side chat's seed is the first card, and text typed
+  above it lands below it. The textarea keeps one input per quote, and a draft
+  saved on one engine restores on the other. Limits: a slash menu typed after a
+  quote lists only skills, and a reply with quotes shows no `@` mention pills.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
