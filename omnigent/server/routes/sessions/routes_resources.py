@@ -2837,7 +2837,9 @@ def register_resources_routes(
 
         Each method has its gate (:mod:`omnigent.server.workspace_access`): the file
         methods the file routes' read gate, the pull request reads their REST routes'
-        gates, and an unknown method a 404. The API never takes absolute paths.
+        gates, the pull request changes the session owner's, and an unknown method a
+        404. A change from an untrusted ``Origin`` is refused before any other work.
+        The API never takes absolute paths.
         Side chats and sub-agents use the host and workspace of the session that
         owns them. Unconfined sessions only, because the host applies no sandbox's
         hidden paths. A host on another replica gets the REST wrong-replica error,
@@ -2858,6 +2860,7 @@ def register_resources_routes(
             WorkspaceServiceASGIApplication,
         )
         from omnigent.host.frames import CAP_WORKSPACE_API
+        from omnigent.host.workspace_methods import WORKSPACE_METHODS
         from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
         from omnigent.server.workspace_api import (
             ConnectCallResponse,
@@ -2869,11 +2872,15 @@ def register_resources_routes(
         gate = gate_for(method)
         if gate is None:
             raise HTTPException(status_code=404, detail="Unknown workspace method")
+        # As on REST's multipart route: a page on another site never makes a change.
+        described = WORKSPACE_METHODS[method]
+        if described.pull_request and not described.no_side_effects:
+            require_trusted_origin(request)
         if gate is WorkspaceGate.BROWSE:
             conv = await _authorize_browse_read(session_id, request)
         else:
             conv = await _validate_session(session_id, request, LEVEL_READ)
-        # The owner grant itself, with no admin pass: only the owner reads as the host's account.
+        # The owner grant itself, with no admin pass: only the owner acts as the host's account.
         # Only an owner-gated method and GetCapabilities, which lists them, need it.
         session_owner = (
             gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities"
@@ -2886,7 +2893,7 @@ def register_resources_routes(
         )
         if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
             raise OmnigentError(
-                "Only the session's owner can read this through the workspace API",
+                "Only the session's owner can use this through the workspace API",
                 code=ErrorCode.FORBIDDEN,
             )
         _host_id, host, workspace = await _session_host(conv, request)

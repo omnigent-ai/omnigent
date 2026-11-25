@@ -5,8 +5,8 @@ the server's route both reach this service. It reads through
 :class:`~omnigent.workspace_fs.WorkspaceReader`, so its answers match the REST
 file routes. Which workspace a call reads comes from the caller-supplied
 ``reader_for``, which resolves it from the call's credentials. Its pull request
-reads are served only over the tunnel, for the session the server sends with the
-call (see :mod:`omnigent.host.workspace_pull_requests`); the socket serves none.
+methods are served only over the tunnel, for the session the server sends with
+the call (see :mod:`omnigent.host.workspace_pull_requests`); the socket serves none.
 
 Mount it with the generated ASGI app::
 
@@ -85,6 +85,7 @@ from omnigent.host.workspace_git.ignored import DirectoryIgnores
 from omnigent.host.workspace_git.runner import Deadline, GitError, runs_on_this_host
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_struct
+from omnigent.host.workspace_pull_request_input import refuse_unserved_request
 from omnigent.host.workspace_pull_requests import (
     PULL_REQUEST_OPS,
     PullRequestCall,
@@ -226,6 +227,7 @@ class WorkspaceService(WorkspaceServiceMethods):
             raise ConnectError(
                 Code.UNIMPLEMENTED, "Pull requests are served through the server's route"
             )
+        refuse_unserved_request(name, request)
         reader = await _read(self._reader_for, ctx)
         payload = await _read(run_pull_request_op, name, reader, call, request)
         return WORKSPACE_METHODS[name].response_type(payload=payload_struct(payload))
@@ -499,7 +501,7 @@ def _reader_at(
 
 
 def _pull_request_handler(name: str) -> Callable[..., object]:
-    """A WorkspaceService method that serves the pull request read ``name``."""
+    """A WorkspaceService method that serves the pull request method ``name``."""
 
     async def handle(
         self: WorkspaceService, request: Message, ctx: RequestContext | None

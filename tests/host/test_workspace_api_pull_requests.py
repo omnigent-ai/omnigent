@@ -8,6 +8,7 @@ the PR reads that get past the host's scope check. The callers' gates are in
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from connectrpc.errors import ConnectError
 from connectrpc.protocol import ProtocolType
 
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
+from omnigent.host import workspace_service
 from omnigent.host.frames import (
     HostHelloFrame,
     HostWorkspaceCallFrame,
@@ -31,17 +33,19 @@ from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict
 from omnigent.runner import pr_resource
 from omnigent.server import session_pull_requests as server_prs
-from omnigent.server import workspace_api
+from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callable_methods
 from omnigent.stores.session_pull_request_store import SessionPullRequests
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.polling import poll_until_async
+from tests.host import test_workspace_pull_requests as host_tests
 from tests.host import test_workspace_service as service_tests
+from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS, _PULL_REQUEST_READS
 
 _SESSION = service_tests._SESSION
 _PR = "https://github.com/example/app/pull/7"
 _OTHER_PR = "https://github.com/example/app/pull/8"
-_PULL_REQUEST_METHODS = {name for name, m in WORKSPACE_METHODS.items() if m.pull_request}
 
 
 @dataclass
@@ -55,8 +59,10 @@ class _Store:
     def __init__(self, stored: SessionPullRequests | None = None, *, fails: bool = False) -> None:
         self.stored = stored
         self.fails = fails
+        self.reads = 0
 
     def read(self, _session_id: str) -> SessionPullRequests | None:
+        self.reads += 1
         if self.fails:
             raise RuntimeError("storage is down")
         return self.stored
@@ -105,7 +111,10 @@ def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: _Store | Non
 
 def test_every_method_has_a_gate_and_the_pull_request_reads_keep_their_rest_gates() -> None:
     assert set(METHOD_GATES) == set(WORKSPACE_METHODS)
-    assert {name: METHOD_GATES[name] for name in _PULL_REQUEST_METHODS} == {
+    assert {name: METHOD_GATES[name] for name in _PULL_REQUEST_OWNER_METHODS} == dict.fromkeys(
+        _PULL_REQUEST_OWNER_METHODS, WorkspaceGate.SESSION_OWNER
+    )
+    assert {name: METHOD_GATES[name] for name in _PULL_REQUEST_READS} == {
         "GetPullRequest": WorkspaceGate.SESSION_OWNER,
         "ListPullRequestFiles": WorkspaceGate.BROWSE,
         "GetPullRequestDiff": WorkspaceGate.BROWSE,
@@ -115,6 +124,16 @@ def test_every_method_has_a_gate_and_the_pull_request_reads_keep_their_rest_gate
         "ListReviewThreads": WorkspaceGate.BROWSE,
         "ListReviewThreadComments": WorkspaceGate.READ,
     }
+
+
+@pytest.mark.parametrize("browse", [True, False], ids=["browse", "read-only"])
+def test_only_the_owner_is_offered_the_owner_methods(browse: bool) -> None:
+    """A non-owner's GetCapabilities leaves them out, so their client offers no edit controls."""
+    others = callable_methods(browse=browse, session_owner=False)
+    owner = callable_methods(browse=browse, session_owner=True)
+
+    assert not others & (_PULL_REQUEST_OWNER_METHODS | {"GetPullRequest"})
+    assert owner - others == _PULL_REQUEST_OWNER_METHODS | {"GetPullRequest"}
 
 
 async def test_after_import_an_unlinked_pr_is_refused_before_the_host(
@@ -248,8 +267,188 @@ async def test_capabilities_through_the_server_list_the_pull_request_reads(
 
     response = await client.get_capabilities(pb.GetCapabilitiesRequest())
 
-    assert set(response.capabilities) >= _PULL_REQUEST_METHODS
+    # Permissions are off here, so the caller is the session's owner.
+    assert set(response.capabilities) >= _PULL_REQUEST_READS | _PULL_REQUEST_OWNER_METHODS
     assert [(call.session_id, call.vouch) for call in host_calls] == [(_SESSION, None)]
+
+
+_CREATE_COMMENT = host_tests._OWNER_CALLS["CreateComment"][0]
+
+
+async def test_a_change_to_an_unlinked_pr_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_OTHER_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(_CREATE_COMMENT)
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert host_calls == []
+    assert owner_calls == []
+
+
+async def test_a_change_to_a_linked_pr_runs_on_the_servers_word(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """The host never recorded the PR; the server's vouch is what lets it change."""
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    response = await client.create_comment(_CREATE_COMMENT)
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [(call.session_id, call.vouch) for call in host_calls] == [
+        (_SESSION, PullRequestVouch(server_tracked=True)),
+    ]
+    assert [call[0] for call in owner_calls] == ["create_pr_comment"]
+
+
+@pytest.fixture
+def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Each pr_resource call an owner method made on the host."""
+    return host_tests.record_owner_calls(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("method", "request_message", "refusal"),
+    [
+        (
+            "SetPullRequestAccount",
+            pb.SetPullRequestAccountRequest(account="octocat"),
+            "Expected a pull request URL",
+        ),
+        (
+            "SetPullRequestAccount",
+            pb.SetPullRequestAccountRequest(pr_url=_PR, remote="upstream"),
+            "Changing the base repository isn't available here",
+        ),
+        (
+            "MergePullRequestAsAccount",
+            pb.MergePullRequestAsAccountRequest(
+                pr_url=_PR, merge_method="squash", expected_head_oid="a" * 40, account=" "
+            ),
+            "Expected an account to merge as",
+        ),
+        (
+            "ListLabels",
+            pb.ListLabelsRequest(pr_url=_PR, text="bug"),
+            "Label search isn't available on this host",
+        ),
+    ],
+    ids=["account-without-pr", "account-with-remote", "merge-as-no-account", "label-search"],
+)
+async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    method: str,
+    request_message: Any,
+    refusal: str,
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    with pytest.raises(ConnectError) as refused:
+        await getattr(client, WORKSPACE_METHODS[method].python_name)(request_message)
+
+    assert (refused.value.code, refused.value.message) == (Code.INVALID_ARGUMENT, refusal)
+    assert store.reads == 0
+    assert host_calls == []
+
+
+async def test_set_account_stores_the_reported_prs_and_answers_with_the_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+) -> None:
+    """Its answer is the PR overview, so it updates the server's list as REST does."""
+    stored = _linked(_PR)
+    ingested: list[dict[str, Any]] = []
+
+    def ingest(_store: object, session_id: str, info: Any, *, requested_at: float) -> Any:
+        assert session_id == _SESSION and requested_at > 0
+        ingested.append(dict(info))
+        return stored
+
+    monkeypatch.setattr(server_prs, "ingest_info", ingest)
+    monkeypatch.setattr(server_prs, "answer", lambda info, _stored: {**info, "prs": ["server"]})
+    monkeypatch.setattr(
+        pr_resource,
+        "set_pr_preference",
+        lambda _root, **_kwargs: {"pr": None, "prs": [{"url": _PR}], "count": 1},
+    )
+    monkeypatch.setattr(pr_resource, "create_pr_comment", lambda _root, **_kwargs: {"id": 1})
+    client = _client(tmp_path, monkeypatch, _Store(stored))
+
+    response = await client.set_pull_request_account(
+        pb.SetPullRequestAccountRequest(pr_url=_PR, account="octocat")
+    )
+    await client.create_comment(_CREATE_COMMENT)
+
+    assert payload_dict(response.payload) == {"pr": None, "prs": ["server"], "count": 1}
+    # The other changes store nothing.
+    assert ingested == [{"pr": None, "prs": [{"url": _PR}], "count": 1}]
+    assert [call.method for call in host_calls] == ["SetPullRequestAccount", "CreateComment"]
+
+
+_SERVICE_PATH = (
+    f"/v1/sessions/{_SESSION}/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService"
+)
+
+
+async def _post(app: Any, method: str, content: bytes, headers: dict[str, str]) -> httpx.Response:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as http:
+        return await http.post(f"{_SERVICE_PATH}/{method}", content=content, headers=headers)
+
+
+@pytest.mark.parametrize(
+    ("headers", "status"),
+    [
+        ({"Content-Type": "application/json", "Origin": "https://attacker.example"}, 403),
+        # A body a page on another site can post without asking first.
+        ({"Content-Type": "text/plain"}, 415),
+    ],
+    ids=["untrusted-origin", "simple-request"],
+)
+async def test_a_change_from_another_site_is_refused_before_any_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    headers: dict[str, str],
+    status: int,
+) -> None:
+    store = _Store(_linked(_PR))
+    app = service_tests._server_app(tmp_path, monkeypatch)
+    monkeypatch.setattr(server_prs, "open_store", lambda _conversations: store)
+    body = b'{"prUrl": "https://github.com/example/app/pull/7", "body": "Looks good"}'
+
+    response = await _post(app, "CreateComment", body, headers)
+
+    assert response.status_code == status, response.text
+    assert store.reads == 0
+    assert host_calls == []
+
+
+async def test_a_change_is_never_served_over_get(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    app = service_tests._server_app(tmp_path, monkeypatch)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as http:
+        response = await http.get(f"{_SERVICE_PATH}/CreateComment", params={"message": "{}"})
+
+    assert response.status_code == 405, response.text
+    assert host_calls == []
+
+
+# -- A change whose answer is lost is never reported as safe to retry. --------------------
 
 
 async def _no_vouch(_pr_url: str) -> PullRequestVouch | None:
@@ -258,6 +457,134 @@ async def _no_vouch(_pr_url: str) -> PullRequestVouch | None:
 
 async def _as_reported(payload: dict[str, Any], _sent_at: float) -> dict[str, Any]:
     return payload
+
+
+@dataclass
+class _Tunnel:
+    """A connected host whose frames the test answers, or drops."""
+
+    registry: HostRegistry
+    host: HostConnection
+    service: workspace_api.HostWorkspaceService
+    sent: list[HostWorkspaceCallFrame]
+
+    async def call(self, method: str, request: Any) -> Any:
+        return await getattr(self.service, WORKSPACE_METHODS[method].python_name)(request, None)
+
+    async def frame_sent(self) -> None:
+        await poll_until_async(lambda: self.host.pending_workspace_calls, timeout_s=5)
+
+
+def _tunnel(tmp_path: Path, *, refuse_send: bool = False) -> _Tunnel:
+    registry = HostRegistry()
+    hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
+    host = registry.register("host_ws", object(), hello, owner=None)  # type: ignore[arg-type]
+    sent: list[HostWorkspaceCallFrame] = []
+
+    def send_text(_conn: HostConnection, text: str) -> None:
+        if refuse_send:
+            raise ConnectionError("closed")
+        frame = decode_host_frame(text)
+        assert isinstance(frame, HostWorkspaceCallFrame)
+        sent.append(frame)
+
+    registry.send_text = send_text  # type: ignore[method-assign]
+    service = workspace_api.HostWorkspaceService(
+        workspace_api.HostTarget(registry, host, str(tmp_path)),
+        content_search=False,
+        pull_requests=workspace_api.PullRequestRoute(
+            _SESSION, vouch=_no_vouch, overview=_as_reported
+        ),
+    )
+    return _Tunnel(registry, host, service, sent)
+
+
+_MERGE = host_tests._OWNER_CALLS["MergePullRequest"][0]
+_COMMENT_UNCONFIRMED = "Could not confirm comment posting. Check GitHub before retrying."
+_CHANGE_UNCONFIRMED = "Could not confirm the pull request change. Check GitHub before retrying."
+
+
+@pytest.mark.parametrize(
+    ("method", "request_message", "unconfirmed"),
+    [
+        ("CreateComment", _CREATE_COMMENT, _COMMENT_UNCONFIRMED),
+        ("MergePullRequest", _MERGE, _CHANGE_UNCONFIRMED),
+    ],
+    ids=["comment", "merge"],
+)
+async def test_a_host_that_drops_after_the_frame_leaves_the_change_unconfirmed(
+    tmp_path: Path, method: str, request_message: Any, unconfirmed: str
+) -> None:
+    tunnel = _tunnel(tmp_path)
+    call = asyncio.create_task(tunnel.call(method, request_message))
+    await tunnel.frame_sent()
+    tunnel.registry.deregister("host_ws", conn=tunnel.host)
+
+    with pytest.raises(ConnectError) as lost:
+        await call
+
+    assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, unconfirmed)
+    assert [frame.method for frame in tunnel.sent] == [method]
+
+
+async def test_an_unavailable_answer_after_the_frame_leaves_the_change_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    """Whoever reports UNAVAILABLE once the frame is out, the change may have been made."""
+    tunnel = _tunnel(tmp_path)
+    call = asyncio.create_task(tunnel.call("MergePullRequest", _MERGE))
+    await tunnel.frame_sent()
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id,
+            done=True,
+            error_code="unavailable",
+            error_message="GitHub is unreachable",
+        ),
+    )
+
+    with pytest.raises(ConnectError) as lost:
+        await call
+
+    assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _CHANGE_UNCONFIRMED)
+
+
+async def test_a_change_whose_answer_times_out_is_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_api, "_WRITE_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+
+    with pytest.raises(ConnectError) as lost:
+        await tunnel.call("CreateComment", _CREATE_COMMENT)
+
+    assert (lost.value.code, lost.value.message) == (Code.DEADLINE_EXCEEDED, _COMMENT_UNCONFIRMED)
+    assert len(tunnel.sent) == 1
+
+
+async def test_a_change_that_was_never_sent_is_safe_to_retry(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path, refuse_send=True)
+
+    with pytest.raises(ConnectError) as unsent:
+        await tunnel.call("CreateComment", _CREATE_COMMENT)
+
+    assert unsent.value.code == Code.UNAVAILABLE
+    assert tunnel.sent == []
+
+
+@pytest.mark.parametrize("method", ["ListPullRequestFiles", "GetMergeOptions"])
+async def test_a_read_cut_off_by_the_host_stays_safe_to_retry(tmp_path: Path, method: str) -> None:
+    tunnel = _tunnel(tmp_path)
+    request = WORKSPACE_METHODS[method].request_type(pr_url=_PR)
+    call = asyncio.create_task(tunnel.call(method, request))
+    await tunnel.frame_sent()
+    tunnel.registry.deregister("host_ws", conn=tunnel.host)
+
+    with pytest.raises(ConnectError) as cut_off:
+        await call
+
+    assert cut_off.value.code == Code.UNAVAILABLE
 
 
 def _listing_through_server(tmp_path: Path, host_lists: list[str], *, session_owner: bool) -> Any:
@@ -350,3 +677,103 @@ async def test_only_owner_gated_calls_look_up_the_owner_and_never_on_the_event_l
     await client.get_pull_request(pb.GetPullRequestRequest())
 
     assert owner_lookups == [False, False]
+
+
+# -- Mixed versions: each side offers only what the other can serve. ----------------------
+
+
+@pytest.fixture
+def reads_only_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A simulated server without the owner methods: no table entry and no gate for them.
+
+    It keeps this server's capability filtering, so it stands in for a server whose
+    method table lacks them, not for any one released version.
+    """
+    monkeypatch.setattr(
+        workspace_api,
+        "WORKSPACE_METHODS",
+        {
+            name: method
+            for name, method in WORKSPACE_METHODS.items()
+            if name not in _PULL_REQUEST_OWNER_METHODS
+        },
+    )
+    monkeypatch.setattr(
+        workspace_access,
+        "METHOD_GATES",
+        {
+            name: gate
+            for name, gate in METHOD_GATES.items()
+            if name not in _PULL_REQUEST_OWNER_METHODS
+        },
+    )
+
+
+@pytest.fixture
+def reads_only_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host as it was before the owner methods: it neither lists nor serves them."""
+    for name in _PULL_REQUEST_OWNER_METHODS:
+        monkeypatch.delitem(workspace_service._SERVED, name)
+        monkeypatch.delattr(
+            workspace_service.WorkspaceService, WORKSPACE_METHODS[name].python_name
+        )
+
+
+async def test_a_new_host_behind_a_reads_only_server_offers_no_owner_method(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reads_only_server: None,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """The host lists them, but this server can't forward them, so the owner isn't offered them."""
+    monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    listed = await client.get_capabilities(pb.GetCapabilitiesRequest())
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(_CREATE_COMMENT)
+
+    assert set(listed.capabilities) >= _PULL_REQUEST_READS
+    assert not set(listed.capabilities) & _PULL_REQUEST_OWNER_METHODS
+    # The route's 404 for a method it has no gate for.
+    assert refused.value.code == Code.UNIMPLEMENTED
+    assert [call.method for call in host_calls] == ["GetCapabilities"]
+    assert owner_calls == []
+
+
+async def test_an_old_host_behind_the_new_server_offers_no_owner_method(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reads_only_host: None,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """A call made anyway gets the host's UNIMPLEMENTED, which says nothing was changed."""
+    monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    listed = await client.get_capabilities(pb.GetCapabilitiesRequest())
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(_CREATE_COMMENT)
+
+    assert set(listed.capabilities) >= _PULL_REQUEST_READS
+    assert not set(listed.capabilities) & _PULL_REQUEST_OWNER_METHODS
+    assert refused.value.code == Code.UNIMPLEMENTED
+    assert [call.method for call in host_calls] == ["GetCapabilities", "CreateComment"]
+    assert owner_calls == []
+
+
+@pytest.mark.parametrize("session_owner", [True, False], ids=["owner", "non-owner"])
+async def test_a_new_hosts_owner_methods_are_offered_to_the_owner_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_owner: bool
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
+    host_lists = workspace_service.capabilities(pull_requests=True)
+
+    response = await _listing_through_server(tmp_path, host_lists, session_owner=session_owner)
+
+    listed = set(response.capabilities)
+    owner_only = _PULL_REQUEST_OWNER_METHODS | {"GetPullRequest"}
+    assert listed >= _PULL_REQUEST_READS - owner_only
+    assert (listed & owner_only) == (owner_only if session_owner else set())

@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 
 from google.protobuf import message_factory
+from google.protobuf.descriptor_pb2 import MethodOptions
 from google.protobuf.message import Message
 
 from omnigent.api.workspace.v1alpha1 import workspace_pb2
@@ -25,8 +26,10 @@ class WorkspaceMethod:
     :param request_type: Its request message class.
     :param response_type: Its response message class.
     :param streaming: Whether it streams responses.
-    :param pull_request: Whether it reads one of the session's pull requests: its request
-        names one in ``pr_url``, and only the server's route serves it.
+    :param pull_request: Whether it reads or changes one of the session's pull requests:
+        its request names one in ``pr_url``, and only the server's route serves it.
+    :param no_side_effects: Whether the schema marks it ``NO_SIDE_EFFECTS``. A pull
+        request method without the mark changes the pull request.
     """
 
     name: str
@@ -35,6 +38,7 @@ class WorkspaceMethod:
     response_type: type[Message]
     streaming: bool
     pull_request: bool = False
+    no_side_effects: bool = False
 
 
 def _snake_case(name: str) -> str:
@@ -49,6 +53,7 @@ WORKSPACE_METHODS: dict[str, WorkspaceMethod] = {
         response_type=message_factory.GetMessageClass(method.output_type),
         streaming=method.server_streaming,
         pull_request="pr_url" in method.input_type.fields_by_name,
+        no_side_effects=method.GetOptions().idempotency_level == MethodOptions.NO_SIDE_EFFECTS,
     )
     for method in workspace_pb2.DESCRIPTOR.services_by_name["WorkspaceService"].methods
 }

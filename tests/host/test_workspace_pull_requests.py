@@ -15,19 +15,22 @@ import httpx
 import pytest
 from connectrpc.code import Code
 
+from omnigent import config
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host.frames import HostWorkspaceCallFrame, PullRequestVouch
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
-from omnigent.runner import pr_resource
+from omnigent.runner import github_resource, pr_resource
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
-from tests.host.test_workspace_methods import _PULL_REQUEST_READS
+from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS, _PULL_REQUEST_READS
 
 _SESSION = "conv_prs"
 _PR = "https://github.com/example/app/pull/7"
+_HEAD = "a" * 40
+_BASE = "b" * 40
 _PULL_REQUEST_METHODS = sorted(name for name, m in WORKSPACE_METHODS.items() if m.pull_request)
 
 
@@ -260,6 +263,331 @@ async def test_the_direct_socket_serves_no_pull_request_whatever_the_call_claims
 
     assert opened == []
     assert provider_reads == []
+
+
+def _pr_target(**fields: Any) -> dict[str, Any]:
+    return {"session_id": _SESSION, "pr_url": _PR, **fields}
+
+
+# Each owner method: a valid request, the pr_resource function it runs, and its arguments.
+_OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "ListLabels": (pb.ListLabelsRequest(pr_url=_PR), "pr_labels", _pr_target()),
+    "ListReviewerCandidates": (
+        pb.ListReviewerCandidatesRequest(pr_url=_PR),
+        "pr_review_candidates",
+        _pr_target(),
+    ),
+    "GetMergeOptions": (pb.GetMergeOptionsRequest(pr_url=_PR), "pr_merge_options", _pr_target()),
+    "CreateComment": (
+        pb.CreateCommentRequest(pr_url=_PR, body="Looks good"),
+        "create_pr_comment",
+        _pr_target(body="Looks good"),
+    ),
+    "CreateReviewThread": (
+        pb.CreateReviewThreadRequest(
+            pr_url=_PR,
+            body="Why this?",
+            anchor=pb.ReviewThreadAnchor(
+                path="src/app.py",
+                side="RIGHT",
+                line=4,
+                start_line=2,
+                head_sha=_HEAD,
+                base_sha=_BASE,
+            ),
+        ),
+        "create_pr_review_thread",
+        _pr_target(
+            body="Why this?",
+            anchor={
+                "path": "src/app.py",
+                "side": "RIGHT",
+                "line": 4,
+                "start_line": 2,
+                "head_sha": _HEAD,
+                "base_sha": _BASE,
+            },
+        ),
+    ),
+    "ReplyToReviewThread": (
+        pb.ReplyToReviewThreadRequest(pr_url=_PR, thread_id="thread_1", body="Done"),
+        "reply_to_pr_review_thread",
+        _pr_target(thread_id="thread_1", body="Done"),
+    ),
+    "UpdatePullRequestDetails": (
+        pb.UpdatePullRequestDetailsRequest(pr_url=_PR, title="A clearer title"),
+        "update_pr_details",
+        _pr_target(title="A clearer title", body=None),
+    ),
+    "UpdateLabels": (
+        pb.UpdateLabelsRequest(pr_url=_PR, add=["bug"], remove=["wip"]),
+        "update_pr_labels",
+        _pr_target(add=["bug"], remove=["wip"]),
+    ),
+    "UpdateReviewers": (
+        pb.UpdateReviewersRequest(
+            pr_url=_PR,
+            add=[pb.Reviewer(login="octocat", kind="user")],
+            remove=[pb.Reviewer(login="core", kind="team")],
+        ),
+        "update_pr_reviewers",
+        _pr_target(
+            add=[{"login": "octocat", "kind": "user"}], remove=[{"login": "core", "kind": "team"}]
+        ),
+    ),
+    "SetPullRequestAccount": (
+        pb.SetPullRequestAccountRequest(pr_url=_PR, account="octocat"),
+        "set_pr_preference",
+        _pr_target(account="octocat", remote=None),
+    ),
+    "MergePullRequest": (
+        pb.MergePullRequestRequest(pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD),
+        "merge_pr",
+        _pr_target(merge_method="squash", expected_head=_HEAD),
+    ),
+    "MergePullRequestAsAccount": (
+        pb.MergePullRequestAsAccountRequest(
+            pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD, account="octocat"
+        ),
+        "merge_pr_as",
+        _pr_target(merge_method="squash", expected_head=_HEAD, account="octocat"),
+    ),
+    "DisableAutoMerge": (
+        pb.DisableAutoMergeRequest(pr_url=_PR),
+        "disable_pr_auto_merge",
+        _pr_target(),
+    ),
+}
+
+
+def record_owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Each pr_resource call an owner method made: the function, its root and arguments."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    for function in {name for _request, name, _kwargs in _OWNER_CALLS.values()}:
+
+        def record(root: str, *, _function: str = function, **kwargs: Any) -> dict[str, Any]:
+            calls.append((_function, root, kwargs))
+            return {"object": "test"}
+
+        monkeypatch.setattr(pr_resource, function, record)
+    return calls
+
+
+@pytest.fixture
+def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    return record_owner_calls(monkeypatch)
+
+
+@pytest.fixture
+def providers(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
+    """The providers a call asked for a facet, so a refused call can show it reached none."""
+    asked: list[str | None] = []
+
+    def facet(provider_id: str | None) -> None:
+        asked.append(provider_id)
+
+    monkeypatch.setattr(pr_resource, "_facet", facet)
+    return asked
+
+
+def test_every_owner_method_has_a_call_case() -> None:
+    assert set(_OWNER_CALLS) == _PULL_REQUEST_OWNER_METHODS
+
+
+@pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
+async def test_an_owner_method_runs_its_rest_function_with_the_requests_fields(
+    tmp_path: Path, method: str, owner_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    request, function, kwargs = _OWNER_CALLS[method]
+    messages, code, message = await _answer(_frame(tmp_path, method, request.SerializeToString()))
+
+    assert code is None, message
+    assert owner_calls == [(function, str(tmp_path.resolve()), kwargs)]
+    payload = WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload
+    assert dict(payload) == {"object": "test"}
+
+
+@pytest.mark.parametrize(
+    ("method", "request_message", "kwargs"),
+    [
+        (
+            "UpdatePullRequestDetails",
+            pb.UpdatePullRequestDetailsRequest(pr_url=_PR, body=""),
+            _pr_target(title=None, body=""),
+        ),
+        (
+            "UpdatePullRequestDetails",
+            pb.UpdatePullRequestDetailsRequest(pr_url=_PR, title=""),
+            _pr_target(title="", body=None),
+        ),
+        (
+            "UpdatePullRequestDetails",
+            pb.UpdatePullRequestDetailsRequest(pr_url=_PR),
+            _pr_target(title=None, body=None),
+        ),
+        (
+            "CreateReviewThread",
+            pb.CreateReviewThreadRequest(
+                pr_url=_PR,
+                body="Why this?",
+                anchor=pb.ReviewThreadAnchor(
+                    path="src/app.py", side="LEFT", line=4, head_sha=_HEAD, base_sha=_BASE
+                ),
+            ),
+            _pr_target(
+                body="Why this?",
+                anchor={
+                    "path": "src/app.py",
+                    "side": "LEFT",
+                    "line": 4,
+                    "start_line": None,
+                    "head_sha": _HEAD,
+                    "base_sha": _BASE,
+                },
+            ),
+        ),
+        (
+            "CreateReviewThread",
+            pb.CreateReviewThreadRequest(pr_url=_PR, body="Why this?"),
+            _pr_target(body="Why this?", anchor=None),
+        ),
+    ],
+    ids=["empty-body", "empty-title", "neither", "one-line", "no-anchor"],
+)
+async def test_an_unset_field_stays_unset_and_an_empty_one_is_passed_on(
+    tmp_path: Path,
+    method: str,
+    request_message: Any,
+    kwargs: dict[str, Any],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    """``pr_resource`` tells "keep it" (``None``) from "make it empty", and refuses the latter."""
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, request_message.SerializeToString())
+    )
+
+    assert code is None, message
+    assert [call[2] for call in owner_calls] == [kwargs]
+
+
+@pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
+async def test_an_owner_method_refuses_a_pr_the_session_never_recorded(
+    tmp_path: Path, method: str, providers: list[str | None]
+) -> None:
+    """Without the server's vouch, no change reaches a provider for an unrecorded PR."""
+    request, _function, _kwargs = _OWNER_CALLS[method]
+    _messages, code, message = await _answer(_frame(tmp_path, method, request.SerializeToString()))
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message == "This pull request is not associated with the session"
+    assert providers == []
+
+
+async def test_list_labels_refuses_a_search_it_cant_do(
+    tmp_path: Path, owner_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    request = pb.ListLabelsRequest(pr_url=_PR, text="bug")
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "ListLabels", request.SerializeToString())
+    )
+
+    assert code == Code.INVALID_ARGUMENT.value
+    assert message == "Label search isn't available on this host"
+    assert owner_calls == []
+
+
+@pytest.fixture
+def account_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """A config of its own for saved accounts; answers the gh commands a call ran with nothing."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(pr_resource, "pr_info", lambda _root, **_kwargs: {"object": "info"})
+    commands: list[list[str]] = []
+
+    def gh(argv: list[str], **_kwargs: Any) -> tuple[int, str, str]:
+        commands.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    return commands
+
+
+def _saved_accounts() -> object:
+    return config.load_global_config().get("github", {}).get("accounts", {})
+
+
+async def _set_account(root: Path, **fields: str) -> tuple[str | None, str | None]:
+    request = pb.SetPullRequestAccountRequest(**fields)
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+    _messages, code, message = await _answer(
+        _frame(root, "SetPullRequestAccount", request.SerializeToString(), vouch=vouch)
+    )
+    return code, message
+
+
+async def test_a_pull_requests_account_is_saved_for_its_repository_alone(
+    tmp_path: Path, account_store: list[list[str]]
+) -> None:
+    """The same key REST saves under; the workspace's own account isn't touched."""
+    code, _ = await _set_account(tmp_path, pr_url=_PR, account="octocat")
+
+    assert code is None
+    assert _saved_accounts() == {"github.com/example/app": "octocat"}
+    assert account_store == []
+
+
+async def test_an_empty_account_keeps_the_saved_one(
+    tmp_path: Path, account_store: list[list[str]]
+) -> None:
+    await _set_account(tmp_path, pr_url=_PR, account="octocat")
+    code, _ = await _set_account(tmp_path, pr_url=_PR, account="")
+
+    assert code is None
+    assert _saved_accounts() == {"github.com/example/app": "octocat"}
+
+
+@pytest.mark.parametrize(
+    ("fields", "refusal"),
+    [
+        # The server's vouch names a default PR; the method still won't change the workspace.
+        ({"account": "octocat"}, "Expected a pull request URL"),
+        (
+            {"pr_url": _PR, "account": "octocat", "remote": "upstream"},
+            "Changing the base repository isn't available here",
+        ),
+        (
+            {"pr_url": _PR, "remote": "upstream"},
+            "Changing the base repository isn't available here",
+        ),
+    ],
+    ids=["no-pr", "remote-with-account", "remote-alone"],
+)
+async def test_set_account_changes_nothing_beyond_one_pull_request(
+    tmp_path: Path, account_store: list[list[str]], fields: dict[str, str], refusal: str
+) -> None:
+    code, message = await _set_account(tmp_path, **fields)
+
+    assert code == Code.INVALID_ARGUMENT.value
+    assert message == refusal
+    assert _saved_accounts() == {}
+    assert account_store == []
+
+
+@pytest.mark.parametrize("account", ["", "  "], ids=["empty", "blank"])
+async def test_merge_as_an_account_needs_one(
+    tmp_path: Path, account: str, owner_calls: list[tuple[str, str, dict[str, Any]]]
+) -> None:
+    """Without one, the merge would run as the saved account instead of the confirmed one."""
+    _record(_SESSION)
+    request = pb.MergePullRequestAsAccountRequest(
+        pr_url=_PR, merge_method="squash", expected_head_oid=_HEAD, account=account
+    )
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "MergePullRequestAsAccount", request.SerializeToString())
+    )
+
+    assert code == Code.INVALID_ARGUMENT.value
+    assert message == "Expected an account to merge as"
+    assert owner_calls == []
 
 
 # Each read: a request, the reader method it runs, and the arguments that method gets.

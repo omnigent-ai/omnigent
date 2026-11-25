@@ -1280,13 +1280,35 @@ _PR_BROWSE_READS = [
 ]
 
 
-def _pull_request_read_passes(method: str, caller: str | None, session: str) -> int:
-    """The status a pull request read gets: 503 past the gate (no host here), else a refusal."""
+# Each valid for the server, so a call past the gate reaches the missing host.
+_PR_OWNER_METHODS = {
+    "ListLabels": {},
+    "ListReviewerCandidates": {},
+    "GetMergeOptions": {},
+    "CreateComment": {"body": "Looks good"},
+    "CreateReviewThread": {"body": "Why this?"},
+    "ReplyToReviewThread": {"threadId": "thread_1", "body": "Done"},
+    "UpdatePullRequestDetails": {"title": "A clearer title"},
+    "UpdateLabels": {"add": ["bug"]},
+    "UpdateReviewers": {"add": [{"login": "octocat", "kind": "user"}]},
+    "SetPullRequestAccount": {"account": "octocat"},
+    "MergePullRequest": {"mergeMethod": "squash", "expectedHeadOid": "a" * 40},
+    "MergePullRequestAsAccount": {
+        "mergeMethod": "squash",
+        "expectedHeadOid": "a" * 40,
+        "account": "octocat",
+    },
+    "DisableAutoMerge": {},
+}
+
+
+def _pull_request_call_passes(method: str, caller: str | None, session: str) -> int:
+    """The status a pull request call gets: 503 past the gate (no host here), else a refusal."""
     if caller is None:
         return 401
     if caller == "manager@example.com" and session == "conv_open":
         return 404  # No grant on this session: it isn't revealed.
-    if method == "GetPullRequest":
+    if method == "GetPullRequest" or method in _PR_OWNER_METHODS:
         # Its overview carries the host account's identities: the owner grant only, no admin.
         return 503 if caller == "real-owner@example.com" else 403
     if method in _PR_BROWSE_READS and caller == "viewer@example.com" and session == "conv_share":
@@ -1325,7 +1347,44 @@ async def test_workspace_api_pull_request_reads_keep_their_rest_gates(
         content=b'{"prUrl": "https://github.com/example/app/pull/7"}',
     )
 
-    assert resp.status_code == _pull_request_read_passes(method, caller, session), resp.text
+    assert resp.status_code == _pull_request_call_passes(method, caller, session), resp.text
+    if resp.status_code == 503:
+        assert b"unavailable" in resp.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "real-owner@example.com",
+        "owner@example.com",
+        "manager@example.com",
+        "viewer@example.com",
+        "admin@example.com",
+        None,
+    ],
+    ids=["owner", "editor", "manager", "viewer", "admin", "anonymous"],
+)
+@pytest.mark.parametrize("method", sorted(_PR_OWNER_METHODS))
+async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
+    client: httpx.AsyncClient, session: str, caller: str | None, method: str
+) -> None:
+    """They act as the host's account, so no editor or admin makes them, as on REST."""
+    headers = {"Content-Type": "application/json"}
+    if caller is not None:
+        headers["X-Forwarded-Email"] = caller
+    body = {"prUrl": "https://github.com/example/app/pull/7", **_PR_OWNER_METHODS[method]}
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers=headers,
+        content=json.dumps(body).encode(),
+    )
+
+    assert resp.status_code == _pull_request_call_passes(method, caller, session), resp.text
+    if resp.status_code == 403:
+        assert "Only the session's owner can use this" in resp.text
     if resp.status_code == 503:
         assert b"unavailable" in resp.content
 

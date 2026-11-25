@@ -1,9 +1,11 @@
-"""The workspace API's pull request reads, as the host serves them over the tunnel.
+"""The workspace API's pull request methods, as the host serves them over the tunnel.
 
-Each method runs the same reader code as the host's ``github_*`` tunnel ops, so it
-answers with the REST route's payload. The server decides which pull requests belong
-to a session: with each call it sends the session and its vouch for the pull request
-in the call frame, never in the request message. A call without them isn't served.
+Each method runs the same code as the host's ``github_*`` tunnel ops, so it answers
+with the REST route's payload. The server decides which pull requests belong to a
+session: with each call it sends the session and its vouch for the pull request in
+the call frame, never in the request message. A call without them isn't served.
+Which caller may change a pull request is the server's gate; the host serves the
+writes only for a call the server sent.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ class PullRequestCall:
     vouch: PullRequestVouch | None = None
 
 
-# One pull request read: the reader, the call and the request, to the REST payload.
+# One pull request method: the reader, the call and the request, to the REST payload.
 PullRequestOp = Callable[[WorkspaceReader, PullRequestCall, Any], dict[str, Any]]
 
 
@@ -61,6 +63,68 @@ def _diff(
         pr_url=_url(request),
         previous_path=_optional(request.previous_path),
         **pins,
+    )
+
+
+def _root(reader: WorkspaceReader) -> str:
+    return str(reader.root)
+
+
+def _anchor(request: pb.CreateReviewThreadRequest) -> dict[str, Any] | None:
+    if not request.HasField("anchor"):
+        return None
+    anchor = request.anchor
+    return {
+        "path": anchor.path,
+        "side": anchor.side,
+        "line": anchor.line,
+        "start_line": anchor.start_line if anchor.HasField("start_line") else None,
+        "head_sha": anchor.head_sha,
+        "base_sha": anchor.base_sha,
+    }
+
+
+def _reviewers(reviewers: Any) -> list[dict[str, str]]:
+    return [{"login": reviewer.login, "kind": reviewer.kind} for reviewer in reviewers]
+
+
+def _details(
+    reader: WorkspaceReader, call: PullRequestCall, request: pb.UpdatePullRequestDetailsRequest
+) -> dict[str, Any]:
+    return pr_resource.update_pr_details(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        title=request.title if request.HasField("title") else None,
+        body=request.body if request.HasField("body") else None,
+    )
+
+
+def _set_account(
+    reader: WorkspaceReader, call: PullRequestCall, request: pb.SetPullRequestAccountRequest
+) -> dict[str, Any]:
+    # refuse_unserved_request has refused a call without a PR, or with a remote. An empty
+    # account keeps the current one; set_pr_preference reads "" as clearing it.
+    return pr_resource.set_pr_preference(
+        _root(reader),
+        account=request.account or None,
+        remote=None,
+        session_id=call.session_id,
+        pr_url=request.pr_url,
+    )
+
+
+def _merge_as(
+    reader: WorkspaceReader, call: PullRequestCall, request: pb.MergePullRequestAsAccountRequest
+) -> dict[str, Any]:
+    # refuse_unserved_request has refused an empty account, so it's never passed as None.
+    return pr_resource.merge_pr_as(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        merge_method=_optional(request.merge_method),
+        expected_head=_optional(request.expected_head_oid),
+        account=request.account,
     )
 
 
@@ -93,13 +157,67 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     "ListReviewThreadComments": lambda reader, call, request: reader.github_review_thread_comments(
         call.session_id, request.pr_url, request.thread_id, request.page_token
     ),
+    # The session owner's: what the edit controls offer, and the changes themselves.
+    "ListLabels": lambda reader, call, request: reader.github_labels(
+        call.session_id, _url(request)
+    ),
+    "ListReviewerCandidates": lambda reader, call, request: reader.github_reviewers(
+        call.session_id, _url(request)
+    ),
+    "GetMergeOptions": lambda reader, call, request: reader.github_merge_options(
+        call.session_id, _url(request)
+    ),
+    "CreateComment": lambda reader, call, request: pr_resource.create_pr_comment(
+        _root(reader), session_id=call.session_id, pr_url=_url(request), body=request.body
+    ),
+    "CreateReviewThread": lambda reader, call, request: pr_resource.create_pr_review_thread(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        body=request.body,
+        anchor=_anchor(request),
+    ),
+    "ReplyToReviewThread": lambda reader, call, request: pr_resource.reply_to_pr_review_thread(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        thread_id=request.thread_id,
+        body=request.body,
+    ),
+    "UpdatePullRequestDetails": _details,
+    "UpdateLabels": lambda reader, call, request: pr_resource.update_pr_labels(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        add=list(request.add),
+        remove=list(request.remove),
+    ),
+    "UpdateReviewers": lambda reader, call, request: pr_resource.update_pr_reviewers(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        add=_reviewers(request.add),
+        remove=_reviewers(request.remove),
+    ),
+    "SetPullRequestAccount": _set_account,
+    "MergePullRequest": lambda reader, call, request: pr_resource.merge_pr(
+        _root(reader),
+        session_id=call.session_id,
+        pr_url=_url(request),
+        merge_method=_optional(request.merge_method),
+        expected_head=_optional(request.expected_head_oid),
+    ),
+    "MergePullRequestAsAccount": _merge_as,
+    "DisableAutoMerge": lambda reader, call, request: pr_resource.disable_pr_auto_merge(
+        _root(reader), session_id=call.session_id, pr_url=_url(request)
+    ),
 }
 
 
 def run_pull_request_op(
     name: str, reader: WorkspaceReader, call: PullRequestCall, request: Any
 ) -> dict[str, Any]:
-    """Run one pull request read under the server's vouch, as the tunnel op would.
+    """Run one pull request method under the server's vouch, as the tunnel op would.
 
     Blocking: call it on the worker thread, since the vouch is a context variable that
     a new thread doesn't inherit.
