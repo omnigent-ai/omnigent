@@ -201,6 +201,8 @@ class _RunnerStreamResponse(StreamingResponse):
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
 # A terminal resource id as the runner builds it, checked before it goes into a runner path.
 _TERMINAL_RESOURCE_ID_RE = re.compile(r"terminal_[A-Za-z0-9_.-]{1,200}")
+# The shell route's answer when the session's runner is offline or unreachable.
+_SHELL_RUNNER_OFFLINE = "This session's runner isn't available right now."
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
@@ -663,11 +665,11 @@ def register_resources_routes(
                 and isinstance(response_payload.get("detail"), str)
             ):
                 raise HTTPException(status_code=400, detail=response_payload["detail"])
+            msg = "runner resource endpoint failed"
             if isinstance(response_payload, dict):
-                error = response_payload.get("error", {})
-                msg = error.get("message") or "runner resource endpoint failed"
-            else:
-                msg = "runner resource endpoint failed"
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    msg = error["message"] or msg
             raise HTTPException(status_code=502, detail=msg)
         if not isinstance(response_payload, dict):
             raise HTTPException(
@@ -1817,7 +1819,8 @@ def register_resources_routes(
 
         Only a caller who may close the terminal may ask: edit access, as deleting it needs.
         Every miss answers one fixed 404, and runner failures become fixed messages: the
-        runner's text never reaches the caller, and its answer is rebuilt field by field.
+        runner's text never reaches the caller, and its answer is rebuilt field by field. A
+        runner tunnel on another replica keeps its routing error, so the client can resend.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
@@ -1834,23 +1837,26 @@ def register_resources_routes(
                 raise not_found from None
             raise
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell"
+        older_runner = "This session's runner can't inspect terminals."
         try:
             payload = await _proxy_get_to_runner(
                 session_id,
                 path,
                 conv,
                 timeout=1.0,
-                unsupported_endpoint_message="This session's runner can't inspect terminals.",
+                unsupported_endpoint_message=older_runner,
                 for_control=True,
             )
+        except WrongReplicaError:
+            # Its host id tells the client where to resend; it carries no runner text.
+            raise
         except OmnigentError as exc:
             if exc.code == ErrorCode.NOT_FOUND:
                 raise not_found from None
             if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
-                raise OmnigentError(
-                    "This session's runner can't inspect terminals.",
-                    code=ErrorCode.RUNNER_UNAVAILABLE,
-                ) from None
+                # An older runner and an offline one both ask before closing, but read apart.
+                message = older_runner if exc.message == older_runner else _SHELL_RUNNER_OFFLINE
+                raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE) from None
             raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
         except HTTPException:
             raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None

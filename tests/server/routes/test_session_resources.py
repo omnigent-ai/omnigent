@@ -12381,6 +12381,77 @@ async def test_terminal_shell_turns_runner_failures_into_fixed_messages(
     )
 
 
+class _UnroutableRunnerRouter(_FakeRunnerRouter):
+    """A control route that fails before any runner is called, with ``error``."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(_FakeRunnerClient(exc=AssertionError("runner called")))
+        self.error = error
+
+    def client_for_session_control(
+        self, conversation_id: str, *, conversation: Conversation | None = None
+    ) -> _RoutedRunner:
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_keeps_the_wrong_replica_signal_for_the_client_to_resend(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    from omnigent.errors import WrongReplicaError
+
+    host_id = uuid.uuid4().hex
+    wrong_replica = WrongReplicaError("host is on another replica", host_id=host_id)
+    reached: list[WrongReplicaError] = []
+
+    async def _handle_wrong_replica(request: Request, exc: Exception) -> JSONResponse:
+        del request
+        assert isinstance(exc, WrongReplicaError)
+        reached.append(exc)
+        return JSONResponse(status_code=exc.http_status, content={"host_id": exc.host_id})
+
+    app.add_exception_handler(WrongReplicaError, _handle_wrong_replica)
+    set_runner_router(_UnroutableRunnerRouter(wrong_replica))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    # The very error, with its host, reaches the handler that tells the client where to resend.
+    assert reached == [wrong_replica]
+    assert resp.status_code == wrong_replica.http_status != 502
+    assert resp.json() == {"host_id": wrong_replica.host_id}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_tells_an_offline_runner_from_an_older_one(
+    client: httpx.AsyncClient,
+) -> None:
+    offline = OmnigentError("runner 'laptop' is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+    set_runner_router(_UnroutableRunnerRouter(offline))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "error": {
+            "code": "runner_unavailable",
+            "message": "This session's runner isn't available right now.",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_a_malformed_runner_error_with_the_fixed_502(
+    client: httpx.AsyncClient,
+) -> None:
+    runner = _FakeRunnerClient(status_code=500, payload={"error": "ps failed at pid 900"})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "Couldn't inspect the terminal."}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("level", "status"),
