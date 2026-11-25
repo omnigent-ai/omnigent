@@ -463,3 +463,47 @@ async def test_a_plain_question_goes_to_the_member_who_requested_the_ticket(
     )
     assert answered.status_code == 201, answered.text
     assert await _requests(client, BOB) == []
+
+
+async def test_an_agents_ask_naming_members_reaches_their_inboxes(multi_user_client, db_uri):
+    client = multi_user_client
+    kasey, elise = "kasey.uhlenhuth@example.com", "elise.gonzales@example.com"
+    project = (
+        await client.post("/v1/projects", json={"name": "Named"}, headers=_as_user(ALICE))
+    ).json()
+    for member in (kasey, elise):
+        shared = await client.post(
+            f"/v1/projects/{project['id']}/shares",
+            json={"user_id": member},
+            headers=_as_user(ALICE),
+        )
+        assert shared.status_code == 200, shared.text
+    store = ProjectTicketStore(db_uri)
+    worker = TicketActor(ALICE, uuid4().hex, uuid4().hex)
+    ticket = store.create(project["id"], CreateTicket(title="Stories"), TicketActor(ALICE))
+    fyi = store.create(project["id"], CreateTicket(title="FYI only"), TicketActor(ALICE))
+    # Display names with a space, as an agent writes them.
+    store.update(
+        project["id"],
+        ticket["id"],
+        UpdateTicket(
+            labels=[{"key": "needs-human"}],
+            comment="@Kasey Uhlenhuth @Elise Gonzales which stories matter most?",
+            audience="human",
+        ),
+        worker,
+    )
+    # Without needs-human, an agent's @mention doesn't cc a person.
+    store.comment(
+        project["id"],
+        fyi["id"],
+        CommentOnTicket(text="@Elise Gonzales heads up", audience="human"),
+        worker,
+    )
+    got = await client.get(
+        f"/v1/projects/{project['id']}/tickets/{ticket['id']}", headers=_as_user(ALICE)
+    )
+    assert got.json()["waiting_on"]["responders"] == [elise, kasey]
+    assert await _requests(client, elise) == ["Stories"]
+    assert await _requests(client, kasey) == ["Stories"]
+    assert await _requests(client, ALICE) == []
