@@ -18,9 +18,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from connectrpc.code import Code
-from connectrpc.errors import ConnectError
+from connectrpc.errors import ConnectError, ErrorDetail
 from connectrpc.request import RequestContext
 from google.protobuf.message import Message
+from protobuf.wkt import Any as PackedDetail
 from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -30,6 +31,7 @@ from omnigent.api.workspace.v1alpha1.workspace_connect import (
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     GetCapabilitiesRequest,
     GetCapabilitiesResponse,
+    PullRequestFailure,
 )
 from omnigent.host.frames import (
     HostWorkspaceCallFrame,
@@ -39,7 +41,10 @@ from omnigent.host.frames import (
 )
 from omnigent.host.workspace_methods import WORKSPACE_METHODS, WorkspaceMethod
 from omnigent.host.workspace_payloads import payload_dict, payload_struct
-from omnigent.host.workspace_pull_request_input import refuse_unserved_request
+from omnigent.host.workspace_pull_request_input import (
+    PullRequestRefused,
+    refuse_unserved_request,
+)
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
 # Each reply must arrive within this; a whole ReadFile can take longer.
@@ -53,6 +58,27 @@ _OVERVIEW_METHODS = frozenset({"GetPullRequest", "SetPullRequestAccount"})
 _COMMENT_WRITES = frozenset({"CreateComment", "CreateReviewThread", "ReplyToReviewThread"})
 # The codes that, once a change's frame is sent, don't say whether the change was made.
 _UNCONFIRMED_AFTER_SEND = frozenset({Code.UNAVAILABLE, Code.INTERNAL})
+_REVIEW_WRITES = frozenset(
+    {
+        "StartPendingReview",
+        "AddPendingReviewComment",
+        "UpdatePendingReviewComment",
+        "DeletePendingReviewComment",
+        "SubmitPendingReview",
+        "DiscardPendingReview",
+        "SubmitReview",
+        "SubmitReviewVerdict",
+        "SetReviewThreadResolved",
+        "EditComment",
+        "DeleteComment",
+        "AddReaction",
+        "RemoveReaction",
+    }
+)
+# The refusal reasons a client may read; any other reason a host sends is dropped.
+PULL_REQUEST_FAILURE_REASONS = frozenset(
+    {"comment_changed", "pull_request_changed", "invalid_input"}
+)
 # Served only while the workspace_content_search flag is on.
 _CONTENT_SEARCH_METHOD = "SearchText"
 
@@ -152,7 +178,10 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         route = self._pull_requests
         if route is None:
             raise ConnectError(Code.UNIMPLEMENTED, "Pull requests aren't served on this route")
-        refuse_unserved_request(method.name, request)
+        try:
+            refuse_unserved_request(method.name, request)
+        except PullRequestRefused as exc:
+            raise ConnectError(exc.code, exc.message, details=failure_details(exc.reason)) from exc
         # The vouch comes from the PRs the server stores, never from the request message.
         vouch = await route.vouch(getattr(request, "pr_url", ""))
         sent_at = time.time()
@@ -257,7 +286,11 @@ class HostWorkspaceService(WorkspaceServiceMethods):
                     # and a host failure past the send may follow a change GitHub made.
                     if unconfirmed is not None and code in _UNCONFIRMED_AFTER_SEND:
                         raise ConnectError(Code.UNKNOWN, unconfirmed)
-                    raise ConnectError(code, reply.error_message or "")
+                    raise ConnectError(
+                        code,
+                        reply.error_message or "",
+                        details=failure_details(reply.error_reason),
+                    )
         finally:
             target.host.pending_workspace_calls.pop(request_id, None)
 
@@ -297,7 +330,22 @@ def _unconfirmed_change(method: str) -> str:
     """What a client is told when a change may have been made but its answer was lost."""
     if method in _COMMENT_WRITES:
         return "Could not confirm comment posting. Check GitHub before retrying."
+    if method in _REVIEW_WRITES:
+        return "Could not confirm the review change. Check GitHub before retrying."
     return "Could not confirm the pull request change. Check GitHub before retrying."
+
+
+def failure_details(reason: str | None) -> list[ErrorDetail]:
+    """The ``PullRequestFailure`` detail for an allowed refusal reason; none for any other."""
+    if reason not in PULL_REQUEST_FAILURE_REASONS:
+        return []
+    # connectrpc packs details with its own protobuf library, so pack this one by hand.
+    failure = PullRequestFailure(reason=reason)
+    packed = PackedDetail(
+        type_url=f"type.googleapis.com/{failure.DESCRIPTOR.full_name}",
+        value=failure.SerializeToString(),
+    )
+    return [ErrorDetail(packed)]
 
 
 def _code(value: str) -> Code:

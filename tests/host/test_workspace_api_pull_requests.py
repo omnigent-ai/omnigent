@@ -834,3 +834,192 @@ async def test_a_new_hosts_owner_methods_are_offered_to_the_owner_alone(
     owner_only = _PULL_REQUEST_OWNER_METHODS | {"GetPullRequest"}
     assert listed >= _PULL_REQUEST_READS - owner_only
     assert (listed & owner_only) == (owner_only if session_owner else set())
+
+
+def _failure_reasons(error: ConnectError) -> list[str]:
+    """The PullRequestFailure reasons an error carries, as a client reads them."""
+    return [
+        pb.PullRequestFailure.FromString(detail.message_bytes).reason
+        for detail in error.details
+        if detail.type_name == pb.PullRequestFailure.DESCRIPTOR.full_name
+    ]
+
+
+@pytest.fixture
+def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
+    """Each GitHub review call a review method made on the host."""
+    return host_tests.record_review_calls(monkeypatch)
+
+
+@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
+async def test_a_review_change_to_a_linked_pr_runs_on_the_servers_word(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    request, function, _kwargs = host_tests._REVIEW_CALLS[method]
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    response = await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [(call.session_id, call.vouch) for call in host_calls] == [
+        (_SESSION, PullRequestVouch(server_tracked=True)),
+    ]
+    assert [(call[0], call[2]) for call in review_calls] == [(function, _PR)]
+
+
+@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
+async def test_a_review_change_to_an_unlinked_pr_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    request, _function, _kwargs = host_tests._REVIEW_CALLS[method]
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_OTHER_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert host_calls == []
+    assert review_calls == []
+
+
+async def test_a_malformed_review_change_is_refused_before_the_vouch_as_invalid_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    with pytest.raises(ConnectError) as refused:
+        await client.add_reaction(
+            pb.AddReactionRequest(pr_url=_PR, kind="issue", comment_id=5, content="MEH")
+        )
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+    assert _failure_reasons(refused.value) == ["invalid_input"]
+    assert store.reads == 0
+    assert host_calls == []
+
+
+async def test_a_hosts_refusal_reason_reaches_the_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    from omnigent.runner import github_reviews
+    from omnigent.runner.pull_request_errors import CommentChangedError
+
+    def changed(_root: str, _reference: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise CommentChangedError()
+
+    monkeypatch.setattr(github_reviews, "edit_comment", changed)
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.edit_comment(host_tests._REVIEW_CALLS["EditComment"][0])
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert _failure_reasons(refused.value) == ["comment_changed"]
+
+
+@pytest.mark.parametrize(
+    ("reason", "attached"),
+    [
+        ("comment_changed", ["comment_changed"]),
+        ("pull_request_changed", ["pull_request_changed"]),
+        ("invalid_input", ["invalid_input"]),
+        ("read_only_code_host", []),
+        ("<b>Click here</b>", []),
+        ("", []),
+        (None, []),
+    ],
+    ids=["comment", "head", "input", "other-known", "arbitrary", "empty", "none"],
+)
+async def test_only_an_allowed_reason_from_the_host_is_attached(
+    tmp_path: Path, reason: str | None, attached: list[str]
+) -> None:
+    """A host can't push its own text into the structured field a client acts on."""
+    tunnel = _tunnel(tmp_path)
+    request = host_tests._REVIEW_CALLS["EditComment"][0]
+    call = asyncio.create_task(tunnel.call("EditComment", request))
+    await tunnel.frame_sent()
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id,
+            done=True,
+            error_code="failed_precondition",
+            error_message="Refused",
+            error_reason=reason,
+        ),
+    )
+
+    with pytest.raises(ConnectError) as refused:
+        await call
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert _failure_reasons(refused.value) == attached
+    assert len(refused.value.details) == len(attached)
+
+
+def test_a_pull_request_failure_carries_only_its_reason() -> None:
+    assert [field.name for field in pb.PullRequestFailure.DESCRIPTOR.fields] == ["reason"]
+    assert {
+        "comment_changed",
+        "pull_request_changed",
+        "invalid_input",
+    } == workspace_api.PULL_REQUEST_FAILURE_REASONS
+
+
+_REVIEW_UNCONFIRMED = "Could not confirm the review change. Check GitHub before retrying."
+_REVIEW_WRITES = sorted(set(host_tests._REVIEW_CALLS) - {"GetPendingReview"})
+
+
+@pytest.mark.parametrize("method", _REVIEW_WRITES)
+async def test_a_review_change_whose_host_drops_after_the_frame_is_unconfirmed(
+    tmp_path: Path, method: str
+) -> None:
+    tunnel = _tunnel(tmp_path)
+    request = host_tests._REVIEW_CALLS[method][0]
+    call = asyncio.create_task(tunnel.call(method, request))
+    await tunnel.frame_sent()
+    tunnel.registry.deregister("host_ws", conn=tunnel.host)
+
+    with pytest.raises(ConnectError) as lost:
+        await call
+
+    assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _REVIEW_UNCONFIRMED)
+
+
+async def test_a_review_change_whose_answer_times_out_is_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_api, "_WRITE_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+
+    with pytest.raises(ConnectError) as lost:
+        await tunnel.call(
+            "SubmitPendingReview", host_tests._REVIEW_CALLS["SubmitPendingReview"][0]
+        )
+
+    assert (lost.value.code, lost.value.message) == (Code.DEADLINE_EXCEEDED, _REVIEW_UNCONFIRMED)
+
+
+async def test_the_pending_review_read_cut_off_by_the_host_stays_safe_to_retry(
+    tmp_path: Path,
+) -> None:
+    tunnel = _tunnel(tmp_path)
+    call = asyncio.create_task(
+        tunnel.call("GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0])
+    )
+    await tunnel.frame_sent()
+    tunnel.registry.deregister("host_ws", conn=tunnel.host)
+
+    with pytest.raises(ConnectError) as cut_off:
+        await call
+
+    assert cut_off.value.code == Code.UNAVAILABLE
