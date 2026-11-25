@@ -4418,6 +4418,7 @@ def _build_skipped_native_items(
             "Kiro did not accept this web message into its structured session "
             "transcript. The native terminal may have shown the underlying error."
         )
+        command_message = message
     else:
         native_agent = _native_coding_agent_for_session(conv)
         display_name = native_agent.display_name if native_agent is not None else "The agent"
@@ -4428,9 +4429,15 @@ def _build_skipped_native_items(
             "accepting a later one, so it was not delivered. The native terminal may "
             "have shown the underlying error."
         )
+        command_message = (
+            f"{display_name} never recorded this command in its transcript before "
+            "accepting a later message, so it was not delivered. It may have opened an "
+            "interactive prompt in the native terminal, which the chat view cannot show."
+        )
     items: list[NewConversationItem] = []
     for skipped in skipped_entries:
         turn_id = generate_task_id()
+        is_command = (_message_text(skipped.content) or "").lstrip().startswith("/")
         items.append(
             NewConversationItem(
                 type="message",
@@ -4448,7 +4455,11 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="error",
                 response_id=turn_id,
-                data=ErrorData(source="execution", code=code, message=message),
+                data=ErrorData(
+                    source="execution",
+                    code=code,
+                    message=command_message if is_command else message,
+                ),
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
                     f"omnigent-skipped-{harness_key}-error:{session_id}:{skipped.pending_id}",
@@ -9451,6 +9462,8 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                agent_idle=_session_status_cache.get(session_id, conv.live_status)
+                in ("idle", "failed"),
             )
             if queues_message
             else None

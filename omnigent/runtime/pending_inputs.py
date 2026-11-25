@@ -233,6 +233,8 @@ class DrainedInput:
         hidden and settles quietly as an uncertain entry.
     :param uncertain: Whether a positional drain may already have mirrored
         this entry. Restore must preserve that evidence even after eviction.
+    :param queued_behind_turn: Whether the agent may have been busy when this
+        entry was sent; see :func:`_is_command_entry`. Unknown counts as busy.
     """
 
     pending_id: str
@@ -250,6 +252,7 @@ class DrainedInput:
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
     uncertain: bool = False
+    queued_behind_turn: bool = True
 
 
 @dataclass
@@ -307,6 +310,9 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param queued_behind_turn: ``True`` unless :func:`record` knew the agent was
+        idle and no earlier entry would start a turn ahead of this one. Claude
+        holds a ``/`` command sent behind a turn until that turn ends.
     """
 
     pending_id: str
@@ -327,6 +333,7 @@ class _Entry:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    queued_behind_turn: bool = True
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -376,6 +383,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    agent_idle: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -399,6 +407,9 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param agent_idle: The session's agent was known to be idle when the
+        message was sent, so a ``/`` command is not held behind a turn unless
+        an earlier queued entry starts one first; see :func:`_is_command_entry`.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -416,14 +427,22 @@ def record(
                 if existing.stable_id == stable_id:
                     return existing.pending_id
         pending_id = make_pending_id(conversation_id, stable_id)
+        entries = _pending.setdefault(conversation_id, {})
+        # An earlier prompt still queued starts a turn ahead of this message even
+        # before the idle status catches up.
+        queued_behind_turn = not agent_idle or any(
+            not earlier.interrupted
+            and (earlier.queued_behind_turn or not _is_slash_command(earlier.content))
+            for earlier in entries.values()
+        )
         entry = _Entry(
             pending_id=pending_id,
             content=copy.deepcopy(content),
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            queued_behind_turn=queued_behind_turn,
         )
-        entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
         _evict_beyond_cap(entries)
     return pending_id
@@ -793,6 +812,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         reason_code=drained.reason_code,
         native_turn_id=drained.native_turn_id,
         lifecycle_response_id=drained.lifecycle_response_id,
+        queued_behind_turn=drained.queued_behind_turn,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -853,7 +873,8 @@ def resolve_matching_text(
         all older inputs queued; shell mirrors cannot establish prompt loss.
     :param claude_commands: The session runs Claude Code, so its own commands
         (``!`` shell commands and bare exit words) are not known lost either
-        when a later match jumps over them; see :func:`_is_command_entry`.
+        when a later match jumps over them, and a ``/`` command is only when
+        it was queued behind a turn; see :func:`_is_command_entry`.
     :param hold: Keep the matched and skipped entries in place, marked held,
         instead of removing them; the caller settles each with
         :func:`release` or :func:`restore`. Entries already held are skipped.
@@ -1019,6 +1040,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         reason_code=entry.reason_code,
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
+        queued_behind_turn=entry.queued_behind_turn,
     )
 
 
@@ -1092,17 +1114,25 @@ def _is_command_entry(entry: _Entry, *, claude_commands: bool) -> bool:
     but holds a ``/`` command or a ``!`` shell command until the turn ends, so
     the older command is recorded after the later prompt. A bare exit word
     quits Claude without recording a prompt at all. Either way, a later match
-    jumping over the entry does not show it was lost.
+    jumping over the entry does not show it was lost. A ``/`` command an idle
+    Claude received runs at once, so a later prompt recorded first shows it was
+    not: it opened a terminal-only prompt or was swallowed.
 
     :param entry: Queued web entry, e.g. one holding ``"!git status"``.
     :param claude_commands: Also count Claude Code's ``!`` shell commands and
-        exit words; ``/``-led text counts for every harness.
+        exit words, and count a ``/`` command only when it was queued behind a
+        turn; ``/``-led text always counts for other harnesses.
     :returns: Whether the entry is such a command.
     """
     text = _collapse_whitespace(_content_text(entry.content))
     if text.startswith("/"):
-        return True
+        return entry.queued_behind_turn or not claude_commands
     return claude_commands and (text.startswith("!") or text.lower() in _CLAUDE_EXIT_WORDS)
+
+
+def _is_slash_command(content: list[dict[str, Any]]) -> bool:
+    """Whether queued content is ``/``-led text."""
+    return _collapse_whitespace(_content_text(content)).startswith("/")
 
 
 def _attachment_count(content: list[dict[str, Any]]) -> int:
