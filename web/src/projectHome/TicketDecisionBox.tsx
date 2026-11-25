@@ -31,38 +31,81 @@ function askedAgo(raisedAtSeconds: number, nowMs: number): string {
   return ago === "now" ? "just now" : `${ago} ago`;
 }
 
-function optionLabel(text: string): string {
-  // "**Factory only** (recommended). The Lead files…" reads as "Factory only (recommended)".
-  const head = (plain(text).split(/(?<=[a-z0-9)])\. |: | — /i)[0] ?? "").replace(/\.$/, "");
-  return head.length > OPTION_MAX_LENGTH ? `${head.slice(0, OPTION_MAX_LENGTH - 1)}…` : head;
+/** A one-click answer: its short label, and the rest of its text for the button's detail. */
+export interface DecisionOption {
+  label: string;
+  detail: string;
 }
 
+function splitOption(marker: string, text: string): DecisionOption {
+  // "**Factory only** (recommended). The Lead files…" reads as "Factory only (recommended)".
+  const full = plain(text);
+  const [head = "", ...rest] = full.split(/(?<=[a-z0-9)])\. |: | — /i);
+  const short = head.replace(/\.$/, "");
+  const label = `${marker} ${short.length > OPTION_MAX_LENGTH ? `${short.slice(0, OPTION_MAX_LENGTH - 1)}…` : short}`;
+  const detail = full
+    .slice(head.length)
+    .replace(/^(?:\.|:| —)\s*/, "")
+    .trim();
+  return { label, detail: rest.length ? detail : "" };
+}
+
+// "A. …", "B) …", "**C.** …": a lettered choice.
+const LETTERED = /^\s*(?:[-*]\s+)?(?:\*\*)?([A-H])(?:\*\*)?[.):](?:\*\*)?\s+(.+)$/gm;
+// "Option 1: …", "**Option B** — …": a named choice.
+const NAMED =
+  /^\s*(?:[-*]\s+)?(?:\*\*)?Option\s+([A-H]|\d{1,2})(?:\*\*)?\s*[.):—-]?(?:\*\*)?\s+(.+)$/gim;
+const NUMBERED = /^\s*(\d+)[.)]\s+(.+)$/gm;
+// Numbered items are choices only when the ask says to answer with a number.
+const REPLY_WITH_NUMBER = /\b(?:reply|answer|respond|pick|choose)\b[^\n]*\b\d\b/i;
+
 /**
- * The choices a question lists explicitly: two or more numbered items ("1. …", "2) …"),
- * or a yes-or-no question. Anything else has no buttons; it is never guessed.
+ * The choices a question lists explicitly, as buttons: two or more lettered ("A. …") or
+ * named ("Option 1: …") options, numbered items when the ask says to reply with a number,
+ * or a yes-or-no question. A numbered plan or list of steps has no buttons; nothing is
+ * ever guessed.
  */
-export function decisionOptions(question: string): string[] {
-  const numbered = [...question.matchAll(/^\s*(\d+)[.)]\s+(.+)$/gm)].map(
-    ([, number, text]) => `${number}. ${optionLabel(text ?? "")}`,
-  );
-  if (numbered.length >= 2) return [...new Set(numbered)];
-  if (/\byes\s*(?:or|\/)\s*no\b/i.test(question)) return ["Yes", "No"];
+export function decisionOptions(question: string): DecisionOption[] {
+  const asks = question.includes("?") || REPLY_WITH_NUMBER.test(question);
+  const pick = (pattern: RegExp, marker: (key: string) => string) => {
+    const seen = new Set<string>();
+    return [...question.matchAll(pattern)]
+      .map(([, key = "", text = ""]) => splitOption(marker(key), text))
+      .filter((option) => !seen.has(option.label) && seen.add(option.label));
+  };
+  if (asks) {
+    for (const options of [
+      pick(NAMED, (key) => `Option ${key.toUpperCase()}:`),
+      pick(LETTERED, (key) => `${key.toUpperCase()}.`),
+      REPLY_WITH_NUMBER.test(question) ? pick(NUMBERED, (key) => `${key}.`) : [],
+    ])
+      if (options.length >= 2) return options;
+  }
+  if (/\byes\s*(?:or|\/)\s*no\b/i.test(question))
+    return [
+      { label: "Yes", detail: "" },
+      { label: "No", detail: "" },
+    ];
   return [];
 }
 
 /**
  * The question to show: its text without embedded media. When the choices became
- * buttons, their list and a "Reply with 1 or 2" line are left out; "See the full ask"
- * still shows every detail.
+ * buttons, their lines and a "Reply with 1 or 2" line are left out; each button keeps
+ * its option's full text, and "See the full ask" still shows every detail.
  */
 export function questionStem(question: string, hasOptions: boolean): string {
   const text = splitTicketImages(question)
     .map((segment) => (segment.kind === "markdown" ? segment.text : ""))
     .join("\n");
   if (!hasOptions) return text.trim();
+  const optionLine = (line: string) =>
+    new RegExp(LETTERED.source, "m").test(line) ||
+    new RegExp(NAMED.source, "im").test(line) ||
+    new RegExp(NUMBERED.source, "m").test(line);
   return text
     .split("\n")
-    .filter((line) => !/^\s*\d+[.)]\s+/.test(line) && !/^\s*reply with\b/i.test(line))
+    .filter((line) => !optionLine(line) && !/^\s*reply with\b/i.test(line))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -219,15 +262,21 @@ export function TicketDecisionBox({
         <div className="flex flex-wrap gap-2" data-testid="ticket-decision-options">
           {options.map((option) => (
             <Button
-              key={option}
+              key={option.label}
               type="button"
               size="sm"
               variant="outline"
-              className="mobile-touch-target h-auto min-h-8 max-w-full shrink whitespace-normal text-left"
+              title={option.detail ? `${option.label}: ${option.detail}` : undefined}
+              className="mobile-touch-target h-auto min-h-8 max-w-full shrink flex-col items-start gap-0.5 py-1.5 whitespace-normal text-left"
               disabled={answering}
-              onClick={() => onAnswer(`Decision: ${option}`)}
+              onClick={() => onAnswer(`Decision: ${option.label}`)}
             >
-              {option}
+              <span>{option.label}</span>
+              {option.detail && (
+                <span className="line-clamp-2 text-xs font-normal text-muted-foreground">
+                  {option.detail}
+                </span>
+              )}
             </Button>
           ))}
         </div>

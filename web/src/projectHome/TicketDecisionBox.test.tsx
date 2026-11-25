@@ -82,17 +82,48 @@ afterEach(() => {
 });
 
 describe("decisionOptions", () => {
-  it("reads explicit numbered choices and yes-or-no questions", () => {
+  const labels = (question: string) => decisionOptions(question).map((option) => option.label);
+
+  it("reads numbered choices the ask says to reply with, and yes-or-no questions", () => {
     expect(decisionOptions(QUESTION)).toEqual([
-      "1. Factory only (recommended)",
-      '2. Send humans a one-line note ("No new data this week")',
+      {
+        label: "1. Factory only (recommended)",
+        detail: "The Lead files a ticket if two Mondays have no data.",
+      },
+      { label: '2. Send humans a one-line note ("No new data this week")', detail: "" },
     ]);
-    expect(decisionOptions("Weekly digest, yes or no?")).toEqual(["Yes", "No"]);
+    expect(labels("Weekly digest, yes or no?")).toEqual(["Yes", "No"]);
   });
 
-  it("never guesses options from free text or a single item", () => {
+  it("reads lettered and named options, keeping the text after a colon", () => {
+    const lettered = [
+      "Which scope should Lead messages cover?",
+      "A. Questions only: Lead-to-Lead messages that ask for a decision.",
+      "B. Everything: status updates too.",
+    ].join("\n");
+    expect(decisionOptions(lettered)).toEqual([
+      {
+        label: "A. Questions only",
+        detail: "Lead-to-Lead messages that ask for a decision.",
+      },
+      { label: "B. Everything", detail: "status updates too." },
+    ]);
+    const named = "Which one?\n- **Option 1:** Ship now\n- **Option 2:** Wait a week";
+    expect(labels(named)).toEqual(["Option 1: Ship now", "Option 2: Wait a week"]);
+  });
+
+  it("leaves a numbered plan as text, and never guesses from free text", () => {
+    const plan = [
+      "Here's the plan; does it look right?",
+      "1. Add the column.",
+      "2. Backfill it.",
+      "3. Switch reads over.",
+    ].join("\n");
+    expect(decisionOptions(plan)).toEqual([]);
     expect(decisionOptions("Which region should we use for the pilot?")).toEqual([]);
     expect(decisionOptions("1. Only one step listed here.")).toEqual([]);
+    // Lettered lines that aren't a question stay text too.
+    expect(decisionOptions("A. Done the export.\nB. Done the import.")).toEqual([]);
   });
 
   it("shows only the question's stem once its choices are buttons", () => {
@@ -127,7 +158,14 @@ describe("TicketDecisionBox", () => {
       options.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "1. Factory only (recommended)" }));
+    const first = screen.getByRole("button", { name: /^1\. Factory only \(recommended\)/ });
+    // The button keeps the option's full text, under its short label and as a tooltip.
+    expect(first).toHaveTextContent("The Lead files a ticket if two Mondays have no data.");
+    expect(first).toHaveAttribute(
+      "title",
+      "1. Factory only (recommended): The Lead files a ticket if two Mondays have no data.",
+    );
+    fireEvent.click(first);
     expect(handlers.onAnswer).toHaveBeenCalledWith("Decision: 1. Factory only (recommended)");
 
     fireEvent.click(screen.getByTestId("ticket-decision-comment"));
