@@ -163,11 +163,23 @@ describe("withStepTimeLimit", () => {
     "Fix it.",
     "Fix it.\n\n```\nsome code",
     "Fix it.\n```\nsome code",
+    "Fix it.\r\n\r\n```\nmake test\n```",
+    "Fix it.\r\n\r\n**Details:** run it.\nThen check it.",
+    "Fix it.\n\r\n**Details:** run it.",
     GOAL,
   ])("gives %j back once a limit set on it is cleared", (goal) => {
     const limited = withStepTimeLimit(goal, "1 hour");
     expect(stepTimeLimit(limited)).toBe("1 hour");
     expect(withStepTimeLimit(limited, null)).toBe(goal);
+  });
+
+  it("breaks a new line as the line before it, and leaves the other breaks alone", () => {
+    expect(withStepTimeLimit("Fix it.\r\n\r\n```\nmake test\n```", "1 hour")).toBe(
+      "Fix it.\r\n\r\n```\nmake test\n```\n\n**Time limit:** 1 hour",
+    );
+    expect(withStepTimeLimit("Fix it.\r\n\r\n**Details:** run it.\nThen check it.", "1 hour")).toBe(
+      "Fix it.\r\n\r\n**Time limit:** 1 hour\r\n\r\n**Details:** run it.\nThen check it.",
+    );
   });
 
   it("puts a new limit in the list item or quote that holds Details", () => {

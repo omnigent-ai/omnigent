@@ -176,15 +176,14 @@ async function savePlan(workflowId: string, proposal: PlanSave): Promise<Workflo
 
 /**
  * *saved*, a write that left the description of *read* alone, with the time the description had
- * when read. A server that keeps no such time, or a plan with no room left for it, reports this
- * write's time instead, which would hide a description proposal that arrived meanwhile.
+ * when read. A server that keeps no such time goes by this write's instead, which would hide a
+ * description proposal that arrived meanwhile; one that keeps it reports it, so it stands.
  */
 function withDescriptionTimeKept(saved: WorkflowDetail, read: WorkflowDetail): WorkflowDetail {
-  const before = read.description_updated_at ?? read.updated_at;
-  const after = saved.description_updated_at ?? saved.updated_at;
-  if (saved.description !== read.description || before === undefined || after === undefined)
-    return saved;
-  return after > before ? { ...saved, description_updated_at: before } : saved;
+  const before = read.updated_at;
+  const keepsTime = saved.description_updated_at != null;
+  if (keepsTime || saved.description !== read.description || before === undefined) return saved;
+  return (saved.updated_at ?? 0) > before ? { ...saved, description_updated_at: before } : saved;
 }
 
 /** Tries for a save whose steps change between its read and its write. */

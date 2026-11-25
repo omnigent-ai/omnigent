@@ -288,12 +288,18 @@ describe("useSaveStepTimeLimit", () => {
   });
 
   it("writes the steps alone, so a description decision made elsewhere stays", async () => {
-    vi.mocked(authenticatedFetch).mockImplementation(async () =>
-      Response.json({ ...saved, description_source: "kept-elsewhere" }),
+    // The same text written again elsewhere after the read; the server's time for it stands.
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) =>
+      Response.json(
+        init?.method === "PATCH"
+          ? { ...saved, description_updated_at: 200, updated_at: 210 }
+          : { ...saved, description_updated_at: 100, updated_at: 100 },
+      ),
     );
     const save = renderSave();
+    let result: { description_updated_at?: number | null } | undefined;
     await act(async () => {
-      await save();
+      result = await save();
     });
     const [body] = vi
       .mocked(authenticatedFetch)
@@ -302,6 +308,7 @@ describe("useSaveStepTimeLimit", () => {
       steps: [{ ...steps[0], goal: "Read it.\n\n**Time limit:** 1 hour" }],
       expected_steps: steps,
     });
+    expect(result?.description_updated_at).toBe(200);
   });
 });
 

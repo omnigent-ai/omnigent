@@ -43,6 +43,15 @@ function descriptionLines(goal: string | null): string[] {
   return goal ? goal.split(/\r\n|\r|\n/) : [];
 }
 
+/** {@link descriptionLines}, with the break after each line; the last has none. */
+function descriptionLinesAndBreaks(goal: string | null): { lines: string[]; breaks: string[] } {
+  const parts = goal ? goal.split(/(\r\n|\r|\n)/) : [];
+  return {
+    lines: parts.filter((_, index) => index % 2 === 0),
+    breaks: [...parts.filter((_, index) => index % 2 === 1), ...(parts.length ? [""] : [])],
+  };
+}
+
 interface CodeBlock {
   /** Its first and last lines, from 0. */
   start: number;
@@ -161,7 +170,30 @@ export function shortTimeLimit(limit: string): string | null {
  * @returns The new description; null when nothing else is left.
  */
 export function withStepTimeLimit(goal: string | null, limit: string | null): string | null {
-  const lines = descriptionLines(goal);
+  const { lines, breaks } = descriptionLinesAndBreaks(goal);
+  // Each line keeps the break after it, so only the edited lines change. A new line takes the
+  // break of the line before it, or else the description's first.
+  const firstBreak = breaks.find((lineBreak) => lineBreak !== "") ?? "\n";
+  const breakAt = (at: number) => {
+    if (at === lines.length) return breaks[at - 2] || firstBreak;
+    return (at > 0 ? breaks[at - 1] : breaks[at]) || firstBreak;
+  };
+  const removeLine = (at: number) => {
+    lines.splice(at, 1);
+    breaks.splice(at, 1);
+    if (at > 0 && at === lines.length) breaks[at - 1] = "";
+  };
+  const insertLines = (at: number, added: readonly string[]) => {
+    const lineBreak = breakAt(at);
+    const atEnd = at === lines.length;
+    if (atEnd && at > 0) breaks[at - 1] = lineBreak;
+    lines.splice(at, 0, ...added);
+    breaks.splice(
+      at,
+      0,
+      ...added.map((_, index) => (atEnd && index === added.length - 1 ? "" : lineBreak)),
+    );
+  };
   const limitLine = limit ? `**Time limit:** ${limit}` : null;
   const marked = !!goal && LIMIT_MARK.test(goal);
   const code = limitLine || marked ? codeLines(lines) : NO_CODE;
@@ -174,9 +206,9 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       lines[at] = `${LIMIT_LINE.exec(lines[at]!)![1]}${limitLine}`;
       continue;
     }
-    lines.splice(at, 1);
+    removeLine(at);
     // Keep one blank line between the paragraphs on either side; in a quote, one with its marker.
-    if (isBlankLine(lines[at - 1]) && isBlankLine(lines[at])) lines.splice(at, 1);
+    if (isBlankLine(lines[at - 1]) && isBlankLine(lines[at])) removeLine(at);
   }
   if (found.length === 0 && limitLine) {
     const details = matchingLines(lines, DETAILS_LINE, code)[0] ?? -1;
@@ -184,18 +216,16 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
     const listMarker = detailsMatch?.[2] ? `${detailsMatch[1]}${detailsMatch[2]}` : "";
     if (listMarker) {
       // Details is a list item, so the limit joins the list just above it.
-      lines.splice(details, 0, `${listMarker}${limitLine}`);
+      insertLines(details, [`${listMarker}${limitLine}`]);
     } else if (details >= 0) {
       // Indented or quoted as Details is, so it stays in Details' list item or quote; a paragraph
       // of its own only where one starts there already, so clearing it gives the text back.
       const prefix = detailsMatch![1]!;
       const startsParagraph = details === 0 || isBlankLine(lines[details - 1]);
-      lines.splice(
-        details,
-        0,
+      insertLines(details, [
         `${prefix}${limitLine}`,
         ...(startsParagraph ? [prefix.trimEnd()] : []),
-      );
+      ]);
     } else {
       // Last, unless a code block left open at the end would take the line in, as Markdown
       // reads it: then just before that block.
@@ -206,19 +236,21 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
       );
       if (open) {
         const startsParagraph = open.start === 0 || isBlankLine(lines[open.start - 1]);
-        lines.splice(open.start, 0, limitLine, ...(startsParagraph ? [""] : []));
+        insertLines(open.start, [limitLine, ...(startsParagraph ? [""] : [])]);
       } else {
-        lines.push(...tail);
+        insertLines(lines.length, tail);
       }
     }
   }
-  // Only the edited lines change: the description's own line break stays, and only blank lines at
-  // the ends go.
+  // Only blank lines at the ends go.
   let first = 0;
   while (first < lines.length && isBlankLine(lines[first])) first += 1;
   let last = lines.length;
   while (last > first && isBlankLine(lines[last - 1])) last -= 1;
-  const text = lines.slice(first, last).join(goal?.match(/\r\n|\r|\n/)?.[0] ?? "\n");
+  const text = lines
+    .slice(first, last)
+    .map((line, index) => (first + index < last - 1 ? line + breaks[first + index]! : line))
+    .join("");
   return text.trim() ? text : null;
 }
 
