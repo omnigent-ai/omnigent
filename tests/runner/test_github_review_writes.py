@@ -1,0 +1,1133 @@
+"""GitHub review and comment writes, against a fake ``gh`` and GraphQL endpoint.
+
+Each write refuses a moved head before any mutation is sent, sends the token only in the
+environment, reports a refusal with its reason, and reports a write GitHub never
+confirmed as an unknown outcome.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any
+
+import pytest
+
+from omnigent.runner import github_failures, pr_actions, pr_resource
+from omnigent.runner import github_resource as github
+from omnigent.runner.pull_request_errors import (
+    PULL_REQUEST_CHANGED_MESSAGE,
+    CommentChangedError,
+    InvalidPullRequestInput,
+    PullRequestChangedError,
+    PullRequestError,
+    UnknownOutcomeError,
+)
+from omnigent.runner.session_prs import PullRequestRef
+
+TOKEN = "ghp_example_token_value"
+HEAD = "66331978a046d81e2f1a6772e6354f9ae43b734b"
+MOVED = "1" * 40
+BASE = "2" * 40
+PR_URL = "https://github.com/example-org/example-repo/pull/7"
+OTHER_PR_URL = "https://github.com/example-org/example-repo/pull/8"
+THIRD_PR_URL = "https://github.com/example-org/example-repo/pull/9"
+COMMENT_PATH = "repos/example-org/example-repo/issues/comments/5"
+REVIEW_COMMENT_PATH = "repos/example-org/example-repo/pulls/comments/5"
+COMMENT_PATHS = (COMMENT_PATH, REVIEW_COMMENT_PATH)
+
+
+def _comment_link(kind: str, number: int, repository: str = "example-org/example-repo") -> str:
+    """The API link a comment carries, naming the pull request it is on."""
+    collection = "issues" if kind == "issue" else "pulls"
+    return f"https://api.github.com/repos/{repository}/{collection}/{number}"
+
+
+def _new_draft(comment_id: str, body: str) -> dict[str, Any]:
+    """A draft GitHub just made in the viewer's pending review R_1, as its mutation answers."""
+    return {
+        "id": comment_id,
+        "author": {"login": "viewer"},
+        "body": body,
+        "createdAt": "2026-11-24T10:00:00Z",
+        "url": f"{PR_URL}#discussion_r1",
+        "state": "PENDING",
+        "diffHunk": "@@ -1 +1 @@",
+        "viewerCanUpdate": True,
+        "viewerCanDelete": True,
+        "viewerCanReact": False,
+        "viewerDidAuthor": True,
+        "pullRequestReview": {"id": "R_1"},
+    }
+
+
+class FakeGitHub:
+    """Answers ``gh`` calls and GraphQL requests for the pull requests it holds."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.heads = {7: HEAD, 8: HEAD, 9: HEAD}
+        self.pending: list[dict[str, Any]] = []
+        self.gh_calls: list[tuple[list[str], str | None]] = []
+        self.json_calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.comment: dict[str, Any] = {
+            "body": "Original text",
+            "node_id": "IC_1",
+            "issue_url": _comment_link("issue", 7),
+            "pull_request_url": _comment_link("review", 7),
+        }
+        # Thread id to the pull request number and repository it belongs to.
+        self.threads: dict[str, tuple[int, str]] = {"T_1": (7, "example-org/example-repo")}
+        # Whether the host's account wrote the comment, as GitHub's viewerDidAuthor says.
+        self.viewer_wrote_comment = True
+        self.refused: dict[str, tuple[str, str | None]] = {}
+        # A failed send: (exit code, stdout, stderr) for the next write to that endpoint kind.
+        self.graphql_failure: tuple[int, str, str] | None = None
+        self.rest_failure: tuple[int, str, str] | None = None
+        monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: TOKEN)
+        monkeypatch.setattr(github, "_host_args", lambda _root, ref: ["--hostname", ref.host])
+        monkeypatch.setattr(github, "_gh", self._gh)
+        monkeypatch.setattr(github, "_pr_json_write", self._json_write)
+        monkeypatch.setattr(
+            pr_resource, "_selected_pr", lambda _session, url: PullRequestRef.from_url(url)
+        )
+
+    def mutations(self, name: str) -> list[dict[str, Any]]:
+        return [
+            fields["variables"]
+            for _method, endpoint, fields in self.json_calls
+            if endpoint == "graphql" and name in fields["query"]
+        ]
+
+    def refuse_mutation(self, name: str, message: str, *, head_becomes: str | None = None) -> None:
+        """Refuse the named GraphQL mutation with ``message``, moving the head if asked."""
+        self.refused[name] = (message, head_becomes)
+
+    def _move_head(self, head_becomes: str | None) -> None:
+        if head_becomes is not None:
+            self.heads[7] = head_becomes
+
+    def _node(self, number: int) -> dict[str, Any]:
+        return {
+            "id": f"PR_{number}",
+            "headRefOid": self.heads[number],
+            "baseRefOid": BASE,
+            "baseRefName": "main",
+            "state": "OPEN",
+            "isDraft": False,
+            "reviews": {"nodes": self.pending},
+        }
+
+    def _draft_page(self, after: str | None) -> dict[str, Any]:
+        """One page of the pending review's drafts, 100 at a time as GitHub pages them."""
+        drafts = self.pending[0]["comments"]["nodes"] if self.pending else []
+        start = int(after) if after else 0
+        end = start + 100
+        return {
+            "nodes": drafts[start:end],
+            "pageInfo": {"hasNextPage": end < len(drafts), "endCursor": str(end)},
+        }
+
+    def _thread(self, thread_id: str) -> dict[str, Any] | None:
+        if thread_id not in self.threads:
+            return None
+        number, repository = self.threads[thread_id]
+        return {"pullRequest": {"number": number, "repository": {"nameWithOwner": repository}}}
+
+    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        if "on PullRequestReview {" in query and "node(id" in query:
+            return {"data": {"node": {"comments": self._draft_page(variables.get("after"))}}}
+        if "viewerDidAuthor" in query and "node(id" in query:
+            return {"data": {"node": {"viewerDidAuthor": self.viewer_wrote_comment}}}
+        if "node(id" in query:
+            return {"data": {"node": self._thread(variables["threadId"])}}
+        if "mutation" not in query:
+            number = variables.get("number", 7)
+            return {"data": {"repository": {"pullRequest": self._node(number)}}}
+        for name, (message, head_becomes) in self.refused.items():
+            if name in query:
+                self._move_head(head_becomes)
+                return {"errors": [{"message": message}]}
+        if "addPullRequestReview(" in query:
+            event = variables["input"].get("event", "COMMENT")
+            states = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}
+            state = states.get(event, "COMMENTED" if "event" in variables["input"] else "PENDING")
+            review = {
+                "id": "R_1",
+                "state": state,
+                "viewerDidAuthor": True,
+                "commit": {"oid": variables["input"].get("commitOID", HEAD)},
+            }
+            return {"data": {"addPullRequestReview": {"pullRequestReview": review}}}
+        if "submitPullRequestReview" in query:
+            review = {
+                "id": "R_1",
+                "state": "COMMENTED",
+                "body": variables["input"]["body"],
+                "createdAt": "2026-11-24T10:00:00Z",
+                "url": f"{PR_URL}#pullrequestreview-1",
+                "commit": {"oid": HEAD},
+            }
+            return {"data": {"submitPullRequestReview": {"pullRequestReview": review}}}
+        if "deletePullRequestReviewComment" in query:
+            payload = {"pullRequestReview": {"id": "R_1"}}
+            return {"data": {"deletePullRequestReviewComment": payload}}
+        if "updatePullRequestReviewComment" in query:
+            draft = variables["input"]
+            edited = {"id": draft["pullRequestReviewCommentId"], "body": draft["body"]}
+            return {
+                "data": {"updatePullRequestReviewComment": {"pullRequestReviewComment": edited}}
+            }
+        if "addPullRequestReviewThreadReply" in query:
+            comment = _new_draft("PRRC_new", variables["input"]["body"])
+            return {"data": {"addPullRequestReviewThreadReply": {"comment": comment}}}
+        if "addPullRequestReviewThread(" in query:
+            draft = variables["input"]
+            thread = {
+                "id": "T_new",
+                "path": draft["path"],
+                "diffSide": draft["side"],
+                "line": draft["line"],
+                "startLine": draft.get("startLine"),
+                "subjectType": "LINE",
+                "viewerCanReply": True,
+                "comments": {"nodes": [_new_draft("PRRC_line", draft["body"])]},
+            }
+            return {"data": {"addPullRequestReviewThread": {"thread": thread}}}
+        if "deletePullRequestReview" in query:
+            return {"data": {"deletePullRequestReview": {"pullRequestReview": {"id": "R_1"}}}}
+        if "resolveReviewThread" in query:
+            return {"data": {"resolveReviewThread": {"thread": {"id": "T_1", "isResolved": True}}}}
+        if "addReaction" in query:
+            subject = {
+                "viewerCanReact": True,
+                "reactionGroups": [
+                    {
+                        "content": "THUMBS_UP",
+                        "viewerHasReacted": True,
+                        "reactors": {"totalCount": 2},
+                    },
+                    {"content": "HEART", "viewerHasReacted": False, "reactors": {"totalCount": 0}},
+                ],
+            }
+            reaction = {"reaction": {"content": "THUMBS_UP"}, "subject": subject}
+            return {"data": {"addReaction": reaction}}
+        if "removeReaction" in query:
+            return {"data": {"removeReaction": {"reaction": {"content": "THUMBS_UP"}}}}
+        raise AssertionError(f"unexpected GraphQL request: {query}")
+
+    def _json_write(
+        self,
+        _root: str,
+        *,
+        host: list[str],
+        token: str | None,
+        method: str,
+        endpoint: str,
+        fields: dict[str, Any],
+    ) -> tuple[int, str, str]:
+        assert token == TOKEN
+        self.json_calls.append((method, endpoint, fields))
+        if endpoint == "graphql":
+            is_write = "mutation" in fields["query"]
+            if is_write and self.graphql_failure is not None:
+                return self.graphql_failure
+            body = self._graphql(fields["query"], fields["variables"])
+            return 0, json.dumps(body), ""
+        if self.rest_failure is not None:
+            return self.rest_failure
+        return 0, json.dumps({"id": 5, "body": fields.get("body", "")}), ""
+
+    def _gh(
+        self, argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+    ) -> tuple[int, str, str]:
+        self.gh_calls.append((argv, token))
+        assert TOKEN not in " ".join(argv), "the token must never reach argv"
+        if "-X" in argv and self.rest_failure is not None:
+            return self.rest_failure
+        if argv[:2] == ["api", "--hostname"] and "-X" not in argv and argv[-1] in COMMENT_PATHS:
+            return 0, json.dumps(self.comment), ""
+        return 0, "", ""
+
+
+def _reference(url: str = PR_URL) -> PullRequestRef:
+    return PullRequestRef.from_url(url)
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@pytest.fixture
+def fake(monkeypatch: pytest.MonkeyPatch) -> FakeGitHub:
+    return FakeGitHub(monkeypatch)
+
+
+SESSION = "session_one"
+
+
+def test_approve_refuses_a_moved_head_before_any_mutation(fake: FakeGitHub) -> None:
+    fake.heads[7] = MOVED
+    with pytest.raises(PullRequestChangedError) as refused:
+        pr_actions.submit_review_verdict(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="APPROVE",
+            body="Ship it",
+            commit_oid=HEAD,
+        )
+    assert str(refused.value) == PULL_REQUEST_CHANGED_MESSAGE
+    assert refused.value.reason == "pull_request_changed"
+    assert fake.mutations("addPullRequestReview") == []
+
+
+def test_approve_on_the_head_the_user_saw_is_submitted_with_its_commit(fake: FakeGitHub) -> None:
+    result = pr_actions.submit_review_verdict(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        event="APPROVE",
+        body="Ship it",
+        commit_oid=HEAD,
+    )
+    assert result["event"] == "APPROVE"
+    [sent] = fake.mutations("addPullRequestReview")
+    assert sent["input"]["commitOID"] == HEAD
+    assert sent["input"]["event"] == "APPROVE"
+
+
+def test_request_changes_refuses_a_moved_head(fake: FakeGitHub) -> None:
+    fake.heads[7] = MOVED
+    with pytest.raises(PullRequestChangedError):
+        pr_actions.submit_review_verdict(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="REQUEST_CHANGES",
+            body="Fix this",
+            commit_oid=HEAD,
+        )
+    assert fake.mutations("addPullRequestReview") == []
+
+
+@pytest.mark.parametrize("event", ["APPROVE", "REQUEST_CHANGES"])
+def test_the_comment_review_route_refuses_verdicts_before_the_host(
+    fake: FakeGitHub, event: str
+) -> None:
+    with pytest.raises(InvalidPullRequestInput):
+        pr_actions.submit_review(
+            "/workspace", session_id=SESSION, pr_url=PR_URL, event=event, body="x", commit_oid=HEAD
+        )
+    assert fake.json_calls == []
+
+
+def test_a_comment_review_is_one_review_on_the_head_the_user_saw(fake: FakeGitHub) -> None:
+    result = pr_actions.submit_review(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        event="COMMENT",
+        body="Nit",
+        commit_oid=HEAD,
+    )
+    assert result["event"] == "COMMENT"
+    [sent] = fake.mutations("addPullRequestReview")
+    assert sent["input"] == {
+        "pullRequestId": "PR_7",
+        "commitOID": HEAD,
+        "event": "COMMENT",
+        "body": "Nit",
+    }
+
+
+def test_a_comment_review_refuses_a_moved_head(fake: FakeGitHub) -> None:
+    fake.heads[7] = MOVED
+    with pytest.raises(PullRequestChangedError):
+        pr_actions.submit_review(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="COMMENT",
+            body="Nit",
+            commit_oid=HEAD,
+        )
+    assert fake.mutations("addPullRequestReview") == []
+
+
+def test_submit_pending_refuses_a_moved_head(fake: FakeGitHub) -> None:
+    fake.pending = [{"id": "R_1", "viewerDidAuthor": True, "commit": {"oid": HEAD}}]
+    fake.heads[7] = MOVED
+    with pytest.raises(PullRequestChangedError):
+        pr_actions.submit_pending_review(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="COMMENT",
+            body="",
+            commit_oid=HEAD,
+            pending_review_id="R_1",
+        )
+    assert fake.mutations("submitPullRequestReview") == []
+
+
+def test_submit_pending_sends_the_pending_review(fake: FakeGitHub) -> None:
+    fake.pending = [{"id": "R_1", "viewerDidAuthor": True, "commit": {"oid": HEAD}}]
+    result = pr_actions.submit_pending_review(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        event="COMMENT",
+        body="Done",
+        commit_oid=HEAD,
+        pending_review_id="R_1",
+    )
+    assert result["object"] == "session.github.pr_review"
+    assert result["review"] == {
+        "id": "R_1",
+        "state": "COMMENTED",
+        "body": "Done",
+        "created_at": "2026-11-24T10:00:00Z",
+        "url": f"{PR_URL}#pullrequestreview-1",
+        "commit_oid": HEAD,
+    }
+    [sent] = fake.mutations("submitPullRequestReview")
+    assert sent["input"]["pullRequestReviewId"] == "R_1"
+
+
+def test_submit_pending_without_a_pending_review_is_refused(fake: FakeGitHub) -> None:
+    with pytest.raises(PullRequestError, match="no pending review"):
+        pr_actions.submit_pending_review(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="COMMENT",
+            body="",
+            commit_oid=HEAD,
+            pending_review_id="R_1",
+        )
+
+
+@pytest.mark.parametrize("kind", ["issue", "review"])
+@pytest.mark.parametrize("action", ["edit", "delete", "react"])
+def test_a_comment_from_another_pull_request_is_refused_before_any_write(
+    fake: FakeGitHub, kind: str, action: str
+) -> None:
+    link_field = "issue_url" if kind == "issue" else "pull_request_url"
+    fake.comment[link_field] = _comment_link(kind, 8)
+    with pytest.raises(PullRequestError) as refused:
+        if action == "edit":
+            pr_actions.edit_comment(
+                "/workspace",
+                session_id=SESSION,
+                pr_url=PR_URL,
+                kind=kind,
+                comment_id=5,
+                body="Mine",
+                expected_body_sha256=_digest("Original text"),
+            )
+        elif action == "delete":
+            pr_actions.delete_comment(
+                "/workspace", session_id=SESSION, pr_url=PR_URL, kind=kind, comment_id=5
+            )
+        else:
+            pr_actions.add_reaction(
+                "/workspace",
+                session_id=SESSION,
+                pr_url=PR_URL,
+                kind=kind,
+                comment_id=5,
+                content="THUMBS_UP",
+            )
+    assert str(refused.value) == "This comment isn't on this pull request."
+    assert fake.json_calls == []
+    assert not [call for call in fake.gh_calls if "-X" in call[0]]
+    assert fake.mutations("addReaction") == []
+
+
+@pytest.mark.parametrize(
+    ("pull_request_number", "repository"),
+    [(8, "example-org/example-repo"), (7, "example-org/other-repo")],
+)
+def test_resolving_a_thread_from_another_pull_request_is_refused(
+    fake: FakeGitHub, pull_request_number: int, repository: str
+) -> None:
+    fake.threads["T_OTHER"] = (pull_request_number, repository)
+    with pytest.raises(PullRequestError):
+        pr_actions.set_review_thread_resolved(
+            "/workspace", session_id=SESSION, pr_url=PR_URL, thread_id="T_OTHER", resolved=True
+        )
+    assert fake.mutations("resolveReviewThread") == []
+
+
+def test_a_graphql_refusal_after_the_head_moved_reports_pull_request_changed(
+    fake: FakeGitHub,
+) -> None:
+    fake.refuse_mutation("addPullRequestReview", "Head sha didn't match", head_becomes=MOVED)
+    with pytest.raises(PullRequestChangedError):
+        pr_actions.submit_review_verdict(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="APPROVE",
+            body="Ship it",
+            commit_oid=HEAD,
+        )
+    assert len(fake.mutations("addPullRequestReview")) == 1
+
+
+@pytest.mark.parametrize("message", ["expectedHeadOid is stale", "commitOID is not valid"])
+def test_a_refusal_with_an_unmoved_head_is_the_ordinary_refusal(
+    fake: FakeGitHub, message: str
+) -> None:
+    fake.refuse_mutation("addPullRequestReview", message)
+    with pytest.raises(ValueError) as refused:
+        pr_actions.submit_review_verdict(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="APPROVE",
+            body="Ship it",
+            commit_oid=HEAD,
+        )
+    assert str(refused.value) != PULL_REQUEST_CHANGED_MESSAGE
+    assert getattr(refused.value, "reason", None) is None
+
+
+def test_editing_a_comment_refuses_when_its_text_changed(fake: FakeGitHub) -> None:
+    fake.comment["body"] = "Changed by someone else"
+    with pytest.raises(CommentChangedError) as refused:
+        pr_actions.edit_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            kind="issue",
+            comment_id=5,
+            body="Mine",
+            expected_body_sha256=_digest("Original text"),
+        )
+    assert refused.value.reason == "comment_changed"
+    assert _comment_writes(fake) == []
+
+
+def test_editing_a_comment_sends_the_edit_when_the_digest_matches(fake: FakeGitHub) -> None:
+    result = pr_actions.edit_comment(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        kind="issue",
+        comment_id=5,
+        body="Mine",
+        expected_body_sha256=_digest("Original text"),
+    )
+    assert result["body"] == "Mine"
+    assert _comment_writes(fake) == [("PATCH", COMMENT_PATH)]
+
+
+def _comment_writes(fake: FakeGitHub) -> list[tuple[str, str]]:
+    return [(method, endpoint) for method, endpoint, _ in fake.json_calls if method == "PATCH"]
+
+
+def _change_comment(action: str, kind: str = "review") -> dict[str, Any]:
+    if action == "edit":
+        return pr_actions.edit_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            kind=kind,
+            comment_id=5,
+            body="Rewritten",
+            expected_body_sha256=_digest("Original text"),
+        )
+    return pr_actions.delete_comment(
+        "/workspace", session_id=SESSION, pr_url=PR_URL, kind=kind, comment_id=5
+    )
+
+
+def _rest_writes(fake: FakeGitHub) -> list[tuple[str, str]]:
+    patches = _comment_writes(fake)
+    deletes = [("DELETE", argv[-1]) for argv, _ in fake.gh_calls if "-X" in argv]
+    return patches + deletes
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_someone_elses_comment_is_refused_with_nothing_sent(fake: FakeGitHub, action: str) -> None:
+    """GitHub lets a repository admin change anyone's comment; here only the account's own."""
+    fake.viewer_wrote_comment = False
+    with pytest.raises(PullRequestError, match="Only your own comments"):
+        _change_comment(action)
+    assert _rest_writes(fake) == []
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_comment_github_doesnt_say_who_wrote_is_refused(fake: FakeGitHub, action: str) -> None:
+    del fake.comment["node_id"]
+    with pytest.raises(PullRequestError, match="Only your own comments"):
+        _change_comment(action)
+    assert _rest_writes(fake) == []
+
+
+@pytest.mark.parametrize("kind", ["issue", "review"])
+def test_your_own_comment_is_deleted(fake: FakeGitHub, kind: str) -> None:
+    result = _change_comment("delete", kind)
+    assert result["object"] == "session.github.comment_deleted"
+    path = COMMENT_PATH if kind == "issue" else REVIEW_COMMENT_PATH
+    assert _rest_writes(fake) == [("DELETE", path)]
+
+
+# After a write is sent, gh's stderr for failures GitHub may have applied anyway.
+_UNCONFIRMED_STDERR = {
+    "502": "gh: Bad Gateway (HTTP 502)",
+    "reset": 'Post "https://api.github.com/graphql": read tcp: connection reset by peer',
+    "eof": 'Post "https://api.github.com/graphql": unexpected EOF',
+}
+# And the ones that mean GitHub refused it without making it.
+_REFUSED_STDERR = {
+    "422": "gh: Validation Failed (HTTP 422)",
+    "404": "gh: Not Found (HTTP 404)",
+    "403": "gh: Resource not accessible by integration (HTTP 403)",
+    "401": "gh: Bad credentials (HTTP 401)",
+    "scope": "gh: INSUFFICIENT_SCOPES",
+}
+
+
+def _resolve() -> dict[str, Any]:
+    return pr_actions.set_review_thread_resolved(
+        "/workspace", session_id=SESSION, pr_url=PR_URL, thread_id="T_1", resolved=True
+    )
+
+
+@pytest.mark.parametrize(
+    "stderr", list(_UNCONFIRMED_STDERR.values()), ids=list(_UNCONFIRMED_STDERR)
+)
+def test_a_mutation_that_fails_after_the_send_is_an_unknown_outcome(
+    fake: FakeGitHub, stderr: str
+) -> None:
+    fake.graphql_failure = (1, "", stderr)
+    with pytest.raises(UnknownOutcomeError):
+        _resolve()
+
+
+@pytest.mark.parametrize(
+    "stderr", list(_UNCONFIRMED_STDERR.values()), ids=list(_UNCONFIRMED_STDERR)
+)
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_comment_change_that_fails_after_the_send_is_an_unknown_outcome(
+    fake: FakeGitHub, action: str, stderr: str
+) -> None:
+    fake.rest_failure = (1, "", stderr)
+    with pytest.raises(UnknownOutcomeError):
+        _change_comment(action)
+
+
+@pytest.mark.parametrize("stderr", list(_REFUSED_STDERR.values()), ids=list(_REFUSED_STDERR))
+def test_a_write_github_definitely_refused_is_a_refusal(fake: FakeGitHub, stderr: str) -> None:
+    fake.graphql_failure = (1, "", stderr)
+    with pytest.raises(ValueError) as refused:
+        _resolve()
+    assert not isinstance(refused.value, UnknownOutcomeError)
+    fake.graphql_failure = None
+    fake.rest_failure = (1, "", stderr)
+    with pytest.raises(ValueError) as refused:
+        _change_comment("edit")
+    assert not isinstance(refused.value, UnknownOutcomeError)
+
+
+def test_graphql_errors_in_an_answer_that_parsed_are_a_refusal(fake: FakeGitHub) -> None:
+    fake.refuse_mutation("resolveReviewThread", "Could not resolve to a node")
+    with pytest.raises(ValueError) as refused:
+        _resolve()
+    assert not isinstance(refused.value, UnknownOutcomeError)
+
+
+def test_a_graphql_timeout_error_is_an_unknown_outcome(fake: FakeGitHub) -> None:
+    fake.refuse_mutation("resolveReviewThread", "Something went wrong; this may be a timeout")
+    with pytest.raises(UnknownOutcomeError):
+        _resolve()
+
+
+def test_an_edit_answered_with_an_error_body_on_exit_zero_is_an_unknown_outcome(
+    fake: FakeGitHub,
+) -> None:
+    fake.rest_failure = (0, json.dumps({"message": "Server Error", "status": "500"}), "")
+    with pytest.raises(UnknownOutcomeError):
+        _change_comment("edit")
+
+
+def test_an_unknown_outcome_is_never_reported_as_a_moved_head(fake: FakeGitHub) -> None:
+    fake.graphql_failure = (1, "", _UNCONFIRMED_STDERR["502"])
+    fake.heads[7] = MOVED
+    with pytest.raises(UnknownOutcomeError):
+        pr_actions.submit_review_verdict(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="APPROVE",
+            body="Ship it",
+            commit_oid=MOVED,
+        )
+
+
+def test_a_reaction_is_added_to_the_comments_node(fake: FakeGitHub) -> None:
+    result = pr_actions.add_reaction(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        kind="issue",
+        comment_id=5,
+        content="THUMBS_UP",
+    )
+    assert result["reacted"] is True
+    [sent] = fake.mutations("addReaction")
+    assert sent["input"] == {"subjectId": "IC_1", "content": "THUMBS_UP"}
+    # The comment's reactions as GitHub has them after the change.
+    assert result["reactions"] == [{"content": "THUMBS_UP", "count": 2, "viewer_reacted": True}]
+    assert result["can_react"] is True
+
+
+def test_a_reaction_change_github_answers_without_the_comment_says_none(
+    fake: FakeGitHub,
+) -> None:
+    result = pr_actions.remove_reaction(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        kind="issue",
+        comment_id=5,
+        content="THUMBS_UP",
+    )
+    assert result["reacted"] is False
+    assert "reactions" not in result and "can_react" not in result
+
+
+def test_a_reaction_must_be_a_github_reaction(fake: FakeGitHub) -> None:
+    with pytest.raises(InvalidPullRequestInput):
+        pr_actions.add_reaction(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            kind="issue",
+            comment_id=5,
+            content="meh",
+        )
+
+
+def test_resolving_a_thread_names_the_thread(fake: FakeGitHub) -> None:
+    result = pr_actions.set_review_thread_resolved(
+        "/workspace", session_id=SESSION, pr_url=PR_URL, thread_id="T_1", resolved=True
+    )
+    assert result["resolved"] is True
+    assert fake.mutations("resolveReviewThread") == [{"input": {"threadId": "T_1"}}]
+
+
+def test_a_non_github_pull_request_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    gitlab = PullRequestRef(
+        provider="gitlab",
+        host="gitlab.com",
+        repository="example-org/example-repo",
+        number=3,
+        url="https://gitlab.com/example-org/example-repo/-/merge_requests/3",
+    )
+    monkeypatch.setattr(pr_resource, "_selected_pr", lambda _session, _url: gitlab)
+    with pytest.raises(ValueError, match="supported only for GitHub"):
+        pr_actions.submit_review(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=gitlab.url,
+            event="COMMENT",
+            body="x",
+            commit_oid=HEAD,
+        )
+
+
+def test_failure_classes_name_the_host_and_never_the_token() -> None:
+    cases = {
+        "needs the repo scope": "INSUFFICIENT_SCOPES",
+        "sso": "Resource protected by organization SAML enforcement",
+        "rate": "API rate limit exceeded",
+        "signed out": "To get started, please run: gh auth login",
+    }
+    messages = {
+        key: str(github_failures.refusal(stderr, host="ghe.example.com", action="x"))
+        for key, stderr in cases.items()
+    }
+    assert "needs the `repo` scope" in messages["needs the repo scope"]
+    assert messages["sso"] == "Authorize the login on ghe.example.com for SSO."
+    assert "rate limiting" in messages["rate"]
+    assert "gh auth login" in messages["signed out"]
+    assert all(TOKEN not in message for message in messages.values())
+
+
+_DRAFT = {"id": "PRRC_draft", "body": "Draft text"}
+_DRAFT_SHA = hashlib.sha256(b"Draft text").hexdigest()
+
+
+def _own_pending(*drafts: dict[str, Any], viewer: bool = True) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "R_1",
+            "viewerDidAuthor": viewer,
+            "commit": {"oid": HEAD},
+            "comments": {"nodes": list(drafts)},
+        }
+    ]
+
+
+def _draft_writes(fake: FakeGitHub) -> list[dict[str, Any]]:
+    return [
+        *fake.mutations("updatePullRequestReviewComment"),
+        *fake.mutations("deletePullRequestReviewComment"),
+        *fake.mutations("addPullRequestReviewThreadReply"),
+    ]
+
+
+def test_a_draft_in_the_viewers_pending_review_is_updated_while_its_text_is_as_read(
+    fake: FakeGitHub,
+) -> None:
+    fake.pending = _own_pending(_DRAFT)
+    result = pr_actions.update_pending_review_comment(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        comment_node_id="PRRC_draft",
+        pending_review_id="R_1",
+        body="New text",
+        expected_body_sha256=_DRAFT_SHA,
+    )
+    assert result == {
+        "object": "session.github.pr_comment_edit",
+        "pr_url": PR_URL,
+        "comment_id": "PRRC_draft",
+        "body": "New text",
+    }
+    [sent] = fake.mutations("updatePullRequestReviewComment")
+    assert sent["input"] == {"pullRequestReviewCommentId": "PRRC_draft", "body": "New text"}
+
+
+def test_a_stale_draft_digest_is_refused_with_nothing_sent(fake: FakeGitHub) -> None:
+    fake.pending = _own_pending({**_DRAFT, "body": "Changed elsewhere"})
+    with pytest.raises(CommentChangedError):
+        pr_actions.update_pending_review_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            comment_node_id="PRRC_draft",
+            pending_review_id="R_1",
+            body="New text",
+            expected_body_sha256=_DRAFT_SHA,
+        )
+    assert _draft_writes(fake) == []
+
+
+@pytest.mark.parametrize(
+    "pending",
+    [
+        pytest.param([], id="no-pending-review"),
+        pytest.param(_own_pending({"id": "PRRC_other", "body": "x"}), id="not-in-the-review"),
+        pytest.param(_own_pending(_DRAFT, viewer=False), id="someone-elses-review"),
+    ],
+)
+@pytest.mark.parametrize("action", ["update", "delete"])
+def test_a_draft_outside_the_viewers_pending_review_is_refused_with_nothing_sent(
+    fake: FakeGitHub, pending: list[dict[str, Any]], action: str
+) -> None:
+    fake.pending = pending
+    with pytest.raises(PullRequestError, match="isn't in your pending review"):
+        if action == "update":
+            pr_actions.update_pending_review_comment(
+                "/workspace",
+                session_id=SESSION,
+                pr_url=PR_URL,
+                comment_node_id="PRRC_draft",
+                pending_review_id="R_1",
+                body="New text",
+                expected_body_sha256=_DRAFT_SHA,
+            )
+        else:
+            pr_actions.delete_pending_review_comment(
+                "/workspace",
+                session_id=SESSION,
+                pr_url=PR_URL,
+                comment_node_id="PRRC_draft",
+                pending_review_id="R_1",
+            )
+    assert _draft_writes(fake) == []
+
+
+def test_a_draft_in_the_viewers_pending_review_is_deleted(fake: FakeGitHub) -> None:
+    fake.pending = _own_pending(_DRAFT)
+    result = pr_actions.delete_pending_review_comment(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        comment_node_id="PRRC_draft",
+        pending_review_id="R_1",
+    )
+    assert result == {
+        "object": "session.github.pr_comment_delete",
+        "pr_url": PR_URL,
+        "comment_id": "PRRC_draft",
+    }
+    [sent] = fake.mutations("deletePullRequestReviewComment")
+    assert sent["input"] == {"id": "PRRC_draft"}
+
+
+def test_a_draft_reply_joins_the_viewers_pending_review_in_a_conversation_on_this_pr(
+    fake: FakeGitHub,
+) -> None:
+    fake.pending = _own_pending()
+    result = pr_actions.add_pending_review_comment(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        body="Agreed",
+        anchor=None,
+        in_reply_to_thread_id="T_1",
+        pending_review_id="R_1",
+        expected_head=HEAD,
+    )
+    assert result["object"] == "session.github.pr_review_draft"
+    assert (result["review_id"], result["thread_id"]) == ("R_1", "T_1")
+    assert result["comment"]["id"] == "PRRC_new"
+    assert result["comment"]["body"] == "Agreed"
+    assert result["comment"]["pending"] is True
+    [sent] = fake.mutations("addPullRequestReviewThreadReply")
+    assert sent["input"] == {
+        "pullRequestReviewId": "R_1",
+        "pullRequestReviewThreadId": "T_1",
+        "body": "Agreed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("threads", "pending", "match"),
+    [
+        pytest.param(
+            {"T_1": (8, "example-org/example-repo")},
+            None,
+            "isn't on this pull request",
+            id="other-pr",
+        ),
+        pytest.param({}, None, "isn't on this pull request", id="unknown-thread"),
+        pytest.param(None, [], "no pending review", id="no-pending-review"),
+    ],
+)
+def test_a_draft_reply_is_refused_with_nothing_sent(
+    fake: FakeGitHub,
+    threads: dict[str, tuple[int, str]] | None,
+    pending: list[dict[str, Any]] | None,
+    match: str,
+) -> None:
+    fake.pending = _own_pending() if pending is None else pending
+    if threads is not None:
+        fake.threads = threads
+    with pytest.raises(PullRequestError, match=match):
+        pr_actions.add_pending_review_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            body="Agreed",
+            anchor=None,
+            in_reply_to_thread_id="T_1",
+            pending_review_id="R_1",
+            expected_head=HEAD,
+        )
+    assert _draft_writes(fake) == []
+    # Nothing starts a review for a reply, either.
+    assert fake.mutations("addPullRequestReview(") == []
+
+
+def test_a_reply_with_lines_is_refused(fake: FakeGitHub) -> None:
+    anchor = {"path": "a.py", "side": "RIGHT", "line": 1, "head_sha": HEAD, "base_sha": BASE}
+    with pytest.raises(InvalidPullRequestInput):
+        pr_actions.add_pending_review_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            body="Agreed",
+            anchor=anchor,
+            in_reply_to_thread_id="T_1",
+            pending_review_id="R_1",
+            expected_head=HEAD,
+        )
+    assert _draft_writes(fake) == []
+
+
+def test_a_draft_past_the_first_hundred_is_found_on_a_later_page(fake: FakeGitHub) -> None:
+    others = [{"id": f"PRRC_other_{index}", "body": "x"} for index in range(250)]
+    fake.pending = _own_pending(*others, _DRAFT)
+    pr_actions.delete_pending_review_comment(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        comment_node_id="PRRC_draft",
+        pending_review_id="R_1",
+    )
+    [sent] = fake.mutations("deletePullRequestReviewComment")
+    assert sent["input"] == {"id": "PRRC_draft"}
+    # Three pages were read: 100, 100, then the last 51.
+    assert len(fake.mutations("on PullRequestReview {")) == 3
+
+
+def _pending_change(action: str, review_id: str) -> None:
+    """Send ``action`` to the pending review named ``review_id``, as the page would."""
+    common = {"session_id": SESSION, "pr_url": PR_URL, "pending_review_id": review_id}
+    anchor = {"path": "a.py", "side": "RIGHT", "line": 1, "head_sha": HEAD, "base_sha": BASE}
+    if action == "add":
+        pr_actions.add_pending_review_comment(
+            "/workspace", body="New", anchor=anchor, expected_head=HEAD, **common
+        )
+    elif action == "reply":
+        pr_actions.add_pending_review_comment(
+            "/workspace",
+            body="New",
+            anchor=None,
+            in_reply_to_thread_id="T_1",
+            expected_head=HEAD,
+            **common,
+        )
+    elif action == "update":
+        pr_actions.update_pending_review_comment(
+            "/workspace",
+            comment_node_id="PRRC_draft",
+            body="New",
+            expected_body_sha256=_DRAFT_SHA,
+            **common,
+        )
+    elif action == "delete":
+        pr_actions.delete_pending_review_comment(
+            "/workspace", comment_node_id="PRRC_draft", **common
+        )
+    elif action == "submit":
+        pr_actions.submit_pending_review(
+            "/workspace", event="COMMENT", body="", commit_oid=HEAD, **common
+        )
+    else:
+        pr_actions.discard_pending_review("/workspace", **common)
+
+
+_PENDING_ACTIONS = ["add", "reply", "update", "delete", "submit", "discard"]
+
+
+def _pending_writes(fake: FakeGitHub) -> list[dict[str, Any]]:
+    names = (
+        "addPullRequestReviewThread",
+        "updatePullRequestReviewComment",
+        "deletePullRequestReviewComment",
+        "submitPullRequestReview",
+        "deletePullRequestReview(",
+    )
+    return [write for name in names for write in fake.mutations(name)]
+
+
+@pytest.mark.parametrize("action", _PENDING_ACTIONS)
+def test_a_change_to_another_pending_review_than_the_page_saw_is_refused(
+    fake: FakeGitHub, action: str
+) -> None:
+    """Submitted and replaced elsewhere: the viewer's pending review is now another one."""
+    fake.pending = _own_pending(_DRAFT)
+    with pytest.raises(PullRequestError, match=r"changed since this page read it|isn.t in your"):
+        _pending_change(action, "R_old")
+    assert _pending_writes(fake) == []
+
+
+@pytest.mark.parametrize("action", _PENDING_ACTIONS)
+def test_a_change_without_the_pending_review_id_is_refused_before_any_read(
+    fake: FakeGitHub, action: str
+) -> None:
+    fake.pending = _own_pending(_DRAFT)
+    with pytest.raises(InvalidPullRequestInput, match="pending review the page showed"):
+        _pending_change(action, "")
+    assert fake.json_calls == []
+
+
+@pytest.mark.parametrize("action", ["add", "reply"])
+def test_a_draft_add_refuses_a_moved_head_with_nothing_sent(fake: FakeGitHub, action: str) -> None:
+    fake.pending = _own_pending()
+    fake.heads[7] = MOVED
+    with pytest.raises(PullRequestChangedError):
+        _pending_change(action, "R_1")
+    assert _pending_writes(fake) == []
+
+
+def test_a_line_draft_answers_its_new_conversation_in_the_pages_shape(fake: FakeGitHub) -> None:
+    fake.pending = _own_pending()
+    result = pr_actions.add_pending_review_comment(
+        "/workspace",
+        session_id=SESSION,
+        pr_url=PR_URL,
+        body="Why strip here?",
+        anchor={
+            "path": "src/parser.py",
+            "side": "RIGHT",
+            "line": 4,
+            "start_line": 2,
+            "head_sha": HEAD,
+            "base_sha": BASE,
+        },
+        pending_review_id="R_1",
+        expected_head=HEAD,
+    )
+    assert result["object"] == "session.github.pr_review_draft"
+    assert result["review_id"] == "R_1"
+    thread = result["thread"]
+    assert (thread["id"], thread["path"], thread["side"]) == ("T_new", "src/parser.py", "RIGHT")
+    assert (thread["line"], thread["start_line"]) == (4, 2)
+    [draft] = thread["comments"]["data"]
+    assert (draft["id"], draft["body"], draft["pending"]) == ("PRRC_line", "Why strip here?", True)
+    [sent] = fake.mutations("addPullRequestReviewThread(")
+    assert sent["input"]["pullRequestReviewId"] == "R_1"
+    assert (sent["input"]["startLine"], sent["input"]["startSide"]) == (2, "RIGHT")
+    # A draft joins the review the page saw; it never starts one itself.
+    assert fake.mutations("addPullRequestReview(") == []
+
+
+def test_a_line_draft_needs_its_lines_picked_on_the_expected_head(fake: FakeGitHub) -> None:
+    fake.pending = _own_pending()
+    anchor = {"path": "a.py", "side": "RIGHT", "line": 1, "head_sha": MOVED, "base_sha": BASE}
+    with pytest.raises(InvalidPullRequestInput):
+        pr_actions.add_pending_review_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            body="New",
+            anchor=anchor,
+            pending_review_id="R_1",
+            expected_head=HEAD,
+        )
+    assert fake.json_calls == []
+
+
+def test_a_discard_names_the_review_it_deleted(fake: FakeGitHub) -> None:
+    fake.pending = _own_pending()
+    result = pr_actions.discard_pending_review(
+        "/workspace", session_id=SESSION, pr_url=PR_URL, pending_review_id="R_1"
+    )
+    assert result == {
+        "object": "session.github.pr_review_discard",
+        "pr_url": PR_URL,
+        "review_id": "R_1",
+    }
+
+
+def test_a_started_review_answers_only_itself(fake: FakeGitHub) -> None:
+    """Starting a review reads back nothing more than what the mutation answered."""
+    result = pr_actions.start_pending_review(
+        "/workspace", session_id=SESSION, pr_url=PR_URL, commit_oid=HEAD
+    )
+    assert result == {
+        "object": "session.github.pr_review_start",
+        "pr_url": PR_URL,
+        "review_id": "R_1",
+        "commit_oid": HEAD,
+    }
+    assert fake.mutations("on PullRequestReview {") == []
+    assert fake.mutations("reviewThreads(") == []
+
+
+def test_a_start_refuses_a_moved_head_with_nothing_sent(fake: FakeGitHub) -> None:
+    fake.heads[7] = MOVED
+    with pytest.raises(PullRequestChangedError):
+        pr_actions.start_pending_review(
+            "/workspace", session_id=SESSION, pr_url=PR_URL, commit_oid=HEAD
+        )
+    assert fake.mutations("addPullRequestReview(") == []
