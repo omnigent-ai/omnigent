@@ -1105,6 +1105,39 @@ def test_the_route_takes_the_reader_to_be_the_least_trusted_unless_told() -> Non
     assert {"ListReviewThreads", "ListReviewThreadComments"} == workspace_api.VIEWER_SHAPED_METHODS
 
 
+@pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
+async def test_a_failed_owner_lookup_reads_threads_without_the_rights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """As on REST: unsure who's reading, the read still answers, with no one's rights."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    def lookup_fails(*_args: Any, **_kwargs: Any) -> bool:
+        raise RuntimeError("permission store unavailable")
+
+    monkeypatch.setattr(routes_resources, "_is_session_owner", lookup_fails)
+    monkeypatch.setattr(
+        WorkspaceReader, "github_review_threads", lambda _self, *_args: _HOST_THREADS
+    )
+    comments = _HOST_THREADS["data"][0]["comments"]
+    monkeypatch.setattr(
+        WorkspaceReader, "github_review_thread_comments", lambda _self, *_args: comments
+    )
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    if method == "ListReviewThreads":
+        response = await client.list_review_threads(pb.ListReviewThreadsRequest(pr_url=_PR))
+        [thread] = payload_dict(response.payload)["data"]
+        assert thread["can_reply"] is False
+        [comment] = thread["comments"]["data"]
+    else:
+        response = await client.list_review_thread_comments(
+            pb.ListReviewThreadCommentsRequest(pr_url=_PR, thread_id="PRRT_1")
+        )
+        [comment] = payload_dict(response.payload)["data"]
+    assert comment["can_update"] is False
+
+
 @pytest.mark.parametrize("owner", [True, False], ids=["owner", "non-owner"])
 async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
     tmp_path: Path,
