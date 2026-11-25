@@ -16767,6 +16767,19 @@
             "description": "The planning conversation's journal entry for the proposal the description was saved from or kept over, until the description is written otherwise.",
             "title": "Description Source"
           },
+          "description_updated_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Unix epoch seconds when the description was last written; a write that leaves it, such as one to the steps alone, keeps it. For a workflow last written before the server kept it, its last write.",
+            "title": "Description Updated At"
+          },
           "id": {
             "title": "Id",
             "type": "string"

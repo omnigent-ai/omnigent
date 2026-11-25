@@ -3503,11 +3503,15 @@ class WorkflowObject(WorkflowSummary):
     :param description_source: The planning conversation's journal entry for the proposal
         the description was saved from or kept over, until the description is written
         otherwise.
+    :param description_updated_at: Unix epoch seconds when the description was last written;
+        a write that leaves it, such as one to the steps alone, keeps it. For a workflow last
+        written before the server kept it, its last write.
     """
 
     steps: list[WorkflowStep]
     planning_session_id: str | None = None
     description_source: str | None = None
+    description_updated_at: int | None = None
 
 
 class WorkflowList(BaseModel):

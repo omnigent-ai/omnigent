@@ -17,6 +17,7 @@ from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlPreference, SqlWork
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.stores import workflow_store
 from omnigent.stores.workflow_store import (
     WorkflowNameTakenError,
     WorkflowStore,
@@ -263,6 +264,33 @@ def test_a_description_keeps_its_proposal_until_written_otherwise(store: Workflo
     assert kept_over is not None and kept_over.description == "From the new chat."
     assert kept_over.description_source == declined
     assert store.get(saved.id, user_id=ALICE) == kept_over
+
+
+def test_a_description_keeps_its_time_through_writes_that_leave_it(
+    store: WorkflowStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter(range(100, 1000, 10))
+    monkeypatch.setattr(workflow_store, "now_epoch", lambda: next(clock))
+    saved = _save(store, "deploy")
+    assert (saved.updated_at, saved.description_updated_at) == (100, 100)
+    stepped = store.update(saved.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert stepped is not None
+    assert (stepped.updated_at, stepped.description_updated_at) == (110, 100)
+    renamed = store.update(saved.id, user_id=ALICE, name="deploy-2")
+    assert renamed is not None and renamed.description_updated_at == 100
+    stale = store.update(
+        saved.id, user_id=ALICE, description="From a stale page.", expected_description="Not it."
+    )
+    assert stale is not None and stale.description_updated_at == 100
+    described = store.update(saved.id, user_id=ALICE, description="New words.")
+    assert described is not None
+    assert (described.updated_at, described.description_updated_at) == (140, 140)
+    assert store.get(saved.id, user_id=ALICE) == described
+    # A plan holds the time only while it's older than the last write, so a workflow from
+    # before the store kept it reads as written then.
+    stored = store.update(saved.id, user_id=ALICE, steps=STEPS)
+    assert stored is not None and stored.description_updated_at == 140
+    assert store.get(saved.id, user_id=ALICE) == stored
 
 
 def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> None:

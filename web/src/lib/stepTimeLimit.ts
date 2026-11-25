@@ -20,8 +20,8 @@ export const TIME_LIMIT_CHOICES = [
 // A line of its own, as a paragraph or a list item, e.g. "- **Time limit:** 2 hours".
 const LIMIT_LINE = /^([ \t]*(?:[-*+][ \t]+)?)\*\*Time limit:\*\*[ \t]*(.*?)[ \t]*$/i;
 const DETAILS_LINE = /^([ \t]*)([-*+][ \t]+)?\*\*Details:\*\*/i;
-// A fence's run of backticks or tildes, and what follows it.
-const FENCE = /^[ \t]*(`{3,}|~{3,})(.*)$/;
+// Most descriptions name no limit, and those need no parsing.
+const LIMIT_MARK = /\*\*Time limit:\*\*/i;
 // One part of a length, e.g. "1 hour" in "1 hour 30 minutes" or "1h" in "1h30m", with what
 // separates it from the next.
 const LENGTH_PART =
@@ -44,8 +44,15 @@ interface MarkdownNode {
   children?: MarkdownNode[];
 }
 
+// A page reads the same descriptions on every render, and parsing is the costly part.
+const parsedCodeBlocks = new Map<string, readonly CodeBlock[]>();
+const PARSED_CODE_BLOCKS_KEPT = 200;
+
 /** A description's code blocks, fenced or indented, as Markdown reads them. */
-function codeBlocks(lines: readonly string[]): CodeBlock[] {
+function codeBlocks(lines: readonly string[]): readonly CodeBlock[] {
+  const text = lines.join("\n");
+  const parsed = parsedCodeBlocks.get(text);
+  if (parsed) return parsed;
   const blocks: CodeBlock[] = [];
   const visit = (node: MarkdownNode) => {
     if (node.type === "code" && node.position) {
@@ -54,7 +61,10 @@ function codeBlocks(lines: readonly string[]): CodeBlock[] {
     }
     for (const child of node.children ?? []) visit(child);
   };
-  visit(unified().use(remarkParse).parse(lines.join("\n")) as MarkdownNode);
+  visit(unified().use(remarkParse).parse(text) as MarkdownNode);
+  if (parsedCodeBlocks.size >= PARSED_CODE_BLOCKS_KEPT)
+    parsedCodeBlocks.delete(parsedCodeBlocks.keys().next().value!);
+  parsedCodeBlocks.set(text, blocks);
   return blocks;
 }
 
@@ -68,23 +78,9 @@ function matchingLines(
   return lines.flatMap((line, index) => (!inCode(index) && pattern.test(line) ? [index] : []));
 }
 
-/** The fenced code block a description leaves open at its end, which would take in a new last line. */
-function openBlockAtEnd(lines: readonly string[], blocks: readonly CodeBlock[]): CodeBlock | null {
-  const last = blocks.at(-1);
-  if (!last || last.end !== lines.length - 1) return null;
-  const opening = FENCE.exec(lines[last.start]!)?.[1];
-  if (!opening) return null;
-  const closing = last.end > last.start ? FENCE.exec(lines[last.end]!) : null;
-  const closed =
-    !!closing &&
-    closing[1]![0] === opening[0] &&
-    closing[1]!.length >= opening.length &&
-    !closing[2]!.trim();
-  return closed ? null : last;
-}
-
 /** The step's time limit as its description words it, e.g. "2 hours"; null without one. */
 export function stepTimeLimit(goal: string | null): string | null {
+  if (!goal || !LIMIT_MARK.test(goal)) return null;
   const lines = descriptionLines(goal);
   for (const index of matchingLines(lines, LIMIT_LINE)) {
     // An empty line names no limit; a later one may.
@@ -135,7 +131,7 @@ export function shortTimeLimit(limit: string): string | null {
 export function withStepTimeLimit(goal: string | null, limit: string | null): string | null {
   const lines = descriptionLines(goal);
   const limitLine = limit ? `**Time limit:** ${limit}` : null;
-  const blocks = codeBlocks(lines);
+  const blocks = limitLine || (goal && LIMIT_MARK.test(goal)) ? codeBlocks(lines) : [];
   const found = matchingLines(lines, LIMIT_LINE, blocks);
   const kept = limitLine ? found[0] : undefined;
   // From the last, so the earlier lines keep their places.
@@ -151,7 +147,6 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
   }
   if (found.length === 0 && limitLine) {
     const details = matchingLines(lines, DETAILS_LINE, blocks)[0] ?? -1;
-    const open = openBlockAtEnd(lines, blocks);
     const detailsMatch = details < 0 ? null : DETAILS_LINE.exec(lines[details]!);
     const listMarker = detailsMatch?.[2] ? `${detailsMatch[1]}${detailsMatch[2]}` : "";
     if (listMarker) {
@@ -160,13 +155,20 @@ export function withStepTimeLimit(goal: string | null, limit: string | null): st
     } else if (details >= 0) {
       const before = details > 0 && lines[details - 1]!.trim() !== "" ? [""] : [];
       lines.splice(details, 0, ...before, limitLine, "");
-    } else if (open) {
-      // A code block left open at the end would take in the limit, so it goes before the block.
-      const before = open.start > 0 && lines[open.start - 1]!.trim() !== "" ? [""] : [];
-      lines.splice(open.start, 0, ...before, limitLine, "");
     } else {
-      if (lines.length > 0 && lines.at(-1)!.trim() !== "") lines.push("");
-      lines.push(limitLine);
+      // Last, unless a code block left open at the end would take the line in, as Markdown
+      // reads it: then just before that block.
+      const tail = lines.length > 0 && lines.at(-1)!.trim() !== "" ? ["", limitLine] : [limitLine];
+      const last = lines.length + tail.length - 1;
+      const open = codeBlocks([...lines, ...tail]).find(
+        ({ start, end }) => start < lines.length && end === last,
+      );
+      if (open) {
+        const before = open.start > 0 && lines[open.start - 1]!.trim() !== "" ? [""] : [];
+        lines.splice(open.start, 0, ...before, limitLine, "");
+      } else {
+        lines.push(...tail);
+      }
     }
   }
   // Only the edited lines change: the line breaks stay, and only blank lines at the ends go.
@@ -185,6 +187,11 @@ export function withTimeLimitLength(goal: string | null, length: string): string
   const limit = stepTimeLimit(goal);
   const old = limit ? timeLimitLength(limit) : null;
   return withStepTimeLimit(goal, limit && old ? `${length}${limit.slice(old.length)}` : length);
+}
+
+/** The step's description with the limit its menu chose, or without one for null. */
+export function withChosenTimeLimit(goal: string | null, limit: string | null): string | null {
+  return limit === null ? withStepTimeLimit(goal, null) : withTimeLimitLength(goal, limit);
 }
 
 /**

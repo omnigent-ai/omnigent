@@ -90,11 +90,18 @@ def _is_name_conflict(error: IntegrityError) -> bool:
     )
 
 
-def _plan_text(steps: list[dict[str, Any]], description_source: str | None = None) -> str:
-    """Serialize the plan, and the proposal its description came from, before the codec."""
+def _plan_text(
+    steps: list[dict[str, Any]],
+    description_source: str | None = None,
+    description_updated_at: int | None = None,
+) -> str:
+    """Serialize the plan before the codec, with the proposal its description came from and,
+    when it's older than the workflow's last write, the time the description was written."""
     plan: dict[str, Any] = {"steps": steps}
     if description_source is not None:
         plan["description_source"] = description_source
+    if description_updated_at is not None:
+        plan["description_updated_at"] = description_updated_at
     return json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -211,6 +218,7 @@ class WorkflowStore:
                     steps=saved["steps"],
                     planning_session_id=row.planning_session_id,
                     description_source=saved.get("description_source"),
+                    description_updated_at=saved.get("description_updated_at", row.updated_at),
                 )
             )
         return workflows
@@ -242,6 +250,7 @@ class WorkflowStore:
             created_at=now,
             updated_at=now,
             steps=workflow_steps,
+            description_updated_at=now,
         )
 
         def write(session: Session) -> Workflow:
@@ -454,15 +463,28 @@ class WorkflowStore:
                 description=description if describes else current.description,
                 steps=current.steps if steps is None else steps,
             )
-            # The plan keeps the description's source, so a new source rewrites it.
-            rewrites_plan = steps is not None or source != current.description_source
+            now = now_epoch()
+            # A write that leaves the description, such as a time limit's change to the steps,
+            # keeps its time. The plan holds that time only while it's older than the last write.
+            was_written_at = (
+                current.updated_at
+                if current.description_updated_at is None
+                else current.description_updated_at
+            )
+            described_at = now if describes else was_written_at
+            held = None if described_at == now else described_at
+            was_held = None if was_written_at == current.updated_at else was_written_at
+            # The plan keeps the description's source and time, so a new one rewrites it.
+            rewrites_plan = (
+                steps is not None or source != current.description_source or held != was_held
+            )
             stored = self._stored_texts(
-                text, _plan_text(workflow_steps, source) if rewrites_plan else None
+                text, _plan_text(workflow_steps, source, held) if rewrites_plan else None
             )
             values: dict[str, Any] = {
                 "name": workflow_name,
                 "description": stored[0],
-                "updated_at": now_epoch(),
+                "updated_at": now,
             }
             if rewrites_plan:
                 values["plan"] = stored[1]
@@ -488,6 +510,7 @@ class WorkflowStore:
                 steps=workflow_steps,
                 planning_session_id=values.get("planning_session_id", row.planning_session_id),
                 description_source=source,
+                description_updated_at=described_at,
             )
 
         try:

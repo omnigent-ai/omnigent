@@ -163,6 +163,14 @@ describe("withStepTimeLimit", () => {
     expect(withStepTimeLimit("**Details:** run it.\n\n```\nsome code", "1 hour")).toBe(
       "**Time limit:** 1 hour\n\n**Details:** run it.\n\n```\nsome code",
     );
+    // A fence indented four spaces is code, not the block's end.
+    const unclosed = withStepTimeLimit("Fix it.\n\n```\nsome code\n    ```", "2 hours");
+    expect(unclosed).toBe("Fix it.\n\n**Time limit:** 2 hours\n\n```\nsome code\n    ```");
+    expect(stepTimeLimit(unclosed)).toBe("2 hours");
+    // A list item's fence, indented with the item, does close its block.
+    const listed = withStepTimeLimit("- Run it:\n  ```\n  make test\n  ```", "2 hours");
+    expect(listed).toBe("- Run it:\n  ```\n  make test\n  ```\n\n**Time limit:** 2 hours");
+    expect(stepTimeLimit(listed)).toBe("2 hours");
   });
 
   it("changes only the edited lines: their breaks and the first line's indent stay", () => {

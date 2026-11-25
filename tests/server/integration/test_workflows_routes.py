@@ -576,6 +576,8 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     assert proposed.json()["description_source"] == source
     edited = await client.patch(path, json={"description": "Ship it."}, headers=_headers(ALICE))
     assert edited.json()["description_source"] is None
+    described_at = edited.json()["description_updated_at"]
+    assert isinstance(described_at, int)
     malformed = await client.patch(
         path, json={"description": "Ship.", "description_source": "x"}, headers=_headers(ALICE)
     )
@@ -608,6 +610,8 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     )
     assert saved.status_code == 200 and saved.json()["is_draft"] is False
     assert saved.json()["planning_session_id"] == planner
+    # Saving the steps alone, as a time limit does, keeps the description's time.
+    assert saved.json()["description_updated_at"] == described_at
     assert (await client.get(path + "/runs", headers=_headers(ALICE))).json()["data"] == []
     listed = (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0]
     assert listed["id"] == draft["id"] and listed["is_draft"] is False

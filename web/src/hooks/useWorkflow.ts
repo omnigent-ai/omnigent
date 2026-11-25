@@ -3,6 +3,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { authenticatedFetch } from "@/lib/identity";
 import type { JournalEntry, JournalPlanStep } from "@/lib/sessionJournal";
+import { withChosenTimeLimit } from "@/lib/stepTimeLimit";
 import type { WorkflowRun } from "@/lib/workflowRuns";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
@@ -18,6 +19,11 @@ export interface WorkflowDetail extends SavedWorkflow {
    * otherwise.
    */
   description_source?: string | null;
+  /**
+   * Epoch seconds when the description was last written; a write to the steps alone keeps it.
+   * A server from before it sends none.
+   */
+  description_updated_at?: number | null;
 }
 
 /** The workflow doesn't exist, or isn't the user's. */
@@ -141,6 +147,25 @@ export function useCloneWorkflow() {
   });
 }
 
+/** A description saved with a plan, kept only while the stored one is `expected_description`. */
+interface DescriptionSave {
+  description?: string;
+  expected_description?: string;
+  description_source?: string;
+}
+
+interface PlanSave extends DescriptionSave {
+  steps: WorkflowStep[];
+}
+
+async function savePlan(workflowId: string, proposal: PlanSave): Promise<WorkflowDetail> {
+  const path = workflowPath(workflowId);
+  const res = await sendWorkflow(path, "PATCH", proposal);
+  if (proposal.expected_description !== undefined && (await refusesExpectedDescription(res)))
+    return writeWorkflow(path, "PATCH", { steps: proposal.steps });
+  return savedWorkflow(res);
+}
+
 /**
  * Apply the reviewed proposal, its steps and any new description, to the existing workflow.
  * The server keeps a description that is no longer `expected_description`; a server too old
@@ -149,19 +174,40 @@ export function useCloneWorkflow() {
 export function useSaveWorkflowPlan(workflowId: string) {
   const onSuccess = useWorkflowSaved();
   return useMutation({
-    mutationFn: async (proposal: {
-      steps: WorkflowStep[];
-      description?: string;
-      expected_description?: string;
-      description_source?: string;
-    }) => {
-      const path = workflowPath(workflowId);
-      const res = await sendWorkflow(path, "PATCH", proposal);
-      if (proposal.expected_description !== undefined && (await refusesExpectedDescription(res)))
-        return writeWorkflow(path, "PATCH", { steps: proposal.steps });
-      return savedWorkflow(res);
+    mutationFn: (proposal: PlanSave) => savePlan(workflowId, proposal),
+    onSuccess,
+  });
+}
+
+/**
+ * Set a step's time limit, or clear it for null, from the step's menu. The plan is read again
+ * just before the write and only that step changes, so steps saved elsewhere meanwhile stay;
+ * a description goes as in {@link useSaveWorkflowPlan}.
+ */
+export function useSaveStepTimeLimit(workflowId: string) {
+  const queryClient = useQueryClient();
+  const onSuccess = useWorkflowSaved();
+  return useMutation({
+    mutationFn: async ({
+      stepId,
+      limit,
+      ...description
+    }: DescriptionSave & { stepId: string; limit: string | null }) => {
+      const res = await authenticatedFetch(workflowPath(workflowId));
+      if (!res.ok) throw await apiErrorFromResponse(res);
+      const { steps = [] } = (await res.json()) as WorkflowDetail;
+      if (!steps.some((step) => step.id === stepId))
+        throw new Error("The step is no longer in the saved plan.");
+      return savePlan(workflowId, {
+        ...description,
+        steps: steps.map((step) =>
+          step.id === stepId ? { ...step, goal: withChosenTimeLimit(step.goal, limit) } : step,
+        ),
+      });
     },
     onSuccess,
+    // The page may show an older plan, so it reads the saved one again.
+    onError: () => void queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] }),
   });
 }
 

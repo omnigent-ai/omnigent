@@ -312,8 +312,9 @@ interface StorePatch {
 }
 
 // Answers PATCH like the workflow store: a description applies only while the stored one is
-// still `expected_description`, and keeps the proposal it was saved with as its source. With
-// `hold` set, PATCHes wait for `release`; with `fail` set, they're refused.
+// still `expected_description`, keeps the proposal it was saved with as its source, and keeps
+// its time through writes that leave it. With `hold` set, PATCHes wait for `release`; with
+// `fail` set, they're refused.
 function serveLikeTheStore(initial: WorkflowDetail) {
   const held: (() => void)[] = [];
   const server = {
@@ -344,6 +345,7 @@ function serveLikeTheStore(initial: WorkflowDetail) {
         body.description !== undefined &&
         (body.expected_description === undefined ||
           body.expected_description === stored.description);
+      const now = (stored.updated_at ?? 0) + 100;
       server.stored = {
         ...stored,
         steps: body.steps ?? stored.steps,
@@ -351,7 +353,10 @@ function serveLikeTheStore(initial: WorkflowDetail) {
         description_source: describes
           ? (body.description_source ?? null)
           : stored.description_source,
-        updated_at: (stored.updated_at ?? 0) + 100,
+        description_updated_at: describes
+          ? now
+          : (stored.description_updated_at ?? stored.updated_at),
+        updated_at: now,
       };
     }
     return new Response(JSON.stringify(server.stored));
@@ -755,6 +760,64 @@ describe("WorkflowDetailPage", () => {
 
     expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
     expect(screen.getByText(newDescription)).toBeInTheDocument();
+  });
+
+  it("keeps offering the first proposal's description when it arrives while a time limit saves", async () => {
+    // The planning chat has no proposal yet, so the save records no description source.
+    const { patches, server, release } = await workflowWithProposals(WORKFLOW.steps, []);
+    server.hold = true;
+    const view = renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]).not.toHaveProperty("description_source");
+
+    // Its first proposal, the saved steps with a new description, comes before the save lands.
+    const newDescription = "Finds flaky tests and fixes the worst one.";
+    mockJournal([plan(50, WORKFLOW.steps, newDescription)]);
+    view.rerender(<WorkflowDetailPage />);
+    await release();
+    await waitFor(() =>
+      expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
+    );
+    expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
+    expect(screen.getByText(newDescription)).toBeInTheDocument();
+  });
+
+  it("sets a time limit in the plan as saved now, not the page's older copy", async () => {
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
+    renderPage();
+    const limit = await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" });
+
+    // Another page saves a new step meanwhile; it stays.
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    server.stored = { ...server.stored, steps: [...WORKFLOW.steps, report] };
+    fireEvent.click(limit);
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.steps).toEqual([
+      WORKFLOW.steps[0],
+      { ...WORKFLOW.steps[1], goal: "The suite passes\n\n**Time limit:** 4 hours" },
+      report,
+    ]);
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+        "Explore the failures, Fix the test, Report",
+      ),
+    );
+
+    // A step removed meanwhile gets no limit, and the page shows the plan as saved.
+    server.stored = { ...server.stored, steps: [WORKFLOW.steps[0]!] };
+    fireEvent.click(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        "Couldn’t save the time limit. The step is no longer in the saved plan.",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+        /^Explore the failures$/,
+      ),
+    );
+    expect(patches).toHaveLength(1);
   });
 
   it("offers time limits only to the owner, and not while a proposal is unsaved", () => {

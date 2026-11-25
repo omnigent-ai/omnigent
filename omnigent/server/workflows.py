@@ -175,6 +175,7 @@ def _object(
         steps=[WorkflowStep(**step) for step in workflow.steps],
         planning_session_id=workflow.planning_session_id,
         description_source=workflow.description_source,
+        description_updated_at=workflow.description_updated_at,
     )
 
 

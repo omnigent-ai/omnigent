@@ -43,6 +43,7 @@ import {
   useCloneWorkflow,
   useWorkflow,
   useWorkflowRuns,
+  useSaveStepTimeLimit,
   useSaveWorkflowDescription,
   useSaveWorkflowPlan,
   WorkflowNotFoundError,
@@ -60,12 +61,7 @@ import { UNSHAREABLE_WORKFLOW_MESSAGE, workflowSharingAvailable } from "@/lib/pe
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
-import {
-  splitTimeLimit,
-  withSavedTimeLimits,
-  withStepTimeLimit,
-  withTimeLimitLength,
-} from "@/lib/stepTimeLimit";
+import { splitTimeLimit, withSavedTimeLimits } from "@/lib/stepTimeLimit";
 import { ApiError } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 
@@ -130,7 +126,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     source,
   );
   const savePlan = useSaveWorkflowPlan(workflowId);
-  const saveTimeLimit = useSaveWorkflowPlan(workflowId);
+  const saveTimeLimit = useSaveStepTimeLimit(workflowId);
   useEffect(() => {
     if (plannerFlash === 0) return;
     const timer = setTimeout(() => setPlannerFlash(0), PLANNING_CHAT_FLASH_MS);
@@ -185,12 +181,14 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   // Where the description's source sits in this journal: null when it came from another
   // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
-  // Only a proposal newer than that source, or else than the workflow's last write in whole
+  // Only a proposal newer than that source, or else than the description's last write in whole
   // seconds (a tie keeps the description), offers its description, so an edit made since stands.
+  // An older server keeps no such time, so the workflow's last write stands in for it.
+  const describedAt = workflow.description_updated_at ?? workflow.updated_at ?? 0;
   const proposalIsNewer =
     proposal !== null &&
     (!source || sourceAt === null
-      ? proposal.created_at > (workflow.updated_at ?? 0)
+      ? proposal.created_at > describedAt
       : sourceAt !== undefined && proposal.position > sourceAt);
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
   // A different description is only offered: Save plan keeps the current one unless accepted.
@@ -233,21 +231,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const changeTimeLimit = ({ stepId, limit }: StepTimeLimitChange) =>
     saveTimeLimit.mutate(
       {
-        steps: workflow.steps.map((step) =>
-          step.id === stepId
-            ? {
-                ...step,
-                goal:
-                  limit === null
-                    ? withStepTimeLimit(step.goal, null)
-                    : withTimeLimitLength(step.goal, limit),
-              }
-            : step,
-        ),
-        // The menu shows only while no proposal is offered, so the description stands over the
-        // current one; recording that keeps a later proposal's offer from going by this save's time.
-        // While the description's own source can't be placed, as after a failed lookup, nothing is
-        // recorded, so a proposal not offered yet stays unhandled.
+        stepId,
+        limit,
+        // Record the current proposal as the description's source (none is offered while the
+        // menu shows), unless the existing source can't be placed yet.
         ...(proposal && (!source || sourceAt !== undefined)
           ? {
               description: workflow.description,

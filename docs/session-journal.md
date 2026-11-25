@@ -469,7 +469,9 @@ it ran.
   applies only while the stored one is still that text. `description_source`
   names the planning-chat proposal the description was saved from or kept
   over; the workflow returns it until the description is written without one or
-  another planning chat is attached.
+  another planning chat is attached. The workflow's `description_updated_at` is
+  when the description was last written: a write that leaves it, such as a time
+  limit's change to the steps, keeps it.
 - `DELETE /v1/workflows/{id}`: deletes it, then who it was shared with.
 
 ### Sharing a workflow
