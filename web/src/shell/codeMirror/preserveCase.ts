@@ -31,8 +31,11 @@ export function withCaseOf(matched: string, replacement: string): string {
   }
   if (matched.toUpperCase() === matched) return replacement.toUpperCase();
   if (matched.toLowerCase() === matched) return replacement.toLowerCase();
-  const first = matched[0] ?? "";
-  if (hasUppercase(first)) return replacement[0]!.toUpperCase() + replacement.slice(1);
-  if (first.toUpperCase() !== first) return replacement[0]!.toLowerCase() + replacement.slice(1);
+  // Whole code points, so an initial beyond the BMP isn't split into its surrogates.
+  const first = String.fromCodePoint(matched.codePointAt(0)!);
+  const initial = String.fromCodePoint(replacement.codePointAt(0)!);
+  const rest = replacement.slice(initial.length);
+  if (hasUppercase(first)) return initial.toUpperCase() + rest;
+  if (first.toUpperCase() !== first) return initial.toLowerCase() + rest;
   return replacement;
 }

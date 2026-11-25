@@ -12,6 +12,10 @@ describe("withCaseOf", () => {
     ["parts that don't line up use the whole word", "Foo-bar", "baz", "Baz"],
     ["digits and symbols count as both cases", "123", "baz", "BAZ"],
     ["non-Latin capitals are kept", "Ärger", "öl", "Öl"],
+    // Deseret letters lie outside the Basic Multilingual Plane: each is two UTF-16 units.
+    ["a capital initial beyond the BMP capitalises", "\u{10400}\u{10428}", "word", "Word"],
+    ["a capital initial capitalises one beyond the BMP", "Title", "\u{10428}x", "\u{10400}x"],
+    ["a lower initial beyond the BMP lowers one", "\u{10428}\u{10400}", "\u{10400}X", "\u{10428}X"],
   ])("%s", (_case, matched, replacement, expected) => {
     expect(withCaseOf(matched, replacement)).toBe(expected);
   });
