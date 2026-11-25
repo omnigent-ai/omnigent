@@ -23,6 +23,8 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useIsMacPullRequestScope } from "@/hooks/macPullRequestScope";
+import { isRunnerUnavailable503, RunnerOfflineError } from "@/lib/workspaceReadErrors";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -60,6 +62,8 @@ export function useSessionActive(conversationId: string | undefined): boolean {
 export function useWorkspaceServeable(conversationId: string | undefined): boolean | undefined {
   const runnerOnline = useSessionRunnerOnline(conversationId);
   const hostOnline = useSessionHostOnline(conversationId);
+  // A session-free PR view has no host to ask.
+  if (useIsMacPullRequestScope(conversationId)) return false;
   if (runnerOnline !== false) return runnerOnline; // online or unknown → serve
   // Runner known-offline: block only when the host is *known* unavailable
   // (`false` down, `null` not host-bound). While host liveness is still
@@ -134,21 +138,6 @@ export interface WorkspaceChangedFile {
 export interface WorkspaceChangedFilesResult {
   available: boolean;
   data: WorkspaceChangedFile[];
-}
-
-/**
- * The session's runner is bound but not currently connected (the server's
- * `runner_unavailable` error, HTTP 503). For host-bound sessions this is
- * recoverable — sending a message wakes the runner — so callers render a
- * "reconnect" hint instead of a raw error. Distinct from a 404 (no OS
- * environment at all, e.g. a cloud-only agent), which degrades to
- * `available: false`.
- */
-export class RunnerOfflineError extends Error {
-  constructor() {
-    super("runner offline");
-    this.name = "RunnerOfflineError";
-  }
 }
 
 /**
@@ -236,18 +225,6 @@ export function useWorkspaceAsleep(conversationId: string | undefined): boolean 
     turnActive,
   });
   return liveness.kind === "host_asleep";
-}
-
-/** Whether `res` is the app's runner-offline 503 response. */
-export async function isRunnerUnavailable503(res: Response): Promise<boolean> {
-  if (res.status !== 503) return false;
-  try {
-    const body = (await res.json()) as { error?: { code?: string } };
-    return body?.error?.code === "runner_unavailable";
-  } catch {
-    // Non-JSON body (gateway/front-door 503) → not the app error.
-    return false;
-  }
 }
 
 interface ChangedFilesResponse {
@@ -1496,3 +1473,5 @@ export function useWorkspaceDirectories(
     combine,
   });
 }
+
+export { isRunnerUnavailable503, RunnerOfflineError } from "@/lib/workspaceReadErrors";

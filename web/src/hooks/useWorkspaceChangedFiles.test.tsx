@@ -21,6 +21,7 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { MacPullRequestScopeContext } from "@/hooks/macPullRequestScope";
 import { useSession } from "@/hooks/useSession";
 import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
@@ -2817,5 +2818,21 @@ describe("useTrailingInvalidate", () => {
       queryKey: ["workspace-changed-files", "conv-1"],
     });
     expect(invalidate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useWorkspaceServeable in a session-free pull request view", () => {
+  it("has no host to ask, though the session's runner is online", () => {
+    vi.mocked(useSessionRunnerOnline).mockReturnValue(true);
+    vi.mocked(useSessionHostOnline).mockReturnValue(true);
+    const scoped = renderHook(() => useWorkspaceServeable("pull-requests-page"), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <MacPullRequestScopeContext.Provider value="pull-requests-page">
+          {children}
+        </MacPullRequestScopeContext.Provider>
+      ),
+    });
+    expect(scoped.result.current).toBe(false);
+    expect(renderHook(() => useWorkspaceServeable("conv-1")).result.current).toBe(true);
   });
 });
