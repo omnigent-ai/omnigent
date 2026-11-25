@@ -1949,7 +1949,11 @@ async def test_listings_sharing_a_failed_scan_each_report_it_and_the_next_listin
     try:
         await poll_until_async(status_started.is_set, timeout_s=budget(5))
         # Breaks the next scan; the running one already chose its repositories.
-        (workspace / "broken" / ".git").mkdir(parents=True)
+        broken = workspace / "broken"
+        subprocess.run(
+            ["git", "init", str(broken)], env=_git_env(), check=True, capture_output=True
+        )
+        (broken / ".git" / "HEAD").write_text("not a ref\n")
         late = [asyncio.create_task(client.get(path)) for _ in range(3)]
         await poll_until_async(lambda: len(arrivals) == 4, timeout_s=budget(5))
     finally:
