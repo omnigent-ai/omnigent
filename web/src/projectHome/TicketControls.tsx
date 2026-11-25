@@ -201,8 +201,8 @@ function NeedsWhomBadge({ whom, question }: { whom: NeedsWhom; question?: string
       <NeedsResponseBadge
         title={question}
         data-testid="needs-you"
-        // The accent darkened for white text to meet AA contrast (5.4:1 on the default pink).
-        className="bg-[color-mix(in_srgb,var(--brand-accent)_85%,black)] text-white dark:text-white"
+        // The accent darkened per theme for AA contrast with white text; see index.css.
+        className="needs-you-tag"
       >
         Needs you
       </NeedsResponseBadge>

@@ -3007,3 +3007,12 @@ main[data-shell-header="hidden"] .extension-view-host {
 main[data-shell-header="hidden"] .extension-view-status {
   top: 0;
 }
+
+/* "Needs you" tag: the theme's accent, darkened only as far as white text needs.
+ * Capping OKLCH lightness at 0.5 keeps every theme's hue and gives at least 4.5:1
+ * with white (AA). Browsers without relative colors keep the mixed fallback. */
+.needs-you-tag {
+  background-color: color-mix(in srgb, var(--brand-accent) 85%, black);
+  background-color: oklch(from var(--brand-accent) min(l, 0.5) c h);
+  color: white;
+}
