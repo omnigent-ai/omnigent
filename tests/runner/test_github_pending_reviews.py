@@ -317,6 +317,30 @@ def test_no_review_of_the_viewers_reads_as_none(fake: FakeGitHub, review: Any) -
         pending_reviews.own_pending_review("/workspace", PR)
 
 
+@pytest.mark.parametrize(
+    "pull_request",
+    [
+        {"reviews": None},
+        {},
+        {"reviews": {"nodes": None}},
+        {"reviews": {"nodes": [None]}},
+    ],
+    ids=["null-reviews", "missing-reviews", "null-nodes", "null-review"],
+)
+def test_reviews_github_failed_to_read_are_refused_not_taken_for_none(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, pull_request: dict[str, Any]
+) -> None:
+    """A partial answer, such as one with an error on reviews, must not read as no review."""
+    answer = {"id": "PR_1", "headRefOid": HEAD, "baseRefOid": BASE, **pull_request}
+    monkeypatch.setattr(pending_reviews, "pull_request_node", lambda *_args: answer)
+
+    with pytest.raises(PullRequestError, match="couldn't read your pending review"):
+        _read()
+    with pytest.raises(PullRequestError, match="couldn't read your pending review"):
+        pending_reviews.own_pending_review("/workspace", PR)
+    assert fake.graphql_reads == []
+
+
 def test_a_kept_answer_stands_in_until_the_review_moves(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
 ) -> None:

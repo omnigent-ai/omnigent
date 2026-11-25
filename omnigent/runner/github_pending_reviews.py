@@ -84,9 +84,15 @@ _THREADS_QUERY = (
 
 
 def own_pending_node(pull_request: dict[str, Any]) -> dict[str, Any] | None:
-    """The PR's latest pending review, only where the viewer wrote it."""
-    nodes = (pull_request.get("reviews") or {}).get("nodes") or []
-    review = nodes[0] if nodes and isinstance(nodes[0], dict) else None
+    """The PR's latest pending review, only where the viewer wrote it.
+
+    A reviews connection GitHub failed to read is refused, not taken for no review.
+    """
+    reviews = pull_request.get("reviews")
+    nodes = reviews.get("nodes") if isinstance(reviews, dict) else None
+    if not isinstance(nodes, list) or (nodes and not isinstance(nodes[0], dict)):
+        raise PullRequestError(_UNREADABLE)
+    review = nodes[0] if nodes else None
     if not review or not isinstance(review.get("id"), str) or not review["id"]:
         return None
     return review if review.get("viewerDidAuthor") is True else None
