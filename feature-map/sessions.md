@@ -179,7 +179,8 @@ the header menu), and each place is a separate entry point.
   which the server still lists the session's host offline (usually because the
   host came back under a new ID), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
-- `host-recovery`: individually opted-in hosts request continuation after their
+- `host-recovery`: hosts (on by default; `host.recover_interrupted_sessions: false`
+  opts out) request continuation after their
   local state is ready. Lost runners resume witnessed interrupted root tasks with
   a hidden system-tagged prompt; Stop, newer input, approvals, and archive win.
   Completed turns stay stopped. Automatic launch retries are bounded and survive

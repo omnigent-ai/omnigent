@@ -297,14 +297,15 @@ credential context; the default context is a no-op.
 
 ## Automatic continuation after a host restart
 
-A host opts in through its own `config.yaml`:
+Hosts continue their interrupted sessions by default. To keep continuation
+manual on a host, turn it off in that host's own `config.yaml`:
 
 ```yaml
 host:
-  recover_interrupted_sessions: true
+  recover_interrupted_sessions: false
 ```
 
-Restart the host process to apply the setting. It advertises this opt-in on its
+Restart the host process to apply the setting. It advertises its choice on its
 current authenticated connection and requests recovery every 30 seconds with its
 live runner IDs. No server-side host preference is stored. This works for ordinary
 machines as well as provider hosts; a stable host identity is required.
@@ -316,12 +317,13 @@ sandbox:
   provider: kubernetes
   host_config:
     host:
-      recover_interrupted_sessions: true
+      recover_interrupted_sessions: false
 ```
 
 Provider membership and launch-token provenance do not grant recovery permission.
-Omitting the host flag, setting it to `false`, or using an older host keeps manual
-continuation. Existing controllers remain unchanged. Opt-out closes existing
+Setting the host flag to `false`, or using a host built before this default,
+keeps manual continuation. Older hosts that omit the flag are never assumed to
+recover. Existing controllers remain unchanged. Opt-out closes existing
 recovery episodes; re-enabling does not revive completed or stopped work.
 
 Stock server entrypoints permit host opt-in. Embedded `create_app` integrations

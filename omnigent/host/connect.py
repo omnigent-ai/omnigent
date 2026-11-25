@@ -1307,6 +1307,19 @@ class HostRetryableConnectionError(Exception):
     """Server-reported channel failure that should use reconnect backoff."""
 
 
+def recover_interrupted_sessions_enabled(host_config: object) -> bool:
+    """Whether this host asks the server to continue its interrupted sessions.
+
+    On unless the ``host`` section of ``config.yaml`` sets
+    ``recover_interrupted_sessions: false``.
+
+    :param host_config: The ``host`` section, e.g. ``{"recover_interrupted_sessions": False}``.
+    """
+    if not isinstance(host_config, dict):
+        return True
+    return host_config.get("recover_interrupted_sessions", True) is not False
+
+
 class HostProcess:
     """Manages the host daemon lifecycle.
 
@@ -1358,10 +1371,8 @@ class HostProcess:
         self._runners: dict[str, _RunnerHandle] = {}
         from omnigent.onboarding.provider_config import load_config
 
-        host_config = load_config().get("host", {})
-        self._recover_interrupted_sessions = (
-            isinstance(host_config, dict)
-            and host_config.get("recover_interrupted_sessions") is True
+        self._recover_interrupted_sessions = recover_interrupted_sessions_enabled(
+            load_config().get("host", {})
         )
         from omnigent.host.skills import HostSkillDiscovery
 

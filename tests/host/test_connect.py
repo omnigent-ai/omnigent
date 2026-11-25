@@ -12786,6 +12786,31 @@ async def test_mcp_activation_launch_frame_to_runner_environment(activation):
     )
 
 
+@pytest.mark.parametrize(
+    ("host_config", "enabled"),
+    [
+        ({}, True),
+        ({"recover_interrupted_sessions": True}, True),
+        ({"recover_interrupted_sessions": False}, False),
+        (None, True),
+    ],
+    ids=["no-key", "explicit-true", "explicit-false", "no-host-section"],
+)
+def test_interrupted_session_recovery_is_on_unless_turned_off(
+    monkeypatch: pytest.MonkeyPatch, host_config: object, enabled: bool
+) -> None:
+    from omnigent.host.connect import recover_interrupted_sessions_enabled
+
+    assert recover_interrupted_sessions_enabled(host_config) is enabled
+    config = {} if host_config is None else {"host": host_config}
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", lambda: config)
+    host = _make_host_process()
+    try:
+        assert host._recover_interrupted_sessions is enabled
+    finally:
+        _cleanup_host(host)
+
+
 async def test_host_recovery_loop_uses_opt_in_and_current_inventory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
