@@ -839,6 +839,62 @@ def test_a_non_github_pull_request_is_refused(monkeypatch: pytest.MonkeyPatch) -
         )
 
 
+def _chosen_login_signed_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A login is chosen for the repository, but the host has no token for it at the write.
+
+    The checks before the write read with the token they're given; the write's lookup fails.
+    """
+    monkeypatch.setattr(
+        github,
+        "_pr_token",
+        lambda _root, _reference: TOKEN if github._gh_deadline.get() is None else None,
+    )
+    monkeypatch.setattr(github, "_in_sandbox", lambda: False)
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repository: "octocat")
+
+
+def test_a_mutation_for_a_signed_out_chosen_login_is_never_sent(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sending it would run it as the host's active account instead of the chosen one."""
+    _chosen_login_signed_out(monkeypatch)
+    with pytest.raises(ValueError, match="octocat isn't signed in on the host") as refused:
+        _resolve()
+    assert not isinstance(refused.value, UnknownOutcomeError)
+    assert fake.mutations("resolveReviewThread") == []
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_comment_change_for_a_signed_out_chosen_login_is_never_sent(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    monkeypatch.setattr(github_reviews, "_own_comment", lambda *_args, **_kwargs: fake.comment)
+    _chosen_login_signed_out(monkeypatch)
+    with pytest.raises(ValueError, match="octocat isn't signed in on the host"):
+        _change_comment(action)
+    assert _rest_writes(fake) == []
+
+
+@pytest.mark.parametrize("chosen", [None, "octocat"], ids=["no-login-chosen", "sandbox"])
+def test_a_write_without_a_token_runs_where_no_login_is_chosen_or_in_a_sandbox(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, chosen: str | None
+) -> None:
+    """With no login chosen gh's active account is the one meant; a sandbox has only its own."""
+    monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: None)
+    monkeypatch.setattr(github, "_in_sandbox", lambda: chosen is not None)
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repository: chosen)
+    tokens: list[str | None] = []
+
+    def json_write(root: str, **kwargs: Any) -> tuple[int, str, str]:
+        tokens.append(kwargs["token"])
+        return fake._json_write(root, **{**kwargs, "token": TOKEN})
+
+    monkeypatch.setattr(github, "_pr_json_write", json_write)
+    _resolve()
+    assert len(fake.mutations("resolveReviewThread")) == 1
+    assert tokens[-1] is None
+
+
 def test_failure_classes_name_the_host_and_never_the_token() -> None:
     # Each input carries the token, as a verbose gh might print it.
     cases = {
