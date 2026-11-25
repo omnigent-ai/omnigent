@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ConnectionState } from "@/components/blocks/TerminalSession";
-import type { TerminalSplitState } from "@/lib/paneSplitLayout";
+import { type TerminalSplitState, terminalLayoutKeys } from "@/lib/paneSplitLayout";
 
 import {
   isPaneShellEnded,
@@ -55,7 +55,7 @@ function memoryTarget(initial: TerminalSplitState) {
 }
 
 const panesOf = (state: TerminalSplitState | undefined): string[] =>
-  JSON.stringify(state?.layout ?? null).match(/terminal:[\w-]+/g) ?? [];
+  state ? terminalLayoutKeys(state.layout) : [];
 
 afterEach(resetEndedPaneShellsForTests);
 
