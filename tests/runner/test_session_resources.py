@@ -1096,8 +1096,13 @@ async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_rea
     monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
     path = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"
     requests = [asyncio.create_task(client.get(path)) for _ in range(3)]
-    while probes == 0:
-        await asyncio.sleep(0)
+
+    async def probe_started() -> None:
+        while probes == 0:
+            await asyncio.sleep(0)
+
+    # Bounded, so a request that never probes fails here instead of hanging.
+    await asyncio.wait_for(probe_started(), timeout=5)
     for _ in range(5):
         await asyncio.sleep(0)
     release.set()

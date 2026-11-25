@@ -12352,33 +12352,43 @@ async def test_terminal_shell_answers_every_miss_with_the_same_404(
     assert resp.json() == _TERMINAL_NOT_FOUND
 
 
+_INSPECT_FAILED = '{"detail":"Couldn\'t inspect the terminal."}'
+_CANT_INSPECT = (
+    '{"error":{"code":"runner_unavailable",'
+    '"message":"This session\'s runner can\'t inspect terminals."}}'
+)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("runner", "status"),
+    ("runner", "status", "body"),
     [
         (
             _FakeRunnerClient(status_code=500, payload={"error": {"message": "ps: 900 secret"}}),
             502,
+            _INSPECT_FAILED,
         ),
-        (_FakeRunnerClient(responses={_SHELL_PATH: (404, {"detail": "Not Found"})}), 503),
-        (_FakeRunnerClient(exc=httpx.ConnectError("runner at 10.0.0.9 refused")), 502),
+        (
+            _FakeRunnerClient(responses={_SHELL_PATH: (404, {"detail": "Not Found"})}),
+            503,
+            _CANT_INSPECT,
+        ),
+        (
+            _FakeRunnerClient(exc=httpx.ConnectError("runner at 10.0.0.9 refused")),
+            502,
+            _INSPECT_FAILED,
+        ),
     ],
     ids=["runner error", "older runner", "unreachable"],
 )
 async def test_terminal_shell_turns_runner_failures_into_fixed_messages(
-    client: httpx.AsyncClient, runner: _FakeRunnerClient, status: int
+    client: httpx.AsyncClient, runner: _FakeRunnerClient, status: int, body: str
 ) -> None:
     set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
 
     resp = await client.get(_SHELL_PATH)
 
-    assert resp.status_code == status
-    assert "secret" not in resp.text and "10.0.0.9" not in resp.text
-    assert resp.text in (
-        '{"detail":"Couldn\'t inspect the terminal."}',
-        '{"error":{"code":"runner_unavailable",'
-        '"message":"This session\'s runner can\'t inspect terminals."}}',
-    )
+    assert (resp.status_code, resp.text) == (status, body)
 
 
 class _UnroutableRunnerRouter(_FakeRunnerRouter):
