@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { replaceEmojiShortcodes } from "./emojiShortcodes";
+import { MAX_EMOJI_SHORTCODE_TEXT_LENGTH, replaceEmojiShortcodes } from "./emojiShortcodes";
 
 describe("replaceEmojiShortcodes", () => {
   it.each([
@@ -13,29 +13,30 @@ describe("replaceEmojiShortcodes", () => {
   it.each([
     ["unknown name", "see :not_an_emoji_name:"],
     ["no shortcode", "a plain comment"],
-    ["inline code", "use `:rocket:` literally"],
-    ["fenced code", "```\nkey: :tada:\n```"],
     ["an unclosed fence", "```\n:rocket:"],
+    ["a fence closed by a shorter run", "````\n:rocket:\n```\n:tada:"],
+    ["a fence closed by the other character", "```\n:rocket:\n~~~\n:tada:"],
+    ["a non-breaking space after a closing run", "~~~\n~~~ \n:rocket:\n~~~"],
+    ["a fence in a blockquote", "> ~~~\n> :rocket:\n> ~~~"],
   ])("keeps %s as written", (_label, input) => {
     expect(replaceEmojiShortcodes(input)).toBe(input);
   });
 
-  it("converts outside a code span while keeping its contents", () => {
-    expect(replaceEmojiShortcodes(":rocket: `:rocket:` :rocket:")).toBe("🚀 `:rocket:` 🚀");
-  });
-
   it.each([
-    [
-      "a shorter or mismatched run",
-      "```\n:rocket:\n``\n~~~\n:rocket:",
-      "```\n:rocket:\n``\n~~~\n:rocket:",
-    ],
+    ["an inline span", ":rocket: `:rocket:` :tada:", "🚀 `:rocket:` 🎉"],
     ["a closed fence", "```\n:rocket:\n```\nafter :tada:", "```\n:rocket:\n```\nafter 🎉"],
     ["a longer closing run", "```\n:rocket:\n````\nafter :tada:", "```\n:rocket:\n````\nafter 🎉"],
     ["a tilde fence", "~~~\n:rocket:\n~~~\nafter :tada:", "~~~\n:rocket:\n~~~\nafter 🎉"],
     ["CRLF lines", "```\r\n:rocket:\r\n```\r\nafter :tada:", "```\r\n:rocket:\r\n```\r\nafter 🎉"],
+    ["a fence in a list item", "- ```\n  :rocket:\n  ```\n:tada:", "- ```\n  :rocket:\n  ```\n🎉"],
+    ["an indented code block", "    :rocket:\n\nafter :tada:", "    :rocket:\n\nafter 🎉"],
     ["a backtick run with a backtick after it", "```a` :rocket:", "```a` 🚀"],
-  ])("ends code only at a matching fence: %s", (_label, input, expected) => {
+  ])("keeps code literal and converts prose around %s", (_label, input, expected) => {
     expect(replaceEmojiShortcodes(input)).toBe(expected);
+  });
+
+  it("leaves a body longer than the limit as written", () => {
+    const body = `:rocket: ${"x".repeat(MAX_EMOJI_SHORTCODE_TEXT_LENGTH)}`;
+    expect(replaceEmojiShortcodes(body)).toBe(body);
   });
 });
