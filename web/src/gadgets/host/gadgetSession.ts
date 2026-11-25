@@ -413,11 +413,17 @@ export async function openGadgetSession(
     reveal = true,
     railSessionId,
     onDelivered,
+    signal,
   }: {
     deliver: boolean;
     actionId?: string;
     reveal?: boolean;
     railSessionId?: string;
+    /**
+     * Cancels a call whose message hasn't left: checked after each lookup, before anything is
+     * sent, queued as pending or navigated to.
+     */
+    signal?: AbortSignal;
     /**
      * For a request left in New session (`"starting"`): called once the session started there
      * got it in its first message. Never called when New session is left, or its prompt sent
@@ -426,6 +432,9 @@ export async function openGadgetSession(
     onDelivered?: (sessionId: string) => void;
   },
 ): Promise<"sent" | "starting"> {
+  const stopIfCancelled = (): void => {
+    if (signal?.aborted) throw new BridgeError("CANCELLED", "The call was cancelled.");
+  };
   // Only the viewer's gadget session gets an action; a failed lookup sends nothing.
   let target = railSessionId;
   let show = reveal;
@@ -445,6 +454,7 @@ export async function openGadgetSession(
       show = false;
     }
   }
+  stopIfCancelled();
   if (target !== undefined) {
     if (deliver) {
       try {
@@ -456,6 +466,7 @@ export async function openGadgetSession(
     return "sent";
   }
   const sessionId = registered !== undefined ? registered : await getGadgetGadgetSession(app.id);
+  stopIfCancelled();
   if (sessionId !== null) {
     try {
       if (deliver) {
@@ -528,6 +539,7 @@ export async function requestGadgetAction(
     actionId: entry.id,
     reveal: false,
     railSessionId,
+    signal,
   });
   return { actionId: entry.id, delivery };
 }

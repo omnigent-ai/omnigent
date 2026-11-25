@@ -72,7 +72,7 @@ type Handler = (
   req: unknown,
   res: (...transforms: Transform[]) => MockResult,
   ctx: MockContext,
-) => MockResult;
+) => MockResult | Promise<MockResult>;
 interface MockContext {
   json: (body: unknown) => Transform;
   status: (status: number) => Transform;
@@ -125,6 +125,9 @@ function createFakeServer() {
     use(...added: Route[]) {
       routes = [...added, ...routes];
     },
+    requests(method: string, path: string): RecordedRequest[] {
+      return requests.filter((r) => r.method === method.toUpperCase() && r.path === path);
+    },
     waitForRequest(method: string, path: string): Promise<RecordedRequest> {
       const found = requests.find((r) => r.method === method.toUpperCase() && r.path === path);
       if (found) return Promise.resolve(found);
@@ -151,7 +154,7 @@ function createFakeServer() {
       });
       const match = routes.find((r) => r.method === method && r.pattern.test(path));
       const result = match
-        ? match.handler(request, respond, mockContext)
+        ? await match.handler(request, respond, mockContext)
         : { status: 404, body: {} };
       return new Response(result.body === undefined ? null : JSON.stringify(result.body), {
         status: result.status,
@@ -435,6 +438,46 @@ describe("gadget session", () => {
     expect(await (await queued).json()).toMatchObject({ operation_id: "req-1" });
     expect(sendUserMessage).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["an existing gadget session", "s_1"],
+    ["no gadget session", null],
+  ])(
+    "sends, queues and opens nothing when cancelled while it looks up %s",
+    async (_label, sessionId) => {
+      let answer: () => void = () => {};
+      const answered = new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+      server.use(
+        rest.post(`${API}/app-1/actions`, (_req, res, ctx) =>
+          res(ctx.status(201), ctx.json(ENTRY)),
+        ),
+        rest.get(`${API}/app-1/session`, async (_req, res, ctx) => {
+          await answered;
+          return res(ctx.json({ session_id: sessionId, version: "v" }));
+        }),
+      );
+      const lookup = waitForRequest("get", `${API}/app-1/session`);
+      const controller = new AbortController();
+
+      const request = requestGadgetAction(
+        EDITOR,
+        { action: "run_card", params: { cardId: "c1" }, operationId: "req-1" },
+        navigate,
+        undefined,
+        controller.signal,
+      );
+      await lookup;
+      controller.abort();
+      answer();
+
+      await expect(request).rejects.toMatchObject({ code: "CANCELLED" });
+      expect(sendUserMessage).not.toHaveBeenCalled();
+      expect(navigate).not.toHaveBeenCalled();
+      expect(fakeServer.requests("post", `${API}/app-1/actions/act1/delivery`)).toHaveLength(0);
+    },
+  );
 
   it("still takes a message the session answers without queueing it", async () => {
     server.use(
