@@ -1067,11 +1067,13 @@ class SandboxHostLauncher(SandboxLifecycle):
         del resolve
 
     def host_online_failure_hint(self, sandbox_id: str) -> str | None:
-        """Suggest recovery when a scheduled launch times out before registration.
+        """Suggest recovery when a provisioned sandbox's host has not registered in time.
 
-        Called off the event loop, before cancellation and teardown. Prefer
-        cached observations; bound any I/O because a caller timeout cannot stop
-        a worker thread. Return user-safe guidance, never credentials, and keep
+        Called off the event loop when a scheduled launch times out, before its
+        cancellation and teardown, and again each time a message waiting on a
+        launch or wake times out while the launch continues. Prefer cached
+        observations; bound any I/O because a caller timeout cannot stop a
+        worker thread. Return user-safe guidance, never credentials, and keep
         unconfirmed causes conditional. ``None`` preserves the generic error.
 
         :param sandbox_id: The provisioned sandbox that has not registered.
