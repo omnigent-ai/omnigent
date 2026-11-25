@@ -5537,6 +5537,7 @@ def create_app(
                     )
                     # Idle trees reinitialize on demand; active trees recover now.
                     if not initialize_runtime:
+                        runner_session_initializer.defer(conv, connection.generation)
                         _logger.info(
                             "Deferred runner session init until first use: session=%s reason=%s",
                             conv.id,

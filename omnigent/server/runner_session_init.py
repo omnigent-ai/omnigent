@@ -113,6 +113,8 @@ class RunnerSessionInitializer:
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[tuple[str, int, str, str, str | None, bool], str] = {}
+        # (runner_id, generation, session_id) whose connect init was deferred.
+        self._deferred: set[tuple[str, int, str]] = set()
 
     def log_decision(
         self,
@@ -154,6 +156,20 @@ class RunnerSessionInitializer:
         """Prevent delayed recovery work from following a replacement tunnel."""
         if self.generation_for(runner_id, runner_client) != generation:
             raise ConnectionError("runner tunnel changed during session recovery")
+
+    def defer(self, conversation: Conversation, generation: int) -> None:
+        """Remember that the runner connect left this session's init to its next use."""
+        if conversation.runner_id is not None and conversation.agent_id is not None:
+            self._deferred.add((conversation.runner_id, generation, conversation.id))
+
+    def is_deferred(self, conversation: Conversation, runner_client: httpx.AsyncClient) -> bool:
+        """Whether the runner connect deferred this session's init on its current tunnel."""
+        runner_id = conversation.runner_id
+        return (
+            runner_id is not None
+            and (runner_id, self.generation_for(runner_id, runner_client), conversation.id)
+            in self._deferred
+        )
 
     def is_initialized(self, conversation: Conversation, runner_client: httpx.AsyncClient) -> bool:
         """Whether initialization accepted this session on its current tunnel."""
@@ -480,6 +496,11 @@ class RunnerSessionInitializer:
         self, runner_id: str, *, generation: int | None = None
     ) -> list[asyncio.Task[httpx.Response]]:
         """Forget readiness and cancel work belonging to a retired connection."""
+        self._deferred = {
+            key
+            for key in self._deferred
+            if key[0] != runner_id or (generation is not None and key[1] != generation)
+        }
         for key in list(self._recovery_ids):
             if key[0] == runner_id and (generation is None or key[1] == generation):
                 self._recovery_ids.pop(key)

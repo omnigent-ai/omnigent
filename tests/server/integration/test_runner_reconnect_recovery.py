@@ -653,6 +653,71 @@ async def test_failed_binding_batch_does_not_strand_later_roots(
         )
 
 
+@pytest.mark.parametrize("kind", [None, "sub_agent"])
+async def test_message_after_idle_reconnect_runs_the_deferred_session_init(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str | None,
+) -> None:
+    """The deferred init must run before the first turn on an online runner.
+
+    The runner creates the session inbox (and redelivers retained sub-agent
+    results) only in its session init. Without it, ``sys_session_send`` fails
+    with "requires parent session inbox". A non-native sub-agent shares its
+    parent's runner state, so it still skips the init.
+    """
+    store = app.state.runner_router._conversation_store
+    root = store.create_conversation(agent_id=agent.id, runner_id=_RUNNER_ID)
+    store.set_session_live_status(root.id, "idle")
+    target = root
+    if kind is not None:
+        target = store.create_conversation(
+            agent_id=agent.id,
+            runner_id=_RUNNER_ID,
+            kind=kind,
+            parent_conversation_id=root.id,
+        )
+        store.set_session_live_status(target.id, "idle")
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        calls.append((request.url.path, body))
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"queued": True})
+        return httpx.Response(201, json={})
+
+    async def relay_ready(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        # Idle trees defer the init on runner connect.
+        assert [path for path, _ in calls] == []
+        monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", relay_ready)
+        response = await client.post(
+            f"/v1/sessions/{target.id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+        assert response.status_code in (200, 202), response.text
+
+    paths = [path for path, _ in calls]
+    events_path = f"/v1/sessions/{target.id}/events"
+    assert events_path in paths
+    inits = [body for path, body in calls if path == "/v1/sessions"]
+    if kind == "sub_agent":
+        assert inits == []
+        return
+    assert paths.index("/v1/sessions") < paths.index(events_path)
+    assert [body["session_id"] for body in inits] == [target.id]
+    assert inits[0]["session_init"]["suppress_recovery_turn"] is True
+
+
 @pytest.mark.parametrize("phase", ["listing", "attachment"])
 @pytest.mark.parametrize("dependent_kind", [None, "child", "mirror"])
 async def test_reconnect_skips_root_rebound_before_initialization(
