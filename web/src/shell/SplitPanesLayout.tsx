@@ -103,6 +103,16 @@ export interface SplitPanesLayoutProps {
    * background; the focused card's edge brightens instead of its row carrying an accent line.
    */
   cards?: boolean;
+  /**
+   * Whether a workspace tab dragged over the session's panes lands here, so this view marks itself
+   * for that drop and shows where the tab would open. Floating panes leave it to the main split.
+   */
+  tabDropTarget?: boolean;
+  /**
+   * Whether this view draws the tab drop's preview itself; off while it waits hidden under a chat
+   * shown alone, which draws the preview over itself instead.
+   */
+  tabDropPreview?: boolean;
   className?: string;
 }
 
@@ -137,6 +147,8 @@ export function SplitPanesLayout({
   refocusPane,
   paneDragOutside,
   cards = false,
+  tabDropTarget = false,
+  tabDropPreview = true,
   className,
 }: SplitPanesLayoutProps) {
   // The pointer drag on a divider or corner, from press to release: its sizes show over the latest
@@ -266,13 +278,13 @@ export function SplitPanesLayout({
   });
 
   // A sidebar tab dragged over the panes shows where it would open, as a dragged pane does.
-  const tabDrop = usePendingAppPaneDrop(conversationId);
+  const tabDrop = usePendingAppPaneDrop(tabDropTarget && tabDropPreview ? conversationId : null);
   const shownDrop = paneDrag.drop ?? tabDrop;
 
   return (
     <div
       ref={panesRef}
-      data-split-panes={conversationId}
+      data-split-panes={tabDropTarget ? conversationId : undefined}
       className={cn("relative min-h-0 flex-1", className)}
     >
       {paneKeys.map((key) => {

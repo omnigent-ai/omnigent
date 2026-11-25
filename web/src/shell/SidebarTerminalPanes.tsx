@@ -41,6 +41,7 @@ import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
 import { useTerminalPaneActions } from "./terminalPaneActions";
 import { unzoomPane, useZoomedPaneKey } from "./terminalPaneZoom";
 import { NO_MAIN_SPLIT_MEMBERS, useMainOwnedTerminalKeys } from "./terminalPlacement";
+import { useFloatingPanesShown } from "./useFloatingPanes";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 
 export interface SidebarTerminalPanesProps {
@@ -96,6 +97,7 @@ export function SidebarTerminalPanes({
 }: SidebarTerminalPanesProps) {
   const { terminals, listCompleteAt, isFetching } = useTerminals(conversationId);
   const listGeneration = useTerminalListGeneration(conversationId, terminals.length);
+  const floatingPanes = useFloatingPanesShown();
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
   // Splits are managed only by desktop owners; everyone else sees one shell per tab.
   const splitAllowed = usePanesSplitsAllowed(readOnly);
@@ -311,6 +313,8 @@ export function SidebarTerminalPanes({
           )
         }
         panesRef={panesRef}
+        // With floating panes a tab dragged over the panes opens in the main view's split only.
+        tabDropTarget={!floatingPanes}
         zoomedKey={zoomedKey}
         onUnzoom={(key) => {
           unzoomPane(target);

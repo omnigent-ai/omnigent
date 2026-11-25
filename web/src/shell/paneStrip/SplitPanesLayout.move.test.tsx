@@ -44,6 +44,8 @@ function setup({
   movable = true,
   outside = undefined as PaneDragOutside | undefined,
   toggleZoom = undefined as (() => void) | undefined,
+  tabDropTarget = true,
+  tabDropPreview = true,
 } = {}) {
   const onMovePane = vi.fn();
   const refocusPane = vi.fn();
@@ -72,6 +74,8 @@ function setup({
         onMovePane={movable ? onMovePane : undefined}
         refocusPane={refocusPane}
         paneDragOutside={outside}
+        tabDropTarget={tabDropTarget}
+        tabDropPreview={tabDropPreview}
       />
     </TooltipProvider>
   );
@@ -637,6 +641,31 @@ describe("SplitPanesLayout: off the split", () => {
     );
     expect(dropShown()).toBe("b:bottom");
     act(() => setPendingAppPaneDrop("c1", null));
+    expect(dropShown()).toBeUndefined();
+  });
+  it("stays the drop's target while hidden, leaving its preview to the chat shown over it", () => {
+    setup({ tabDropPreview: false });
+    expect(document.querySelector('[data-split-panes="c1"]')).not.toBeNull();
+    act(() =>
+      setPendingAppPaneDrop("c1", {
+        targetKey: "b",
+        side: "bottom",
+        area: { left: 50, top: 50, width: 50, height: 50 },
+      }),
+    );
+    expect(dropShown()).toBeUndefined();
+  });
+
+  it("leaves a sidebar tab's drop to the main split, showing none in the sidebar's panes", () => {
+    setup({ tabDropTarget: false });
+    expect(document.querySelector("[data-split-panes]")).toBeNull();
+    act(() =>
+      setPendingAppPaneDrop("c1", {
+        targetKey: "b",
+        side: "bottom",
+        area: { left: 50, top: 50, width: 50, height: 50 },
+      }),
+    );
     expect(dropShown()).toBeUndefined();
   });
 });

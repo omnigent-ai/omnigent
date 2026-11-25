@@ -486,6 +486,9 @@ function MainSplitPanes({
         }
         panesRef={panesRef}
         cards={splitCards}
+        tabDropTarget
+        // Hidden under a chat shown alone, floating panes leave the preview to that chat.
+        tabDropPreview={visible || !cards}
         zoomedKey={zoomedKey}
         onUnzoom={(key) => {
           unzoomPane(target);
