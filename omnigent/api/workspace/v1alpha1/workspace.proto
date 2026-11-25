@@ -1526,3 +1526,9 @@ message ReadPullRequestImageResponse {
   // The next part of the image. Concatenate every message's `data`.
   bytes data = 2;
 }
+
+// Attached to a refused pull request call's error: why it was refused, for a client to act on.
+message PullRequestFailure {
+  // One of "comment_changed", "pull_request_changed" or "invalid_input".
+  string reason = 1;
+}
