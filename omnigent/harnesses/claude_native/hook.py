@@ -448,6 +448,9 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     ap_server_url = config.get("ap_server_url")
     if not isinstance(ap_server_url, str) or not ap_server_url:
         return None
+    if config.get("relay_auth") is True:
+        # No bearer here to rotate with; the forwarder rotates instead.
+        return None
     raw_headers = config.get("ap_auth_headers")
     headers = (
         {str(key): str(value) for key, value in raw_headers.items()}
@@ -507,6 +510,9 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     config = read_permission_hook_config(bridge_dir)
     ap_server_url = config.get("ap_server_url")
     if not isinstance(ap_server_url, str) or not ap_server_url:
+        return None
+    if config.get("relay_auth") is True:
+        # No bearer here to rotate with; the forwarder rotates instead.
         return None
     raw_headers = config.get("ap_auth_headers")
     headers = (

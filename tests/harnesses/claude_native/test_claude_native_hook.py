@@ -1718,6 +1718,28 @@ def test_relay_auth_evaluate_policy_waits_for_the_relay(
     assert client.posts == [("http://127.0.0.1:47004/policies/evaluate", "Bearer relay-eval")]
 
 
+@pytest.mark.parametrize("rotate", ["clear", "fork"])
+def test_relay_auth_session_start_sends_no_rotation_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rotate: str
+) -> None:
+    """A relay-authenticated hook leaves /clear and fork rotation to the forwarder.
+
+    Its config holds no bearer, so a rotation request could only be rejected.
+    """
+    bridge_dir = _permission_bridge_with_stdin(tmp_path, monkeypatch, relay_auth=True)
+
+    def no_client(**_kwargs: object) -> None:
+        raise AssertionError("the hook sent a rotation request it can't authenticate")
+
+    monkeypatch.setattr(httpx, "Client", no_client)
+    rotation = {
+        "clear": claude_native_hook._rotate_session_on_clear,
+        "fork": claude_native_hook._rotate_session_on_fork,
+    }[rotate]
+
+    assert rotation(bridge_dir) is None
+
+
 def _assert_chat_fallback(stdout: str) -> None:
     """
     Assert the hook denied a question with the ask-in-chat hint.

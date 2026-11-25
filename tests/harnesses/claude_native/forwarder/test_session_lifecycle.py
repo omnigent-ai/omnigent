@@ -180,8 +180,8 @@ async def test_relay_auth_clear_banner_names_the_old_session_until_the_forwarder
     A relay-authenticated ``/clear`` is rotated by the forwarder, not the hook.
 
     Deliberate behavior change: the hook config of a runner-launched session
-    holds no bearer, so the SessionStart hook can't rotate before Claude prints
-    its banner, and the banner links the session being cleared. The forwarder
+    holds no bearer, so the SessionStart hook sends no rotation request before
+    Claude prints its banner, and the banner links the session being cleared. The forwarder
     then rotates from the recorded hook event with the runner's own client, so
     the bridge, and with it the web UI, moves to the new session.
     """
@@ -215,7 +215,7 @@ async def test_relay_auth_clear_banner_names_the_old_session_until_the_forwarder
     assert json.loads(capsys.readouterr().out) == {
         "systemMessage": "Open this session in Omnigent: http://127.0.0.1:8787/c/conv_old"
     }
-    assert hook_auth == [None], "the hook sent a bearer it should no longer hold"
+    assert hook_auth == [], "the hook sent a rotation request it can't authenticate"
     assert "omnigent_clear_rotated_to" not in (bridge_dir / "hooks.jsonl").read_text("utf-8")
     monkeypatch.setattr(httpx, "Client", real_client)
 
