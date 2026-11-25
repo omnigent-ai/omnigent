@@ -423,6 +423,8 @@ Controls GitLab access through `git` and `glab` shell commands on gitlab.com and
 
 Arguments are parsed using command-specific option definitions; unsupported options and API write routes return ASK. Aliases receive the same checks as their canonical actions. With `write_branches` configured, merges and rebases ask because the destination branch cannot be established from an MR number. API content writes require an explicit allowed branch; an opaque input body asks. MR creation that also pushes or creates a source branch (`--fill`, `--push`, or `--create-source-branch`), restores saved options (`--recover`), or selects another head project asks because its additional targets are unknown.
 
+`glab repo fork` asks because its source project does not identify the new destination project.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `hosts` | string[] | `["gitlab.com"]` | GitLab hosts this policy owns |
@@ -434,6 +436,7 @@ Arguments are parsed using command-specific option definitions; unsupported opti
 | `deny_tag_push` | boolean | `true` | Deny `--tags`, `--follow-tags`, and `refs/tags/` pushes |
 | `deny_force_push` | boolean | `true` | Deny `--force`, `-f`, `--force-with-lease`, `--force-if-includes`, bundled flags such as `-uf`, and `+refspec` pushes |
 | `shell_tools` | string[] | every harness's shell tool | Shell tools whose commands are parsed for git/glab |
+| `deny_reason` | string | `GitLab operation blocked by policy.` | Reason prefix attached to DENY decisions |
 
 ```yaml
 gitlab_access:

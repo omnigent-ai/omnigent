@@ -321,8 +321,9 @@ _EXPECTED_ACTIONS = [
     (
         "repo",
         "write",
-        "create,fork,mirror,transfer,update,members add,members remove,publish catalog",
+        "create,mirror,transfer,update,members add,members remove,publish catalog",
     ),
+    ("repo", "uncertain", "fork"),
     ("repo", "destructive", "delete"),
     ("release", "read", "download,list,ls,view"),
     ("release", "write", "create,upload"),
@@ -406,18 +407,26 @@ def test_glab_actions_match_expected_kind(command: str, kind: str) -> None:
     if command == "glab stack sync":
         command += " --skip-push"
     policy = gitlab_policy(read_all=False, read_repos=[_PROJECT], write_repos=[_PROJECT])
-    assert _result(policy(_sh(f"{command} -R {_PROJECT}"))) == (
-        "DENY" if kind == "destructive" else "ALLOW"
-    )
-    assert _result(policy(_sh(f"{command} -R grp/other"))) == "DENY"
+    allowed, foreign_restricted, foreign_unrestricted = {
+        "read": ("ALLOW", "DENY", "ALLOW"),
+        "write": ("ALLOW", "DENY", "DENY"),
+        "destructive": ("DENY", "DENY", "DENY"),
+        "uncertain": ("ASK", "ASK", "ASK"),
+    }[kind]
+    assert _result(policy(_sh(f"{command} -R {_PROJECT}"))) == allowed
+    assert _result(policy(_sh(f"{command} -R grp/other"))) == foreign_restricted
     unrestricted_reads = gitlab_policy(write_repos=[_PROJECT])
-    assert _result(unrestricted_reads(_sh(f"{command} -R grp/other"))) == (
-        "ALLOW" if kind == "read" else "DENY"
-    )
+    assert _result(unrestricted_reads(_sh(f"{command} -R grp/other"))) == foreign_unrestricted
     if kind == "destructive":
         permitted = gitlab_policy(write_repos=[_PROJECT], allow_destructive=True)
         assert _result(permitted(_sh(f"{command} -R {_PROJECT}"))) == "ALLOW"
         assert _result(permitted(_sh(f"{command} -R grp/other"))) == "DENY"
+
+
+@pytest.mark.parametrize("source", [_PROJECT, _URL, f"-R {_PROJECT}"])
+def test_glab_fork_requires_destination_authorization(source: str) -> None:
+    policy = gitlab_policy(write_repos=[_PROJECT])
+    assert _result(policy(_sh(f"glab repo fork {source}"))) == "ASK"
 
 
 @pytest.mark.parametrize(
@@ -653,7 +662,12 @@ def test_registry_discovers_gitlab_policy() -> None:
         "hosts": [_SELF_HOST],
         "write_repos": [_PROJECT],
         "deny_force_push": True,
+        "deny_reason": "Custom project restriction.",
     }
     assert validate_factory_params(_HANDLER, good) is None
     assert validate_factory_params(_HANDLER, {"bogus": 1}) is not None
     assert validate_factory_params(_HANDLER, {"allow_destructive": "yes"}) is not None
+    assert validate_factory_params(_HANDLER, {"deny_reason": 123}) is not None
+    configured = gitlab_policy(write_repos=[_PROJECT], deny_reason="Custom project restriction.")
+    denied = configured(_sh("glab issue create -R grp/other"))
+    assert denied is not None and denied["reason"].startswith("Custom project restriction.")

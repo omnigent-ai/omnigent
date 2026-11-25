@@ -717,6 +717,8 @@ def _classify_glab(
         return _unparseable(f"{detail} options")
     if args.enabled("help"):
         return None
+    if (group, action) == ("repo", "fork"):
+        return _unparseable("glab repo fork with an unresolved destination project")
     override = _glab_host_override(env_tokens, args, hosts)
     if override == "":
         return _unparseable(f"{detail} with an uncertain host")
@@ -724,7 +726,7 @@ def _classify_glab(
         return _unparseable(f"{detail} with a positional URL selecting another target")
     selectors = args.values("repo")
     # repo commands take their target as an operand, even when -R is present.
-    if group == "repo" and action in {"clone", "delete", "view", "archive", "fork"}:
+    if group == "repo" and action in {"clone", "delete", "view", "archive"}:
         selectors.extend(args.operands[:1])
     if len(set(selectors)) > 1:
         return _unparseable(f"{detail} with conflicting project selectors")
@@ -1146,6 +1148,11 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "items": {"type": "string"},
                     "description": "Shell/terminal tools whose command arg is parsed for "
                     "git/glab (default: every harness's shell tool).",
+                },
+                "deny_reason": {
+                    "type": "string",
+                    "description": "Reason prefix attached to DENY decisions.",
+                    "default": "GitLab operation blocked by policy.",
                 },
             },
         },
