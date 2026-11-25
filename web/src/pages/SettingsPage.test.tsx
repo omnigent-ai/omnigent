@@ -397,6 +397,20 @@ afterEach(() => {
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 
+describe("Keyboard shortcuts", () => {
+  it("offers a search field, and lets Settings search reveal every row", () => {
+    renderPage("/settings/shortcuts");
+
+    expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeTruthy();
+    expect(screen.getAllByRole("searchbox", { name: "Search shortcuts" })).toHaveLength(1);
+    const row = (label: string) => screen.getByText(label, { selector: "span" }).closest("li");
+    expect(row("Open command palette")?.getAttribute("data-settings-item")).toBe(
+      "shortcut.palette.commands",
+    );
+    expect(row("Stop response")?.getAttribute("data-settings-item")).toBe("shortcut.response.stop");
+  });
+});
+
 describe("Import sessions", () => {
   it("keeps session imports without the legacy Harness imports section", () => {
     renderPage("/settings/import");

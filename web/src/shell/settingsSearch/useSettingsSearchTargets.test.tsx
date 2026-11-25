@@ -4,8 +4,12 @@ import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useShortcutPageContext } from "@/components/KeyboardShortcutsDialog";
 import type * as CuratedOutHarnessesModule from "@/hooks/useCuratedOutHarnesses";
+import type { ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
+import { shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
 
 import { useSettingsSearchTargets } from "./useSettingsSearchTargets";
 
@@ -17,13 +21,26 @@ vi.mock("@/hooks/useCuratedOutHarnesses", async (importOriginal) => ({
 
 const HARNESSES = NATIVE_CODING_AGENTS.map((spec) => spec.harness);
 
-function searchTargets() {
-  const wrapper = ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter initialEntries={["/settings/general"]}>{children}</MemoryRouter>
-    </QueryClientProvider>
+function settingsWrapper(info: ServerInfo | "loading") {
+  return ({ children }: { children: ReactNode }) => (
+    <CapabilitiesContext.Provider value={info}>
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/settings/general"]}>{children}</MemoryRouter>
+      </QueryClientProvider>
+    </CapabilitiesContext.Provider>
   );
+}
+
+function searchTargets(info: ServerInfo | "loading" = "loading") {
+  const wrapper = settingsWrapper(info);
   return renderHook(() => useSettingsSearchTargets(), { wrapper }).result.current;
+}
+
+/** The shortcut of every row the Keyboard shortcuts page lists, read from the page itself. */
+function pageShortcutIds(info: ServerInfo | "loading") {
+  const wrapper = settingsWrapper(info);
+  const context = renderHook(() => useShortcutPageContext(), { wrapper }).result.current;
+  return shortcutPageGroups(context).flatMap((group) => group.items.map((row) => row.shortcutId));
 }
 
 /** The harnesses search offers a row of, by their entries' harness. */
@@ -58,5 +75,17 @@ describe("useSettingsSearchTargets and harness curation", () => {
     const { targets, sections } = searchTargets();
     expect(sections.has("harnesses")).toBe(false);
     expect(targets.filter((target) => target.entry.section === "harnesses")).toEqual([]);
+  });
+});
+
+describe("useSettingsSearchTargets and the Keyboard shortcuts page", () => {
+  it("offers every row the page lists, the composer's keys included", () => {
+    const { targets, shortcutRows } = searchTargets();
+    const shortcutIds = targets.flatMap((target) => target.entry.shortcutId ?? []);
+    expect(shortcutIds.toSorted()).toEqual(pageShortcutIds("loading").toSorted());
+    expect([...shortcutRows.keys()].toSorted()).toEqual(shortcutIds.toSorted());
+    expect(shortcutIds).toEqual(
+      expect.arrayContaining(["composer.send", "slash.apply", "response.stop"]),
+    );
   });
 });

@@ -11,6 +11,9 @@ import {
   SHORTCUT_GROUPS,
   shortcutBinding,
   shortcutKeys,
+  type ShortcutEnvironment,
+  type ShortcutId,
+  type ShortcutPageContext,
   shortcutRowKeys,
 } from "./registry";
 
@@ -28,36 +31,77 @@ afterEach(() => {
 describe("shortcut registry", () => {
   it("looks up each binding by its id", () => {
     expect(SHORTCUT_BINDINGS.map((binding) => binding.id)).toEqual([
+      "session.new",
+      "session.addSibling",
       "palette.commands",
       "palette.sessions",
-      "shortcuts.show",
-      "session.new",
       "session.rename",
       "session.toggleUnread",
       "settings.open",
+      "shortcuts.show",
+      "tab.close",
+      "window.close",
+      "session.pin",
+      "session.archive",
+      "session.fork",
+      "app.quit",
+      "composer.send",
+      "composer.sendWithQueue",
+      "composer.newLine",
+      "composer.newLineWithAlt",
+      "composer.previousPrompt",
+      "composer.nextPrompt",
+      "approval.accept",
+      "approval.decline",
+      "question.next",
+      "question.pickOption",
+      "question.cancel",
+      "model.picker",
+      "model.cycle",
+      "effort.cycle",
+      "composer.cyclePermissionMode",
+      "composer.focus",
+      "dictation.toggle",
+      "response.stop",
+      "sessions.recent",
       "history.back",
       "history.forward",
-      "sessions.recent",
       "session.number",
       "view.mode",
       "sidebar.left",
       "sidebar.right",
+      "workspace.searchContents",
       "workspace.tab",
+      "browser.newTab",
       "terminal.new",
-      "model.picker",
-      "model.cycle",
-      "effort.cycle",
-      "composer.focus",
-      "dictation.toggle",
-      "approval.accept",
-      "approval.decline",
+      "tab.previous",
+      "tab.next",
+      "tab.reopen",
+      "browser.reload",
+      "browser.focusAddressBar",
+      "fileViewer.exitFullScreen",
       "pane.previous",
       "pane.next",
       "terminal.splitRight",
       "terminal.splitDown",
+      "slash.previous",
+      "slash.next",
+      "slash.apply",
+      "slash.dismiss",
     ]);
     for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
+  });
+
+  it("draws each alternative and part on a binding's own row", () => {
+    const ids = new Set<string>(SHORTCUT_BINDINGS.map((binding) => binding.id));
+    for (const binding of SHORTCUT_BINDINGS) {
+      const row = binding.alternateOf ?? binding.partOf;
+      if (row === undefined) continue;
+      expect(ids.has(row), binding.id).toBe(true);
+      const target = shortcutBinding(row as ShortcutId);
+      expect(target.alternateOf ?? target.partOf, binding.id).toBeUndefined();
+    }
   });
 
   it("starts a new session with ⌘⇧O in a browser and ⌘N in a native shell", () => {
@@ -469,19 +513,49 @@ describe("Keyboard shortcuts page metadata", () => {
     }
   });
 
+  const page: ShortcutPageContext = {
+    native: false,
+    electron: false,
+    browser: false,
+    submitWithModEnter: false,
+    preventsKeyboardSubmit: false,
+    contentSearch: false,
+    grids: false,
+    splitTerminal: false,
+    siblingSessions: false,
+    desktopCommands: false,
+    alwaysSteer: false,
+  };
+  const resolved = (environment: Partial<ShortcutEnvironment>) =>
+    currentShortcutEnvironment({ submitWithModEnter: false, ...environment });
+
   it("shows a numbered binding's row as a range of digits", () => {
-    const native = { mac: true, native: true, desktopMenu: false };
-    expect(shortcutRowKeys("session.number", native, { contentSearch: false })).toEqual([
-      "⌘",
-      "1…0",
-    ]);
-    expect(shortcutRowKeys("workspace.tab", mac, { contentSearch: false })).toEqual(["⌃", "1…4"]);
-    expect(shortcutRowKeys("workspace.tab", mac, { contentSearch: true })).toEqual(["⌃", "1…5"]);
+    const native = resolved({ mac: true, native: true, desktopMenu: false });
+    expect(shortcutRowKeys("session.number", native, page)).toEqual(["⌘", "1…0"]);
+    expect(shortcutRowKeys("workspace.tab", resolved(mac), page)).toEqual(["⌃", "1…4"]);
+    expect(
+      shortcutRowKeys("workspace.tab", resolved(mac), { ...page, contentSearch: true }),
+    ).toEqual(["⌃", "1…5"]);
   });
 
-  it("gives a range row only to the numbered bindings, and others their chord's keys", () => {
-    const ranged = SHORTCUT_BINDINGS.filter((binding) => binding.rowKeys !== undefined);
-    expect(ranged.map((binding) => binding.id)).toEqual(["session.number", "workspace.tab"]);
-    expect(shortcutRowKeys("palette.commands", mac, { contentSearch: false })).toEqual(["⌘", "K"]);
+  it("draws its own row keys only where a row needs them, and others their chord's keys", () => {
+    const drawn = SHORTCUT_BINDINGS.filter((binding) => binding.rowKeys !== undefined);
+    expect(drawn.map((binding) => binding.id)).toEqual([
+      "session.new",
+      "question.pickOption",
+      "session.number",
+      "workspace.tab",
+      "slash.previous",
+    ]);
+    expect(shortcutRowKeys("palette.commands", resolved(mac), page)).toEqual(["⌘", "K"]);
+  });
+
+  it("shows a desktop menu's accelerator only where the menu owns the action", () => {
+    const menu = resolved({ ...mac, desktopMenu: true });
+    expect(shortcutRowKeys("tab.close", menu, page)).toEqual(["⌘", "W"]);
+    expect(shortcutRowKeys("tab.close", resolved(mac), page)).toEqual([]);
+    // Settings keeps its own chord in a browser and shows the menu's ⌘, in the desktop app.
+    expect(shortcutRowKeys("settings.open", menu, page)).toEqual(["⌘", ","]);
+    expect(shortcutRowKeys("settings.open", resolved(mac), page)).toEqual(["⌘", "⌥", ","]);
   });
 });

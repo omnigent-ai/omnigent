@@ -5,9 +5,11 @@
 import { type Chord, chordMatches, type KeyChordInput } from "@/lib/shortcuts/chord";
 import {
   activeShortcutChords,
+  menuShortcutChords,
   SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
+  shortcutDisplayRow,
 } from "@/lib/shortcuts/registry";
 
 import type { SettingsSearchMatcher } from "./settingsSearchIndex";
@@ -244,14 +246,20 @@ function isBarePrintable(chord: Chord): boolean {
 }
 
 /**
- * The chords a binding can be found by here: its active chords, but not bare printable keys,
- * such as the digit a workspace tab takes after its chord, which only works in context.
+ * The chords a binding can be found by here: its active chords and the desktop menu's
+ * accelerators for it, but not bare printable keys, such as the digit a workspace tab takes
+ * after its chord, which only works in context.
  */
 export function searchableChords(id: ShortcutId, environment: ShortcutEnvironment): Chord[] {
-  return activeShortcutChords(id, environment).filter((chord) => !isBarePrintable(chord));
+  return [...activeShortcutChords(id, environment), ...menuShortcutChords(id, environment)].filter(
+    (chord) => !isBarePrintable(chord),
+  );
 }
 
-/** The listed page rows a typed chord finds here: each binding whose searchable chords it presses. */
+/**
+ * The listed page rows a typed chord finds here: each row showing a binding whose searchable
+ * chords it presses, an alternative's or a part's chord finding the row it's drawn on.
+ */
 export function rowsForChord(
   input: KeyChordInput,
   environment: ShortcutEnvironment,
@@ -259,13 +267,14 @@ export function rowsForChord(
 ): Set<ShortcutId> {
   const rows = new Set<ShortcutId>();
   for (const binding of SHORTCUT_BINDINGS) {
-    if (!listedRows.has(binding.id)) continue;
+    const row = shortcutDisplayRow(binding.id);
+    if (!listedRows.has(row)) continue;
     if (
       searchableChords(binding.id, environment).some((chord) =>
         chordMatches(chord, input, environment.mac),
       )
     ) {
-      rows.add(binding.id);
+      rows.add(row);
     }
   }
   return rows;
