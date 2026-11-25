@@ -74,6 +74,7 @@ import {
 import { FILE_EDITOR_COMMANDS, fileEditorCommandLabel } from "@/components/fileEditorCommands";
 import { baseEditorKeymap, cursorHistory, EDITOR_COMMAND_RUNS } from "./codeMirrorEditorCommands";
 import { indentationFolding } from "./codeMirrorFolding";
+import { stickyScroll } from "./codeMirrorStickyScroll";
 import { detectedIndentation } from "./codeMirrorIndentation";
 import { indentGuides } from "./indentGuides";
 import { selectionWhitespacePlugin } from "./codeMirrorSelectionWhitespace";
@@ -134,6 +135,8 @@ export interface CodeMirrorFileViewerProps {
   /** Shows that a Markdown file opened as source because it is too large to render. */
   largeMarkdown?: boolean;
   wrapLines: boolean;
+  /** Pins the lines opening the scopes around the top of the view; on unless turned off. */
+  stickyScroll?: boolean;
   searchOpen: boolean;
   /** Bumped on every find request so a repeat press refocuses the query. */
   searchFocusNonce?: number;
@@ -175,6 +178,7 @@ export function CodeMirrorFileViewer({
   truncated,
   largeMarkdown = false,
   wrapLines,
+  stickyScroll: stickyScrollOn = true,
   searchOpen,
   searchFocusNonce,
   onSearchHandled,
@@ -187,6 +191,7 @@ export function CodeMirrorFileViewer({
   const viewRef = useRef<EditorView | null>(null);
   const [editorView, setEditorView] = useState<EditorView | null>(null);
   const [lineWrapping] = useState(() => new Compartment());
+  const [stickyLines] = useState(() => new Compartment());
   const [font] = useState(() => new Compartment());
   const [editableCompartment] = useState(() => new Compartment());
   const editingRef = useRef(editing);
@@ -229,8 +234,8 @@ export function CodeMirrorFileViewer({
       : null;
   };
   // The inputs a new view starts from; changes to a live view arrive through the effects below.
-  const currentInputsRef = useRef({ content, wrapLines, position, editable });
-  currentInputsRef.current = { content, wrapLines, position, editable };
+  const currentInputsRef = useRef({ content, wrapLines, stickyScrollOn, position, editable });
+  currentInputsRef.current = { content, wrapLines, stickyScrollOn, position, editable };
 
   const openGoToLine = (target: EditorView) => {
     goToLineOriginRef.current ??= goToLineOrigin(target);
@@ -317,6 +322,7 @@ export function CodeMirrorFileViewer({
           commentLayer.extension,
           lineNumbers(),
           indentationFolding(),
+          stickyLines.of(initial.stickyScrollOn ? stickyScroll() : []),
           detectedIndentation(initial.content),
           selectionWhitespacePlugin,
           indentGuides,
@@ -453,6 +459,12 @@ export function CodeMirrorFileViewer({
       effects: lineWrapping.reconfigure(wrapLines ? EditorView.lineWrapping : []),
     });
   }, [wrapLines, lineWrapping]);
+
+  useEffect(() => {
+    viewRef.current?.dispatch({
+      effects: stickyLines.reconfigure(stickyScrollOn ? stickyScroll() : []),
+    });
+  }, [stickyScrollOn, stickyLines]);
 
   // Reveal a citation until the reader scrolls, clicks, or types; its lines
   // stay highlighted while it is the viewer's position.

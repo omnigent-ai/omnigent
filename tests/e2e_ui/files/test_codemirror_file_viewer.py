@@ -6,6 +6,8 @@ the keyboard. A read-only file highlights matching brackets, which only an edita
 did before. Indented lines show a guide at each level, with the cursor's block drawn
 stronger. Seeded via the filesystem PUT endpoint (no agent run); the edge cases are in
 the unit tests (``columnSelection``, ``codeMirrorBracketMatching``, ``indentGuides``).
+Scrolled into a nested block, the lines opening its scopes stay pinned at the top, and
+clicking one scrolls back to it (``indentationScopes``, ``codeMirrorStickyScroll``).
 """
 
 from __future__ import annotations
@@ -32,13 +34,33 @@ _COLUMNS_PATH = "src/columns.py"
 _COLUMNS_SOURCE = "alpha = 1\nbeta = 2\ngamma = 3\ndelta = 4\n"
 _BLOCKS_PATH = "src/blocks.py"
 _BLOCKS_SOURCE = "def run(ready):\n    if ready:\n        go()\n    return ready\n"
-_SEEDED = {_COLUMNS_PATH: _COLUMNS_SOURCE, _BLOCKS_PATH: _BLOCKS_SOURCE}
+# Three nested scopes with a long body, so their opening lines scroll off the top.
+_NESTED_PATH = "src/inventory.py"
+_NESTED_SOURCE = "\n".join(
+    [
+        "class Inventory:",
+        "    def restock(self, items):",
+        "        for item in items:",
+        *(f"            self.count[item] += {index}" for index in range(1, 121)),
+        "        return self.count",
+        "",
+        "def unrelated():",
+        "    return None",
+    ]
+)
 # Larger than the server's 10 MiB read cap, so the file arrives truncated and opens read-only.
 _LARGE_PATH = "src/generated_tables.ts"
 _LARGE_SOURCE = "\n".join(
     f"export const entry{index:06d} = {{ id: {index}, label: 'row {index}' }};"
     for index in range(240_000)
 )
+
+
+_SEEDED = {
+    _COLUMNS_PATH: _COLUMNS_SOURCE,
+    _BLOCKS_PATH: _BLOCKS_SOURCE,
+    _NESTED_PATH: _NESTED_SOURCE,
+}
 
 
 @pytest.fixture
@@ -134,4 +156,65 @@ def test_indented_lines_show_guides_with_the_cursors_block_drawn_stronger(
     # The cursor inside the if block marks that block's guide on its lines only.
     lines.nth(2).click()
     expect(lines.nth(2)).to_have_class(active)
+    expect(lines.nth(1)).not_to_have_class(active)
+    expect(lines.nth(3)).not_to_have_class(active)
     expect(lines.nth(2)).to_have_attribute("style", re.compile(r"--cm-indent-guides:\s*2"))
+
+
+# How far the first pinned line sits below the scroller's top edge.
+_STICKY_GAP = """(scroller) => {
+    const row = scroller.querySelector(".cm-stickyScroll-line");
+    return row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+}"""
+
+
+def test_a_nested_block_pins_its_scopes_and_a_click_scrolls_back_to_one(
+    page: Page, code_session: tuple[str, str]
+) -> None:
+    base_url, session_id = code_session
+    editor = _open_file(page, base_url, session_id, _NESTED_PATH)
+    expect(editor.locator(".cm-line").first).to_have_text("class Inventory:", timeout=30_000)
+    scroller = editor.locator(".cm-scroller")
+    pinned = editor.locator(".cm-stickyScroll-line")
+    expect(pinned).to_have_count(0)
+
+    scroller.evaluate("(node) => { node.scrollTop = 1500; }")
+    expect(pinned).to_have_count(3)
+    expect(pinned.nth(0)).to_have_text(re.compile(r"^1\s*class Inventory:"))
+    expect(pinned.nth(1)).to_have_text(re.compile(r"^2\s*def restock\(self, items\):"))
+    expect(pinned.nth(2)).to_have_text(re.compile(r"^3\s*for item in items:"))
+    # The pinned lines keep their syntax colors, flush with the top so no text shows above.
+    expect(pinned.nth(0).locator(".cm-shiki-token").first).to_be_visible()
+    gap = scroller.evaluate(_STICKY_GAP)
+    assert abs(gap) < 0.5, f"the pinned lines sit {gap}px below the top"
+
+    # Line 1 opens no scope, so clicking it scrolls to the very top with the cursor on it.
+    pinned.nth(0).click()
+    page.wait_for_function("(node) => node.scrollTop < 10", arg=scroller.element_handle())
+    expect(pinned).to_have_count(0)
+    expect(editor.locator(".cm-activeLine")).to_have_text("class Inventory:")
+
+
+def test_sticky_scroll_follows_the_saved_choice(page: Page, code_session: tuple[str, str]) -> None:
+    """A device that turned sticky scroll off pins nothing, however deep the text scrolls."""
+    base_url, session_id = code_session
+    page.add_init_script(
+        "localStorage.setItem('omnigent:file-view-preferences',"
+        " JSON.stringify({ stickyScroll: false }))"
+    )
+    editor = _open_file(page, base_url, session_id, _NESTED_PATH)
+    expect(editor.locator(".cm-line").first).to_have_text("class Inventory:", timeout=30_000)
+    # Scrolled as deep as the pinned journey, and given the frames its pins take to appear:
+    # the line at the top of the view is inside the loop's body.
+    top_line = editor.locator(".cm-scroller").evaluate(
+        """async (node) => {
+            node.scrollTop = 1500;
+            for (let frame = 0; frame < 5; frame++) await new Promise(requestAnimationFrame);
+            const box = node.querySelector(".cm-content").getBoundingClientRect();
+            const top = node.getBoundingClientRect().top;
+            const at = document.elementFromPoint(box.left + 40, top + 4);
+            return at?.closest(".cm-line")?.textContent ?? "";
+        }"""
+    )
+    assert "self.count[item] +=" in top_line, top_line
+    expect(editor.locator(".cm-stickyScroll-line")).to_have_count(0)
