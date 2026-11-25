@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runner import github_failures, pr_actions, pr_resource
+from omnigent.runner import github_failures, github_reviews, pr_actions, pr_resource
 from omnigent.runner import github_resource as github
 from omnigent.runner.pull_request_errors import (
     PULL_REQUEST_CHANGED_MESSAGE,
@@ -30,8 +30,6 @@ HEAD = "66331978a046d81e2f1a6772e6354f9ae43b734b"
 MOVED = "1" * 40
 BASE = "2" * 40
 PR_URL = "https://github.com/example-org/example-repo/pull/7"
-OTHER_PR_URL = "https://github.com/example-org/example-repo/pull/8"
-THIRD_PR_URL = "https://github.com/example-org/example-repo/pull/9"
 COMMENT_PATH = "repos/example-org/example-repo/issues/comments/5"
 REVIEW_COMMENT_PATH = "repos/example-org/example-repo/pulls/comments/5"
 COMMENT_PATHS = (COMMENT_PATH, REVIEW_COMMENT_PATH)
@@ -65,7 +63,7 @@ class FakeGitHub:
     """Answers ``gh`` calls and GraphQL requests for the pull requests it holds."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.heads = {7: HEAD, 8: HEAD, 9: HEAD}
+        self.heads = {7: HEAD}
         self.pending: list[dict[str, Any]] = []
         self.gh_calls: list[tuple[list[str], str | None]] = []
         self.json_calls: list[tuple[str, str, dict[str, Any]]] = []
@@ -85,6 +83,8 @@ class FakeGitHub:
         self.rest_failure: tuple[int, str, str] | None = None
         # Mutations GitHub runs but answers with errors in a field they selected.
         self.errors_with_payload: set[str] = set()
+        # Where the head moves when a sent mutation fails, as a push racing it would.
+        self.head_after_failure: str | None = None
         monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: TOKEN)
         monkeypatch.setattr(github, "_host_args", lambda _root, ref: ["--hostname", ref.host])
         monkeypatch.setattr(github, "_gh", self._gh)
@@ -232,6 +232,7 @@ class FakeGitHub:
         if endpoint == "graphql":
             is_write = "mutation" in fields["query"]
             if is_write and self.graphql_failure is not None:
+                self._move_head(self.head_after_failure)
                 return self.graphql_failure
             body = self._graphql(fields["query"], fields["variables"])
             if is_write and any(name in fields["query"] for name in self.errors_with_payload):
@@ -252,10 +253,6 @@ class FakeGitHub:
         if argv[:2] == ["api", "--hostname"] and "-X" not in argv and argv[-1] in COMMENT_PATHS:
             return 0, json.dumps(self.comment), ""
         return 0, "", ""
-
-
-def _reference(url: str = PR_URL) -> PullRequestRef:
-    return PullRequestRef.from_url(url)
 
 
 def _digest(text: str) -> str:
@@ -676,6 +673,18 @@ def test_errors_beside_a_mutations_result_are_an_unknown_outcome_not_a_refusal(
     assert len(fake.mutations(mutation)) == 1
 
 
+@pytest.mark.parametrize("error_type", ["INTERNAL", "TIMEOUT", "SERVICE_UNAVAILABLE"])
+def test_a_graphql_error_github_types_as_its_own_failure_is_an_unknown_outcome(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, error_type: str
+) -> None:
+    """Whatever the message says, GitHub failed on its side and may have made the change."""
+    answer = {"data": {"resolveReviewThread": None}}
+    answer["errors"] = [{"type": error_type, "message": "Could not resolve the thread"}]
+    fake.graphql_failure = (1, json.dumps(answer), "gh: Could not resolve the thread")
+    with pytest.raises(UnknownOutcomeError):
+        _resolve()
+
+
 def test_a_graphql_timeout_error_is_an_unknown_outcome(fake: FakeGitHub) -> None:
     fake.refuse_mutation("resolveReviewThread", "Something went wrong; this may be a timeout")
     with pytest.raises(UnknownOutcomeError):
@@ -691,8 +700,9 @@ def test_an_edit_answered_with_an_error_body_on_exit_zero_is_an_unknown_outcome(
 
 
 def test_an_unknown_outcome_is_never_reported_as_a_moved_head(fake: FakeGitHub) -> None:
+    """The head moves while the verdict is sent; GitHub may still have recorded it."""
     fake.graphql_failure = (1, "", _UNCONFIRMED_STDERR["502"])
-    fake.heads[7] = MOVED
+    fake.head_after_failure = MOVED
     with pytest.raises(UnknownOutcomeError):
         pr_actions.submit_review_verdict(
             "/workspace",
@@ -700,8 +710,61 @@ def test_an_unknown_outcome_is_never_reported_as_a_moved_head(fake: FakeGitHub) 
             pr_url=PR_URL,
             event="APPROVE",
             body="Ship it",
-            commit_oid=MOVED,
+            commit_oid=HEAD,
         )
+    assert fake.heads[7] == MOVED
+
+
+def test_a_refusal_after_the_head_moved_during_the_send_is_a_moved_head(
+    fake: FakeGitHub,
+) -> None:
+    fake.graphql_failure = (1, "", "gh: Validation Failed (HTTP 422)")
+    fake.head_after_failure = MOVED
+    with pytest.raises(PullRequestChangedError):
+        pr_actions.submit_review_verdict(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            event="APPROVE",
+            body="Ship it",
+            commit_oid=HEAD,
+        )
+
+
+def _token_lookup_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The write's token lookup runs out of its deadline; the reads before it don't."""
+
+    def timed_out(_root: str, _reference: PullRequestRef) -> str | None:
+        if github._gh_deadline.get() is None:
+            return TOKEN
+        # Inside the write's deadline scope, which resets this when it ends.
+        github._gh_timed_out.set(True)
+        return None
+
+    monkeypatch.setattr(github, "_pr_token", timed_out)
+
+
+def test_a_mutation_whose_token_lookup_timed_out_is_never_sent(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sending it anyway would run it as gh's default account, not the selected one."""
+    _token_lookup_times_out(monkeypatch)
+    with pytest.raises(ValueError, match="Nothing was sent") as refused:
+        _resolve()
+    assert not isinstance(refused.value, UnknownOutcomeError)
+    assert fake.mutations("resolveReviewThread") == []
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_comment_change_whose_token_lookup_timed_out_is_never_sent(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    # The checks before the write read with the token they were given.
+    monkeypatch.setattr(github_reviews, "_own_comment", lambda *_args, **_kwargs: fake.comment)
+    _token_lookup_times_out(monkeypatch)
+    with pytest.raises(ValueError, match="Nothing was sent"):
+        _change_comment(action)
+    assert _rest_writes(fake) == []
 
 
 def test_a_reaction_is_added_to_the_comments_node(fake: FakeGitHub) -> None:
@@ -777,11 +840,12 @@ def test_a_non_github_pull_request_is_refused(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_failure_classes_name_the_host_and_never_the_token() -> None:
+    # Each input carries the token, as a verbose gh might print it.
     cases = {
-        "needs the repo scope": "INSUFFICIENT_SCOPES",
-        "sso": "Resource protected by organization SAML enforcement",
-        "rate": "API rate limit exceeded",
-        "signed out": "To get started, please run: gh auth login",
+        "needs the repo scope": f"INSUFFICIENT_SCOPES token={TOKEN}",
+        "sso": f"Resource protected by organization SAML enforcement {TOKEN}",
+        "rate": f"API rate limit exceeded for {TOKEN}",
+        "signed out": f"Bad token {TOKEN}. To get started, please run: gh auth login",
     }
     messages = {
         key: str(github_failures.refusal(stderr, host="ghe.example.com", action="x"))

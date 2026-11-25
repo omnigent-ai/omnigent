@@ -32,6 +32,8 @@ _SIGNED_OUT = re.compile(
 _REFUSED_STATUS = re.compile(r"\(HTTP (?:401|403|404|422)\)")
 # GraphQL errors GitHub reports when it may have stopped partway, e.g. a timeout.
 _GRAPHQL_INTERRUPTED = re.compile(r"timeout|timed out|Something went wrong", re.I)
+# GraphQL error types that say GitHub failed on its side, whatever the message.
+_INTERRUPTED_TYPES = frozenset({"INTERNAL", "TIMEOUT", "SERVICE_UNAVAILABLE"})
 
 
 def unknown_outcome() -> UnknownOutcomeError:
@@ -70,7 +72,10 @@ def graphql_refusal(errors: list[object], *, host: str, action: str) -> ValueErr
     """The error for a GraphQL mutation GitHub answered with ``errors``."""
     messages = [str(error.get("message", "")) for error in errors if isinstance(error, dict)]
     text = "\n".join(messages)
-    if not messages or _GRAPHQL_INTERRUPTED.search(text):
+    internal = any(
+        isinstance(error, dict) and error.get("type") in _INTERRUPTED_TYPES for error in errors
+    )
+    if not messages or internal or _GRAPHQL_INTERRUPTED.search(text):
         return unknown_outcome()
     return refusal(text, host=host, action=action)
 
