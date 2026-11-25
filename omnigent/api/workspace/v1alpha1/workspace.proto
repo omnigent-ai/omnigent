@@ -185,6 +185,121 @@ service WorkspaceService {
 
   // Turns off the pull request's auto-merge.
   rpc DisableAutoMerge(DisableAutoMergeRequest) returns (DisableAutoMergeResponse);
+
+  // Adds a draft comment on a line or range to the pending review, starting one if needed,
+  // or a draft reply in a review conversation to the viewer's pending review.
+  rpc AddPendingReviewComment(AddPendingReviewCommentRequest) returns (AddPendingReviewCommentResponse);
+
+  // Adds the session user's reaction to a comment.
+  rpc AddReaction(AddReactionRequest) returns (AddReactionResponse);
+
+  // Deletes a comment.
+  rpc DeleteComment(DeleteCommentRequest) returns (DeleteCommentResponse);
+
+  // Deletes a draft comment from the viewer's pending review.
+  rpc DeletePendingReviewComment(DeletePendingReviewCommentRequest) returns (DeletePendingReviewCommentResponse);
+
+  // Removes the pull request from its merge queue.
+  rpc DequeuePullRequest(DequeuePullRequestRequest) returns (DequeuePullRequestResponse);
+
+  // Deletes the pending review and its draft comments.
+  rpc DiscardPendingReview(DiscardPendingReviewRequest) returns (DiscardPendingReviewResponse);
+
+  // Changes a comment's text, only while it still reads as the client last saw it.
+  rpc EditComment(EditCommentRequest) returns (EditCommentResponse);
+
+  // Turns on auto-merge for each pull request, each only while its head is the one the user saw.
+  rpc EnableAutoMerge(EnableAutoMergeRequest) returns (EnableAutoMergeResponse);
+
+  // Adds the pull request to its base branch's merge queue, at the head the user saw.
+  rpc EnqueuePullRequest(EnqueuePullRequestRequest) returns (EnqueuePullRequestResponse);
+
+  // The pull request's merge queue membership and position.
+  rpc GetMergeQueue(GetMergeQueueRequest) returns (GetMergeQueueResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The merge-readiness checks an installed insights provider reports for a head.
+  rpc GetMergeReadiness(GetMergeReadinessRequest) returns (GetMergeReadinessResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The session's pending review, its head and its draft comments.
+  rpc GetPendingReview(GetPendingReviewRequest) returns (GetPendingReviewResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Diff size, update time, state and checks for list rows, for the session's owner.
+  rpc GetPullRequestListStats(GetPullRequestListStatsRequest) returns (GetPullRequestListStatsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull requests in the same stack as this one, found through their branches.
+  rpc GetPullRequestStack(GetPullRequestStackRequest) returns (GetPullRequestStackResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull requests for a branch of the workspace's own repository.
+  rpc ListBranchPullRequests(ListBranchPullRequestsRequest) returns (ListBranchPullRequestsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // One pull request's title and state by its URL, for the session's owner.
+  rpc LookupPullRequest(LookupPullRequestRequest) returns (LookupPullRequestResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Previews a reviewer ping, and returns the single-use token that sends it.
+  rpc PreviewReviewerPing(PreviewReviewerPingRequest) returns (PreviewReviewerPingResponse);
+
+  // Streams an image the pull request links to: its metadata, then its bytes.
+  rpc ReadPullRequestImage(ReadPullRequestImageRequest) returns (stream ReadPullRequestImageResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Removes the session user's reaction from a comment.
+  rpc RemoveReaction(RemoveReactionRequest) returns (RemoveReactionResponse);
+
+  // An editor's @ and # completions: people (the session's owner only) or the repository's PRs.
+  rpc SearchCompletions(SearchCompletionsRequest) returns (SearchCompletionsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // People and teams who can review the pull request, matching `text`, for the session's owner.
+  rpc SearchReviewers(SearchReviewersRequest) returns (SearchReviewersResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Sends a previewed reviewer ping. Each preview token works once, for a short time.
+  rpc SendReviewerPing(SendReviewerPingRequest) returns (SendReviewerPingResponse);
+
+  // Marks the pull request ready for review, or back to draft.
+  rpc SetPullRequestDraft(SetPullRequestDraftRequest) returns (SetPullRequestDraftResponse);
+
+  // Closes or reopens the pull request.
+  rpc SetPullRequestState(SetPullRequestStateRequest) returns (SetPullRequestStateResponse);
+
+  // Resolves or reopens a review conversation.
+  rpc SetReviewThreadResolved(SetReviewThreadResolvedRequest) returns (SetReviewThreadResolvedResponse);
+
+  // Starts a pending review on the head the user saw.
+  rpc StartPendingReview(StartPendingReviewRequest) returns (StartPendingReviewResponse);
+
+  // Submits the pending review with its verdict, only while its head is the commit the user saw.
+  rpc SubmitPendingReview(SubmitPendingReviewRequest) returns (SubmitPendingReviewResponse);
+
+  // Submits a comment-only review on the head the user saw. APPROVE and
+  // REQUEST_CHANGES are refused by the server before they reach the host.
+  rpc SubmitReview(SubmitReviewRequest) returns (SubmitReviewResponse);
+
+  // Approves or requests changes on the head the user saw, in one review.
+  rpc SubmitReviewVerdict(SubmitReviewVerdictRequest) returns (SubmitReviewVerdictResponse);
+
+  // Changes a draft comment in the viewer's pending review, only while its text is as last read.
+  rpc UpdatePendingReviewComment(UpdatePendingReviewCommentRequest) returns (UpdatePendingReviewCommentResponse);
+
+  // Uploads a file to link from a comment.
+  rpc UploadAttachment(UploadAttachmentRequest) returns (UploadAttachmentResponse);
 }
 
 message GetCapabilitiesRequest {}
@@ -1058,4 +1173,356 @@ message DisableAutoMergeRequest {
 
 message DisableAutoMergeResponse {
   google.protobuf.Struct payload = 1;
+}
+
+message GetPullRequestListStatsRequest {
+  repeated string pr_urls = 1;
+}
+
+message GetPullRequestListStatsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message LookupPullRequestRequest {
+  string pr_url = 1;
+}
+
+message LookupPullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListBranchPullRequestsRequest {
+  // A branch of the workspace's own repository.
+  string branch = 1;
+}
+
+message ListBranchPullRequestsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SearchReviewersRequest {
+  string pr_url = 1;
+  string text = 2;
+  // At most 20.
+  int32 page_size = 3;
+}
+
+message SearchReviewersResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+// What an editor completion searches for.
+enum CompletionKind {
+  COMPLETION_KIND_UNSPECIFIED = 0;
+  // People, after @.
+  COMPLETION_KIND_MENTION = 1;
+  // The repository's pull requests, after #.
+  COMPLETION_KIND_REFERENCE = 2;
+}
+
+message SearchCompletionsRequest {
+  string pr_url = 1;
+  CompletionKind kind = 2;
+  string text = 3;
+}
+
+message SearchCompletionsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UploadAttachmentRequest {
+  string pr_url = 1;
+  // The file's name, as the link shows it.
+  string name = 2;
+  bytes content = 3;
+}
+
+message UploadAttachmentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SubmitReviewRequest {
+  string pr_url = 1;
+  // "COMMENT"; the server refuses the other events with INVALID_ARGUMENT.
+  string event = 2;
+  string body = 3;
+  // The head commit the review was written against.
+  string commit_oid = 4;
+}
+
+message SubmitReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SubmitReviewVerdictRequest {
+  string pr_url = 1;
+  // "APPROVE" or "REQUEST_CHANGES".
+  string event = 2;
+  string body = 3;
+  string commit_oid = 4;
+}
+
+message SubmitReviewVerdictResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPendingReviewRequest {
+  string pr_url = 1;
+}
+
+message GetPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message StartPendingReviewRequest {
+  string pr_url = 1;
+  string commit_oid = 2;
+}
+
+message StartPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message AddPendingReviewCommentRequest {
+  string pr_url = 1;
+  string body = 2;
+  // The lines a new conversation is on; unset for a reply.
+  ReviewThreadAnchor anchor = 3;
+  // The review conversation on this pull request a draft reply goes in; it joins the viewer's
+  // pending review, which must already exist.
+  string in_reply_to_thread_id = 4;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 5;
+  // The head the client showed; a push since refuses the draft.
+  string expected_head_oid = 6;
+}
+
+message AddPendingReviewCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UpdatePendingReviewCommentRequest {
+  string pr_url = 1;
+  // The draft's GitHub node ID; it must be in the viewer's pending review on this pull request.
+  string comment_node_id = 2;
+  string body = 3;
+  // SHA-256 of the draft's text the client last saw; the change is refused when it differs.
+  string expected_body_sha256 = 4;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 5;
+}
+
+message UpdatePendingReviewCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DeletePendingReviewCommentRequest {
+  string pr_url = 1;
+  // The draft's GitHub node ID; it must be in the viewer's pending review on this pull request.
+  string comment_node_id = 2;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 3;
+}
+
+message DeletePendingReviewCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SubmitPendingReviewRequest {
+  string pr_url = 1;
+  // "COMMENT", "APPROVE" or "REQUEST_CHANGES".
+  string event = 2;
+  string body = 3;
+  string commit_oid = 4;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 5;
+}
+
+message SubmitPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DiscardPendingReviewRequest {
+  string pr_url = 1;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 2;
+}
+
+message DiscardPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetPullRequestStateRequest {
+  string pr_url = 1;
+  // "closed" or "open".
+  string state = 2;
+}
+
+message SetPullRequestStateResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetPullRequestDraftRequest {
+  string pr_url = 1;
+  // True to make the pull request a draft again; false to mark it ready.
+  bool draft = 2;
+}
+
+message SetPullRequestDraftResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+// One pull request in an auto-merge batch, with the head the user saw.
+message PullRequestAutoMerge {
+  string pr_url = 1;
+  // "merge", "squash" or "rebase".
+  string merge_method = 2;
+  string expected_head_oid = 3;
+}
+
+message EnableAutoMergeRequest {
+  repeated PullRequestAutoMerge pull_requests = 1;
+}
+
+message EnableAutoMergeResponse {
+  // Each pull request's result, in request order.
+  google.protobuf.Struct payload = 1;
+}
+
+message EnqueuePullRequestRequest {
+  string pr_url = 1;
+  string expected_head_oid = 2;
+}
+
+message EnqueuePullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DequeuePullRequestRequest {
+  string pr_url = 1;
+}
+
+message DequeuePullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetMergeQueueRequest {
+  string pr_url = 1;
+}
+
+message GetMergeQueueResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetReviewThreadResolvedRequest {
+  string pr_url = 1;
+  string thread_id = 2;
+  bool resolved = 3;
+}
+
+message SetReviewThreadResolvedResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message EditCommentRequest {
+  string pr_url = 1;
+  // "issue" for a conversation comment, "review" for an inline comment.
+  string kind = 2;
+  int64 comment_id = 3;
+  string body = 4;
+  // SHA-256 of the body the client last saw; the edit is refused when it differs.
+  string expected_body_sha256 = 5;
+}
+
+message EditCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DeleteCommentRequest {
+  string pr_url = 1;
+  // "issue" or "review".
+  string kind = 2;
+  int64 comment_id = 3;
+}
+
+message DeleteCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message AddReactionRequest {
+  string pr_url = 1;
+  // "issue" or "review".
+  string kind = 2;
+  int64 comment_id = 3;
+  // A GitHub reaction, e.g. "THUMBS_UP".
+  string content = 4;
+}
+
+message AddReactionResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message RemoveReactionRequest {
+  string pr_url = 1;
+  string kind = 2;
+  int64 comment_id = 3;
+  string content = 4;
+}
+
+message RemoveReactionResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPullRequestStackRequest {
+  string pr_url = 1;
+}
+
+message GetPullRequestStackResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ReadPullRequestImageRequest {
+  string pr_url = 1;
+  // An image URL the pull request's description or comments link to.
+  string image_url = 2;
+}
+
+message GetMergeReadinessRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+}
+
+message GetMergeReadinessResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message PreviewReviewerPingRequest {
+  string pr_url = 1;
+  string reviewer = 2;
+}
+
+message PreviewReviewerPingResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SendReviewerPingRequest {
+  string pr_url = 1;
+  string preview_token = 2;
+}
+
+message SendReviewerPingResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+// The first message of a ReadPullRequestImage stream.
+message PullRequestImageMetadata {
+  string content_type = 1;
+  int64 size = 2;
+}
+
+message ReadPullRequestImageResponse {
+  // Set on the first message only.
+  PullRequestImageMetadata metadata = 1;
+  // The next part of the image. Concatenate every message's `data`.
+  bytes data = 2;
 }

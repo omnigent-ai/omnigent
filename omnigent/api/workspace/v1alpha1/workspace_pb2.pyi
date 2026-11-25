@@ -107,6 +107,12 @@ class PushUnresolved(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     PUSH_UNRESOLVED_REFSPEC: _ClassVar[PushUnresolved]
     PUSH_UNRESOLVED_PUSH_URL: _ClassVar[PushUnresolved]
     PUSH_UNRESOLVED_PUSH_DEFAULT: _ClassVar[PushUnresolved]
+
+class CompletionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    COMPLETION_KIND_UNSPECIFIED: _ClassVar[CompletionKind]
+    COMPLETION_KIND_MENTION: _ClassVar[CompletionKind]
+    COMPLETION_KIND_REFERENCE: _ClassVar[CompletionKind]
 ENTRY_TYPE_UNSPECIFIED: EntryType
 ENTRY_TYPE_FILE: EntryType
 ENTRY_TYPE_DIRECTORY: EntryType
@@ -168,6 +174,9 @@ PUSH_UNRESOLVED_UNSPECIFIED: PushUnresolved
 PUSH_UNRESOLVED_REFSPEC: PushUnresolved
 PUSH_UNRESOLVED_PUSH_URL: PushUnresolved
 PUSH_UNRESOLVED_PUSH_DEFAULT: PushUnresolved
+COMPLETION_KIND_UNSPECIFIED: CompletionKind
+COMPLETION_KIND_MENTION: CompletionKind
+COMPLETION_KIND_REFERENCE: CompletionKind
 
 class GetCapabilitiesRequest(_message.Message):
     __slots__ = ()
@@ -978,3 +987,495 @@ class DisableAutoMergeResponse(_message.Message):
     PAYLOAD_FIELD_NUMBER: _ClassVar[int]
     payload: _struct_pb2.Struct
     def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class GetPullRequestListStatsRequest(_message.Message):
+    __slots__ = ("pr_urls",)
+    PR_URLS_FIELD_NUMBER: _ClassVar[int]
+    pr_urls: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, pr_urls: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class GetPullRequestListStatsResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class LookupPullRequestRequest(_message.Message):
+    __slots__ = ("pr_url",)
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    def __init__(self, pr_url: _Optional[str] = ...) -> None: ...
+
+class LookupPullRequestResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class ListBranchPullRequestsRequest(_message.Message):
+    __slots__ = ("branch",)
+    BRANCH_FIELD_NUMBER: _ClassVar[int]
+    branch: str
+    def __init__(self, branch: _Optional[str] = ...) -> None: ...
+
+class ListBranchPullRequestsResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SearchReviewersRequest(_message.Message):
+    __slots__ = ("pr_url", "text", "page_size")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    TEXT_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    text: str
+    page_size: int
+    def __init__(self, pr_url: _Optional[str] = ..., text: _Optional[str] = ..., page_size: _Optional[int] = ...) -> None: ...
+
+class SearchReviewersResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SearchCompletionsRequest(_message.Message):
+    __slots__ = ("pr_url", "kind", "text")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    TEXT_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    kind: CompletionKind
+    text: str
+    def __init__(self, pr_url: _Optional[str] = ..., kind: _Optional[_Union[CompletionKind, str]] = ..., text: _Optional[str] = ...) -> None: ...
+
+class SearchCompletionsResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class UploadAttachmentRequest(_message.Message):
+    __slots__ = ("pr_url", "name", "content")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    name: str
+    content: bytes
+    def __init__(self, pr_url: _Optional[str] = ..., name: _Optional[str] = ..., content: _Optional[bytes] = ...) -> None: ...
+
+class UploadAttachmentResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SubmitReviewRequest(_message.Message):
+    __slots__ = ("pr_url", "event", "body", "commit_oid")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    EVENT_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_OID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    event: str
+    body: str
+    commit_oid: str
+    def __init__(self, pr_url: _Optional[str] = ..., event: _Optional[str] = ..., body: _Optional[str] = ..., commit_oid: _Optional[str] = ...) -> None: ...
+
+class SubmitReviewResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SubmitReviewVerdictRequest(_message.Message):
+    __slots__ = ("pr_url", "event", "body", "commit_oid")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    EVENT_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_OID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    event: str
+    body: str
+    commit_oid: str
+    def __init__(self, pr_url: _Optional[str] = ..., event: _Optional[str] = ..., body: _Optional[str] = ..., commit_oid: _Optional[str] = ...) -> None: ...
+
+class SubmitReviewVerdictResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class GetPendingReviewRequest(_message.Message):
+    __slots__ = ("pr_url",)
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    def __init__(self, pr_url: _Optional[str] = ...) -> None: ...
+
+class GetPendingReviewResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class StartPendingReviewRequest(_message.Message):
+    __slots__ = ("pr_url", "commit_oid")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_OID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    commit_oid: str
+    def __init__(self, pr_url: _Optional[str] = ..., commit_oid: _Optional[str] = ...) -> None: ...
+
+class StartPendingReviewResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class AddPendingReviewCommentRequest(_message.Message):
+    __slots__ = ("pr_url", "body", "anchor", "in_reply_to_thread_id", "pending_review_id", "expected_head_oid")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    ANCHOR_FIELD_NUMBER: _ClassVar[int]
+    IN_REPLY_TO_THREAD_ID_FIELD_NUMBER: _ClassVar[int]
+    PENDING_REVIEW_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_HEAD_OID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    body: str
+    anchor: ReviewThreadAnchor
+    in_reply_to_thread_id: str
+    pending_review_id: str
+    expected_head_oid: str
+    def __init__(self, pr_url: _Optional[str] = ..., body: _Optional[str] = ..., anchor: _Optional[_Union[ReviewThreadAnchor, _Mapping]] = ..., in_reply_to_thread_id: _Optional[str] = ..., pending_review_id: _Optional[str] = ..., expected_head_oid: _Optional[str] = ...) -> None: ...
+
+class AddPendingReviewCommentResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class UpdatePendingReviewCommentRequest(_message.Message):
+    __slots__ = ("pr_url", "comment_node_id", "body", "expected_body_sha256", "pending_review_id")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    COMMENT_NODE_ID_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_BODY_SHA256_FIELD_NUMBER: _ClassVar[int]
+    PENDING_REVIEW_ID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    comment_node_id: str
+    body: str
+    expected_body_sha256: str
+    pending_review_id: str
+    def __init__(self, pr_url: _Optional[str] = ..., comment_node_id: _Optional[str] = ..., body: _Optional[str] = ..., expected_body_sha256: _Optional[str] = ..., pending_review_id: _Optional[str] = ...) -> None: ...
+
+class UpdatePendingReviewCommentResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class DeletePendingReviewCommentRequest(_message.Message):
+    __slots__ = ("pr_url", "comment_node_id", "pending_review_id")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    COMMENT_NODE_ID_FIELD_NUMBER: _ClassVar[int]
+    PENDING_REVIEW_ID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    comment_node_id: str
+    pending_review_id: str
+    def __init__(self, pr_url: _Optional[str] = ..., comment_node_id: _Optional[str] = ..., pending_review_id: _Optional[str] = ...) -> None: ...
+
+class DeletePendingReviewCommentResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SubmitPendingReviewRequest(_message.Message):
+    __slots__ = ("pr_url", "event", "body", "commit_oid", "pending_review_id")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    EVENT_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    COMMIT_OID_FIELD_NUMBER: _ClassVar[int]
+    PENDING_REVIEW_ID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    event: str
+    body: str
+    commit_oid: str
+    pending_review_id: str
+    def __init__(self, pr_url: _Optional[str] = ..., event: _Optional[str] = ..., body: _Optional[str] = ..., commit_oid: _Optional[str] = ..., pending_review_id: _Optional[str] = ...) -> None: ...
+
+class SubmitPendingReviewResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class DiscardPendingReviewRequest(_message.Message):
+    __slots__ = ("pr_url", "pending_review_id")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    PENDING_REVIEW_ID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    pending_review_id: str
+    def __init__(self, pr_url: _Optional[str] = ..., pending_review_id: _Optional[str] = ...) -> None: ...
+
+class DiscardPendingReviewResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SetPullRequestStateRequest(_message.Message):
+    __slots__ = ("pr_url", "state")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    state: str
+    def __init__(self, pr_url: _Optional[str] = ..., state: _Optional[str] = ...) -> None: ...
+
+class SetPullRequestStateResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SetPullRequestDraftRequest(_message.Message):
+    __slots__ = ("pr_url", "draft")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    DRAFT_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    draft: bool
+    def __init__(self, pr_url: _Optional[str] = ..., draft: _Optional[bool] = ...) -> None: ...
+
+class SetPullRequestDraftResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class PullRequestAutoMerge(_message.Message):
+    __slots__ = ("pr_url", "merge_method", "expected_head_oid")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    MERGE_METHOD_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_HEAD_OID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    merge_method: str
+    expected_head_oid: str
+    def __init__(self, pr_url: _Optional[str] = ..., merge_method: _Optional[str] = ..., expected_head_oid: _Optional[str] = ...) -> None: ...
+
+class EnableAutoMergeRequest(_message.Message):
+    __slots__ = ("pull_requests",)
+    PULL_REQUESTS_FIELD_NUMBER: _ClassVar[int]
+    pull_requests: _containers.RepeatedCompositeFieldContainer[PullRequestAutoMerge]
+    def __init__(self, pull_requests: _Optional[_Iterable[_Union[PullRequestAutoMerge, _Mapping]]] = ...) -> None: ...
+
+class EnableAutoMergeResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class EnqueuePullRequestRequest(_message.Message):
+    __slots__ = ("pr_url", "expected_head_oid")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_HEAD_OID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    expected_head_oid: str
+    def __init__(self, pr_url: _Optional[str] = ..., expected_head_oid: _Optional[str] = ...) -> None: ...
+
+class EnqueuePullRequestResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class DequeuePullRequestRequest(_message.Message):
+    __slots__ = ("pr_url",)
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    def __init__(self, pr_url: _Optional[str] = ...) -> None: ...
+
+class DequeuePullRequestResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class GetMergeQueueRequest(_message.Message):
+    __slots__ = ("pr_url",)
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    def __init__(self, pr_url: _Optional[str] = ...) -> None: ...
+
+class GetMergeQueueResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SetReviewThreadResolvedRequest(_message.Message):
+    __slots__ = ("pr_url", "thread_id", "resolved")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    THREAD_ID_FIELD_NUMBER: _ClassVar[int]
+    RESOLVED_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    thread_id: str
+    resolved: bool
+    def __init__(self, pr_url: _Optional[str] = ..., thread_id: _Optional[str] = ..., resolved: _Optional[bool] = ...) -> None: ...
+
+class SetReviewThreadResolvedResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class EditCommentRequest(_message.Message):
+    __slots__ = ("pr_url", "kind", "comment_id", "body", "expected_body_sha256")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    COMMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_BODY_SHA256_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    kind: str
+    comment_id: int
+    body: str
+    expected_body_sha256: str
+    def __init__(self, pr_url: _Optional[str] = ..., kind: _Optional[str] = ..., comment_id: _Optional[int] = ..., body: _Optional[str] = ..., expected_body_sha256: _Optional[str] = ...) -> None: ...
+
+class EditCommentResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class DeleteCommentRequest(_message.Message):
+    __slots__ = ("pr_url", "kind", "comment_id")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    COMMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    kind: str
+    comment_id: int
+    def __init__(self, pr_url: _Optional[str] = ..., kind: _Optional[str] = ..., comment_id: _Optional[int] = ...) -> None: ...
+
+class DeleteCommentResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class AddReactionRequest(_message.Message):
+    __slots__ = ("pr_url", "kind", "comment_id", "content")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    COMMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    kind: str
+    comment_id: int
+    content: str
+    def __init__(self, pr_url: _Optional[str] = ..., kind: _Optional[str] = ..., comment_id: _Optional[int] = ..., content: _Optional[str] = ...) -> None: ...
+
+class AddReactionResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class RemoveReactionRequest(_message.Message):
+    __slots__ = ("pr_url", "kind", "comment_id", "content")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    COMMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    kind: str
+    comment_id: int
+    content: str
+    def __init__(self, pr_url: _Optional[str] = ..., kind: _Optional[str] = ..., comment_id: _Optional[int] = ..., content: _Optional[str] = ...) -> None: ...
+
+class RemoveReactionResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class GetPullRequestStackRequest(_message.Message):
+    __slots__ = ("pr_url",)
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    def __init__(self, pr_url: _Optional[str] = ...) -> None: ...
+
+class GetPullRequestStackResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class ReadPullRequestImageRequest(_message.Message):
+    __slots__ = ("pr_url", "image_url")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    IMAGE_URL_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    image_url: str
+    def __init__(self, pr_url: _Optional[str] = ..., image_url: _Optional[str] = ...) -> None: ...
+
+class GetMergeReadinessRequest(_message.Message):
+    __slots__ = ("pr_url", "head_sha")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    HEAD_SHA_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    head_sha: str
+    def __init__(self, pr_url: _Optional[str] = ..., head_sha: _Optional[str] = ...) -> None: ...
+
+class GetMergeReadinessResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class PreviewReviewerPingRequest(_message.Message):
+    __slots__ = ("pr_url", "reviewer")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    REVIEWER_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    reviewer: str
+    def __init__(self, pr_url: _Optional[str] = ..., reviewer: _Optional[str] = ...) -> None: ...
+
+class PreviewReviewerPingResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class SendReviewerPingRequest(_message.Message):
+    __slots__ = ("pr_url", "preview_token")
+    PR_URL_FIELD_NUMBER: _ClassVar[int]
+    PREVIEW_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    pr_url: str
+    preview_token: str
+    def __init__(self, pr_url: _Optional[str] = ..., preview_token: _Optional[str] = ...) -> None: ...
+
+class SendReviewerPingResponse(_message.Message):
+    __slots__ = ("payload",)
+    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    payload: _struct_pb2.Struct
+    def __init__(self, payload: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+
+class PullRequestImageMetadata(_message.Message):
+    __slots__ = ("content_type", "size")
+    CONTENT_TYPE_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    content_type: str
+    size: int
+    def __init__(self, content_type: _Optional[str] = ..., size: _Optional[int] = ...) -> None: ...
+
+class ReadPullRequestImageResponse(_message.Message):
+    __slots__ = ("metadata", "data")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    metadata: PullRequestImageMetadata
+    data: bytes
+    def __init__(self, metadata: _Optional[_Union[PullRequestImageMetadata, _Mapping]] = ..., data: _Optional[bytes] = ...) -> None: ...
