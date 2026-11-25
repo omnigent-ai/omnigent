@@ -119,6 +119,12 @@ describe("TicketDecisionBox", () => {
     expect(box).toHaveTextContent("Decision needed · asked by Lead · 2m ago");
     expect(box).toHaveTextContent("Should human reviewers get a note");
     expect(await screen.findByAltText("Weekly chart")).toBeTruthy();
+    // The decision controls sit right under the question, before the evidence.
+    const options = screen.getByTestId("ticket-decision-options");
+    const evidence = screen.getByTestId("ticket-decision-evidence");
+    expect(
+      options.compareDocumentPosition(evidence) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "1. Factory only (recommended)" }));
     expect(handlers.onAnswer).toHaveBeenCalledWith("Decision: 1. Factory only (recommended)");

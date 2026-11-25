@@ -199,7 +199,7 @@ export function TicketDecisionBox({
         </span>
       </p>
       {questionText ? (
-        <TicketMarkdown className="text-[15px] font-medium text-foreground">
+        <TicketMarkdown className="text-[15px] font-medium text-foreground [&_p]:font-medium [&_li]:font-medium">
           {questionText}
         </TicketMarkdown>
       ) : (
@@ -207,7 +207,6 @@ export function TicketDecisionBox({
           This ticket needs your response; see the latest comment.
         </p>
       )}
-      <Evidence items={evidence} onShowAsk={showAsk} />
       {options.length > 0 && (
         <div className="flex flex-wrap gap-2" data-testid="ticket-decision-options">
           {options.map((option) => (
@@ -225,6 +224,7 @@ export function TicketDecisionBox({
           ))}
         </div>
       )}
+      <Evidence items={evidence} onShowAsk={showAsk} />
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
         <Button
           type="button"
