@@ -46,6 +46,7 @@ import httpx
 
 from omnigent.host.daemon_launch import error_text
 from omnigent.native.native_terminal import url_component
+from omnigent.runtime.message_sender import replayed_content
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Pi session ids are UUIDv7 hex with dashes (e.g.
@@ -605,7 +606,7 @@ def _pi_non_assistant_entry(
     item_type = item.get("type")
 
     if item_type == "message" and item.get("role") == "user":
-        blocks = _pi_text_blocks_from_api_content(item.get("content"), api_type="input_text")
+        blocks = _pi_text_blocks_from_api_content(replayed_content(item), api_type="input_text")
         if not blocks:
             return None
         return {

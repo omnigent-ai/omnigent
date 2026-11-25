@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -33,3 +34,25 @@ def with_message_sender(content: list[dict[str, Any]], sender: str | None) -> li
     if not line or not content:
         return content
     return [{"type": "input_text", "text": line}, *content]
+
+
+def replayed_content(item: Mapping[str, object]) -> object:
+    """
+    Return a stored message item's content as the model received it.
+
+    :param item: A conversation item as served by the items API, e.g.
+        ``{"type": "message", "role": "user", "created_by": "bob@example.com",
+        "sender_in_context": True, "content": [...]}``.
+    :returns: The content behind its sender line when the server named one,
+        else the stored content unchanged.
+    """
+    content = item.get("content")
+    sender = item.get("created_by")
+    if (
+        item.get("sender_in_context") is True
+        and item.get("role", "user") == "user"
+        and isinstance(content, list)
+        and isinstance(sender, str)
+    ):
+        return with_message_sender(content, sender)
+    return content

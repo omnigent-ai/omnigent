@@ -10329,6 +10329,15 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
             "content": [{"type": "input_text", "text": "after compaction"}],
             "response_id": "resp_2",
         },
+        {
+            "id": "msg_4",
+            "type": "message",
+            "role": "user",
+            "created_by": "bob@example.com",
+            "sender_in_context": True,
+            "content": [{"type": "input_text", "text": "from a collaborator"}],
+            "response_id": "resp_3",
+        },
     ]
     records = claude_native._claude_transcript_records_from_session_items(
         items,
@@ -10354,6 +10363,10 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
         str(r.get("message", {}).get("content", "")) for r in records if r.get("type") == "user"
     ]
     assert any("after compaction" in t for t in user_texts)
+    # Resume names the collaborator the model saw named, and only them.
+    named = [t for t in user_texts if "from a collaborator" in t]
+    assert len(named) == 1 and '[Message sender: "bob@example.com"]' in named[0]
+    assert not any("Message sender" in t for t in user_texts if "after compaction" in t)
     # The compact_boundary must carry a non-null compactMetadata: Claude
     # destructures it on every resume-time /compact and auto-compact, and a
     # missing object crashes compaction ("Cannot destructure property

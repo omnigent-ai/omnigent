@@ -212,14 +212,16 @@ async def test_codex_editor_model_input_keeps_edit_access(
 
 
 @pytest.mark.parametrize(
-    ("codex_client", "caller", "content", "named"),
+    ("codex_client", "caller", "content", "named", "queued"),
     [
-        ((_NAMING, "codex-native"), "owner", _typed("Explain this code"), False),
-        ((_NAMING, "codex-native"), "admin", _typed("Explain this code"), True),
-        ((_NAMING, "codex-native"), "admin", _typed("!printf authorized"), False),
-        ((_NAMING, "codex-native"), "editor", _typed("/goal ship the fix"), False),
-        ((_NAMING, "claude-native"), "editor", _typed("Explain this code"), True),
-        ((_NAMING, "claude-native"), "editor", _typed("/compact"), False),
+        ((_NAMING, "codex-native"), "owner", _typed("Explain this code"), False, True),
+        ((_NAMING, "codex-native"), "admin", _typed("Explain this code"), True, True),
+        ((_NAMING, "codex-native"), "admin", _typed("!printf authorized"), False, True),
+        ((_NAMING, "codex-native"), "editor", _typed("/goal ship the fix"), False, True),
+        ((_NAMING, "claude-native"), "editor", _typed("Explain this code"), True, True),
+        ((_NAMING, "claude-native"), "editor", _typed("/compact"), False, True),
+        ((_NAMING, "claude-sdk"), "editor", _typed("Explain this code"), True, False),
+        ((_NAMING, "claude-sdk"), "editor", _typed("/compact"), False, False),
     ],
     ids=[
         "codex-owner",
@@ -228,6 +230,8 @@ async def test_codex_editor_model_input_keeps_edit_access(
         "codex-goal",
         "claude-editor",
         "claude-command",
+        "sdk-prompt",
+        "sdk-compact",
     ],
     indirect=["codex_client"],
 )
@@ -236,6 +240,7 @@ async def test_only_collaborators_model_input_names_them(
     caller: str,
     content: list[dict[str, Any]],
     named: bool,
+    queued: bool,
 ) -> None:
     client, runner, _conv = codex_client
     response = await client.post(
@@ -247,8 +252,9 @@ async def test_only_collaborators_model_input_names_them(
     [message] = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
     sender = f"{caller}@example.com" if named else None
     assert message["content"] == with_message_sender(content, sender)
-    # The queued bubble keeps what the person typed.
-    assert [row["content"] for row in pending_inputs.snapshot_for(_SESSION_ID)] == [content]
+    # A native terminal's queued bubble keeps what the person typed; an API session queues none.
+    expected = [content] if queued else []
+    assert [row["content"] for row in pending_inputs.snapshot_for(_SESSION_ID)] == expected
 
 
 @pytest.mark.parametrize(
@@ -335,32 +341,6 @@ async def test_codex_automated_message_requires_target_ownership_and_stays_model
     ]
     assert "authorized_native_shell_command" not in messages[0]
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
-
-
-@pytest.mark.parametrize(
-    ("codex_client", "content", "named"),
-    [
-        ((_NAMING, "claude-sdk"), _typed("Explain this code"), True),
-        ((_NAMING, "claude-sdk"), _typed("/compact"), False),
-    ],
-    ids=["prompt", "compact"],
-    indirect=["codex_client"],
-)
-async def test_sdk_collaborator_prompts_are_named(
-    codex_client: tuple[httpx.AsyncClient, _ShellRunnerClient, Conversation],
-    content: list[dict[str, Any]],
-    named: bool,
-) -> None:
-    client, runner, _conv = codex_client
-    response = await client.post(
-        _EVENT_PATH,
-        json=_message(content),
-        headers={"X-Forwarded-Email": "editor@example.com"},
-    )
-    assert response.status_code == 202, response.text
-    [message] = [payload for path, payload in runner.post_json_calls if path == _EVENT_PATH]
-    sender = "editor@example.com" if named else None
-    assert message["content"] == with_message_sender(content, sender)
 
 
 @pytest.mark.parametrize(
