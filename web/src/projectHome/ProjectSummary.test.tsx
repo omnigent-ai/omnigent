@@ -352,7 +352,7 @@ describe("drill-down", () => {
     renderSummary();
     await userEvent.click(
       await screen.findByRole("button", {
-        name: "Tickets done by Owner: show the items behind it",
+        name: "Tickets serviced by Owner: show the items behind it",
       }),
     );
     const dialog = await screen.findByTestId("project-status-items");
@@ -365,7 +365,7 @@ describe("drill-down", () => {
       }),
       expect.anything(),
     );
-    expect(within(dialog).getByText("Tickets done for Owner")).toBeTruthy();
+    expect(within(dialog).getByText("Tickets serviced for Owner")).toBeTruthy();
     expect(within(dialog).getByRole("link", { name: "Ship it" }).getAttribute("href")).toContain(
       "ticket=ticket-a",
     );
@@ -373,6 +373,69 @@ describe("drill-down", () => {
     expect(
       within(left).getByText("Created in a completed stage, never moved into it"),
     ).toBeTruthy();
+  });
+
+  it("splits agents from people and drills into a person's submitted tickets", async () => {
+    const human = (name: string, submitted: number, spend: number) => ({
+      key: `user:${name.toLowerCase()}@example.com`,
+      kind: "human" as const,
+      name,
+      user_id: `${name.toLowerCase()}@example.com`,
+      identity_id: null,
+      tickets_done: 0,
+      tickets_submitted: submitted,
+      prs_merged: null,
+      spend_cents: spend,
+      cost_per_merged_pr_cents: null,
+    });
+    vi.mocked(statusApi.getProjectStatusSummary).mockResolvedValue(
+      summary({
+        members: [
+          human("Owner", 1, 250),
+          human("Member", 2, 0),
+          {
+            key: "identity:lead",
+            kind: "identity",
+            name: "Lead",
+            user_id: null,
+            identity_id: "lead",
+            tickets_done: 3,
+            tickets_submitted: 0,
+            prs_merged: null,
+            spend_cents: 400,
+            cost_per_merged_pr_cents: null,
+          },
+        ],
+      }),
+    );
+    vi.mocked(itemsApi.getProjectStatusItems).mockResolvedValue(items);
+    renderSummary();
+    const agents = await screen.findByRole("region", { name: "Agents" });
+    // The owner's own chats spent money, so they count; the member did no agent work.
+    expect(await within(agents).findByText("Lead")).toBeTruthy();
+    expect(within(agents).getByText("Owner")).toBeTruthy();
+    expect(within(agents).queryByText("Member")).toBeNull();
+    const people = screen.getByRole("region", { name: "People" });
+    const names = within(people)
+      .getAllByRole("rowheader")
+      .map((cell) => cell.textContent);
+    expect(names[0]).toContain("Member");
+    expect(within(people).queryByText("Lead")).toBeNull();
+    await userEvent.click(
+      within(people).getByRole("button", {
+        name: "Tickets submitted by Member: show the items behind it",
+      }),
+    );
+    await screen.findByTestId("project-status-items");
+    expect(itemsApi.getProjectStatusItems).toHaveBeenCalledWith(
+      "project",
+      expect.objectContaining({
+        metric: "tickets_submitted",
+        range: "7d",
+        member: "user:member@example.com",
+      }),
+      expect.anything(),
+    );
   });
 
   it("opens a KPI tile's items over the tile's 8 days", async () => {

@@ -25,6 +25,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.project_kpis import (
     KpiInputs,
     KpiStatus,
+    MetricSeries,
+    SeriesItem,
     kpi_history_since,
     kpi_rows,
     load_series,
@@ -35,6 +37,7 @@ from omnigent.server.project_status import (
     StatusWindow,
     load_status_sources,
     status_period,
+    user_member_key,
 )
 from omnigent.server.project_status_cache import project_status_cache
 from omnigent.server.project_status_items import DrilldownRange, drilldown, range_bounds
@@ -129,6 +132,7 @@ StatusItemMetric = Literal[
     "rework_tickets",
     "time_to_merged_median_hours",
     "time_to_merged_p90_hours",
+    "tickets_submitted",
 ]
 
 
@@ -183,6 +187,22 @@ class ProjectKpiRevisionPage(BaseModel):
     object: Literal["list"]
     data: list[ProjectKpiRevision]
     has_more: bool
+
+
+def submitted_series(project: Project, rows: list[dict[str, Any]]) -> MetricSeries:
+    """Tickets each person requested, dated by creation, for the drill-down."""
+    return MetricSeries(
+        "distinct",
+        items=[
+            SeriesItem(
+                row["created_at"],
+                row["ticket_id"],
+                "ticket",
+                member=user_member_key(row.get("requested_by") or project.user_id),
+            )
+            for row in rows
+        ],
+    )
 
 
 def create_project_kpis_router(
@@ -339,7 +359,15 @@ def create_project_kpis_router(
         period = status_period("7d" if range_id == "trend" else range_id, now_epoch())
         inputs = inputs_for(request, project, period, user_id, range_bounds(range_id, period)[0])
         member_of = move_member_resolver(project, conversation_store)
-        series = load_series([metric], inputs, member_of)[metric]
+        if metric == "tickets_submitted":
+            series = submitted_series(
+                project,
+                ticket_store.requested_tickets(
+                    project.id, user_id=user_id, since_epoch=range_bounds(range_id, period)[0]
+                ),
+            )
+        else:
+            series = load_series([metric], inputs, member_of)[metric]
         result = drilldown(series, period, range_id, member) if series.dated else None
         rows = [] if result is None else [*result["items"], *result["excluded"]]
         ticket_ids = {row["id"].removeprefix("ticket:") for row in rows if row["kind"] == "ticket"}
@@ -361,12 +389,12 @@ def create_project_kpis_router(
             else:
                 row["title"] = None
                 row["url"] = row["id"]
-        metric_info = KPI_METRICS_BY_ID[metric]
+        metric_info = KPI_METRICS_BY_ID.get(metric)
         base = {
             "object": "project.status_items",
             "project_id": project.id,
             "metric": metric,
-            "unit": metric_info.unit,
+            "unit": metric_info.unit if metric_info else "count",
             "range": range_id,
             "member": member,
             "today_utc": period.today_utc,

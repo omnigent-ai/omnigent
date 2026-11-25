@@ -817,6 +817,31 @@ class ProjectTicketStore:
 
         return run_write_transaction(self._write, "create_ticket", write)
 
+    def requested_tickets(
+        self, project_id: str, *, user_id: str | None, since_epoch: int | None
+    ) -> builtins.list[dict[str, Any]]:
+        """Tickets created since *since_epoch*, with who requested each, oldest first.
+
+        Readable by any project member. Rows are ``{"ticket_id", "requested_by",
+        "created_at"}``; ``requested_by`` is the person the work is for.
+        """
+        with self._session("list_requested_tickets") as session:
+            project = self._project(session, project_id, user_id)
+            stmt = select(
+                SqlProjectTicket.id, SqlProjectTicket.requested_by, SqlProjectTicket.created_at
+            ).where(
+                SqlProjectTicket.workspace_id == project.workspace_id,
+                SqlProjectTicket.project_id == project.id,
+            )
+            if since_epoch is not None:
+                stmt = stmt.where(SqlProjectTicket.created_at >= since_epoch)
+            return [
+                {"ticket_id": ticket_id, "requested_by": requested_by, "created_at": created_at}
+                for ticket_id, requested_by, created_at in session.execute(
+                    stmt.order_by(SqlProjectTicket.created_at)
+                )
+            ]
+
     def count_requested_since(
         self, project_id: str, requested_by: str, since: int, *, user_id: str | None
     ) -> int:

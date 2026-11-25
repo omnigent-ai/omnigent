@@ -254,8 +254,10 @@ def build_summary(
     tickets_done: MemberTotals,
     spend: MemberTotals,
     prs_merged: MemberTotals,
+    tickets_submitted: MemberTotals | None = None,
 ) -> dict[str, Any]:
     """Assemble the ``ProjectStatusSummary`` response from each metric."""
+    submitted = tickets_submitted or MemberTotals()
     spend_total = spend.total if spend.available else None
     prs_total = prs_merged.total if prs_merged.available else None
     members = []
@@ -267,6 +269,7 @@ def build_summary(
             {
                 **row,
                 "tickets_done": tickets_done.by_member.get(key, 0),
+                "tickets_submitted": submitted.by_member.get(key, 0),
                 "prs_merged": member_prs,
                 "spend_cents": member_spend,
                 "cost_per_merged_pr_cents": _cents_per_pr(member_spend, member_prs),
@@ -282,6 +285,7 @@ def build_summary(
         "generated_at": period.until_epoch,
         "totals": {
             "tickets_done": tickets_done.total,
+            "tickets_submitted": submitted.total,
             "prs_merged": prs_total,
             "spend_cents": spend_total,
             "cost_per_merged_pr_cents": _cents_per_pr(spend_total, prs_total),

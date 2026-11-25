@@ -8,7 +8,6 @@ import {
   ScrollTextIcon,
   SquareKanbanIcon,
 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -87,18 +86,39 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
         ) : null}
       </section>
       <ProjectKpiTiles projectId={projectId} onDrill={setDrilldown} />
-      <section aria-label="Members" className="space-y-3">
-        <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Members</h2>
+      <section aria-label="Agents" className="space-y-3">
+        <div>
+          <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Agents</h2>
+          <p className="text-xs text-muted-foreground">
+            The work agents did and what it cost. People&rsquo;s own chats count here too, since
+            that&rsquo;s where their spend comes from.
+          </p>
+        </div>
         {summary.data ? (
-          <MembersTable
+          <AgentsTable summary={summary.data} statusWindow={statusWindow} onDrill={setDrilldown} />
+        ) : summary.isPending ? (
+          <Spinner aria-label="Loading agents" />
+        ) : (
+          <p className="text-sm text-muted-foreground">Agents are unavailable right now.</p>
+        )}
+      </section>
+      <section aria-label="People" className="space-y-3">
+        <div>
+          <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">People</h2>
+          <p className="text-xs text-muted-foreground">
+            Tickets each person asked for, including ones an agent filed for them.
+          </p>
+        </div>
+        {summary.data ? (
+          <PeopleTable
             members={summary.data.members}
             statusWindow={statusWindow}
             onDrill={setDrilldown}
           />
         ) : summary.isPending ? (
-          <Spinner aria-label="Loading members" />
+          <Spinner aria-label="Loading people" />
         ) : (
-          <p className="text-sm text-muted-foreground">Members are unavailable right now.</p>
+          <p className="text-sm text-muted-foreground">People are unavailable right now.</p>
         )}
       </section>
       {drilldown && (
@@ -310,28 +330,41 @@ function StatTile({
 }
 
 const COLUMNS: { key: ProjectStatusSortKey; label: string; numeric: boolean }[] = [
-  { key: "name", label: "Member", numeric: false },
-  { key: "tickets_done", label: "Tickets done", numeric: true },
+  { key: "name", label: "Agent", numeric: false },
+  { key: "tickets_done", label: "Tickets serviced", numeric: true },
   { key: "prs_merged", label: "PRs merged", numeric: true },
   { key: "spend_cents", label: "Spend", numeric: true },
   { key: "cost_per_merged_pr_cents", label: "Cost per merged PR", numeric: true },
 ];
 
-function MembersTable({
-  members,
+/** Agent rows plus each person's own chats that did work: the rows spend and tickets come from. */
+export function agentRows(members: readonly ProjectStatusMember[]): ProjectStatusMember[] {
+  return members.filter(
+    (member) =>
+      member.kind !== "human" ||
+      member.tickets_done > 0 ||
+      (member.spend_cents ?? 0) > 0 ||
+      (member.prs_merged ?? 0) > 0,
+  );
+}
+
+function AgentsTable({
+  summary,
   statusWindow,
   onDrill,
 }: {
-  members: ProjectStatusMember[];
+  summary: ProjectStatusSummary;
   statusWindow: ProjectStatusWindow;
   onDrill: (drilldown: StatusDrilldown) => void;
 }) {
+  const members = agentRows(summary.members);
+  const { totals } = summary;
   const [sort, setSort] = useState<{ key: ProjectStatusSortKey; direction: "asc" | "desc" }>({
     key: "tickets_done",
     direction: "desc",
   });
   if (!members.length)
-    return <p className="text-sm text-muted-foreground">No members have activity yet.</p>;
+    return <p className="text-sm text-muted-foreground">No agents have activity yet.</p>;
   const rows = sortStatusMembers(members, sort.key, sort.direction);
   return (
     <div className="overflow-x-auto rounded-lg border border-border/60">
@@ -388,16 +421,16 @@ function MembersTable({
               <th scope="row" className="px-3 py-2 text-left font-normal">
                 <span className="flex items-center gap-2">
                   <MemberName member={member} />
-                  <Badge variant="outline" className="shrink-0 text-xs font-normal">
-                    {member.kind === "human" ? "Person" : "Agent"}
-                  </Badge>
+                  {member.kind === "human" && (
+                    <span className="text-muted-foreground">&rsquo;s own chats</span>
+                  )}
                 </span>
               </th>
               <NumberCell
-                label={`Tickets done by ${memberDisplayName(member)}`}
+                label={`Tickets serviced by ${memberDisplayName(member)}`}
                 onOpen={() =>
                   onDrill({
-                    label: "Tickets done",
+                    label: "Tickets serviced",
                     metric: "tickets_shipped",
                     range: statusWindow,
                     member: member.key,
@@ -439,6 +472,75 @@ function MembersTable({
                 {formatCents(member.spend_cents)}
               </NumberCell>
               <NumberCell>{formatCents(member.cost_per_merged_pr_cents)}</NumberCell>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot className="border-t border-border/60 font-medium">
+          <tr data-testid="agents-total">
+            <th scope="row" className="px-3 py-2 text-left">
+              Total
+            </th>
+            <NumberCell>{String(totals.tickets_done)}</NumberCell>
+            <NumberCell>{totals.prs_merged === null ? "—" : String(totals.prs_merged)}</NumberCell>
+            <NumberCell>{formatCents(totals.spend_cents)}</NumberCell>
+            <NumberCell>{formatCents(totals.cost_per_merged_pr_cents)}</NumberCell>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  );
+}
+
+/** Everyone on the project with the tickets they asked for, most first. */
+function PeopleTable({
+  members,
+  statusWindow,
+  onDrill,
+}: {
+  members: ProjectStatusMember[];
+  statusWindow: ProjectStatusWindow;
+  onDrill: (drilldown: StatusDrilldown) => void;
+}) {
+  const people = members
+    .filter((member) => member.kind === "human")
+    .sort(
+      (left, right) =>
+        (right.tickets_submitted ?? 0) - (left.tickets_submitted ?? 0) ||
+        memberDisplayName(left).localeCompare(memberDisplayName(right)),
+    );
+  if (!people.length) return <p className="text-sm text-muted-foreground">No people yet.</p>;
+  return (
+    <div className="overflow-x-auto rounded-lg border border-border/60">
+      <table className="w-full text-sm">
+        <thead className="border-b border-border/60 text-muted-foreground">
+          <tr>
+            <th scope="col" className="px-3 py-2 text-left font-medium">
+              Person
+            </th>
+            <th scope="col" className="px-3 py-2 text-right font-medium">
+              Tickets submitted
+            </th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-border/60">
+          {people.map((person) => (
+            <tr key={person.key}>
+              <th scope="row" className="px-3 py-2 text-left font-normal">
+                <MemberName member={person} />
+              </th>
+              <NumberCell
+                label={`Tickets submitted by ${memberDisplayName(person)}`}
+                onOpen={() =>
+                  onDrill({
+                    label: "Tickets submitted",
+                    metric: "tickets_submitted",
+                    range: statusWindow,
+                    member: person.key,
+                  })
+                }
+              >
+                {String(person.tickets_submitted ?? 0)}
+              </NumberCell>
             </tr>
           ))}
         </tbody>

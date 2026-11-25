@@ -13,6 +13,8 @@ export const PROJECT_STATUS_WINDOWS: readonly { id: ProjectStatusWindow; label: 
 /** A metric is `null` when its source isn't available on this server, never 0. */
 export interface ProjectStatusTotals {
   tickets_done: number;
+  /** Tickets created in the window, counted for who requested them. */
+  tickets_submitted?: number;
   prs_merged: number | null;
   spend_cents: number | null;
   cost_per_merged_pr_cents: number | null;
@@ -27,6 +29,8 @@ export interface ProjectStatusMember {
   user_id: string | null;
   identity_id: string | null;
   tickets_done: number;
+  /** Tickets this person requested in the window; 0 for agents. */
+  tickets_submitted?: number;
   prs_merged: number | null;
   spend_cents: number | null;
   cost_per_merged_pr_cents: number | null;
@@ -69,17 +73,11 @@ export async function getProjectStatusSummary(
 /** Whole cents as dollars, e.g. 123456 -> "$1,234.56"; `null` (no source) -> "—". */
 export function formatCents(cents: number | null): string {
   if (cents === null) return "—";
-  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(
-    cents / 100,
-  );
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(cents / 100);
 }
 
 export type ProjectStatusSortKey =
-  | "name"
-  | "tickets_done"
-  | "prs_merged"
-  | "spend_cents"
-  | "cost_per_merged_pr_cents";
+  "name" | "tickets_done" | "prs_merged" | "spend_cents" | "cost_per_merged_pr_cents";
 
 /** Sort member rows by a column; missing values sort last in either direction. */
 export function sortStatusMembers(

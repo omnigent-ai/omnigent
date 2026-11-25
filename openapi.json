@@ -8278,7 +8278,8 @@
               "tickets_shipped",
               "rework_tickets",
               "time_to_merged_median_hours",
-              "time_to_merged_p90_hours"
+              "time_to_merged_p90_hours",
+              "tickets_submitted"
             ],
             "title": "Metric",
             "type": "string"
@@ -8445,6 +8446,13 @@
           "tickets_done": {
             "format": "int64",
             "title": "Tickets Done",
+            "type": "integer"
+          },
+          "tickets_submitted": {
+            "default": 0,
+            "description": "Tickets this person requested in the window; 0 for agents.",
+            "format": "int64",
+            "title": "Tickets Submitted",
             "type": "integer"
           },
           "user_id": {
@@ -8632,6 +8640,13 @@
           "tickets_done": {
             "format": "int64",
             "title": "Tickets Done",
+            "type": "integer"
+          },
+          "tickets_submitted": {
+            "default": 0,
+            "description": "Tickets created in the window, counted for who requested them.",
+            "format": "int64",
+            "title": "Tickets Submitted",
             "type": "integer"
           }
         },
@@ -25058,7 +25073,8 @@
                 "tickets_shipped",
                 "rework_tickets",
                 "time_to_merged_median_hours",
-                "time_to_merged_p90_hours"
+                "time_to_merged_p90_hours",
+                "tickets_submitted"
               ],
               "title": "Metric",
               "type": "string"

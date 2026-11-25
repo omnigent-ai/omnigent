@@ -10,7 +10,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
@@ -46,6 +46,9 @@ class ProjectStatusTotals(BaseModel):
     """Window totals. ``None`` means the metric's source isn't available."""
 
     tickets_done: int
+    tickets_submitted: int = Field(
+        default=0, description="Tickets created in the window, counted for who requested them."
+    )
     prs_merged: int | None
     spend_cents: int | None
     cost_per_merged_pr_cents: int | None
@@ -61,6 +64,9 @@ class ProjectStatusMember(BaseModel):
     user_id: str | None
     identity_id: str | None
     tickets_done: int
+    tickets_submitted: int = Field(
+        default=0, description="Tickets this person requested in the window; 0 for agents."
+    )
     prs_merged: int | None
     spend_cents: int | None
     cost_per_merged_pr_cents: int | None
@@ -113,6 +119,15 @@ def move_member_resolver(
         )
 
     return resolve
+
+
+def tickets_submitted_by_person(project: Project, rows: list[dict[str, Any]]) -> MemberTotals:
+    """Tickets each person requested: the person the work is for, not who typed it."""
+    by_member: dict[MemberKey, int] = {}
+    for row in rows:
+        key = user_member_key(row.get("requested_by") or project.user_id)
+        by_member[key] = by_member.get(key, 0) + 1
+    return MemberTotals(total=len(rows), by_member=by_member)
 
 
 def tickets_done_by_member(
@@ -187,6 +202,12 @@ def create_project_status_router(
             )
             return tickets_done_by_member(project, moves, conversation_store)
 
+        def count_tickets_submitted() -> MemberTotals:
+            rows = ticket_store.requested_tickets(
+                project.id, user_id=user_id, since_epoch=period.since_epoch
+            )
+            return tickets_submitted_by_person(project, rows)
+
         timings: dict[str, float] = {}
 
         async def timed(name: str, call: Callable[..., T], *args: Any) -> T:
@@ -197,7 +218,7 @@ def create_project_status_router(
                 timings[name] = round((time.perf_counter() - started) * 1000, 1)
 
         # Independent reads run side by side; each source is cached per project and window.
-        identities, shares, tickets_done, spend, prs = await asyncio.gather(
+        identities, shares, tickets_done, submitted, spend, prs = await asyncio.gather(
             timed(
                 "identities",
                 functools.partial(project_store.list_identities, user_id=user_id),
@@ -214,11 +235,19 @@ def create_project_status_router(
                 ("tickets_done", period_key(period)),
                 count_tickets_done,
             ),
+            timed(
+                "tickets_submitted",
+                project_status_cache.get_or_compute,
+                project.id,
+                "tickets",
+                ("tickets_submitted", period_key(period)),
+                count_tickets_submitted,
+            ),
             timed("spend", _measure, active.spend, "spend", project, period),
             timed("prs_merged", _measure, active.prs_merged, "prs_merged", project, period),
         )
         logger.debug("Project status summary %s %s timings (ms): %s", project.id, window, timings)
-        seen = {*tickets_done.by_member, *spend.by_member, *prs.by_member}
+        seen = {*tickets_done.by_member, *submitted.by_member, *spend.by_member, *prs.by_member}
         roster = summary_members(project, identities, [share.user_id for share in shares], seen)
         summary = build_summary(
             project,
@@ -227,6 +256,7 @@ def create_project_status_router(
             tickets_done=tickets_done,
             spend=spend,
             prs_merged=prs,
+            tickets_submitted=submitted,
         )
         return {**summary, "description": project.description}
 

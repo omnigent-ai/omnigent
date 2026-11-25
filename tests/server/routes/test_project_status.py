@@ -94,6 +94,7 @@ def test_unavailable_sources_report_null_not_zero() -> None:
     )
     assert summary["totals"] == {
         "tickets_done": 2,
+        "tickets_submitted": 0,
         "prs_merged": None,
         "spend_cents": 1001,
         "cost_per_merged_pr_cents": None,
@@ -184,3 +185,37 @@ def test_sources_are_found_by_module_and_missing_ones_stay_none(
     # Installed sources are wrapped in the status cache.
     assert loaded.spend._source == ("state", spend)
     assert loaded.prs_merged is None
+
+
+async def test_tickets_submitted_count_for_who_requested_them_and_drill_down(
+    multi_user_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+) -> None:
+    owner, member = _as_user("owner@example.com"), _as_user("member@example.com")
+    created = (
+        await multi_user_client.post("/v1/projects", json={"name": "Asks"}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    await multi_user_client.post(
+        f"{path}/shares", json={"user_id": "member@example.com"}, headers=owner
+    )
+    for title in ("A", "B"):
+        await multi_user_client.post(f"{path}/tickets", json={"title": title}, headers=member)
+    await multi_user_client.post(f"{path}/tickets", json={"title": "C"}, headers=owner)
+    body = (await multi_user_client.get(f"{path}/status/summary", headers=member)).json()
+    assert body["totals"]["tickets_submitted"] == 3
+    by_person = {
+        row["user_id"]: row["tickets_submitted"]
+        for row in body["members"]
+        if row["kind"] == "human"
+    }
+    assert by_person == {"owner@example.com": 1, "member@example.com": 2}
+    assert all(row["tickets_submitted"] == 0 for row in body["members"] if row["kind"] != "human")
+    drill = (
+        await multi_user_client.get(
+            f"{path}/status/items",
+            params={"metric": "tickets_submitted", "member": "user:member@example.com"},
+            headers=member,
+        )
+    ).json()
+    assert (drill["total"], drill["unit"]) == (2, "count")
+    assert sorted(row["title"] for row in drill["items"]) == ["A", "B"]
