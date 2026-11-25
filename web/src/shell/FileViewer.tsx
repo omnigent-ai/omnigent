@@ -403,6 +403,11 @@ interface FileViewerProps {
   besideSidebar?: boolean;
   /** Shown first in the toolbar, such as a sidebar's toggle. */
   toolbarLeading?: ReactNode;
+  /**
+   * Shows the file's changes in the Changes review, as the tabs sidebar's text files do:
+   * the toolbar's diff button then reads "Show changes", and "Open file" in a diff.
+   */
+  onShowChanges?: () => void;
   /** The same frameless viewer fills the mobile viewport without remounting. */
   mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
@@ -479,6 +484,7 @@ function FileViewerBody({
   pathHeader,
   besideSidebar = false,
   toolbarLeading,
+  onShowChanges,
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
@@ -1541,18 +1547,23 @@ function FileViewerBody({
     },
   });
   if (!isPdf && !isDeletedFile && isDiffAvailable) {
+    const toggleDiff = () =>
+      guardDirty(() => {
+        dismissFilePosition(position);
+        setDismissedPosition(position);
+        setCommentLinkFileView(false);
+        setDiffActive(viewMode !== "diff");
+      });
+    // Where the page has a Changes review, the file's changes open there.
+    const diffLabels = onShowChanges
+      ? { diff: "Open file", file: "Show changes" }
+      : { diff: "Exit diff view", file: "Show diff" };
     toolbarActions.push({
       key: "diff",
-      label: viewMode === "diff" ? "Exit diff view" : "Show diff",
+      label: viewMode === "diff" ? diffLabels.diff : diffLabels.file,
       icon: <FileDiffIcon className="size-4" />,
       active: viewMode === "diff",
-      onSelect: () =>
-        guardDirty(() => {
-          dismissFilePosition(position);
-          setDismissedPosition(position);
-          setCommentLinkFileView(false);
-          setDiffActive(viewMode !== "diff");
-        }),
+      onSelect: onShowChanges && viewMode !== "diff" ? () => guardDirty(onShowChanges) : toggleDiff,
     });
   }
   if (viewMode === "diff" && splitToggleAvailable) {

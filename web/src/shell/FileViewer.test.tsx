@@ -292,6 +292,7 @@ interface RenderProps {
   shareDisabledReason?: string;
   linkedCommentId?: string;
   comparisonDiff?: ComponentProps<typeof FileViewer>["comparisonDiff"];
+  onShowChanges?: () => void;
 }
 
 /**
@@ -325,6 +326,7 @@ function viewerTree({
   registerLeaveGuard,
   linkedCommentId,
   comparisonDiff,
+  onShowChanges,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -354,6 +356,7 @@ function viewerTree({
           registerLeaveGuard={registerLeaveGuard}
           linkedCommentId={linkedCommentId}
           comparisonDiff={comparisonDiff}
+          onShowChanges={onShowChanges}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -1082,6 +1085,25 @@ describe("FileViewer URL sync — diff param", () => {
     // Failure: diff sync useEffect did not call setSearchParams after diffActive changed.
     expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
     expect(screen.getByTestId("url-params").textContent).toContain("diff=1");
+  });
+
+  it("sends Show changes to the page's Changes review, and Open file leaves a diff", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onShowChanges = vi.fn();
+    renderViewer({ open: true, path: "file1.py", onShowChanges });
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show changes" }));
+    expect(onShowChanges).toHaveBeenCalledTimes(1);
+    // The review shows the diff, so the file stays in its own view.
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    cleanup();
+
+    // A file that opens in a diff, as from a ?diff=1 link, leaves it with Open file.
+    renderViewer({ open: true, path: "file1.py", onShowChanges, initialSearch: "diff=1" });
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open file" }));
+    expect(await screen.findByTestId("code-viewer")).toBeInTheDocument();
+    expect(onShowChanges).toHaveBeenCalledTimes(1);
   });
 
   it("removes ?diff from the URL when diff is toggled off", async () => {
