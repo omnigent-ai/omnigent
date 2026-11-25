@@ -3,25 +3,45 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .datamodel import OSEnvSpec
+from .credential_proxy import CODEX_GATEWAY_TOKEN_ENV, prepare_credential_proxy_runtime
+from .datamodel import CredentialProxySpec, OSEnvSpec
 from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
+from .egress.rules import parse_rules
 from .model_signer import SignerReadiness
+from .os_env import _build_credential_proxy_parent_env, build_helper_env
 from .sandbox import (
     cleanup_private_tmpdir,
     create_exec_launcher,
     create_private_tmpdir,
     get_backend,
+    harness_sandbox_preparation,
     resolve_sandbox,
+    validate_harness_sandbox,
     with_additional_read_roots,
     with_additional_write_roots,
     with_spawn_env_allowlist,
 )
 
 _FRAMEWORK_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+BROKERED_CODEX_AUTH_COMMAND = f'printf %s "${CODEX_GATEWAY_TOKEN_ENV}"'
+BROKERED_CODEX_ENV = "OMNIGENT_CODEX_BROKERED_GATEWAY"
+BROKERED_CODEX_ALLOWED_ENV = frozenset(
+    {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "PYTHONUTF8",
+        "OPENAI_MAX_RETRIES",
+        "OPENAI_TIMEOUT",
+        BROKERED_CODEX_ENV,
+    }
+)
 _BROKERED_AUTH_SECRET_ENV = frozenset(
     {
         "DATABRICKS_BEARER",
@@ -39,6 +59,7 @@ class CodexWorkerLaunch:
 
     launch_path: str
     sandboxed: bool
+    allow_network: bool = True
     _owned_launcher: Path | None = None
     _egress_handle: EgressProxyHandle | None = None
     _egress_tmpdir: Path | None = None
@@ -70,32 +91,34 @@ def prepare_codex_catalog_probe(
     """Prepare a network-denied launcher for ``codex debug models --bundled``."""
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
         raise OSError("brokered Codex catalog probe requires an active sandbox")
-    policy = resolve_sandbox(os_env, cwd)
-    if not policy.active:
-        raise OSError("brokered Codex catalog probe requires an active sandbox")
+    with harness_sandbox_preparation():
+        policy = resolve_sandbox(os_env, cwd)
+        if not policy.active:
+            raise OSError("brokered Codex catalog probe requires an active sandbox")
 
-    codex_dir = Path(codex_path).resolve(strict=False).parent
-    policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
-    policy = with_additional_write_roots(policy, [codex_home])
-    policy = replace(
-        policy,
-        allow_network=False,
-        egress_relay_port=None,
-        egress_socket_path=None,
-    )
-    policy = with_spawn_env_allowlist(policy, spawn_env_names)
-    backend = get_backend(policy.backend_type)
-    probe_argv = [codex_path, "debug", "models", "--bundled"]
-    if backend.wrap_launcher_argv(probe_argv, policy, cwd, target=codex_path) == probe_argv:
-        raise OSError(
-            f"Sandbox backend {policy.backend_type!r} cannot contain the Codex catalog probe"
+        codex_dir = Path(codex_path).resolve(strict=False).parent
+        policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
+        policy = with_additional_write_roots(policy, [codex_home])
+        policy = replace(
+            policy,
+            allow_network=False,
+            egress_relay_port=None,
+            egress_socket_path=None,
         )
-    launcher = Path(create_exec_launcher(codex_path, policy))
-    return CodexWorkerLaunch(
-        launch_path=str(launcher),
-        sandboxed=True,
-        _owned_launcher=launcher,
-    )
+        policy = with_spawn_env_allowlist(policy, spawn_env_names)
+        backend = get_backend(policy.backend_type)
+        probe_argv = [codex_path, "debug", "models", "--bundled"]
+        if backend.wrap_launcher_argv(probe_argv, policy, cwd, target=codex_path) == probe_argv:
+            raise OSError(
+                f"Sandbox backend {policy.backend_type!r} cannot contain the Codex catalog probe"
+            )
+        launcher = Path(create_exec_launcher(codex_path, policy, cwd=str(cwd)))
+        return CodexWorkerLaunch(
+            launch_path=str(launcher),
+            sandboxed=True,
+            allow_network=False,
+            _owned_launcher=launcher,
+        )
 
 
 def prepare_codex_worker(
@@ -110,9 +133,19 @@ def prepare_codex_worker(
     worker_env: MutableMapping[str, str] | None = None,
 ) -> CodexWorkerLaunch:
     """Prepare a contained worker or propagate the containment failure."""
+    brokered_gateway = worker_env is not None and worker_env.get(BROKERED_CODEX_ENV) == "1"
+    if os_env is not None:
+        with harness_sandbox_preparation():
+            validate_harness_sandbox(
+                os_env,
+                "Codex",
+                cwd=cwd,
+                supports_egress_rules=True,
+                supports_credential_proxy=brokered_gateway,
+            )
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
-        if signer_readiness is not None:
-            raise OSError("signer-backed Codex worker requires an active sandbox")
+        if signer_readiness is not None or brokered_gateway:
+            raise OSError("brokered Codex worker requires an active sandbox")
         return CodexWorkerLaunch(launch_path=codex_path, sandboxed=False)
     sandbox_spec = os_env.sandbox
     if signer_readiness is not None and sandbox_spec is not None and sandbox_spec.egress_rules:
@@ -121,11 +154,11 @@ def prepare_codex_worker(
             "brokered sessions are model-only"
         )
 
-    policy = resolve_sandbox(os_env, cwd)
-    if not policy.active:
-        if signer_readiness is not None:
-            raise OSError("signer-backed Codex worker requires an active sandbox")
-        return CodexWorkerLaunch(launch_path=codex_path, sandboxed=False)
+    with harness_sandbox_preparation():
+        policy = resolve_sandbox(os_env, cwd)
+        if not policy.active:
+            raise OSError("Codex worker requires an active sandbox for the requested policy")
+
     if signer_readiness is not None and worker_env is None:
         raise ValueError("signer-backed Codex worker requires an owned worker environment")
     egress_rules = (
@@ -135,17 +168,58 @@ def prepare_codex_worker(
     )
     if egress_rules and worker_env is None:
         raise ValueError("egress-filtered Codex worker requires an owned worker environment")
+    broker_proxy: CredentialProxySpec | None = None
+    if brokered_gateway:
+        if sandbox_spec is None or sandbox_spec.credential_proxy is None or not egress_rules:
+            raise ValueError("brokered Codex gateway requires credential_proxy and egress rules")
+        bindings = [
+            entry
+            for entry in sandbox_spec.credential_proxy.entries
+            if CODEX_GATEWAY_TOKEN_ENV in entry.inject_env
+        ]
+        if (
+            len(bindings) != 1
+            or bindings[0].scheme != "bearer"
+            or bindings[0].inject_env != [CODEX_GATEWAY_TOKEN_ENV]
+        ):
+            raise ValueError("brokered Codex gateway requires one bearer token binding")
+        source = bindings[0].source
+        if source.kind not in ("file", "unix_socket") or source.refresh_interval_seconds is None:
+            raise ValueError("brokered Codex gateway requires a renewable file/socket source")
+        host_rules = [
+            rule for rule in parse_rules(egress_rules) if rule._host_matches(bindings[0].host)
+        ]
+        if len(host_rules) != 1 or (
+            host_rules[0].host_pattern != bindings[0].host
+            or host_rules[0].methods != frozenset({"POST"})
+            or not host_rules[0].path_pattern.endswith("/responses")
+            or "*" in host_rules[0].path_pattern
+        ):
+            raise ValueError("brokered Codex gateway requires one exact POST Responses route")
+        broker_proxy = CredentialProxySpec(entries=bindings)
 
-    codex_dir = Path(codex_path).resolve(strict=False).parent
-    policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
-    if skills_dir is not None:
-        policy = with_additional_read_roots(policy, [skills_dir])
-    policy = with_additional_write_roots(policy, [codex_home])
-    if signer_readiness is not None:
-        if signer_readiness.ca_bundle_path.parent != signer_readiness.socket_path.parent:
-            raise ValueError("signer relay and public CA must share one public directory")
-        policy = with_additional_read_roots(policy, [signer_readiness.ca_bundle_path.parent])
+    with harness_sandbox_preparation():
+        codex_dir = Path(codex_path).resolve(strict=False).parent
+        policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
+        if skills_dir is not None:
+            policy = with_additional_read_roots(policy, [skills_dir])
+        policy = with_additional_write_roots(policy, [codex_home])
+        if signer_readiness is not None:
+            if signer_readiness.ca_bundle_path.parent != signer_readiness.socket_path.parent:
+                raise ValueError("signer relay and public CA must share one public directory")
+            policy = with_additional_read_roots(policy, [signer_readiness.ca_bundle_path.parent])
+
     staged_env = dict(worker_env) if worker_env is not None else None
+    if brokered_gateway and staged_env is not None:
+        for key in tuple(staged_env):
+            if key not in BROKERED_CODEX_ALLOWED_ENV:
+                staged_env.pop(key, None)
+        staged_env["HOME"] = str(codex_home)
+        staged_env["CODEX_HOME"] = str(codex_home)
+        staged_env["CFFIXED_USER_HOME"] = str(codex_home)
+        staged_env["CODEX_SQLITE_HOME"] = str(codex_home)
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            staged_env[name] = str(codex_home)
     if signer_readiness is not None:
         assert staged_env is not None
         for key in _BROKERED_AUTH_SECRET_ENV:
@@ -167,18 +241,19 @@ def prepare_codex_worker(
             egress_socket_path=str(signer_readiness.socket_path),
         )
 
-    backend = get_backend(policy.backend_type)
-    probe_argv = [codex_path, "app-server"]
-    wrapped_argv = backend.wrap_launcher_argv(
-        probe_argv,
-        policy,
-        cwd,
-        target=codex_path,
-    )
-    if wrapped_argv == probe_argv:
-        raise OSError(
-            f"Sandbox backend {policy.backend_type!r} cannot contain the Codex worker at spawn"
+    with harness_sandbox_preparation():
+        backend = get_backend(policy.backend_type)
+        probe_argv = [codex_path, "app-server"]
+        wrapped_argv = backend.wrap_launcher_argv(
+            probe_argv,
+            policy,
+            cwd,
+            target=codex_path,
         )
+        if wrapped_argv == probe_argv:
+            raise OSError(
+                f"Sandbox backend {policy.backend_type!r} cannot contain the Codex worker at spawn"
+            )
 
     egress_handle: EgressProxyHandle | None = None
     egress_tmpdir: Path | None = None
@@ -189,43 +264,65 @@ def prepare_codex_worker(
             assert sandbox_spec is not None
             for key in ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
                 staged_env.pop(key, None)
-            egress_tmpdir = create_private_tmpdir()
-            policy = with_additional_write_roots(policy, [egress_tmpdir])
-            egress_handle = start_egress_proxy(
-                rules=egress_rules,
-                tmpdir=egress_tmpdir,
-                allow_private_destinations=sandbox_spec.egress_allow_private_destinations,
-                # Codex has no helper config channel that keeps this value out
-                # of its environment. Match the terminal path: relay access is
-                # tokenless, while destination/method/path policy remains strict.
-                require_auth=False,
-            )
-            apply_egress_env(
-                staged_env,
-                relay_port=egress_handle.relay_port,
-                ca_bundle_path=egress_handle.ca_bundle_path,
-                auth_token=None,
-            )
-            policy = replace(
-                policy,
-                allow_network=False,
-                egress_relay_port=egress_handle.relay_port,
-                egress_socket_path=str(egress_handle.socket_path),
-            )
+            with harness_sandbox_preparation():
+                egress_tmpdir = create_private_tmpdir()
+                policy = with_additional_write_roots(policy, [egress_tmpdir])
+            credential_runtime = None
+            if brokered_gateway:
+                assert broker_proxy is not None
+                parent_env = _build_credential_proxy_parent_env(
+                    helper_env=build_helper_env(os.environ, policy),
+                    parent_env=os.environ,
+                    spec=broker_proxy,
+                )
+                credential_runtime = prepare_credential_proxy_runtime(
+                    broker_proxy,
+                    parent_env=parent_env,
+                    sandbox=policy,
+                    cwd=cwd,
+                )
+                if CODEX_GATEWAY_TOKEN_ENV not in credential_runtime.helper_env_updates:
+                    raise ValueError("brokered Codex gateway token placeholder is unavailable")
+                staged_env.update(credential_runtime.helper_env_updates)
+            with harness_sandbox_preparation():
+                egress_handle = start_egress_proxy(
+                    rules=egress_rules,
+                    tmpdir=egress_tmpdir,
+                    allow_private_destinations=sandbox_spec.egress_allow_private_destinations,
+                    require_auth=brokered_gateway,
+                    credential_rewrites=(
+                        credential_runtime.rewrites if credential_runtime is not None else None
+                    ),
+                )
+                apply_egress_env(
+                    staged_env,
+                    relay_port=egress_handle.relay_port,
+                    ca_bundle_path=egress_handle.ca_bundle_path,
+                    auth_token=egress_handle.auth_token if brokered_gateway else None,
+                )
+                policy = replace(
+                    policy,
+                    allow_network=False,
+                    egress_relay_port=egress_handle.relay_port,
+                    egress_socket_path=str(egress_handle.socket_path),
+                )
 
         # Compute this after proxy variables are staged so the sandbox does
         # not prune HTTP_PROXY or the CA bundle variables at exec time.
-        policy = with_spawn_env_allowlist(
-            policy,
-            list(staged_env) if staged_env is not None else spawn_env_names,
-        )
-        launcher = Path(create_exec_launcher(codex_path, policy))
+        with harness_sandbox_preparation():
+            policy = with_spawn_env_allowlist(
+                policy,
+                list(staged_env) if staged_env is not None else spawn_env_names,
+            )
+            launcher = Path(create_exec_launcher(codex_path, policy, cwd=str(cwd)))
+
         if staged_env is not None and worker_env is not None:
             worker_env.clear()
             worker_env.update(staged_env)
         return CodexWorkerLaunch(
             launch_path=str(launcher),
             sandboxed=True,
+            allow_network=policy.allow_network,
             _owned_launcher=launcher,
             _egress_handle=egress_handle,
             _egress_tmpdir=egress_tmpdir,

@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_MEMORY_IMPORT_SKILL,
+    CAP_WORKFLOWS,
     HostHelloFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
@@ -23,8 +25,10 @@ from omnigent.host.frames import (
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.skills import HostSkillDiscovery
+from omnigent.memory_availability import without_memory_tools
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions.routes_agent import register_agent_routes
 from omnigent.server.routes.skills import create_skills_router
@@ -118,10 +122,21 @@ def presession_app(skills_app):
 
 @pytest.mark.parametrize("user", ["owner", "editor"])
 @pytest.mark.parametrize("acknowledged", [True, False])
+@pytest.mark.parametrize(
+    "workflows_enabled,host_supports_workflows", [(False, True), (True, True), (True, False)]
+)
 async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
-    skills_app, user: str, acknowledged: bool
+    skills_app,
+    user: str,
+    acknowledged: bool,
+    workflows_enabled: bool,
+    host_supports_workflows: bool,
 ) -> None:
     app, _, conn, conv, agent, _ = skills_app
+    conn.hello.capabilities = [CAP_WORKFLOWS] if host_supports_workflows else []
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
+    )
     assert conv.runner_id is None
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -133,6 +148,7 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
             (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
         )
         assert isinstance(frame, HostSkillsFrame)
+        assert frame.workflows_enabled is (workflows_enabled and host_supports_workflows)
         assert (
             frame.session_id,
             frame.path,
@@ -140,20 +156,23 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
             frame.agent_version,
             frame.sub_agent_name,
         ) == (conv.id, conv.workspace, agent.id, str(agent.version), "child")
+        warning = "Codex plugin skills unavailable: `codex plugin list` exited 1"
         conn.pending_skills[frame.request_id].set_result(
             HostSkillsResultFrame(
                 frame.request_id,
                 "ok",
                 skills=[{"name": "child-review", "description": "Review"}],
                 session_id=conv.id if acknowledged else None,
+                warnings=[warning],
             )
         )
         response = await task
     assert response.status_code == (200 if acknowledged else 502)
     if acknowledged:
-        assert response.json()["skills"] == [
-            {"name": "child-review", "description": "Review", "display_name": None}
-        ]
+        assert response.json() == {
+            "skills": [{"name": "child-review", "description": "Review", "display_name": None}],
+            "warnings": [warning],
+        }
     else:
         assert "update the host" in response.json()["detail"]
     assert not conn.pending_skills
@@ -201,12 +220,34 @@ async def test_session_target_cannot_be_overridden(skills_app, overrides: dict[s
 
 
 @pytest.mark.parametrize("skill_filter", ["all", "none", ["allowed"]])
+@pytest.mark.parametrize(
+    "workflows_enabled,host_supports_workflows", [(False, True), (True, True), (True, False)]
+)
+@pytest.mark.parametrize("memory_on", [False, True])
+@pytest.mark.parametrize("host_ships_memory_skill", [True, False], ids=["host", "older-host"])
 async def test_presession_catalog_matches_filtered_invocations(
-    presession_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_filter: str | list[str]
+    presession_app,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skill_filter: str | list[str],
+    workflows_enabled: bool,
+    host_supports_workflows: bool,
+    memory_on: bool,
+    host_ships_memory_skill: bool,
 ) -> None:
     app, _, conn, _, agent, _ = presession_app
+    conn.hello.capabilities = [
+        *([CAP_WORKFLOWS] if host_supports_workflows else []),
+        # An older host's runner has no import-memory skill to load.
+        *([CAP_MEMORY_IMPORT_SKILL] if host_ships_memory_skill else []),
+    ]
+    memory_listed = memory_on and host_ships_memory_skill
+    app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
+    )
+    app.state.memory_available = lambda: memory_on
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-    for name in ("bundled", "hidden", "allowed", "denied"):
+    for name in ("bundled", "hidden", "allowed", "denied", "save-workflow"):
         directory = tmp_path / ".claude" / "skills" / name
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_text(
@@ -218,6 +259,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         skills_filter=skill_filter,
         skills=[
             SkillSpec(name="bundled", description="Bundled precedence", content="Instructions"),
+            SkillSpec(name="workflow", description="Custom workflow", content="Instructions"),
             SkillSpec(
                 name="hidden", description="Hidden", content="Instructions", user_invocable=False
             ),
@@ -229,15 +271,12 @@ async def test_presession_catalog_matches_filtered_invocations(
         _to_agent_object as session_agent_object,
     )
 
-    assert [s.name for s in builtin_agent_object(agent, app.state.agent_cache).skills] == [
-        "bundled"
-    ]
-    assert [
-        s.name
-        for s in session_agent_object(
-            agent, app.state.agent_cache, mcp_servers_editable=True
-        ).skills
-    ] == ["bundled"]
+    builtin = builtin_agent_object(agent, app.state.agent_cache)
+    session = session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True)
+    assert [s.name for s in builtin.skills] == ["bundled", "workflow"]
+    assert [s.name for s in session.skills] == ["bundled", "workflow"]
+    # `skills: none` runs claude-sdk with no setting sources, so /mcp hides user servers.
+    assert builtin.loads_user_settings is session.loads_user_settings is (skill_filter != "none")
     discovery = HostSkillDiscovery(
         lambda _: pytest.fail("Pre-session discovery needs no bundle fetch")
     )
@@ -273,12 +312,46 @@ async def test_presession_catalog_matches_filtered_invocations(
         )
         response = await task
     assert response.status_code == 200
-    expected = resolve_session_skills(spec, (tmp_path,), None)
+    # Without memory on the server, the runner's copy of the spec has the memory group off.
+    expected = resolve_session_skills(
+        spec if memory_listed else without_memory_tools(spec),
+        (tmp_path,),
+        None,
+        workflows_enabled=workflows_enabled and host_supports_workflows,
+    )
     assert response.json()["skills"] == [
         {"name": s.name, "description": s.description, "display_name": s.display_name}
         for s in expected
     ]
-    assert "hidden" not in {s["name"] for s in response.json()["skills"]}
+    names = [s["name"] for s in response.json()["skills"]]
+    assert ("import-memory" in names) is memory_listed
+    assert "hidden" not in set(names)
+    assert response.json()["warnings"] == []
+
+
+async def test_agent_object_without_loadable_bundle_keeps_user_settings(
+    presession_app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, _, _, agent, _ = presession_app
+
+    def fail_load(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("bundle unavailable")
+
+    monkeypatch.setattr(app.state.agent_cache, "load", fail_load)
+    from omnigent.server.routes.builtin_agents import _to_agent_object as builtin_agent_object
+    from omnigent.server.routes.sessions.routes_permissions import (
+        _to_agent_object as session_agent_object,
+    )
+
+    for agent_object in (
+        builtin_agent_object(agent, app.state.agent_cache),
+        session_agent_object(agent, app.state.agent_cache, mcp_servers_editable=True),
+    ):
+        # Without the spec, `skills: none` can't be told apart, so /mcp keeps user servers.
+        assert agent_object.loads_user_settings is True
+        assert agent_object.harness is None
+        assert agent_object.mcp_servers == []
+        assert agent_object.skills == []
 
 
 async def test_presession_discovery_rejects_private_agent(

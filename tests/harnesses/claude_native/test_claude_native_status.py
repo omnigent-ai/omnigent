@@ -91,7 +91,11 @@ def test_status_wrapper_captures_cost(tmp_path: Path, monkeypatch: pytest.Monkey
         {
             "session_id": "abc",
             "context_window": {"context_window_size": 1_000_000},
-            "cost": {"total_cost_usd": 0.42, "total_duration_ms": 1234},
+            "cost": {
+                "total_cost_usd": 0.42,
+                "total_duration_ms": 1234,
+                "total_api_duration_ms": 567,
+            },
         }
     )
 
@@ -100,6 +104,8 @@ def test_status_wrapper_captures_cost(tmp_path: Path, monkeypatch: pytest.Monkey
 
     persisted = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
     assert persisted["total_cost_usd"] == 0.42
+    # Zero before the first API call tells a restored total from a billed one.
+    assert persisted["total_api_duration_ms"] == 567
 
 
 def test_status_wrapper_drops_payload_without_context_window(

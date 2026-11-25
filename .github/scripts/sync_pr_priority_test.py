@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import unittest
+import urllib.error
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("sync_pr_priority.py")
 SPEC = importlib.util.spec_from_file_location("sync_pr_priority", SCRIPT_PATH)
@@ -15,11 +16,26 @@ SPEC.loader.exec_module(sync_pr_priority)
 
 
 class FakeAPI:
-    def __init__(self, *, closing: list[list[str]], current: list[str]) -> None:
+    def __init__(
+        self,
+        *,
+        closing: list[list[str]],
+        current: list[str],
+        pulls: list[int] | None = None,
+        lookup_error: Exception | None = None,
+    ) -> None:
         self._closing = closing
         self._current = current
+        self._pulls = pulls or []
+        self._lookup_error = lookup_error
         self.added: list[tuple[int, str]] = []
         self.removed: list[tuple[int, str]] = []
+
+    def open_pulls_closing(self, issue_number: int) -> list[int]:
+        assert issue_number
+        if self._lookup_error:
+            raise self._lookup_error
+        return self._pulls
 
     def closing_issue_labels(self, pull_number: int) -> list[list[str]]:
         assert pull_number
@@ -101,6 +117,20 @@ class SyncPullTest(unittest.TestCase):
         self.assertEqual(api.removed, [])
 
 
+class SyncIssueTest(unittest.TestCase):
+    def test_syncs_every_open_pr_closing_the_issue(self) -> None:
+        api = FakeAPI(closing=[["P2-medium"]], current=[], pulls=[11, 12])
+        sync_pr_priority.sync_issue(api, 5)
+        self.assertEqual(api.added, [(11, "P2-medium"), (12, "P2-medium")])
+
+    def test_lookup_failure_skips_sync(self) -> None:
+        for error in (urllib.error.URLError("down"), RuntimeError("GraphQL error")):
+            with self.subTest(error=error):
+                api = FakeAPI(closing=[["P2-medium"]], current=[], lookup_error=error)
+                sync_pr_priority.sync_issue(api, 5)
+                self.assertEqual(api.added, [])
+
+
 class ClosingIssueLabelsParseTest(unittest.TestCase):
     """GraphQL response parsing tolerates null nodes and surfaces errors."""
 
@@ -138,6 +168,20 @@ class ClosingIssueLabelsParseTest(unittest.TestCase):
         response = {"data": None, "errors": [{"message": "boom"}]}
         with self.assertRaises(RuntimeError):
             self._api_returning(response).closing_issue_labels(1)
+
+    def test_parses_open_pulls_closing_an_issue(self) -> None:
+        response = {
+            "data": {
+                "repository": {
+                    "issue": {"closedByPullRequestsReferences": {"nodes": [{"number": 3}]}}
+                }
+            }
+        }
+        self.assertEqual(self._api_returning(response).open_pulls_closing(1), [3])
+
+    def test_null_issue_yields_no_pulls(self) -> None:
+        response = {"data": {"repository": {"issue": None}}}
+        self.assertEqual(self._api_returning(response).open_pulls_closing(1), [])
 
 
 if __name__ == "__main__":

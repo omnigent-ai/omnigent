@@ -10,6 +10,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ApprovePage } from "./ApprovePage";
 import * as identity from "@/lib/identity";
 
@@ -29,11 +30,13 @@ function jsonResponse(body: unknown, { ok = true, status = 200 } = {}): Response
 /** Render the page at a concrete `/approve/:sessionId/:elicitationId` route. */
 function renderPage(sessionId = "sess_1", elicitationId = "eli_1") {
   return render(
-    <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
-      <Routes>
-        <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
-      </Routes>
-    </MemoryRouter>,
+    <TooltipProvider>
+      <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
+        <Routes>
+          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
+        </Routes>
+      </MemoryRouter>
+    </TooltipProvider>,
   );
 }
 
@@ -122,6 +125,37 @@ describe("ApprovePage states", () => {
     expect(
       await screen.findByText(verdict.action === "accept" ? "Approved" : "Rejected"),
     ).toBeInTheDocument();
+  });
+
+  it("shows a gated edit as a diff and submits the verdict", async () => {
+    const toolInput = {
+      file_path: "/repo/config.py",
+      old_string: "TIMEOUT = 30\n",
+      new_string: "TIMEOUT = 60\n",
+    };
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: "pending",
+          message: "Claude wants to call **Edit**",
+          policy_name: "claude_native_permission",
+          content_preview: `Edit(${JSON.stringify(toolInput)})`,
+          file_edit: { tool_name: "Edit", tool_input: toolInput },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ queued: false }));
+    const { container } = renderPage();
+
+    const approve = await screen.findByRole("button", { name: "Approve" });
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/config.py+1-1");
+    expect(container.textContent).toContain("+TIMEOUT = 60");
+    expect(container.textContent).not.toContain('"old_string"');
+    fireEvent.click(approve);
+    const posts = vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(JSON.parse(posts[0]![1]!.body as string)).toEqual({ action: "accept" });
+    expect(await screen.findByText("Approved")).toBeInTheDocument();
   });
 
   it("shows the resolved state when the elicitation is no longer pending", async () => {

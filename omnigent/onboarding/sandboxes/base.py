@@ -41,6 +41,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
+    from omnigent.onboarding.sandboxes.profiles import (
+        ProviderSandboxProfile,
+        SandboxProfileContext,
+    )
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
@@ -54,6 +58,15 @@ in-sandbox dependency install. Providers layer their own override
 mechanisms (env var / server config) on top of this default."""
 
 _logger = logging.getLogger(__name__)
+
+# Where the detached in-sandbox host writes its stdout and stderr.
+HOST_STDOUT_LOG_PATH: str = "/tmp/omnigent-host.log"
+# Bounds on each log tail read by ``capture_logs`` so a huge or single-line
+# log cannot bloat the server log.
+_LOG_TAIL_LINES: int = 100
+_LOG_TAIL_MAX_BYTES: int = 8192
+# In-sandbox process-log destinations tailed by ``capture_logs``.
+_CAPTURED_PROCESS_LOG_DESTINATIONS: tuple[str, ...] = ("host", "runner")
 
 MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
 """Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
@@ -361,7 +374,7 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     in the destination directory followed by :func:`os.replace`, so an
     interrupted write cannot expose a truncated destination file. A pre-existing
     ``config.yaml`` symlink is replaced by a real file — durability of the write
-    is favored over following the link, which an internal sandbox config never
+    is favored over following the link, which a sandbox config never
     relies on.
 
     The payload travels as base64-encoded JSON substituted into a fixed
@@ -386,9 +399,10 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
 
     The only optional primitive today is
     :meth:`SandboxLauncher.forward_local_port` — providers without a
-    local-to-sandbox forwarding path (e.g. Modal) raise this, and the
-    OAuth flow surfaces the message (which should name the ``--no-auth``
-    escape hatch) to the user.
+    local-to-sandbox forwarding path (e.g. Modal) raise this, and
+    callers surface the message to the user. The OAuth flow's copy
+    names the ``--no-auth`` escape hatch; a preview caller surfacing
+    this error should use its own wording instead.
     """
 
 
@@ -491,8 +505,8 @@ class SandboxLifecycle(ABC):
 
     # Package index URL exported as ``UV_INDEX_URL`` for the local wheel
     # build, or ``None`` to use ambient uv configuration. Providers tied
-    # to networks where public PyPI is unreachable (Lakebox on the
-    # Databricks corp network) override this.
+    # to networks where public PyPI is unreachable (for example, Lakebox on a
+    # restricted network) override this.
     wheel_build_index_url: ClassVar[str | None] = None
 
     # Legacy class vars — kept for backward compat while providers migrate
@@ -544,6 +558,9 @@ class SandboxLifecycle(ABC):
         if base_method is None:
             return False
         return self_method is not base_method
+
+    # Provider ID learned during start; managed launch persists it over the reserved ID.
+    started_sandbox_id: str | None = None
 
     @abstractmethod
     def prepare(self) -> None:
@@ -604,9 +621,10 @@ class SandboxLifecycle(ABC):
         ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
-        by the managed path for as long as the sandbox has a live runner
-        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
-        must be idempotent and cheap enough to repeat. Either shape
+        by the managed path while the sandbox's runner does work, and for the
+        runner idle timeout after (:mod:`omnigent.server.managed_host_keepalive`),
+        so an implementation must be idempotent and cheap enough to repeat.
+        Either shape
         satisfies it: "configure once to maximize lifetime" (disable idle
         autostop, restate a cap) or "push a deadline forward" (refresh an
         absolute expiry). Managed-only launchers that cannot extend a
@@ -621,8 +639,9 @@ class SandboxLifecycle(ABC):
     def forward_capability_error(self) -> SandboxCapabilityError:
         """
         Build the error explaining that this provider cannot forward a
-        local port into the sandbox (and therefore cannot run the
-        in-sandbox App OAuth flow).
+        local port into the sandbox (and therefore cannot run flows
+        that need a local port bridged in, such as the in-sandbox App
+        OAuth flow or a browser preview of a sandbox-local service).
 
         Single source for the message: raised both by the default
         :meth:`forward_local_port` and by the bootstrap's fail-fast
@@ -642,6 +661,9 @@ class SandboxLifecycle(ABC):
         Forward ``localhost:<port>`` on the local machine into the
         sandbox (``ssh -L`` semantics), yielding once the local port is
         bound and tearing the forward down on exit.
+
+        Not limited to the OAuth callback: any sandbox loopback port
+        can be bridged, e.g. a dev server for browser preview.
 
         Optional capability: the default implementation raises
         :class:`SandboxCapabilityError`. Providers with an inbound
@@ -679,6 +701,45 @@ class SandboxLifecycle(ABC):
             "sandbox termination — delete the sandbox with the provider's "
             "own tooling."
         )
+
+    def stop(self, sandbox_id: str) -> None:
+        """
+        Stop a sandbox's compute without deleting it, so :meth:`resume` can
+        restart the SAME sandbox with its filesystem intact.
+
+        Optional capability: the default implementation raises
+        :class:`SandboxCapabilityError`. Providers that implement
+        :meth:`resume` may override it to park an idle sandbox at
+        storage-only cost. Implementations must treat an already stopped
+        or archived sandbox as success.
+
+        :param sandbox_id: The sandbox to stop, e.g. ``"sb-a1b2c3"``.
+        :raises SandboxCapabilityError: When the provider cannot stop a
+            sandbox without deleting it.
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
+        :raises click.ClickException: If the stop fails.
+        """
+        raise self._capability_error("stop a sandbox without deleting it")
+
+    def stop_when_archived(self, *, owner: str, configured: bool) -> bool:
+        """
+        Whether to :meth:`stop` a managed sandbox whose session was archived.
+
+        Asked only for a sandbox this provider can resume. If this returns
+        ``True``, the server then checks that no other session uses the sandbox
+        before it stops it. The default follows the provider's
+        ``stop_on_archive`` server setting. Override it to decide per owner at
+        archive time, for example from a feature flag, so a rollout or rollback
+        needs no server restart. Runs in a worker thread, after the archive
+        request has returned. An exception leaves the sandbox running.
+
+        :param owner: The host owner (the session creator), e.g.
+            ``"alice@example.com"``.
+        :param configured: The provider's ``stop_on_archive`` setting.
+        :returns: ``True`` to stop the sandbox.
+        """
+        return configured
 
     def resume(self, sandbox_id: str) -> None:
         """
@@ -809,7 +870,7 @@ class SandboxExecTransport(SandboxLifecycle):
         """
 
     def run_background(
-        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+        self, sandbox_id: str, command: str, *, log_path: str = HOST_STDOUT_LOG_PATH
     ) -> RemoteCommandResult:
         """
         Start *command* under a supervisor as a detached background process.
@@ -928,6 +989,45 @@ class SandboxHostLauncher(SandboxLifecycle):
     transport.
     """
 
+    manages_profiles: ClassVar[bool] = False
+    """Own profile discovery, permissions, and configuration; mirror in registry metadata."""
+
+    supports_sandbox_profile_lookup: ClassVar[bool] = False
+    """Whether sandbox-scoped discovery returns the durable assigned revision."""
+
+    automation_notice: ClassVar[str | None] = None
+    """User-safe note on what this provider's unattended runs need from their owner.
+
+    ``/v1/info`` reports it in ``sandbox_provider_automation_notices``, and the
+    automation form shows it while a new sandbox is the run target, e.g. for a
+    credential that must stay fresh on the owner's machine. ``None`` shows nothing.
+    """
+
+    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile] | None:
+        """Return only profiles currently authorized for the trusted caller context.
+
+        Use bounded provider I/O, including explicit network timeouts. This
+        synchronous hook must not provision resources or perform launch preflight.
+        Return public metadata only; keep configuration and access rules private.
+        For sandbox-scoped lookup only, None confirms an authorized legacy sandbox
+        has no profile. Denied access must raise SandboxProfileAccessDenied.
+        """
+        raise self._capability_error("list provider-managed sandbox profiles")
+
+    def select_profile(
+        self, context: SandboxProfileContext, profile: ProviderSandboxProfile
+    ) -> None:
+        """Re-authorize an exact revision and configure this launcher for its use.
+
+        Re-read current access and settings using bounded provider I/O. Raise
+        SandboxProfileAccessDenied for revoked access or SandboxProfileChanged
+        if the requested revision is unavailable; never silently use a newer one.
+        Configure this instance before prepare_for_launch, prepare, provision,
+        or resume. Do not provision resources or perform launch preflight here.
+        A previous list_profiles result is not proof of current authorization.
+        """
+        raise self._capability_error("select provider-managed sandbox profiles")
+
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
 
@@ -965,6 +1065,51 @@ class SandboxHostLauncher(SandboxLifecycle):
         :param resolve: Zero-argument resolver for this host's owner.
         """
         del resolve
+
+    def host_online_failure_hint(self, sandbox_id: str) -> str | None:
+        """Suggest recovery when a provisioned sandbox's host has not registered in time.
+
+        Called off the event loop when a scheduled launch times out, before its
+        cancellation and teardown, and again each time a message waiting on a
+        launch or wake times out while the launch continues. Prefer cached
+        observations; bound any I/O because a caller timeout cannot stop a
+        worker thread. Return user-safe guidance, never credentials, and keep
+        unconfirmed causes conditional. ``None`` preserves the generic error.
+
+        :param sandbox_id: The provisioned sandbox that has not registered.
+        :returns: Recovery instructions, or ``None`` when none are available.
+        """
+        del sandbox_id
+        return None
+
+    def capture_logs(self, sandbox_id: str) -> str | None:
+        """
+        Read the tails of the in-sandbox host and runner logs.
+
+        Called just before the server terminates a sandbox whose teardown
+        asked for diagnostics, since termination destroys those logs.
+        Implementations should bound the read and may raise; the caller
+        treats any failure as "no logs".
+
+        :param sandbox_id: The sandbox about to be terminated.
+        :returns: The captured text, or ``None`` when the provider cannot
+            read files inside its sandboxes (the default).
+        """
+        del sandbox_id
+        return None
+
+    def bind_owner(self, owner: str) -> None:
+        """
+        Bind the session owner this launcher instance acts for.
+
+        Called by the server right after it builds a launcher for a host's
+        owner, before any other method. Providers that act on the owner's
+        behalf (for example, passing it to an external API for authorization
+        or attribution) override it; the default ignores the owner.
+
+        :param owner: The host's user id, e.g. ``alice@example.com``.
+        """
+        del owner
 
     @abstractmethod
     def start_host(
@@ -1018,6 +1163,31 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     :class:`SandboxHostLauncher` directly and do NOT need ``run()`` or any
     exec transport.
     """
+
+    def capture_logs(self, sandbox_id: str) -> str | None:
+        """
+        Tail the host stdout log and the newest host and runner process logs.
+
+        Each log is cut to its last :data:`_LOG_TAIL_LINES` lines, then to its
+        last :data:`_LOG_TAIL_MAX_BYTES` bytes, keeping the end where the
+        final error usually is.
+
+        :param sandbox_id: The sandbox about to be terminated.
+        :returns: One section per log, each headed ``## <path>``, or
+            ``None`` when no log exists.
+        """
+        tail = f'tail -n {_LOG_TAIL_LINES} "$f" | tail -c {_LOG_TAIL_MAX_BYTES}'
+        logs_root = '"${OMNIGENT_DATA_DIR:-$HOME/.omnigent}/logs"'
+        sections = [f"f={shlex.quote(HOST_STDOUT_LOG_PATH)}"] + [
+            f"f=$(ls -t {logs_root}/{destination}/*.log 2>/dev/null | head -n 1)"
+            for destination in _CAPTURED_PROCESS_LOG_DESTINATIONS
+        ]
+        command = "; ".join(
+            f'{section}; [ -f "$f" ] && {{ printf "\\n## %s\\n" "$f"; {tail}; }}'
+            for section in sections
+        )
+        output = self.run(sandbox_id, command, check=False).stdout.strip()
+        return output or None
 
     def start_host(
         self,

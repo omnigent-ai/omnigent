@@ -18,6 +18,7 @@ will start instantiating them as those phases ship.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC
 from typing import Any
@@ -29,9 +30,11 @@ from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
+from omnigent.policies.registry import function_policy_handler_allowed
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
     SESSION_COST_UNPRICED_APPROVED_KEY,
@@ -49,7 +52,11 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    SPAWN_TREE_READ_CAP,
+    ConversationStore,
+    DailyCostState,
+)
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -102,6 +109,10 @@ _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
     _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC,
 )
 
+# The policy caches below are pure caches over the DB and are reached from
+# ``asyncio.to_thread`` workers, so they reset themselves if the backing
+# cache ever raises instead of turning every evaluation into a deny.
+
 # Bounded cache of ``conversation_id -> session owner``. The owner
 # (``LEVEL_OWNER`` grantee) is immutable for a session's lifetime, so
 # caching it avoids a ``session_permissions`` lookup on every
@@ -109,16 +120,23 @@ _REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
 # session is granted its owner atomically at creation, so ``None`` is a
 # transient single-user/pre-grant state, not worth caching).
 _SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
-    lambda: cachetools.LRUCache(maxsize=4096)
+    lambda: cachetools.LRUCache(maxsize=4096), reset_on_error=True
 )
 
-# TTL cache of ``workspace_id -> list[PolicySpec]`` for DB-stored default
-# policies. Default policies are admin-managed and change infrequently, so
-# a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
-# evaluation while still propagating changes within half a minute.
-# custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
-_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachetools.TTLCache(
-    maxsize=256, ttl=30
+_POLICY_SPECS_CACHE_TTL_S = 30.0
+
+# Cached policy lists are stored with the ``time.monotonic()`` of the store read,
+# so a no-policy answer can say how old it is (see policy_specs_cache_age).
+_CachedPolicySpecs = tuple[list[PolicySpec], float]
+
+# TTL cache of the DB-stored default policies, one entry per workspace
+# (the wrapper supplies the workspace; the key is a constant). Default
+# policies are admin-managed and change infrequently, so a short TTL
+# (30 s) avoids one ``list_defaults()`` DB query per tool-call evaluation
+# while still propagating changes within half a minute.
+_DEFAULT_POLICY_SPECS_KEY = "default_policies"
+_DEFAULT_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, _CachedPolicySpecs] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=256, ttl=_POLICY_SPECS_CACHE_TTL_S), reset_on_error=True
 )
 
 # TTL+LRU cache of ``conversation_id -> list[PolicySpec]`` for session-scoped
@@ -129,8 +147,8 @@ _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachet
 # cannot evict another replica's in-process cache — without it, a deleted session
 # policy would remain enforced on other replicas indefinitely (no natural expiry).
 # TTLCache subsumes LRU eviction, bounding memory the same way.
-_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = WorkspaceScopedCache(
-    lambda: cachetools.TTLCache(maxsize=4096, ttl=30)
+_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, _CachedPolicySpecs] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=_POLICY_SPECS_CACHE_TTL_S), reset_on_error=True
 )
 
 
@@ -430,9 +448,9 @@ def any_policies_apply(
     :param conversation: The conversation row when the caller holds one. For
         sub-agent conversations this lets the check see the CHILD spec's own
         guardrails (which :func:`build_policy_engine` enforces), so a bundle
-        whose only policies live on a sub-agent is not fast-path skipped.
-        Children with a policy store must build the engine to resolve
-        inherited session policies against their verified root.
+        whose only policies live on a sub-agent is not fast-path skipped. It
+        also names the root whose session policies a sub-agent inherits, so
+        pass a row read in the current request.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
@@ -456,12 +474,12 @@ def any_policies_apply(
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
         return True
-    # The engine verifies ancestry before inheriting root session policies.
-    # A child's local policy list cannot rule out an inherited policy.
+    # Sub-agents inherit the root session's policies. The row was read in this
+    # request and its root never changes, so it names the tree the engine loads.
     if (
-        policy_store is not None
-        and conversation is not None
-        and conversation.parent_conversation_id is not None
+        conversation is not None
+        and conversation.root_conversation_id != conversation_id
+        and _load_session_policy_specs(conversation.root_conversation_id, policy_store)
     ):
         return True
     return False
@@ -854,8 +872,43 @@ def build_policy_engine(
         harness = (
             conv.harness_override if conv is not None and conv.harness_override else spec_harness
         )
+        # Price sessions on non-default providers at their configured rate,
+        # not the harness default's. A sub-agent session runs the CHILD
+        # spec's executor, so its auth decides the provider identity.
+        from omnigent.spec.types import ProviderAuth
+
+        _executor = child_spec.executor if child_spec is not None else spec.executor
+        _provider_entry = None
+        if (
+            isinstance(_executor.auth, ProviderAuth)
+            and _executor.auth.name
+            and harness is not None
+        ):
+            try:
+                from omnigent.inference_config import load_runtime_inference_config
+                from omnigent.onboarding.detected import resolve_named_provider
+
+                _provider_entry = resolve_named_provider(
+                    _executor.auth.name, load_runtime_inference_config(provider_config)
+                )
+                if _provider_entry is None:
+                    # A declared provider absent from config silently reverts
+                    # to default-provider pricing; surface the misconfiguration.
+                    _logger.warning(
+                        "session executor names provider %r but it is not "
+                        "configured; pricing falls back to the default provider",
+                        _executor.auth.name,
+                    )
+            except Exception:
+                # Provider resolution must never break policy pricing; fall back
+                # to the default-provider lookup. Warn, not debug: this runs once
+                # per policy build, so a broken config is worth surfacing.
+                _logger.warning("named-provider lookup failed for pricing", exc_info=True)
         token_pricing = fetch_model_pricing_with_provider(
-            initial_model, provider_config=provider_config, harness=harness
+            initial_model,
+            provider_config=provider_config,
+            harness=harness,
+            provider_entry=_provider_entry,
         )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
@@ -982,10 +1035,10 @@ def _build_policy_llm_client(
 
 def _normalize_policy_model(model: str) -> str:
     """
-    Apply the ``databricks-`` → ``databricks/`` provider-prefix fixup.
+    Apply the ``databricks/`` provider-prefix fixup to bare Databricks ids.
 
-    Models prefixed with ``databricks-`` (e.g.
-    ``databricks-claude-sonnet-4-6``) need the ``databricks/``
+    Bare Databricks models (e.g. ``databricks-claude-sonnet-4-6`` or the
+    Unity Catalog ``system.ai.claude-sonnet-4-6``) need the ``databricks/``
     provider prefix so the LLM adapter routes through
     ``DatabricksAdapter`` (Chat Completions) rather than
     ``OpenAIAdapter`` (Responses API). Without this, the request
@@ -994,11 +1047,11 @@ def _normalize_policy_model(model: str) -> str:
     fallback path routes the same way as the primary.
 
     :param model: A model id from the server ``llm:`` config,
-        possibly a bare ``databricks-`` name.
+        possibly a bare ``databricks-`` or ``system.ai.`` name.
     :returns: The model id with the ``databricks/`` prefix applied
         when needed; otherwise unchanged.
     """
-    if "/" not in model and model.startswith("databricks-"):
+    if "/" not in model and is_databricks_model_id(model):
         return f"databricks/{model}"
     return model
 
@@ -1201,10 +1254,10 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-# Page size for walking a spawn tree when summing sub-agent usage.
-# Sub-agent trees are small in practice, but we still paginate so a
-# large tree is not silently truncated (see load_session_usage).
-_SUBTREE_USAGE_PAGE_SIZE = 100
+# Page size for summing a spawn tree's usage: the root plus the sub-agents one
+# bounded tree read covers, so nearly every policy check reads its tree once.
+# Bigger trees still page, so none is silently truncated.
+_SUBTREE_USAGE_PAGE_SIZE = SPAWN_TREE_READ_CAP + 1
 
 # Usage counters summed across a conversation subtree. Restricted to the
 # known numeric keys the PolicyEngine reads so an unexpected key in one
@@ -1724,12 +1777,10 @@ def _load_default_policy_specs(
     """
     if policy_store is None:
         return []
-    from omnigent.db.db_models import current_workspace_id
-
-    workspace_id = current_workspace_id()
-    cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+    cached = _DEFAULT_POLICY_SPECS_CACHE.get(_DEFAULT_POLICY_SPECS_KEY)
     if cached is not None:
-        return cached
+        return cached[0]
+    loaded_at = time.monotonic()
     specs: list[PolicySpec] = []
     for policy in policy_store.list_defaults():
         if not policy.enabled:
@@ -1749,8 +1800,18 @@ def _load_default_policy_specs(
                 policy.type,
             )
             continue
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            # A row whose handler is no longer registered would fail engine construction
+            # for every session; skip it so one stale row cannot take the server down.
+            _logger.warning(
+                "Skipping default policy %r (id=%r): handler %r is not registered.",
+                policy.name,
+                policy.id,
+                policy.handler,
+            )
+            continue
         specs.append(_stored_policy_to_spec(policy))
-    _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
+    _DEFAULT_POLICY_SPECS_CACHE[_DEFAULT_POLICY_SPECS_KEY] = (specs, loaded_at)
     return specs
 
 
@@ -1760,12 +1821,11 @@ def invalidate_default_policy_specs_cache() -> None:
 
     Call this after any mutation (create, update, delete) of a default
     policy so the next :func:`build_policy_engine` call re-reads from the
-    DB rather than serving a stale TTL entry. Scoped to the current
-    workspace context via :func:`~omnigent.db.db_models.current_workspace_id`.
+    DB rather than serving a stale TTL entry. The workspace-scoped cache
+    supplies the current workspace and serializes access; if its backing
+    store is corrupted it resets itself, so eviction never raises.
     """
-    from omnigent.db.db_models import current_workspace_id
-
-    _DEFAULT_POLICY_SPECS_CACHE.pop(current_workspace_id(), None)
+    _DEFAULT_POLICY_SPECS_CACHE.pop(_DEFAULT_POLICY_SPECS_KEY, None)
 
 
 def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
@@ -1774,7 +1834,9 @@ def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
 
     Call this after any mutation (create, update, delete) of a session
     policy so the next :func:`build_policy_engine` call re-reads from
-    the DB. Scoped to the current workspace context.
+    the DB. Scoped to the current workspace context; like the default
+    cache, access is serialized and a corrupted backing store resets
+    itself instead of raising.
 
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
@@ -1816,17 +1878,49 @@ def _load_session_policy_specs(
     """
     if policy_store is None:
         return []
-    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
+    cached = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
     if cached is not None:
-        return cached
+        return cached[0]
+    loaded_at = time.monotonic()
     stored = policy_store.list_for_session(conversation_id)
     specs: list[PolicySpec] = []
     for policy in stored:
         if not policy.enabled:
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
+    _SESSION_POLICY_SPECS_CACHE[conversation_id] = (specs, loaded_at)
     return specs
+
+
+def policy_specs_cache_age(
+    conversation_id: str,
+    policy_store: PolicyStore | None,
+    root_conversation_id: str | None = None,
+) -> float:
+    """
+    Return how old the store reads behind a session's cached policy lists are.
+
+    A no-policy answer from :func:`any_policies_apply` is only as fresh as the
+    oldest of the default, session, and inherited root lists it read, so
+    anything that lets callers reuse that answer must subtract this age. A
+    list no longer cached counts as a full cache TTL old.
+
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param policy_store: The policy store; ``None`` means there are no stored
+        policies to go stale.
+    :param root_conversation_id: The session's tree root, e.g.
+        ``"conv_root"``; a sub-agent's answer also depends on its list.
+    :returns: Age in seconds, e.g. ``12.5``.
+    """
+    if policy_store is None:
+        return 0.0
+    now = time.monotonic()
+    session_ids = {conversation_id, root_conversation_id or conversation_id}
+    entries = (
+        _DEFAULT_POLICY_SPECS_CACHE.get(_DEFAULT_POLICY_SPECS_KEY),
+        *(_SESSION_POLICY_SPECS_CACHE.get(session_id) for session_id in session_ids),
+    )
+    return max(_POLICY_SPECS_CACHE_TTL_S if entry is None else now - entry[1] for entry in entries)
 
 
 def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
@@ -1851,6 +1945,12 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
         (e.g. ``type="url"``).
     """
     if policy.type == "python":
+        # Persisted rows can predate the API handler allowlist.
+        if not function_policy_handler_allowed(policy.handler, policy.factory_params):
+            raise OmnigentError(
+                f"Policy handler {policy.handler!r} is not a registered policy handler",
+                code=ErrorCode.INVALID_INPUT,
+            )
         return FunctionPolicySpec(
             name=policy.name,
             # Session policies self-select: on=None means the

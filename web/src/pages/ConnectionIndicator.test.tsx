@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ConnectionIndicator } from "./ChatIndicators";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import { useChatStore } from "@/store/chatStore";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -48,9 +49,30 @@ function renderWithContext(
 
 const ONLINE: SessionLiveness = { kind: "online" };
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  useChatStore.setState({ sandboxStatus: null });
+});
 
 describe("ConnectionIndicator", () => {
+  it.each(["chat", "terminal"] as const)(
+    "keeps sandbox failures in the connection band only for the terminal view: %s",
+    (view) => {
+      useChatStore.setState({
+        sandboxStatus: { stage: "failed", error: "Sandbox allocation failed." },
+      });
+      renderWithContext({ kind: "host_offline", isOwner: true }, makeCtx({ view }));
+      if (view === "terminal") {
+        expect(screen.getByTestId("sandbox-failed-indicator")).toHaveTextContent(
+          "Sandbox launch failed",
+        );
+      } else {
+        expect(screen.queryByTestId("sandbox-failed-indicator")).toBeNull();
+      }
+      expect(screen.queryByTestId("disconnected-indicator")).toBeNull();
+    },
+  );
+
   it("renders nothing for an online non-terminal-first session", () => {
     // With status moved to the sidebar, an online non-CN session has
     // nothing to show in the chat band — the composer sits below.

@@ -6,7 +6,8 @@
 //
 // Wire protocol (mirrors `omnigent/server/routes/terminal_attach.py`):
 //   - Server → client: binary pane output → `term.write`; text frames for
-//     JSON control messages (currently tmux clipboard writes).
+//     JSON control messages (tmux clipboard writes and the queries tmux
+//     answers itself).
 //   - Client → server: binary frames for keystrokes (`term.onData`);
 //     text frames for JSON control messages (currently only resize).
 
@@ -22,6 +23,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
+import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
 
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
 
@@ -44,14 +46,14 @@ export const WS_CLOSE_WRONG_REPLICA = 4400;
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */
 export function terminalTheme(isDark: boolean): ITheme {
-  const { background: bg, foreground } = terminalSurfaceColors(isDark);
+  const { background: bg, foreground, selection } = terminalSurfaceColors(isDark);
   return isDark
     ? {
         background: bg,
         foreground,
         cursor: "#22d3ee",
         cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
+        selectionBackground: selection,
         black: "#09090b",
         brightBlack: "#71717a",
       }
@@ -60,7 +62,7 @@ export function terminalTheme(isDark: boolean): ITheme {
         foreground,
         cursor: "#0891b2",
         cursorAccent: bg,
-        selectionBackground: "#0891b233",
+        selectionBackground: selection,
         black: "#18181b",
         brightBlack: "#e4e4e7",
         // CLIs that assume a dark terminal paint primary text with ANSI
@@ -139,13 +141,23 @@ export function openTerminalLink(
     const target = withBasePath(sameOriginSessionPath);
     const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     if (target !== currentPath) {
-      window.history.pushState(null, "", target);
+      window.history.pushState(nextRouterHistoryState(), "", target);
       window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
     }
     return;
   }
   if (!parseHttpUrl(uri)) return;
   window.open(uri, "_blank", "noopener,noreferrer");
+}
+
+/**
+ * A history entry in React Router's format, one past the current one, so the router
+ * (and Back's first-entry boundary) still know where this entry sits.
+ */
+function nextRouterHistoryState(): { usr: null; key: string; idx: number } | null {
+  const index = (window.history.state as { idx?: unknown } | null)?.idx;
+  if (typeof index !== "number") return null;
+  return { usr: null, key: Math.random().toString(36).slice(2, 10), idx: index + 1 };
 }
 
 function sameOriginSessionLink(uri: string): string | null {
@@ -618,6 +630,15 @@ export function touchScrollPayload(
 }
 
 /**
+ * The width the fit holds back for the scrollbar, as xterm's fit addon reckons it: none without
+ * scrollback, else the overview ruler's width or 14px.
+ */
+export function terminalFitReserveWidth(term: Pick<Terminal, "options">): number {
+  if (term.options.scrollback === 0) return 0;
+  return term.options.overviewRuler?.width || 14;
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -629,6 +650,7 @@ export function touchScrollPayload(
  * close the WS, dispose the terminal.
  */
 export class TerminalSession {
+  private readonly container: HTMLElement;
   private readonly term: Terminal;
   private readonly fit: FitAddon;
   /** WebGL renderer addon, or ``null`` when WebGL is unavailable. */
@@ -638,6 +660,8 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  /** Drops xterm's replies to the queries tmux answers, once the runner lists them. */
+  private queryReplies: { dispose: () => void } | null = null;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
@@ -703,6 +727,7 @@ export class TerminalSession {
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
   ) {
+    this.container = container;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -803,6 +828,11 @@ export class TerminalSession {
         } else if (typeof ev.data === "string") {
           const text = parseTerminalClipboardMessage(ev.data);
           if (text !== null) this.requestClipboardWrite(text);
+          const tmuxAnswers = parseTmuxRepliesMessage(ev.data);
+          if (tmuxAnswers !== null) {
+            this.queryReplies?.dispose();
+            this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
+          }
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
@@ -812,6 +842,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
+        this.clearFittedSize();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -980,6 +1011,50 @@ export class TerminalSession {
     this.term.focus();
   }
 
+  /** Paste without Enter, waiting briefly for safe multiline input support. */
+  pasteCommand(text: string, onResult: (error: string | null) => void): () => void {
+    const command = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
+    const hasControlCharacters = Array.from(command).some((char) => {
+      const code = char.charCodeAt(0);
+      return (code < 32 && code !== 9 && code !== 10) || (code >= 127 && code <= 159);
+    });
+    if (hasControlCharacters || this.disposed || this.ws.readyState !== WebSocket.OPEN) {
+      onResult(
+        hasControlCharacters
+          ? "This command contains terminal control characters."
+          : "The shell is not connected. Nothing was sent.",
+      );
+      return () => {};
+    }
+    let finished = false;
+    let listener: { dispose: () => void } | undefined;
+    let timer: number | undefined;
+    const cancel = () => {
+      finished = true;
+      listener?.dispose();
+      window.clearTimeout(timer);
+      this.listenerCtl.signal.removeEventListener("abort", cancel);
+    };
+    const tryPaste = () => {
+      if (finished || (/[\n\t]/.test(command) && !this.term.modes.bracketedPasteMode)) return;
+      cancel();
+      if (this.ws.readyState !== WebSocket.OPEN) {
+        onResult("The shell disconnected. Nothing was sent.");
+        return;
+      }
+      this.term.paste(command);
+      onResult(null);
+    };
+    listener = this.term.onWriteParsed(tryPaste);
+    timer = window.setTimeout(() => {
+      cancel();
+      onResult("The shell is not ready to safely paste this command. Nothing was sent.");
+    }, 5000);
+    this.listenerCtl.signal.addEventListener("abort", cancel, { once: true });
+    tryPaste();
+    return cancel;
+  }
+
   /**
    * Update the terminal's code font without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size
@@ -1008,8 +1083,10 @@ export class TerminalSession {
     this.disposed = true;
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
+    this.clearFittedSize();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
+    this.queryReplies?.dispose();
     try {
       this.ws.close();
     } catch {
@@ -1065,6 +1142,13 @@ export class TerminalSession {
     };
   }
 
+  /** A closed or disposed session has no fitted size to say. */
+  private clearFittedSize(): void {
+    delete this.container.dataset.terminalCols;
+    delete this.container.dataset.terminalRows;
+    delete this.container.dataset.terminalFitReserveWidth;
+  }
+
   private sendResize(): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;
     try {
@@ -1073,6 +1157,10 @@ export class TerminalSession {
       return;
     }
     const { cols, rows } = this.term;
+    // The container says its fitted size in cells, so a layout around it can measure in cells.
+    this.container.dataset.terminalCols = String(cols);
+    this.container.dataset.terminalRows = String(rows);
+    this.container.dataset.terminalFitReserveWidth = String(terminalFitReserveWidth(this.term));
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both
     // call this on mount, and a transient re-fit can land the same size. On
     // the control transport an unchanged size is a wasted round-trip (tmux

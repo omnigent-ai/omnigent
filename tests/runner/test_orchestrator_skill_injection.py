@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import omnigent
 from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
 from omnigent.runner.native.orchestration import (
@@ -57,6 +59,66 @@ def test_codex_resolves_the_injected_skill(tmp_path: Path) -> None:
     """
     _ensure_orchestrator_skills_in_bundle(tmp_path, None)
 
-    sources = codex_skill_sources(tmp_path, tmp_path / "fake-home")
+    sources = codex_skill_sources(tmp_path, tmp_path / "fake-home").linked
     assert sources == [tmp_path / "skills"]
     assert SKILL_NAME in select_codex_skill_dirs("all", sources)
+
+
+@pytest.mark.parametrize("workflows_enabled", [False, True])
+@pytest.mark.parametrize("disabled_by", ["server", "journal", "missing_spec"])
+def test_native_workflow_skills_require_server_flag_and_journal_tools(
+    tmp_path: Path, workflows_enabled: bool, disabled_by: str
+) -> None:
+    """Native workflow instructions must agree with the tools advertised by the server."""
+    from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+
+    # Memory is off so that only the workflow skills vary; the memory skill has its own test.
+    with_journal, without = tmp_path / "with", tmp_path / "without"
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(memory=False))
+    _ensure_orchestrator_skills_in_bundle(with_journal, spec, workflows_enabled=workflows_enabled)
+    _ensure_orchestrator_skills_in_bundle(
+        without,
+        AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False, memory=False)),
+        workflows_enabled=workflows_enabled,
+    )
+
+    assert (with_journal / "skills" / "workflow" / "SKILL.md").is_file() is workflows_enabled
+    assert (with_journal / "skills" / "save-workflow" / "SKILL.md").is_file() is workflows_enabled
+    assert sorted(p.name for p in (with_journal / "skills").iterdir()) == sorted(
+        [SKILL_NAME, *(["save-workflow", "workflow"] if workflows_enabled else [])]
+    )
+    assert [p.name for p in (without / "skills").iterdir()] == [SKILL_NAME]
+
+    disabled_spec = (
+        None
+        if disabled_by == "missing_spec"
+        else AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False, memory=False))
+        if disabled_by == "journal"
+        else spec
+    )
+    _ensure_orchestrator_skills_in_bundle(
+        with_journal, disabled_spec, workflows_enabled=disabled_by != "server"
+    )
+    assert [p.name for p in (with_journal / "skills").iterdir()] == [SKILL_NAME]
+    user_skill = with_journal / "skills" / "workflow" / "SKILL.md"
+    user_skill.parent.mkdir()
+    user_skill.write_text("User-authored workflow instructions")
+    _ensure_orchestrator_skills_in_bundle(
+        with_journal, disabled_spec, workflows_enabled=disabled_by != "server"
+    )
+    assert user_skill.read_text() == "User-authored workflow instructions"
+
+
+@pytest.mark.parametrize("workflows_enabled", [False, True])
+@pytest.mark.parametrize("memory_on", [False, True])
+def test_native_memory_skill_follows_only_the_memory_tool_group(
+    tmp_path: Path, workflows_enabled: bool, memory_on: bool
+) -> None:
+    """``import-memory`` is linked only when the memory group is on, never by workflows."""
+    from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+
+    spec = AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(journal=False, memory=memory_on))
+    _ensure_orchestrator_skills_in_bundle(tmp_path, spec, workflows_enabled=workflows_enabled)
+
+    assert (tmp_path / "skills" / "import-memory" / "SKILL.md").is_file() is memory_on
+    assert not (tmp_path / "skills" / "workflow").exists()

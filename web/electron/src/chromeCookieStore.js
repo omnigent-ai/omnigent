@@ -1,7 +1,8 @@
-// Read the current site's cookies out of a local Google Chrome install and
-// replay them into one embedded browser session. Chrome owns the database; this
-// module reads a private copy of it and never writes to Chrome's file. Cookie
-// values never leave here except as `session.cookies.set()` payloads.
+// Read cookies out of a local Google Chrome install, for the current site or
+// for every website in one profile, and replay them into one embedded browser
+// session. Chrome owns the database; this module reads a private copy of it and
+// never writes to Chrome's file. Cookie values never leave here except as
+// `session.cookies.set()` payloads.
 //
 // Everything is injectable (`run`, `fsImpl`, `readPassword`, `cookiesApi`,
 // `rootDir`, `nowMs`) so tests drive it without Chrome, a Keychain or Electron.
@@ -20,23 +21,29 @@ const execFileAsync = promisify(execFile);
 
 /** Chrome's encryption key lives under this Keychain generic password. */
 const SAFE_STORAGE_SERVICE = "Chrome Safe Storage";
+/** The account name Google Chrome files that password under. */
+const SAFE_STORAGE_ACCOUNT = "Chrome";
 
-// Absolute paths: a GUI-launched shell has a minimal PATH, and a PATH lookup
-// would let a planted binary stand in for the one that reads Chrome's key.
+// Absolute path: a GUI-launched shell has a minimal PATH, and a PATH lookup
+// would let a planted binary stand in for the one that reads Chrome's jar.
 const SQLITE3_BINARY = "/usr/bin/sqlite3";
-const SECURITY_BINARY = "/usr/bin/security";
 /** Chrome's PBKDF2 parameters for the "v10" AES key (unchanged since 2013). */
 const KEY_SALT = "saltysalt";
 const KEY_ITERATIONS = 1003;
 const KEY_LENGTH = 16;
 /** The Keychain read blocks on a system approval dialog the first time. */
 const KEYCHAIN_TIMEOUT_MS = 120_000;
+const KEYCHAIN_TIMEOUT_MESSAGE =
+  "Timed out waiting for Keychain access. Retry and approve the prompt.";
 /** Seconds between the Windows/Chrome epoch (1601-01-01) and the Unix epoch. */
 const CHROME_EPOCH_OFFSET_SECONDS = 11644473600;
 /** Chrome 130+ prepends SHA-256(host_key) to the plaintext (domain binding). */
 const DOMAIN_HASH_LENGTH = 32;
 
 const COOKIE_DB_READ_ERROR = "Could not read Chrome's cookie database.";
+
+/** The scope the pane sends for every website in a profile; never a valid hostname. */
+const ALL_SITES_SCOPE = "*";
 
 // Chrome renamed `secure`/`httponly` to `is_secure`/`is_httponly` and added
 // `samesite` in 2016. Try the modern set first, then the legacy one, so a very
@@ -49,6 +56,13 @@ const COLUMN_SETS = [
   `${COOKIE_COLUMNS}, expires_utc, is_secure, is_httponly, samesite`,
   `${COOKIE_COLUMNS}, expires_utc, secure, httponly`,
 ];
+
+/** Enough to count a profile's importable cookies without reading any value. */
+const COUNT_COLUMN_SETS = ["expires_utc, top_frame_site_key", "expires_utc"];
+
+/** Rows per `sqlite3` run, and its output cap: ample for 500 cookies of Chrome's 4 KB maximum, hex-encoded. */
+const ROW_BATCH_SIZE = 500;
+const ROW_BATCH_MAX_BUFFER = 32 * 1024 * 1024;
 
 const SAME_SITE_BY_CODE = {
   "-1": "unspecified",
@@ -179,6 +193,20 @@ function sameSiteValue(code) {
 }
 
 /**
+ * Drop cookies that already expired. Session cookies (no expiry) are kept.
+ *
+ * @param {object[]} rows normalized rows
+ * @param {number} nowMs
+ */
+function selectUnexpiredCookies(rows, nowMs = Date.now()) {
+  const nowSeconds = nowMs / 1000;
+  return (rows ?? []).filter((row) => {
+    const expiry = chromeExpirySeconds(row.expiresUtc);
+    return expiry === undefined || expiry > nowSeconds;
+  });
+}
+
+/**
  * Drop cookies outside the scope's tree or already expired. Session cookies (no
  * expiry) are kept.
  *
@@ -188,12 +216,10 @@ function sameSiteValue(code) {
  */
 function selectCookiesForScope(rows, scope, nowMs = Date.now()) {
   const normalized = normalizeHost(scope);
-  const nowSeconds = nowMs / 1000;
-  return (rows ?? []).filter((row) => {
-    if (!cookieInScope(row.hostKey, normalized)) return false;
-    const expiry = chromeExpirySeconds(row.expiresUtc);
-    return expiry === undefined || expiry > nowSeconds;
-  });
+  return selectUnexpiredCookies(
+    (rows ?? []).filter((row) => cookieInScope(row.hostKey, normalized)),
+    nowMs,
+  );
 }
 
 /** AES-128-CBC key Chrome derives from the Keychain password. */
@@ -290,7 +316,17 @@ function toElectronCookie(row, value) {
  * @returns {{ cookies: object[], skippedCount: number, selectedCount: number }}
  */
 function buildCookiePlan({ rows, scope, key, nowMs = Date.now() }) {
-  const selected = selectCookiesForScope(rows, scope, nowMs);
+  return planSelectedCookies(selectCookiesForScope(rows, scope, nowMs), key);
+}
+
+/**
+ * Decrypt already-selected rows into `session.cookies.set` payloads.
+ *
+ * @param {object[]} selected
+ * @param {Buffer} key
+ * @returns {{ cookies: object[], skippedCount: number, selectedCount: number }}
+ */
+function planSelectedCookies(selected, key) {
   const cookies = [];
   let skippedCount = 0;
   for (const row of selected) {
@@ -416,23 +452,70 @@ async function queryCookieRows({ snapshot, scopes, run = execFileAsync }) {
     return `(host_key = '${literal}' OR host_key LIKE '%.${escapeLike(literal)}' ESCAPE '\\'${inherited})`;
   });
   if (treeFilters.length === 0) return [];
-  const where = treeFilters.join(" OR ");
-  let lastError = null;
-  for (const columns of COLUMN_SETS) {
-    try {
-      // No `-readonly`: the snapshot keeps Chrome's WAL header, and a WAL
-      // database can't be opened read-only when no `-shm` exists yet.
-      // oxlint-disable-next-line no-await-in-loop -- each column set must fail before the next is tried
-      const { stdout } = await run(SQLITE3_BINARY, [
+  return await selectCookieRows({ snapshot, where: treeFilters.join(" OR "), run });
+}
+
+/** Whether `sqlite3` rejected the query because this profile's schema lacks a selected column. */
+function isMissingColumnError(err) {
+  return /no such column/i.test(String(err?.stderr ?? ""));
+}
+
+/**
+ * Read every row matching `where` in rowid order, a bounded batch per `sqlite3`
+ * run, so a large profile never has to fit in one process's output buffer.
+ *
+ * @param {{ snapshot: string, columns: string, where: string, run: Function }} options
+ * @returns {Promise<object[]>} raw rows
+ */
+async function selectRowBatches({ snapshot, columns, where, run }) {
+  const rows = [];
+  let afterRowid = null;
+  for (;;) {
+    const resume = afterRowid === null ? "" : ` AND rowid > ${afterRowid}`;
+    // No `-readonly`: the snapshot keeps Chrome's WAL header, and a WAL
+    // database can't be opened read-only when no `-shm` exists yet.
+    // oxlint-disable-next-line no-await-in-loop -- each batch starts after the previous one's last row
+    const { stdout } = await run(
+      SQLITE3_BINARY,
+      [
         "-json",
         snapshot,
-        `SELECT ${columns} FROM cookies WHERE ${where}`,
-      ]);
-      return parseSqliteJson(stdout)
-        .map(normalizeRow)
-        .filter((row) => row.partitionKey === "");
+        `SELECT rowid AS cookie_rowid, ${columns} FROM cookies WHERE (${where})${resume} ORDER BY rowid LIMIT ${ROW_BATCH_SIZE}`,
+      ],
+      { maxBuffer: ROW_BATCH_MAX_BUFFER },
+    );
+    const batch = parseSqliteJson(stdout);
+    rows.push(...batch);
+    if (batch.length < ROW_BATCH_SIZE) return rows;
+    afterRowid = Number(batch[batch.length - 1].cookie_rowid);
+    if (!Number.isSafeInteger(afterRowid))
+      throw new Error("sqlite3 returned a row without a rowid");
+  }
+}
+
+/**
+ * Select `FROM cookies WHERE <where>` against the snapshot and drop partitioned
+ * cookies. Only a missing column moves on to the next (older-schema) column set:
+ * any other failure fails the read, so a column is never dropped by accident.
+ *
+ * @param {{ snapshot: string, where: string, run?: Function, columnSets?: string[] }} options
+ * @returns {Promise<object[]>}
+ */
+async function selectCookieRows({
+  snapshot,
+  where,
+  run = execFileAsync,
+  columnSets = COLUMN_SETS,
+}) {
+  let lastError = null;
+  for (const columns of columnSets) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- each column set must fail before the next is tried
+      const rows = await selectRowBatches({ snapshot, columns, where, run });
+      return rows.map(normalizeRow).filter((row) => row.partitionKey === "");
     } catch (err) {
       lastError = err;
+      if (!isMissingColumnError(err)) break;
     }
   }
   // Fixed text: the exec error carries the full command line (temp paths, the
@@ -502,39 +585,74 @@ async function readCookieRows({ cookieDbPath, scopes, run = execFileAsync, fsImp
 }
 
 /**
- * Chrome's "Safe Storage" password from the login Keychain. Shows a system
- * approval dialog the first time — the caller must have a user-initiated import
- * behind this.
+ * Read every unpartitioned row of one profile, whatever its site.
  *
- * @param {{ run?: Function }} [options]
+ * @param {{ cookieDbPath: string, run?: Function, fsImpl?: typeof fs, columnSets?: string[] }} options
+ * @returns {Promise<object[]>} normalized rows
+ */
+async function readAllSitesRows({ cookieDbPath, run = execFileAsync, fsImpl = fs, columnSets }) {
+  try {
+    return await withCookieSnapshot({ cookieDbPath, fsImpl }, async (snapshot) =>
+      selectCookieRows({ snapshot, where: "1", run, columnSets }),
+    );
+  } catch (err) {
+    // A failed snapshot copy carries temp paths, which must not reach a toast.
+    if (messageOf(err) === COOKIE_DB_READ_ERROR) throw err;
+    throw new Error(COOKIE_DB_READ_ERROR, { cause: err });
+  }
+}
+
+/** The in-process Keychain binding, loaded on first use: only an import needs it. */
+function loadKeychainBinding() {
+  return require("@napi-rs/keyring");
+}
+
+/**
+ * Read Chrome's Safe Storage password in-process so Keychain grants belong to
+ * this app, never a shared helper. Shows the system approval dialog the first
+ * time — the caller must have a user-initiated import behind this.
+ *
+ * @param {{ loadBinding?: () => { AsyncEntry: new (service: string, account: string) => { getPassword: () => Promise<string | null> } }, timeoutMs?: number }} [options]
  * @returns {Promise<string>}
  */
-async function readSafeStoragePassword({ run = execFileAsync } = {}) {
-  let stdout;
+async function readSafeStoragePassword({
+  loadBinding = loadKeychainBinding,
+  timeoutMs = KEYCHAIN_TIMEOUT_MS,
+} = {}) {
+  let entry;
   try {
-    ({ stdout } = await run(
-      SECURITY_BINARY,
-      ["find-generic-password", "-w", "-s", SAFE_STORAGE_SERVICE],
-      { timeout: KEYCHAIN_TIMEOUT_MS },
-    ));
+    const { AsyncEntry } = loadBinding();
+    entry = new AsyncEntry(SAFE_STORAGE_SERVICE, SAFE_STORAGE_ACCOUNT);
   } catch (err) {
-    if (err && err.code === 44) {
-      throw new Error(
-        "Chrome's cookie key isn't in your login Keychain. Open Google Chrome once, then retry.",
-        { cause: err },
-      );
-    }
-    if (err && (err.killed || err.signal)) {
-      throw new Error("Timed out waiting for Keychain access. Retry and approve the prompt.", {
-        cause: err,
-      });
-    }
+    throw new Error("This build of the app can't read the Keychain, so it can't import cookies.", {
+      cause: err,
+    });
+  }
+  let timer;
+  let password;
+  try {
+    // The native read can't be cancelled; a late answer to the dialog is dropped.
+    password = await Promise.race([
+      entry.getPassword(),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(KEYCHAIN_TIMEOUT_MESSAGE)), timeoutMs);
+      }),
+    ]);
+  } catch (err) {
+    if (err && err.message === KEYCHAIN_TIMEOUT_MESSAGE) throw err;
+    // Fixed text: the platform error can name Keychain internals.
     throw new Error(
       "Couldn't read Chrome's cookie key from the Keychain. Approve the prompt (or unlock the login Keychain) and retry.",
       { cause: err },
     );
+  } finally {
+    clearTimeout(timer);
   }
-  const password = String(stdout ?? "").replace(/\r?\n$/, "");
+  if (password === null || password === undefined) {
+    throw new Error(
+      "Chrome's cookie key isn't in your login Keychain. Open Google Chrome once, then retry.",
+    );
+  }
   if (!password) {
     throw new Error("Chrome's Keychain item is empty. Open Google Chrome once, then retry.");
   }
@@ -658,7 +776,7 @@ async function importSiteCookies({
   }
   let key;
   try {
-    key = deriveMacKey(await readPassword({ run }));
+    key = deriveMacKey(await readPassword());
   } catch (err) {
     return { ok: false, error: messageOf(err) };
   }
@@ -671,17 +789,7 @@ async function importSiteCookies({
     };
   }
   const plan = buildCookiePlan({ rows, scope: target, key, nowMs });
-  let imported = 0;
-  let failed = 0;
-  for (const cookie of plan.cookies) {
-    try {
-      // oxlint-disable-next-line no-await-in-loop -- one failure must not abort the rest
-      await cookiesApi.set(cookie);
-      imported += 1;
-    } catch {
-      failed += 1;
-    }
-  }
+  const { imported, failed } = await writeCookies(cookiesApi, plan.cookies);
   return {
     ok: true,
     host: pageHost,
@@ -695,10 +803,116 @@ async function importSiteCookies({
   };
 }
 
+/**
+ * Write planned cookies into the session, counting the ones it rejects.
+ *
+ * @param {{ set: (cookie: object) => Promise<unknown> }} cookiesApi
+ * @param {object[]} cookies
+ * @returns {Promise<{ imported: number, failed: number }>}
+ */
+async function writeCookies(cookiesApi, cookies) {
+  let imported = 0;
+  let failed = 0;
+  for (const cookie of cookies) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- one failure must not abort the rest
+      await cookiesApi.set(cookie);
+      imported += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { imported, failed };
+}
+
+/**
+ * How many unexpired cookies each installed Chrome profile holds across every
+ * website. No Keychain access and no cookie values.
+ *
+ * @param {{ rootDir?: string, run?: Function, fsImpl?: typeof fs, nowMs?: number }} [options]
+ * @returns {Promise<{ ok: boolean, profiles: Array<{ id: string, name: string, cookieCount: number }> }>}
+ */
+async function previewAllSitesCookies({
+  rootDir,
+  run = execFileAsync,
+  fsImpl = fs,
+  nowMs = Date.now(),
+} = {}) {
+  const profiles = await listChromeProfiles({ rootDir, fsImpl });
+  const found = [];
+  for (const profile of profiles) {
+    let rows;
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- one Chrome DB at a time keeps disk reads small
+      rows = await readAllSitesRows({
+        cookieDbPath: profile.cookieDbPath,
+        run,
+        fsImpl,
+        columnSets: COUNT_COLUMN_SETS,
+      });
+    } catch {
+      continue; // An unreadable/locked profile is simply not offered.
+    }
+    const cookieCount = selectUnexpiredCookies(rows, nowMs).length;
+    if (cookieCount > 0) found.push({ id: profile.id, name: profile.name, cookieCount });
+  }
+  return { ok: true, profiles: found };
+}
+
+/**
+ * Decrypt every website's cookies for one Chrome profile and write them into
+ * the given session, returning counts only (never values).
+ *
+ * @param {{
+ *   profileId: string,
+ *   cookiesApi: { set: (cookie: object) => Promise<unknown> },
+ *   rootDir?: string,
+ *   run?: Function,
+ *   fsImpl?: typeof fs,
+ *   readPassword?: Function,
+ *   nowMs?: number,
+ * }} options
+ */
+async function importAllSitesCookies({
+  profileId,
+  cookiesApi,
+  rootDir,
+  run = execFileAsync,
+  fsImpl = fs,
+  readPassword = readSafeStoragePassword,
+  nowMs = Date.now(),
+}) {
+  const profiles = await listChromeProfiles({ rootDir, fsImpl });
+  const profile = profiles.find((candidate) => candidate.id === profileId);
+  if (!profile) return { ok: false, error: "That Chrome profile wasn't found on this machine." };
+  const rows = await readAllSitesRows({ cookieDbPath: profile.cookieDbPath, run, fsImpl });
+  let key;
+  try {
+    key = deriveMacKey(await readPassword());
+  } catch (err) {
+    return { ok: false, error: messageOf(err) };
+  }
+  const plan = planSelectedCookies(selectUnexpiredCookies(rows, nowMs), key);
+  const { imported, failed } = await writeCookies(cookiesApi, plan.cookies);
+  return {
+    ok: true,
+    scope: ALL_SITES_SCOPE,
+    profileId: profile.id,
+    profileName: profile.name,
+    found: plan.selectedCount,
+    imported,
+    skipped: plan.skippedCount,
+    failed,
+  };
+}
+
 module.exports = {
   // Orchestration used by the IPC layer.
+  ALL_SITES_SCOPE,
   previewSiteCookies,
   importSiteCookies,
+  previewAllSitesCookies,
+  importAllSitesCookies,
   listChromeProfiles,
   readCookieRows,
   readScopeTrees,
@@ -718,6 +932,7 @@ module.exports = {
   normalizeRow,
   defaultChromeRoot,
   SAFE_STORAGE_SERVICE,
+  SAFE_STORAGE_ACCOUNT,
   KEY_ITERATIONS,
   KEY_SALT,
   KEY_LENGTH,

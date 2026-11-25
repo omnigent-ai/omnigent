@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -23,6 +25,7 @@ from fastapi import FastAPI
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import (
     DirectoryNotEmpty,
+    FilesystemEntry,
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
@@ -34,6 +37,10 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.workspace_file_search import walk_search
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
 
@@ -435,6 +442,139 @@ async def test_edit_file(
     assert body["object"] == "session.environment.filesystem.edit_result"
     assert body["replacements"] == 1
     assert (workspace / "hello.txt").read_text() == "goodbye world"
+
+
+@pytest.mark.parametrize(
+    "saves,statuses",
+    [
+        pytest.param(
+            [
+                ("PATCH", {"old_text": "hello", "new_text": "goodbye"}),
+                ("PATCH", {"old_text": "goodbye", "new_text": "hello"}),
+            ],
+            [],
+            id="edit-reverted",
+        ),
+        pytest.param(
+            [("PUT", {"content": "changed"}), ("PUT", {"content": "hello world"})],
+            [],
+            id="save-reverted",
+        ),
+        pytest.param(
+            [
+                ("PUT", {"content": "one two"}),
+                ("PATCH", {"old_text": "one", "new_text": "hello"}),
+            ],
+            ["modified"],
+            id="partially-reverted",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_restoring_the_original_leaves_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    saves: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    for step, (method, body) in enumerate(saves, start=1):
+        response = await client.request(method, f"{base}/filesystem/hello.txt", json=body)
+        assert response.status_code == 200, response.text
+        if step < len(saves):
+            assert (await client.get(f"{base}/changes")).json()["data"]
+
+    response = await client.get(f"{base}/changes")
+    assert [entry["status"] for entry in response.json()["data"]] == statuses
+
+
+@pytest.mark.asyncio
+async def test_editor_save_of_a_truncated_original_stays_in_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 5)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.put(f"{base}/filesystem/hello.txt", json={"content": "hello"})
+    assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
+    assert (await client.get(f"{base}/diff/hello.txt")).json()["before"] is None
+
+
+@pytest.mark.parametrize(
+    "other_content,saves",
+    [
+        pytest.param(
+            "hello world",
+            [(DEFAULT_ENVIRONMENT_ID, "changed"), ("terminal", "hello world")],
+            id="other-restores-the-same-text",
+        ),
+        pytest.param(
+            "elsewhere",
+            [("terminal", "changed"), (DEFAULT_ENVIRONMENT_ID, "elsewhere")],
+            id="other-saves-first",
+        ),
+        pytest.param(
+            "hello world",
+            [
+                (DEFAULT_ENVIRONMENT_ID, "changed"),
+                ("terminal", None),
+                (DEFAULT_ENVIRONMENT_ID, "hello world"),
+            ],
+            id="other-deletes",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_in_another_environment_keeps_the_change(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    other_content: str,
+    saves: list[tuple[str, str | None]],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    (other_root / "hello.txt").write_text(other_content)
+    other_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(other_root), sandbox=OSEnvSandboxSpec(type="none")
+        )
+    )
+    assert other_env is not None
+    request.addfinalizer(other_env.close)
+    resolve = registry.resolve_environment
+    monkeypatch.setattr(
+        registry,
+        "resolve_environment",
+        lambda session_id, environment_id, agent_spec=None: (
+            other_env
+            if environment_id == "terminal"
+            else resolve(session_id, environment_id, agent_spec)
+        ),
+    )
+
+    base = "/v1/sessions/conv_test/resources/environments"
+    for environment_id, content in saves:
+        url = f"{base}/{environment_id}/filesystem/hello.txt"
+        if content is None:
+            response = await client.delete(url)
+        else:
+            response = await client.put(url, json={"content": content})
+        assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/{DEFAULT_ENVIRONMENT_ID}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
 
 
 @pytest.mark.asyncio
@@ -893,6 +1033,82 @@ async def test_download_returns_complete_file_past_read_cap(
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
     assert resp.headers["x-content-type-options"] == "nosniff"
     assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("range_header", "start", "end"),
+    [
+        ("bytes=0-1", 0, 2),
+        ("bytes=65530-65545", 65530, 65546),
+        ("bytes=131072-", 131072, 153600),
+        ("bytes=-16", 153584, 153600),
+        ("bytes=153590-999999", 153590, 153600),
+        ("bytes=-999999", 0, 153600),
+    ],
+)
+async def test_download_serves_byte_range(
+    client: httpx.AsyncClient, workspace: Path, range_header: str, start: int, end: int
+) -> None:
+    payload = bytes(range(256)) * 600
+    (workspace / "recording.mp4").write_bytes(payload)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/recording.mp4",
+        params={"download": "true"},
+        headers={"Range": range_header},
+    )
+    assert response.status_code == 206
+    assert response.content == payload[start:end]
+    assert response.headers["content-length"] == str(end - start)
+    assert response.headers["content-range"] == f"bytes {start}-{end - 1}/{len(payload)}"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"] == "video/mp4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "range_header"),
+    [(b"hello", "bytes=5-"), (b"hello", "bytes=10-20"), (b"", "bytes=0-"), (b"hello", "bytes=-0")],
+)
+async def test_download_rejects_unsatisfiable_byte_range(
+    client: httpx.AsyncClient, workspace: Path, payload: bytes, range_header: str
+) -> None:
+    (workspace / "recording.mp4").write_bytes(payload)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/recording.mp4",
+        params={"download": "true"},
+        headers={"Range": range_header},
+    )
+    assert response.status_code == 416
+    assert response.headers["content-range"] == f"bytes */{len(payload)}"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.content == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Range": "items=0-1"},
+        {"Range": "bytes=garbage"},
+        {"Range": "bytes=3-1"},
+        {"Range": "bytes=0-1,3-4"},
+        {"Range": "bytes=0-1", "If-Range": '"different-version"'},
+    ],
+)
+async def test_download_falls_back_to_complete_file(
+    client: httpx.AsyncClient, workspace: Path, headers: dict[str, str]
+) -> None:
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/filesystem/hello.txt",
+        params={"download": "true"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.content == (workspace / "hello.txt").read_bytes()
+    assert response.headers["accept-ranges"] == "bytes"
+    assert "content-range" not in response.headers
 
 
 @pytest.mark.asyncio
@@ -1420,6 +1636,7 @@ def app_with_registry(
 
     reg = app.state.filesystem_registry
     # Seed change events via the public API: hello.txt modified, gone.py deleted.
+    reg.seed_snapshot("hello.txt", "before content")
     reg.record_change("hello.txt", "modified", "conv_test")
     reg.record_change("gone.py", "deleted", "conv_test")
     return app
@@ -1454,7 +1671,7 @@ async def test_filesystem_changes_modified(
     resp = await client_with_registry.get(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["object"] == "list"
     entries_by_path = {e["path"]: e for e in body["data"]}
@@ -1503,6 +1720,315 @@ async def test_filesystem_changes_no_events_returns_empty(
     body = resp.json()
     assert body["object"] == "list"
     assert body["data"] == [], "No registry means no changes"
+
+
+async def test_multi_repo_routes_bind_session_git_and_preserve_repository_metadata(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    for name in ("alpha", "beta"):
+        repo = workspace / name
+        repo.mkdir()
+        (repo / "same.txt").write_text(f"{name} original\n")
+        for argv in (["init"], ["add", "."], ["commit", "-m", "initial"]):
+            subprocess.run(
+                ["git", *argv], cwd=repo, env=_git_env(), check=True, capture_output=True
+            )
+        (repo / "same.txt").write_text(f"{name} changed\n")
+    (workspace / "alpha" / "new.txt").write_text("one\ntwo\n")
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    event_loop_thread = threading.get_ident()
+    calls: list[tuple[str, Path]] = []
+
+    def capture_git(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert threading.get_ident() != event_loop_thread
+        calls.append((argv[0], cwd))
+        return run_git(argv, cwd, timeout)
+
+    monkeypatch.setattr(environment, "run_git", capture_git)
+    app.state.filesystem_registry.record_change("hello.txt", "modified", "conv_test")
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.get(f"{base}/changes")
+    assert response.status_code == 200, response.text
+    entries = {entry["path"]: entry for entry in response.json()["data"]}
+    assert set(entries) == {"alpha/new.txt", "alpha/same.txt", "beta/same.txt", "hello.txt"}
+    assert "repository_root" not in entries["hello.txt"]
+    for name in ("alpha", "beta"):
+        assert entries[f"{name}/same.txt"]["repository_root"] == name
+        assert entries[f"{name}/same.txt"]["lines_added"] == 1
+        assert entries[f"{name}/same.txt"]["lines_removed"] == 1
+        assert entries[f"{name}/same.txt"]["untracked_lines"] is None
+    assert entries["alpha/new.txt"]["lines_added"] is None
+    assert entries["alpha/new.txt"]["untracked_lines"] == 2
+    assert calls == [
+        (command, workspace / name) for name in ("alpha", "beta") for command in ("status", "diff")
+    ]
+    calls.clear()
+    response = await client.get(f"{base}/diff/beta/same.txt")
+    assert response.status_code == 200, response.text
+    assert response.json()["before"] == "beta original\n"
+    assert response.json()["after"] == "beta changed\n"
+    assert calls == [("status", workspace / "beta"), ("show", workspace / "beta")]
+    assert app.state.filesystem_registry._run_repository_git is None
+
+    # A bounded HEAD-read failure must be an error, not a successful empty original.
+    original = workspace / "beta" / "same.txt"
+    original.write_text("x" * (10 * 1024 * 1024 + 1))
+    for argv in (["add", "."], ["commit", "-m", "large baseline"]):
+        subprocess.run(
+            ["git", *argv], cwd=original.parent, env=_git_env(), check=True, capture_output=True
+        )
+    original.write_text("small replacement\n")
+    response = await client.get(f"{base}/diff/beta/same.txt")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "git_status_failed"
+
+    for suffix in ("changes", "diff/beta/same.txt"):
+        response = await client.get(
+            f"/v1/sessions/conv_test/resources/environments/missing-terminal/{suffix}"
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "not_found"
+
+    (workspace / "broken" / ".git").mkdir(parents=True)
+    response = await client.get(f"{base}/changes")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "git_status_failed"
+    assert "Repository 'broken'" in response.json()["error"]["message"]
+
+
+# ── Concurrent /changes listings ─────────────────────────────────────────────
+
+
+def _changed_repository(root: Path) -> None:
+    """Create a repository at *root* whose committed ``same.txt`` is modified."""
+    root.mkdir()
+    (root / "same.txt").write_text("original\n")
+    for argv in (["init"], ["add", "."], ["commit", "-m", "initial"]):
+        subprocess.run(["git", *argv], cwd=root, env=_git_env(), check=True, capture_output=True)
+    (root / "same.txt").write_text("changed\n")
+
+
+def _observe_listing_arrivals(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record each /changes listing as it joins or starts a shared scan."""
+    from omnigent.util.fresh_call_coalescer import FreshCallCoalescer
+
+    arrivals: list[object] = []
+    coalesced_run = FreshCallCoalescer.run
+
+    async def observed_run(self: Any, key: Any, call: Any) -> Any:
+        arrivals.append(key)
+        return await coalesced_run(self, key, call)
+
+    monkeypatch.setattr(FreshCallCoalescer, "run", observed_run)
+    return arrivals
+
+
+async def test_concurrent_listings_for_two_sessions_each_see_only_their_own_edits(
+    client: httpx.AsyncClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sessions sharing one workspace never wait on, or read, each other's listing.
+
+    Both sessions here use the runner's non-Git registry, which answers per
+    session; a listing for one must not be served by, or queue behind, the other's.
+    """
+    from omnigent.runtime.filesystem_registry import MultiRepositoryFilesystemRegistry
+
+    fs_registry = app.state.filesystem_registry
+    fs_registry.record_change("hello.txt", "modified", "conv_test")
+    fs_registry.record_change("src/main.py", "modified", "conv_other")
+    first_listing = threading.Event()
+    release = threading.Event()
+    list_changed_files = MultiRepositoryFilesystemRegistry.list_changed_files
+
+    def held_first_listing(self: Any, conversation_id: str, *, limit: int) -> Any:
+        if not first_listing.is_set():
+            first_listing.set()
+            release.wait(budget(10))
+        return list_changed_files(self, conversation_id, limit=limit)
+
+    monkeypatch.setattr(
+        MultiRepositoryFilesystemRegistry, "list_changed_files", held_first_listing
+    )
+    path = f"resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    held = asyncio.create_task(client.get(f"/v1/sessions/conv_test/{path}"))
+    try:
+        await poll_until_async(first_listing.is_set, timeout_s=budget(5))
+        other = await asyncio.wait_for(
+            client.get(f"/v1/sessions/conv_other/{path}"), timeout=budget(5)
+        )
+        assert not held.done()
+    finally:
+        release.set()
+    assert other.status_code == 200, other.text
+    assert [entry["path"] for entry in other.json()["data"]] == ["src/main.py"]
+    response = await held
+    assert response.status_code == 200, response.text
+    assert [entry["path"] for entry in response.json()["data"]] == ["hello.txt"]
+
+
+async def test_a_missing_environment_still_404s_while_the_default_one_scans(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """An unknown environment answers 404 at once, even mid-scan for its session."""
+    _changed_repository(workspace / "alpha")
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    status_started = threading.Event()
+    release = threading.Event()
+
+    def held_first_status(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        if argv[0] == "status" and not status_started.is_set():
+            status_started.set()
+            release.wait(budget(10))
+        return run_git(argv, cwd, timeout)
+
+    monkeypatch.setattr(environment, "run_git", held_first_status)
+    base = "/v1/sessions/conv_test/resources/environments"
+    listing = asyncio.create_task(client.get(f"{base}/{DEFAULT_ENVIRONMENT_ID}/changes"))
+    try:
+        await poll_until_async(status_started.is_set, timeout_s=budget(5))
+        missing = await asyncio.wait_for(
+            client.get(f"{base}/missing-terminal/changes"), timeout=budget(5)
+        )
+        assert not listing.done()
+    finally:
+        release.set()
+    assert missing.status_code == 404, missing.text
+    assert missing.json()["error"]["code"] == "not_found"
+    response = await listing
+    assert response.status_code == 200, response.text
+    assert [entry["path"] for entry in response.json()["data"]] == ["alpha/same.txt"]
+
+
+async def test_listings_sharing_a_failed_scan_each_report_it_and_the_next_listing_rescans(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """A scan's Git failure reaches each listing sharing it, and is not reused afterwards."""
+    _changed_repository(workspace / "alpha")
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    status_started = threading.Event()
+    release = threading.Event()
+
+    def held_first_status(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        if argv[0] == "status" and not status_started.is_set():
+            status_started.set()
+            release.wait(budget(10))
+        return run_git(argv, cwd, timeout)
+
+    monkeypatch.setattr(environment, "run_git", held_first_status)
+    arrivals = _observe_listing_arrivals(monkeypatch)
+    path = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    first = asyncio.create_task(client.get(path))
+    late: list[asyncio.Task[httpx.Response]] = []
+    try:
+        await poll_until_async(status_started.is_set, timeout_s=budget(5))
+        # Breaks the next scan; the running one already chose its repositories.
+        (workspace / "broken" / ".git").mkdir(parents=True)
+        late = [asyncio.create_task(client.get(path)) for _ in range(3)]
+        await poll_until_async(lambda: len(arrivals) == 4, timeout_s=budget(5))
+    finally:
+        release.set()
+
+    first_response = await first
+    assert first_response.status_code == 200, first_response.text
+    assert [entry["path"] for entry in first_response.json()["data"]] == ["alpha/same.txt"]
+    for response in await asyncio.gather(*late):
+        assert response.status_code == 500, response.text
+        assert response.json()["error"]["code"] == "git_status_failed"
+        assert "Repository 'broken'" in response.json()["error"]["message"]
+
+    shutil.rmtree(workspace / "broken")
+    response = await client.get(path)
+    assert response.status_code == 200, response.text
+    assert [entry["path"] for entry in response.json()["data"]] == ["alpha/same.txt"]
+
+
+class _SteppedClock:
+    """Stands in for a module's ``time``; ``monotonic`` runs ``offset`` seconds ahead."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.offset
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+async def test_a_listing_queued_behind_a_long_scan_gets_a_full_repository_budget(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """The eight-second multi-repository budget starts when a scan starts, not on arrival.
+
+    A listing that waits out a slow scan must not fail with the budget already spent.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+
+    _changed_repository(workspace / "alpha")
+    clock = _SteppedClock()
+    monkeypatch.setattr(filesystem_registry_mod, "time", clock)
+    environment = registry._primary_envs["conv_test"]
+    request.addfinalizer(environment.close)
+    run_git = environment.run_git
+    diff_started = threading.Event()
+    release = threading.Event()
+
+    def long_first_diff(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = run_git(argv, cwd, timeout)
+        if argv[0] == "diff" and not diff_started.is_set():
+            diff_started.set()
+            release.wait(budget(10))
+            # The first scan's last Git call outlasts any budget set while it ran.
+            clock.offset += 9
+        return result
+
+    monkeypatch.setattr(environment, "run_git", long_first_diff)
+    arrivals = _observe_listing_arrivals(monkeypatch)
+    path = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    first = asyncio.create_task(client.get(path))
+    queued: asyncio.Task[httpx.Response] | None = None
+    try:
+        await poll_until_async(diff_started.is_set, timeout_s=budget(5))
+        queued = asyncio.create_task(client.get(path))
+        await poll_until_async(lambda: len(arrivals) == 2, timeout_s=budget(5))
+    finally:
+        release.set()
+
+    assert queued is not None
+    for response in await asyncio.gather(first, queued):
+        assert response.status_code == 200, response.text
+        assert [entry["path"] for entry in response.json()["data"]] == ["alpha/same.txt"]
 
 
 # ── _require_os_env guard: all Phase-3 endpoints ────────────────────────────
@@ -1564,10 +2090,10 @@ async def test_filesystem_endpoints_return_404_when_spec_has_no_os_env(
         assert request.url.path == "/v1/sessions/conv_test"
         return httpx.Response(200, json={"id": "conv_test", "agent_id": "ag_no_env"})
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> object:
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return a spec with no os_env for the agent under test."""
         assert agent_id == "ag_no_env"
-        return SimpleNamespace(os_env=None)
+        return AgentSpec(spec_version=1, name="no-env", executor=ExecutorSpec(), os_env=None)
 
     server_client = httpx.AsyncClient(
         transport=httpx.MockTransport(_session_handler),
@@ -1612,11 +2138,6 @@ async def test_diff_endpoint_returns_before_and_after_for_modified_file(
 
     :param app_with_registry: Runner app with hello.txt seeded as 'modified'.
     """
-
-    reg = app_with_registry.state.filesystem_registry
-    # Seed the pre-modification snapshot so get_baseline has something to return.
-    # This simulates what the PUT/PATCH handlers do before overwriting the file.
-    reg.seed_snapshot("hello.txt", "before content")
 
     transport = httpx.ASGITransport(app=app_with_registry)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
@@ -1684,6 +2205,41 @@ async def test_diff_endpoint_returns_null_before_for_new_file(
 
 
 @pytest.mark.asyncio
+async def test_intent_to_add_file_is_listed_and_diffed_as_created(tmp_path: Path) -> None:
+    """A ``git add -N`` file has no HEAD version, so Changes and diff must treat it as added."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "README.md").write_text("# repo\n")
+    subprocess.run(["git", "add", "README.md"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    content = "".join(f"CASE_{index} = {index}\n" for index in range(5))
+    (ws / "suite").mkdir()
+    (ws / "suite" / "new_suite.py").write_text(content)
+    subprocess.run(
+        ["git", "add", "-N", "suite/new_suite.py"],
+        cwd=ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    base = f"/v1/sessions/conv_ita/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_ita") as client:
+        changes = (await client.get(f"{base}/changes")).json()["data"]
+        diff = (await client.get(f"{base}/diff/suite/new_suite.py")).json()
+
+    statuses = {entry["path"]: entry["status"] for entry in changes}
+    assert statuses.get("suite/new_suite.py") == "created", changes
+    assert diff["before"] is None, diff
+    assert diff["after"] == content, diff
+    assert "baseline_state" not in diff, diff
+
+
+@pytest.mark.asyncio
 async def test_diff_endpoint_returns_null_after_for_deleted_file(
     client_with_registry: httpx.AsyncClient,
 ) -> None:
@@ -1704,6 +2260,7 @@ async def test_diff_endpoint_returns_null_after_for_deleted_file(
     # Deleted file → after must be null; a non-null value means the endpoint
     # tried to read a file that no longer exists instead of short-circuiting.
     assert body["after"] is None, f"Expected after=None for deleted file, got {body['after']!r}."
+    assert body["baseline_state"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -1908,6 +2465,74 @@ async def test_content_search_live_workspace(
     assert not (workspace / "injected").exists()
 
 
+@pytest.mark.parametrize(
+    "case",
+    json.loads(
+        (
+            Path(__file__).resolve().parents[2] / "web/src/lib/__fixtures__/globLists.json"
+        ).read_text(encoding="utf-8")
+    )["cases"],
+    ids=lambda case: repr(case["raw"]),
+)
+def test_split_glob_list_matches_the_web_client(case: dict[str, Any]) -> None:
+    """The web client splits globs for the workspace API as REST does here."""
+    from omnigent.runner.environment_filesystem import split_glob_list
+
+    assert split_glob_list(case["raw"]) == case["patterns"]
+
+
+# The web panel's Whole word cases, shared with its unit test, run through real ripgrep.
+_WHOLE_WORD_FIXTURE = json.loads(
+    (
+        Path(__file__).resolve().parents[2]
+        / "web/src/lib/__fixtures__/contentSearchWholeWord.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    _WHOLE_WORD_FIXTURE["cases"],
+    ids=[case["name"] for case in _WHOLE_WORD_FIXTURE["cases"]],
+)
+async def test_content_search_whole_word_patterns(
+    client: httpx.AsyncClient, workspace: Path, case: dict[str, Any]
+) -> None:
+    (workspace / "words.txt").write_text(
+        "\n".join(_WHOLE_WORD_FIXTURE["corpus"]) + "\n", encoding="utf-8"
+    )
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={
+            "q": case["pattern"],
+            "regex": str(case["sentRegex"]).lower(),
+            "case_sensitive": str(case["caseSensitive"]).lower(),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert [match["line"] for match in response.json()["matches"]] == case["lines"]
+
+
+@pytest.mark.asyncio
+async def test_content_search_whole_word_reports_the_word_itself(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "words.txt").write_text("x(needle)y\ncafe\u0301 au lait\n", encoding="utf-8")
+    endpoint = "/v1/sessions/conv_test/resources/environments/default/content-search"
+    response = await client.get(endpoint, params={"q": r"\bneedle\b", "regex": "true"})
+    match = response.json()["matches"][0]
+    assert (match["match_start"], match["match_end"]) == (2, 8)
+    # The panel's own pattern classifies the accent in ripgrep; it must consume only the accent.
+    decomposed = next(
+        case for case in _WHOLE_WORD_FIXTURE["cases"] if case["name"] == "decomposed accent"
+    )
+    response = await client.get(endpoint, params={"q": decomposed["pattern"], "regex": "true"})
+    match = response.json()["matches"][0]
+    # Offsets are UTF-16 units: the combining accent is one more unit after "cafe".
+    assert (match["match_start"], match["match_end"]) == (0, 5)
+
+
 @pytest.mark.asyncio
 async def test_content_search_limits_errors_and_hidden_files(
     client: httpx.AsyncClient, workspace: Path
@@ -1942,17 +2567,33 @@ async def test_content_search_limits_errors_and_hidden_files(
     assert len(match["text"]) <= 402
 
 
+@pytest.mark.asyncio
+async def test_content_search_keeps_matches_with_unicode_line_separators(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    """Minified bundles hold U+2028, U+2029 and U+0085, which Python also reads as line breaks."""
+    text = 'var s = "a\u2028b\u2029c\u0085d";'
+    (workspace / "bundle.js").write_text(text + "\n", encoding="utf-8")
+
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={"q": "var s"},
+    )
+
+    result = response.json()
+    assert "error" not in result, result
+    assert [match["text"] for match in result["matches"]] == [text]
+
+
 @pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
 def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
-    """Exercise the sandbox script with controlled executables and a short deadline."""
-    from omnigent.runner.content_search import _SEARCH_SCRIPT
+    """Exercise the sandbox script with controlled executables and a bounded timeout."""
+    from omnigent.workspace_content_search import _SEARCH_SCRIPT, collect_records
 
     if mode != "missing":
         executable = tmp_path / "rg"
         body = (
-            "import os, time\n"
-            f"open({str(tmp_path / 'pid')!r}, 'w').write(str(os.getpid()))\n"
-            "time.sleep(60)\n"
+            "import time\ntime.sleep(60)\n"
             if mode == "timeout"
             else "print('x' * (2 * 1024 * 1024))\n"
         )
@@ -1960,11 +2601,19 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         executable.chmod(0o755)
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
+        "extra_args = []\nsearch_paths = ['.']\ntime_limit = 15.0\n"
     )
-    timer = (
-        "import threading\noriginal_timer = threading.Timer\n"
-        "threading.Timer = lambda seconds, callback: original_timer(0.2, callback)\n"
-    )
+    timer = ""
+    if mode == "timeout":
+        # Record the owned child's PID before the shortened timer can kill it.
+        timer = (
+            "import threading\noriginal_timer = threading.Timer\n"
+            "def shortened_timer(seconds, callback):\n"
+            f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
+            "        marker.write(str(process.pid))\n"
+            "    return original_timer(0.2, callback)\n"
+            "threading.Timer = shortened_timer\n"
+        )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
         env={**os.environ, "PATH": str(tmp_path)},
@@ -1973,7 +2622,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         timeout=5,
         check=True,
     )
-    result = json.loads(completed.stdout)
+    result = collect_records(completed.stdout.splitlines())
     if mode == "missing":
         assert "Install ripgrep" in result["error"]
     elif mode == "timeout":
@@ -3017,6 +3666,51 @@ def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
     assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
 
 
+def test_search_indexed_paths_hands_leaf_symlinks_to_describe_link(tmp_path: Path) -> None:
+    """A leaf link goes to the caller's describer with its own lstat; a path
+    beneath a symlinked parent is still never described."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-link").symlink_to(outside / "b.txt")
+    (root / "a").symlink_to(outside)
+    seen: list[tuple[str, bool]] = []
+
+    def describe(path: str, own: os.stat_result) -> FilesystemEntry:
+        seen.append((path, stat.S_ISLNK(own.st_mode)))
+        return FilesystemEntry(id=path, name=path, path=path, type="file")
+
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt"], "b", describe_link=describe)
+
+    assert seen == [("b-link", True)]
+    assert [e.path for e in entries] == ["b-link"]
+
+
+def test_walk_search_hands_symlinks_to_describe_link(tmp_path: Path) -> None:
+    """Links to files and to directories go to the describer; real entries don't."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-file").symlink_to(outside / "b.txt")
+    (root / "b-dir").symlink_to(outside)
+    (root / "b.md").write_text("md")
+    seen: list[str] = []
+
+    def describe(path: str, own: os.stat_result) -> FilesystemEntry:
+        assert stat.S_ISLNK(own.st_mode)
+        seen.append(path)
+        return FilesystemEntry(id=path, name=path, path=path, type="file")
+
+    entries, _ = walk_search(root, "b", [], [], 10, budget=100, describe_link=describe)
+
+    assert sorted(seen) == ["b-dir", "b-file"]
+    assert {e.path: e.bytes for e in entries} == {"b-dir": None, "b-file": None, "b.md": 2}
+
+
 @pytest.mark.asyncio
 async def test_search_follows_a_repository_created_inside_an_outer_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3301,3 +3995,31 @@ def test_download_over_the_wire_fails_instead_of_truncating(
     message = str(excinfo.value)
     assert str(_DOWNLOAD_CHUNK) in message
     assert str(_SHRINK_SIZE) in message
+
+
+@pytest.mark.parametrize("directory", ["", "tree"])
+async def test_runner_listing_matches_the_host_reader(
+    client: httpx.AsyncClient, workspace: Path, directory: str
+) -> None:
+    """The workspace API lists through the host's reader, so it must answer like the runner."""
+    from omnigent.workspace_fs import WorkspaceReader
+
+    tree = workspace / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "empty").mkdir()
+    (tree / ".hidden").write_text("x")
+    (tree / "file.txt").write_text("12345")
+    (tree / "dir-link").symlink_to(tree / "sub")
+    (tree / "broken-link").symlink_to(tree / "missing")
+    if sys.platform.startswith("linux"):
+        # Skipped by both: a non-UTF-8 name can't travel in JSON.
+        with open(os.path.join(os.fsencode(tree), b"bad-\xff"), "wb") as handle:
+            handle.write(b"x")
+    url = _FS_URL + (f"/{directory}" if directory else "")
+
+    runner = await client.get(url, params={"limit": 1000, "order": "asc"})
+    host = WorkspaceReader(workspace).list_directory(directory, limit=1000, after=None)
+
+    assert runner.status_code == 200, runner.text
+    assert runner.json()["data"] == host.data
+    assert runner.json()["has_more"] is host.has_more

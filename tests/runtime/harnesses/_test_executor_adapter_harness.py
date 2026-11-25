@@ -12,6 +12,7 @@ Four scripts:
   with a result, then a TurnComplete (no further text).
 - ``"error"``: an ExecutorError event.
 - ``"cancelled"``: a TurnCancelled event.
+- ``"sandbox_policy"``: validate the transported policy before a scripted text turn.
 - ``"capture_messages"``: writes the received messages list as
   JSON to the path in ``MOCK_EXECUTOR_CAPTURE_PATH``, then
   emits a TurnComplete. Used to verify the full AP→harness→
@@ -36,6 +37,8 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     MockExecutor,
+    NativeTurnAcceptance,
+    TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
@@ -44,6 +47,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.model_auth import ProviderAuthRequired
+from omnigent.inner.os_env_serialization import resolve_harness_os_env
+from omnigent.inner.sandbox import harness_sandbox_preparation, validate_harness_sandbox
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _SCRIPT_ENV_VAR = "MOCK_EXECUTOR_SCRIPT"
@@ -115,7 +120,17 @@ def _build_text_only() -> Executor:
     :returns: A configured :class:`MockExecutor` instance.
     """
     executor = MockExecutor()
-    executor.enqueue_response("hello from mock")
+    raw_acceptance = os.environ.get("MOCK_EXECUTOR_NATIVE_ACCEPTANCE")
+    executor.enqueue_events(
+        [
+            TurnComplete(
+                response="hello from mock",
+                native_acceptance=NativeTurnAcceptance(**json.loads(raw_acceptance))
+                if raw_acceptance
+                else None,
+            )
+        ]
+    )
     return executor
 
 
@@ -208,12 +223,20 @@ def _build_cancelled() -> Executor:
     MockExecutor scripted with a provider-side :class:`TurnCancelled`.
 
     The adapter should map this cleanly to ``response.cancelled`` rather than
-    falling through to ``response.completed``.
+    falling through to ``response.completed``, with the usage of the model
+    calls the turn made before it was cancelled.
 
     :returns: A configured :class:`MockExecutor` instance.
     """
     executor = MockExecutor()
-    executor._turns.append([TurnCancelled(reason="provider_cancelled")])
+    executor._turns.append(
+        [
+            TurnCancelled(
+                reason="provider_cancelled",
+                usage={"input_tokens": 300, "output_tokens": 40, "total_tokens": 340},
+            )
+        ]
+    )
     return executor
 
 
@@ -253,7 +276,25 @@ def _build_provider_auth_failure() -> Executor:
     return _ProviderAuthFailureExecutor()
 
 
+def _build_claude_preparation_auth_failure() -> Executor:
+    from omnigent.inner.claude_model_access import ClaudeAuthRequired
+
+    with harness_sandbox_preparation():
+        raise ClaudeAuthRequired()
+
+
+def _build_sandbox_policy() -> Executor:
+    """Validate the transported worker policy before allocating a mock executor."""
+    validate_harness_sandbox(resolve_harness_os_env("HARNESS_CLAUDE_SDK_OS_ENV"), "Test")
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [TextChunk(text="policy retry completed"), TurnComplete(response=None)]
+    )
+    return executor
+
+
 _SCRIPTS: dict[str, Callable[[], Executor]] = {
+    "sandbox_policy": _build_sandbox_policy,
     "pr_tracking": _build_pr_tracking,
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
@@ -262,6 +303,7 @@ _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
     "provider_auth_failure": _build_provider_auth_failure,
+    "claude_preparation_auth_failure": _build_claude_preparation_auth_failure,
 }
 
 

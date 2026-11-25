@@ -59,7 +59,13 @@ from tests._helpers.operator_agents import operator_agent_store, post_operator_s
 from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
-from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
+from tests.e2e.helpers import (
+    HEALTH_TIMEOUT_S,
+    POLL_INTERVAL_S,
+    harness_model_base_url,
+    lookup_databricks_host,
+    model_base_url,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -362,6 +368,7 @@ def configure_mock_llm(
     *,
     key: str = "default",
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """
     Configure a keyed response queue on the mock LLM server.
@@ -397,6 +404,11 @@ def configure_mock_llm(
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
+    :param required_tools: Advertised tools required to consume this queue,
+        isolating agent turns from background generation and review. Serve
+        the queue only to requests advertising all of these tools, so a
+        tool-less request (a title generation) cannot consume a scripted tool
+        call meant for the agent's own turn.
     :param match: Optional content-routing token. When set, the queue is
         selected if this token appears in the request's user input,
         regardless of ``model``. Use a deliberately-unique token (the
@@ -411,6 +423,8 @@ def configure_mock_llm(
     }
     if match is not None:
         payload["match"] = match
+    if required_tools is not None:
+        payload["required_tools"] = required_tools
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
         json=payload,
@@ -519,6 +533,20 @@ def get_mock_requests(
     return resp.json()["requests"]
 
 
+def get_mock_message_requests(mock_llm_server_url: str, *, key: str | None = None) -> list[dict]:
+    """
+    Retrieve captured Anthropic Messages requests with their beta flags.
+
+    :param mock_llm_server_url: Mock server URL.
+    :param key: When set, only return requests whose ``model`` field matches this key.
+    :returns: Entries shaped ``{"body": <request body>, "betas": [<flag>, ...]}``.
+    """
+    params = {"key": key} if key is not None else {}
+    resp = httpx.get(f"{mock_llm_server_url}/mock/message_requests", params=params, timeout=5.0)
+    resp.raise_for_status()
+    return resp.json()["requests"]
+
+
 @pytest.fixture(scope="session")
 def openai_judge_api_key(
     llm_api_key: str,
@@ -588,6 +616,13 @@ def live_runner_id() -> str:
         _live_runner_state["binding_token"] = token
         _live_runner_state["runner_id"] = token_bound_runner_id(token)
     return _live_runner_state["runner_id"]
+
+
+# Test-only policy handler modules the live server may reference from fixture agents.
+_E2E_POLICY_MODULES = [
+    "omnigent._e2e_policy_callables",
+    "tests.resources.examples._shared.search_rate_limit_policy",
+]
 
 
 @pytest.fixture(scope="session")
@@ -666,7 +701,9 @@ def live_server(
         # include /v1 in the base so the SDK hits /v1/responses.
         env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
     elif databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
+        env["OPENAI_BASE_URL"] = harness_model_base_url(
+            databricks_workspace_host, request.config.getoption("--harness")
+        )
         # Thread --profile so claude-sdk and other harnesses that read
         # ~/.databrickscfg directly pick the right profile. Without it
         # ClaudeSDKExecutor falls through and 403s.
@@ -717,13 +754,14 @@ def live_server(
         server_cfg.write_text(
             yaml.safe_dump(
                 {
+                    "policy_modules": _E2E_POLICY_MODULES,
                     "llm": {
                         "model": "_policy_llm_",
                         "connection": {
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
                         },
-                    }
+                    },
                 }
             )
         )
@@ -733,15 +771,16 @@ def live_server(
         server_cfg.write_text(
             yaml.safe_dump(
                 {
+                    "policy_modules": _E2E_POLICY_MODULES,
                     "llm": {
                         # Stable key: session-scoped server must not
                         # depend on which test boots it first.
                         "model": resolve_model("databricks-gpt-5-4-mini", key="live-server"),
                         "connection": {
-                            "base_url": f"{databricks_workspace_host}/serving-endpoints",
+                            "base_url": model_base_url(databricks_workspace_host, "mlflow/v1"),
                             "api_key": llm_api_key,
                         },
-                    }
+                    },
                 }
             )
         )
@@ -1030,7 +1069,7 @@ def register_inline_agent(
         block into the executor so the harness hits the mock server
         instead of ``api.openai.com``.
     :param builtin_tools: When set, add a ``tools.builtins`` list to
-        the agent spec, e.g. ``["list_files", "upload_file"]``.
+        the agent spec, e.g. ``["web_search"]``.
     :param extra_config: When set, top-level keys shallow-merged into
         the agent YAML before upload (e.g. ``tools`` and ``policies``).
         ``name``/``prompt``/``executor`` stay helper-controlled.
@@ -1883,7 +1922,7 @@ def resume_test_server(
     # primary live_server fixture above).
     apply_server_env(env, _REPO_ROOT)
     if databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
+        env["OPENAI_BASE_URL"] = model_base_url(databricks_workspace_host, "codex/v1")
     # See docstring: an allow-list would reject the CLI's own runner.
     env.pop("OMNIGENT_RUNNER_TUNNEL_TOKEN", None)
 

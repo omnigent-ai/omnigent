@@ -63,7 +63,9 @@ async def test_observer_records_unobserved_without_raising(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A stopped pane produces diagnostics without failing session creation."""
-    terminal = _FakeTerminal(["starting"], running=False)
+    terminal = _FakeTerminal(
+        ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456\nstarting"], running=False
+    )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
         await _observe_terminal_interactive(
@@ -83,3 +85,7 @@ async def test_observer_records_unobserved_without_raising(
         if record.event_name == "terminal_interactive_unobserved"
     )
     assert record.attributes["reason"] == "RuntimeError"
+    # The last pane is the only record of what held the TUI back.
+    output = record.attributes["terminal_last_output"]
+    assert "starting" in output
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in output

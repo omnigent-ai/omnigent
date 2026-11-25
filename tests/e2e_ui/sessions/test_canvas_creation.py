@@ -13,6 +13,7 @@ from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.session import bind_session_runner
 from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.sessions._sidebar_helpers import wait_for_sidebar_collapse
 from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
 from tests.e2e_ui.sessions.test_canvas_workspace import canvas_project as canvas_project
 
@@ -31,6 +32,7 @@ def test_canvas_uses_standard_sidebar_navigation(
     page.get_by_role("button", name="Close sidebar", exact=True).click()
     toggle = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(toggle).to_be_visible()
+    wait_for_sidebar_collapse(page)
     ordinary_icon = toggle.locator("svg").inner_html()
     ordinary_bounds = toggle.bounding_box()
     assert ordinary_bounds is not None

@@ -35,9 +35,11 @@ import {
   isSessionScopedDecision,
   routingExtras,
 } from "./routingDecision";
+import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
-import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
-import type { ActiveResponse } from "@/store/types";
+import { readTaskActivity, repeatsTaskMarker } from "./taskActivity";
+import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
+import type { ActiveResponse, UploadFailure } from "@/store/types";
 
 /**
  * UI states for a tool card. The first three line up with values in
@@ -74,7 +76,11 @@ export type RenderItem =
       itemId: string | null;
       text: string;
       final: boolean;
+      /** Key for text that arrived over this page's stream; it holds while the item id commits. */
+      streamKey?: string;
       previewInterrupted?: boolean;
+      /** Harness label for the message (Codex); `commentary` is progress narration. */
+      phase?: AssistantMessagePhase;
     }
   | {
       kind: "reasoning";
@@ -97,6 +103,17 @@ export type RenderItem =
       toolType: string;
       label: string;
       data: Record<string, unknown>;
+    }
+  | {
+      kind: "subagent_activity";
+      itemId: string | null;
+      data: Record<string, unknown>;
+      /**
+       * Seconds into the turn's work when this task marker landed, on the clock
+       * `Bubble.workedForS` spans, so the marker can split that duration. Only task
+       * markers carry it, and only when the turn's first work shares their clock.
+       */
+      turnElapsedS?: number;
     }
   | {
       kind: "slash_command";
@@ -149,11 +166,13 @@ export type RenderItem =
       } | null;
       askUserQuestion?: Record<string, unknown> | null;
       exitPlanMode?: Record<string, unknown> | null;
+      fileEdit?: FileEditRequest | null;
       codexCommand?: {
         command: string;
         cwd: string | null;
         reason: string | null;
         execPolicyAmendment: string[] | null;
+        requestFingerprint?: string | null;
       } | null;
       allowAllEdits?: boolean;
       allowAutoMode?: boolean;
@@ -172,6 +191,12 @@ export type Bubble =
       pending?: boolean;
       /** Pending input sent mid-turn that the agent hasn't read yet. */
       awaitingAgent?: boolean;
+      /** Pending input whose send request has not been answered for a while. */
+      stillSending?: boolean;
+      /** Pending input the server accepted (its send request succeeded). */
+      accepted?: boolean;
+      /** Saved startup message the server never delivered (the launch failed). */
+      undelivered?: boolean;
       content: MessageContentBlock[];
       /** Shell input is literal command text, not Markdown or attachment markers. */
       shellCommand?: string;
@@ -187,12 +212,16 @@ export type Bubble =
        * optimistic→committed swap (no remount/flink).
        */
       stableKey?: string;
+      /** Set when this send's upload failed before posting; its attachment offers Retry. */
+      uploadFailure?: UploadFailure;
     }
   | {
       kind: "assistant";
       responseId: string;
       // Stable, sibling-unique identifier for React keying
       stableId: string;
+      /** Response id of the streamed block that opened this bubble; it keys the bubble. */
+      liveOpener?: string;
       lifecycle: ActiveResponse["state"];
       /** Free-form error message when `lifecycle === "failed"`. */
       error: string | null;
@@ -567,6 +596,14 @@ function isAnonymousRid(rid: string): boolean {
   return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
 }
 
+/** Whether a block arrived over this page's live stream, not from history or as a `live:` preview. */
+function arrivedLive(block: AnyBlock): boolean {
+  return (
+    block.ctx.clientCreatedAtS !== undefined &&
+    !(block.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false)
+  );
+}
+
 function errorDetails(block: ErrorBlock): RelatedRenderError {
   return {
     itemId: block.ctx.itemId,
@@ -797,6 +834,13 @@ function walkBubbles(
   liveTurnId: string | null = null,
 ): { bubbles: Bubble[]; lastBubbleStart: number; lastBubbleCount: number } {
   const bubbles: Bubble[] = [...seedBubbles];
+  // Streamed bubbles already in the reused prefix keep their numbers per opener.
+  const liveIndexByOpener = new Map<string, number>();
+  for (const b of seedBubbles) {
+    if (b.kind === "assistant" && b.liveOpener !== undefined) {
+      liveIndexByOpener.set(b.liveOpener, (liveIndexByOpener.get(b.liveOpener) ?? 0) + 1);
+    }
+  }
   // One cross-bubble result index per walk: the relay backdates a
   // delayed function_call_output to its ORIGINAL turn's response id, so
   // a result can sit outside its call's bubble; pairing is keyed
@@ -839,15 +883,23 @@ function walkBubbles(
       continue;
     }
 
-    if (isSubagentActivityBlock(b)) {
+    // A sub-agent notice joins the assistant work beside it so it folds with
+    // that work. With no work after it yet it stands alone, and the run is one
+    // re-walk region so all of it can join the work that arrives next.
+    if (isSubagentActivityBlock(b) && workBesideNotice(blocks, i, 1) === undefined) {
       lastBubbleStart = i;
-      lastBubbleCount = 1;
-      bubbles.push({
-        kind: "subagent_activity",
-        itemId: b.ctx.itemId ?? `subagent_activity_${i}`,
-        data: b.data,
-      });
-      i += 1;
+      lastBubbleCount = 0;
+      for (; i < blocks.length && isNoticeTransparent(blocks[i]!); i += 1) {
+        const notice = blocks[i]!;
+        if (isNonRenderingBlock(notice)) expandNextAssistantResponseId = null;
+        if (!isSubagentActivityBlock(notice)) continue;
+        bubbles.push({
+          kind: "subagent_activity",
+          itemId: notice.ctx.itemId ?? `subagent_activity_${i}`,
+          data: notice.data,
+        });
+        lastBubbleCount += 1;
+      }
       continue;
     }
 
@@ -992,7 +1044,7 @@ function walkBubbles(
     // Question/plan cards split the turn on their own (see
     // `isUserInputElicitationBlock`) — they carry the turn's id, but the
     // user answering one is a boundary, not a step of the work.
-    let groupResponseId = b.ctx.responseId;
+    let groupResponseId = isSubagentActivityBlock(b) ? "" : b.ctx.responseId; // never a notice's own id
     const groupStart = i;
     // Sentinel-headed groups never absorb a different turn's blocks, in
     // either direction (see the id-change handling below).
@@ -1012,8 +1064,7 @@ function walkBubbles(
         isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
-        cur.type === "routing_decision" ||
-        isSubagentActivityBlock(cur)
+        cur.type === "routing_decision"
       )
         break;
       if (isNonRenderingBlock(cur)) {
@@ -1024,6 +1075,19 @@ function walkBubbles(
       // breaks: the work before it and the work after the answer are
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
+      if (isSubagentActivityBlock(cur)) {
+        // A notice stays in its turn's bubble until committed work from another
+        // response follows it, then opens that response's bubble: a native fold
+        // that has shown never reopens to show the new response streaming.
+        if (
+          i > groupStart &&
+          (groupOpenedOnSentinel || noticeSeparatesResponses(blocks, groupStart, i))
+        ) {
+          break;
+        }
+        i += 1;
+        continue;
+      }
       // A bare tool_result never renders standalone (it folds into its
       // call's card by callId) — don't let a backdated one split the
       // open bubble. Anonymous blocks never carry turn identity.
@@ -1066,12 +1130,27 @@ function walkBubbles(
           bk.ctx.itemId !== null &&
           !bk.ctx.itemId.startsWith(LIVE_ITEM_PREFIX),
       )?.ctx.itemId ?? null;
-    const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
+    // A bubble opened by a streamed block is keyed by that block's response id: ids that
+    // commit afterwards (a tool call, the id stamped onto its text) or a later step's
+    // response id would otherwise change the key and remount the reply mid-turn.
+    const opener = groupBlocks.find((bk) => bk.type !== "tool_result");
+    const liveOpener =
+      opener !== undefined && arrivedLive(opener) && !isAnonymousRid(opener.ctx.responseId)
+        ? opener.ctx.responseId
+        : undefined;
+    let stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
+    if (liveOpener !== undefined) {
+      const liveIndex = liveIndexByOpener.get(liveOpener) ?? 0;
+      liveIndexByOpener.set(liveOpener, liveIndex + 1);
+      stableId = `${liveOpener}:live:${liveIndex}`;
+    }
 
     lastBubbleStart = groupStart;
     lastBubbleCount = 1;
-    const workedForS = turnWorkedForS(groupBlocks);
-    const lastActivityAtS = turnLastActivityAtS(groupBlocks);
+    // A notice is stamped when the sub-agent reported, not when this turn worked.
+    const workBlocks = groupBlocks.filter((bk) => !isSubagentActivityBlock(bk));
+    const workedForS = turnWorkedForS(workBlocks);
+    const lastActivityAtS = turnLastActivityAtS(workBlocks);
     // Freshest stamp in the group — server stamp on cold load, client
     // stamp while live, either clock display-only. The max tracks latest
     // activity and never jumps back for a backdated tail block.
@@ -1086,7 +1165,7 @@ function walkBubbles(
         }
       }
     }
-    const groupCreatedAtS = groupBlocks
+    const groupCreatedAtS = workBlocks
       .filter(
         (bk) =>
           bk.type !== "tool_result" || localResultKeys.has(`${bk.ctx.responseId}:${bk.callId}`),
@@ -1101,6 +1180,7 @@ function walkBubbles(
       kind: "assistant",
       responseId: groupResponseId,
       stableId,
+      ...(liveOpener !== undefined ? { liveOpener } : {}),
       lifecycle,
       error,
       // `sessionLive` spins this turn's trailing tools when the session is
@@ -1111,6 +1191,7 @@ function walkBubbles(
         lifecycle,
         crossBubbleResults,
         liveTurnId !== null && groupResponseId === liveTurnId,
+        workBlocks,
       ),
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
@@ -1415,15 +1496,48 @@ function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
   const first = groupBlocks[0];
   const last = groupBlocks[groupBlocks.length - 1];
   if (first === undefined || last === undefined || first === last) return undefined;
-  if (first.ctx.timestamp > 0 && last.ctx.timestamp >= first.ctx.timestamp) {
-    return last.ctx.timestamp - first.ctx.timestamp;
-  }
+  const clock = sharedClock(first, last);
+  return clock === undefined ? undefined : secondsOn(clock, first, last);
+}
+
+type TurnClock = "page" | "server";
+
+/** The clock both ends of a span carry, page clock first (see `turnWorkedForS`). */
+function sharedClock(first: AnyBlock, last: AnyBlock): TurnClock | undefined {
+  if (first.ctx.timestamp > 0 && last.ctx.timestamp >= first.ctx.timestamp) return "page";
   const firstCreated = first.ctx.createdAtS;
   const lastCreated = last.ctx.createdAtS;
   if (firstCreated !== undefined && lastCreated !== undefined && lastCreated >= firstCreated) {
-    return lastCreated - firstCreated;
+    return "server";
   }
   return undefined;
+}
+
+/** Seconds from `from` to `to` on `clock`, negative when `to` came first. */
+function secondsOn(clock: TurnClock, from: AnyBlock, to: AnyBlock): number | undefined {
+  const stamp = ({ ctx }: AnyBlock): number | undefined => {
+    if (clock === "server") return ctx.createdAtS;
+    return ctx.timestamp > 0 ? ctx.timestamp : undefined;
+  };
+  const start = stamp(from);
+  const end = stamp(to);
+  return start === undefined || end === undefined ? undefined : end - start;
+}
+
+/**
+ * How far into the turn's work a task marker landed, on the clock that spans the
+ * turn. A journal write's marker can be recorded just before the call it marks,
+ * so one ahead of the turn's first work counts from its start.
+ */
+function taskMarkerElapsedS(turnWork: AnyBlock[], marker: NativeToolBlock): number | undefined {
+  const first = turnWork[0];
+  const last = turnWork[turnWork.length - 1];
+  if (first === undefined || last === undefined || readTaskActivity(marker.data) === null) {
+    return undefined;
+  }
+  const clock = sharedClock(first, last);
+  const elapsed = clock === undefined ? undefined : secondsOn(clock, first, marker);
+  return elapsed === undefined ? undefined : Math.max(0, elapsed);
 }
 
 function isSubagentActivityBlock(
@@ -1432,10 +1546,70 @@ function isSubagentActivityBlock(
   return b.type === "native_tool" && b.toolType === "subagent_activity";
 }
 
+/**
+ * What a notice looks past to find the work beside it: other notices, and
+ * blocks that never render on their own.
+ */
+function isNoticeTransparent(b: AnyBlock): boolean {
+  return (
+    isSubagentActivityBlock(b) ||
+    isNonRenderingBlock(b) ||
+    b.type === "tool_result" ||
+    b.type === "file"
+  );
+}
+
+/**
+ * The nearest assistant work beside the notice at `index`, stepping `step` and
+ * never below `floor`; `undefined` when a bubble boundary (or nothing) comes
+ * first. `committedOnly` skips streaming blocks to find a server item.
+ */
+function workBesideNotice(
+  blocks: AnyBlock[],
+  index: number,
+  step: 1 | -1,
+  committedOnly = false,
+  floor = 0,
+): AnyBlock | undefined {
+  for (let k = index + step; k >= floor && k < blocks.length; k += step) {
+    const b = blocks[k]!;
+    if (isNoticeTransparent(b)) continue;
+    if (
+      !isAssistantSideBlock(b) ||
+      isStandaloneSentinelBlock(b) ||
+      isUserInputElicitationBlock(b)
+    ) {
+      return undefined;
+    }
+    if (!committedOnly || isCommittedBlock(b)) return b;
+  }
+  return undefined;
+}
+
+/**
+ * A server item, whose response id is the same live and on reload. Live deltas
+ * carry the active response's id instead, and previews carry none.
+ */
+function isCommittedBlock(b: AnyBlock): boolean {
+  const { itemId, responseId } = b.ctx;
+  return itemId !== null && !itemId.startsWith(LIVE_ITEM_PREFIX) && !isAnonymousRid(responseId);
+}
+
+/**
+ * Whether the committed work on either side of the notice at `index` belongs to
+ * different responses: one stopped, and the next started after the notice.
+ */
+function noticeSeparatesResponses(blocks: AnyBlock[], groupStart: number, index: number): boolean {
+  const before = workBesideNotice(blocks, index, -1, true, groupStart);
+  const after = workBesideNotice(blocks, index, 1, true);
+  return (
+    before !== undefined && after !== undefined && before.ctx.responseId !== after.ctx.responseId
+  );
+}
+
 /** Filter to blocks that participate in assistant rendering. */
 function isAssistantSideBlock(b: AnyBlock): boolean {
   return (
-    !isSubagentActivityBlock(b) &&
     b.type !== "user_message" &&
     !isTerminalCommandInput(b) &&
     b.type !== "compaction" &&
@@ -1496,13 +1670,15 @@ function groupHasInterruptedText(blocks: AnyBlock[]): boolean {
  * this bubble's own results and delayed cross-turn outputs alike,
  * while a reused callId can never adopt another turn's output —
  * and tool-state derivation from bubble lifecycle plus the trailing
- * live tool phase.
+ * live tool phase. `turnWork` is the span `turnWorkedForS` measures,
+ * which task markers measure their place in the turn against.
  */
 function buildAssistantItems(
   groupBlocks: AnyBlock[],
   lifecycle: ActiveResponse["state"],
   crossBubbleResults: Map<string, ToolResultBlock>,
   sessionLive = false,
+  turnWork: AnyBlock[] = [],
 ): RenderItem[] {
   // Results render only by folding into a call's card — strip them so
   // an absorbed out-of-band result can't split a text/reasoning run.
@@ -1517,6 +1693,7 @@ function buildAssistantItems(
   const hasNonEmptyTextDone = blocks.some((b) => b.type === "text_done" && b.fullText.length > 0);
 
   const items: RenderItem[] = [];
+  let textCount = 0;
   let i = 0;
   while (i < blocks.length) {
     const b = blocks[i]!;
@@ -1533,7 +1710,9 @@ function buildAssistantItems(
       for (let k = 0; k < run.length; k += 1) {
         if (run[k]!.type === "text_done") {
           const slice = run.slice(chunkStart, k + 1);
-          const item = textItem(slice);
+          // Every segment takes an ordinal, so dropping an empty one doesn't renumber the rest.
+          const item = textItem(slice, textCount);
+          textCount += 1;
           // Drop empty trailing TextDones when a non-empty one exists
           // in the same bubble. Without this, the server's empty
           // trailing message item would render as a blank bubble line.
@@ -1547,7 +1726,8 @@ function buildAssistantItems(
         }
       }
       if (chunkStart < run.length) {
-        items.push(textItem(run.slice(chunkStart)));
+        items.push(textItem(run.slice(chunkStart), textCount));
+        textCount += 1;
       }
       continue;
     }
@@ -1565,18 +1745,31 @@ function buildAssistantItems(
       // reducer only ever emits one per group, but the schema permits
       // many — preserve that shape).
       for (const ex of b.executions) {
-        items.push(
-          toolItem(
-            ex,
-            b.ctx.itemId,
-            b.ctx.timestamp,
-            // Rid-scoped lookup: a reused callId can't adopt another turn's output.
-            crossBubbleResults.get(`${b.ctx.responseId}:${ex.callId}`),
-            lifecycle,
-            liveToolCallIds.has(ex.callId),
-          ),
+        const item = toolItem(
+          ex,
+          b.ctx.itemId,
+          b.ctx.timestamp,
+          // Rid-scoped lookup: a reused callId can't adopt another turn's output.
+          crossBubbleResults.get(`${b.ctx.responseId}:${ex.callId}`),
+          lifecycle,
+          liveToolCallIds.has(ex.callId),
         );
+        // A journal write the chat marks with a task or plan line gets no row of its own.
+        if (repeatsTaskMarker(ex.name, item.output, item.state === "input-available")) continue;
+        items.push(item);
       }
+      i += 1;
+      continue;
+    }
+
+    if (isSubagentActivityBlock(b)) {
+      const turnElapsedS = taskMarkerElapsedS(turnWork, b);
+      items.push({
+        kind: "subagent_activity",
+        itemId: b.ctx.itemId,
+        data: b.data,
+        ...(turnElapsedS !== undefined ? { turnElapsedS } : {}),
+      });
       i += 1;
       continue;
     }
@@ -1677,6 +1870,7 @@ function buildAssistantItems(
         response: b.response,
         askUserQuestion: b.askUserQuestion,
         exitPlanMode: b.exitPlanMode,
+        fileEdit: b.fileEdit,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
         allowAutoMode: b.allowAutoMode,
@@ -1726,10 +1920,11 @@ function trailingLiveToolCallIds(
   return callIds;
 }
 
-function textItem(run: AnyBlock[]): RenderItem {
+function textItem(run: AnyBlock[], ordinal: number): RenderItem {
   // Prefer the canonical fullText from text_done if present; otherwise
   // concatenate the text_chunks. Use the text_done's itemId for keys
   // when available.
+  const streamed = run.some(arrivedLive) ? { streamKey: `text#${ordinal}` } : {};
   for (let i = run.length - 1; i >= 0; i -= 1) {
     const b = run[i]!;
     if (b.type === "text_done") {
@@ -1738,7 +1933,9 @@ function textItem(run: AnyBlock[]): RenderItem {
         itemId: b.ctx.itemId,
         text: b.fullText,
         final: true,
+        ...streamed,
         ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
+        ...(b.phase !== undefined ? { phase: b.phase } : {}),
       };
     }
   }
@@ -1746,7 +1943,7 @@ function textItem(run: AnyBlock[]): RenderItem {
     .filter((b) => b.type === "text_chunk")
     .map((b) => (b as Extract<AnyBlock, { type: "text_chunk" }>).text)
     .join("");
-  return { kind: "text", itemId: null, text, final: false };
+  return { kind: "text", itemId: null, text, final: false, ...streamed };
 }
 
 function reasoningItem(run: AnyBlock[]): RenderItem {
@@ -1794,7 +1991,7 @@ function toolItem(
   result: ToolResultBlock | undefined,
   lifecycle: ActiveResponse["state"],
   isLiveToolCall: boolean,
-): RenderItem {
+): Extract<RenderItem, { kind: "tool" }> {
   const output = result?.output ?? execution.output ?? null;
   const startedAt = startedAtTimestamp > 0 ? startedAtTimestamp : null;
   const duration =
@@ -1869,9 +2066,14 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
+      Boolean(a.stillSending) !== Boolean(b.stillSending) ||
+      Boolean(a.accepted) !== Boolean(b.accepted) ||
+      Boolean(a.undelivered) !== Boolean(b.undelivered) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      a.uploadFailure?.fileId !== b.uploadFailure?.fileId ||
+      a.uploadFailure?.message !== b.uploadFailure?.message ||
       a.shellCommand !== b.shellCommand ||
       a.content.length !== b.content.length
     )

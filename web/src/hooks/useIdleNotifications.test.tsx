@@ -4,7 +4,15 @@ import {
   useConversations,
 } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+// `serverRows` follows the displayed rows unless a test sets the server's own counts.
+const serverRowsOverride = vi.hoisted(() => ({ rows: undefined as Conversation[] | undefined }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => {
+    const loaded = useTestConversations();
+    const displayed = loaded.data?.pages.flatMap((page) => page.data) ?? [];
+    return { ...loaded, serverRows: serverRowsOverride.rows ?? displayed };
+  },
+}));
 import { cleanup, renderHook, act } from "@testing-library/react";
 
 const navigateMock = vi.fn();
@@ -51,6 +59,7 @@ import {
 } from "@/lib/browserNotifications";
 import { isNativeShell, onNativeNotificationActivated, setBadgeCount } from "@/lib/nativeBridge";
 import { fetchLastAssistantText } from "@/lib/lastAssistantText";
+import { clearSessionMuteState, setMutedProjects } from "@/lib/sessionMute";
 import {
   resetReadStateForTests,
   markConversationSeen,
@@ -122,6 +131,7 @@ function setWindowFocused(focused: boolean): void {
 }
 
 beforeEach(() => {
+  serverRowsOverride.rows = undefined;
   // Fake only the timers the settle uses, leaving Date/microtasks/etc. real so
   // React's act scheduling and the preview promise keep working.
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -152,6 +162,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  clearSessionMuteState();
 });
 
 describe("useIdleNotifications turn-end transitions", () => {
@@ -188,6 +199,48 @@ describe("useIdleNotifications turn-end transitions", () => {
       body: "Fixed the badge bug and shipped it.",
     });
   });
+
+  it.each([false, true])(
+    "stays silent when the session is muted while its preview loads, then removed=%s",
+    async (removed) => {
+      let resolvePreview: (text: string) => void = () => {};
+      fetchPreviewMock.mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      );
+      setConversations([conv("a", "running")]);
+      const { rerender } = renderHook(() => useIdleNotifications());
+      setConversations([conv("a", "idle")]);
+      rerender();
+      await settle();
+      expect(fetchPreviewMock).toHaveBeenCalledWith("a");
+
+      setConversations([{ ...conv("a", "idle"), labels: { "omnigent.muted": "1" } }]);
+      rerender();
+      // Archiving (or any other removal) must not lose the observed mute.
+      if (removed) {
+        setConversations([]);
+        rerender();
+      }
+      await act(async () => {
+        resolvePreview("Fixed the badge bug and shipped it.");
+        await Promise.resolve();
+      });
+
+      expect(showMock).not.toHaveBeenCalled();
+
+      // Unmuting permits the next completion without opening the session.
+      fetchPreviewMock.mockResolvedValue("Another turn finished.");
+      setConversations([conv("a", "running")]);
+      rerender();
+      setConversations([conv("a", "idle")]);
+      rerender();
+      await settle();
+      expect(showMock).toHaveBeenCalledOnce();
+      expect(showMock.mock.calls[0][0].body).toBe("Another turn finished.");
+    },
+  );
 
   it("navigates to the conversation when the notification is clicked", async () => {
     setConversations([conv("a", "running")]);
@@ -256,6 +309,136 @@ describe("useIdleNotifications turn-end transitions", () => {
     expect(showMock).toHaveBeenCalledOnce();
   });
 
+  it.each(["its cue settles", "its preview loads"] as const)(
+    "stays silent when the session's project is muted while %s",
+    async (phase) => {
+      let resolvePreview: (text: string) => void = () => {};
+      fetchPreviewMock.mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      );
+      const filed = (status: Conversation["status"]) => ({ ...conv("a", status), project_id: "p" });
+      setConversations([filed("running")]);
+      const { rerender } = renderHook(() => useIdleNotifications());
+      // Stable rows, as the real list serves them between polls.
+      const idle = [filed("idle")];
+      serverRowsOverride.rows = idle;
+      setConversations(idle);
+      rerender();
+
+      // Muting a project changes no row, so no poll lands before delivery.
+      const muteProject = () =>
+        act(() => setMutedProjects([{ id: "p", name: "Factory", muted: true }], null));
+      if (phase === "its cue settles") muteProject();
+      await settle();
+      if (phase === "its preview loads") {
+        expect(fetchPreviewMock).toHaveBeenCalledWith("a");
+        muteProject();
+      }
+      await act(async () => {
+        resolvePreview("Finished the worker task.");
+        await Promise.resolve();
+      });
+
+      expect(showMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["its cue settles", "p_new", false],
+    ["its cue settles", "p_old", true],
+    ["its preview loads", "p_new", false],
+    ["its preview loads", "p_old", true],
+  ] as const)(
+    "checks the project a session moved to while %s: muting %s notifies=%s",
+    async (phase, mutedProject, notifies) => {
+      let resolvePreview: (text: string) => void = () => {};
+      fetchPreviewMock.mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      );
+      const filed = (status: Conversation["status"], projectId: string) => ({
+        ...conv("a", status),
+        project_id: projectId,
+      });
+      setConversations([filed("running", "p_old")]);
+      const { rerender } = renderHook(() => useIdleNotifications());
+      const finished = [filed("idle", "p_old")];
+      serverRowsOverride.rows = finished;
+      setConversations(finished);
+      rerender();
+
+      const moveThenMute = () => {
+        // An idle session's move is a plain row update: no new transition re-arms the cue.
+        const moved = [filed("idle", "p_new")];
+        serverRowsOverride.rows = moved;
+        setConversations(moved);
+        rerender();
+        act(() => setMutedProjects([{ id: mutedProject, name: mutedProject, muted: true }], null));
+      };
+      if (phase === "its cue settles") moveThenMute();
+      await settle();
+      if (phase === "its preview loads") {
+        expect(fetchPreviewMock).toHaveBeenCalledWith("a");
+        moveThenMute();
+      }
+      await act(async () => {
+        resolvePreview("Finished the worker task.");
+        await Promise.resolve();
+      });
+
+      if (notifies) expect(showMock).toHaveBeenCalledOnce();
+      else expect(showMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["its cue settles", "its preview loads"] as const)(
+    "delivers when the project is unmuted again while %s, even after a poll saw it muted",
+    async (phase) => {
+      let resolvePreview: (text: string) => void = () => {};
+      fetchPreviewMock.mockReturnValue(
+        new Promise<string>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      );
+      const filed = (status: Conversation["status"], updatedAt = 0) => ({
+        ...conv("a", status),
+        project_id: "p",
+        updated_at: updatedAt,
+      });
+      setConversations([filed("running")]);
+      const { rerender } = renderHook(() => useIdleNotifications());
+      const finished = [filed("idle")];
+      serverRowsOverride.rows = finished;
+      setConversations(finished);
+      rerender();
+
+      const muteThenPollThenUnmute = () => {
+        act(() => setMutedProjects([{ id: "p", name: "Factory", muted: true }], null));
+        // A poll lands while the project is muted: a changed row, but no new transition.
+        const polled = [filed("idle", 1)];
+        serverRowsOverride.rows = polled;
+        setConversations(polled);
+        rerender();
+        act(() => setMutedProjects([{ id: "p", name: "Factory", muted: false }], null));
+      };
+      if (phase === "its cue settles") muteThenPollThenUnmute();
+      await settle();
+      if (phase === "its preview loads") {
+        expect(fetchPreviewMock).toHaveBeenCalledWith("a");
+        muteThenPollThenUnmute();
+      }
+      await act(async () => {
+        resolvePreview("Finished the worker task.");
+        await Promise.resolve();
+      });
+
+      expect(showMock).toHaveBeenCalledOnce();
+    },
+  );
+
   it("cancels the deferred cue when the agent resumes (a step, not the end)", async () => {
     setConversations([conv("a", "running")]);
     const { rerender } = renderHook(() => useIdleNotifications());
@@ -299,6 +482,21 @@ describe("useIdleNotifications elicitation transitions", () => {
       body: "Agent is asking for your input.",
       tag: "omnigent:session:a",
     });
+  });
+
+  it("does not announce a prompt as new when its answer in flight is rolled back", () => {
+    // The server keeps counting the prompt while the sidebar subtracts the answer.
+    serverRowsOverride.rows = [conv("a", "running", 1)];
+    setConversations([conv("a", "running", 1)]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([conv("a", "running", 0)]);
+    rerender();
+
+    // The POST failed or the hold expired, so the prompt shows again.
+    setConversations([conv("a", "running", 1)]);
+    rerender();
+
+    expect(showMock).not.toHaveBeenCalled();
   });
 
   it("does not notify on a fresh load with already-pending elicitations", () => {
@@ -555,6 +753,26 @@ describe("useIdleNotifications badge (native shell)", () => {
     setConversations([{ ...conv("a", "idle"), updated_at: 100 }]);
     rerender();
     // The turn ended -> the session is now unseen -> badge 1.
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
+  });
+
+  it("recounts when only a project mute changes, with no row update", () => {
+    // Stable rows, as the real list serves them between polls.
+    const rows = [{ ...unseenConv("a"), project_id: "p" }];
+    serverRowsOverride.rows = rows;
+    setConversations(rows);
+    renderHook(() => useIdleNotifications());
+    expect(setBadgeMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ navigatePath: "/c/a" }),
+    );
+
+    act(() => setMutedProjects([{ id: "p", name: "Factory", muted: true }], null));
+    expect(setBadgeMock).toHaveBeenLastCalledWith(0);
+    act(() => setMutedProjects([{ id: "p", name: "Factory", muted: false }], null));
     expect(setBadgeMock).toHaveBeenLastCalledWith(
       1,
       expect.objectContaining({ navigatePath: "/c/a" }),

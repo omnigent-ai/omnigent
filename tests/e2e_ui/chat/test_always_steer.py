@@ -1,4 +1,4 @@
-"""E2E: Settings → General "Always steer" dispatches busy follow-ups now."""
+"""E2E: Settings → General "Always steer" (on by default) dispatches busy follow-ups now."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ _STORAGE_KEY = "omnigent:always-steer"
 _COMPOSER_LABEL = "Message the agent"
 _INITIAL_DIRECT = "always-steer initial direct turn"
 _DIRECT_FOLLOWUP = "always-steer direct busy follow-up"
+_SHORTCUT_QUEUED = "always-steer follow-up queued with Mod+Enter"
 _INITIAL_ORDERING = "always-steer initial ordering turn"
 _EARLIER_QUEUED = "always-steer earlier queued follow-up"
 _LATER_QUEUED = "always-steer later queued follow-up"
@@ -31,7 +32,7 @@ def _wait_for(page: Page, predicate: Callable[[], bool], *, timeout_s: float = 3
 
 def _open_general_settings(page: Page, base_url: str, *, from_chat: bool = False) -> Locator:
     if from_chat:
-        page.get_by_test_id("settings-button").click()
+        page.get_by_test_id("sidebar-profile-settings").click()
     else:
         page.goto(f"{base_url}/settings/appearance")
     general_link = page.get_by_test_id("settings-nav-general")
@@ -93,24 +94,16 @@ def _items_contain(base_url: str, session_id: str, *texts: str) -> bool:
     return all(text in payload for text in texts)
 
 
-def test_always_steer_persists_and_posts_a_busy_followup(
+def test_always_steer_defaults_on_and_an_opt_out_persists(
     page: Page,
     paused_mid_turn_session: tuple[str, str, str],
 ) -> None:
-    """A reloaded opt-in sends through the real server while the turn is gated."""
+    """With nothing stored, a busy follow-up sends now and Mod+Enter queues; opting out sticks."""
     base_url, session_id, mock_url = paused_mid_turn_session
 
     toggle = _open_general_settings(page, base_url)
-    expect(toggle).to_have_attribute("aria-checked", "false")
-    assert page.evaluate(f"localStorage.getItem('{_STORAGE_KEY}')") is None
-
-    toggle.click()
     expect(toggle).to_have_attribute("aria-checked", "true")
-    assert page.evaluate(f"localStorage.getItem('{_STORAGE_KEY}')") == "true"
-
-    page.reload()
-    toggle = page.get_by_test_id("always-steer-toggle")
-    expect(toggle).to_have_attribute("aria-checked", "true", timeout=30_000)
+    assert page.evaluate(f"localStorage.getItem('{_STORAGE_KEY}')") is None
 
     posts = _record_message_posts(page, session_id)
     page.goto(f"{base_url}/c/{session_id}")
@@ -121,27 +114,51 @@ def test_always_steer_persists_and_posts_a_busy_followup(
 
     _send(page, _DIRECT_FOLLOWUP)
     _wait_for(page, lambda: posts == [_INITIAL_DIRECT, _DIRECT_FOLLOWUP])
-    expect(page.get_by_test_id("composer-queued-strip")).to_have_count(0)
+    queue = page.get_by_test_id("composer-queued-strip")
+    expect(queue).to_have_count(0)
+
+    composer = page.get_by_label(_COMPOSER_LABEL)
+    composer.fill(_SHORTCUT_QUEUED)
+    composer.press("ControlOrMeta+Enter")
+    # A queued message is held client-side, so it never reaches the server mid-turn.
+    expect(queue).to_contain_text(_SHORTCUT_QUEUED)
+    assert posts == [_INITIAL_DIRECT, _DIRECT_FOLLOWUP]
 
     _release_gate(mock_url)
     _wait_for(
         page,
-        lambda: _items_contain(base_url, session_id, _INITIAL_DIRECT, _DIRECT_FOLLOWUP),
+        lambda: posts == [_INITIAL_DIRECT, _DIRECT_FOLLOWUP, _SHORTCUT_QUEUED],
+        timeout_s=90.0,
+    )
+    _wait_for(
+        page,
+        lambda: _items_contain(
+            base_url, session_id, _INITIAL_DIRECT, _DIRECT_FOLLOWUP, _SHORTCUT_QUEUED
+        ),
         timeout_s=60.0,
     )
+    expect(queue).to_have_count(0)
 
     page.reload()
     expect(page.get_by_text(_DIRECT_FOLLOWUP, exact=True)).to_be_visible(timeout=30_000)
     toggle = _open_general_settings(page, base_url, from_chat=True)
-    expect(toggle).to_have_attribute("aria-checked", "true")
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "false")
+    assert page.evaluate(f"localStorage.getItem('{_STORAGE_KEY}')") == "false"
+
+    page.reload()
+    toggle = page.get_by_test_id("always-steer-toggle")
+    expect(toggle).to_have_attribute("aria-checked", "false", timeout=30_000)
 
 
 def test_existing_queue_still_drains_in_order_after_enabling_always_steer(
     page: Page,
     paused_mid_turn_session: tuple[str, str, str],
 ) -> None:
-    """A queued message keeps later sends behind it even after the opt-in."""
+    """A queued message keeps later sends behind it even after turning steering on."""
     base_url, session_id, mock_url = paused_mid_turn_session
+    # Only the first load runs this; the Settings round-trip below is client-side.
+    page.add_init_script(f"localStorage.setItem('{_STORAGE_KEY}', 'false')")
     posts = _record_message_posts(page, session_id)
 
     page.goto(f"{base_url}/c/{session_id}")

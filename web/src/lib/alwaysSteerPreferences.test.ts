@@ -1,5 +1,11 @@
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_ALWAYS_STEER, readAlwaysSteer, writeAlwaysSteer } from "./alwaysSteerPreferences";
+import {
+  DEFAULT_ALWAYS_STEER,
+  readAlwaysSteer,
+  useAlwaysSteer,
+  writeAlwaysSteer,
+} from "./alwaysSteerPreferences";
 
 afterEach(() => {
   localStorage.clear();
@@ -7,11 +13,11 @@ afterEach(() => {
 });
 
 describe("alwaysSteerPreferences", () => {
-  it("defaults to off (queue mid-turn follow-ups) when nothing is stored", () => {
-    // Opt-in: with no stored preference a busy-session follow-up still parks in
-    // the queue strip, so read must report the feature off.
-    expect(DEFAULT_ALWAYS_STEER).toBe(false);
-    expect(readAlwaysSteer()).toBe(false);
+  it("defaults to on (steer mid-turn follow-ups) when nothing is stored", () => {
+    // With no stored preference a busy-session follow-up is sent immediately
+    // instead of parking in the queue strip.
+    expect(DEFAULT_ALWAYS_STEER).toBe(true);
+    expect(readAlwaysSteer()).toBe(true);
   });
 
   it("round-trips both boolean values", () => {
@@ -22,17 +28,17 @@ describe("alwaysSteerPreferences", () => {
     expect(readAlwaysSteer()).toBe(false);
   });
 
-  it('treats any non-"true" stored value as off (defensive against hand edits)', () => {
-    // Only the exact string "true" enables always-steer; garbage or a stale
-    // format reads as off rather than silently changing dispatch behavior.
+  it("falls back to the default for a malformed stored value", () => {
+    // Only the exact strings "true" and "false" are honored; garbage or a stale
+    // format reads as the default.
     localStorage.setItem("omnigent:always-steer", "1");
-    expect(readAlwaysSteer()).toBe(false);
+    expect(readAlwaysSteer()).toBe(DEFAULT_ALWAYS_STEER);
 
-    localStorage.setItem("omnigent:always-steer", "yes");
-    expect(readAlwaysSteer()).toBe(false);
+    localStorage.setItem("omnigent:always-steer", "no");
+    expect(readAlwaysSteer()).toBe(DEFAULT_ALWAYS_STEER);
 
-    localStorage.setItem("omnigent:always-steer", "true");
-    expect(readAlwaysSteer()).toBe(true);
+    localStorage.setItem("omnigent:always-steer", "false");
+    expect(readAlwaysSteer()).toBe(false);
   });
 
   it("never throws when storage is inaccessible", () => {
@@ -45,7 +51,22 @@ describe("alwaysSteerPreferences", () => {
     vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("access denied");
     });
-    expect(() => writeAlwaysSteer(true)).not.toThrow();
-    expect(readAlwaysSteer()).toBe(false);
+    expect(() => writeAlwaysSteer(false)).not.toThrow();
+    expect(readAlwaysSteer()).toBe(DEFAULT_ALWAYS_STEER);
+  });
+
+  it("updates a mounted reader on a write here and on a change from another window", () => {
+    const { result } = renderHook(() => useAlwaysSteer());
+    expect(result.current).toBe(true);
+    act(() => writeAlwaysSteer(false));
+    expect(result.current).toBe(false);
+    // Another window's write reaches this one only as a storage event.
+    act(() => {
+      localStorage.setItem("omnigent:always-steer", "true");
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: "omnigent:always-steer", storageArea: localStorage }),
+      );
+    });
+    expect(result.current).toBe(true);
   });
 });

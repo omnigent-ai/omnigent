@@ -62,6 +62,9 @@ async def _assert_failure_on_both_streams(
         assert event.source == source
         assert event.response.status == "failed"
         assert failed[0]["response"]["error"] == failed[0]["error"]
+        for key in ("pending_id", "delivery_attempt_id"):
+            if key in message_fields:
+                assert failed[0][key] == message_fields[key]
         failures.append(failed[0])
     assert failures[0] == failures[1]
     return failures[0]["error"]
@@ -81,37 +84,26 @@ async def test_harness_rejection_has_a_valid_queued_failure(status_code: int) ->
         process_manager=_FakeProcessManager(RejectedHarnessClient([])),  # type: ignore[arg-type]
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    error = await _assert_failure_on_both_streams(app, source="harness")
+    error = await _assert_failure_on_both_streams(
+        app,
+        source="harness",
+        pending_id="pending_" + "a" * 32,
+        delivery_attempt_id="b" * 32,
+    )
     assert error["status"] == status_code
     assert error["code"] == "runner_error"
     assert error["message"] == f"turn failed (status {status_code})"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("eager", [True, False], ids=["eager", "lazy"])
-async def test_spec_resolution_error_has_a_valid_queued_failure(eager: bool) -> None:
+async def test_spec_resolution_error_has_a_valid_queued_failure() -> None:
     async def fail_resolution(agent_id: str, session_id: str | None = None) -> AgentSpec:
         raise RuntimeError("synthetic spec resolution failure")
 
-    harness = _ScriptedHarnessClient(
-        [
-            _sse({"type": "response.created", "response": {"id": "resp_test"}}),
-            _sse(
-                {
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "function_call",
-                        "status": "action_required",
-                        "name": "sys_os_read",
-                        "call_id": "call_test",
-                        "arguments": "{}",
-                    },
-                }
-            ),
-        ]
-    )
+    harness = _ScriptedHarnessClient([])
+    manager = _FakeProcessManager(harness)
     app = create_runner_app(
-        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        process_manager=manager,  # type: ignore[arg-type]
         spec_resolver=fail_resolution,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
@@ -119,14 +111,18 @@ async def test_spec_resolution_error_has_a_valid_queued_failure(eager: bool) -> 
         app,
         source="execution",
         agent_id="22222222222222222222222222222222",
-        has_mcp_servers=eager,
+        has_mcp_servers=True,
+        pending_id="pending_" + "a" * 32,
+        delivery_attempt_id="b" * 32,
     )
     assert error == {
         "code": "RuntimeError",
         "message": "Failed to resolve the agent spec for this turn.",
         "type": "RuntimeError",
-        **({"undelivered": True} if eager else {}),
+        "undelivered": True,
     }
+    assert not manager.get_client_calls
+    assert not harness.posted_bodies
 
 
 @pytest.mark.asyncio

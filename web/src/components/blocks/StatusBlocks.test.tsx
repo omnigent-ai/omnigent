@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -8,7 +9,10 @@ import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
-vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionSignInLink: vi.fn(),
+}));
 
 afterEach(cleanup);
 
@@ -282,6 +286,18 @@ describe("ErrorBanner", () => {
     [
       "client_update_required",
       "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+    ],
+    [
+      "codex_provider_auth_failed",
+      "Codex couldn't get a token from the model provider's sign-in command on the host.",
+    ],
+    [
+      "content_policy_refusal",
+      "The model's safeguards refused this message. Start a new session and rephrase it without the flagged content.",
+    ],
+    [
+      "harness_not_configured",
+      "The harness isn't set up on the host, so this session can't start.",
     ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
@@ -614,16 +630,13 @@ describe("ErrorBanner", () => {
     expect(screen.getByRole("button", { name: "View diagnostics" })).toBeInTheDocument();
   });
 
-  it("does not invent retry for non-retryable variants", () => {
-    render(
-      <ErrorBanner
-        message="The conversation is too long."
-        source="llm"
-        code="context_length_exceeded"
-        onRetry={vi.fn()}
-      />,
-    );
+  it.each([
+    { code: "context_length_exceeded", message: "The conversation is too long." },
+    { code: "content_policy_refusal", message: "The model's safeguards blocked this message." },
+  ])("does not invent retry for the $code variant", ({ code, message }) => {
+    render(<ErrorBanner message={message} source="llm" code={code} onRetry={vi.fn()} />);
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
   });
 
   it("keeps causally related error messages in order inside one expanded banner", () => {
@@ -679,6 +692,16 @@ describe("ErrorBanner", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
     await waitFor(() => expect(onRetry).toHaveBeenCalledWith(relatedDisconnect));
+  });
+
+  it("shows the final automatic resume guidance without a manual resume action", () => {
+    const message = "Automatic resume failed. Please send a new message to continue.";
+    render(
+      <ErrorBanner message={message} source="" code="session_recovery_failed" onRetry={vi.fn()} />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(message);
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
   it("retries classified rate-limit errors and preserves the provider's details", async () => {
@@ -752,6 +775,22 @@ describe("ErrorBanner", () => {
       expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     },
   );
+
+  it("headlines an output-limit failure as the model's cap, without retry", () => {
+    render(
+      <ErrorBanner
+        message="Output limit reached — the response exceeded the model’s maximum output length and was cut off."
+        source="execution"
+        code="output_limit_exceeded"
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model's response hit its maximum output length and was cut off.",
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+  });
 
   it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(
     "does not offer reconnect for live-runner code %s",
@@ -1394,5 +1433,28 @@ describe("ErrorBanner — info level", () => {
     render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
     expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
     expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
+  });
+});
+
+describe("ErrorBanner sign-in notice", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reloads the page from its Reload page action", () => {
+    const reload = vi.fn();
+    vi.stubGlobal("location", { reload });
+    render(
+      <ErrorBanner
+        message="Reload the page to sign in again."
+        source=""
+        code="sign_in_expired"
+        title="Your sign-in expired"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reload page" }));
+
+    expect(reload).toHaveBeenCalledOnce();
   });
 });

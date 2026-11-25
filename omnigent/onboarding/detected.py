@@ -23,6 +23,7 @@ Two surfaces:
 from __future__ import annotations
 
 import logging
+import os
 
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
@@ -39,6 +40,7 @@ from omnigent.onboarding.provider_config import (
     LOCAL_KIND,
     OPENAI_FAMILY,
     SUBSCRIPTION_KIND,
+    ProviderEntry,
     get_default_provider,
     load_providers,
     provider_families,
@@ -367,6 +369,37 @@ def effective_config_with_detected(
                 break
 
     return {**config, "providers": merged}
+
+
+def resolve_named_provider(name: str, explicit_config: dict[str, object]) -> ProviderEntry | None:
+    """Return the provider an ``executor.auth: {type: provider}`` names.
+
+    Explicit config wins, then ambient detections, then the local config
+    when the managed-sandbox overlay replaced the providers block. Launch
+    (``omnigent.runtime.workflow``) and the cost paths share this, so a
+    session is priced by the entry it was launched with. Detection runs only
+    when the name is not explicitly configured, which keeps the per-usage
+    pricing lookup free of ambient probes for ordinary named providers.
+
+    :param name: The provider name from ``executor.auth.name``, e.g.
+        ``"expensive-named"``.
+    :param explicit_config: The runtime-overlaid config mapping, i.e.
+        :func:`~omnigent.inference_config.load_runtime_inference_config`
+        output, so the lookup matches the launch resolver.
+    :returns: The named :class:`ProviderEntry`, or ``None`` when no explicit
+        or detected provider has that name.
+    """
+    entry = load_providers(explicit_config).get(name)
+    if entry is not None:
+        return entry
+    entry = load_providers(effective_config_with_detected(explicit_config)).get(name)
+    if entry is None and os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+        # The managed-sandbox overlay replaces the local providers block, so an
+        # explicitly named provider from ~/.omnigent/config.yaml would vanish.
+        from omnigent.onboarding.provider_config import _load_config
+
+        entry = load_providers(effective_config_with_detected(_load_config())).get(name)
+    return entry
 
 
 def providers_to_adopt(

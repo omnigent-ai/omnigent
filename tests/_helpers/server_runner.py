@@ -13,6 +13,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.host.identity_env import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.compat import (
@@ -42,6 +43,7 @@ class ServerRunner:
         binding_token: str,
         health_timeout: float,
         poll_interval: float,
+        server_args: Sequence[str] = (),
     ) -> None:
         self.root = root
         self.workspace = workspace if workspace is not None else root / "workspace"
@@ -54,12 +56,14 @@ class ServerRunner:
         self.database_uri = database_uri or f"sqlite:///{root / 'chat.db'}"
         self.artifact_location = artifact_location or root / "artifacts"
         self.runner_id = token_bound_runner_id(binding_token)
+        self.host_id = secrets.token_hex(16)
         self._token = binding_token
         self._resources = resources
         self._client = resources.enter_context(httpx.Client(trust_env=False))
         self._health_timeout = health_timeout
         self._poll_interval = poll_interval
         self._server_bootstrap = server_bootstrap
+        self._server_args = list(server_args)
         self._server_env = dict(server_env)
         self._base_env = dict(base_env) if base_env is not None else None
         self._server_cwd = server_cwd
@@ -113,12 +117,13 @@ class ServerRunner:
                 continue
         return "\n".join(tails)
 
-    def _wait_ready(self, *, runner: bool = False) -> None:
-        url = (
-            f"{self.base_url}/v1/runners/{self.runner_id}/status"
-            if runner
-            else f"{self.base_url}/health"
-        )
+    def _wait_ready(self, *, runner: bool = False, host: bool = False) -> None:
+        if host:
+            url = f"{self.base_url}/v1/hosts"
+        elif runner:
+            url = f"{self.base_url}/v1/runners/{self.runner_id}/status"
+        else:
+            url = f"{self.base_url}/health"
         deadline = time.monotonic() + self._health_timeout
         last = "not polled"
         while time.monotonic() < deadline:
@@ -129,16 +134,41 @@ class ServerRunner:
                 )
             try:
                 if runner:
-                    self._client.get(f"{self.base_url}/health", timeout=2.0).raise_for_status()
-                response = self._client.get(url, timeout=2.0)
-                if response.status_code == 200 and (
-                    not runner or response.json().get("online") is True
-                ):
-                    return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._client.get(
+                        f"{self.base_url}/health", timeout=min(2.0, remaining)
+                    ).raise_for_status()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                response = self._client.get(url, timeout=min(2.0, remaining))
                 last = f"HTTP {response.status_code}: {response.text[:300]}"
+                if time.monotonic() >= deadline:
+                    break
+                if response.status_code == 200:
+                    if host:
+                        # A persisted online row can precede tunnel registration.
+                        for row in response.json().get("hosts", []):
+                            if row.get("status") != "online" or row.get("host_id") != self.host_id:
+                                continue
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            rpc = self._client.get(
+                                f"{self.base_url}/v1/hosts/{row['host_id']}/filesystem",
+                                params={"limit": 1},
+                                timeout=min(2.0, remaining),
+                            )
+                            if rpc.status_code == 200 and time.monotonic() < deadline:
+                                return
+                            last = f"Host RPC HTTP {rpc.status_code}: {rpc.text[:300]}"
+                    elif not runner or response.json().get("online") is True:
+                        return
             except (httpx.HTTPError, ValueError) as exc:
                 last = f"{type(exc).__name__}: {exc}"
-            time.sleep(self._poll_interval)
+            time.sleep(min(self._poll_interval, max(0.0, deadline - time.monotonic())))
         raise AssertionError(f"{url} never became ready: {last}\n{self.log_tail()}")
 
     def start_server(self, *, wait_ready: bool = True) -> None:
@@ -158,6 +188,7 @@ class ServerRunner:
                 self.database_uri,
                 "--artifact-location",
                 str(self.artifact_location),
+                *self._server_args,
             ],
             self.server_home,
             {"OMNIGENT_RUNNER_TUNNEL_TOKEN": self._token, **self._server_env},
@@ -166,9 +197,11 @@ class ServerRunner:
         if wait_ready:
             self._wait_ready()
 
-    def restart_server(self) -> None:
+    def restart_server(self, *, env: Mapping[str, str | None] | None = None) -> None:
         """Clear in-memory server state and await the existing runner's reconnect."""
         terminate_process(self.server)
+        if env is not None:
+            self._server_env.update(env)
         self.start_server()
         if self.runner is not None:
             self._wait_ready(runner=True)
@@ -179,15 +212,22 @@ class ServerRunner:
         env: Mapping[str, str | None] | None = None,
         cwd: Path | None = None,
     ) -> None:
-        """Start a host daemon that launches runners through the server's host API."""
+        """Start this stack's host and wait until its tunnel answers an RPC."""
         assert self.host is None, "host already started"
+        if env is not None and {HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR} & env.keys():
+            raise ValueError("Host identity is owned by the isolated stack")
         self.host = self._spawn(
             "host",
             ["-m", "omnigent.host._daemon_entry", "--server", self.base_url],
             self.runner_home,
-            env or {},
+            {
+                **(env or {}),
+                HOST_ID_ENV_VAR: self.host_id,
+                HOST_NAME_ENV_VAR: f"server-runner-{self.host_id[:8]}",
+            },
             cwd=cwd,
         )
+        self._wait_ready(host=True)
 
     def start_runner(
         self,
@@ -239,11 +279,13 @@ def server_runner(
     health_timeout: float = 120.0,
     poll_interval: float = 1.0,
     wait_ready: bool = True,
+    server_args: Sequence[str] = (),
 ) -> Iterator[ServerRunner]:
     """Yield a ready server; explicitly call start_runner with scenario overrides.
 
     A supplied base_env replaces ambient inheritance for both processes.
-    Environment overrides set values; None removes a variable.
+    Environment overrides set values; None removes a variable. ``server_args``
+    are appended to the server CLI (for example ``--config path``).
     Set wait_ready=False to start both processes before waiting for the runner.
     Cleanup applies even when readiness fails. Detached Omnigent descendants
     are attributed only to this stack's directories, never the whole machine.
@@ -262,6 +304,7 @@ def server_runner(
             binding_token=binding_token or secrets.token_urlsafe(32),
             health_timeout=health_timeout,
             poll_interval=poll_interval,
+            server_args=server_args,
         )
         # Register before process callbacks so direct children terminate first.
         for scope in (root, stack.runner_home / ".omnigent", stack.server_home / ".omnigent"):

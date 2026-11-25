@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCategory
+from omnigent.llms.errors import REQUEST_SIZE_OVERFLOW_GUIDANCE
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -13,7 +14,10 @@ from omnigent.runner.launch_failure import (
     diagnose_client_update_required,
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
+    diagnose_codex_provider_auth_failure,
+    diagnose_content_policy_refusal,
     diagnose_model_unavailable,
+    turn_error_display_message,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -31,6 +35,27 @@ _CLIENT_UPDATE_OUTPUT = (
     "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
     'desktop app, then try again."}'
 )
+
+# Claude Code's turn error when the model's safeguards refuse a request: two 2.1.283
+# wordings, then the wording older releases print.
+_CONTENT_POLICY_REFUSAL_OUTPUTS = (
+    "API Error: Sonnet 4 can't help with this. Start a new session to continue.\n\n"
+    "Send feedback with /feedback or learn more: https://www.anthropic.com/legal/aup\n\n"
+    "Message ID: msg_43124cd62101",
+    "API Error: Claude Opus 4.7's safeguards flagged this message "
+    "(https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal "
+    "conversations. Claude Code can't respond to this message with Claude Opus 4.7.",
+    "Claude Code is unable to respond to this request, which appears to violate our Usage "
+    "Policy. Please double press esc to edit your last message or start a new session.",
+)
+# Codex's turn error when a custom model provider's token command fails its refresh.
+_PROVIDER_AUTH_OUTPUT = (
+    "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+    "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
+    "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools access "
+    "token. Run `isaac` to log in and try again."
+)
+_CODEX_LOGIN_HINT = "\n\nIf this looks like an auth issue, running `codex login` may help."
 
 
 def test_classifies_root_permission_failure() -> None:
@@ -78,6 +103,39 @@ def test_classifies_rejected_arguments(command: str, exit_status: int, output: s
     assert diagnosis.category is ErrorCategory.CONFIG
 
 
+@pytest.mark.parametrize("exit_status", [0, 1, None])
+def test_classifies_background_session_refusal_even_when_wrapper_exits_zero(
+    exit_status: int | None,
+) -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=exit_status,
+        output=(
+            "That session is running in the\nbackground (abcd1234). "
+            "Run `claude attach abcd1234` to open it, or `claude stop abcd1234` "
+            "first to resume it here.\nAdd --fork-session to branch off a copy instead.\n"
+            "Claude Code exited with code 1\nPane is dead (status 0)"
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude session is already running in the background"
+    assert diagnosis.remediation is not None
+    assert "claude attach <session-id>" in diagnosis.remediation
+    assert "claude stop <session-id>" in diagnosis.remediation
+    assert "abcd1234" not in str(diagnosis)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Background task running; use claude attach or claude stop to manage sessions.",
+        "That session is running in the background; waiting for tool results.",
+    ],
+)
+def test_background_work_alone_does_not_diagnose_a_resume_refusal(output: str) -> None:
+    assert classify_terminal_failure(command="claude", exit_status=None, output=output) is None
+
+
 @pytest.mark.parametrize(
     "output",
     [
@@ -107,6 +165,76 @@ def test_classifies_missing_binary_by_output() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Agent command not found"
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        # npm's ENOENT text from a launcher's failed install also says "no such file".
+        (
+            0,
+            "npm error code ENOENT\n"
+            "npm error syscall rename\n"
+            "npm error enoent ENOENT: no such file or directory, rename "
+            "'/home/dev/.local/lib/node_modules/@anthropic-ai/claude-code'\n"
+            "Failed to install Claude Code version 2.1.400.\n"
+            "Claude Code exited with code 127",
+        ),
+        (1, "Error: claude native binary not installed.\nClaude Code exited with code 1"),
+        # Pane wrapping and borders can split the marker mid-word.
+        (
+            0,
+            "│ An error occurred while running Claude Code: [Errno 8] Exec form │\n"
+            "│ at error: '/home/dev/.local/bin/claude'                          │",
+        ),
+    ],
+)
+def test_classifies_broken_claude_install(exit_status: int, output: str) -> None:
+    diagnosis = classify_terminal_failure(command="env", exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code's install is broken"
+    assert diagnosis.remediation is not None
+    assert "reinstall Claude Code" in diagnosis.remediation
+
+
+def test_exec_format_error_of_another_program_is_not_a_broken_claude_install() -> None:
+    # The launcher's exit box names Claude Code right after the other program's path.
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=1,
+        output=(
+            "OSError: [Errno 8] Exec format error: '/home/dev/bin/helper'\n"
+            "│ Claude Code exited with code 1 │"
+        ),
+    )
+    assert diagnosis is None
+
+
+def test_classifies_gateway_claude_version_failure() -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=0,
+        output=(
+            "! ug requires Claude Code 2.1.290 or newer. Your current version is Claude "
+            "Code 2.1.185.\nERROR ug requires Claude Code 2.1.290 or newer."
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code is too old for the Databricks gateway"
+    assert diagnosis.remediation is not None
+
+
+def test_gateway_claude_version_remediation_uses_existing_installation_method() -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=0,
+        output="ERROR ug requires Claude Code 2.1.290 or newer. Your current version is 2.1.185.",
+    )
+    assert diagnosis is not None
+    assert diagnosis.remediation is not None
+    assert "Update Claude Code" in diagnosis.remediation
+    assert "same installer or package manager you used to install it" in diagnosis.remediation
+    assert "brew upgrade claude-code" not in diagnosis.remediation
 
 
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
@@ -181,6 +309,12 @@ def test_classifies_native_429_and_rate_limit_errors(code: str, message: str) ->
     "message",
     [
         "An unexpected error occurred",
+        "provider auth command `helper` timed out after 20000 ms",
+        "Authentication request timed out",
+        "Tool request timed out",
+        "Fatal error: application network permission was revoked",
+        "Fatal error: application network policy is unavailable",
+        "HTTP 401: currently experiencing high demand, which may cause temporary errors",
         "API Error: Request rejected (401) · UNAUTHENTICATED",
         "API Error: Request rejected (403) · PERMISSION_DENIED",
         (
@@ -238,6 +372,41 @@ def test_content_length_text_does_not_override_specific_failure_codes(code: str)
     assert classify_native_turn_error(code, _CONTENT_LENGTH_REJECTION) == code
 
 
+_REQUEST_SIZE_LIMIT_REJECTION = (
+    '{"error_code":"BAD_REQUEST","message":"The request size exceeds the maximum '
+    'allowed limit of 33554432 bytes. Please reduce the request size and try again."}'
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+def test_classifies_request_size_limit_wording_as_context_overflow(code: str) -> None:
+    assert classify_native_turn_error(code, _REQUEST_SIZE_LIMIT_REJECTION) == (
+        "context_length_exceeded"
+    )
+
+
+def test_request_size_rejection_displays_the_remedy_not_the_raw_body() -> None:
+    assert (
+        turn_error_display_message("context_length_exceeded", _REQUEST_SIZE_LIMIT_REJECTION)
+        == REQUEST_SIZE_OVERFLOW_GUIDANCE
+    )
+    assert "Compact the conversation" in REQUEST_SIZE_OVERFLOW_GUIDANCE
+    assert "start a new session" in REQUEST_SIZE_OVERFLOW_GUIDANCE
+
+
+def test_other_turn_error_text_is_displayed_unchanged() -> None:
+    message = "Codex ran into a model rejection."
+    assert turn_error_display_message("codex_turn_error", message) == message
+
+
+def test_sized_request_size_rejection_keeps_its_text() -> None:
+    sized = (
+        "exceeds maximum allowed content length. RequestSize(bytes): 33967957, "
+        "Limit(bytes): 33554432"
+    )
+    assert turn_error_display_message("context_length_exceeded", sized) == sized
+
+
 @pytest.mark.parametrize(
     "code",
     # Budget detection runs before the early-return guard, so it applies to
@@ -264,6 +433,8 @@ def test_content_length_text_does_not_override_specific_failure_codes(code: str)
         ),
         # Minimal form — just the key phrase.
         "Budget X has reached its limit of $0.",
+        # Claude Code's retry row, cut to an 80-column pane before the key phrase.
+        'API Error: 403 Budget "example-budget" (00000000-0000-…',
         # Disabled per-user rate limit (rate limit is set to 0).
         (
             'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED",'
@@ -275,6 +446,81 @@ def test_classifies_budget_exhausted(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "budget_exhausted"
 
 
+# Claude Code's constant for a response that ended with stop_reason "max_tokens".
+_RAW_OUTPUT_LIMIT_ERROR = (
+    "API Error: Claude's response exceeded the 32000 output token maximum. "
+    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
+    "environment variable."
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _RAW_OUTPUT_LIMIT_ERROR,
+        # The constant without its "API Error: " prefix, at a raised limit.
+        "Claude’s response exceeded the 64,000 output token maximum.",
+        # The forwarder's category-only fallback when the StopFailure hook
+        # carries no error_details.
+        "Claude Code ended the turn with an API error (max_output_tokens).",
+    ],
+)
+def test_classifies_output_limit_exceeded(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "output_limit_exceeded"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Mentions the cap without a response having exceeded it.
+        "The model supports a 32000 output token maximum.",
+        "Output tokens: 32000",
+        # A request-parameter complaint names the field, not a cut-off reply.
+        "API Error: 400 max_output_tokens must be at most 32000",
+        # An unrelated limit that happens to share the rewrite's opening words.
+        "Terminal output limit reached while capturing logs",
+        f'The terminal previously printed "{_RAW_OUTPUT_LIMIT_ERROR}".',
+        "The guide explains why the response exceeded the model's maximum output length.",
+        "```text\nClaude Code ended the turn with an API error (max_output_tokens).\n```",
+    ],
+)
+def test_output_limit_wording_alone_is_not_the_limit_error(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
+def test_output_limit_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _RAW_OUTPUT_LIMIT_ERROR) == code
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+def test_bridge_output_limit_guidance_is_classified(code: str) -> None:
+    """The classifier keys on the bridge's rewrite, so the two must move together."""
+    from omnigent.harnesses.claude_native.bridge import _OUTPUT_TOKEN_LIMIT_REPLACEMENT
+
+    assert classify_native_turn_error(code, _OUTPUT_TOKEN_LIMIT_REPLACEMENT) == (
+        "output_limit_exceeded"
+    )
+
+
+def test_forwarder_output_limit_fallback_is_classified() -> None:
+    """The forwarder's category-only StopFailure detail must stay classifiable."""
+    from omnigent.harnesses.claude_native import forwarder
+    from omnigent.harnesses.claude_native.bridge import ClaudeHookRecord
+
+    record = ClaudeHookRecord(
+        event_cursor=5,
+        byte_offset=100,
+        event_name="StopFailure",
+        failure_category="max_output_tokens",
+    )
+    detail = forwarder._stop_failure_detail(record, session_id="conv_test")
+
+    assert detail is not None
+    assert classify_native_turn_error("native_turn_error", detail) == "output_limit_exceeded"
+
+
 def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
     """A real auth failure under codex_reauth_required must not be reclassified."""
     message = (
@@ -284,6 +530,126 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
     assert classify_native_turn_error("codex_reauth_required", message) == "codex_reauth_required"
 
 
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("codex_turn_error", _PROVIDER_AUTH_OUTPUT),
+        ("codex_reauth_required", _PROVIDER_AUTH_OUTPUT + _CODEX_LOGIN_HINT),
+    ],
+)
+def test_classifies_codex_provider_auth_failure(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "codex_provider_auth_failed"
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "workspace_missing"])
+def test_provider_auth_text_does_not_override_other_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _PROVIDER_AUTH_OUTPUT) == code
+
+
+@pytest.mark.parametrize(
+    "message", [_PROVIDER_AUTH_OUTPUT, _PROVIDER_AUTH_OUTPUT + _CODEX_LOGIN_HINT]
+)
+def test_codex_provider_auth_diagnosis_names_the_command_to_sign_in(message: str) -> None:
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis == FailureDiagnosis(
+        title="Codex couldn't get a model provider token",
+        cause=(
+            "The model provider's token command `isaac` failed on the host: Error: Could not "
+            "get an AI DevTools access token. Run `isaac` to log in and try again."
+        ),
+        remediation="Run `isaac` on the host to sign in again, then send your message again.",
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "OSError: [Errno 28] No space left on device: '/tmp/token-helper-example'",
+        "OSError: [Errno 122] Disk quota exceeded: '/tmp/token-helper-example'",
+    ],
+)
+@pytest.mark.parametrize("hint", ["", _CODEX_LOGIN_HINT])
+def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, hint: str) -> None:
+    message = (
+        "provider auth command `isaac` exited with status exit status: 1: "
+        "Traceback (most recent call last):\n"
+        '  File "/opt/token-helper/bootstrap.py", line 10, in create_venv\n'
+        f"    tempfile.mkdtemp()\n{failure}{hint}"
+    )
+
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis == FailureDiagnosis(
+        title="Host storage is full",
+        cause=f"The model provider's token command `isaac` failed on the host: {failure}",
+        remediation=(
+            "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+            "then send your message again."
+        ),
+        category=ErrorCategory.HOST,
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "cause", "remediation"),
+    [
+        (
+            "provider auth command `sh` exited with status exit status: 1: Error: not logged in\n",
+            "The model provider's token command failed on the host: Error: not logged in",
+            "Sign in to the model provider again on the host, then send your message again.",
+        ),
+        (
+            "provider auth command `/opt/bin/isaac` failed to start: "
+            "No such file or directory (os error 2)",
+            "The model provider's token command `/opt/bin/isaac` couldn't be started on the "
+            "host: No such file or directory (os error 2)",
+            "Check that `/opt/bin/isaac` is installed and on PATH on the host, then send your "
+            "message again.",
+        ),
+        (
+            "provider auth command `isaac` timed out after 5000ms",
+            "The model provider's token command `isaac` timed out on the host.",
+            "Run `isaac` on the host to sign in again, then send your message again.",
+        ),
+        (
+            "provider auth command `isaac` produced an empty token",
+            "The model provider's token command `isaac` returned no usable token.",
+            "Run `isaac` on the host to sign in again, then send your message again.",
+        ),
+    ],
+)
+def test_codex_provider_auth_diagnosis_covers_each_codex_outcome(
+    message: str, cause: str, remediation: str
+) -> None:
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis is not None
+    assert (diagnosis.cause, diagnosis.remediation) == (cause, remediation)
+
+
+def test_codex_provider_auth_diagnosis_fits_its_labels() -> None:
+    message = (
+        f"provider auth command `{'isaac' * 40}` exited with status exit status: 1: "
+        f"Error: {'token refresh failed ' * 30}"
+    )
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis is not None
+    for field in (diagnosis.title, diagnosis.cause, diagnosis.remediation):
+        assert field is not None
+        assert len(field) <= 256
+    assert diagnosis.cause.endswith("…")
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["", "401 Unauthorized: your login has expired.", "auth command `isaac` exited"],
+)
+def test_codex_provider_auth_diagnosis_ignores_unrelated_errors(message: str) -> None:
+    assert diagnose_codex_provider_auth_failure(message) is None
+
+
 @pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
 @pytest.mark.parametrize(
     "message",
@@ -291,18 +657,24 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "API Error: Server error mid-response. The response above may be incomplete.",
         "Connection lost mid-response. The response above may be incomplete.",
         "connection lost mid-response",
+        "API Error: The response stopped arriving. The response above may be incomplete.",
+        "  api error: the response stopped arriving. the response above may be incomplete.  ",
         "API Error: 503 Service Unavailable",
         "HTTP 500 Internal Server Error",
         "HTTP/1.1 502 Bad Gateway",
         "status_code: 504 Gateway Timeout",
         "API Error: 529",
         "The model is overloaded. Please retry your request.",
+        "Selected model is at capacity. Please try a different model.",
         # The gateway's cancelled upstream call: Claude Code retries 503s, never 499.
         _GATEWAY_499_OUTPUT,
         "API Error: 499",
         "API Error: Request rejected (499) · CANCELLED",
         'unexpected status 499 Client Closed Request: {"error_code": "CANCELLED","message":""}',
         '{"error_code":"CANCELLED","message":""}',
+        "Request timed out",
+        " request timed out. ",
+        "We’re currently experiencing high demand, which may cause temporary errors.",
     ],
 )
 def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
@@ -325,6 +697,13 @@ def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
         "Request rejected (4990)",
         "API Error: 4991",
         'API Error: 400 {"error_code":"INVALID_PARAMETER_VALUE","message":"query cancelled"}',
+        "The response stopped arriving.",
+        "API Error: The response stopped arriving. Retry the tool.",
+        "Quoted: API Error: The response stopped arriving. The response above may be incomplete.",
+        "API Error: The response stopped arriving. The response above may be incomplete. "
+        "Cancelled.",
+        "API Error: 401 The response stopped arriving. The response above may be incomplete.",
+        "API Error: 403 The response stopped arriving. The response above may be incomplete.",
     ],
 )
 def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> None:
@@ -332,8 +711,28 @@ def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> Non
 
 
 @pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
-def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None:
+def test_transient_messages_do_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, _GATEWAY_499_OUTPUT) == code
+    assert classify_native_turn_error(code, "Request timed out") == code
+    assert (
+        classify_native_turn_error(
+            code,
+            "API Error: The response stopped arriving. The response above may be incomplete.",
+        )
+        == code
+    )
+    assert (
+        classify_native_turn_error(
+            code, "Selected model is at capacity. Please try a different model."
+        )
+        == code
+    )
+    assert (
+        classify_native_turn_error(
+            code, "We’re currently experiencing high demand, which may cause temporary errors."
+        )
+        == code
+    )
 
 
 @pytest.mark.parametrize(
@@ -387,8 +786,11 @@ def test_other_unsupported_model_errors_are_not_client_update(message: str) -> N
 
 
 @pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
-def test_client_update_text_does_not_override_specific_failure_codes(code: str) -> None:
-    assert classify_native_turn_error(code, _CLIENT_UPDATE_OUTPUT) == code
+@pytest.mark.parametrize("message", [_CLIENT_UPDATE_OUTPUT, _CONTENT_POLICY_REFUSAL_OUTPUTS[0]])
+def test_cli_refusal_text_does_not_override_specific_failure_codes(
+    code: str, message: str
+) -> None:
+    assert classify_native_turn_error(code, message) == code
 
 
 def test_client_update_diagnosis_names_both_versions_and_the_fix() -> None:
@@ -418,6 +820,46 @@ def test_client_update_diagnosis_without_installed_version_still_names_required(
 def test_client_update_diagnosis_ignores_unrelated_errors() -> None:
     assert diagnose_client_update_required(_GATEWAY_499_OUTPUT) is None
     assert diagnose_client_update_required("") is None
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize("message", _CONTENT_POLICY_REFUSAL_OUTPUTS)
+def test_classifies_content_policy_refusal(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "content_policy_refusal"
+    assert diagnose_content_policy_refusal(message) is not None
+
+
+def test_content_policy_refusal_diagnosis_explains_the_block_and_recovery() -> None:
+    diagnosis = diagnose_content_policy_refusal(_CONTENT_POLICY_REFUSAL_OUTPUTS[0])
+
+    assert diagnosis is not None
+    assert diagnosis.title == "The model's safeguards blocked this message"
+    assert "stays in this session's history" in diagnosis.cause
+    assert diagnosis.remediation is not None
+    assert "Start a new session" in diagnosis.remediation
+    assert diagnosis.category is ErrorCategory.UPSTREAM
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "I can't help with this request right now.",
+        "API Error: 400 Usage policy violation detected in tool schema",
+        "The reply said the prompt appears to violate our Usage Policy, so I rephrased it.",
+        "The terminal printed 'safeguards flagged this message' on an earlier turn.",
+        *(
+            f'The terminal previously printed "{message}".'
+            for message in _CONTENT_POLICY_REFUSAL_OUTPUTS
+        ),
+        *(f'"{message}"' for message in _CONTENT_POLICY_REFUSAL_OUTPUTS),
+        *(f"```text\n{message}\n```" for message in _CONTENT_POLICY_REFUSAL_OUTPUTS),
+        _GATEWAY_499_OUTPUT,
+        "",
+    ],
+)
+def test_other_errors_are_not_content_policy_refusals(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) != "content_policy_refusal"
+    assert diagnose_content_policy_refusal(message) is None
 
 
 @pytest.mark.parametrize(
@@ -614,11 +1056,15 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("rate_limit_exceeded", "You can retry this turn"),
         ("transient_upstream_error", "temporary error"),
         ("client_update_required", "too old for the selected model"),
+        ("content_policy_refusal", "safeguards refused this message"),
         ("budget_exhausted", "budget"),
+        ("output_limit_exceeded", "output length"),
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
         ("codex_compaction_model_failed", "previous model"),
+        ("codex_provider_auth_failed", "model provider's sign-in command"),
+        ("harness_not_configured", "isn't set up on the host"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
