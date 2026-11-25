@@ -24,6 +24,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
+    AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE,
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
     ApiRetry,
@@ -2334,10 +2335,12 @@ def _partition_subagent_batches(
 def _leaves_turn_open(item: ClaudeTranscriptItem, *, open_before: bool) -> bool:
     """Whether a child's turn is still open after this item.
 
-    Assistant text, a handback, and an interrupt end it; a tool result keeps
-    the state its call set.
+    Assistant text, a handback, and an interrupt end it; a tool result and a
+    hook-blocked message keep the state set before them.
     """
-    if item.item_type == "function_call_output":
+    if item.item_type == "function_call_output" or (
+        item.item_type == "error" and item.data.get("code") == AGENT_MESSAGE_BLOCKED_BY_HOOK_CODE
+    ):
         return open_before
     if item.item_type == "function_call":
         return item.data.get("name") != _SUBAGENT_HANDBACK_TOOL
