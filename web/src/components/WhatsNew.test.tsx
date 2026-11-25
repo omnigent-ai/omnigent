@@ -37,7 +37,7 @@ describe("WhatsNew", () => {
     expect(top.className).toMatch(/(^| )top-\[calc\(4\.25rem/);
     rerender(<WhatsNew entries={entries} phoneAtBottom />);
     const bottom = screen.getByTestId("whats-new");
-    expect(bottom.className).toMatch(/(^| )bottom-\[calc\(1rem/);
+    expect(bottom.className).toMatch(/(^| )bottom-\[calc\(6\.5rem/);
     expect(bottom.className).not.toMatch(/(^| )top-\[/);
     expect(bottom.className).toContain("md:bottom-[calc(4.5rem");
     expect(bottom.className).toContain("md:left-3");

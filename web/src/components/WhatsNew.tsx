@@ -74,13 +74,13 @@ export function WhatsNew({
       {badgeVisible && (
         <div
           role="status"
-          // Phones: a one-line pill under the header, or at the bottom over a project's
-          // toolbar row. Desktop: a card at the bottom-left, above the sidebar footer.
+          // Phones: a one-line pill under the header, or on project pages (toolbar under the
+          // header) above the chat composer. Desktop: a bottom-left card above the sidebar footer.
           data-testid="whats-new"
           className={cn(
             "fixed left-1/2 z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md md:top-auto md:bottom-[calc(4.5rem+var(--omnigent-safe-bottom,0px))] md:left-3 md:w-72 md:translate-x-0 md:items-start md:rounded-lg md:py-2 md:pl-3",
             phoneAtBottom
-              ? "bottom-[calc(1rem+var(--omnigent-safe-bottom,0px))]"
+              ? "bottom-[calc(6.5rem+var(--omnigent-safe-bottom,0px))]"
               : "top-[calc(4.25rem+var(--omnigent-safe-top,0px))]",
           )}
         >
