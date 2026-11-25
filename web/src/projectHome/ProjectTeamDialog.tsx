@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { PlusIcon, Trash2Icon } from "lucide-react";
+import { Link } from "@/lib/routing";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
 import {
@@ -336,6 +337,33 @@ export function ProjectTeamDialog({
                     defaultLabel={isLead ? "Default" : "Project default"}
                     onChange={(next) => setDraft({ ...draft, ...next })}
                   />
+                  {!isLead && (
+                    <p
+                      className="text-xs text-muted-foreground"
+                      data-testid="project-team-own-copy"
+                    >
+                      This team member gets its own copy, so you can change its tools without
+                      touching the original.
+                    </p>
+                  )}
+                  {!isLead && !shared && selectedIdentity?.project_agent_id && (
+                    <div
+                      className="flex flex-col gap-1 rounded-md border border-border/60 p-3 text-sm"
+                      data-testid="project-team-tools"
+                    >
+                      <span className="font-medium">Tools and permissions</span>
+                      <span className="text-xs text-muted-foreground">
+                        Give this team member its own MCP servers or permission mode. Only you can
+                        change them; they apply from its next session.
+                      </span>
+                      <Link
+                        className="text-xs underline underline-offset-2"
+                        to={`/settings/custom-agents/${encodeURIComponent(selectedIdentity.project_agent_id)}`}
+                      >
+                        Edit {selectedIdentity.name}&apos;s tools and permissions
+                      </Link>
+                    </div>
+                  )}
                   {shared && (
                     <p
                       className="text-xs text-muted-foreground"

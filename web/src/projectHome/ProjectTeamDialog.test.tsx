@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as projectsApi from "@/lib/projectsApi";
 import { ProjectTeamDialog, ROLE_TEMPLATES } from "./ProjectTeamDialog";
 
@@ -15,11 +16,14 @@ vi.mock("@/lib/projectsApi", () => ({
   updateProjectIdentity: vi.fn(),
   deleteProjectIdentity: vi.fn(),
 }));
+const identities = vi.hoisted(() => ({
+  extra: [] as Record<string, unknown>[],
+}));
 vi.mock("./useProjectIdentities", () => ({
   projectIdentitiesKey: (projectId: string) => ["identities", projectId],
   useProjectIdentities: () => ({
     isLoading: false,
-    data: [{ id: "lead", name: "Lead", builtin: true, instructions: "" }],
+    data: [{ id: "lead", name: "Lead", builtin: true, instructions: "" }, ...identities.extra],
   }),
 }));
 vi.mock("./useProjectAgentSession", () => ({
@@ -27,6 +31,10 @@ vi.mock("./useProjectAgentSession", () => ({
 }));
 vi.mock("./IdentityModelEffortFields", () => ({ IdentityModelEffortFields: () => null }));
 vi.mock("./ProjectRoutingSection", () => ({ ProjectRoutingSection: () => null }));
+
+afterEach(() => {
+  identities.extra = [];
+});
 
 describe("ProjectTeamDialog", () => {
   it("adds a team member from a template, in team-member wording throughout", async () => {
@@ -57,5 +65,34 @@ describe("ProjectTeamDialog", () => {
       ),
     );
     expect(screen.queryByRole("group", { name: "Team member templates" })).toBeNull();
+  });
+
+  it("says a team member runs its own copy, and links the owner to its tools", () => {
+    identities.extra = [
+      {
+        id: "pe",
+        name: "Platform Engineer",
+        builtin: false,
+        instructions: "Own the platform.",
+        project_agent_id: "agent-copy",
+      },
+    ];
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={new QueryClient()}>
+          <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    const nav = screen.getByRole("navigation", { name: "Team members" });
+    fireEvent.click(within(nav).getByText("Platform Engineer"));
+    expect(screen.getByTestId("project-team-own-copy")).toHaveTextContent(
+      "This team member gets its own copy",
+    );
+    expect(
+      within(screen.getByTestId("project-team-tools")).getByRole("link", {
+        name: "Edit Platform Engineer's tools and permissions",
+      }),
+    ).toHaveAttribute("href", "/settings/custom-agents/agent-copy");
   });
 });

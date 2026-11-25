@@ -370,6 +370,8 @@ export interface ProjectIdentity {
   active_session_state: ProjectIdentitySessionState;
   /** The agent session that created it; `null` or absent when the owner did. */
   created_by_session_id?: string | null;
+  /** The role's own copy of its base agent, once a session has made it. */
+  project_agent_id?: string | null;
   /** Whether it receives the project's routed events (one entry at most). */
   router?: boolean;
 }
