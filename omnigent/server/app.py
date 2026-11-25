@@ -4720,6 +4720,11 @@ def create_app(
                 prefix="/v1",
                 tags=["projects"],
             )
+            usage_location = getattr(project_store, "storage_location", None)
+            if usage_location:
+                from omnigent.stores.usage_event_store import UsageEventStore
+
+                app.state.usage_events = UsageEventStore(usage_location)
             kpi_location = getattr(project_store, "storage_location", None)
             if kpi_location:
                 from omnigent.server.routes.project_kpis import create_project_kpis_router

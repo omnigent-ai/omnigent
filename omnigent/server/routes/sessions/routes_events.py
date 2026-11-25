@@ -106,6 +106,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
     effective_admin,
 )
@@ -327,6 +328,7 @@ from omnigent.server.subagent_activity import (
     native_subagent_terminal_status,
     record_subagent_activity,
 )
+from omnigent.server.usage_events import record_usage_event
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     MAX_SESSION_EVENT_REQUEST_BYTES,
@@ -1647,6 +1649,14 @@ def register_events_routes(
             from omnigent.server.session_orchestration import orchestration_message
 
             body = orchestration_message(source.id, body.data.get("message"))
+        if human_input and conv.project_id:
+            await record_usage_event(
+                request.app,
+                "message.sent",
+                project_id=conv.project_id,
+                user_id=user_id or RESERVED_USER_LOCAL,
+                session_id=session_id,
+            )
         if human_input and await asyncio.to_thread(
             _is_session_owner,
             user_id,

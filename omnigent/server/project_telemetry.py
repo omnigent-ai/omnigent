@@ -7,10 +7,10 @@ and roles, over the Summary's UTC windows. Nothing is recorded for telemetry her
   is counted separately, never as a person.
 - **Sessions started by people** are top-level sessions that aren't the Lead's, a
   role's, a side chat, an agent worker's or a sub-agent, credited to their owner.
-- **Messages to the Lead or a role** need to know a person typed them. Stored
-  messages can't tell that: the server's own notices (ticket updates, reminders,
-  handoffs) are stored the same way as a person's words. So these counts are
-  ``None`` (not measured) until the usage log records each message as it's sent.
+- **Messages to the Lead or a role** come from the usage log, which records a
+  message at the moment a person sends it. Stored messages can't tell that: the
+  server's own notices are stored the same way as a person's words. With the log
+  off, these counts are ``None`` (not measured).
 - **Roles by the Lead vs by hand:** a role an agent created records its session;
   the owner's records none. Deleted roles aren't counted.
 """
@@ -246,6 +246,34 @@ def compute_telemetry(inputs: TelemetryInputs) -> dict[str, Any]:
         "people_rows": [vars(person) for person in rows],
         **inputs.extra,
     }
+
+
+def add_usage_log_counts(
+    result: dict[str, Any],
+    events: Iterable[Any],
+    sessions: Iterable[ProjectSession],
+    period: StatusPeriod,
+    measured_since: int | None,
+) -> None:
+    """Add the usage log's figures: sessions by client and role edits in the window."""
+    personal = {session.id for session in sessions if session.kind == "personal"}
+    by_client: dict[str, int] = {}
+    edits = 0
+    edited: set[str] = set()
+    for event in events:
+        if not period.contains(event.created_at):
+            continue
+        if event.name == "session.started" and event.session_id in personal:
+            client = event.surface or "unknown"
+            by_client[client] = by_client.get(client, 0) + 1
+        elif event.name == "role.updated":
+            edits += 1
+            if event.subject_id:
+                edited.add(event.subject_id)
+    result["work_start"]["sessions_by_client"] = dict(sorted(by_client.items()))
+    result["role_interaction"]["messages_measured_since"] = measured_since
+    result["team_building"]["role_edits_in_window"] = edits
+    result["team_building"]["roles_edited_in_window"] = len(edited)
 
 
 def review_rounds_and_stalled(

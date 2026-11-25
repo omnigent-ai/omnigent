@@ -441,6 +441,7 @@ from omnigent.server.subagent_activity import (
     record_claude_subagent_return,
     record_subagent_activity,
 )
+from omnigent.server.usage_events import record_usage_event
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.types import (
     AgentSpec,
@@ -474,7 +475,11 @@ from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessi
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
-from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session_surface
+from omnigent.telemetry.surface import (
+    CLIENT_SURFACE_LABEL_KEY,
+    resolve_client_surface,
+    resolve_session_surface,
+)
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -13817,6 +13822,16 @@ async def _create_session_from_existing_agent(
             )
     except Exception:  # noqa: BLE001
         pass
+    # Project telemetry only: a personal session outside any project records nothing.
+    if conv.project_id and body.parent_session_id is None and body.sub_agent_name is None:
+        await record_usage_event(
+            request.app,
+            "session.started",
+            project_id=conv.project_id,
+            user_id=None if created_by_session_id else (user_id or RESERVED_USER_LOCAL),
+            session_id=conv.id,
+            surface="agent" if created_by_session_id else resolve_client_surface(request.headers),
+        )
 
     if body.initial_items:
         runner_client = await _get_runner_client(

@@ -9422,8 +9422,21 @@
         "type": "object"
       },
       "RoleInteraction": {
-        "description": "How people talk to the Lead and roles.\n\nMessage counts, and the people counts derived from them, are null until the usage\nlog measures them: stored messages don't distinguish a person's words from the\nserver's automatic notices.",
+        "description": "How people talk to the Lead and roles.\n\nMessage counts come from the usage log, which records a message when a person sends\nit. They're null when the log is off: stored messages don't distinguish a person's\nwords from the server's automatic notices.",
         "properties": {
+          "messages_measured_since": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When the usage log's oldest kept event was recorded (Unix seconds). A window starting earlier is only counted from then.",
+            "title": "Messages Measured Since"
+          },
           "messages_to_lead": {
             "anyOf": [
               {
@@ -17405,8 +17418,21 @@
                 "type": "null"
               }
             ],
-            "description": "Creation to last edit, over edited roles; earlier edits aren't kept yet.",
+            "description": "Creation to last edit, over edited roles.",
             "title": "Median Hours To Last Role Edit"
+          },
+          "role_edits_in_window": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Role edits recorded by the usage log in the window; null when it's off.",
+            "title": "Role Edits In Window"
           },
           "roles": {
             "format": "int64",
@@ -17437,6 +17463,19 @@
             "format": "int64",
             "title": "Roles Edited After Creation",
             "type": "integer"
+          },
+          "roles_edited_in_window": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Distinct roles edited in the window, from the usage log.",
+            "title": "Roles Edited In Window"
           }
         },
         "required": [
@@ -19318,6 +19357,22 @@
             },
             "title": "People",
             "type": "object"
+          },
+          "sessions_by_client": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "format": "int64",
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Sessions people started, by client (web, desktop, cli, slack, ...), from the usage log; null when it's off. Counts start at messages_measured_since.",
+            "title": "Sessions By Client"
           },
           "sessions_started_by_people": {
             "format": "int64",

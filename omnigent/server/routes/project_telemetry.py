@@ -20,8 +20,10 @@ from omnigent.server.project_status import (
     status_period,
 )
 from omnigent.server.project_telemetry import (
+    PersonMessage,
     ProjectTelemetryReader,
     TelemetryInputs,
+    add_usage_log_counts,
     compute_telemetry,
     review_rounds_and_stalled,
     visible_people,
@@ -29,6 +31,7 @@ from omnigent.server.project_telemetry import (
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.project_kpis import WindowParam
 from omnigent.server.routes.project_status import _measure, move_member_resolver
+from omnigent.server.usage_events import usage_event_store
 
 if TYPE_CHECKING:
     from omnigent.entities import Project
@@ -54,14 +57,21 @@ class WorkStart(BaseModel):
     people: dict[Literal["session_first", "ticket_first", "both"], int] = Field(
         description="People who only started sessions, only filed tickets, or did both."
     )
+    sessions_by_client: dict[str, int] | None = Field(
+        default=None,
+        description=(
+            "Sessions people started, by client (web, desktop, cli, slack, ...), from the "
+            "usage log; null when it's off. Counts start at messages_measured_since."
+        ),
+    )
 
 
 class RoleInteraction(BaseModel):
     """How people talk to the Lead and roles.
 
-    Message counts, and the people counts derived from them, are null until the usage
-    log measures them: stored messages don't distinguish a person's words from the
-    server's automatic notices.
+    Message counts come from the usage log, which records a message when a person sends
+    it. They're null when the log is off: stored messages don't distinguish a person's
+    words from the server's automatic notices.
     """
 
     messages_to_lead: int | None
@@ -72,6 +82,13 @@ class RoleInteraction(BaseModel):
     ticket_comments_by_people: int
     people_ticket_only: int | None = Field(
         description="People who commented on tickets but never chatted with the Lead or a role."
+    )
+    messages_measured_since: int | None = Field(
+        default=None,
+        description=(
+            "When the usage log's oldest kept event was recorded (Unix seconds). A window "
+            "starting earlier is only counted from then."
+        ),
     )
 
 
@@ -85,7 +102,14 @@ class TeamBuilding(BaseModel):
     roles_created_in_window_by_lead: int
     roles_edited_after_creation: int
     median_hours_to_last_role_edit: float | None = Field(
-        description="Creation to last edit, over edited roles; earlier edits aren't kept yet."
+        description="Creation to last edit, over edited roles."
+    )
+    role_edits_in_window: int | None = Field(
+        default=None,
+        description="Role edits recorded by the usage log in the window; null when it's off.",
+    )
+    roles_edited_in_window: int | None = Field(
+        default=None, description="Distinct roles edited in the window, from the usage log."
     )
 
 
@@ -220,12 +244,32 @@ def create_project_telemetry_router(
         stages = functools.cache(
             lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
         )
+        usage = usage_event_store(request.app)
+        sessions = functools.cache(lambda: reader.sessions(project))
+        events = functools.cache(
+            lambda: (
+                []
+                if usage is None
+                else usage.events(
+                    project.id,
+                    since_epoch=period.since_epoch,
+                    names=("message.sent", "session.started", "role.updated"),
+                )
+            )
+        )
         inputs = TelemetryInputs(
             project=project,
             period=period,
-            sessions=lambda: reader.sessions(project),
-            # People's messages are measured once the usage log records them as sent.
-            person_messages=lambda _sessions: None,
+            sessions=sessions,
+            person_messages=lambda _sessions: (
+                None
+                if usage is None
+                else [
+                    PersonMessage(event.session_id, event.user_id or "local", event.created_at)
+                    for event in events()
+                    if event.name == "message.sent" and event.session_id and event.user_id
+                ]
+            ),
             activity=lambda: ticket_store.activity_actors(
                 project.id, user_id=user_id, since_epoch=period.since_epoch
             ),
@@ -234,6 +278,8 @@ def create_project_telemetry_router(
         )
         result = compute_telemetry(inputs)
         rows = result.pop("people_rows")
+        if usage is not None:
+            add_usage_log_counts(result, events(), sessions(), period, usage.first_event_at())
         return {
             "object": "project.telemetry",
             "project_id": project.id,

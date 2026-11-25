@@ -43,7 +43,12 @@ from omnigent.runtime.project_ticket_instructions import (
     PROJECT_TICKET_WORK_INSTRUCTION,
 )
 from omnigent.server import github_pr_intake, product_approval, project_release
-from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_PUBLIC, AuthProvider
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    AuthProvider,
+)
 from omnigent.server.persona_mentions import (
     Mention,
     MentionRateLimiter,
@@ -78,9 +83,11 @@ from omnigent.server.ticket_review import (
     to_worker_message,
 )
 from omnigent.server.ticket_summary import TicketSummarizer, build_ticket_summarizer
+from omnigent.server.usage_events import record_usage_event
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore, ProjectStore
 from omnigent.stores.conversation_store import SessionActivity
 from omnigent.stores.project_ticket_store import ProjectTicketStore
+from omnigent.telemetry.surface import resolve_client_surface
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 
@@ -761,6 +768,15 @@ def create_project_tickets_router(
         )
         with _storage_errors():
             ticket = await asyncio.to_thread(store.create, project_id, body, who)
+        await record_usage_event(
+            request.app,
+            "ticket.filed",
+            project_id=project_id,
+            user_id=None if who.session_id else (who.user_id or RESERVED_USER_LOCAL),
+            session_id=who.session_id,
+            surface="agent" if who.session_id else resolve_client_surface(request.headers),
+            subject_id=ticket["id"],
+        )
         wake(request)
         return ticket
 

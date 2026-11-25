@@ -83,6 +83,7 @@ from omnigent.server.schemas import (
     UpdateProjectShareRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.server.usage_events import record_usage_event
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
@@ -333,6 +334,28 @@ def _refuse_description_write(
         ),
         user_id=user_id,
         conversation_store=conversation_store,
+    )
+
+
+async def _record_role_event(
+    request: Request,
+    project: Project,
+    user_id: str | None,
+    name: str,
+    identity_id: str,
+    body: Any,
+) -> None:
+    """Record a role edit or removal: who made it and which fields changed, never their values."""
+    source = normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
+    fields = sorted(body.model_fields_set) if body is not None else []
+    await record_usage_event(
+        request.app,
+        name,
+        project_id=project.id,
+        user_id=None if source else (user_id or RESERVED_USER_LOCAL),
+        session_id=source,
+        subject_id=identity_id,
+        props={"fields": fields} if fields else None,
     )
 
 
@@ -837,6 +860,14 @@ def create_projects_router(
             created_by_session_id=source_session,
             scope=body.scope.model_dump() if body.scope is not None else None,
         )
+        await record_usage_event(
+            request.app,
+            "role.created",
+            project_id=project.id,
+            user_id=None if source_session else (user_id or RESERVED_USER_LOCAL),
+            session_id=source_session,
+            subject_id=identity.id,
+        )
         announce_projects_changed(user_id)
         # A new identity starts its one session right away; a failure retries on the next list.
         [identity] = await heal_identity_sessions(request, project, [identity])
@@ -939,6 +970,7 @@ def create_projects_router(
         )
         if identity is None:
             raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        await _record_role_event(request, project, user_id, "role.updated", identity.id, body)
         announce_projects_changed(user_id)
         return await _identity_payload(project, identity)
 
@@ -961,6 +993,7 @@ def create_projects_router(
         )
         if not deleted:
             raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        await _record_role_event(request, project, user_id, "role.deleted", normalized, None)
         announce_projects_changed(user_id)
         return {"id": normalized, "object": "project.identity.deleted", "deleted": True}
 

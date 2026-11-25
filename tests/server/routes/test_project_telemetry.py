@@ -268,11 +268,11 @@ async def test_telemetry_endpoints_count_real_activity_and_respect_access(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["work_start"]["tickets_filed_directly"] == 1
-    # Stored messages can't tell a person's words from the server's notices: not measured.
-    assert body["role_interaction"]["messages_to_lead"] is None
-    assert body["role_interaction"]["messages_to_roles"] is None
+    # The automatic notice isn't a person's message: only the usage log's sends count.
+    assert body["role_interaction"]["messages_to_lead"] == 0
+    assert body["role_interaction"]["messages_to_roles"] == 0
     assert body["role_interaction"]["ticket_comments_by_people"] == 1
-    assert body["role_interaction"]["people_ticket_only"] is None
+    assert body["role_interaction"]["people_ticket_only"] == 1
     assert body["team_building"]["roles_created_by_hand"] == 1
     assert body["throughput"]["tickets_shipped"] == 1
     assert {row["user_id"] for row in body["people"]} == {OWNER, MEMBER}

@@ -1207,6 +1207,38 @@ class SqlProjectRoleKpiRevision(OmnigentBase):
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class SqlUsageEvent(OmnigentBase):
+    """One product-usage event for project telemetry: names and IDs only, never content.
+
+    Kept in the server's own database and pruned after a retention period; nothing
+    here is sent anywhere else.
+    """
+
+    __tablename__ = "usage_events"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # An enumerated event name, e.g. "message.sent".
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # The person, or NULL for an agent; single-user mode stores "local".
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # An enumerated client or entry point, e.g. "web" or "slack".
+    surface: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The ticket, session or role the event is about.
+    subject_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Small enumerated properties, e.g. which role fields changed; never their values.
+    props: Mapped[dict[str, Any] | None] = mapped_column(EnvelopedJSON(2048), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_usage_events_project_time", "workspace_id", "project_id", "created_at"),
+        Index("ix_usage_events_user_time", "workspace_id", "user_id", "created_at"),
+        Index("ix_usage_events_time", "workspace_id", "created_at"),
+    )
+
+
 class SqlProjectTicketLink(OmnigentBase):
     """An untyped, undirected link stored once with the smaller ticket ID first."""
 
