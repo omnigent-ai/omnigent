@@ -11,7 +11,14 @@ import {
   StateField,
   type Transaction,
 } from "@codemirror/state";
-import { Decoration, EditorView } from "@codemirror/view";
+import { getSearchQuery, searchPanelOpen } from "@codemirror/search";
+import {
+  Decoration,
+  type DecorationSet,
+  EditorView,
+  ViewPlugin,
+  type ViewUpdate,
+} from "@codemirror/view";
 
 /** A run of the document, as offsets. */
 export interface FindRange {
@@ -90,6 +97,76 @@ const findScopeField = StateField.define<FindScopeState>({
   },
 });
 
+/** The scope range holding `position`, by binary search over the sorted ranges. */
+function rangeHolding(scope: readonly FindRange[], position: number): FindRange | null {
+  let low = 0;
+  let high = scope.length - 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    const range = scope[middle]!;
+    if (position < range.from) high = middle - 1;
+    else if (position >= range.to) low = middle + 1;
+    else return range;
+  }
+  return null;
+}
+
+/**
+ * The inside parts of the shown matches that cross a scope edge. Find leaves such a match
+ * out, so these join the outside marks, and none of its highlight shows.
+ */
+function crossingMatchMarks(view: EditorView): DecorationSet {
+  const { state } = view;
+  const scope = findScopeOf(state);
+  const query = getSearchQuery(state);
+  if (!scope || scope.length === 0 || !searchPanelOpen(state) || !query.valid || !query.search) {
+    return Decoration.none;
+  }
+  const marks = [];
+  // The lines on screen, as CodeMirror's own match highlighting reads them.
+  for (const visible of view.visibleRanges) {
+    const from = state.doc.lineAt(visible.from).from;
+    const to = state.doc.lineAt(visible.to).to;
+    const cursor = query.getCursor(state, from, to) as Iterator<FindRange>;
+    for (let next = cursor.next(); !next.done; next = cursor.next()) {
+      const match = next.value;
+      const holder = rangeHolding(scope, match.from);
+      if (holder && match.to <= holder.to) continue;
+      // The match leaves its range; mark each part of it the scope covers.
+      for (let position = match.from; position < match.to;) {
+        const range = rangeHolding(scope, position);
+        if (!range) {
+          position += 1;
+          continue;
+        }
+        const end = Math.min(range.to, match.to);
+        marks.push(OUTSIDE_SCOPE_MARK.range(position, end));
+        position = end;
+      }
+    }
+  }
+  return Decoration.set(marks, true);
+}
+
+const crossingMatches = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet;
+    constructor(view: EditorView) {
+      this.decorations = crossingMatchMarks(view);
+    }
+    update(update: ViewUpdate) {
+      const changed =
+        update.docChanged ||
+        update.viewportChanged ||
+        findScopeOf(update.state) !== findScopeOf(update.startState) ||
+        getSearchQuery(update.state) !== getSearchQuery(update.startState) ||
+        searchPanelOpen(update.state) !== searchPanelOpen(update.startState);
+      if (changed) this.decorations = crossingMatchMarks(update.view);
+    }
+  },
+  { decorations: (plugin) => plugin.decorations },
+);
+
 const scopeDecorations = [
   EditorView.decorations.compute([findScopeField], (state) =>
     Decoration.set(
@@ -110,6 +187,7 @@ const scopeDecorations = [
       );
     }),
   ),
+  Prec.lowest(crossingMatches),
 ];
 
 /** The ranges find is limited to, or null for the whole file. */

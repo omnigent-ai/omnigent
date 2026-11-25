@@ -227,6 +227,25 @@ describe("find in selection edge cases", () => {
     expect(view.state.doc.toString()).toBe(text);
   });
 
+  it("leaves out a match that starts in the scope and ends past it, counted and drawn", () => {
+    const text = "HIT one HIT two";
+    const view = longLineEditor(text);
+    openSearchPanel(view);
+    query(view, "HIT", false, "X");
+    // The scope ends inside the second HIT, which starts at 8.
+    view.dispatch({ selection: { anchor: 0, head: 9 }, userEvent: "select" });
+    toggleFindInSelection(view, true);
+    const index = indexFor(view);
+    expect(index.status(view.state).matchCount).toBe(1);
+    // Only the counted match shows: no part of the one crossing the edge is drawn.
+    const shown = [...view.dom.querySelectorAll(".cm-searchMatch")].filter(
+      (match) => !match.closest(".cm-find-outside-scope"),
+    );
+    expect(shown.map((match) => match.textContent)).toEqual(["HIT"]);
+    new FindReplacer(index, immediate).replaceAll(view);
+    expect(view.state.doc.toString()).toBe("X one HIT two");
+  });
+
   it("keeps a scope whose text was all removed, matching nothing", () => {
     const view = editor();
     query(view, "alpha");
