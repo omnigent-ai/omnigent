@@ -1376,14 +1376,16 @@ describe('WorkspacePanel "+" new-tab menu', () => {
   });
 
   it.each([false, true])(
-    "excludes the scrolling tabs from window dragging without excluding the whole toolbar (maximized=%s)",
+    "excludes the open tabs from window dragging but not the strip's empty end (maximized=%s)",
     (maximized) => {
       renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"], maximized });
       const toolbar = screen.getByRole("toolbar", { name: "Workspace tabs" });
-      const viewport = toolbar.querySelector(".overflow-x-auto");
-      expect(viewport).not.toBeNull();
-      expect(viewport).toHaveClass("no-drag");
-      expect(viewport).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+      const viewport = toolbar.querySelector("[data-workspace-tabs-viewport]");
+      const tabRow = viewport?.firstElementChild;
+      // The row hugs labelled tabs, leaving the rest of the flex-1 viewport draggable.
+      expect(tabRow).toHaveClass("no-drag", "w-fit", "max-w-full");
+      expect(tabRow).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+      expect(viewport).not.toHaveClass("no-drag");
       expect(toolbar).not.toHaveClass("no-drag");
     },
   );

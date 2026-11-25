@@ -8,6 +8,8 @@ import {
   useState,
 } from "react";
 
+import { cn } from "@/lib/utils";
+
 const CompactWorkspaceTabsContext = createContext(false);
 
 /** Whether open tabs should render icon-only because their full labels don't fit. */
@@ -149,16 +151,21 @@ export function WorkspaceTabsScroller({
     };
   }, []);
 
+  // The tab row, not the flex-1 viewport, opts out of macOS window dragging, so the strip's
+  // empty end still moves the window. Icon-only tabs scroll, so their row spans them all.
   return (
     <div
       ref={viewportRef}
       data-workspace-tabs-viewport
-      className="no-drag min-w-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className="min-w-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
     >
       <div
         ref={contentRef}
         data-compact={compact || undefined}
-        className="flex w-full min-w-0 items-center gap-0.5"
+        className={cn(
+          "no-drag flex min-w-0 items-center gap-0.5",
+          compact ? "w-max" : "w-fit max-w-full",
+        )}
       >
         <CompactWorkspaceTabsContext.Provider value={compact}>
           {children}

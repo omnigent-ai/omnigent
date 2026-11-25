@@ -8,24 +8,29 @@ the macOS shell in Chromium, as
 
 from __future__ import annotations
 
+import contextlib
 import os
+import re
+from collections.abc import Iterator
 
+import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui.conftest import open_right_rail
 from tests.e2e_ui.desktop._mac_shell import (
     MAC_SHELL_INIT_SCRIPT,
     WINDOW_CONTROLS_STRIP,
     intersects_window_controls,
 )
+from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag
 
 _WIDE_VIEWPORT = {"width": 1280, "height": 860}
 _NARROW_VIEWPORT = {"width": 480, "height": 860}
 
 # Electron applies app-region rects in document order, ignoring stacking, opacity
 # and pointer-events, so the last rendered region over a point decides dragging.
-_EMPTY_TITLE_BAR_POINTS_SCRIPT = """
-(stripHeight) => {
+_LAST_APP_REGION_JS = """
   const appRegion = (element) => getComputedStyle(element).getPropertyValue("-webkit-app-region");
   const regions = [...document.querySelectorAll("*")].flatMap((element) => {
     const region = appRegion(element);
@@ -35,6 +40,21 @@ _EMPTY_TITLE_BAR_POINTS_SCRIPT = """
     const hasRegion = region === "drag" || region === "no-drag";
     return hasRegion && rendered ? [{ element, region, rect }] : [];
   });
+  const regionAt = (x, y) => {
+    const covering = regions.filter(
+      ({ rect }) => x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom,
+    ).at(-1);
+    const element = covering?.element;
+    const coveredBy = element ? element.dataset.testid || element.tagName : null;
+    return { x, y, region: covering?.region ?? null, coveredBy };
+  };
+"""
+
+_EMPTY_TITLE_BAR_POINTS_SCRIPT = (
+    """
+(stripHeight) => {"""
+    + _LAST_APP_REGION_JS
+    + """
   let empty = 0;
   const undraggable = [];
   for (let x = 4; x < window.innerWidth; x += 16) {
@@ -42,19 +62,71 @@ _EMPTY_TITLE_BAR_POINTS_SCRIPT = """
       const isEmpty = document.elementsFromPoint(x, y).every((el) => appRegion(el) !== "no-drag");
       if (!isEmpty) continue;
       empty += 1;
-      const covering = regions.filter(
-        ({ rect }) => x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom,
-      ).at(-1);
-      if (covering?.region !== "drag") {
-        const element = covering?.element;
-        const coveredBy = element ? element.dataset.testid || element.tagName : null;
-        undraggable.push({ x, y, coveredBy });
-      }
+      const { region, coveredBy } = regionAt(x, y);
+      if (region !== "drag") undraggable.push({ x, y, coveredBy });
     }
   }
   return { empty, undraggable };
 }
 """
+)
+
+# Samples the maximized rail's tab bar: its tabs, the strip above them, and the empty
+# space between the last tab and the first trailing control.
+_WORKSPACE_TAB_BAR_REGIONS_SCRIPT = (
+    """
+({ tabLabels, controlLabels }) => {"""
+    + _LAST_APP_REGION_JS
+    + """
+  const toolbar = document.querySelector('[role="toolbar"][aria-label="Workspace tabs"]');
+  const box = (label) => toolbar.querySelector(`[aria-label="${label}"]`)?.getBoundingClientRect();
+  const tabs = tabLabels.map(box);
+  const emptyStart = Math.max(...tabs.map((rect) => rect.right));
+  const emptyEnd = Math.min(
+    ...controlLabels.map(box).filter(Boolean).map((rect) => rect.left),
+  );
+  const bar = toolbar.getBoundingClientRect();
+  const middle = Math.round(bar.top + bar.height / 2);
+  const center = (rect) => Math.round(rect.left + rect.width / 2);
+  const emptySpace = [];
+  for (let x = Math.ceil(emptyStart) + 8; x < emptyEnd - 8; x += 16) {
+    emptySpace.push(regionAt(x, middle));
+  }
+  return {
+    tabs: tabs.map((rect) => regionAt(center(rect), middle)),
+    stripAboveTabs: tabs.map((rect) => regionAt(center(rect), bar.top + 8)),
+    emptySpace,
+  };
+}
+"""
+)
+
+# Samples the tabs sidebar's strip between its last control before Exit full screen and
+# Exit full screen itself.
+_TABS_SIDEBAR_STRIP_EMPTY_SPACE_SCRIPT = (
+    """
+() => {"""
+    + _LAST_APP_REGION_JS
+    + """
+  const toolbar = document.querySelector('[role="toolbar"][aria-label="Workspace tabs"]');
+  const exit = toolbar.querySelector('[aria-label="Exit full screen"]').getBoundingClientRect();
+  const leading = [...toolbar.querySelectorAll("button")]
+    .map((button) => button.getBoundingClientRect())
+    .filter((rect) => rect.width && rect.right <= exit.left);
+  const emptyStart = Math.max(...leading.map((rect) => rect.right));
+  const bar = toolbar.getBoundingClientRect();
+  const middle = Math.round(bar.top + bar.height / 2);
+  const emptySpace = [];
+  for (let x = Math.ceil(emptyStart) + 8; x < exit.left - 8; x += 16) {
+    emptySpace.push(regionAt(x, middle));
+  }
+  return emptySpace;
+}
+"""
+)
+
+_WORKSPACE_TAB_FILES = ("tab_bar_notes.md", "tab_bar_design.md")
+_TAB_BAR_TRAILING_CONTROLS = ("Open new", "Select panel", "Exit full screen")
 
 
 def _undraggable_empty_title_bar_points(page: Page) -> list[dict[str, object]]:
@@ -207,3 +279,76 @@ def test_narrow_window_title_bar_stays_draggable(
     assert narrow_points == [], (
         f"empty title-bar points not draggable at {_NARROW_VIEWPORT['width']}px: {narrow_points}"
     )
+
+
+@pytest.fixture
+def session_with_workspace_files(
+    seeded_session: tuple[str, str],
+) -> Iterator[tuple[str, str]]:
+    base_url, session_id = seeded_session
+    file_urls = [
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{name}"
+        for name in _WORKSPACE_TAB_FILES
+    ]
+    for name, file_url in zip(_WORKSPACE_TAB_FILES, file_urls, strict=True):
+        httpx.put(
+            file_url, json={"content": f"# {name}\n", "encoding": "utf-8"}, timeout=10.0
+        ).raise_for_status()
+    try:
+        yield base_url, session_id
+    finally:
+        # Session deletion leaves workspace files behind.
+        for file_url in file_urls:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(file_url, timeout=10.0).raise_for_status()
+
+
+def test_maximized_workspace_tab_bar_empty_space_drags_the_window(
+    request: pytest.FixtureRequest, session_with_workspace_files: tuple[str, str]
+) -> None:
+    base_url, session_id = session_with_workspace_files
+    page = _open_session_in_mac_shell(request, base_url, session_id)
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    for name in _WORKSPACE_TAB_FILES:
+        rail.get_by_role("tab", name="Files", exact=True).click()
+        rail.get_by_role("button", name=re.compile(rf"^{re.escape(name)}\b")).click()
+        expect(page.get_by_role("button", name=f"Close {name}", exact=True).first).to_be_visible()
+    page.get_by_role("button", name="Full screen", exact=True).click()
+    expect(page.locator('aside[aria-label="Workspace"][data-maximized]')).to_be_visible()
+    _hold_for_recording(page)
+
+    regions = page.evaluate(
+        _WORKSPACE_TAB_BAR_REGIONS_SCRIPT,
+        {
+            "tabLabels": list(_WORKSPACE_TAB_FILES),
+            "controlLabels": list(_TAB_BAR_TRAILING_CONTROLS),
+        },
+    )
+    assert all(point["region"] == "no-drag" for point in regions["tabs"]), (
+        f"open tabs would move the window instead of selecting: {regions['tabs']}"
+    )
+    assert all(point["region"] == "drag" for point in regions["stripAboveTabs"]), (
+        f"strip above the tabs does not drag the window: {regions['stripAboveTabs']}"
+    )
+    assert regions["emptySpace"], "no empty tab-bar space was sampled"
+    undraggable = [point for point in regions["emptySpace"] if point["region"] != "drag"]
+    assert undraggable == [], f"empty tab-bar space does not drag the window: {undraggable}"
+
+
+def test_maximized_tabs_sidebar_strip_empty_space_drags_the_window(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    base_url, session_id = seeded_session
+    _set_flag(request.getfixturevalue("page"), True)
+    page = _open_session_in_mac_shell(request, base_url, session_id)
+    open_right_rail(page)
+    rail = page.locator('aside[aria-label="Workspace"][data-workspace-design="tabs"]')
+    rail.get_by_role("button", name="Full screen", exact=True).click()
+    expect(rail).to_have_attribute("data-maximized", "true")
+    _hold_for_recording(page)
+
+    empty_space = page.evaluate(_TABS_SIDEBAR_STRIP_EMPTY_SPACE_SCRIPT)
+    assert empty_space, "no empty tab-bar space was sampled"
+    undraggable = [point for point in empty_space if point["region"] != "drag"]
+    assert undraggable == [], f"empty tab-bar space does not drag the window: {undraggable}"
