@@ -688,6 +688,14 @@ describe("desktop command menu items", () => {
     ]);
   });
 
+  it("says closing the last main window quits off macOS, even with a panel open", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    harness.api.windows.set({ isDestroyed: () => false }, { role: "panel" });
+    findMenuItem(reportState(harness, { commands: ["close"] }), "close").click();
+    assert.equal(harness.calls.sent.at(-1).payload.closingQuits, true);
+  });
+
   it("steps a focused web page's own history, else hands Back/Forward to the app", (t) => {
     const harness = loadMainHarness({ platform: "darwin" });
     t.after(harness.cleanup);
@@ -1024,6 +1032,94 @@ describe("global show shortcut IPC", () => {
       enabled: false,
       accelerator: "Control+Shift+K",
     });
+  });
+
+  it("saves the New Agent shortcut by id on macOS, asking with its own action", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin", dialogResponses: [{ response: 1 }] });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const handler = (channel) => harness.ipcHandlers.get(channel);
+    const setting = { enabled: true, accelerator: "Control+Alt+Space" };
+
+    const result = await handler("omnigent:set-global-shortcut")(
+      harness.events.pinned,
+      setting,
+      "floatingComposer",
+    );
+
+    assert.deepEqual(plain(result), { ok: true, setting });
+    const { options } = harness.calls.showMessageBox[0];
+    assert.match(options.message, /open New Agent from any app/);
+    assert.match(options.detail, /opens the New Agent panel/);
+    assert.deepEqual(harness.readSettings().floating_composer_shortcut, setting);
+    assert.equal(harness.readSettings().global_shortcut, undefined);
+    assert.equal(
+      handler("omnigent:get-global-shortcut")(harness.events.pinned, "floatingComposer")
+        .accelerator,
+      "Control+Alt+Space",
+    );
+    assert.equal(
+      handler("omnigent:get-global-shortcut")(harness.events.pinned).accelerator,
+      "Alt+Space",
+    );
+  });
+
+  for (const [platform, id] of [
+    ["darwin", "toString"],
+    ["darwin", "nope"],
+    ["linux", "floatingComposer"],
+  ]) {
+    it(`refuses the ${id} shortcut on ${platform}, saving and asking nothing`, async (t) => {
+      const harness = loadMainHarness({ platform });
+      t.after(harness.cleanup);
+      harness.api.registerIpc();
+      const handler = (channel) => harness.ipcHandlers.get(channel);
+
+      assert.throws(
+        () => handler("omnigent:get-global-shortcut")(harness.events.pinned, id),
+        /Unknown global shortcut/,
+      );
+      assert.throws(
+        () =>
+          handler("omnigent:set-global-shortcut")(
+            harness.events.pinned,
+            { enabled: true, accelerator: "Control+Alt+Space" },
+            id,
+          ),
+        /Unknown global shortcut/,
+      );
+      assert.throws(
+        () => handler("omnigent:record-global-shortcut")(harness.events.pinned, id),
+        /Unknown global shortcut/,
+      );
+      assert.equal(harness.calls.showMessageBox.length, 0);
+      assert.deepEqual(harness.calls.globalShortcuts, []);
+    });
+  }
+
+  it("records for one shortcut at a time, ending the other's recording", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    // record() listens for the next chord on the page that asked.
+    Object.assign(harness.events.pinned.sender, {
+      on: () => {},
+      once: () => {},
+      removeListener: () => {},
+    });
+    const record = harness.ipcHandlers.get("omnigent:record-global-shortcut");
+
+    const first = record(harness.events.pinned);
+    const second = record(harness.events.pinned, "floatingComposer");
+
+    let timer;
+    const stillRecording = new Promise((resolve) => {
+      timer = setTimeout(() => resolve("still recording"), 200);
+    });
+    assert.equal(await Promise.race([first, stillRecording]), null);
+    clearTimeout(timer);
+    harness.ipcHandlers.get("omnigent:cancel-global-shortcut-recording")(harness.events.pinned);
+    assert.equal(await second, null);
   });
 });
 

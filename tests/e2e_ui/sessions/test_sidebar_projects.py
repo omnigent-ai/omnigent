@@ -77,6 +77,7 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
     row.get_by_test_id("conversation-actions").click()
     # Open the submenu flyout, then pick the just-created project by name.
     page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name="Projects", exact=True).hover()
     page.get_by_role("menuitem", name=name, exact=True).click()
 
 
@@ -258,6 +259,7 @@ def test_remove_session_from_project(
     project_row.hover()
     project_row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name="Projects", exact=True).hover()
     # The kebab item names the project it removes from ("Remove from <name>").
     # It unfiles immediately — no confirmation, since a first-class project
     # persists when emptied (nothing is deleted).
@@ -391,7 +393,7 @@ def test_project_menu_is_visible_without_hover(
 
         for expanded in [True, False]:
             if header.get_attribute("aria-expanded") != str(expanded).lower():
-                header.click()
+                header.locator("[data-section-toggle]").first.click()
                 touch.mouse.move(viewport["width"] - 1, 0)
             expect(kebab).to_be_visible()
             assert kebab.evaluate("""element => {

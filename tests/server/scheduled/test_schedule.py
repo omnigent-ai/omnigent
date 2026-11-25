@@ -6,13 +6,15 @@ from datetime import UTC, datetime
 import pytest
 
 from omnigent.entities import ScheduledTask
-from omnigent.server.scheduled.rrule import RRuleSearchError
+from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
     sandbox_host_id,
+    timer_interval,
+    timer_rule,
 )
 
 
@@ -174,3 +176,72 @@ def test_inactive_or_invalid_schedule_has_no_next_occurrence(task, changes) -> N
     from dataclasses import replace
 
     assert next_scheduled_time(replace(task, **changes), task.created_at) is None
+
+
+# A timer anchored here with a 120-second interval first fires at _ANCHOR + 120.
+_ANCHOR = 1_800_000_000
+
+
+@pytest.mark.parametrize(
+    "repeat,after,expected",
+    [
+        (True, _ANCHOR, _ANCHOR + 120),
+        # Saved a moment late: the first firing is still the next one, not skipped.
+        (True, _ANCHOR + 119, _ANCHOR + 120),
+        # Strictly after: claiming the firing due now moves to the next tick.
+        (True, _ANCHOR + 120, _ANCHOR + 240),
+        # Back from a long outage: missed ticks are skipped, the phase is kept.
+        (True, _ANCHOR + 1000, _ANCHOR + 1080),
+        (False, _ANCHOR + 119, _ANCHOR + 120),
+        # A one-shot timer has no firing after its only one.
+        (False, _ANCHOR + 120, None),
+        (False, _ANCHOR + 5000, None),
+    ],
+    ids=[
+        "repeat-first",
+        "repeat-just-before",
+        "repeat-at-firing",
+        "repeat-after-outage",
+        "once-just-before",
+        "once-at-firing",
+        "once-long-after",
+    ],
+)
+def test_timer_firings_fall_on_whole_intervals_from_the_anchor(
+    task, repeat: bool, after: int, expected: int | None
+) -> None:
+    from dataclasses import replace
+
+    timer = replace(
+        task,
+        kind="timer",
+        rrule=timer_rule(120, repeat=repeat),
+        created_at=_ANCHOR,
+        session_mode="continue",
+    )
+    assert next_scheduled_time(timer, after) == expected
+
+
+def test_timer_rules_round_trip_their_interval() -> None:
+    assert timer_rule(120, repeat=True) == "FREQ=SECONDLY;INTERVAL=120"
+    assert timer_rule(1, repeat=False) == "FREQ=SECONDLY;INTERVAL=1;COUNT=1"
+    assert timer_interval(timer_rule(1_000_000, repeat=True)) == 1_000_000
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=DAILY",
+        "FREQ=SECONDLY;INTERVAL=0",
+        "FREQ=SECONDLY;INTERVAL=1000001",
+        "FREQ=SECONDLY;INTERVAL=5;COUNT=2",
+        "FREQ=SECONDLY;INTERVAL=05",
+    ],
+)
+def test_a_rule_a_timer_never_saves_is_invalid(task, rule: str) -> None:
+    from dataclasses import replace
+
+    with pytest.raises(RRuleValidationError):
+        timer_interval(rule)
+    # The scheduler finds no firing for it instead of failing the poll.
+    assert next_scheduled_time(replace(task, kind="timer", rrule=rule), _ANCHOR) is None

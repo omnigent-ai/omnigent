@@ -1121,6 +1121,9 @@ async def _drive_landing_clears_after_navigating_away(
             await landing_input.fill(message)
             await page.get_by_test_id("new-chat-landing-submit").click()
             await poll_until_async(lambda: len(create_bodies) == 1)
+            # The router can defer the temporary chat; leaving before it renders would keep
+            # the submitted landing mounted, text and all, rather than test a remount.
+            await expect(landing_input).to_have_count(0, timeout=30_000)
 
             # Detour through another session and come straight back, all
             # while the create is still bootstrapping.

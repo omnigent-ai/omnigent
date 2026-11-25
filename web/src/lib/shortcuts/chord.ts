@@ -47,6 +47,16 @@ export function keyChordInput(event: globalThis.KeyboardEvent): KeyChordInput {
   };
 }
 
+/** The modifier keys a chord presses on a platform: `mod` is Meta on macOS, Control elsewhere. */
+function physicalModifiers(chord: Chord, mac: boolean) {
+  return {
+    meta: mac && !!chord.mod,
+    ctrl: !!chord.ctrl || (!mac && !!chord.mod),
+    alt: !!chord.alt,
+    shift: !!chord.shift,
+  };
+}
+
 /** True when `input` presses exactly `chord`'s modifiers and key on this platform. */
 export function chordMatches(
   chord: Chord,
@@ -55,10 +65,9 @@ export function chordMatches(
 ): boolean {
   const keys = "getModifierState" in input ? keyChordInput(input) : input;
   if (keys.altGraph && !chord.matchesAltGraph) return false;
-  const wantMeta = mac && !!chord.mod;
-  const wantCtrl = !!chord.ctrl || (!mac && !!chord.mod);
-  if (keys.metaKey !== wantMeta || keys.ctrlKey !== wantCtrl) return false;
-  if (keys.altKey !== !!chord.alt || keys.shiftKey !== !!chord.shift) return false;
+  const wanted = physicalModifiers(chord, mac);
+  if (keys.metaKey !== wanted.meta || keys.ctrlKey !== wanted.ctrl) return false;
+  if (keys.altKey !== wanted.alt || keys.shiftKey !== wanted.shift) return false;
   if (chord.code !== undefined) return keys.code === chord.code;
   if (chord.key === undefined) return false;
   return chord.exactKey
@@ -88,6 +97,7 @@ const CODE_LABELS: Record<string, string> = {
 
 const KEY_LABELS: Record<string, string> = {
   enter: "↵",
+  backspace: "⌫",
   escape: "Esc",
   arrowup: "↑",
   arrowdown: "↓",
@@ -121,4 +131,27 @@ export function chordKeys(chord: Chord, mac: boolean = isMacPlatform()): string[
   if (chord.shift) keys.push(glyphs.shift);
   keys.push(chordKeyLabel(chord));
   return keys;
+}
+
+const ARIA_KEY_NAMES: Record<string, string> = {
+  "↵": "Enter",
+  "⌫": "Backspace",
+  Esc: "Escape",
+  "↑": "ArrowUp",
+  "↓": "ArrowDown",
+  "←": "ArrowLeft",
+  "→": "ArrowRight",
+};
+
+/** The chord as an `aria-keyshortcuts` value, such as `Meta+Alt+R`. */
+export function chordAriaShortcut(chord: Chord, mac: boolean = isMacPlatform()): string {
+  const wanted = physicalModifiers(chord, mac);
+  const parts: string[] = [];
+  if (wanted.meta) parts.push("Meta");
+  if (wanted.ctrl) parts.push("Control");
+  if (wanted.alt) parts.push("Alt");
+  if (wanted.shift) parts.push("Shift");
+  const label = chordKeyLabel(chord);
+  parts.push(ARIA_KEY_NAMES[label] ?? label);
+  return parts.join("+");
 }

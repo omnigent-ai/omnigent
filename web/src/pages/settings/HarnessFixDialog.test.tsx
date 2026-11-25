@@ -5,9 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
+import { HARNESS_CREDENTIAL_COPY } from "@/lib/harnessSetup";
 import { authenticatedFetch } from "@/lib/identity";
 import { HarnessFixDialog, type HarnessFixDialogProps } from "./HarnessFixDialog";
-import { harnessFixOwner } from "./search/catalog/harnesses";
+import { HARNESS_DETAIL_ENTRIES } from "./search/catalog/harnesses";
 import { SettingsOverlayOwner } from "./search/settingsOwnership";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -175,7 +176,14 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
 
     expect(screen.getByRole("heading", { name: "Reconfigure Codex" })).toBeVisible();
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toHaveAttribute("aria-checked", "true");
+    const [firstCredential] = Object.values(HARNESS_CREDENTIAL_COPY);
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAccessibleDescription(
+      firstCredential.description,
+    );
     await user.click(screen.getByRole("button", { name: "Authenticate" }));
 
     expect(
@@ -1710,7 +1718,7 @@ describe("HarnessFixDialog as a Settings overlay", () => {
     render(
       <QueryClientProvider client={client}>
         <SettingsOverlayOwner
-          entry={harnessFixOwner("cursor-native", "fixAction")}
+          entry={HARNESS_DETAIL_ENTRIES.entry("cursor-native")}
           opener="fixAction"
         >
           <HarnessFixDialog
@@ -1752,7 +1760,7 @@ describe("HarnessFixDialog's credential step as a Settings overlay", () => {
     render(
       <QueryClientProvider client={client}>
         <SettingsOverlayOwner
-          entry={harnessFixOwner("codex-native", "fixAction")}
+          entry={HARNESS_DETAIL_ENTRIES.entry("codex-native")}
           opener="fixAction"
         >
           <HarnessFixDialog {...baseProps} mode="reconfigure" />

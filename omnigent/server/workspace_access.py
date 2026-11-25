@@ -1,0 +1,83 @@
+"""Who may call each workspace API method through the server.
+
+Checked before a call is forwarded, against the caller's access to the session. A
+method missing from the table is refused without reaching the host, so a new method
+stays unreachable until it is given a level here.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+
+class WorkspaceGate(StrEnum):
+    """The access a method needs.
+
+    ``BROWSE`` is the file routes' gate: edit access, or read access once the owner
+    shares the workspace's files. ``SESSION_OWNER`` passes only the holder of the
+    session's own owner grant, or anyone where permissions are off; an admin doesn't.
+    """
+
+    READ = "read"
+    BROWSE = "browse"
+    SESSION_OWNER = "session_owner"
+
+
+# The pull request reads keep their REST routes' gates. GetPullRequest's overview carries
+# the host account's identities, so only the session's owner reads it here for now. The
+# changes, and the reads that feed their controls, act as the host's account: the owner's.
+METHOD_GATES: dict[str, WorkspaceGate] = {
+    "GetCapabilities": WorkspaceGate.BROWSE,
+    "ListDirectory": WorkspaceGate.BROWSE,
+    "ReadFile": WorkspaceGate.BROWSE,
+    "StatPath": WorkspaceGate.BROWSE,
+    "SearchFiles": WorkspaceGate.BROWSE,
+    "SearchText": WorkspaceGate.BROWSE,
+    "ResolveWorkingCopyBase": WorkspaceGate.BROWSE,
+    "ListWorkingCopyChanges": WorkspaceGate.BROWSE,
+    "ReadBaseFile": WorkspaceGate.BROWSE,
+    "ReadLinkText": WorkspaceGate.BROWSE,
+    "ListRepositoryRefs": WorkspaceGate.BROWSE,
+    "ListBranchCommits": WorkspaceGate.BROWSE,
+    "ResolveRepositoryContext": WorkspaceGate.BROWSE,
+    "GetPullRequest": WorkspaceGate.SESSION_OWNER,
+    "ListPullRequestFiles": WorkspaceGate.BROWSE,
+    "GetPullRequestDiff": WorkspaceGate.BROWSE,
+    "ListPullRequestCommits": WorkspaceGate.BROWSE,
+    "GetCommitDiff": WorkspaceGate.BROWSE,
+    "ComparePullRequestRange": WorkspaceGate.BROWSE,
+    "ListReviewThreads": WorkspaceGate.BROWSE,
+    "ListReviewThreadComments": WorkspaceGate.READ,
+    "ListLabels": WorkspaceGate.SESSION_OWNER,
+    "ListReviewerCandidates": WorkspaceGate.SESSION_OWNER,
+    "GetMergeOptions": WorkspaceGate.SESSION_OWNER,
+    "CreateComment": WorkspaceGate.SESSION_OWNER,
+    "CreateReviewThread": WorkspaceGate.SESSION_OWNER,
+    "ReplyToReviewThread": WorkspaceGate.SESSION_OWNER,
+    "UpdatePullRequestDetails": WorkspaceGate.SESSION_OWNER,
+    "UpdateLabels": WorkspaceGate.SESSION_OWNER,
+    "UpdateReviewers": WorkspaceGate.SESSION_OWNER,
+    "SetPullRequestAccount": WorkspaceGate.SESSION_OWNER,
+    "MergePullRequest": WorkspaceGate.SESSION_OWNER,
+    "MergePullRequestAsAccount": WorkspaceGate.SESSION_OWNER,
+    "DisableAutoMerge": WorkspaceGate.SESSION_OWNER,
+}
+
+
+def gate_for(method: str) -> WorkspaceGate | None:
+    """The access ``method`` needs, or ``None`` for a method the server doesn't forward."""
+    return METHOD_GATES.get(method)
+
+
+def callable_methods(*, browse: bool, session_owner: bool) -> frozenset[str]:
+    """The methods a caller with read access may call, given what else they clear.
+
+    :param browse: Whether the caller clears the file routes' gate.
+    :param session_owner: Whether the caller holds the session's own owner grant.
+    """
+    cleared = {WorkspaceGate.READ}
+    if browse:
+        cleared.add(WorkspaceGate.BROWSE)
+    if session_owner:
+        cleared.add(WorkspaceGate.SESSION_OWNER)
+    return frozenset(name for name, gate in METHOD_GATES.items() if gate in cleared)

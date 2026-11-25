@@ -36,6 +36,13 @@ function defaultWidthPx(): number {
   return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
 }
 
+/** The default width once the window grows by it, which keeps the chat's width unchanged. */
+function defaultWidthInWiderWindowPx(): number {
+  if (typeof window === "undefined") return DEFAULT_SSR_PX;
+  const candidate = Math.round((window.innerWidth * DEFAULT_RATIO) / (1 - DEFAULT_RATIO));
+  return Math.max(DEFAULT_MIN_PX, Math.min(DEFAULT_MAX_PX, candidate));
+}
+
 // Width the panel may not eat into: the sidebar when it's open. Passed down
 // from AppShell so opening the sidebar tightens the ceiling instead of
 // squeezing the chat.
@@ -227,20 +234,15 @@ export function useResizableInlinePanel(
     loadSession(sessionId);
   }, [sessionId]);
 
-  // Re-clamp on viewport resize so the panel can't overflow a shrunken window.
-  // Re-derive the effective width from the persisted preference so widening the
-  // window restores the user's saved choice. Deliberately clamped WITHOUT
-  // `reservedPx`: the store holds the preferred width, and the reserve is
-  // applied at render time, so an open sidebar's squeeze is never written in
-  // (collapsing it restores this width).
+  // Re-clamp the saved choice to the new viewport (without one, the default tracks it).
+  // No `reservedPx` here: the sidebar's squeeze is applied at render time only.
   useEffect(() => {
     function onResize() {
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
-        return base !== null
-          ? clamp(base, minWidthRef.current, 0, chatMinRef.current)
-          : defaultWidthPx();
-      });
+      setStoredWidthRaw(
+        preferredWidth !== null
+          ? clamp(preferredWidth, minWidthRef.current, 0, chatMinRef.current)
+          : null,
+      );
       // Force a re-render even when the stored width is unchanged, so the
       // render-time reserve clamp re-runs against the new viewport.
       bumpViewport();
@@ -357,8 +359,17 @@ export function useResizableInlinePanel(
     [onMouseDown, onKeyDown, persistEnabled],
   );
 
+  // Read when the panel opens, so a window resized since the last render is measured.
+  // The store holds the choice clamped to this viewport; a wider window can fit all of it.
+  const widthInWiderWindow = useCallback(() => {
+    const chosen = sessionId === currentSessionId ? preferredWidth : effectiveRaw;
+    return Math.max(minWidthPx, chosen ?? defaultWidthInWiderWindowPx());
+  }, [sessionId, effectiveRaw, minWidthPx]);
+
   return {
     panelWidth: resolvedWidth,
+    /** How much wider the window must get for the panel to leave the chat its width. */
+    widthInWiderWindow,
     preferredContentWidth: preferredPanelWidth + chatMinWidthPx + GAP_PX,
     handleProps,
     isDragging,

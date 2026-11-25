@@ -1,15 +1,22 @@
 syntax = "proto3";
 
-// Workspace API: read a session's workspace files.
+// Workspace API: read, search and compare a session's workspace files.
 //
 // One implementation serves every route: directly from the desktop app over a
 // local socket, and through the server for every other client. Which session
 // and workspace a call reads comes from its credentials, never from a message.
-// Paths in messages are always relative to the workspace root.
 //
-// v1alpha1 may still change incompatibly.
+// Paths in messages are relative to the workspace root (search results: to
+// the request's `path`), use "/" separators, and are empty for the root. A
+// path that is absolute, contains "..", or resolves through symlinks outside
+// the root is refused with INVALID_ARGUMENT or PERMISSION_DENIED.
+//
+// Clients call GetCapabilities first and skip what a server doesn't list, so a
+// newer client works with an older server. v1alpha1 may still change
+// incompatibly, except that ListDirectory and ReadFile keep their wire shapes.
 package omnigent.api.workspace.v1alpha1;
 
+import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
 service WorkspaceService {
@@ -25,13 +32,282 @@ service WorkspaceService {
 
   // Streams a file: metadata first, then its bytes in order.
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+
+  // Describes one path, as ListDirectory describes its entries.
+  rpc StatPath(StatPathRequest) returns (StatPathResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Finds files by path: ranked fuzzy matches for Go to File, or the REST
+  // file search's case-insensitive substring matches.
+  rpc SearchFiles(SearchFilesRequest) returns (SearchFilesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Streams the lines of workspace files that match a query, in batches.
+  rpc SearchText(SearchTextRequest) returns (stream SearchTextResponse);
+
+  // Git comparisons of the working copy, all read-only. Each answers with a
+  // typed reason, not an error, when no comparison can be made.
+
+  // Resolves a comparison's base and head commits.
+  rpc ResolveWorkingCopyBase(ResolveWorkingCopyBaseRequest) returns (ResolveWorkingCopyBaseResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Lists the files a comparison changes.
+  rpc ListWorkingCopyChanges(ListWorkingCopyChangesRequest) returns (ListWorkingCopyChangesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Streams a file's content at a commit, as ReadFile streams a working file.
+  rpc ReadBaseFile(ReadBaseFileRequest) returns (stream ReadBaseFileResponse);
+
+  // Reads a symlink's own text, without following it.
+  rpc ReadLinkText(ReadLinkTextRequest) returns (ReadLinkTextResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Lists branch and tag names to offer as a comparison's base or head.
+  rpc ListRepositoryRefs(ListRepositoryRefsRequest) returns (ListRepositoryRefsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Lists the commits a head (HEAD by default) has beyond its merge base with a
+  // base, newest first.
+  rpc ListBranchCommits(ListBranchCommitsRequest) returns (ListBranchCommitsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The checked-out branch, its commit, where it pushes, and the remotes, so a
+  // client can find the branch's pull request. Configuration values and remote
+  // URLs never appear in the answer.
+  rpc ResolveRepositoryContext(ResolveRepositoryContextRequest) returns (ResolveRepositoryContextResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Pull requests: one of the session's pull requests on its code host, read or
+  // changed through the host's `gh`. Each answers with the payload the REST route
+  // under /v1/sessions/{id}/resources/github returns, so a client reads both alike.
+  // Only the server's route serves them, for a pull request the session links;
+  // another one answers FAILED_PRECONDITION. GetPullRequest, ListPullRequestFiles
+  // and GetPullRequestDiff read the session's first pull request, or the
+  // workspace branch's, when `pr_url` is empty; the others need it set, as their
+  // REST routes do.
+
+  // The pull request's overview, checks, reviews, labels and merge state. Only
+  // the session's owner may call it, since it lists the host account's identities.
+  rpc GetPullRequest(GetPullRequestRequest) returns (GetPullRequestResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The files the pull request changes.
+  rpc ListPullRequestFiles(ListPullRequestFilesRequest) returns (ListPullRequestFilesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull request's whole diff, or one file's, optionally at a pinned revision.
+  rpc GetPullRequestDiff(GetPullRequestDiffRequest) returns (GetPullRequestDiffResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull request's commits.
+  rpc ListPullRequestCommits(ListPullRequestCommitsRequest) returns (ListPullRequestCommitsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // One of the pull request's commits, as a diff.
+  rpc GetCommitDiff(GetCommitDiffRequest) returns (GetCommitDiffResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The diff between an earlier head of the pull request and its head.
+  rpc ComparePullRequestRange(ComparePullRequestRangeRequest) returns (ComparePullRequestRangeResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull request's review threads, a page at a time.
+  rpc ListReviewThreads(ListReviewThreadsRequest) returns (ListReviewThreadsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // One review thread's comments, a page at a time.
+  rpc ListReviewThreadComments(ListReviewThreadCommentsRequest) returns (ListReviewThreadCommentsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The rest change the pull request, or read what its edit controls offer. Only
+  // the session's owner may call them. A change that the host may have made
+  // before its answer was lost answers UNKNOWN or DEADLINE_EXCEEDED, never
+  // UNAVAILABLE, so a client checks the code host before it retries.
+
+  // The labels the pull request's repository offers, or those matching `text`.
+  rpc ListLabels(ListLabelsRequest) returns (ListLabelsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The people and teams who can be asked to review.
+  rpc ListReviewerCandidates(ListReviewerCandidatesRequest) returns (ListReviewerCandidatesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The merge methods allowed, and the pull request's auto-merge state.
+  rpc GetMergeOptions(GetMergeOptionsRequest) returns (GetMergeOptionsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Posts a comment on the pull request.
+  rpc CreateComment(CreateCommentRequest) returns (CreateCommentResponse);
+
+  // Starts a review thread on a line or range of the diff.
+  rpc CreateReviewThread(CreateReviewThreadRequest) returns (CreateReviewThreadResponse);
+
+  // Replies in a review thread.
+  rpc ReplyToReviewThread(ReplyToReviewThreadRequest) returns (ReplyToReviewThreadResponse);
+
+  // Changes the pull request's title or description.
+  rpc UpdatePullRequestDetails(UpdatePullRequestDetailsRequest) returns (UpdatePullRequestDetailsResponse);
+
+  // Adds and removes labels.
+  rpc UpdateLabels(UpdateLabelsRequest) returns (UpdateLabelsResponse);
+
+  // Requests and removes reviewers.
+  rpc UpdateReviewers(UpdateReviewersRequest) returns (UpdateReviewersResponse);
+
+  // Chooses the code-host account the pull request uses, saved for its repository.
+  rpc SetPullRequestAccount(SetPullRequestAccountRequest) returns (SetPullRequestAccountResponse);
+
+  // Merges the pull request, only while its head is still the expected commit.
+  rpc MergePullRequest(MergePullRequestRequest) returns (MergePullRequestResponse);
+
+  // Merges like MergePullRequest, as a chosen account, which becomes the pull request's account.
+  rpc MergePullRequestAsAccount(MergePullRequestAsAccountRequest) returns (MergePullRequestAsAccountResponse);
+
+  // Turns off the pull request's auto-merge.
+  rpc DisableAutoMerge(DisableAutoMergeRequest) returns (DisableAutoMergeResponse);
+
+  // Adds a draft comment on a line or range to the pending review, starting one if needed,
+  // or a draft reply in a review conversation to the viewer's pending review.
+  rpc AddPendingReviewComment(AddPendingReviewCommentRequest) returns (AddPendingReviewCommentResponse);
+
+  // Adds the session user's reaction to a comment.
+  rpc AddReaction(AddReactionRequest) returns (AddReactionResponse);
+
+  // Deletes a comment.
+  rpc DeleteComment(DeleteCommentRequest) returns (DeleteCommentResponse);
+
+  // Deletes a draft comment from the viewer's pending review.
+  rpc DeletePendingReviewComment(DeletePendingReviewCommentRequest) returns (DeletePendingReviewCommentResponse);
+
+  // Removes the pull request from its merge queue.
+  rpc DequeuePullRequest(DequeuePullRequestRequest) returns (DequeuePullRequestResponse);
+
+  // Deletes the pending review and its draft comments.
+  rpc DiscardPendingReview(DiscardPendingReviewRequest) returns (DiscardPendingReviewResponse);
+
+  // Changes a comment's text, only while it still reads as the client last saw it.
+  rpc EditComment(EditCommentRequest) returns (EditCommentResponse);
+
+  // Turns on auto-merge for each pull request, each only while its head is the one the user saw.
+  rpc EnableAutoMerge(EnableAutoMergeRequest) returns (EnableAutoMergeResponse);
+
+  // Adds the pull request to its base branch's merge queue, at the head the user saw.
+  rpc EnqueuePullRequest(EnqueuePullRequestRequest) returns (EnqueuePullRequestResponse);
+
+  // The pull request's merge queue membership and position.
+  rpc GetMergeQueue(GetMergeQueueRequest) returns (GetMergeQueueResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The merge-readiness checks an installed insights provider reports for a head.
+  rpc GetMergeReadiness(GetMergeReadinessRequest) returns (GetMergeReadinessResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The session's pending review, its head and its draft comments.
+  rpc GetPendingReview(GetPendingReviewRequest) returns (GetPendingReviewResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Diff size, update time, state and checks for list rows, for the session's owner.
+  rpc GetPullRequestListStats(GetPullRequestListStatsRequest) returns (GetPullRequestListStatsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull requests in the same stack as this one, found through their branches.
+  rpc GetPullRequestStack(GetPullRequestStackRequest) returns (GetPullRequestStackResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull requests for a branch of the workspace's own repository.
+  rpc ListBranchPullRequests(ListBranchPullRequestsRequest) returns (ListBranchPullRequestsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // One pull request's title and state by its URL, for the session's owner.
+  rpc LookupPullRequest(LookupPullRequestRequest) returns (LookupPullRequestResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Previews a reviewer ping, and returns the single-use token that sends it.
+  rpc PreviewReviewerPing(PreviewReviewerPingRequest) returns (PreviewReviewerPingResponse);
+
+  // Streams an image the pull request links to: its metadata, then its bytes.
+  rpc ReadPullRequestImage(ReadPullRequestImageRequest) returns (stream ReadPullRequestImageResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Removes the session user's reaction from a comment.
+  rpc RemoveReaction(RemoveReactionRequest) returns (RemoveReactionResponse);
+
+  // An editor's @ and # completions: people (the session's owner only) or the repository's PRs.
+  rpc SearchCompletions(SearchCompletionsRequest) returns (SearchCompletionsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // People and teams who can review the pull request, matching `text`, for the session's owner.
+  rpc SearchReviewers(SearchReviewersRequest) returns (SearchReviewersResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Sends a previewed reviewer ping. Each preview token works once, for a short time.
+  rpc SendReviewerPing(SendReviewerPingRequest) returns (SendReviewerPingResponse);
+
+  // Marks the pull request ready for review, or back to draft.
+  rpc SetPullRequestDraft(SetPullRequestDraftRequest) returns (SetPullRequestDraftResponse);
+
+  // Closes or reopens the pull request.
+  rpc SetPullRequestState(SetPullRequestStateRequest) returns (SetPullRequestStateResponse);
+
+  // Resolves or reopens a review conversation.
+  rpc SetReviewThreadResolved(SetReviewThreadResolvedRequest) returns (SetReviewThreadResolvedResponse);
+
+  // Starts a pending review on the head the user saw.
+  rpc StartPendingReview(StartPendingReviewRequest) returns (StartPendingReviewResponse);
+
+  // Submits the pending review with its verdict, only while its head is the commit the user saw.
+  rpc SubmitPendingReview(SubmitPendingReviewRequest) returns (SubmitPendingReviewResponse);
+
+  // Submits a comment-only review on the head the user saw. APPROVE and
+  // REQUEST_CHANGES are refused by the server before they reach the host.
+  rpc SubmitReview(SubmitReviewRequest) returns (SubmitReviewResponse);
+
+  // Approves or requests changes on the head the user saw, in one review.
+  rpc SubmitReviewVerdict(SubmitReviewVerdictRequest) returns (SubmitReviewVerdictResponse);
+
+  // Changes a draft comment in the viewer's pending review, only while its text is as last read.
+  rpc UpdatePendingReviewComment(UpdatePendingReviewCommentRequest) returns (UpdatePendingReviewCommentResponse);
+
+  // Uploads a file to link from a comment.
+  rpc UploadAttachment(UploadAttachmentRequest) returns (UploadAttachmentResponse);
 }
 
 message GetCapabilitiesRequest {}
 
 message GetCapabilitiesResponse {
-  // Supported method names, e.g. "ListDirectory". Clients treat a missing
-  // name as unsupported and use another route.
+  // Supported method names, e.g. "ListDirectory", and optional features in
+  // lower snake case, e.g. "search_files.fuzzy". Clients treat a missing name
+  // as unsupported and use another route.
   repeated string capabilities = 1;
 }
 
@@ -45,6 +321,16 @@ message ListDirectoryRequest {
 
   // `next_page_token` from the previous response, to continue a listing.
   string page_token = 3;
+
+  // Leave out entries Git ignores. By default they are listed, with
+  // `Entry.ignored` set. Offered with the "gitignore" feature.
+  bool hide_ignored = 4;
+
+  // Fill each directory entry's `leaf_directory_path`, so a tree can show
+  // "a/b/c" on one row without a request per level. Offered with the
+  // "list_directory.collapse_single_child_directories" feature; hosts without
+  // it leave `leaf_directory_path` empty.
+  bool collapse_single_child_directories = 5;
 }
 
 message ListDirectoryResponse {
@@ -67,7 +353,19 @@ message Entry {
   // File size in bytes. Unset for directories and broken symlinks.
   optional int64 size = 4;
 
+  // Seconds precision. For a broken symlink, the link's own time.
   google.protobuf.Timestamp modify_time = 5;
+
+  bool is_symlink = 6;
+
+  // Excluded by .gitignore, .git/info/exclude or the global excludes file,
+  // with Git's semantics. Always false outside a Git repository.
+  bool ignored = 7;
+
+  // With `collapse_single_child_directories`: the deepest directory reached
+  // by following this one while its only entry is another directory. Empty
+  // unless this directory's only entry is a directory.
+  string leaf_directory_path = 8;
 }
 
 enum EntryType {
@@ -79,6 +377,10 @@ enum EntryType {
 message ReadFileRequest {
   // File to read, e.g. "src/main.py".
   string path = 1;
+
+  // Bytes to read at most; 0 means the server's limit. Values above it are
+  // lowered to it. Older hosts ignore this field.
+  uint64 maximum_bytes = 2;
 }
 
 message ReadFileResponse {
@@ -102,6 +404,9 @@ message FileMetadata {
 
   // Guessed from the file name, e.g. "text/markdown". Empty when unknown.
   string content_type = 4;
+
+  // When the file was last modified, when known.
+  google.protobuf.Timestamp modify_time = 5;
 }
 
 enum ContentEncoding {
@@ -110,4 +415,1159 @@ enum ContentEncoding {
   CONTENT_ENCODING_UTF8 = 1;
   // The delivered bytes are not valid UTF-8.
   CONTENT_ENCODING_BINARY = 2;
+}
+
+message StatPathRequest {
+  // Path to describe. Empty for the workspace root.
+  string path = 1;
+}
+
+message StatPathResponse {
+  Entry entry = 1;
+}
+
+enum FileSearchMode {
+  // The default: FILE_SEARCH_MODE_FUZZY.
+  FILE_SEARCH_MODE_UNSPECIFIED = 0;
+  // Ranked fuzzy match over file paths, best first; every whitespace-separated
+  // word must match, ignoring case unless the query has a capital letter.
+  // Feature "search_files.fuzzy".
+  FILE_SEARCH_MODE_FUZZY = 1;
+  // Files and directories whose path contains the query, ignoring case,
+  // sorted by path, as the REST file search returns them. Feature
+  // "search_files.substring".
+  FILE_SEARCH_MODE_SUBSTRING = 2;
+}
+
+message SearchFilesRequest {
+  // A blank query returns nothing in substring mode. In fuzzy mode it returns
+  // files in path order, so a picker can show them before anything is typed.
+  // Feature "search_files.browse".
+  string query = 1;
+
+  FileSearchMode mode = 2;
+
+  // 0 means 500; at most 10,000.
+  uint32 maximum_results = 3;
+
+  // Directory to search under. Empty for the workspace root. Result paths
+  // are relative to it.
+  string path = 4;
+
+  // Globs, one per entry, with the REST file search's syntax, e.g. "*.ts" or
+  // "src/**". When any are set, only matching paths are returned.
+  repeated string include = 5;
+
+  repeated string exclude = 6;
+
+  // Also search files Git ignores.
+  bool include_git_ignored = 7;
+
+  // Workspace-relative directories: results come only from beneath an
+  // include (when any) and never from beneath an exclude.
+  repeated string include_directories = 8;
+  repeated string exclude_directories = 9;
+
+  // Look for untracked files again now, even if a search just did. Send it
+  // once, for the user's retry, not on follow-up requests.
+  bool retry_untracked = 10;
+}
+
+// One match. The entry's path is relative to the request's `path`, and is
+// what the query matched against.
+message FileSearchResult {
+  Entry entry = 1;
+
+  // Higher is better. Zero in substring mode.
+  uint32 score = 2;
+
+  // Indices, in UTF-16 code units, of the entry's path characters that matched,
+  // for highlighting.
+  repeated uint32 matched_indices = 3;
+}
+
+// The statuses describe the file list the results came from.
+message SearchFilesResponse {
+  repeated FileSearchResult results = 1;
+
+  // More results matched than were returned.
+  bool truncated = 2;
+
+  // Paths in the list that was searched.
+  uint64 indexed_paths = 3;
+
+  // The list stopped at its size limit, so some files weren't searched.
+  bool index_incomplete = 4;
+
+  // A newer list is being built or was published since; ask again shortly.
+  bool refreshing = 5;
+
+  // Untracked files couldn't be listed, so new files not yet in Git may be
+  // missing. Ask again with `retry_untracked`.
+  bool untracked_unavailable = 6;
+}
+
+enum SearchOrder {
+  // The default: SEARCH_ORDER_WALK.
+  SEARCH_ORDER_UNSPECIFIED = 0;
+  // One walk of the scope, in no particular order.
+  SEARCH_ORDER_WALK = 1;
+  // `focused_paths` first, then their directories, then the directories with
+  // the most changes against `changed_against`, then the rest. Feature
+  // "text_search_priority".
+  SEARCH_ORDER_PRIORITY = 2;
+}
+
+message SearchTextRequest {
+  // One line, 1 to 4096 characters, and not blank.
+  string query = 1;
+
+  bool case_sensitive = 2;
+
+  // Interpret `query` as a regular expression, not a literal.
+  bool regular_expression = 3;
+
+  bool whole_word = 4;
+
+  // Comma-separated globs, as the REST content search takes them, e.g.
+  // "*.{js,ts}, src/**". An include also searches files ignore rules skip.
+  string include = 5;
+
+  string exclude = 6;
+
+  // Matching lines to return at most; 0 means 500.
+  uint32 maximum_results = 7;
+
+  // Also search files Git ignores.
+  bool include_git_ignored = 8;
+
+  // Workspace-relative directories. The search starts only at the includes
+  // (the whole root when there are none) and never enters an exclude, so
+  // scoping a search in a large repository also makes it faster.
+  repeated string include_directories = 9;
+  repeated string exclude_directories = 10;
+
+  SearchOrder order = 11;
+
+  // Workspace-relative files, the most important first; at most 16 are used.
+  repeated string focused_paths = 12;
+
+  // What changed directories are measured against; unspecified means the
+  // last commit.
+  ComparisonKind changed_against = 13;
+}
+
+// One matching line, for its first match, as the REST content search reports
+// it. Column and offsets count UTF-16 code units.
+message TextSearchMatch {
+  // Path from the workspace root, e.g. "src/main.py".
+  string path = 1;
+
+  // 1-based.
+  uint64 line = 2;
+
+  // 1-based.
+  uint32 column = 3;
+
+  // At most 400 characters of the line around the match, with "…" marking
+  // where it was cut.
+  string text = 4;
+
+  // Where the match starts and ends in `text`.
+  uint32 match_start = 5;
+  uint32 match_end = 6;
+}
+
+// Matches arrive in batches; concatenate every response's `matches`. The
+// last response has `done` set and carries the search's status.
+message SearchTextResponse {
+  repeated TextSearchMatch matches = 1;
+
+  bool done = 2;
+
+  // The search stopped early, so more lines may match.
+  bool truncated = 3;
+
+  // Why results may be incomplete, for the user. Empty when there is nothing
+  // to say.
+  string warning = 4;
+}
+
+enum ComparisonKind {
+  COMPARISON_KIND_UNSPECIFIED = 0;
+  // The last commit (HEAD).
+  COMPARISON_KIND_LAST_COMMIT = 1;
+  // The merge base of HEAD and the default branch: the tracked remote's
+  // default branch, else an upstream naming another branch, else origin/HEAD.
+  COMPARISON_KIND_BRANCH_POINT = 2;
+  // The merge base of `base_revision` and `head_revision`, compared with that
+  // head. Feature "revision_comparison".
+  COMPARISON_KIND_REVISIONS = 3;
+}
+
+// What to compare.
+message Comparison {
+  // Unspecified means COMPARISON_KIND_LAST_COMMIT.
+  ComparisonKind kind = 1;
+
+  // For COMPARISON_KIND_REVISIONS: any revision Git resolves to a commit. An
+  // empty base means the default branch, else HEAD.
+  string base_revision = 2;
+
+  // Empty compares with the working copy.
+  string head_revision = 3;
+}
+
+enum ComparisonProblem {
+  COMPARISON_PROBLEM_UNSPECIFIED = 0;
+  COMPARISON_PROBLEM_NOT_A_REPOSITORY = 1;
+  COMPARISON_PROBLEM_NO_COMMITS = 2;
+  COMPARISON_PROBLEM_NO_DEFAULT_BRANCH = 3;
+  COMPARISON_PROBLEM_NO_BRANCH_POINT = 4;
+  COMPARISON_PROBLEM_MISSING_OBJECT = 5;
+  COMPARISON_PROBLEM_PARTIAL_CLONE_NEEDS_NEWER_GIT = 6;
+  COMPARISON_PROBLEM_TIMEOUT = 7;
+  COMPARISON_PROBLEM_TOO_MANY_FILES = 8;
+  COMPARISON_PROBLEM_LISTING_TOO_LARGE = 9;
+  COMPARISON_PROBLEM_GIT_UNAVAILABLE = 10;
+  COMPARISON_PROBLEM_GIT_FAILED = 11;
+  // A repository nested inside the workspace's own, untracked by it.
+  COMPARISON_PROBLEM_MULTIPLE_REPOSITORIES = 12;
+  // A revision Git must not be asked about, such as one starting with "-".
+  COMPARISON_PROBLEM_INVALID_REVISION = 13;
+  COMPARISON_PROBLEM_BASE_NOT_FOUND = 14;
+  COMPARISON_PROBLEM_HEAD_NOT_FOUND = 15;
+  // The base and head share no commit.
+  COMPARISON_PROBLEM_NO_COMMON_HISTORY = 16;
+}
+
+// Which requested revision a problem is about.
+enum ComparisonField {
+  // The problem isn't about either revision.
+  COMPARISON_FIELD_UNSPECIFIED = 0;
+  COMPARISON_FIELD_BASE = 1;
+  COMPARISON_FIELD_HEAD = 2;
+  COMPARISON_FIELD_BOTH = 3;
+}
+
+// Why no comparison could be made.
+message ComparisonUnavailable {
+  ComparisonProblem problem = 1;
+
+  // For NO_BRANCH_POINT: the ref compared with, and whether the clone is
+  // shallow.
+  string reference = 2;
+  bool shallow = 3;
+
+  // For GIT_FAILED: Git's last error line, or the signal that stopped it.
+  string detail = 4;
+
+  ComparisonField field = 5;
+}
+
+// A resolved comparison. Commits are full object names.
+message WorkingCopyBase {
+  ComparisonKind kind = 1;
+  string head = 2;
+  string base = 3;
+
+  // For the branch point: the ref, e.g. "origin/main", and its commit.
+  string reference = 4;
+  string reference_commit = 5;
+
+  // Set when no comparison could be made; the other fields are then empty.
+  ComparisonUnavailable unavailable = 6;
+
+  // For COMPARISON_KIND_REVISIONS: `base` is the merge base, also in
+  // `merge_base`, and the displays are the revisions as asked for, or as
+  // defaulted.
+  string merge_base = 7;
+  string base_display = 8;
+  string head_display = 9;
+  bool head_is_working_copy = 10;
+}
+
+message ResolveWorkingCopyBaseRequest {
+  Comparison comparison = 1;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 2;
+}
+
+message ResolveWorkingCopyBaseResponse {
+  WorkingCopyBase base = 1;
+}
+
+enum ChangeStatus {
+  CHANGE_STATUS_UNSPECIFIED = 0;
+  CHANGE_STATUS_ADDED = 1;
+  CHANGE_STATUS_MODIFIED = 2;
+  CHANGE_STATUS_DELETED = 3;
+  CHANGE_STATUS_TYPE_CHANGED = 4;
+  CHANGE_STATUS_CONFLICTED = 5;
+}
+
+enum GitEntryKind {
+  // No entry on this side, e.g. the base of an added file.
+  GIT_ENTRY_KIND_UNSPECIFIED = 0;
+  GIT_ENTRY_KIND_FILE = 1;
+  GIT_ENTRY_KIND_SYMLINK = 2;
+  GIT_ENTRY_KIND_SUBMODULE = 3;
+}
+
+enum ChangedFileProblem {
+  // The file can be compared.
+  CHANGED_FILE_PROBLEM_UNSPECIFIED = 0;
+  // A Git filter, such as LFS, changes how this file is stored.
+  CHANGED_FILE_PROBLEM_FILTERED = 1;
+  // The file's base version isn't in this clone.
+  CHANGED_FILE_PROBLEM_MISSING_OBJECT = 2;
+}
+
+message ChangedFile {
+  // Relative to the workspace root.
+  string path = 1;
+
+  ChangeStatus status = 2;
+  GitEntryKind base_kind = 3;
+  GitEntryKind working_kind = 4;
+
+  // The base blob, for ReadBaseFile. Empty for added files.
+  string base_object = 5;
+  optional uint64 base_size = 6;
+
+  optional uint64 lines_added = 7;
+  optional uint64 lines_removed = 8;
+  bool binary = 9;
+  ChangedFileProblem problem = 10;
+
+  // Absent when there is no working file (deleted).
+  WorkingFileMetadata working = 11;
+
+  // For a committed head: the file's blob there, read with ReadBaseFile at
+  // that commit. Absent when the head is the working copy, or the file was
+  // deleted.
+  CommittedFile committed = 12;
+}
+
+message CommittedFile {
+  string object = 1;
+  optional uint64 size = 2;
+}
+
+// A working file's own metadata at listing time, by lstat: a symlink's, not
+// its target's. Any field changing means the file changed since the listing.
+message WorkingFileMetadata {
+  uint64 size = 1;
+  int64 modified_unix_nanos = 2;
+  int64 changed_unix_nanos = 3;
+  uint64 inode = 4;
+  uint64 device = 5;
+}
+
+message ListWorkingCopyChangesRequest {
+  Comparison comparison = 1;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 2;
+}
+
+// Files sorted by path, by byte value; at most 10,000.
+message ListWorkingCopyChangesResponse {
+  WorkingCopyBase base = 1;
+  repeated ChangedFile files = 2;
+
+  // Changed files left out because their names aren't valid UTF-8.
+  uint32 unrepresentable_names = 3;
+}
+
+// A file's content at `commit`, if its tree entry there is the blob `object`.
+// FAILED_PRECONDITION when it isn't; NOT_FOUND when the clone lacks the blob.
+message ReadBaseFileRequest {
+  // A full commit name, e.g. a WorkingCopyBase's `base`.
+  string commit = 1;
+
+  string path = 2;
+
+  // The blob, e.g. a ChangedFile's `base_object`.
+  string object = 3;
+
+  // Bytes to read at most; 0 means the server's limit. A larger blob sends
+  // only metadata, with `truncated` set.
+  uint64 maximum_bytes = 4;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 5;
+}
+
+// As ReadFileResponse: metadata first, then the bytes in order.
+message ReadBaseFileResponse {
+  // Set on the first message only.
+  FileMetadata metadata = 1;
+
+  // The next part of the content. Concatenate every message's `data`.
+  bytes data = 2;
+}
+
+// FAILED_PRECONDITION when the path isn't a symlink.
+message ReadLinkTextRequest {
+  string path = 1;
+}
+
+message ReadLinkTextResponse {
+  // The link's target as stored, which may not be valid UTF-8.
+  bytes target = 1;
+}
+
+message ListRepositoryRefsRequest {
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 1;
+}
+
+// Short branch and tag names, local branches first. At most 1,000.
+message ListRepositoryRefsResponse {
+  repeated string refs = 1;
+  bool truncated = 2;
+
+  // The default branch's short name, e.g. "origin/main"; empty when unknown.
+  string default_branch_ref = 3;
+}
+
+message ListBranchCommitsRequest {
+  // Any revision Git resolves to a commit; empty means the default branch,
+  // else HEAD.
+  string base_revision = 1;
+
+  // The commit whose commits are listed; empty means HEAD. Feature
+  // "branch_commits.head": a server without it lists HEAD's commits.
+  string head_revision = 2;
+
+  // The repository to compare: a directory relative to the workspace root,
+  // such as a worktree inside it. Empty for the workspace's own repository.
+  // Paths in the request and response are then relative to that directory.
+  // INVALID_ARGUMENT when it isn't a folder in the workspace, lies in a Git
+  // directory, or belongs to a repository other than the workspace's own and
+  // its worktrees inside the workspace, and for any folder when the workspace
+  // lies inside a larger repository. Feature "comparison.repository".
+  string repository = 3;
+}
+
+message BranchCommit {
+  // The full object name.
+  string object = 1;
+  string subject = 2;
+  string author_name = 3;
+  int64 author_time_unix = 4;
+
+  // It has no parent; compare it with the empty tree, which a revision
+  // comparison accepts as its base.
+  bool root = 5;
+
+  // The message after the subject line, trimmed: at most 4096 bytes, cut
+  // at a character boundary and ending in "…" when cut. Empty when the
+  // message is the subject alone, when the listing was too large to carry
+  // bodies, and from hosts that predate this field.
+  string body = 6;
+}
+
+// At most 200 commits, newest first. Feature "branch_commits".
+message ListBranchCommitsResponse {
+  // The comparison of the base with HEAD, as for COMPARISON_KIND_REVISIONS;
+  // `unavailable` says why no commits could be listed.
+  WorkingCopyBase base = 1;
+  repeated BranchCommit commits = 2;
+  bool truncated = 3;
+}
+
+message ResolveRepositoryContextRequest {}
+
+enum RepositoryContextProblem {
+  // The context was read.
+  REPOSITORY_CONTEXT_PROBLEM_UNSPECIFIED = 0;
+  REPOSITORY_CONTEXT_PROBLEM_NOT_A_REPOSITORY = 1;
+  // URL rewrites, or remotes and branches defined outside the repository's
+  // own configuration, which the server doesn't resolve.
+  REPOSITORY_CONTEXT_PROBLEM_UNSUPPORTED_CONFIG = 2;
+  // The repository changed while it was read, twice; ask again.
+  REPOSITORY_CONTEXT_PROBLEM_REPOSITORY_CHANGING = 3;
+  REPOSITORY_CONTEXT_PROBLEM_TIMEOUT = 4;
+  REPOSITORY_CONTEXT_PROBLEM_GIT_UNAVAILABLE = 5;
+  REPOSITORY_CONTEXT_PROBLEM_GIT_FAILED = 6;
+}
+
+// Why a branch that may push somewhere has no push target.
+enum PushUnresolved {
+  // Not unresolved: there is a push target, or the branch doesn't push.
+  PUSH_UNRESOLVED_UNSPECIFIED = 0;
+  // Refspecs don't give one destination, or Git reports a different one.
+  PUSH_UNRESOLVED_REFSPEC = 1;
+  // The push URLs don't name one supported repository.
+  PUSH_UNRESOLVED_PUSH_URL = 2;
+  // push.default=matching, which can push many branches.
+  PUSH_UNRESOLVED_PUSH_DEFAULT = 3;
+}
+
+// A remote, as the host, owner and repository its URL names.
+message RepositoryRemote {
+  string name = 1;
+  string host = 2;
+  string owner = 3;
+  string repo = 4;
+}
+
+message PushTarget {
+  string remote_name = 1;
+
+  // The destination branch on the remote, without "refs/heads/".
+  string branch = 2;
+
+  // The repository the branch pushes to, from its push URLs.
+  string host = 3;
+  string owner = 4;
+  string repo = 5;
+
+  // The local tracking ref's commit, or empty when there is none or it
+  // describes a different repository than the push target.
+  string tracking_sha = 6;
+}
+
+message ResolveRepositoryContextResponse {
+  RepositoryContextProblem problem = 1;
+
+  // Without "refs/heads/"; empty when HEAD is detached.
+  string branch = 2;
+
+  // Empty in a repository without commits.
+  string head_sha = 3;
+
+  // Absent when the branch doesn't push, or not unambiguously.
+  PushTarget push = 4;
+  PushUnresolved push_unresolved = 5;
+
+  // The upstream's local tracking ref, only for telling contexts apart; never
+  // evidence of where the branch pushes.
+  string upstream_ref = 6;
+
+  // At most 8; remotes whose URL isn't supported are counted, not listed.
+  repeated RepositoryRemote remotes = 7;
+  uint32 unsupported_remote_count = 8;
+  bool truncated_remotes = 9;
+
+  // The workspace directory below the repository's root, "/"-separated and
+  // ending in "/" unless empty, so a workspace path names a repository path.
+  // Absent from older hosts and when there is a problem.
+  optional string workspace_prefix = 10;
+}
+
+message GetPullRequestRequest {
+  string pr_url = 1;
+}
+
+message GetPullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListPullRequestFilesRequest {
+  string pr_url = 1;
+  // Pins the revision; both empty for the current one.
+  string head_sha = 2;
+  string base_sha = 3;
+}
+
+message ListPullRequestFilesResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPullRequestDiffRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+  string base_sha = 3;
+  // One file's diff, relative to the repository root; empty for the whole diff.
+  string path = 4;
+  // The file's path before a rename.
+  string previous_path = 5;
+  // Without a pull request, the ref the working copy is compared with.
+  string base = 6;
+}
+
+message GetPullRequestDiffResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListPullRequestCommitsRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+}
+
+message ListPullRequestCommitsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetCommitDiffRequest {
+  string pr_url = 1;
+  string commit_sha = 2;
+}
+
+message GetCommitDiffResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ComparePullRequestRangeRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+  // The earlier head the reader last saw.
+  string from_sha = 3;
+}
+
+message ComparePullRequestRangeResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListReviewThreadsRequest {
+  string pr_url = 1;
+  string page_token = 2;
+  string head_sha = 3;
+  string base_sha = 4;
+}
+
+message ListReviewThreadsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListReviewThreadCommentsRequest {
+  string pr_url = 1;
+  string thread_id = 2;
+  string page_token = 3;
+}
+
+message ListReviewThreadCommentsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListLabelsRequest {
+  string pr_url = 1;
+  // Labels whose name matches; unset lists the repository's labels.
+  // Not supported yet: setting this field returns INVALID_ARGUMENT.
+  string text = 2;
+}
+
+message ListLabelsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListReviewerCandidatesRequest {
+  string pr_url = 1;
+}
+
+message ListReviewerCandidatesResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetMergeOptionsRequest {
+  string pr_url = 1;
+}
+
+message GetMergeOptionsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message CreateCommentRequest {
+  string pr_url = 1;
+  // Markdown.
+  string body = 2;
+}
+
+message CreateCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ReviewThreadAnchor {
+  // Relative to the repository root.
+  string path = 1;
+  // "LEFT" for the base, "RIGHT" for the head.
+  string side = 2;
+  int32 line = 3;
+  // The range's first line, before `line`; unset for one line.
+  optional int32 start_line = 4;
+  string head_sha = 5;
+  string base_sha = 6;
+}
+
+message CreateReviewThreadRequest {
+  string pr_url = 1;
+  string body = 2;
+  ReviewThreadAnchor anchor = 3;
+}
+
+message CreateReviewThreadResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ReplyToReviewThreadRequest {
+  string pr_url = 1;
+  string thread_id = 2;
+  string body = 3;
+}
+
+message ReplyToReviewThreadResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UpdatePullRequestDetailsRequest {
+  string pr_url = 1;
+  // Unset fields stay as they are.
+  optional string title = 2;
+  optional string body = 3;
+}
+
+message UpdatePullRequestDetailsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UpdateLabelsRequest {
+  string pr_url = 1;
+  repeated string add = 2;
+  repeated string remove = 3;
+}
+
+message UpdateLabelsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message Reviewer {
+  string login = 1;
+  // "user" or "team".
+  string kind = 2;
+}
+
+message UpdateReviewersRequest {
+  string pr_url = 1;
+  repeated Reviewer add = 2;
+  repeated Reviewer remove = 3;
+}
+
+message UpdateReviewersResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetPullRequestAccountRequest {
+  // Required: the account is saved for this pull request's repository.
+  string pr_url = 1;
+  // An account login; empty keeps the current one.
+  string account = 2;
+  // A remote name. The server's route changes no remote, and answers
+  // INVALID_ARGUMENT when it's set.
+  string remote = 3;
+}
+
+message SetPullRequestAccountResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message MergePullRequestRequest {
+  string pr_url = 1;
+  // "merge", "squash" or "rebase".
+  string merge_method = 2;
+  // The full head commit SHA the user reviewed.
+  string expected_head_oid = 3;
+}
+
+message MergePullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message MergePullRequestAsAccountRequest {
+  string pr_url = 1;
+  string merge_method = 2;
+  string expected_head_oid = 3;
+  // The account login the user confirmed; required.
+  string account = 4;
+}
+
+message MergePullRequestAsAccountResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DisableAutoMergeRequest {
+  string pr_url = 1;
+}
+
+message DisableAutoMergeResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPullRequestListStatsRequest {
+  repeated string pr_urls = 1;
+}
+
+message GetPullRequestListStatsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message LookupPullRequestRequest {
+  string pr_url = 1;
+}
+
+message LookupPullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListBranchPullRequestsRequest {
+  // A branch of the workspace's own repository.
+  string branch = 1;
+}
+
+message ListBranchPullRequestsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SearchReviewersRequest {
+  string pr_url = 1;
+  string text = 2;
+  // At most 20.
+  int32 page_size = 3;
+}
+
+message SearchReviewersResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+// What an editor completion searches for.
+enum CompletionKind {
+  COMPLETION_KIND_UNSPECIFIED = 0;
+  // People, after @.
+  COMPLETION_KIND_MENTION = 1;
+  // The repository's pull requests, after #.
+  COMPLETION_KIND_REFERENCE = 2;
+}
+
+message SearchCompletionsRequest {
+  string pr_url = 1;
+  CompletionKind kind = 2;
+  string text = 3;
+}
+
+message SearchCompletionsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UploadAttachmentRequest {
+  string pr_url = 1;
+  // The file's name, as the link shows it.
+  string name = 2;
+  bytes content = 3;
+}
+
+message UploadAttachmentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SubmitReviewRequest {
+  string pr_url = 1;
+  // "COMMENT"; the server refuses the other events with INVALID_ARGUMENT.
+  string event = 2;
+  string body = 3;
+  // The head commit the review was written against.
+  string commit_oid = 4;
+}
+
+message SubmitReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SubmitReviewVerdictRequest {
+  string pr_url = 1;
+  // "APPROVE" or "REQUEST_CHANGES".
+  string event = 2;
+  string body = 3;
+  string commit_oid = 4;
+}
+
+message SubmitReviewVerdictResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPendingReviewRequest {
+  string pr_url = 1;
+}
+
+message GetPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message StartPendingReviewRequest {
+  string pr_url = 1;
+  string commit_oid = 2;
+}
+
+message StartPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message AddPendingReviewCommentRequest {
+  string pr_url = 1;
+  string body = 2;
+  // The lines a new conversation is on; unset for a reply.
+  ReviewThreadAnchor anchor = 3;
+  // The review conversation on this pull request a draft reply goes in; it joins the viewer's
+  // pending review, which must already exist.
+  string in_reply_to_thread_id = 4;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 5;
+  // The head the client showed; a push since refuses the draft.
+  string expected_head_oid = 6;
+}
+
+message AddPendingReviewCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message UpdatePendingReviewCommentRequest {
+  string pr_url = 1;
+  // The draft's GitHub node ID; it must be in the viewer's pending review on this pull request.
+  string comment_node_id = 2;
+  string body = 3;
+  // SHA-256 of the draft's text the client last saw; the change is refused when it differs.
+  string expected_body_sha256 = 4;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 5;
+}
+
+message UpdatePendingReviewCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DeletePendingReviewCommentRequest {
+  string pr_url = 1;
+  // The draft's GitHub node ID; it must be in the viewer's pending review on this pull request.
+  string comment_node_id = 2;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 3;
+}
+
+message DeletePendingReviewCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SubmitPendingReviewRequest {
+  string pr_url = 1;
+  // "COMMENT", "APPROVE" or "REQUEST_CHANGES".
+  string event = 2;
+  string body = 3;
+  string commit_oid = 4;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 5;
+}
+
+message SubmitPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DiscardPendingReviewRequest {
+  string pr_url = 1;
+  // The viewer's pending review the client saw; the change is refused when it's another.
+  string pending_review_id = 2;
+}
+
+message DiscardPendingReviewResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetPullRequestStateRequest {
+  string pr_url = 1;
+  // "closed" or "open".
+  string state = 2;
+}
+
+message SetPullRequestStateResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetPullRequestDraftRequest {
+  string pr_url = 1;
+  // True to make the pull request a draft again; false to mark it ready.
+  bool draft = 2;
+}
+
+message SetPullRequestDraftResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+// One pull request in an auto-merge batch, with the head the user saw.
+message PullRequestAutoMerge {
+  string pr_url = 1;
+  // "merge", "squash" or "rebase".
+  string merge_method = 2;
+  string expected_head_oid = 3;
+}
+
+message EnableAutoMergeRequest {
+  repeated PullRequestAutoMerge pull_requests = 1;
+}
+
+message EnableAutoMergeResponse {
+  // Each pull request's result, in request order.
+  google.protobuf.Struct payload = 1;
+}
+
+message EnqueuePullRequestRequest {
+  string pr_url = 1;
+  string expected_head_oid = 2;
+}
+
+message EnqueuePullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DequeuePullRequestRequest {
+  string pr_url = 1;
+}
+
+message DequeuePullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetMergeQueueRequest {
+  string pr_url = 1;
+}
+
+message GetMergeQueueResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SetReviewThreadResolvedRequest {
+  string pr_url = 1;
+  string thread_id = 2;
+  bool resolved = 3;
+}
+
+message SetReviewThreadResolvedResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message EditCommentRequest {
+  string pr_url = 1;
+  // "issue" for a conversation comment, "review" for an inline comment.
+  string kind = 2;
+  int64 comment_id = 3;
+  string body = 4;
+  // SHA-256 of the body the client last saw; the edit is refused when it differs.
+  string expected_body_sha256 = 5;
+}
+
+message EditCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message DeleteCommentRequest {
+  string pr_url = 1;
+  // "issue" or "review".
+  string kind = 2;
+  int64 comment_id = 3;
+}
+
+message DeleteCommentResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message AddReactionRequest {
+  string pr_url = 1;
+  // "issue" or "review".
+  string kind = 2;
+  int64 comment_id = 3;
+  // A GitHub reaction, e.g. "THUMBS_UP".
+  string content = 4;
+}
+
+message AddReactionResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message RemoveReactionRequest {
+  string pr_url = 1;
+  string kind = 2;
+  int64 comment_id = 3;
+  string content = 4;
+}
+
+message RemoveReactionResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPullRequestStackRequest {
+  string pr_url = 1;
+}
+
+message GetPullRequestStackResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ReadPullRequestImageRequest {
+  string pr_url = 1;
+  // An image URL the pull request's description or comments link to.
+  string image_url = 2;
+}
+
+message GetMergeReadinessRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+}
+
+message GetMergeReadinessResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message PreviewReviewerPingRequest {
+  string pr_url = 1;
+  string reviewer = 2;
+}
+
+message PreviewReviewerPingResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message SendReviewerPingRequest {
+  string pr_url = 1;
+  string preview_token = 2;
+}
+
+message SendReviewerPingResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+// The first message of a ReadPullRequestImage stream.
+message PullRequestImageMetadata {
+  string content_type = 1;
+  int64 size = 2;
+}
+
+message ReadPullRequestImageResponse {
+  // Set on the first message only.
+  PullRequestImageMetadata metadata = 1;
+  // The next part of the image. Concatenate every message's `data`.
+  bytes data = 2;
 }

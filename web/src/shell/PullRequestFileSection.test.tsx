@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
-import type { FileDiffMetadata } from "@pierre/diffs";
+import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
@@ -88,8 +88,7 @@ function renderSection(
   const fileDiff = {
     name: FILE.path,
     type: "change",
-    unifiedLineCount,
-    hunks: [],
+    hunks: [{ unifiedLineCount }],
   } as unknown as FileDiffMetadata;
   const onToggleCollapsed = vi.fn();
   // Unplaced conversations render their own queries, so the section gets a query client.
@@ -156,11 +155,58 @@ describe("PullRequestFileSection overrides", () => {
     expect(screen.getByTestId("diff")).toBeInTheDocument();
   });
 
+  it("renders a small diff inline however far apart its hunks are", () => {
+    const hunks = [10, 2100, 4224].map(
+      (line) =>
+        `@@ -${line - 3},7 +${line - 3},7 @@\n` +
+        [1, 2, 3].map((offset) => ` context ${line - 4 + offset}\n`).join("") +
+        `-old ${line}\n+new ${line}\n` +
+        [1, 2, 3].map((offset) => ` context ${line + offset}\n`).join(""),
+    );
+    const patch = `diff --git a/${FILE.path} b/${FILE.path}\n--- a/${FILE.path}\n+++ b/${FILE.path}\n${hunks.join("")}`;
+    const [fileDiff] = parsePatchFiles(patch)[0].files;
+    expect(fileDiff.hunks.reduce((rows, hunk) => rows + hunk.unifiedLineCount, 0)).toBe(24);
+
+    renderSection({ forceMount: true, fileDiff });
+    expect(screen.queryByText(/^Large diff/)).toBeNull();
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+  });
+
   it("shows a collapsed file while forced expanded", () => {
     const { rerender } = renderSection({ forceMount: true, collapsed: true });
     expect(screen.queryByTestId("diff")).toBeNull();
     rerender({ forceMount: true, collapsed: true, forceExpanded: true });
     expect(screen.getByRole("button", { name: /app\.ts/, expanded: true })).toBeInTheDocument();
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+  });
+
+  it("keeps a sparse diff inline after its unchanged lines load", async () => {
+    const { hydratePartialDiff } = await import("@pierre/diffs");
+    const changedLines = [10, 1500];
+    const fileText = (marker: string) =>
+      Array.from({ length: 4300 }, (_, index) =>
+        changedLines.includes(index + 1) ? `${marker} ${index + 1}\n` : `context ${index + 1}\n`,
+      ).join("");
+    const context = (from: number) =>
+      [0, 1, 2].map((offset) => ` context ${from + offset}\n`).join("");
+    const hunks = changedLines.map(
+      (line) =>
+        `@@ -${line - 3},7 +${line - 3},7 @@\n${context(line - 3)}` +
+        `-old ${line}\n+new ${line}\n${context(line + 1)}`,
+    );
+    const patch = `diff --git a/${FILE.path} b/${FILE.path}\n--- a/${FILE.path}\n+++ b/${FILE.path}\n${hunks.join("")}`;
+    const [fileDiff] = parsePatchFiles(patch)[0].files;
+    const { rerender } = renderSection({ forceMount: true, fileDiff });
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+
+    // Expanding context hydrates the diff in place, so its file-level count grows to the whole file.
+    hydratePartialDiff("merge", fileDiff, {
+      oldFile: { name: FILE.path, contents: fileText("old") },
+      newFile: { name: FILE.path, contents: fileText("new") },
+    });
+    expect(fileDiff.unifiedLineCount).toBeGreaterThan(LARGE_DIFF_THRESHOLD);
+    rerender({ forceMount: true, fileDiff });
+    expect(screen.queryByText(/^Large diff/)).toBeNull();
     expect(screen.getByTestId("diff")).toBeInTheDocument();
   });
 

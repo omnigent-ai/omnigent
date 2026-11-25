@@ -73,8 +73,9 @@ interface HostsResponse {
 export async function fetchHosts(
   includeSandbox: boolean,
   sourceHostId?: string | null,
+  signal?: AbortSignal,
 ): Promise<Host[]> {
-  const res = await authenticatedFetch("/v1/hosts");
+  const res = await authenticatedFetch("/v1/hosts", signal ? { signal } : undefined);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
   // Hide server-managed sandbox hosts from every host picker: they

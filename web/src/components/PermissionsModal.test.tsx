@@ -19,6 +19,7 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   grantPermission: vi.fn(),
   revokePermission: vi.fn(),
   listAutomationPermissions: vi.fn(),
+  listWorkflowPermissions: vi.fn(),
   grantSharePermission: vi.fn(),
   revokeSharePermission: vi.fn(),
 }));
@@ -64,6 +65,7 @@ const listMock = vi.mocked(api.listPermissions);
 const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
 const listAutomationMock = vi.mocked(api.listAutomationPermissions);
+const listWorkflowMock = vi.mocked(api.listWorkflowPermissions);
 const grantShareMock = vi.mocked(api.grantSharePermission);
 const revokeShareMock = vi.mocked(api.revokeSharePermission);
 
@@ -2011,6 +2013,54 @@ describe("PermissionsModal", () => {
         }
       },
     );
+  });
+
+  describe("sharing a workflow", () => {
+    const workflow = { id: "a".repeat(32), name: "Release" };
+    const workflowTarget = { kind: "workflow", id: workflow.id };
+
+    function grantee(userId: string, displayName = userId) {
+      return { user_id: userId, workflow_id: workflow.id, level: 1, display_name: displayName };
+    }
+
+    it("shares it at Read through the workflow's endpoints, with no public access or link", async () => {
+      listWorkflowMock.mockResolvedValue(grantList([grantee("bob@example.com", "Bob")]));
+      grantShareMock.mockResolvedValue(grantee("carol@example.com"));
+      revokeShareMock.mockResolvedValue(undefined);
+
+      render(<PermissionsModal workflow={workflow} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ workflow_sharing: true }),
+      });
+
+      expect(await screen.findByText("Bob")).toHaveAttribute("title", "bob@example.com");
+      expect(screen.getByRole("heading", { name: "Share this workflow" })).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "The people below can view this workflow, run it and make a copy. Their runs stay private.",
+        ),
+      ).toBeInTheDocument();
+      expect(listWorkflowMock).toHaveBeenCalledWith(workflow.id);
+      expect(listMock).not.toHaveBeenCalled();
+      expect(screen.queryAllByRole("combobox")).toHaveLength(0);
+      expect(screen.getAllByText("Read")).toHaveLength(2);
+      expect(screen.queryByText("General access")).toBeNull();
+      expect(screen.queryByRole("button", { name: /copy link/i })).toBeNull();
+
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(workflowTarget, "carol@example.com", 1),
+      );
+      const revokeButton = screen.getByRole("button", { name: /revoke/i });
+      await waitFor(() => expect(revokeButton).toBeEnabled());
+      fireEvent.click(revokeButton);
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(workflowTarget, "bob@example.com"),
+      );
+      expect(grantMock).not.toHaveBeenCalled();
+    });
   });
 
   describe("a grants list that fails to load", () => {

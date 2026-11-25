@@ -4,9 +4,12 @@
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
 import { ACCOUNT_SETTINGS } from "./account";
+import { ADMIN_SETTINGS } from "./admin";
+import { APPEARANCE_SETTINGS } from "./appearance";
 import { ARCHIVED_SETTINGS } from "./archived";
 import { CLI_SETTINGS } from "./cli";
 import { CUSTOM_AGENTS_SETTINGS } from "./customAgents";
+import { GENERAL_SETTINGS } from "./general";
 import { GIT_SETTINGS } from "./git";
 import { HARNESS_SETTINGS } from "./harnesses";
 import { IMPORT_SETTINGS } from "./import";
@@ -15,21 +18,23 @@ import { MCP_SETTINGS } from "./mcp";
 import { MEMBERS_SETTINGS } from "./members";
 import { POLICIES_SETTINGS } from "./policies";
 import { SHARING_SETTINGS } from "./sharing";
+import { SHORTCUTS_SETTINGS } from "./shortcuts";
 import type { SettingsEntry } from "./types";
 import { UPDATES_SETTINGS } from "./updates";
 
 export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly SettingsEntry[]>> = {
-  appearance: [],
+  appearance: APPEARANCE_SETTINGS,
   harnesses: HARNESS_SETTINGS,
   "custom-agents": CUSTOM_AGENTS_SETTINGS,
-  general: [],
+  general: GENERAL_SETTINGS,
   git: GIT_SETTINGS,
   integrations: INTEGRATION_SETTINGS,
   mcp: MCP_SETTINGS,
-  shortcuts: [],
+  // Its other rows are generated from the shortcut registry; see shortcutEntries.ts.
+  shortcuts: SHORTCUTS_SETTINGS,
   import: IMPORT_SETTINGS,
   account: ACCOUNT_SETTINGS,
-  admin: [],
+  admin: ADMIN_SETTINGS,
   members: MEMBERS_SETTINGS,
   policies: POLICIES_SETTINGS,
   sharing: SHARING_SETTINGS,

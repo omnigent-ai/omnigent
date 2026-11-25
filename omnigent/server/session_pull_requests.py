@@ -43,8 +43,8 @@ _RELATIONSHIPS = frozenset({"created", "worked_on", "attached", "inferred"})
 FRESHNESS_S = 300.0
 _ATTEMPTS_MAX = 10_000
 
-# custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
-_stores: dict[str, SessionPullRequestStore] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by database URLs; queries scope rows
+_stores: dict[tuple[str, str | None], SessionPullRequestStore] = {}
 _stores_lock = threading.Lock()
 
 
@@ -52,20 +52,25 @@ def open_store(conversation_store: object) -> SessionPullRequestStore | None:
     """Return the PR store beside the session metadata, or ``None`` without a SQL backend.
 
     :param conversation_store: The server's conversation store; PRs live in the
-        database at its ``storage_location``.
+        database at its ``storage_location`` and run labels at its
+        ``conversation_storage_location``.
     """
     location = getattr(conversation_store, "storage_location", None)
     if not isinstance(location, str) or not location:
         return None
+    conversation_location = getattr(conversation_store, "conversation_storage_location", None)
+    if not isinstance(conversation_location, str) or not conversation_location:
+        conversation_location = None
+    key = (location, conversation_location)
     with _stores_lock:
-        store = _stores.get(location)
+        store = _stores.get(key)
         if store is None:
             try:
-                store = SessionPullRequestStore(location)
+                store = SessionPullRequestStore(location, conversation_location)
             except Exception:
                 _logger.warning("Session pull request storage is unavailable", exc_info=True)
                 return None
-            _stores[location] = store
+            _stores[key] = store
         return store
 
 

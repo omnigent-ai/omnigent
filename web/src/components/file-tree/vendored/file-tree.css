@@ -1,0 +1,561 @@
+/*
+ * Styles for the vendored file tree (see README.md). Every rule is scoped under
+ * [data-file-tree]. Hosts theme the tree by setting the --trees-*-override
+ * custom properties on the root element.
+ */
+
+[data-file-tree] {
+  --trees-accent: var(--trees-accent-override, #009fff);
+  --trees-fg: var(--trees-fg-override, light-dark(#6c6c71, #adadb1));
+  --trees-fg-muted: var(--trees-fg-muted-override, #84848a);
+  --trees-bg: var(--trees-bg-override, light-dark(#f8f8f8, #141415));
+  --trees-bg-muted: var(
+    --trees-bg-muted-override,
+    light-dark(
+      color-mix(in lab, var(--trees-accent) 8%, var(--trees-bg)),
+      color-mix(in lab, var(--trees-accent) 10%, var(--trees-bg))
+    )
+  );
+  --trees-selected-fg: var(--trees-selected-fg-override, var(--trees-fg));
+  --trees-selected-bg: var(
+    --trees-selected-bg-override,
+    light-dark(
+      color-mix(in lab, var(--trees-accent) 12%, var(--trees-bg)),
+      color-mix(in lab, var(--trees-accent) 15%, var(--trees-bg))
+    )
+  );
+  --trees-focus-ring-color: var(--trees-focus-ring-color-override, var(--trees-accent));
+  --trees-focus-ring-width: var(--trees-focus-ring-width-override, 1px);
+  --trees-focus-ring-offset: var(--trees-focus-ring-offset-override, -1px);
+  --trees-indent-guide-bg: var(
+    --trees-indent-guide-bg-override,
+    color-mix(in lab, var(--trees-fg-muted) 25%, transparent)
+  );
+  --trees-scrollbar-thumb: var(
+    --trees-scrollbar-thumb-override,
+    color-mix(in lab, var(--trees-fg) 25%, var(--trees-bg))
+  );
+
+  --trees-git-added-color: var(--trees-git-added-color-override, light-dark(#16a994, #00cab1));
+  --trees-git-deleted-color: var(--trees-git-deleted-color-override, light-dark(#ff2e3f, #ff6762));
+  --trees-git-ignored-color: var(--trees-git-ignored-color-override, light-dark(#adadb1, #4a4a4e));
+  --trees-git-modified-color: var(
+    --trees-git-modified-color-override,
+    light-dark(#1ca1c7, #08c0ef)
+  );
+  --trees-git-renamed-color: var(--trees-git-renamed-color-override, light-dark(#d5a910, #ffd452));
+  --trees-git-untracked-color: var(
+    --trees-git-untracked-color-override,
+    light-dark(#16a994, #00cab1)
+  );
+
+  --trees-icon-gray: light-dark(#84848a, #adadb1);
+  --trees-icon-red: light-dark(#d52c36, #ff6762);
+  --trees-icon-vermilion: light-dark(#ff8c5b, #d5512f);
+  --trees-icon-orange: light-dark(#d47628, #ffa359);
+  --trees-icon-yellow: light-dark(#d5a910, #ffd452);
+  --trees-icon-green: light-dark(#199f43, #5ecc71);
+  --trees-icon-teal: light-dark(#17a5af, #64d1db);
+  --trees-icon-cyan: light-dark(#1ca1c7, #68cdf2);
+  --trees-icon-blue: light-dark(#1a85d4, #69b1ff);
+  --trees-icon-indigo: light-dark(#693acf, #9d6afb);
+  --trees-icon-purple: light-dark(#a631be, #d568ea);
+  --trees-icon-pink: light-dark(#d32a61, #ff678d);
+  --trees-icon-mauve: light-dark(#594c5b, #79697b);
+
+  --trees-font-family: var(--trees-font-family-override, system-ui);
+  --trees-font-size: var(--trees-font-size-override, 13px);
+  --trees-font-weight-semibold: var(--trees-font-weight-semibold-override, 600);
+  --trees-border-radius: var(--trees-border-radius-override, 6px);
+  --trees-row-height: var(--trees-item-height, 30px);
+  --trees-level-gap: var(--trees-level-gap-override, 8px);
+  --trees-item-padding-x: var(--trees-item-padding-x-override, 8px);
+  --trees-item-margin-x: var(--trees-item-margin-x-override, 2px);
+  --trees-item-row-gap: var(--trees-item-row-gap-override, 6px);
+  --trees-icon-width: var(--trees-icon-width-override, 16px);
+  --trees-icon-nudge: var(--trees-icon-nudge-override, 1px);
+  --trees-git-lane-width: var(--trees-git-lane-width-override, 12px);
+  --trees-scrollbar-gutter: var(--trees-scrollbar-gutter-override, 6px);
+  --trees-padding-inline: var(--trees-padding-inline-override, 16px);
+
+  color-scheme: light dark;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  outline: none;
+  color: var(--trees-fg);
+  background-color: var(--trees-bg);
+  font-family: var(--trees-font-family);
+  font-size: var(--trees-font-size);
+}
+
+/* Long names truncate in the middle, so rows never scroll sideways. */
+[data-file-tree-scroll] {
+  --trees-scrollbar-thumb-current: transparent;
+  position: relative;
+  flex: 1 1 0;
+  /* Fills the root even when a host stylesheet makes it a block. */
+  height: 100%;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  padding-inline: max(calc(var(--trees-padding-inline) - var(--trees-item-margin-x)), 0px)
+    max(
+      calc(
+        var(--trees-padding-inline) - var(--trees-item-margin-x) - var(--trees-scrollbar-gutter)
+      ),
+      0px
+    );
+
+  &:hover {
+    --trees-scrollbar-thumb-current: var(--trees-scrollbar-thumb);
+  }
+
+  &::-webkit-scrollbar {
+    width: var(--trees-scrollbar-gutter);
+  }
+
+  &::-webkit-scrollbar:horizontal {
+    height: 0;
+  }
+
+  &::-webkit-scrollbar-track,
+  &::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background-color: var(--trees-scrollbar-thumb-current);
+    border: 1px solid transparent;
+    background-clip: content-box;
+    border-radius: calc(var(--trees-scrollbar-gutter) / 2);
+  }
+}
+
+[data-file-tree-list] {
+  position: relative;
+  min-height: 100%;
+  width: 100%;
+  overflow-anchor: none;
+}
+
+[data-file-tree-window] {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  will-change: transform;
+}
+
+[data-file-tree] [data-type="item"] {
+  position: relative;
+  display: flex;
+  flex: 0 0 var(--trees-row-height);
+  align-items: center;
+  gap: var(--trees-item-row-gap);
+  height: var(--trees-row-height);
+  margin: 0 var(--trees-item-margin-x);
+  padding: 0 var(--trees-item-padding-x);
+  border: none;
+  border-radius: var(--trees-border-radius);
+  outline: none;
+  color: inherit;
+  background-color: var(--trees-bg);
+  font: inherit;
+  line-height: var(--trees-row-height);
+  text-align: start;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+
+  &:hover {
+    background-color: var(--trees-bg-muted);
+  }
+
+  &:focus-visible {
+    z-index: 2;
+
+    &::before {
+      position: absolute;
+      inset: 0;
+      content: "";
+      border-radius: var(--trees-border-radius);
+      outline: var(--trees-focus-ring-width) solid var(--trees-focus-ring-color);
+      outline-offset: var(--trees-focus-ring-offset);
+      pointer-events: none;
+    }
+  }
+
+  &[aria-selected="true"] {
+    z-index: 3;
+    color: var(--trees-selected-fg);
+    background-color: var(--trees-selected-bg);
+
+    [data-item-section="icon"] {
+      color: var(--trees-selected-fg);
+    }
+  }
+
+  &[aria-selected="true"]:has(+ [aria-selected="true"]) {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+
+  &[aria-selected="true"] + &[aria-selected="true"] {
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+  }
+}
+
+[data-file-tree] [data-item-section="spacing"] {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  padding-left: calc(var(--trees-icon-width) / 2 - 0.5px);
+}
+
+[data-file-tree] [data-item-section="spacing-item"] {
+  display: inline-block;
+  height: 100%;
+  margin-right: calc(var(--trees-level-gap) - 1px);
+  border-left: 1px solid var(--trees-indent-guide-bg);
+  opacity: 0;
+  transition: opacity 150ms ease;
+
+  & + & {
+    margin-left: calc(var(--trees-item-row-gap) + var(--trees-icon-width) / 2 - 0.5px);
+  }
+}
+
+[data-file-tree]:hover [data-item-section="spacing-item"] {
+  opacity: 0.75;
+}
+
+[data-file-tree] [data-item-section="spacing-item"][data-active-guide] {
+  opacity: 1;
+}
+
+[data-file-tree] [data-item-section="icon"] {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: var(--trees-icon-width);
+  color: var(--trees-fg-muted);
+  fill: currentColor;
+}
+
+[data-file-tree] [data-icon-name="file-tree-icon-chevron"] {
+  transform: translateY(var(--trees-icon-nudge));
+}
+
+[data-file-tree] [aria-expanded="false"] [data-icon-name="file-tree-icon-chevron"] {
+  transform: rotate(-90deg)
+    translate(calc(var(--trees-icon-nudge) / -2), calc(var(--trees-icon-nudge) / 2));
+}
+
+[data-file-tree] [data-item-section="content"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+[data-file-tree] [data-item-flattened-subitems] {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Middle truncation: each part ellipsizes itself; the start gives way first. */
+[data-file-tree] [data-truncate-group-container="middle"] {
+  display: flex;
+  min-width: 0;
+
+  > span {
+    min-width: 0;
+  }
+
+  > [data-truncate-segment-priority="1"] {
+    flex: 0 1 max-content;
+  }
+
+  > [data-truncate-segment-priority="2"] {
+    flex: 0 999999 max-content;
+  }
+}
+
+[data-file-tree] [data-truncate-container] {
+  display: block;
+  min-width: 0;
+}
+
+[data-file-tree] [data-truncate-content="visible"] {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The end clips from its start, so its ellipsis sits before what stays. */
+[data-file-tree] [data-truncate-container="fruncate"] [data-truncate-content] {
+  direction: rtl;
+
+  > span {
+    unicode-bidi: plaintext;
+  }
+}
+
+[data-file-tree] [data-item-section="decoration"] {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-left: auto;
+  color: var(--trees-fg-muted);
+
+  > span {
+    display: inline-flex;
+    gap: 0.25em;
+  }
+
+  & ~ [data-item-section="git"] {
+    margin-left: 0;
+  }
+}
+
+/* The row under the actions button keeps room for it, so the button never covers its name. */
+[data-file-tree] [data-type="item"][data-item-has-menu-button] {
+  padding-inline-end: calc(var(--trees-item-padding-x) + var(--trees-row-height));
+}
+
+/* Pointing at the button still reads as pointing at its row; a selected row keeps its highlight. */
+[data-file-tree]:has([data-type="context-menu-trigger"]:hover)
+  [data-type="item"][data-item-has-menu-button]:not([aria-selected="true"]) {
+  background-color: var(--trees-bg-muted);
+}
+
+/* One actions button follows the hovered or focused row. */
+[data-file-tree] [data-type="context-menu-trigger"] {
+  position: absolute;
+  right: var(--trees-item-margin-x);
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--trees-row-height);
+  padding: 0;
+  border: none;
+  border-radius: var(--trees-border-radius);
+  color: var(--trees-fg-muted);
+  background-color: var(--trees-bg-muted);
+  fill: currentColor;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--trees-fg);
+  }
+}
+
+[data-file-tree] [data-item-section="git"] {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: var(--trees-git-lane-width);
+  margin-left: auto;
+}
+
+[data-file-tree] [data-item-contains-git-change] > [data-item-section="git"] {
+  color: var(--trees-git-modified-color);
+  opacity: 0.5;
+  fill: currentColor;
+}
+
+/* Nudges the dot to sit on the likely lowercase x-height. */
+[data-file-tree] [data-item-section="git"] [data-icon-name="file-tree-icon-dot"] {
+  transform: translateY(calc(0.65ex - 50%));
+}
+
+[data-file-tree] [data-item-git-status] {
+  /* :where keeps per-language icon colors winning over the status color. */
+  > :where([data-item-section="icon"]) > :where(:not([data-icon-name="file-tree-icon-chevron"])),
+  > [data-item-section="content"] {
+    color: var(--trees-item-git-status-color);
+  }
+
+  > [data-item-section="git"] {
+    color: var(--trees-item-git-status-color);
+    font-weight: var(--trees-font-weight-semibold);
+  }
+}
+
+[data-file-tree] [data-item-git-status="added"] {
+  --trees-item-git-status-color: var(--trees-git-added-color);
+}
+[data-file-tree] [data-item-git-status="deleted"] {
+  --trees-item-git-status-color: var(--trees-git-deleted-color);
+}
+[data-file-tree] [data-item-git-status="modified"] {
+  --trees-item-git-status-color: var(--trees-git-modified-color);
+}
+[data-file-tree] [data-item-git-status="renamed"] {
+  --trees-item-git-status-color: var(--trees-git-renamed-color);
+}
+[data-file-tree] [data-item-git-status="untracked"] {
+  --trees-item-git-status-color: var(--trees-git-untracked-color);
+}
+[data-file-tree] [data-item-git-status="ignored"] {
+  --trees-item-git-status-color: var(--trees-git-ignored-color);
+
+  > [data-item-section="icon"] {
+    opacity: 0.5;
+  }
+}
+
+/* Per-language file icon colors. */
+[data-file-tree-colored-icons] [data-icon-token="astro"] {
+  color: var(--trees-icon-purple);
+}
+[data-file-tree-colored-icons] [data-icon-token="babel"] {
+  color: var(--trees-icon-yellow);
+}
+[data-file-tree-colored-icons] [data-icon-token="bash"] {
+  color: var(--trees-icon-green);
+}
+[data-file-tree-colored-icons] [data-icon-token="biome"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="bootstrap"] {
+  color: var(--trees-icon-indigo);
+}
+[data-file-tree-colored-icons] [data-icon-token="browserslist"] {
+  color: var(--trees-icon-yellow);
+}
+[data-file-tree-colored-icons] [data-icon-token="bun"] {
+  color: var(--trees-icon-mauve);
+}
+[data-file-tree-colored-icons] [data-icon-token="c"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="cpp"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="claude"] {
+  color: var(--trees-icon-orange);
+}
+[data-file-tree-colored-icons] [data-icon-token="css"] {
+  color: var(--trees-icon-indigo);
+}
+[data-file-tree-colored-icons] [data-icon-token="database"] {
+  color: var(--trees-icon-purple);
+}
+[data-file-tree-colored-icons] [data-icon-token="docker"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="eslint"] {
+  color: var(--trees-icon-indigo);
+}
+[data-file-tree-colored-icons] [data-icon-token="git"] {
+  color: var(--trees-icon-vermilion);
+}
+[data-file-tree-colored-icons] [data-icon-token="go"] {
+  color: var(--trees-icon-cyan);
+}
+[data-file-tree-colored-icons] [data-icon-token="graphql"] {
+  color: var(--trees-icon-pink);
+}
+[data-file-tree-colored-icons] [data-icon-token="html"] {
+  color: var(--trees-icon-orange);
+}
+[data-file-tree-colored-icons] [data-icon-token="image"] {
+  color: var(--trees-icon-pink);
+}
+[data-file-tree-colored-icons] [data-icon-token="javascript"] {
+  color: var(--trees-icon-yellow);
+}
+[data-file-tree-colored-icons] [data-icon-token="json"] {
+  color: var(--trees-icon-orange);
+}
+[data-file-tree-colored-icons] [data-icon-token="markdown"] {
+  color: var(--trees-icon-green);
+}
+[data-file-tree-colored-icons] [data-icon-token="mcp"] {
+  color: var(--trees-icon-teal);
+}
+[data-file-tree-colored-icons] [data-icon-token="npm"] {
+  color: var(--trees-icon-red);
+}
+[data-file-tree-colored-icons] [data-icon-token="oxc"] {
+  color: var(--trees-icon-cyan);
+}
+[data-file-tree-colored-icons] [data-icon-token="postcss"] {
+  color: var(--trees-icon-red);
+}
+[data-file-tree-colored-icons] [data-icon-token="prettier"] {
+  color: var(--trees-icon-teal);
+}
+[data-file-tree-colored-icons] [data-icon-token="python"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="react"] {
+  color: var(--trees-icon-cyan);
+}
+[data-file-tree-colored-icons] [data-icon-token="ruby"] {
+  color: var(--trees-icon-red);
+}
+[data-file-tree-colored-icons] [data-icon-token="rust"] {
+  color: var(--trees-icon-orange);
+}
+[data-file-tree-colored-icons] [data-icon-token="sass"] {
+  color: var(--trees-icon-pink);
+}
+[data-file-tree-colored-icons] [data-icon-token="svg"] {
+  color: var(--trees-icon-orange);
+}
+[data-file-tree-colored-icons] [data-icon-token="svelte"] {
+  color: var(--trees-icon-red);
+}
+[data-file-tree-colored-icons] [data-icon-token="svgo"] {
+  color: var(--trees-icon-green);
+}
+[data-file-tree-colored-icons] [data-icon-token="swift"] {
+  color: var(--trees-icon-orange);
+}
+[data-file-tree-colored-icons] [data-icon-token="table"] {
+  color: var(--trees-icon-teal);
+}
+[data-file-tree-colored-icons] [data-icon-token="text"] {
+  color: var(--trees-icon-gray);
+}
+[data-file-tree-colored-icons] [data-icon-token="tailwind"] {
+  color: var(--trees-icon-cyan);
+}
+[data-file-tree-colored-icons] [data-icon-token="terraform"] {
+  color: var(--trees-icon-indigo);
+}
+[data-file-tree-colored-icons] [data-icon-token="typescript"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="vite"] {
+  color: var(--trees-icon-purple);
+}
+[data-file-tree-colored-icons] [data-icon-token="vscode"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="vue"] {
+  color: var(--trees-icon-green);
+}
+[data-file-tree-colored-icons] [data-icon-token="wasm"] {
+  color: var(--trees-icon-indigo);
+}
+[data-file-tree-colored-icons] [data-icon-token="webpack"] {
+  color: var(--trees-icon-blue);
+}
+[data-file-tree-colored-icons] [data-icon-token="yml"] {
+  color: var(--trees-icon-red);
+}
+[data-file-tree-colored-icons] [data-icon-token="zig"] {
+  color: var(--trees-icon-orange);
+}
+[data-file-tree-colored-icons] [data-icon-token="zip"] {
+  color: var(--trees-icon-orange);
+}

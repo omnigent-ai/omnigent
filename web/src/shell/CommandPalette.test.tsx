@@ -1,16 +1,20 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import type { ComponentProps, ReactNode } from "react";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
+import { type ComponentProps, type ReactNode, useState } from "react";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
+import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
+import { useWorkspaceHistoryCommands } from "./workspaceCommands/useWorkspaceHistoryCommands";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
+  useLocation: () => ({ pathname: "/", search: "", hash: "", state: null, key: "default" }),
 }));
 
 const useConversations = vi.fn();
@@ -24,6 +28,12 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
   useProjects: (...args: unknown[]) => useProjects(...args),
+}));
+
+let sidebarSessions: { pages: { data: unknown[] }[] } | undefined;
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: () => sidebarSessions,
 }));
 
 function conv(
@@ -65,7 +75,8 @@ function searchPages(...pages: (ReturnType<typeof conv> & Partial<Conversation>)
   return { data: { pages: pages.map((data) => ({ data })) } };
 }
 
-const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8 };
+// ⌘K's own search keeps archived sessions, as the server does by default.
+const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8, includeArchived: true };
 
 /** Find a session row by its full label text even when the highlighter has
     split it around a <mark> (so the text lives across several nodes). */
@@ -96,6 +107,7 @@ function withQueryClient(queryClient = new QueryClient()) {
 
 beforeEach(() => {
   navigate.mockClear();
+  sidebarSessions = undefined;
   useConversations.mockReset();
   useSessionSearch.mockReset();
   useProjects.mockReturnValue({ data: [] });
@@ -103,7 +115,11 @@ beforeEach(() => {
   setSessions([]);
   setSearchGroups({});
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // QuickPick records accepted commands under Recent; a later case starts without them.
+  localStorage.clear();
+});
 
 /** Every non-empty live region's text, so both palettes' status messages read the same. */
 const announced = () =>
@@ -115,7 +131,7 @@ const announced = () =>
 
 describe("CommandPalette — sessions", () => {
   it.each([false, true])(
-    "requests active sessions and keeps owned and shared results (sessionsOnly=%s)",
+    "keeps owned and shared sessions, and archived ones only in ⌘K (sessionsOnly=%s)",
     (sessionsOnly) => {
       const sessions = [
         { ...conv("owned", "Owned session"), owner: "current-user", permission_level: 4 },
@@ -125,12 +141,83 @@ describe("CommandPalette — sessions", () => {
       setSessions(sessions);
       renderPalette({ sessionsOnly });
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", !sessionsOnly, { enabled: true });
       expect(screen.getByText("Owned session")).toBeTruthy();
       expect(screen.getByText("Shared session")).toBeTruthy();
-      expect(screen.queryByText("Archived session")).toBeNull();
+      if (sessionsOnly) {
+        expect(screen.queryByText("Archived session")).toBeNull();
+      } else {
+        expect(labelRow("Archived session").closest('[role="option"]')?.textContent).toContain(
+          "Archived",
+        );
+      }
     },
   );
+
+  it("lists a just-archived session first among the recent sessions and opens it", () => {
+    // Archiving bumps updated_at, so the session lands above older activity.
+    setSessions([
+      ...Array.from({ length: 5 }, (_, index) => ({
+        ...conv(`active-${index}`, `Active ${index}`),
+        updated_at: 10 - index,
+      })),
+      { ...conv("mistake", "Archived too early"), archived: true, updated_at: 20 },
+    ]);
+    const { onOpenChange } = renderPalette();
+
+    const rows = screen
+      .getAllByRole("option")
+      .map((option) => option.textContent ?? "")
+      .filter((text) => text.includes("Active") || text.includes("Archived too early"));
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toContain("Archived too early");
+    expect(rows[0]).toContain("Archived");
+    expect(rows.slice(1).some((text) => text.includes("Archived"))).toBe(false);
+    expect(screen.queryByText("Active 4")).toBeNull();
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/mistake");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("shows the sidebar's loaded sessions until the archived-inclusive list loads", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />, { wrapper: withQueryClient() });
+
+    expect(screen.getByText("Cached session")).toBeTruthy();
+
+    // Once loaded, the list replaces the sidebar's rows, even when it's empty.
+    setSessions([]);
+    rerender(<CommandPalette {...props} />);
+    expect(screen.queryByText("Cached session")).toBeNull();
+  });
+
+  it("doesn't fill Find a session's list from the sidebar", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
+    renderPalette({ sessionsOnly: true });
+
+    expect(screen.queryByText("Cached session")).toBeNull();
+  });
+
+  it("keeps the row of a session opened from the recent list for the sidebar to list", () => {
+    const archived = { ...conv("archived", "Archived session"), archived: true, owner: "me" };
+    setSessions([archived]);
+    const queryClient = new QueryClient();
+    renderPalette({}, queryClient);
+
+    fireEvent.click(labelRow("Archived session"));
+
+    expect(navigate).toHaveBeenCalledWith("/c/archived");
+    expect(queryClient.getQueryData(["conversation-backfill", "archived"])).toEqual(archived);
+  });
 
   it.each([false, true])(
     "shows project and parent context without needing the parent in results (sessionsOnly=%s)",
@@ -411,7 +498,7 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", true, { enabled: true });
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
@@ -645,6 +732,21 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     expect(screen.getByLabelText("Close search")).toBeTruthy();
   });
 
+  it("pins the mobile sheet to the top of the visible viewport in the iOS app", () => {
+    // The iOS app's dialogs center on the keyboard-aware viewport inline; the sheet must not.
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    setMobile(true);
+    renderPalette();
+
+    const style = (dialogContent() as HTMLElement | null)?.style;
+    expect(style?.top).toBe("0px");
+    expect(style?.height).toBe("var(--omnigent-viewport-height, 100dvh)");
+    expect(style?.maxHeight).toBe("var(--omnigent-viewport-height, 100dvh)");
+  });
+
   it("keeps the centered dialog and shows no close button on desktop", () => {
     setMobile(false);
     renderPalette();
@@ -758,7 +860,11 @@ describe("CommandPalette — title and content groups", () => {
 
   it("does not search while the palette is closed or listing sessions only", () => {
     renderPalette({ open: false });
-    expect(useSessionSearch).toHaveBeenCalledWith("", "title", { enabled: false, limit: 8 });
+    expect(useSessionSearch).toHaveBeenCalledWith("", "title", {
+      enabled: false,
+      limit: 8,
+      includeArchived: true,
+    });
     cleanup();
     useSessionSearch.mockClear();
     renderPalette({ sessionsOnly: true });
@@ -766,6 +872,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenLastCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
   });
 
@@ -1023,6 +1130,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
     expect(screen.queryByText("In messages")).toBeNull();
     const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
@@ -1163,4 +1271,132 @@ describe("CommandPalette — empty state", () => {
 
     expect(screen.getByText("No results found")).toBeTruthy();
   });
+});
+
+describe("CommandPalette — commands a mounted feature offers", () => {
+  const BACK_ONLY: WorkspaceHistoryFacts = {
+    back: { target: "Files", waitingForPage: false },
+    forward: { target: null, waitingForPage: false },
+  };
+
+  const FORWARD_ONLY: WorkspaceHistoryFacts = {
+    back: { target: null, waitingForPage: false },
+    forward: { target: "Files", waitingForPage: false },
+  };
+
+  /** The tabs sidebar's Back and Forward, registered as its host registers them. */
+  function WorkspaceHistory({ go, facts }: { go: () => void; facts: WorkspaceHistoryFacts }) {
+    useWorkspaceHistoryCommands({ conversationId: "conv_a", facts, go }, true);
+    return null;
+  }
+
+  /** A palette opened from a button. */
+  function OpenedPalette({
+    go,
+    facts = BACK_ONLY,
+  }: {
+    go: () => void;
+    facts?: WorkspaceHistoryFacts;
+  }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          Open palette
+        </button>
+        <button type="button">Where the command moves focus</button>
+        <WorkspaceHistory go={go} facts={facts} />
+        <CommandPalette
+          open={open}
+          onOpenChange={setOpen}
+          onToggleLeftSidebar={vi.fn()}
+          onToggleRightSidebar={vi.fn()}
+        />
+      </>
+    );
+  }
+
+  const withSidebarFlag = (enabled: boolean) =>
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { workspace_sidebar_v2: enabled },
+    });
+
+  function openPalette(go: () => void, facts?: WorkspaceHistoryFacts) {
+    render(<OpenedPalette go={go} facts={facts} />, { wrapper: withQueryClient() });
+    const opener = screen.getByRole("button", { name: "Open palette" });
+    opener.focus();
+    fireEvent.click(opener);
+    return opener;
+  }
+
+  it("lists them with their chords, and one that can't run says why", async () => {
+    withSidebarFlag(true);
+    openPalette(vi.fn());
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "in the workspace" },
+    });
+
+    const back = await screen.findByRole("option", { name: /Go back in the workspace/ });
+    expect(back.textContent).toContain("←");
+    const forward = screen.getByRole("option", { name: /Go forward in the workspace/ });
+    expect(forward).toHaveAttribute("aria-disabled", "true");
+    expect(forward.textContent).toContain("There's nothing to go forward to in the workspace.");
+  });
+
+  it("highlights the first one that can run, so Enter runs it past one that can't", async () => {
+    withSidebarFlag(true);
+    const go = vi.fn();
+    openPalette(go, FORWARD_ONLY);
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "in the workspace" } });
+
+    const forward = await screen.findByRole("option", { name: /Go forward in the workspace/ });
+    expect(screen.getByRole("option", { name: /Go back in the workspace/ })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // Once the rows have settled, before anyone moves the selection.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    expect(forward).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await vi.waitFor(() => expect(go).toHaveBeenCalledWith("forward"));
+  });
+
+  it("runs one that moves focus once the palette has closed, so the focus stays", async () => {
+    withSidebarFlag(true);
+    let dialogAtRun: Element | null = null;
+    const go = vi.fn(() => {
+      dialogAtRun = screen.queryByRole("dialog");
+      screen.getByText("Where the command moves focus").focus();
+    });
+    openPalette(go);
+
+    fireEvent.click(await screen.findByRole("option", { name: /Go back in the workspace/ }));
+    expect(go).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(go).toHaveBeenCalledOnce());
+    expect(dialogAtRun).toBeNull();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    // The dialog's own focus return, to the opener, came first and didn't undo it.
+    expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
+  });
+
+  // The QuickPick palette lists them under its own flag; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "lists none without the workspace_sidebar_v2 flag",
+    async () => {
+      withSidebarFlag(false);
+      openPalette(vi.fn());
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "in the workspace" },
+      });
+
+      await screen.findByText("No results found");
+      expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
+    },
+  );
 });

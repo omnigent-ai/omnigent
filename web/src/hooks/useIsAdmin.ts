@@ -1,5 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { useEffect } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getCurrentIsAdmin, resolveIdentity, subscribeIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 
@@ -19,9 +20,11 @@ const QUERY_KEY = ["identity-is-admin"];
  */
 export function useIsAdmin(): boolean {
   const info = useServerInfo();
+  const enabled = info !== "loading" && !isBootFallbackInfo(info);
+  const queryClient = useQueryClient();
   const { data } = useQuery<boolean>({
     queryKey: QUERY_KEY,
-    enabled: info !== "loading" && !isBootFallbackInfo(info),
+    enabled,
     queryFn: async () => {
       await resolveIdentity();
       return getCurrentIsAdmin();
@@ -33,5 +36,9 @@ export function useIsAdmin(): boolean {
     // A false seed may mean the startup identity probe is still pending.
     initialDataUpdatedAt: 0,
   });
+  useEffect(() => {
+    if (!enabled) return;
+    return subscribeIdentity(() => queryClient.setQueryData(QUERY_KEY, getCurrentIsAdmin()));
+  }, [enabled, queryClient]);
   return data;
 }

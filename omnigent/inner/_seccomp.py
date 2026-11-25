@@ -50,7 +50,8 @@ import ctypes
 import ctypes.util
 import errno
 import platform
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -248,6 +249,41 @@ def apply_seccomp_filter(
         be initialized, a compat-arch token cannot be resolved, a rule
         fails to add for a non-skip reason, or ``seccomp_load`` fails.
     """
+    with _seccomp_context(rules, default_action=default_action) as (lib, ctx):
+        rc = lib.seccomp_load(ctx)
+        if rc != 0:
+            raise OSError(-rc, f"seccomp_load failed (rc={rc})")
+
+
+def export_seccomp_filter(
+    rules: Sequence[SeccompRule],
+    output_fd: int,
+    *,
+    default_action: int = SCMP_ACT_ALLOW,
+) -> None:
+    """Write the same native/compat-ABI filter as cBPF without installing it.
+
+    The caller owns the descriptor and its position for the launcher's read.
+    """
+    if not 0 <= output_fd <= 2_147_483_647:
+        raise ValueError("output_fd must be a nonnegative C file descriptor")
+    with _seccomp_context(rules, default_action=default_action) as (lib, ctx):
+        try:
+            exporter = lib.seccomp_export_bpf
+        except AttributeError as exc:
+            raise OSError(errno.ENOSYS, "libseccomp cannot export BPF filters") from exc
+        exporter.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        exporter.restype = ctypes.c_int
+        rc = exporter(ctx, ctypes.c_int(output_fd))
+        if rc != 0:
+            raise OSError(-rc, f"seccomp_export_bpf failed (rc={rc})")
+
+
+@contextmanager
+def _seccomp_context(
+    rules: Sequence[SeccompRule], *, default_action: int
+) -> Iterator[tuple[ctypes.CDLL, int]]:
+    """Own one context while preserving shared architecture and rule construction."""
     lib = _load_libseccomp()
     ctx = lib.seccomp_init(ctypes.c_uint32(default_action))
     if not ctx:
@@ -314,9 +350,7 @@ def apply_seccomp_filter(
                     f"seccomp_rule_add failed for {rule.syscall} (rc={rc})",
                 )
 
-        rc = lib.seccomp_load(ctx)
-        if rc != 0:
-            raise OSError(-rc, f"seccomp_load failed (rc={rc})")
+        yield lib, ctx
     finally:
         lib.seccomp_release(ctx)
 

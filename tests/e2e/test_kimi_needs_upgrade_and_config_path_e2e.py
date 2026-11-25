@@ -8,18 +8,19 @@ Three user-observable failure modes are guarded here:
    (0.32.0 at report time). No release could satisfy ``>=1.47.0``.
 2. The same predicate (``harness_cli_installed`` → ``harness_is_configured``)
    made the host refuse every kimi launch, so the harness was unusable.
-3. The Kimi auth guidance Omnigent prints names the wrong config path:
+3. The Kimi auth diagnostic names the wrong config path:
    ``~/.kimi/config.toml`` is the legacy ``kimi-cli`` location; Kimi Code
    keeps its config in ``$KIMI_CODE_HOME/config.toml`` (default
    ``~/.kimi-code/config.toml`` — ``kimi doctor`` is authoritative). The
-   user-visible ``executor.auth`` rejection in
-   ``omnigent/runtime/workflow.py`` still points users at ``~/.kimi/``.
+   ``executor.auth`` rejection must name that location in the runner log
+   referenced by the sanitized CLI error.
 
 Failure modes 1–2 were fixed by "fix(onboarding): correct the kimi and hermes
 CLI version floors" (the floor is now 0.7.0); the tests here guard that fix so
 a future edit can't silently re-import kimi-cli's 1.x series. Failure mode 3 is
 guarded by ``test_kimi_auth_rejection_names_the_real_kimi_code_config_path``,
-which fails while any user-visible guidance names the legacy path.
+which checks the CLI's log reference and rejects the legacy path in the
+logged auth diagnostic.
 
 All three tests drive real user surfaces: the ``omni setup`` TUI under a
 pseudo-TTY and the ``omnigent run`` launcher as a subprocess, with a stub
@@ -219,19 +220,14 @@ class pexpect_suppress:
 
 
 def test_kimi_auth_rejection_names_the_real_kimi_code_config_path(tmp_path: Path) -> None:
-    """The ``executor.auth`` rejection must point at Kimi Code's real config.
+    """The public ``executor.auth`` rejection names Kimi Code's real config.
 
     Journey: a configured Kimi Code install (CLI on PATH + login credential),
     launch a kimi agent whose spec declares ``executor.auth``. The launch is
-    rejected by design (kimi has no per-spawn auth injection), and the error
-    is *guidance*: it tells the user where to configure the provider instead.
-    That guidance currently names ``~/.kimi/config.toml`` — the legacy
-    ``kimi-cli`` project's path. Kimi Code reads ``$KIMI_CODE_HOME/config.toml``
-    (default ``~/.kimi-code/config.toml``; ``kimi doctor`` confirms), so a
-    user following the message edits a file their CLI never loads.
-
-    FAILS on the buggy build (message says ``~/.kimi/config.toml``); passes
-    once the guidance names the Kimi Code location.
+    rejected by design (kimi has no per-spawn auth injection). The CLI shows
+    fixed configuration guidance and keeps private diagnostics in the runner
+    log. Verify both name ``$KIMI_CODE_HOME/config.toml`` or the default
+    ``~/.kimi-code/config.toml``, rather than legacy ``~/.kimi/config.toml``.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -280,22 +276,38 @@ def test_kimi_auth_rejection_names_the_real_kimi_code_config_path(tmp_path: Path
     )
     output = proc.stdout + proc.stderr
 
-    # Control: the journey reached the kimi auth rejection (not some earlier
-    # gate like "harness 'kimi' is not configured on host").
-    assert "does not support per-invocation provider" in output, (
-        f"the run never reached the kimi executor.auth rejection; output was:\n{output[-3000:]}"
+    assert proc.returncode != 0, output
+    auth_rejection = "The 'kimi' harness does not support per-invocation provider"
+    assert f"turn setup failed: {auth_rejection}" in output, output
+    assert "Remove ``executor.auth``" in output, output
+    assert "~/.kimi-code/config.toml" in output, output
+    assert "~/.kimi/config.toml" not in output, output
+    assert str(home) not in output, output
+    assert "sk-e2e-stub" not in output, output
+
+    # Follow the CLI's home-relative log reference inside this test's HOME.
+    log_reference = re.search(r"see the runner log for details: (~/[^\r\n]+\.log)", output)
+    assert log_reference is not None, output
+    runner_log = (home / log_reference.group(1).removeprefix("~/")).read_text()
+    auth_diagnostic = "\n".join(line for line in runner_log.splitlines() if auth_rejection in line)
+    assert auth_diagnostic, (
+        "the run never reached the kimi executor.auth rejection; runner log was:\n"
+        f"{runner_log[-3000:]}"
     )
 
     # The actual bug: the guidance names the legacy kimi-cli path instead of
     # Kimi Code's config location.
-    assert "~/.kimi/config.toml" not in output, (
+    assert "~/.kimi/config.toml" not in auth_diagnostic, (
         "the kimi auth guidance points users at ~/.kimi/config.toml — the "
         "legacy kimi-cli path. Kimi Code reads $KIMI_CODE_HOME/config.toml "
         "(default ~/.kimi-code/config.toml, per `kimi doctor`), so this "
         "guidance sends users to a file their CLI never loads."
     )
-    assert ".kimi-code" in output or "KIMI_CODE_HOME" in output, (
+    assert (
+        "~/.kimi-code/config.toml" in auth_diagnostic
+        or "$KIMI_CODE_HOME/config.toml" in auth_diagnostic
+    ), (
         "the kimi auth guidance no longer names Kimi Code's real config "
-        "location (~/.kimi-code / $KIMI_CODE_HOME); output was:\n"
-        f"{output[-3000:]}"
+        "location (~/.kimi-code / $KIMI_CODE_HOME); diagnostic was:\n"
+        f"{auth_diagnostic[-3000:]}"
     )

@@ -22,6 +22,8 @@ export interface WorkflowRun {
   sessionStatus: "idle" | "running" | "failed";
   /** Work that outlives the parent turn, such as background shells or an active goal. */
   backgroundWorkRunning?: boolean;
+  /** The session's sandbox is still launching, so the run is starting; absent on older servers. */
+  sandboxLaunching?: boolean;
   archived: boolean;
   /** The run's latest steps, counted by their current status. */
   progress: {
@@ -39,6 +41,8 @@ export interface WorkflowRun {
   workflowId?: string;
   /** The session that started the run, when another session did and you can read it. */
   startedBy?: WorkflowRunStarter;
+  /** The automation whose scheduled run started the run's session, when you can see it. */
+  automation?: WorkflowRunAutomation;
   /** Its workflow's name when the workflow is yours; `null` for someone else's or a deleted one. */
   workflowName?: string | null;
   /** The first page of the workflow runs below this one, each right after the run that started it. */
@@ -51,6 +55,12 @@ export interface WorkflowRun {
   descendantRunsActive?: boolean;
 }
 
+/** The automation whose scheduled run started a workflow run. */
+export interface WorkflowRunAutomation {
+  id: string;
+  name: string;
+}
+
 /** The session that started a workflow run. */
 export interface WorkflowRunStarter {
   sessionId: string;
@@ -58,9 +68,17 @@ export interface WorkflowRunStarter {
   title: string;
 }
 
-/** The session's turn, delegated work, or work left running between turns. */
+/** The run is starting: its session waits on a sandbox that is still launching. */
+export function isWorkflowRunLaunching(run: WorkflowRun): boolean {
+  return run.isCurrent && run.sandboxLaunching === true;
+}
+
+/** The session's turn, delegated work, work left running between turns, or its sandbox launch. */
 export function isWorkflowRunWorking(run: WorkflowRun): boolean {
-  return run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true);
+  return (
+    isWorkflowRunLaunching(run) ||
+    (run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true))
+  );
 }
 
 /** Where each of the run's steps stands, as the Tasks tab works it out. */

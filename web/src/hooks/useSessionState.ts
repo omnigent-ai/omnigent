@@ -1,6 +1,6 @@
 // Per-row state derivation for the sidebar badge.
 // Priority: awaiting (web prompts, then terminal prompts) > running > disconnected
-// > error > background work > no badge.
+// > error > unread (`withUnreadState`) > background work > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
@@ -48,6 +48,16 @@ export function getSessionState(
   if (failed && latestError !== "recovered_disconnect") return { kind: "error" };
   if (conversation?.background_work_running) return { kind: "running", background: true };
   return null;
+}
+
+/**
+ * Folds unread output into a derived state. Only background work yields to the
+ * dot, so an ended turn's new output shows until it is seen.
+ */
+export function withUnreadState(state: SessionState | null, unread: boolean): SessionState | null {
+  if (!unread) return state;
+  if (state === null || (state.kind === "running" && state.background)) return { kind: "unseen" };
+  return state;
 }
 
 /**

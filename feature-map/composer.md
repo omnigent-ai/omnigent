@@ -14,6 +14,20 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
+- `codemirror-input`: behind the `chat_composer_codemirror` release flag (off by
+  default; enable it with `OMNIGENT_FEATURES=chat_composer_codemirror` on the
+  server), the main chat's message box is a CodeMirror editor. It takes plain
+  text, scrolls inside the box when the draft is taller than the cap, and keeps
+  the same send, history, and completion keys. Side chats and New Chat follow
+  the same choice. Mobile widths always use the plain text box. It also stays
+  while the editor loads, and stays if loading fails; a failed load retries on
+  window focus, at most once a minute. In this editor a paste of files becomes one
+  chip per file at the caret, named after the file it sends as. A plain-text
+  paste of 40 lines or 4,000 characters becomes a `pasted-text.txt` chip. Chips
+  show in the main chat and New Chat; side-chat pastes stay in the tray. A draft
+  that leaves the editor (switching sessions, a new-session handoff, a recovered
+  send) keeps each chip's file as a tray attachment with its `@name` text
+  unchanged.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -151,6 +165,18 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   harness as text. A claude-sdk `/clear` continues in a new, empty session on
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `command-and-shell-tint`: in the main chat, side chats, Canvas grid cells
+  and the new-session composer (textarea or CodeMirror), a leading known
+  command or skill is tinted (the main chat's built-ins in any case, as they
+  run) and an unknown `/word` is not; the sent bubble keeps the tint, except
+  for a message relayed from another session. In Claude Code and Codex native
+  sessions a leading `!` is tinted with a "Shell command" hint (Codex skips
+  leading whitespace and treats `!!` as text). States: known or unknown
+  command; quotes or attachments (no tint); shell mode; refused shell send,
+  with the reason as the hint and the draft kept (an @-tag, review comments, a
+  reply quote, or a Codex non-owner, whom the server would reject); permission
+  still loading or a pending Codex side-chat tab (no shell mode). See the
+  [native shell recipes](native-harnesses.md#driving-it-with-the-repro-environment).
 - `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
   existing message path. Sessions without the control keep sending the text
@@ -188,7 +214,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   same older runner cannot resolve this ambiguity. With older servers, an
   unavailable session can also appear to have no goal. See the
   [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
-  requirements.
+  requirements. In Claude Code native sessions, **+ → Goal** and `/goal`
+  send Claude Code's built-in `/goal <condition>`; the composer shows no goal
+  indicator, and progress appears as ordinary agent work in the conversation.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -249,7 +277,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
-  be removed. State: unsupported file type rejected without losing the message.
+  be removed. With the CodeMirror editor, pasted files and large text are chips
+  at the caret instead (see `codemirror-input`). Supported native coding agents receive binary attachments, including
+  MP4 uploads up to 50 MiB, as local files.
+  State: unsupported file type rejected without losing the message.
 - `at-mentions`: a bare `@` in the in-session or new-session composer shows a
   "Sessions" row. Opening it (click, Enter, Tab or →) shows a "Subagents" row
   for the current session's subagents, then every other session the sidebar
@@ -265,6 +296,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session pill opens that session. The new-session composer lists the same
   sessions (no subagents yet) with the same title search; its files come from
   the host directory listing only, without the recursive workspace search.
+  Behind `chat_composer_codemirror`, a question card's custom answer takes the
+  same session tags (no files, no subagents); the answer goes to the agent with the
+  markers and tool hint, and the answered card shows them as pills.
   States: file listing still loading (Enter holds; a pending session search
   does not hold it), no match (Enter sends the literal text), late results
   arriving (the highlighted row stays put), a file and a session with the same
@@ -299,16 +333,22 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   opens and focuses the new-session composer in browsers. Native shells use
   ⌘/Ctrl+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
-  can be steered into the running turn. Side-chat composers queue and steer the
-  same way, with their own queue strip.
+  can be steered into the running turn. Mod+Enter inverts Always steer for one
+  message: with it on, the draft waits in the queue until the turn ends; with it
+  off, the draft and the whole queue are steered. Side-chat composers queue and
+  steer the same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
-  after its current step in the timestamp row. It appears on desktop hover or
-  focus and stays visible with truncation on touch, without adding row height.
+  after its current step in the timestamp row. The note stays visible, with
+  truncation, on desktop and touch until the agent reads the message, while the
+  row's timestamp and actions keep their hover reveal on desktop.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
-- `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
-  and always-steer preference, keeping their element screenshots.
+- `browser-pointer-queue`: desktop Design-mode instructions (older shells) follow
+  the same queue and always-steer preference, keeping their element screenshots.
+  Annotate/Draw requests skip the queue: they wait in their own outbox, saved in
+  the browser, send once the session is idle and its account is still the one
+  signed in, and show Retry/Remove above the composer (a side chat's too).
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
@@ -339,17 +379,20 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   each message once. If the sandbox never comes up, each saved message stays in
   the transcript marked **Not delivered**, live and after reload. **Copy message
   to new session** opens New Chat with its text and attachments.
-- `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
-  missing or expired dbcert preserves the draft and shows a yellow refresh
-  banner instead of provisioning. Skip continues the current launch without
-  waiting for the check. Refresh is explicit; launch needs another submit after
-  renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
-  CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
   something, such as a sandbox still waiting for its owner's credentials, the session's chat
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `palette-model-effort`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's **Model** and **Reasoning Effort** (**Thinking
+  Level** for Pi) under **Composer**, each showing its current value. Enter opens
+  the menu's choices; picking one runs the menu's own handler. Model lists Smart
+  Routing first where the composer offers it, and the whole effort row is greyed
+  while Smart Routing picks the effort. A value the menu greys says why. With the
+  flag off the picker mounts none of it
+  (`web/src/components/composer/composerSectionSettings.test.tsx`,
+  `web/src/components/composer/SessionHarnessPicker.test.tsx`).
 - `custom-agent-placement`: New session and Add nested agent can launch an uploaded
   custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
   is advertised. Nested custom agents can also use new or existing worktrees on a
@@ -360,13 +403,26 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
   a server without agent install.
+- `palette-add-actions`: with `quick_pick_palette` on (off by default), ⌘K lists
+  the open session composer's Add menu under **Composer**: Attach files and
+  images…, Start a new side chat, Set goal… (View or update goal… once one is
+  set), and Enter or Exit Plan mode. Each reads the menu item's availability
+  and runs its handler, so a row the menu hides is absent and a greyed one says
+  why. Only the open session's composer offers them; side chats and the
+  new-session composer add none
+  (`web/src/components/composer/useComposerAddPaletteCommands.test.tsx`).
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
 
 ## How to get to it (user POV)
 
-- In a Codex native chat or a Polly session with a Goal control, send `/goal`,
-  choose `/goal` from the slash menu, or open **+ → Goal**.
+- In a Codex native chat, a Claude Code native chat, or a Polly session with a
+  Goal control, send `/goal`, choose `/goal` from the slash menu, or open
+  **+ → Goal**.
+- In the in-session composer, a side chat, a Canvas grid cell, or the
+  new-session composer, type a known command or skill such as `/help`; in a
+  Claude Code or Codex native session (or with that agent chosen on the
+  new-session composer), type a draft that starts with `!`.
 
 **In-session composer** (open any session):
 
@@ -439,12 +495,20 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **Desktop browser pointer** (open a session in the desktop app):
 
-- Choose **+ → Browser** to open a Browser soft tab, navigate to a page, enable
-  Design mode, and click an element. Type an instruction in the floating popup
-  and use Send or Enter.
+- Choose **+ → Browser** to open a Browser soft tab and navigate to a page. Use
+  Annotate to click an element and type an instruction, or Draw to mark up the
+  page and add a note, then send. Where they're unavailable (older shells),
+  enable Design mode instead, click an element, type an instruction in the
+  floating popup, and use Send or Enter.
 - Change Settings → Always steer (on by default) to choose whether
-  busy-session follow-ups queue or send immediately. Existing queued messages
-  retain FIFO ordering.
+  busy-session Design-mode follow-ups queue or send immediately. Existing queued
+  messages retain FIFO ordering. Annotate/Draw requests ignore it: they wait above
+  the composer (Send/Enter, then Retry or Remove) until the turn ends. With
+  `quick_pick_palette` on, ⌘K also lists Always steer as a setting row: type
+  "always steer", press Enter, and pick On or Off
+  (`web/src/shell/QuickPickCommandPalette.appCommands.test.tsx`).
+- With `quick_pick_palette` on, in an open session press Cmd/Ctrl+K, type
+  "model" or "reasoning effort", press Enter, then pick a value.
 
 **New-session composer** (landing page, or New session):
 
@@ -465,14 +529,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   buttons. The New Chat composer opens with the action's prompt as an editable
   draft, through the same one-time handoff token; nothing is sent until Send.
   Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
-  and opens the composer with its prompt`).
+and opens the composer with its prompt`).
 
-- In the managed desktop app, choose **Arclet Sandbox** and submit a task with
-  missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
-  banner, finish browser sign-in, then submit the preserved task again. Sending
-  alone must not open the browser, and renewal alone must not create a sandbox.
-  While **Checking laptop credentials…** is visible, **Skip** starts that launch
-  without waiting for verification or opening sign-in. Later launches check again.
 - On a deployment whose launches can report that the user needs to act, start a
   managed session whose launch needs you, e.g. a sandbox still waiting for its
   owner's credentials. The session's chat
@@ -561,6 +619,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `native-harnesses.md`) this New Chat entry point is absent: a curated
   deployment offers no bundle import from New Chat.
 
+- With `quick_pick_palette` on, open a session, press Cmd/Ctrl+K and type
+  "attach", "side chat", "goal" or "plan mode", then press Enter to run the
+  Add menu's action. A row that can't run stays listed with the reason.
+
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
 pickers, seeded from the source session when its harness family is kept.
@@ -589,16 +651,28 @@ its tags and review comments as the full-screen composer does, and shows the
 review comments as chips. Sending while the session works queues the message on
 that session, as the full-screen composer does: it waits in the cell's queue strip
 (edit, steer, remove) and sends when the turn ends. With Always steer on it steers
-into the running turn instead, and Mod+Enter steers the whole queue. Editing a
+into the running turn instead, and Mod+Enter queues it; with it off, Mod+Enter
+steers the whole queue. Editing a
 queued message brings its tags back as tokens. The queue belongs to the session, so
 the full-screen view shows and flushes the same messages; a reload drops a cell's
 queued messages, where the full-screen composer restores its own. Escape does not
 stop a cell's turn, and Interrupt shows only while the draft is empty, so a draft
-sends. It also shows the session's host, permission mode (switchable by the owner)
-and harness. Shift+Tab in the cell's composer steps that session's mode too; side
-chats and subagent tabs keep Shift+Tab for focus. Switch the host from the cell's
-host menu when you can edit the session. See or switch the model from the
-full-screen view.
+sends. Typing "@" opens the full-screen "@" picker over that session: its sessions,
+and its workspace files when the harness opens them. A picked tag is kept in the
+shared draft, so it carries to the full-screen view, and is sent as its marker.
+Enter picks from the open picker and never sends while it is open, and Mod+Enter
+waits for it too. Tags are picked only in the cell's main text, not in quote cards,
+and show as plain `@name` text, not as pills. It also shows the session's host,
+permission mode (switchable by the owner), and the same model and effort picker as
+the full-screen composer, which changes only that session (Smart Routing too, where
+eligible). Shift+Tab in the cell's composer steps that session's mode too, even with
+the "@" picker open; side chats and subagent tabs keep Shift+Tab for focus.
+Switch the host from the cell's host menu when you can edit the session. The model picker
+is hidden along with the composer for a viewer who can't edit the session. It is
+inert while the session is unreachable or structurally read-only, such as a Claude
+Code sub-agent. A cell whose managed sandbox is still launching lists no models until
+its host is bound, unlike the full-screen composer, which previews the sandbox's
+catalog.
 
 ## Driving it with the repro environment
 
@@ -631,7 +705,7 @@ Other connection providers alone do not enable the managed MCP picker.
   with the action's prompt filled in and editable, the handoff token gone from
   the URL, and no session created until Send. Component coverage:
   `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
-  composer with its prompt`).
+composer with its prompt`).
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
@@ -852,6 +926,18 @@ Other connection providers alone do not enable the managed MCP picker.
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
   claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
+- **`command-and-shell-tint`:** component coverage, run with vitest from
+  `web/`: `web/src/components/composer/composerHighlight.test.ts`
+  (classification, including the harness-specific `!` rules),
+  `web/src/pages/ChatPage.composer.test.tsx` (`Composer native shell mode` and
+  the CodeMirror release-flag cases),
+  `web/src/components/chat/SideChatPane.test.tsx`,
+  `web/src/shell/NewChatDialog.test.tsx` and
+  `web/src/pages/ChatPage.userBubble.test.tsx` (sent-bubble tint). Manually,
+  in a Codex native session as owner, type `!echo hi`: the `!` is tinted and
+  the hint shows; add an @-tag and send to see the refusal. Repeat in a side
+  chat, a Canvas grid cell and on the new-session composer, with and without
+  `chat_composer_codemirror`.
 - **`goal-command`:**
   `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
   drives a real Codex native session through **+ → Goal**, bare `/goal`, and
@@ -969,7 +1055,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
   composer only), run from `web/electron` after building the SPA
   (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
-  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   server without dictation (on macOS, the macOS Dictation mic instead), then
   the mic dictating through a fake-engine server. Manually, for the in-session,
   new-session and side-chat composers: connect the desktop app to a default
@@ -1017,7 +1103,9 @@ Other connection providers alone do not enable the managed MCP picker.
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
   `tests/browser_ui/chat/test_status_indicators.py::test_mobile_layout_reveals_timestamps_and_pending_steering`
-  verifies their visibility without hover in the mobile layout.
+  verifies their visibility without hover in the mobile layout, and
+  `test_steering_explanation_stays_visible_on_desktop` keeps the notice visible
+  without hover on desktop.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
@@ -1033,6 +1121,9 @@ Other connection providers alone do not enable the managed MCP picker.
   Repeat in a fresh session with Always steer on: both entry points send while
   busy and the pointer popup says "Sent to agent." If older messages are already
   queued, new pointer instructions must join them even with Always steer on.
+  With Annotate or Draw instead, the request waits above the composer while the
+  turn runs and sends once it ends; after a reload it comes back for Retry or
+  Remove.
 - **`pi-compact`:** in a Pi session, start a long turn, type `/comp`, press Tab,
   then Enter. With Always steer off, confirm `/compact` queues; use Send now to
   interrupt and compact. With Always steer on and an empty queue, Enter should
@@ -1091,16 +1182,6 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/server/integration/test_managed_startup_inputs.py` checks native
   transcript ownership, bundle uploads, recovery, access revocation and deletion,
   plus failed inputs in the snapshot.
-- **`arclet-dbcert`, desktop new-session composer (own environment):**
-  `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
-  native bridge, CLI process, and local server with a fake dbcert executable and
-  machine policy. Follow `web/electron/e2e/README.md` for build and recording
-  prerequisites. It proves explicit refresh and launch, preserved input, skipping
-  a pending check, and skipped kubeconfig updates and host sync; macOS sign-in
-  needs a manual managed-desktop check. Component tests in
-  `web/src/shell/NewChatDialog.test.tsx` and
-  `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
-  results after skipping, retry, dismissal, check errors, and older shells.
 - **`launch-action-required`, session chat transcript:**
   `tests/browser_ui/chat/test_status_indicators.py::test_action_banner_follows_the_launch`
   shows the snapshot's instructions in the banner and clears it when the stream
@@ -1125,12 +1206,6 @@ Other connection providers alone do not enable the managed MCP picker.
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
 
-- The Arclet dbcert preflight needs the updated desktop shell and web UI, with
-  managed features enabled on the server. Browsers, older shells, other sandbox
-  providers, and already-connected hosts skip this check. Refreshing a host's
-  credential from the session banner does not prove new-session gating works.
-  Skip bypasses only this launch's check; it does not renew credentials or
-  guarantee that sandbox authentication will succeed.
 - The launch action banner appears only on deployments whose launch code
   reports it; Omnigent's own sandbox providers never do. Its text comes from the
   deployment, so check the wording there rather than in the web UI.

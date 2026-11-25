@@ -19,7 +19,7 @@ export interface DefaultPolicy {
 
 // ── Query helpers ────────────────────────────────────────────────────────────
 
-const QUERY_KEY = ["default-policies"];
+export const DEFAULT_POLICIES_QUERY_KEY = ["default-policies"];
 
 /**
  * Thrown when the server forbids listing global policies (HTTP 403). A backend
@@ -41,10 +41,11 @@ async function fetchDefaultPolicies(): Promise<DefaultPolicy[]> {
 // ── Hooks ────────────────────────────────────────────────────────────────────
 
 /** Fetch all server-wide default policies. */
-export function useDefaultPolicies() {
+export function useDefaultPolicies(enabled = true) {
   return useQuery({
-    queryKey: QUERY_KEY,
+    queryKey: DEFAULT_POLICIES_QUERY_KEY,
     queryFn: fetchDefaultPolicies,
+    enabled,
     staleTime: 5_000,
   });
 }
@@ -68,7 +69,7 @@ export function useAddDefaultPolicy() {
       return (await res.json()) as DefaultPolicy;
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: DEFAULT_POLICIES_QUERY_KEY });
     },
   });
 }
@@ -87,7 +88,7 @@ export function useUpdateDefaultPolicy() {
       return (await res.json()) as DefaultPolicy;
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: DEFAULT_POLICIES_QUERY_KEY });
     },
   });
 }
@@ -103,7 +104,7 @@ export function useDeleteDefaultPolicy() {
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: DEFAULT_POLICIES_QUERY_KEY });
     },
   });
 }
