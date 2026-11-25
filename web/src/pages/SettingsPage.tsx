@@ -164,6 +164,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { BrowserAgentToolsSettingsGroup } from "@/components/BrowserPane/agentTools/BrowserAgentToolsSettingsGroup";
+import { TrustedRemoteHostsSettingsGroup } from "@/components/BrowserPane/agentTools/TrustedRemoteHostsSettingsGroup";
 import {
   Select,
   SelectContent,
@@ -2307,6 +2308,7 @@ function GeneralSection() {
           </SettingsGroup>
         )}
         <BrowserAgentToolsSettingsGroup />
+        <TrustedRemoteHostsSettingsGroup />
         {(globalShortcut || widenWindowForRightSidebar) && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
             {globalShortcut && <GlobalShortcutControl />}

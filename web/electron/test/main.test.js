@@ -5991,6 +5991,16 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         ),
         /can't be verified as Arca/,
       );
+      h.electron.dialog.showMessageBox = async () => ({ response: 1 });
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId,
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        true,
+        "a managed sandbox can still use explicit trust",
+      );
     });
   }
 
@@ -6041,7 +6051,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(resolvedUrl, `${resolvedOrigin}/omnigent`);
     assert.notEqual(resolvedUrl, serverUrl);
     const deps = h.browserIpcDeps();
-    const recover = deps.recoverAgentNavigationForEvent;
+    let recoveryRequested = false;
+    const recover = (...args) =>
+      deps.recoverAgentNavigationForEvent(...args, undefined, () => {
+        recoveryRequested = true;
+      });
     const hint = deps.getAgentNavigationHintForEvent;
     const event = { sender: h.webContents, senderFrame: { url: resolvedUrl } };
     let previewPrompts = 0;
@@ -6061,6 +6075,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       false,
     );
     assert.equal(previewPrompts, 0, "pending reconnect consent must not start another prompt");
+    assert.equal(recoveryRequested, true);
     assert.equal(h.calls.arcaConsentRuns.length, 1);
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
@@ -6073,7 +6088,13 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       () => /declined/.test(hint(event, "http://localhost:5173", hostId, hostId)),
       "decline cooldown hint",
     );
+    recoveryRequested = false;
     assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(
+      recoveryRequested,
+      true,
+      "a declined recovery still suppresses another trust prompt",
+    );
     assert.equal(h.calls.arcaConsentRuns.length, 1);
   });
 
@@ -7647,22 +7668,40 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
   });
 
-  it("keeps a declined host blocked until restart and tells the agent why", async (t) => {
-    const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
-    assert.equal((await connect()).ok, true);
-    assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
+  for (const prefixed of [false, true]) {
+    it(`keeps a declined host blocked until restart (prefixed: ${prefixed})`, async (t) => {
+      const sourceHostId = prefixed ? `host_${hostId}` : hostId;
+      const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
+      assert.equal((await connect()).ok, true);
+      assert.equal(deps.getAgentNavigationHintForEvent(event, preview, sourceHostId), null);
 
-    const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(questions.length, 1);
-    assert.equal(eligible(context()), false);
-    assert.match(
-      deps.getAgentNavigationHintForEvent(event, preview, hostId),
-      /"devbox" were declined/,
-    );
-    assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
-  });
+      const opts = {
+        sourceHostId,
+        sourceSshTarget: "devbox",
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      };
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, preview, {
+          ...opts,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      assert.equal(questions.length, 1);
+      assert.equal(eligible(context()), false);
+      assert.match(
+        deps.getAgentNavigationHintForEvent(event, preview, sourceHostId),
+        prefixed ? /this host were declined/ : /"devbox" were declined/,
+      );
+      assert.equal(
+        deps.getAgentNavigationHintForEvent(event, "https://example.com/", sourceHostId),
+        null,
+      );
+    });
+  }
 
   it("does not ask an older renderer even for a recorded destination or supplied hint", async (t) => {
     const { event, deps, questions, eligible, connect } = previewHarness(t, () => 1);
@@ -8073,6 +8112,180 @@ describe("settings-based remote previews", () => {
     assert.equal(hint("https://example.com", true), null);
     assert.match(hint("http://localhost:5173", true, {}), /web app.*Update it/);
     assert.doesNotMatch(hint("http://localhost:5173", true, {}), /trusted_remote_hosts/);
+  });
+
+  it("confirms Settings grants and scopes host management to the connected server", async (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const list = h.ipc.get("omnigent:get-trusted-remote-hosts");
+    const add = h.ipc.get("omnigent:add-trusted-remote-host");
+    const remove = h.ipc.get("omnigent:remove-trusted-remote-host");
+    // IPC results cross a vm boundary, so compare plain JSON copies.
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    const other = { server_url: "https://other.example.com/", host_id: "other-host" };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ trusted_remote_hosts: [other] }));
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts++;
+      assert.match(options.detail, /Server: https:\/\/server.example.com\//);
+      assert.match(options.detail, /Host ID: abc123/);
+      assert.equal(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts.length, 1);
+      return { response: 1 };
+    };
+    assert.deepEqual(plain(await list(event)), { ok: true, serverUrl: `${server}/`, hosts: [] });
+    assert.equal((await add(event, other.server_url, "abc123")).ok, false);
+    assert.equal((await remove(event, other.server_url, other.host_id)).ok, false);
+    const unpinned = { ...event, senderFrame: { url: "https://unconnected.example.com" } };
+    assert.equal((await list(unpinned)).ok, false);
+    assert.equal((await add(unpinned, server, "abc123")).ok, false);
+    assert.equal(prompts, 0);
+    const added = plain(await add(event, `${server}/`, "ABC123"));
+    assert.equal(added.ok, true);
+    assert.deepEqual(added.hosts, [{ server_url: `${server}/`, host_id: "abc123" }]);
+    assert.deepEqual(plain((await list(event)).hosts), added.hosts);
+    assert.equal((await add(event, server, "abc123")).ok, true);
+    assert.equal(prompts, 1, "existing trust is idempotent");
+    assert.equal((await add(event, "not a url", "abc123")).ok, false);
+    const removed = plain(await remove(event, server, "ABC123"));
+    assert.equal(removed.removed, true);
+    assert.deepEqual(removed.hosts, []);
+    assert.equal((await remove(event, server, "abc123")).ok, false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts, [other]);
+  });
+
+  for (const [name, contents] of [
+    ["malformed", "{"],
+    ["non-object", "null"],
+    ["array", "[]"],
+    ["unreadable", null],
+  ]) {
+    it(`refuses to manage trust when desktop settings are ${name}`, async (t) => {
+      const server = "https://server.example.com";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createBrowserRegistryForWindow(h.win);
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      if (contents === null) fs.mkdirSync(h.settingsPath);
+      else fs.writeFileSync(h.settingsPath, contents);
+      h.electron.dialog.showMessageBox = () =>
+        assert.fail("unreadable settings must not offer a grant");
+      const list = await h.ipc.get("omnigent:get-trusted-remote-hosts")(event);
+      assert.equal(list.ok, false);
+      assert.match(list.error, /Could not read desktop settings/);
+      assert.equal(
+        (await h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        (await h.ipc.get("omnigent:remove-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        await h.browserIpcDeps().requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId: "example-host",
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      if (contents === null) assert.equal(fs.statSync(h.settingsPath).isDirectory(), true);
+      else assert.equal(fs.readFileSync(h.settingsPath, "utf8"), contents);
+    });
+  }
+
+  for (const changed of ["server", "page", "closed", "declined", "settings"]) {
+    it(`does not save a Settings grant when consent is ${changed}`, async (t) => {
+      const server = "https://server.example.com/app";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      const consent = Promise.withResolvers();
+      let prompted = false;
+      h.electron.dialog.showMessageBox = async () => {
+        prompted = true;
+        return consent.promise;
+      };
+      const pending = h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host");
+      await until(() => prompted, "native trust confirmation");
+      assert.equal(fs.existsSync(h.settingsPath), false);
+      if (changed === "server") h.api.windows.get(h.win).serverUrl = `${server}/other`;
+      if (changed === "page") h.setUrl("https://other.example.com");
+      if (changed === "closed") h.win.isDestroyed = () => true;
+      if (changed === "settings") fs.writeFileSync(h.settingsPath, "{");
+      consent.resolve({ response: changed === "declined" ? 0 : 1 });
+      assert.equal((await pending).ok, false);
+      if (changed === "settings") assert.equal(fs.readFileSync(h.settingsPath, "utf8"), "{");
+      else assert.equal(fs.existsSync(h.settingsPath), false);
+    });
+  }
+
+  it("trusts a host from the native dialog and holds a decline until restart", async (t) => {
+    const server = "https://server.example.com";
+    const host = "sandbox-host";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const opts = {
+      sourceHostId: host.toUpperCase(),
+      sessionHostProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
+    };
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts += 1;
+      assert.match(options.message, /Let sessions on/);
+      assert.match(options.detail, /Host ID: (sandbox-host|other-host)/);
+      return { response: prompts === 1 ? 1 : 0 };
+    };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", opts),
+      true,
+    );
+    assert.equal(prompts, 1);
+    assert.equal(deps.getAgentContextForEvent(event, opts).hostIsTrustedRemotePreview, true);
+    assert.equal(
+      h.browserRegistryDeps().allowsLocalhost(deps.getAgentContextForEvent(event, opts)),
+      true,
+    );
+    // A second host is asked once, declined, and not asked again this run.
+    const other = { ...opts, sourceHostId: "other-host" };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(prompts, 2);
+    const settingsRetry = await h.ipc.get("omnigent:add-trusted-remote-host")(
+      event,
+      server,
+      "other-host",
+    );
+    assert.equal(settingsRetry.ok, false);
+    assert.match(settingsRetry.error, /restart Omnigent/);
+    assert.equal(prompts, 2, "Settings IPC must not bypass a native decline");
+    assert.match(
+      deps.getAgentNavigationHintForEvent(
+        event,
+        "http://localhost:5173",
+        "other-host",
+        undefined,
+        false,
+        true,
+        1,
+      ),
+      /restart Omnigent/,
+    );
   });
 });
 

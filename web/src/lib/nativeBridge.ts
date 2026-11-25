@@ -236,6 +236,15 @@ interface ElectronDesktopApi extends NativeShellApi {
   onHostStatusChanged?: (callback: () => void) => () => void;
   /** Desktop feature gates; absent on older shells. */
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
+  /** Remote hosts trusted for localhost previews; absent on older shells. */
+  getTrustedRemoteHosts?: () => Promise<TrustedRemoteHostsResult>;
+  /** Trust one remote host for localhost previews; absent on older shells. */
+  addTrustedRemoteHost?: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+  /** Remove one trusted remote host; absent on older shells. */
+  removeTrustedRemoteHost?: (
+    serverUrl: string,
+    hostId: string,
+  ) => Promise<TrustedRemoteHostsResult>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
@@ -608,6 +617,7 @@ export interface DesktopFeatures {
   chromeCookieImport?: boolean;
   /** Shell can ask to verify a remote host over SSH before allowing localhost previews. */
   sshLocalhostPreview?: boolean;
+  /** Shell can ask to trust a remote host for localhost previews. */
   trustedRemoteLocalhostPreview?: boolean;
   /** This shell can show the floating New Agent panel (macOS). */
   floatingComposer?: boolean;
@@ -631,6 +641,22 @@ export interface CliStatus {
   accepted?: boolean;
   /** Policy disables set/browse/reset of custom CLI paths. */
   customizationDisabled?: boolean;
+}
+
+/** One remote host trusted for localhost previews, in settings-file shape. */
+export interface TrustedRemoteHost {
+  server_url: string;
+  host_id: string;
+}
+
+/** Result of listing, adding, or removing trusted remote hosts. */
+export interface TrustedRemoteHostsResult {
+  ok: boolean;
+  serverUrl?: string;
+  error?: string;
+  hosts?: TrustedRemoteHost[];
+  added?: boolean;
+  removed?: boolean;
 }
 
 /** This machine's identity, read from local config (fast — no subprocess). */
@@ -1660,6 +1686,31 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
     console.warn("[nativeBridge] electron getDesktopFeatures failed:", err);
     return null;
   }
+}
+
+/**
+ * The trusted-remote-hosts bridge, or null outside the shell / on shells too
+ * old to offer it. Callers must optional-chain; a missing bridge means the
+ * settings-file fallback is the only way to trust a host.
+ */
+export function trustedRemoteHostsBridge(): {
+  list: () => Promise<TrustedRemoteHostsResult>;
+  add: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+  remove: (serverUrl: string, hostId: string) => Promise<TrustedRemoteHostsResult>;
+} | null {
+  const electron = electronApi();
+  if (
+    !electron?.getTrustedRemoteHosts ||
+    !electron?.addTrustedRemoteHost ||
+    !electron?.removeTrustedRemoteHost
+  ) {
+    return null;
+  }
+  return {
+    list: () => electron.getTrustedRemoteHosts!(),
+    add: (serverUrl, hostId) => electron.addTrustedRemoteHost!(serverUrl, hostId),
+    remove: (serverUrl, hostId) => electron.removeTrustedRemoteHost!(serverUrl, hostId),
+  };
 }
 
 /** Whether this desktop shell can connect the user's Arca instance as a host. */
