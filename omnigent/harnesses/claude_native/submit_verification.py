@@ -99,30 +99,42 @@ def has_matching_hook_refusal(
     """Match a fresh explicit refusal only to stop retries, without assigning ownership."""
     for entry in read_fresh_submit_records(boundary):
         if (
-            entry.get("type") != "system"
-            or entry.get("isSidechain") is True
+            entry.get("isSidechain") is True
             or entry.get("sessionId") != boundary.native_session_id
             or not isinstance(entry.get("uuid"), str)
             or not entry["uuid"]
         ):
             continue
-        content = entry.get("content")
-        if not isinstance(content, str) or not content.startswith(_BLOCKED_HEADER):
-            continue
-        body = content.removeprefix(_BLOCKED_HEADER)
-        ending = entry.get("promptSubmitEnding")
-        if isinstance(ending, dict):
-            outcome = ending.get("ending")
-            if not isinstance(outcome, dict) or outcome.get("kind") != "blocked_by_hook":
-                continue
-            reason = outcome.get("reason")
-            if not isinstance(reason, str) or not body.startswith(reason + _PROMPT_SEPARATOR):
-                continue
-            prompt = body[len(reason + _PROMPT_SEPARATOR) :]
-        elif ending is None and body.count(_PROMPT_SEPARATOR) == 1:
-            _reason, _separator, prompt = body.partition(_PROMPT_SEPARATOR)
-        else:
-            continue
-        if normalize_prompt(prompt) == submitted_text:
+        blocked = hook_blocked_prompt(entry)
+        if blocked is not None and normalize_prompt(blocked[1]) == submitted_text:
             return True
     return False
+
+
+def hook_blocked_prompt(entry: JsonObject) -> tuple[str, str] | None:
+    """
+    Split Claude's record of a prompt a ``UserPromptSubmit`` hook blocked.
+
+    :param entry: Decoded Claude transcript record.
+    :returns: The hook's reason and the original prompt, or ``None`` when the
+        record is not a hook block or the two cannot be told apart.
+    """
+    if entry.get("type") != "system":
+        return None
+    content = entry.get("content")
+    if not isinstance(content, str) or not content.startswith(_BLOCKED_HEADER):
+        return None
+    body = content.removeprefix(_BLOCKED_HEADER)
+    ending = entry.get("promptSubmitEnding")
+    if isinstance(ending, dict):
+        outcome = ending.get("ending")
+        if not isinstance(outcome, dict) or outcome.get("kind") != "blocked_by_hook":
+            return None
+        reason = outcome.get("reason")
+        if not isinstance(reason, str) or not body.startswith(reason + _PROMPT_SEPARATOR):
+            return None
+        return reason, body[len(reason + _PROMPT_SEPARATOR) :]
+    if ending is None and body.count(_PROMPT_SEPARATOR) == 1:
+        reason, _separator, prompt = body.partition(_PROMPT_SEPARATOR)
+        return reason, prompt
+    return None

@@ -14,6 +14,7 @@ vi.mock("@/shell/AppShell", () => ({
   AppShell: () => (
     <div>
       <span>app shell</span>
+      <Link to="/inbox">Inbox</Link>
       <Outlet />
     </div>
   ),
@@ -36,6 +37,12 @@ vi.mock("@/pages/ChatPage", async () => {
 });
 vi.mock("@/pages/ProjectHomePage", () => ({
   ProjectHomePage: () => <div>project home page</div>,
+}));
+// Stays suspended, like a page whose code is still downloading.
+vi.mock("@/pages/InboxPage", () => ({
+  InboxPage: () => {
+    throw new Promise(() => {});
+  },
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
@@ -310,6 +317,17 @@ describe("Project home route", () => {
   });
 });
 
+describe("Shell page loading", () => {
+  it("shows the pane spinner when an in-app click opens a page still loading", async () => {
+    renderRoute("/");
+    fireEvent.click(await screen.findByRole("link", { name: "Inbox" }));
+
+    expect(await screen.findByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("chat page")).toBeNull();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
+  });
+});
+
 describe("Canvas route", () => {
   it("preserves healthy chat state across pathname changes", () => {
     renderRoute("/c/first");
@@ -469,7 +487,7 @@ describe("Automation routes", () => {
 
   it("waits for server info before loading automations", () => {
     renderRoute("/tasks", {}, "loading");
-    expect(screen.getByRole("status")).toHaveTextContent("Loading Omnigent");
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
   });

@@ -349,6 +349,27 @@ def test_update_workspace_explicit_null_clears_it(
     assert cleared.host_id is None
 
 
+def test_workflow_id_round_trips_and_clears(store: SqlAlchemyScheduledTaskStore) -> None:
+    """The saved workflow a task runs reads back, stays unless updated, and clears to None."""
+    workflow_id = _uid("wf")
+    created = store.create(
+        scheduled_task_id=_uid("st_wf"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        workflow_id=workflow_id,
+    )
+    assert created.workflow_id == workflow_id
+    assert store.get(_uid("st_wf")).workflow_id == workflow_id
+    renamed = store.update(_uid("st_wf"), name="renamed")
+    assert renamed is not None and renamed.workflow_id == workflow_id
+    cleared = store.update(_uid("st_wf"), workflow_id=None)
+    assert cleared is not None and cleared.workflow_id is None
+
+
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     """Updating ``state`` to ``paused`` reads back ``paused``."""
     store.create(

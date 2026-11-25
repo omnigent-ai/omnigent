@@ -41,7 +41,8 @@ New in v2:
 - **Diffs**: the working copy's changes as a review, including rendered
   Markdown diffs. Rendered Markdown is sanitized before it reaches the page, as
   in the existing file viewer. Where the host can compare revisions, a Commits
-  list shows the branch's commits, each opening what it changed.
+  list shows the branch's commits, or a typed base and head's, each opening
+  what it changed.
 - **Pull Requests**: the session's pull requests and a page for each one.
 
 Existing pages, which come along unchanged as tabs: terminals, the browser,
@@ -116,6 +117,14 @@ The change that routes the sidebar to v2 adds one server feature flag,
 `workspace_sidebar_v2`, in `omnigent/server/feature_flags.py`. It is off by
 default and listed in `/v1/info`; `OMNIGENT_FEATURES=workspace_sidebar_v2`
 turns it on. With it off, the sidebar is unchanged.
+
+`floating_panes` follows it. While a deployment doesn't name it, it takes
+`workspace_sidebar_v2`'s value, so turning sidebar v2 on brings floating panes
+too. `-floating_panes` turns floating panes off and `floating_panes` turns them
+on, whatever sidebar v2 does. With floating panes, a session's chat and the
+workspace sidebar are rounded cards on the left sidebar's color, below one top
+row, from 48rem wide in a browser and the desktop app alike. Grids, touch
+clients and narrower windows keep the edge-to-edge layout.
 
 ## Data
 

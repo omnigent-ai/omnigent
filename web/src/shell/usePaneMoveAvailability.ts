@@ -2,7 +2,7 @@
 // the split, its maximized pane or the panes' size change, and as their terminals fit, so a split
 // with no room to move a pane lists the command greyed with why, as the drag offers no spot there.
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { type RefObject, useLayoutEffect, useRef, useState } from "react";
 
 import type { TerminalLayout } from "@/lib/paneSplitLayout";
 import type { CommandAvailability } from "@/store/paletteCommands";
@@ -17,8 +17,11 @@ export interface PaneMoveAvailabilityOptions {
   paneKey: string | null;
   /** The panes' size rule, measured now. */
   sizing: () => PaneSizing | null;
-  /** The element the panes are laid out in, watched for size changes and terminals fitting. */
-  root: HTMLElement | null;
+  /**
+   * The element the panes are laid out in, watched for size changes and terminals fitting. Read
+   * after each commit, so one that attaches later or is replaced is watched in its turn.
+   */
+  rootRef: RefObject<HTMLElement | null>;
 }
 
 /** A session terminal's fitted grid, which its pane's size rule reads. */
@@ -34,7 +37,7 @@ export function usePaneMoveAvailability({
   zoomedKey,
   paneKey,
   sizing,
-  root,
+  rootRef,
 }: PaneMoveAvailabilityOptions): CommandAvailability | null {
   const measure = () => movePaneAvailability({ layout, zoomedKey, key: paneKey, sizing: sizing() });
   const latest = useRef(measure);
@@ -42,7 +45,16 @@ export function usePaneMoveAvailability({
   const [measured, setMeasured] = useState(measure);
   const movable = paneMoveLayout(layout, zoomedKey);
   const shape = movable === null ? null : JSON.stringify(movable);
+  // What is watched, and for which split: kept in a ref, so reading the ref's element after a
+  // commit never renders again by itself.
+  const watched = useRef<{ root: HTMLElement | null; key: string; stop: () => void } | null>(null);
+  // After every commit, since nothing tells the hook when the ref's element changes.
   useLayoutEffect(() => {
+    const root = shape === null ? null : rootRef.current;
+    const key = `${shape}\0${paneKey}`;
+    if (watched.current && watched.current.root === root && watched.current.key === key) return;
+    watched.current?.stop();
+    watched.current = { root, key, stop: () => {} };
     if (shape === null) return;
     const update = () =>
       setMeasured((previous) => {
@@ -57,11 +69,18 @@ export function usePaneMoveAvailability({
     // are what session panes measure by, so fitting one measures again.
     const fits = new MutationObserver(update);
     fits.observe(root, { subtree: true, attributeFilter: FIT_ATTRIBUTES });
-    return () => {
+    watched.current.stop = () => {
       resizes.disconnect();
       fits.disconnect();
     };
-  }, [shape, paneKey, root]);
+  });
+  useLayoutEffect(
+    () => () => {
+      watched.current?.stop();
+      watched.current = null;
+    },
+    [],
+  );
   // Not offered at all, as for a lone or maximized pane, at once; room is what's measured.
   if (movable === null) return null;
   return measured;

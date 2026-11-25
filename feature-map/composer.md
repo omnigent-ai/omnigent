@@ -21,7 +21,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the same send, history, and completion keys. Side chats and New Chat follow
   the same choice. Mobile widths always use the plain text box. It also stays
   while the editor loads, and stays if loading fails; a failed load retries on
-  window focus, at most once a minute.
+  window focus, at most once a minute. In this editor a paste of files becomes one
+  chip per file at the caret, named after the file it sends as. A plain-text
+  paste of 40 lines or 4,000 characters becomes a `pasted-text.txt` chip. Chips
+  show in the main chat and New Chat; side-chat pastes stay in the tray. A draft
+  that leaves the editor (switching sessions, a new-session handoff, a recovered
+  send) keeps each chip's file as a tray attachment with its `@name` text
+  unchanged.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -271,7 +277,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
-  be removed. Supported native coding agents receive binary attachments, including
+  be removed. With the CodeMirror editor, pasted files and large text are chips
+  at the caret instead (see `codemirror-input`). Supported native coding agents receive binary attachments, including
   MP4 uploads up to 50 MiB, as local files.
   State: unsupported file type rejected without losing the message.
 - `at-mentions`: a bare `@` in the in-session or new-session composer shows a
@@ -289,6 +296,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session pill opens that session. The new-session composer lists the same
   sessions (no subagents yet) with the same title search; its files come from
   the host directory listing only, without the recursive workspace search.
+  Behind `chat_composer_codemirror`, a question card's custom answer takes the
+  same session tags (no files, no subagents); the answer goes to the agent with the
+  markers and tool hint, and the answered card shows them as pills.
   States: file listing still loading (Enter holds; a pending session search
   does not hold it), no match (Enter sends the literal text), late results
   arriving (the highlighted row stays put), a file and a session with the same
@@ -323,8 +333,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   opens and focuses the new-session composer in browsers. Native shells use
   ⌘/Ctrl+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
-  can be steered into the running turn. Side-chat composers queue and steer the
-  same way, with their own queue strip.
+  can be steered into the running turn. Mod+Enter inverts Always steer for one
+  message: with it on, the draft waits in the queue until the turn ends; with it
+  off, the draft and the whole queue are steered. Side-chat composers queue and
+  steer the same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
   after its current step in the timestamp row. The note stays visible, with
   truncation, on desktop and touch until the agent reads the message, while the
@@ -639,7 +651,8 @@ its tags and review comments as the full-screen composer does, and shows the
 review comments as chips. Sending while the session works queues the message on
 that session, as the full-screen composer does: it waits in the cell's queue strip
 (edit, steer, remove) and sends when the turn ends. With Always steer on it steers
-into the running turn instead, and Mod+Enter steers the whole queue. Editing a
+into the running turn instead, and Mod+Enter queues it; with it off, Mod+Enter
+steers the whole queue. Editing a
 queued message brings its tags back as tokens. The queue belongs to the session, so
 the full-screen view shows and flushes the same messages; a reload drops a cell's
 queued messages, where the full-screen composer restores its own. Escape does not

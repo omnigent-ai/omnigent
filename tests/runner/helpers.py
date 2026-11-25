@@ -40,6 +40,7 @@ class NullServerClient:
         """Stub HTTP response that looks like a 200 with an empty body."""
 
         status_code = 200
+        is_success = True
 
         def json(self) -> dict[str, Any]:
             """Return an empty JSON object."""

@@ -4,7 +4,9 @@ This is the API's single implementation: the desktop app's direct socket and
 the server's route both reach this service. It reads through
 :class:`~omnigent.workspace_fs.WorkspaceReader`, so its answers match the REST
 file routes. Which workspace a call reads comes from the caller-supplied
-``reader_for``, which resolves it from the call's credentials.
+``reader_for``, which resolves it from the call's credentials. Its pull request
+methods are served only over the tunnel, for the session the server sends with
+the call (see :mod:`omnigent.host.workspace_pull_requests`); the socket serves none.
 
 Mount it with the generated ASGI app::
 
@@ -18,6 +20,7 @@ an owner-only Unix socket, admitting calls that carry a server-issued token
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import shutil
@@ -74,10 +77,20 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     StatPathRequest,
     StatPathResponse,
 )
+from omnigent.entities.pagination import PagedList
 from omnigent.host import workspace_fuzzy
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_git import comparison, context, working_copy
+from omnigent.host.workspace_git.ignored import DirectoryIgnores
+from omnigent.host.workspace_git.runner import Deadline, GitError, runs_on_this_host
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
+from omnigent.host.workspace_payloads import payload_struct
+from omnigent.host.workspace_pull_request_input import refuse_unserved_request
+from omnigent.host.workspace_pull_requests import (
+    PULL_REQUEST_OPS,
+    PullRequestCall,
+    run_pull_request_op,
+)
 from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
@@ -88,6 +101,8 @@ _logger = logging.getLogger(__name__)
 
 # Matches the largest page the web Files tree asks for.
 _MAX_PAGE_SIZE = 1000
+# How long ListDirectory may ask Git which entries it ignores, across its pages.
+_IGNORED_DEADLINE_S = 10.0
 # Small enough to keep a stream responsive, large enough to keep framing cheap.
 _READ_CHUNK_BYTES = 64 * 1024
 _ERROR_CODES = {
@@ -107,7 +122,7 @@ class _Served:
     :param features: Optional features it offers, e.g. ``"search_files.substring"``.
     :param tool: A program it needs on ``PATH``; without it, the method isn't listed.
     :param optional_features: Returns the features this host can offer only when
-        a library they need loads.
+        what they need is there, such as a library that loads or a program on ``PATH``.
     """
 
     features: tuple[str, ...] = ()
@@ -117,7 +132,10 @@ class _Served:
 
 # The methods this host answers. Only these, and GetCapabilities, are dispatched.
 _SERVED: dict[str, _Served] = {
-    "ListDirectory": _Served(),
+    "ListDirectory": _Served(
+        features=("list_directory.collapse_single_child_directories",),
+        optional_features=lambda: ("gitignore",) if _reads_ignore_rules() else (),
+    ),
     "ReadFile": _Served(),
     "StatPath": _Served(),
     "ReadLinkText": _Served(),
@@ -131,15 +149,28 @@ _SERVED: dict[str, _Served] = {
     "ListWorkingCopyChanges": _Served(tool="git"),
     "ReadBaseFile": _Served(tool="git"),
     "ListRepositoryRefs": _Served(tool="git"),
-    "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
+    "ListBranchCommits": _Served(features=("branch_commits", "branch_commits.head"), tool="git"),
     "ResolveRepositoryContext": _Served(tool="git"),
+    # Served only over the tunnel, for a call the server sent with its session.
+    **{name: _Served(tool="gh") for name in PULL_REQUEST_OPS},
 }
 
 
-def capabilities() -> list[str]:
-    """The method and feature names GetCapabilities lists on this host."""
+def _reads_ignore_rules() -> bool:
+    """Whether listings can ask Git what it ignores: ``git`` is on ``PATH`` and can run here."""
+    return bool(shutil.which("git")) and runs_on_this_host()
+
+
+def capabilities(*, pull_requests: bool = False) -> list[str]:
+    """The method and feature names GetCapabilities lists on this host.
+
+    :param pull_requests: Whether the call may read pull requests: only a tunnel call
+        that carries the session the server authorized.
+    """
     names: list[str] = []
     for name, served in _SERVED.items():
+        if name in PULL_REQUEST_OPS and not pull_requests:
+            continue
         if served.tool is None or shutil.which(served.tool):
             optional = served.optional_features() if served.optional_features else ()
             names += [name, *served.features, *optional]
@@ -168,17 +199,38 @@ class WorkspaceService(WorkspaceServiceMethods):
 
     :param reader_for: Returns the reader for the workspace a call may read.
         It must raise :class:`ConnectError` when the call isn't authorized.
+    :param pull_request_call: The session and vouch the server sent with a tunnel call,
+        or ``None``, e.g. on the direct socket, where pull requests aren't served.
     """
 
-    def __init__(self, reader_for: ReaderForCall) -> None:
+    def __init__(
+        self, reader_for: ReaderForCall, pull_request_call: PullRequestCall | None = None
+    ) -> None:
         self._reader_for = reader_for
+        self._pull_request_call = pull_request_call
 
     async def get_capabilities(
         self,
         _request: GetCapabilitiesRequest,
         _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
     ) -> GetCapabilitiesResponse:
-        return GetCapabilitiesResponse(capabilities=capabilities())
+        return GetCapabilitiesResponse(
+            capabilities=capabilities(pull_requests=self._pull_request_call is not None)
+        )
+
+    async def _serve_pull_request(
+        self, name: str, request: Message, ctx: RequestContext | None
+    ) -> Message:
+        # Refused before any reader, registry or gh work when the server sent no session.
+        call = self._pull_request_call
+        if call is None:
+            raise ConnectError(
+                Code.UNIMPLEMENTED, "Pull requests are served through the server's route"
+            )
+        refuse_unserved_request(name, request)
+        reader = await _read(self._reader_for, ctx)
+        payload = await _read(run_pull_request_op, name, reader, call, request)
+        return WORKSPACE_METHODS[name].response_type(payload=payload_struct(payload))
 
     async def list_directory(
         self,
@@ -188,18 +240,61 @@ class WorkspaceService(WorkspaceServiceMethods):
         if request.page_size < 0:
             raise ConnectError(Code.INVALID_ARGUMENT, "page_size must not be negative")
         reader = await _read(self._reader_for, ctx)
-        page = await _read(
-            reader.list_directory,
-            request.path,
-            limit=min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE),
-            after=request.page_token or None,
-        )
-        # The REST listing has no symlink flag, so look at each entry itself.
-        links = await _read(_symlinks, reader.root, [item["path"] for item in page.data])
-        entries = [_entry(item, is_symlink=item["path"] in links) for item in page.data]
-        # The cursor is the last entry's id; the proto keeps it opaque.
-        next_page_token = page.last_id if page.has_more and page.last_id else ""
-        return ListDirectoryResponse(entries=entries, next_page_token=next_page_token)
+        limit = min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE)
+        deadline = Deadline(_IGNORED_DEADLINE_S)
+        entries: list[Entry] = []
+        # The cursor is the last consumed entry's id; the proto keeps it opaque.
+        after = request.page_token or None
+
+        async def read_page(after: str | None) -> PagedList[ListedEntry]:
+            return await _read(
+                reader.list_directory,
+                request.path,
+                limit=limit,
+                after=after,
+                collapse_single_child_directories=request.collapse_single_child_directories,
+            )
+
+        page = await read_page(after)
+        # Git reads the confined directory the listing read; one repository answers for it all.
+        directory = await _read(reader.resolve_directory, request.path)
+        ignores = await _directory_ignores(directory, deadline)
+        while True:
+            paths = [item["path"] for item in page.data]
+            # The REST listing has no symlink flag, so look at each entry itself.
+            links = await _read(_symlinks, reader.root, paths)
+            ignored = await _ignored(ignores, [item["name"] for item in page.data], deadline)
+            if ignored is None and entries:
+                # Git stopped answering partway: end here rather than mix in unfiltered pages.
+                return ListDirectoryResponse(entries=entries, next_page_token=after or "")
+            ignored = ignored or set()
+            leaves = await _leaves_short_of_ignored(ignores, page.data, ignored, deadline)
+            for index, item in enumerate(page.data):
+                after = item["id"]
+                hidden = request.hide_ignored and item["name"] in ignored
+                if not hidden:
+                    entries.append(
+                        _entry(
+                            {**item, "leaf_directory_path": leaves[item["path"]]}
+                            if item["path"] in leaves
+                            else item,
+                            is_symlink=item["path"] in links,
+                            ignored=item["name"] in ignored,
+                        )
+                    )
+                if len(entries) == limit:
+                    more = page.has_more or index < len(page.data) - 1
+                    return ListDirectoryResponse(
+                        entries=entries, next_page_token=after if more else ""
+                    )
+            # Hidden entries leave room, so read on: a page comes back empty only at the end.
+            if not (request.hide_ignored and page.has_more and page.last_id):
+                return ListDirectoryResponse(
+                    entries=entries,
+                    next_page_token=page.last_id if page.has_more and page.last_id else "",
+                )
+            after = page.last_id
+            page = await read_page(after)
 
     async def read_file(
         self,
@@ -312,7 +407,72 @@ class WorkspaceService(WorkspaceServiceMethods):
         return ReadLinkTextResponse(target=await _read(reader.read_link_text, request.path))
 
 
-def _entry(item: ListedEntry, *, is_symlink: bool) -> Entry:
+async def _directory_ignores(directory: Path, deadline: Deadline) -> DirectoryIgnores | None:
+    """The listed directory's ignore rules; none without Git, so the listing still answers."""
+    if not _reads_ignore_rules():
+        return None
+    try:
+        return await DirectoryIgnores.for_directory(directory, deadline)
+    except GitError as exc:
+        _logger.info("Listing without ignored files: %s", exc.problem.name)
+        return None
+
+
+async def _ignored(
+    ignores: DirectoryIgnores | None, names: list[str], deadline: Deadline
+) -> set[str] | None:
+    """The ``names`` Git ignores, empty without a repository, or ``None`` when Git failed."""
+    if ignores is None:
+        return set()
+    try:
+        return await ignores.ignored(names, deadline)
+    except GitError as exc:
+        _logger.info("Listing without ignored files: %s", exc.problem.name)
+        return None
+
+
+async def _leaves_short_of_ignored(
+    ignores: DirectoryIgnores | None,
+    items: list[ListedEntry],
+    ignored: set[str],
+    deadline: Deadline,
+) -> dict[str, str]:
+    """Folder chains cut before the first folder Git ignores, so a hint never shows one.
+
+    :returns: Each changed entry's path and its new ``leaf_directory_path``, ``""`` for none.
+    """
+    if ignores is None:
+        return {}
+    leaves: dict[str, str] = {}
+    # Each chain's inner folders, as paths below the listed directory.
+    inner: dict[str, list[str]] = {}
+    for item in items:
+        leaf = item.get("leaf_directory_path")
+        if not leaf:
+            continue
+        if item["name"] in ignored:
+            # Everything below an ignored folder is ignored too; it lists folder by folder.
+            leaves[item["path"]] = ""
+            continue
+        below = leaf.removeprefix(item["path"] + "/").split("/")
+        inner[item["path"]] = [
+            "/".join([item["name"], *below[: depth + 1]]) for depth in range(len(below))
+        ]
+    if not inner:
+        return leaves
+    hit = await _ignored(ignores, [path for paths in inner.values() for path in paths], deadline)
+    for path, folders in inner.items():
+        if hit is None:
+            # Git stopped answering: leave out the hint rather than risk an ignored folder.
+            leaves[path] = ""
+            continue
+        kept = len(list(itertools.takewhile(lambda folder: folder not in hit, folders)))
+        if kept < len(folders):
+            leaves[path] = "/".join([path, *folders[kept - 1].split("/")[1:]]) if kept else ""
+    return leaves
+
+
+def _entry(item: ListedEntry, *, is_symlink: bool, ignored: bool = False) -> Entry:
     return Entry(
         name=item["name"],
         path=item["path"],
@@ -320,6 +480,8 @@ def _entry(item: ListedEntry, *, is_symlink: bool) -> Entry:
         size=item["bytes"],
         modify_time=Timestamp(seconds=item["modified_at"]),
         is_symlink=is_symlink,
+        leaf_directory_path=item.get("leaf_directory_path", ""),
+        ignored=ignored,
     )
 
 
@@ -336,6 +498,22 @@ def _reader_at(
     if not os.path.isdir(expanded):
         raise ConnectError(Code.NOT_FOUND, "The session's workspace is not on this host")
     return reader_for_workspace(expanded)
+
+
+def _pull_request_handler(name: str) -> Callable[..., object]:
+    """A WorkspaceService method that serves the pull request method ``name``."""
+
+    async def handle(
+        self: WorkspaceService, request: Message, ctx: RequestContext | None
+    ) -> Message:
+        return await self._serve_pull_request(name, request, ctx)
+
+    handle.__name__ = WORKSPACE_METHODS[name].python_name
+    return handle
+
+
+for _name in PULL_REQUEST_OPS:
+    setattr(WorkspaceService, WORKSPACE_METHODS[_name].python_name, _pull_request_handler(_name))
 
 
 async def _call(service: WorkspaceService, method: str, request: bytes) -> AsyncIterator[Message]:
@@ -367,7 +545,14 @@ async def serve_tunnel_call(
     Yields one reply per response message, then a final ``done`` reply that
     carries the error, if any.
     """
-    service = WorkspaceService(lambda _ctx: _reader_at(reader_for_workspace, frame.workspace))
+    pull_request_call = (
+        PullRequestCall(session_id=frame.session_id, vouch=frame.vouch)
+        if frame.session_id
+        else None
+    )
+    service = WorkspaceService(
+        lambda _ctx: _reader_at(reader_for_workspace, frame.workspace), pull_request_call
+    )
     request_id = frame.request_id
     try:
         async for response in _call(service, frame.method, frame.request):

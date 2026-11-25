@@ -3572,6 +3572,82 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
     ) in fake_runner.calls
 
 
+@pytest.mark.asyncio
+async def test_only_a_github_info_poll_lets_the_runner_answer_from_its_previous_read(
+    client: httpx.AsyncClient,
+) -> None:
+    """A client's poll forwards ``allow_cached``; other reads ask the runner for a fresh one."""
+    runner = _FakeRunnerClient(payload={"object": "session.github.info", "available": True})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github"
+
+    polled = await client.get(path, params={"allow_cached": "true"})
+    plain = await client.get(path)
+
+    assert (polled.status_code, plain.status_code) == (200, 200)
+    assert runner.get_params == [{"allow_cached": True}, None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [{}, {"allow_cached": "true"}], ids=["one-shot", "poll"])
+async def test_github_info_serves_a_tunnelled_runners_late_answer_unchanged(
+    client: httpx.AsyncClient, params: dict[str, str]
+) -> None:
+    """A runner answer that arrives over the tunnel late and in parts is served unchanged."""
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        HelloFrame,
+        ResponseBodyFrame,
+        ResponseEndFrame,
+        ResponseHeadFrame,
+    )
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+
+    class _QuietRunnerSocket:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    registry = TunnelRegistry()
+    hello = HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+    registry.register("runner_one", _QuietRunnerSocket(), hello)
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"),
+        base_url="http://runner",
+        timeout=httpx.Timeout(5.0, read=None),
+    )
+    set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
+    payload = {"object": "session.github.info", "available": True, "pr": None}
+
+    read = asyncio.create_task(
+        client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github", params=params)
+    )
+    session = registry.get("runner_one")
+    assert session is not None
+    await poll_until_async(lambda: len(session.in_flight) == 1, timeout_s=budget(5))
+    request_id = next(iter(session.in_flight))
+    await asyncio.sleep(0.2)
+    registry.route_response_frame(
+        "runner_one",
+        ResponseHeadFrame(
+            id=request_id, status=200, headers=[["content-type", "application/json"]]
+        ),
+    )
+    await asyncio.sleep(0.2)
+    registry.route_response_frame(
+        "runner_one", ResponseBodyFrame(id=request_id, body=json.dumps(payload), encoding="utf-8")
+    )
+    registry.route_response_frame("runner_one", ResponseEndFrame(id=request_id))
+    resp = await asyncio.wait_for(read, timeout=budget(5))
+    await runner_client.aclose()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == payload
+    assert not session.in_flight
+
+
 def _pr_app(db_uri: str, **router_options: Any) -> FastAPI:
     """App whose sessions keep their pull requests in a real SQLite store."""
     SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
@@ -3699,6 +3775,25 @@ async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
 
 
 @pytest.mark.asyncio
+async def test_a_cached_runner_answer_does_not_replace_a_newer_stored_state(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    """A runner answer from an earlier read is stored as of when that read began."""
+    path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+    merged = {**_pr_info(), "pr": {**_pr_info()["pr"], "state": "MERGED"}}  # type: ignore[dict-item]
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=merged)))  # type: ignore[arg-type]
+    assert (await pr_client.get(path)).status_code == 200
+
+    cached = {**_pr_info(), "cache_age_s": 60.0}
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=cached)))  # type: ignore[arg-type]
+    answered = await pr_client.get(path)
+    assert answered.status_code == 200, answered.text
+    assert "cache_age_s" not in answered.json()
+    listed = await pr_client.get(f"/v1/sessions/{_PR_SESSION}/pull-requests")
+    assert listed.json()["data"][0]["state"] == "MERGED"
+
+
+@pytest.mark.asyncio
 async def test_linking_checks_the_session_limit_before_asking_the_host(
     pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3778,6 +3873,41 @@ async def test_a_listed_session_is_imported_from_its_runner_in_the_background(
 
 
 @pytest.mark.asyncio
+async def test_background_pr_refreshes_and_plain_reads_ask_the_runner_for_a_fresh_read(
+    runner_globals_reset: None, db_uri: str
+) -> None:
+    """Only a client's poll may take the runner's earlier read; refreshes after turns may not."""
+    from omnigent.server.session_pull_requests import PullRequestRefresher
+
+    del runner_globals_reset
+    SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
+    conversation_store = _ConversationStore()
+    conversation_store.storage_location = db_uri  # type: ignore[attr-defined]
+    conversation_store._conversations[_PR_SESSION].runner_id = "runner_pr"
+    refresher = PullRequestRefresher()
+    app = _sessions_app(conversation_store, pull_request_refresher=refresher)
+    runner = _FakeRunnerClient(payload=_pr_info())
+    set_runner_router(_OnlineRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        refresher.request(_PR_SESSION)
+        await asyncio.sleep(0)
+        while refresher._running:
+            await asyncio.gather(*refresher._running.values())
+        plain = await client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
+    assert plain.status_code == 200, plain.text
+    gets = [url for method, url in runner.calls if method == "GET"]
+    github_reads = [
+        params or {}
+        for url, params in zip(gets, runner.get_params, strict=True)
+        if url.endswith("/resources/github")
+    ]
+    assert len(github_reads) == 2
+    assert all("allow_cached" not in params for params in github_reads)
+
+
+@pytest.mark.asyncio
 async def test_pull_request_list_pages_by_url(pr_client: httpx.AsyncClient) -> None:
     set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
     await pr_client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
@@ -3833,7 +3963,7 @@ async def test_unlink_on_the_wrong_replica_asks_the_client_to_re_address(
 @pytest.mark.parametrize(
     ("level", "list_status", "unlink_status"),
     # Without a grant the session reads as missing.
-    [(None, 404, 404), (LEVEL_READ, 200, 403), (LEVEL_EDIT, 200, 200)],
+    [(None, 404, 404), (LEVEL_READ, 200, 403), (LEVEL_EDIT, 200, 403), (LEVEL_OWNER, 200, 200)],
 )
 async def test_stored_pull_request_routes_check_session_access(
     runner_globals_reset: None,

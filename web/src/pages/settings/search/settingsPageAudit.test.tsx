@@ -388,12 +388,30 @@ const PROJECT_KANBAN_OFF =
   "Shows only when the server turns on project kanban, which no scenario does.";
 const PROACTIVE_AGENT_OFF =
   "Shows only where the server offers the proactive agent, which no scenario sets up yet.";
+const OMNI_ADVISOR_OFF = "The server doesn't offer Omni Advisor.";
+const OMNI_ADVISOR_SETTINGS: SettingsRoute = {
+  url: "/v1/proactive-agent/settings",
+  body: { workspace_enabled: true, user_enabled: true, enabled: true, can_manage_workspace: true },
+};
+const OMNI_ADVISOR_SETTINGS_FAIL: SettingsRoute = {
+  url: "/v1/proactive-agent/settings",
+  status: 500,
+  body: { detail: "Try again." },
+};
+const OMNI_ADVISOR_PROMPT: SettingsRoute = {
+  url: "/v1/proactive-agent/prompt",
+  body: { prompt: "Be useful.", default_prompt: "Be useful.", overridden: false },
+};
+const FLOATING_PANES_UNAVAILABLE =
+  "Shows only where sidebar v2 or floating panes is on; the web › sidebar v2 scenario checks it.";
+const APPEARANCE_HIDES = { "pane-corners": FLOATING_PANES_UNAVAILABLE };
 const GENERAL_WEB_HIDES = {
   "open-links-in-app": DESKTOP_ONLY,
   "global-shortcut": DESKTOP_ONLY,
   "floating-composer-shortcut": DESKTOP_ONLY,
   "widen-window-for-right-sidebar": DESKTOP_ONLY,
   "browser-agent-tools": DESKTOP_ONLY,
+  "trusted-remote-hosts": DESKTOP_ONLY,
   "admin-view": ADMIN_VIEW_NOT_LOADED,
   "project-kanban-board": PROJECT_KANBAN_OFF,
   "proactive-agent": PROACTIVE_AGENT_OFF,
@@ -517,6 +535,35 @@ function harnessPageScenario(harness: NativeHarnessId): SettingsAuditScenario {
 
 const SCENARIOS: readonly SettingsAuditScenario[] = [
   {
+    section: "general",
+    scenario: "desktop trusted hosts",
+    ready: [TITLES_LOADED, "https://server.example.com/"],
+    hides: {
+      ...Object.fromEntries(
+        Object.entries(GENERAL_WEB_HIDES).filter(
+          ([id]) =>
+            !["trusted-remote-hosts", "browser-agent-tools", "open-links-in-app"].includes(id),
+        ),
+      ),
+      "open-in-desktop-app": "Already running in the desktop app.",
+    },
+    states: { "session-title-instructions": ["loaded"] },
+    setup: () => {
+      vi.stubGlobal("omnigentDesktop", {
+        kind: "electron",
+        browserOpenOrNavigate: vi.fn(),
+        getDesktopFeatures: async () => ({ trustedRemoteLocalhostPreview: true }),
+        getTrustedRemoteHosts: async () => ({
+          ok: true,
+          serverUrl: "https://server.example.com/",
+          hosts: [{ server_url: "https://server.example.com/", host_id: "example-host" }],
+        }),
+        addTrustedRemoteHost: vi.fn(),
+        removeTrustedRemoteHost: vi.fn(),
+      });
+    },
+  },
+  {
     section: "harnesses",
     scenario: "web",
     ready: ["laptop"],
@@ -618,6 +665,27 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
         name: "harness list",
         open: () => userEvent.click(screen.getByRole("combobox", { name: "Harness" })),
         witness: { option: "Claude SDK" },
+      },
+      {
+        name: "a server's transport list",
+        origin: "custom-agent-create:serverTransport",
+        prepare: () => userEvent.click(screen.getByRole("button", { name: "Add server" })),
+        open: () =>
+          userEvent.click(screen.getByRole("combobox", { name: "Transport for server 1" })),
+        witness: { option: "http" },
+        states: { "custom-agent-create": ["has servers", "stdio server"] },
+      },
+    ],
+    inlineActions: [
+      {
+        name: "an HTTP server",
+        open: async () => {
+          await userEvent.click(screen.getByRole("combobox", { name: "Transport for server 1" }));
+          await userEvent.click(await screen.findByRole("option", { name: "http" }));
+        },
+        witness: { label: "URL for server 1" },
+        states: { "custom-agent-create": ["has servers", "http server"] },
+        close: () => userEvent.click(screen.getByRole("button", { name: "Remove server 1" })),
       },
     ],
   },
@@ -799,7 +867,28 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
       },
     ],
   },
-  { section: "admin", scenario: "web", ready: [{ row: "nested-agent-destinations" }] },
+  {
+    section: "admin",
+    scenario: "web",
+    ready: [{ row: "nested-agent-destinations" }],
+    hides: { "proactive-agent-workspace": OMNI_ADVISOR_OFF },
+  },
+  {
+    section: "admin",
+    scenario: "web › Omni Advisor offered",
+    info: { proactive_agent_available: true },
+    routes: [OMNI_ADVISOR_SETTINGS, OMNI_ADVISOR_PROMPT],
+    ready: [{ row: "nested-agent-destinations" }],
+    states: { "proactive-agent-workspace": ["prompt loaded", "settings loaded"] },
+  },
+  {
+    section: "admin",
+    scenario: "web › Omni Advisor failed to load",
+    info: { proactive_agent_available: true },
+    routes: [OMNI_ADVISOR_SETTINGS_FAIL, OMNI_ADVISOR_PROMPT],
+    ready: [{ row: "nested-agent-destinations" }],
+    states: { "proactive-agent-workspace": ["load failed", "prompt loaded"] },
+  },
   {
     section: "archived",
     scenario: "web",
@@ -874,6 +963,7 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
   },
   {
     section: "appearance",
+    hides: APPEARANCE_HIDES,
     scenario: "web",
     ready: ["Settings data"],
     // Collapsing project sessions is on by default, so its page size shows.
@@ -898,6 +988,14 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
   },
   {
     section: "appearance",
+    scenario: "web › sidebar v2",
+    info: { features: { ...SERVER_INFO.features, workspace_sidebar_v2: true } },
+    ready: ["Settings data"],
+    states: { "project-folder-pagination": ["collapsed"] },
+  },
+  {
+    section: "appearance",
+    hides: APPEARANCE_HIDES,
     scenario: "web › custom palette",
     setup: () => writeThemePalette("custom"),
     ready: ["Background tint"],
@@ -917,6 +1015,7 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
   },
   {
     section: "appearance",
+    hides: APPEARANCE_HIDES,
     scenario: "web › agents failed to load",
     routes: [{ url: "/v1/agents", status: 500, body: {} }],
     ready: ["Couldn't load this server's harnesses and agents."],
@@ -924,6 +1023,7 @@ const SCENARIOS: readonly SettingsAuditScenario[] = [
   },
   {
     section: "appearance",
+    hides: APPEARANCE_HIDES,
     scenario: "web › in a Databricks embed",
     embedded: true,
     setup: () =>

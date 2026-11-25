@@ -39,7 +39,7 @@ import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
 import { readTaskActivity, repeatsTaskMarker } from "./taskActivity";
 import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
-import type { ActiveResponse } from "@/store/types";
+import type { ActiveResponse, UploadFailure } from "@/store/types";
 
 /**
  * UI states for a tool card. The first three line up with values in
@@ -212,6 +212,8 @@ export type Bubble =
        * optimistic→committed swap (no remount/flink).
        */
       stableKey?: string;
+      /** Set when this send's upload failed before posting; its attachment offers Retry. */
+      uploadFailure?: UploadFailure;
     }
   | {
       kind: "assistant";
@@ -2070,6 +2072,8 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      a.uploadFailure?.fileId !== b.uploadFailure?.fileId ||
+      a.uploadFailure?.message !== b.uploadFailure?.message ||
       a.shellCommand !== b.shellCommand ||
       a.content.length !== b.content.length
     )

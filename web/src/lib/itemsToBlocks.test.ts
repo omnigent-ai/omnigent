@@ -650,6 +650,45 @@ describe("itemsToBlocks — answered question and plan cards", () => {
     });
   });
 
+  it("keeps a tagged answer whole, including its session marker's quotes", () => {
+    const tagged =
+      'Base it on the fix from [Session: "Fix CI" id=s_ci subagent=no]\n\n' +
+      "[Tagged sessions: read with sys_session_get_history]";
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Pick for me"),
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1", "claude-native-ui"),
+      functionCallOutput(
+        "resp_1",
+        "c1",
+        `Your questions have been answered: "Which library should we use?"="${tagged}", ` +
+          '"Ship the "fast path" too?"="Yes". You can now continue with these answers in mind.',
+      ),
+    ];
+    const card = itemsToBlocks(items)[1] as ElicitationBlock;
+    expect(card.response?.content).toEqual({
+      "Which library should we use?": tagged,
+      'Ship the "fast path" too?': "Yes",
+    });
+  });
+
+  it("keeps an answer with several quotes, when it is the last one", () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Pick for me"),
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1", "claude-native-ui"),
+      functionCallOutput(
+        "resp_1",
+        "c1",
+        'Your questions have been answered: "Which library should we use?"="date-fns", ' +
+          '"Ship the "fast path" too?"="Say "yes", then "ship" it". You can now continue.',
+      ),
+    ];
+    const card = itemsToBlocks(items)[1] as ElicitationBlock;
+    expect(card.response?.content).toEqual({
+      "Which library should we use?": "date-fns",
+      'Ship the "fast path" too?': 'Say "yes", then "ship" it',
+    });
+  });
+
   it("leaves an unanswered question as a plain tool row", () => {
     // No output yet (still parked, or the pair split across history pages):
     // the live snapshot owns the pending card, and a rebuilt one would have

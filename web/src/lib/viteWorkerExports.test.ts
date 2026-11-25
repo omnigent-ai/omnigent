@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { rootPackageName, workerEntryFor } from "../../vite.workerExports";
+import { devServerWorkerExports, rootPackageName, workerEntryFor } from "../../vite.workerExports";
 
 const ROOT = "/app/node_modules/.pnpm/pkg@1/node_modules/pkg";
 
@@ -46,5 +46,20 @@ describe("rootPackageName", () => {
     ]) {
       expect(rootPackageName(source)).toBeNull();
     }
+  });
+});
+
+describe("devServerWorkerExports", () => {
+  it("swaps entries in the module graph and the pre-bundle only while serving the app", () => {
+    const serving = devServerWorkerExports("serve", "development");
+    expect(serving.plugins).toHaveLength(1);
+    expect(serving.optimizeDeps.rolldownOptions?.plugins).toHaveLength(1);
+  });
+
+  it.each([
+    ["the tests", "serve", "test"],
+    ["a build", "build", "production"],
+  ])("keeps the browser entries in both halves for %s", (_name, command, mode) => {
+    expect(devServerWorkerExports(command, mode)).toEqual({ plugins: [], optimizeDeps: {} });
   });
 });

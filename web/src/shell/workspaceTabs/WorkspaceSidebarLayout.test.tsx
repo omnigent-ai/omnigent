@@ -10,6 +10,7 @@ import { readPanelSharePreference, writePanelSizePreference } from "@/lib/panelS
 
 import { FILES_TREE_DEFAULT_WIDTH, FILES_TREE_WIDTH } from "./placeViews/filesTreeWidth";
 import {
+  SIDEBAR_HANDLES_ESCAPE,
   WORKSPACE_SIDEBAR_LAYOUT,
   WorkspaceSidebarLayout,
   WorkspaceSidebarToggle,
@@ -106,6 +107,29 @@ describe("WorkspaceSidebarToggle", () => {
     expect(document.activeElement).toBe(toggle);
     // Opening the popover leaves the remembered docked choice alone.
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("stays open for Escape in a field that handles it, and closes for Escape elsewhere", async () => {
+    page.width = 500;
+    render(
+      <Page
+        sidebar={
+          <>
+            <input aria-label="Name contains" {...{ [SIDEBAR_HANDLES_ESCAPE]: "" }} />
+            <button type="button">Reveal Active File</button>
+          </>
+        }
+      />,
+    );
+    screen.getByRole("button", { name: "Show tree" }).focus();
+    await userEvent.keyboard("{Enter}");
+    screen.getByRole("textbox", { name: "Name contains" }).focus();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Workspace files" })).toBeInTheDocument();
+
+    screen.getByRole("button", { name: "Reveal Active File" }).focus();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Workspace files" })).toBeNull();
   });
 
   it("starts the popover on the control the sidebar marks, past the ones before it", async () => {

@@ -1023,8 +1023,9 @@ async def test_review_conversation_reads_follow_file_sharing(
 )
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 async def test_pr_edit_routes_require_edit(
     client: httpx.AsyncClient,
@@ -1034,7 +1035,7 @@ async def test_pr_edit_routes_require_edit(
     path: str,
     added: object,
 ) -> None:
-    """PR label and reviewer routes act as the host's account, so viewers are refused."""
+    """PR label and reviewer routes act as the host's account, so only the owner reaches it."""
     headers = {"X-Forwarded-Email": caller}
     listed = await client.get(path, params={"pr_url": _LABELS_PR_URL}, headers=headers)
     edited = await client.post(
@@ -1069,8 +1070,9 @@ _ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 async def test_pr_merge_routes_require_edit(
     client: httpx.AsyncClient,
@@ -1078,7 +1080,7 @@ async def test_pr_merge_routes_require_edit(
     caller: str,
     expected: int,
 ) -> None:
-    """Merging acts with the host's account, so viewers are refused before the runner."""
+    """Merging acts with the host's account, so only the owner reaches the runner."""
     headers = {"X-Forwarded-Email": caller}
     options = await client.get(
         _MERGE_OPTIONS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers
@@ -1109,8 +1111,9 @@ async def test_pr_merge_routes_require_edit(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "caller,expected",
-    [("owner@example.com", 200), ("viewer@example.com", 403)],
-    ids=["edit-allowed", "read-denied"],
+    # owner@example.com holds an edit grant; only the owner grant changes a pull request.
+    [("real-owner@example.com", 200), ("owner@example.com", 403), ("viewer@example.com", 403)],
+    ids=["owner-allowed", "edit-denied", "read-denied"],
 )
 @pytest.mark.parametrize("resource", ["details", "comment", "reply", "thread"])
 async def test_pr_details_route_requires_edit(
@@ -1120,7 +1123,7 @@ async def test_pr_details_route_requires_edit(
     expected: int,
     resource: str,
 ) -> None:
-    """Writing PR text acts as the host's account, so viewers are refused."""
+    """Writing PR text acts as the host's account, so only the owner may."""
     comment = resource != "details"
     path = {
         "details": _DETAILS_PATH,
@@ -1195,7 +1198,7 @@ async def test_pr_edit_requires_a_json_body(
     resp = await client.post(
         path,
         content=json.dumps(body),
-        headers={"X-Forwarded-Email": "owner@example.com", "Content-Type": "text/plain"},
+        headers={"X-Forwarded-Email": "real-owner@example.com", "Content-Type": "text/plain"},
     )
 
     assert resp.status_code == 415, resp.text
@@ -1268,3 +1271,146 @@ async def test_workspace_api_follows_the_file_read_gate(
     # stream reports it in its body, a unary call as its status.
     assert resp.status_code == (200 if streaming else 503), resp.text
     assert b"unavailable" in resp.content
+
+
+_PR_BROWSE_READS = [
+    "ListPullRequestFiles",
+    "GetPullRequestDiff",
+    "ListPullRequestCommits",
+    "GetCommitDiff",
+    "ComparePullRequestRange",
+    "ListReviewThreads",
+]
+
+
+# Each valid for the server, so a call past the gate reaches the missing host.
+_PR_OWNER_METHODS = {
+    "ListLabels": {},
+    "ListReviewerCandidates": {},
+    "GetMergeOptions": {},
+    "CreateComment": {"body": "Looks good"},
+    "CreateReviewThread": {"body": "Why this?"},
+    "ReplyToReviewThread": {"threadId": "thread_1", "body": "Done"},
+    "UpdatePullRequestDetails": {"title": "A clearer title"},
+    "UpdateLabels": {"add": ["bug"]},
+    "UpdateReviewers": {"add": [{"login": "octocat", "kind": "user"}]},
+    "SetPullRequestAccount": {"account": "octocat"},
+    "MergePullRequest": {"mergeMethod": "squash", "expectedHeadOid": "a" * 40},
+    "MergePullRequestAsAccount": {
+        "mergeMethod": "squash",
+        "expectedHeadOid": "a" * 40,
+        "account": "octocat",
+    },
+    "DisableAutoMerge": {},
+}
+
+
+def _pull_request_call_passes(method: str, caller: str | None, session: str) -> int:
+    """The status a pull request call gets: 503 past the gate (no host here), else a refusal."""
+    if caller is None:
+        return 401
+    if caller == "manager@example.com" and session == "conv_open":
+        return 404  # No grant on this session: it isn't revealed.
+    if method == "GetPullRequest" or method in _PR_OWNER_METHODS:
+        # Its overview carries the host account's identities: the owner grant only, no admin.
+        return 503 if caller == "real-owner@example.com" else 403
+    if method in _PR_BROWSE_READS and caller == "viewer@example.com" and session == "conv_share":
+        return 403
+    return 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "real-owner@example.com",
+        "owner@example.com",
+        "manager@example.com",
+        "viewer@example.com",
+        "admin@example.com",
+        None,
+    ],
+    ids=["owner", "editor", "manager", "viewer", "admin", "anonymous"],
+)
+@pytest.mark.parametrize(
+    "method", ["GetPullRequest", *_PR_BROWSE_READS, "ListReviewThreadComments"]
+)
+async def test_workspace_api_pull_request_reads_keep_their_rest_gates(
+    client: httpx.AsyncClient, session: str, caller: str | None, method: str
+) -> None:
+    """Each read has its REST route's gate; GetPullRequest is the owner's alone for now."""
+    headers = {"Content-Type": "application/json"}
+    if caller is not None:
+        headers["X-Forwarded-Email"] = caller
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers=headers,
+        content=b'{"prUrl": "https://github.com/example/app/pull/7"}',
+    )
+
+    assert resp.status_code == _pull_request_call_passes(method, caller, session), resp.text
+    if resp.status_code == 503:
+        assert b"unavailable" in resp.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "real-owner@example.com",
+        "owner@example.com",
+        "manager@example.com",
+        "viewer@example.com",
+        "admin@example.com",
+        None,
+    ],
+    ids=["owner", "editor", "manager", "viewer", "admin", "anonymous"],
+)
+@pytest.mark.parametrize("method", sorted(_PR_OWNER_METHODS))
+async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
+    client: httpx.AsyncClient, session: str, caller: str | None, method: str
+) -> None:
+    """They act as the host's account, so no editor or admin makes them, as on REST."""
+    headers = {"Content-Type": "application/json"}
+    if caller is not None:
+        headers["X-Forwarded-Email"] = caller
+    body = {"prUrl": "https://github.com/example/app/pull/7", **_PR_OWNER_METHODS[method]}
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers=headers,
+        content=json.dumps(body).encode(),
+    )
+
+    assert resp.status_code == _pull_request_call_passes(method, caller, session), resp.text
+    if resp.status_code == 403:
+        assert "Only the session's owner can use this" in resp.text
+    if resp.status_code == 503:
+        assert b"unavailable" in resp.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["Bogus", "ListDirectory"])
+async def test_workspace_api_refuses_a_method_it_has_no_gate_for(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """A method the service serves but the gate table leaves out is refused, not served."""
+    from omnigent.server import workspace_access
+
+    gates = {name: gate for name, gate in workspace_access.METHOD_GATES.items() if name != method}
+    monkeypatch.setattr(workspace_access, "METHOD_GATES", gates)
+    resp = await client.post(
+        "/v1/sessions/conv_open/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers={
+            "X-Forwarded-Email": "real-owner@example.com",
+            "Content-Type": "application/json",
+        },
+        content=b"{}",
+    )
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Unknown workspace method"

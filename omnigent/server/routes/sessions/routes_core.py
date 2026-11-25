@@ -9,6 +9,7 @@ import json
 import re
 import secrets
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from itertools import batched
 from typing import Any
@@ -82,6 +83,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_live_state
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -104,6 +106,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.failed_status_diagnostics import bound_runner_connection
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
@@ -143,7 +146,7 @@ from omnigent.server.routes._errors import (
     agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._host_launch import _deployment_is_sharded
+from omnigent.server.routes._host_launch import _deployment_is_sharded, routed_slice_key
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -861,7 +864,8 @@ def register_core_routes(
             and the working directory is the parent that holds them.
         :param requested_host_id: Host id the caller chose for the sandbox
             host (already checked against existing hosts),
-            or ``None`` to let the launch mint one.
+            or ``None`` to mint one: here when *request* is keyed on a
+            host-sharded deployment, so the host keys by it, else in the launch.
         :param held_runner_id: The claim a move holds on the session's runner
             until the sandbox binds; see :func:`_run_managed_launch`.
         :param before_start: Run once the launch is visible to message
@@ -918,6 +922,10 @@ def register_core_routes(
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
+        if requested_host_id is None and _deployment_is_sharded() and routed_slice_key(request):
+            # Keyed callers re-address via wrong_replica by host id, so mint one to key
+            # the host; keyless callers only reach the default replica, so stay unkeyed.
+            requested_host_id = uuid.uuid4().hex
         managed_labels: dict[str, str] = {}
         if requested_host_id is not None:
             managed_labels[REQUESTED_HOST_ID_LABEL_KEY] = requested_host_id
@@ -2383,6 +2391,7 @@ def register_core_routes(
                         id=proj.id,
                         name=proj.name,
                         icon=icon if isinstance(icon, str) else None,
+                        muted=proj.config.get("muted") is True,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in sorted(conversation_store.list_projects(owned_by=user_id)):
@@ -2533,6 +2542,15 @@ def register_core_routes(
             request=request,
         )
         snapshot.side_chat_allowed = side_chat_ok
+        # The session list also reads the stored pending count, which stays stale
+        # when a prompt is resolved on a replica that never recorded it.
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if bound_runner_connection(tunnel_registry, conv.runner_id) is not None and (
+            pending_elicitations.count_for(conv.id) != (conv.pending_elicitation_count or 0)
+        ):
+            session_live_state.reconcile_pending_count(
+                conv.id, conv.pending_elicitation_count, runner_id=conv.runner_id
+            )
         return snapshot
 
     @router.get(

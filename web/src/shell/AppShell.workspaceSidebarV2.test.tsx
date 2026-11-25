@@ -192,6 +192,7 @@ import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { AppShell } from "./AppShell";
+import { setSplitOnScreen } from "./chatPaneToolbarHost";
 import { FileViewerContext, useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
 import * as workspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
@@ -231,13 +232,16 @@ const viewportListeners = new Map<(event: { matches: boolean }) => void, string>
 /** The window is `width` wide: below 1181px the shell shows the sidebar as a drawer. */
 function setViewport(width: number, pointer: "fine" | "coarse" = "fine") {
   vi.spyOn(window, "matchMedia").mockImplementation((query: string) => {
-    const max = /max-width:\s*([\d.]+)px/.exec(query);
-    const min = /min-width:\s*([\d.]+)px/.exec(query);
+    // A media query's rem is the browser's default font size, 16px here.
+    const pixels = (bound: RegExpExecArray | null) =>
+      bound === null ? null : Number(bound[1]) * (bound[2] === "rem" ? 16 : 1);
+    const max = pixels(/max-width:\s*([\d.]+)(px|rem)/.exec(query));
+    const min = pixels(/min-width:\s*([\d.]+)(px|rem)/.exec(query));
     const pointerQuery = /pointer:\s*(\w+)/.exec(query);
     const matches =
       pointerQuery !== null
         ? pointerQuery[1] === pointer
-        : (max === null || width <= Number(max[1])) && (min === null || width >= Number(min[1]));
+        : (max === null || width <= max) && (min === null || width >= min);
     return {
       matches,
       media: query,
@@ -486,6 +490,72 @@ describe("workspace_sidebar_v2", () => {
       expect(await screen.findByRole("button", { name: toggle })).toBeInTheDocument();
     },
   );
+
+  it.each([
+    ["follows the flag", { floating_panes: true }, "fine", true],
+    ["stays off when the server says off", { floating_panes: false }, "fine", false],
+    ["stays off on an older server without it", {}, "fine", false],
+    ["stays off on a touch client", { floating_panes: true }, "coarse", false],
+  ] as const)("marks the shell for floating panes: %s", (_, features, pointer, floating) => {
+    setViewport(DESKTOP, pointer);
+    const info = withFlag(true);
+    const { floating_panes: _withoutIt, ...base } = info.features ?? {};
+    renderShell({ ...info, features: { ...base, ...features } });
+
+    const shell = document.querySelector(".app-shell");
+    if (floating) expect(shell).toHaveAttribute("data-floating-panes", "");
+    else expect(shell).not.toHaveAttribute("data-floating-panes");
+    // The session column is marked, so the styling cards its chat page and nothing else.
+    expect(document.querySelector("[data-main-view]")).toHaveAttribute("data-main-view", "chat");
+  });
+
+  // Only floating panes draw a split as cards of its own; without them the chat keeps its card.
+  it.each([
+    ["floats as its own cards", true, "terminal"],
+    ["shows without floating panes", false, "chat"],
+  ] as const)(
+    "gives the column the view it has while a split on screen beside the chat %s",
+    (_case, floating, splitView) => {
+      setViewport(DESKTOP);
+      renderShell({
+        ...withFlag(true),
+        features: { ...withFlag(true).features, floating_panes: floating },
+      });
+      const column = () => document.querySelector("[data-main-view]");
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+
+      act(() => setSplitOnScreen("conv_ws", true));
+      expect(column()).toHaveAttribute("data-main-view", splitView);
+      act(() => setSplitOnScreen("conv_ws", false));
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+    },
+  );
+
+  it("reserves the header's room for the rail only while the rail sits inline", async () => {
+    setViewport(1000);
+    renderShell({
+      ...withFlag(true),
+      features: { ...withFlag(true).features, floating_panes: true },
+    });
+    const column = () => document.querySelector<HTMLElement>("[data-main-view]")!;
+    const offset = () => column().style.getPropertyValue("--workspace-panel-offset");
+    expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+    expect(tabs.host).toMatchObject({ placement: "drawer" });
+    expect(offset()).toBe("0px");
+
+    // Opening the drawer and putting it away leaves the rail open, and still out of the header's way.
+    fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
+    const drawer = screen.getByTestId("workspace-tabs-drawer");
+    await waitFor(() => expect(drawer).toHaveAttribute("data-state", "open"));
+    expect(offset()).toBe("0px");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(offset()).toBe("0px");
+
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(Number.parseFloat(offset())).toBeGreaterThan(0);
+  });
 
   it("shows the tabs in the Workspace drawer in a narrow desktop window", async () => {
     setViewport(NARROW_DESKTOP);

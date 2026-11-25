@@ -9,6 +9,8 @@ import {
   describePagerDutyFilter,
   describeSlackFilter,
   emptyTriggerFields,
+  FOLLOWED_SLACK_THREAD_HOURS,
+  MAX_FOLLOWED_SLACK_THREADS,
   jiraAssignee,
   parseGithubReviewer,
   promptMayRunSavedWorkflow,
@@ -20,6 +22,7 @@ import {
   readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   LEGACY_MAX_INSTRUCTIONS_CHARS,
+  LEGACY_SESSION_MESSAGE_MAX_CHARS,
   MAX_INSTRUCTIONS_CHARS,
   renderTriggerConfigPrompt,
   renderTriggerPrompt,
@@ -710,7 +713,9 @@ describe("Slack DM triggers", () => {
       slack({ scope: "eng-support, C0123ABCD", scopeOperator: "in" }),
       CTX,
     );
-    expect(prompt).toContain("Watch: new Slack messages in #eng-support, C0123ABCD\n");
+    expect(prompt).toContain(
+      "Watch: new Slack messages in #eng-support, C0123ABCD, then new replies in their threads\n",
+    );
   });
 
   it("saves a channel trigger's Slack lookups in its reply and bounds history reads", () => {
@@ -797,6 +802,193 @@ describe("Slack DM triggers", () => {
 
     expect(withAuthor).toContain("adding one yes/no column per author ID the conditions name");
     expect(withoutAuthor).not.toContain("yes/no column per author ID");
+  });
+});
+
+describe("Slack thread replies", () => {
+  const channel = (overrides: Partial<TriggerFields> = {}) =>
+    fields({
+      event: "posted",
+      scope: "eng-support",
+      scopeOperator: "is",
+      conditions: [{ field: "text", operator: "contains", value: "help" }],
+      ...overrides,
+    });
+  /** The numbered step of `prompt` that starts with `start`, e.g. 6 for "6. Then send". */
+  const stepNumber = (prompt: string, start: string) => {
+    const match = new RegExp(`\\n(\\d+)\\. ${start}`).exec(prompt);
+    if (match === null) throw new Error(`No step starts with: ${start}`);
+    return Number(match[1]);
+  };
+
+  it("sends new replies in a channel trigger's threads to the session the thread's message went to", () => {
+    const prompt = renderTriggerPrompt("slack", channel(), CTX);
+
+    expect(prompt).toContain(
+      'Watch: new Slack messages in #eng-support whose text contains "help", then new replies in their threads\n',
+    );
+    // The thread step runs after sessions start, so this run's new threads are followed too.
+    const create = stepNumber(
+      prompt,
+      "For each other message, oldest first, call sys_session_create",
+    );
+    const threads = stepNumber(prompt, "Then send new replies in the threads you follow");
+    expect(threads).toBe(create + 1);
+    expect(stepNumber(prompt, "Reply with the title and session ID")).toBe(threads + 1);
+
+    // Thread state comes from the same reply as the check time, so a reply without it can't
+    // drop the followed threads.
+    expect(prompt).toContain(
+      `The reply you read your check time from, when it has a "Slack threads:" line, lists those threads as one-line JSON: each key is "<channel ID> <thread ts>"`,
+    );
+    // A session an earlier run started without recording it still gets its thread followed, but
+    // only once its history shows the task: it can exist without one, and follow-ups would reach
+    // a session that never got its instructions.
+    expect(prompt).toContain(
+      "Add the thread of each message this run started a session for with its task delivered, or that you found an earlier run started one for without recording it in its reply once that session's history (sys_session_get_history) shows your task message, with session set to that session's conversation_id and through set to the message's own ts",
+    );
+    expect(prompt).toContain(
+      'If such an earlier session\'s history doesn\'t show your task message, list it as "<title> <conversation_id>" on a "Delivery pending:" line instead, so its thread is followed once the task is confirmed, and never resend the task.',
+    );
+    // Re-adding a followed thread mustn't rewind it and send its replies again.
+    expect(prompt).toContain("a thread you already follow keeps its through.");
+    // The cap bounds reads up front; expiry waits until a thread is read, so a reply posted just
+    // before a thread would expire still reaches its session.
+    const cap = `Follow at most the ${MAX_FOLLOWED_SLACK_THREADS} with the newest through.`;
+    const read = "For each thread you follow, read the replies posted in it";
+    const expire = `Then stop following each thread whose read in this run was complete and found nothing posted in it in the ${FOLLOWED_SLACK_THREAD_HOURS} hours before the time you noted, and whose through is older than that too`;
+    for (const rule of [cap, read, expire]) expect(prompt).toContain(rule);
+    expect(prompt.indexOf(cap)).toBeLessThan(prompt.indexOf(read));
+    expect(prompt.indexOf(read)).toBeLessThan(prompt.indexOf(expire));
+    // A deferred lookup or refused send leaves through old, so expiry mustn't drop that thread.
+    expect(prompt).toContain(
+      "a thread with a reply you deferred or couldn't send keeps being followed.",
+    );
+    // A reply posted during a run waits for the next run instead of moving through past it.
+    expect(prompt).toContain(
+      "read the replies posted in it after its through and by the time you noted, for example with conversations.replies with the channel ID, ts set to the thread ts, oldest set to its through, latest set to the time you noted as a Unix timestamp, inclusive false",
+    );
+    expect(prompt).toContain("replies posted after the time you noted (the next run reads them)");
+    expect(prompt).toContain(
+      "If a read fails or you can't read every page of a thread, keep its through and send nothing for it in this run, so the next run reads it again.",
+    );
+    // A worker's own thread posts (bot replies, or the owner's account with the attribution
+    // line) must not come back to it as new replies.
+    expect(prompt).toContain(
+      'messages with a system subtype or the bot_message subtype, posts that end with a "Sent with Omnigent" line, which Omnigent sessions add to what they post, and posts by bots.',
+    );
+    // Slack sets bot_id on what a person posts through an app (such as a Slack MCP), so a
+    // bot_id alone mustn't drop a person's follow-up.
+    expect(prompt).toContain(
+      "A person can post through an app, so a reply with a bot_id is a bot's only when its user is a bot: check each such user with users.info",
+    );
+    // Only a confirmed bot is left out: a failed lookup defers the thread rather than moving
+    // through past what may be a person's reply.
+    expect(prompt).toContain(
+      "leave the reply out only when is_bot is true. If a lookup fails, keep that thread's through and send nothing for it in this run, so the next run checks again.",
+    );
+    // A privacy filter can hide the user of a person's app-posted reply; skipping it would lose it.
+    expect(prompt).toContain(
+      "A reply whose user is missing or hidden counts as a person's, since a filter can hide the user of a person's reply",
+    );
+    expect(prompt).toContain(
+      "The conditions above apply only to the message that starts a thread, so every other reply counts.",
+    );
+    expect(prompt).toContain(
+      "send its session one message under 32000 characters with sys_session_message, with session_id set to the thread's session",
+    );
+    expect(prompt).toContain(
+      '"Slack <channel> <thread ts> replies through <ts of the newest reply it carries>"',
+    );
+    expect(prompt).toContain("following the instructions it already has");
+    // Every channel trigger follows its threads, so the session stays quiet unless a reply needs it.
+    expect(prompt).toContain(
+      "It says to post in that same thread only when a reply asks it something or needs it to act, and not for thanks, acknowledgements or people talking among themselves",
+    );
+    expect(prompt).toContain(
+      "to name the message that started the thread, not a reply, wherever a Slack tool asks which message to reply to",
+    );
+    expect(prompt).toContain("between <slack-replies> and </slack-replies> lines");
+    // A backlog too big for one message is sent oldest first, and through covers only what went.
+    expect(prompt).toContain(
+      "If the replies still don't fit, the message carries only the oldest ones that do, and the rest wait for the next run.",
+    );
+    // Dedupe: an accepted or uncertain send, or a thread whose new replies were all left out,
+    // moves the thread past those replies for good.
+    expect(prompt).toContain(
+      "Once a send is accepted, set the thread's through to the ts of the newest reply that message carried; when you left out every new reply in a thread, set it to the ts of the newest reply you read in it.",
+    );
+    expect(prompt).toContain(
+      "If a send times out or its result is unclear, don't retry it: set the thread's through as for an accepted send, so those replies are never sent twice, say in your reply that they may not have reached that session",
+    );
+    // Match prior delivery titles after the sender prefix to avoid resending an uncheckpointed batch.
+    const recover =
+      "An earlier run can send replies and stop before its reply records them, so before sending a thread's replies, look through your own earlier calls in this session that sent replies to that thread, and the latest items of the thread's session (sys_session_get_history, tail_items 50), for a message from your session that names a \"Slack <channel> <thread ts> replies through <ts>\" title for this thread. Treat every reply up to the newest ts such a title names as already handled, whether that send was accepted or unclear";
+    expect(prompt).toContain(recover);
+    expect(prompt.indexOf(recover)).toBeLessThan(
+      prompt.indexOf("For each thread with replies left, send its session one message"),
+    );
+    // Pending entries name top-level messages; a thread send there would be read back as one, so
+    // the step uses the line only for an unconfirmed top-level task.
+    const threadStep =
+      prompt.split("\n").find((line) => line.includes("Then send new replies")) ?? "";
+    expect(threadStep.split('"Delivery pending:"').length - 1).toBe(1);
+    expect(threadStep).toContain(
+      'list it as "<title> <conversation_id>" on a "Delivery pending:" line instead, so its thread is followed once the task is confirmed',
+    );
+    expect(prompt).toContain("stop following that thread and say so in your reply");
+    expect(prompt).toContain(
+      "Stopping means starting no more sessions in this run; still send new thread replies and write your reply.",
+    );
+    expect(prompt).toContain("Do this step even if you stopped starting sessions above");
+    expect(prompt).toContain(
+      'above "Checked through:" write a "Slack threads:" line followed by one-line JSON of the threads you follow after this run\'s changes, carried over unchanged when you skipped that step, or {} when you follow none.',
+    );
+  });
+
+  it("sends a task session's thread replies there with its instructions", () => {
+    const prompt = renderTriggerPrompt("slack", channel(), { ...CTX, taskSessionMode: "continue" });
+    // A delivery an earlier run made without recording it still gets its thread followed. It was
+    // found in the task session's history, so it needs no separate task confirmation.
+    expect(prompt).toContain(
+      "Add the thread of each message this run sent to your task session, or that you found an earlier run sent there without recording it, with session set to the task session it went to",
+    );
+    expect(prompt).not.toContain(
+      "If such an earlier session's history doesn't show your task message",
+    );
+    expect(prompt).toContain(
+      'a sentence saying that this is the task session of a Slack automation and that someone replied in the thread of a Slack message it was sent earlier, titled "Slack <channel> <thread ts>", then the instructions below',
+    );
+    expect(prompt).toContain("Do this step even if you stopped sending matches above");
+    expect(prompt).toContain(
+      "Stopping means sending no more matches in this run; still send new thread replies and write your reply.",
+    );
+  });
+
+  it("sizes thread messages to the server's message budget in both modes", () => {
+    for (const taskSessionMode of ["new", "continue"] as const) {
+      const prompt = renderTriggerPrompt("slack", channel(), {
+        ...CTX,
+        taskSessionMode,
+        messageMaxChars: LEGACY_SESSION_MESSAGE_MAX_CHARS,
+      });
+      expect(prompt).toContain(
+        `send its session one message under ${LEGACY_SESSION_MESSAGE_MAX_CHARS} characters with sys_session_message`,
+      );
+    }
+  });
+
+  it("leaves DM and group DM triggers without a thread step", () => {
+    for (const event of ["dm", "group_dm"]) {
+      const prompt = renderTriggerPrompt(
+        "slack",
+        channel({ event, scope: "alice, bob", conditions: [] }),
+        CTX,
+      );
+      expect(prompt).not.toContain("Slack threads:");
+      expect(prompt).not.toContain("replies in their threads");
+      expect(prompt).toContain("still write your reply.");
+    }
   });
 });
 
@@ -1709,7 +1901,9 @@ describe("renderTriggerPrompt", () => {
       fields({ event: "posted", scope: "#eng-support", conditions: [] }),
       CTX,
     );
-    expect(unfiltered).toContain("Watch: new Slack messages in #eng-support\n");
+    expect(unfiltered).toContain(
+      "Watch: new Slack messages in #eng-support, then new replies in their threads\n",
+    );
     expect(unfiltered).toContain("Every top-level message counts.");
     // Bot posts still count, so a channel of alerts or a bot author can match.
     expect(unfiltered).not.toContain("bot_id set");

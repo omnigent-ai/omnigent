@@ -33,6 +33,20 @@ MCP independent creation.
   shows only when the session launched in it, since anyone who can edit the
   session can write the reported mode; `null` when the harness has no
   permission modes or the mode is unknown. Coverage: `tests/e2e/test_session_info_permission_mode_e2e.py`.
+  With `include_usage`, `sys_session_get_info` adds a `usage` object: the cost so far
+  and token totals the session's cost badge shows, overall and per model, summed over
+  the session and its sub-agents. Its `total_cost_usd` is `null` when the session is
+  unpriced or the operator hides cost. The aggregate is opt-in because it reads every
+  descendant session (`tests/runner/test_runner_dispatch.py`).
+- `cli-create`: `omnigent session create` starts a session from a script with no
+  terminal. It creates the session as the signed-in user on this machine's host
+  (started if needed) in the current directory, or on another owned host with
+  `--host-id` and an absolute `--workspace`, queues the first message from
+  `--message` or `--message-file` (`-` for stdin), prints the session id (or JSON
+  with `--json`) and exits. `--project-id` files it in a project whose saved agent
+  and workspace apply unless given. A session whose message the server refused is
+  still printed, with a non-zero exit (`tests/cli/test_session_create.py`,
+  `tests/e2e/test_session_create_cli_e2e.py`).
 - `created-by`: independent workers record their creating session. The session
   header does not show it. The worker's sidebar card looks the creator up through
   an access-checked read each time it opens: its "Created by" row names the
@@ -263,7 +277,8 @@ Independent creates can use an existing owned `project_id` instead of
 explicit agent, workspace or git selection. `sys_session_link_pr` takes
 `url`, optional `session_id` (defaults to this session), and `action` (`attach`
 or `remove`, default `attach`). It uses the target session's host and requires
-edit access there and an authorized private or read-only-shared source. The
+the owner grant on the target's root session (the host's account is its owner's)
+and an authorized private or read-only-shared source. The
 host or runner must be online and able to read the PR. An uncertain response
 requires checking the session before retrying.
 

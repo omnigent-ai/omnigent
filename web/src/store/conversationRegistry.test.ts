@@ -324,6 +324,22 @@ describe("ConversationRegistry", () => {
     expect(registry.has("temp:aaaa0001")).toBe(false);
   });
 
+  it("rekey onto a live id carries a posted-but-unconsumed bubble until its echo arrives", () => {
+    const temp = registry.acquire("temp:aaaa0002");
+    temp.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_2",
+          content: [{ type: "input_text", text: "just sent" }],
+          posted: true,
+        },
+      ],
+    });
+    const existing = registry.acquire("conv_real_2");
+    registry.rekey("temp:aaaa0002", "conv_real_2");
+    expect(existing.getState().pendingUserMessages.map((m) => m.tempId)).toEqual(["pend_2"]);
+  });
+
   it("rekey is a no-op when the old id is not live", () => {
     registry.rekey("temp:deadbeef", "conv_real");
     expect(registry.has("conv_real")).toBe(false);

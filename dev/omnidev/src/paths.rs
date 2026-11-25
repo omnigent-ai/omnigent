@@ -89,6 +89,11 @@ pub fn check_cache_path() -> Result<PathBuf> {
     Ok(cache_home()?.join("omnidev").join("omnigent-check.json"))
 }
 
+/// `~/.cache/omnidev/recent-servers.json` — servers `omnidev ui` offers in its picker.
+pub fn recent_servers_path() -> Result<PathBuf> {
+    Ok(cache_home()?.join("omnidev").join("recent-servers.json"))
+}
+
 /// FNV-1a 64-bit, rendered as 8 hex chars. No external dep needed — we only
 /// need a stable, collision-unlikely tag for a filesystem path.
 fn short_hash(bytes: &[u8]) -> String {

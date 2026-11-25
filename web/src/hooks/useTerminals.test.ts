@@ -9,7 +9,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   createTerminal,
   deleteTerminal,
@@ -1264,5 +1264,34 @@ describe("findAgentTerminal", () => {
     };
 
     expect(findAgentTerminal([shell])).toBeNull();
+  });
+});
+
+describe("useDeleteTerminal", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ["says so by default", undefined, 1],
+    ["leaves it to a caller that reports it", { reportsFailure: false }, 0],
+  ] as const)("when a shell won't close, %s", async (_case, options, toasts) => {
+    fetchMock.mockResolvedValue(mockResponse({}, { ok: false, status: 503 }));
+    const shown = vi.fn();
+    window.addEventListener("omnigent:toast", shown);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", shown));
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const remove = renderHook(() => useDeleteTerminal("conv_close_reports", options), { wrapper });
+
+    await act(async () => {
+      await expect(remove.result.current.mutateAsync("terminal_zsh_s1")).rejects.toThrow();
+    });
+    expect(shown).toHaveBeenCalledTimes(toasts);
   });
 });

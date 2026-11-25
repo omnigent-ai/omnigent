@@ -27,10 +27,15 @@ off by default.
 - `launch`: ⌘↵ (shown beside the send button; plain ↵ adds a line) or the send
   button creates the session on This Mac in the chosen
   folder, or in a new sandbox. The session opens in an Omnigent window of the same
-  server, which comes forward, the panel hides, and the first message is
-  delivered once. A successful launch clears the panel for the next prompt.
+  server, which comes forward, and the panel hides. A main window that has the
+  session's chat open and can send it takes the first message and sends it
+  through its own chat, so its bubble stays on screen while the agent starts;
+  otherwise the panel delivers it once. A successful launch clears the panel for
+  the next prompt.
 - `launch-failure`: when the first message can't be delivered (the server never
   stored it, or the runner refused it), the panel keeps the prompt and says why.
+  When the main window sent it, a failure shows in that session's chat instead,
+  as any failed send does; the panel has already cleared.
 - `locations`: the panel offers only This Mac and a new sandbox. Remote hosts,
   the import prompt and the page heading are hidden.
 - `links`: links in the panel to Settings pages open in an Omnigent window, which
@@ -49,6 +54,9 @@ off by default.
   System-wide, turns ⇧⌘Space off or records another chord. The row shows only with the flag on, in a
   desktop app that can show the panel. A chord **Show Omnigent from anywhere**
   already uses is refused.
+- When another app holds the chord, the row says which chord is taken and offers
+  **Use ⌃⌥⇧Space instead**, a free chord the app checked. Allowing it in the macOS
+  dialog saves that chord and turns the shortcut on. Declining saves nothing.
 - The same Desktop app group also holds **Widen window when opening the right
   sidebar**; see [sessions](sessions.md).
 - There is no menu, Dock or command-palette entry yet.

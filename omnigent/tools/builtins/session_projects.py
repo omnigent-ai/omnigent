@@ -222,7 +222,8 @@ class SysSessionLinkPrTool(Tool):
     def description(cls) -> str:
         return (
             "Link or unlink a GitHub pull request in a session's PR panel. "
-            "Defaults to the current session; another session requires edit access. "
+            "Defaults to the current session; another session must be one you own, "
+            "since the link runs as its host's GitHub account. "
             "Its host or runner must be online and able to read the PR. "
             "Requires scripted sessions enabled on the server and a private or "
             "read-only-shared calling session. This updates the association only."

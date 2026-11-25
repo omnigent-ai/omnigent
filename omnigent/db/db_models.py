@@ -1665,6 +1665,9 @@ class SqlScheduledTask(OmnigentBase):
         continue (relates to ``conversations.id``; no DB foreign key, Rule R032).
         ``None`` until the first such firing creates it, unless a session was
         chosen.
+    :param workflow_id: The saved workflow every run starts as a run of (relates
+        to ``workflows.id``; no DB foreign key, Rule R032). ``None`` for a task
+        that runs no saved workflow.
     :param kind: What the task is for — ``automation`` (1, the default),
         ``reminder`` (2), a one-time message an agent set for its own session, or
         ``timer`` (3), a hidden one-shot or repeating wake an agent set with
@@ -1754,6 +1757,9 @@ class SqlScheduledTask(OmnigentBase):
     # The session each run's new session starts as a copy of. Relates to
     # conversations.id. No DB foreign key (Rule R032).
     source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # The saved workflow every run starts as a run of. Relates to workflows.id.
+    # No DB foreign key (Rule R032).
+    workflow_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     # Stable int code: automation=1, reminder=2, timer=3. Defaults to automation so
     # existing tasks keep listing as automations.
     kind: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")

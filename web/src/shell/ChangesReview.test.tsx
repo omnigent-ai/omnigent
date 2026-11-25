@@ -14,6 +14,7 @@ import type { inMemoryCustomComparisons } from "@/lib/commitComparisons";
 import type { RevisionSpec } from "@/lib/customComparison";
 import type * as WorkingCopyComparisonsModule from "@/lib/workingCopyComparisons";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import { BRANCH_RANGE } from "@/lib/branchCommits";
 import type * as BranchCommitsModule from "@/lib/branchCommits";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { openFindForActiveSurface } from "@/lib/findRouting";
@@ -582,7 +583,10 @@ const showCommitCommand = () =>
     .find((command) => command.id === "show-a-commit:s1");
 
 /** A review whose session can compare revisions and lists these commits once asked. */
-function reviewWithCommits(listed = [commitRow(SHOWN_COMMIT, "Fix the build")]) {
+function reviewWithCommits(
+  listed = [commitRow(SHOWN_COMMIT, "Fix the build")],
+  custom: RevisionSpec | null = null,
+) {
   mocks.fetchBranchCommits.mockResolvedValue({
     kind: "listed",
     commits: listed,
@@ -592,6 +596,7 @@ function reviewWithCommits(listed = [commitRow(SHOWN_COMMIT, "Fix the build")]) 
   const shared = changes({
     revisionSupport: { kind: "available" },
     workspace: { hostId: "host_1", root: "/repo" },
+    custom,
   });
   const built = source(shared);
   mocks.source.mockReturnValue(built);
@@ -728,7 +733,7 @@ describe("the Commits and Changes tabs", () => {
     expect(tab("Commits")).toContainElement(
       screen.getByText("2", { selector: "[data-slot=badge]" }),
     );
-    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith("s1", expect.anything());
+    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith("s1", BRANCH_RANGE, expect.anything());
 
     await userEvent.click(tab("Commits"));
     expect(await screen.findByRole("option", { name: /Fix the build/ })).toBeVisible();
@@ -736,6 +741,22 @@ describe("the Commits and Changes tabs", () => {
     const behind = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
     expect(behind.active).toBe(false);
     expect(behind.fileActionsInPalette).toBe(false);
+  });
+
+  it("lists and counts a typed base and head's commits, not the branch's", async () => {
+    reviewWithCommits([commitRow(SHOWN_COMMIT, "Fix the build")], { base: "v1", head: "feature" });
+    renderReview();
+    expect(await screen.findByText("1", { selector: "[data-slot=badge]" })).toBeVisible();
+    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith(
+      "s1",
+      { base: "v1", head: "feature" },
+      expect.anything(),
+    );
+    expect(mocks.fetchBranchCommits).not.toHaveBeenCalledWith(
+      "s1",
+      BRANCH_RANGE,
+      expect.anything(),
+    );
   });
 
   it("opens a picked commit in Commits, keeping the comparison, with focus on its title", async () => {

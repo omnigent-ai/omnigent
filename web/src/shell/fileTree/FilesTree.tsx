@@ -3,18 +3,30 @@
 // and the panel's sort, change marks, sizes, menus and ⌘K target carry over.
 // Row interactions the tree doesn't offer are delegated from its root.
 
-import { type CSSProperties, type FocusEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type FocusEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   FileTree,
   type FileTreeDirectoryHandle,
   type FileTreeItemHandle,
   type FileTreeModel,
-  FILE_TREE_ROOT_SELECTOR,
   useFileTree,
 } from "@/components/file-tree/vendored";
 import { FILE_TREE_THEME, WORKSPACE_FILE_TREE_CLASS } from "@/components/file-tree/fileTreeStyle";
 import { useTreeRowTooltip } from "@/components/file-tree/treeRowTooltip";
-import { type WorkspaceFile, useWorkspaceDirectories } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  type WorkspaceFile,
+  listingCutOff,
+  useWorkspaceDirectories,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { type PrefetchTarget, useWorkspacePrefetch } from "@/hooks/useWorkspacePrefetch";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { folderTreePath } from "../breadcrumbPaths";
@@ -22,6 +34,7 @@ import type { ChangedSort } from "../FlatFileList";
 import { useFocusedFileSource } from "../fileCommands/focusedFile";
 import { useFileCommandTarget } from "../fileCommands/target";
 import { FileCommandMenuAt } from "../fileCommands/useFileCommandMenu";
+import { RevealBaseContext } from "../RevealInFileManager";
 import type { FolderListing } from "../folderTreeSync";
 import {
   type TreeChange,
@@ -30,11 +43,12 @@ import {
   visibleEntries,
   withChangedFiles,
 } from "./filesTreeListings";
-import { treeChangeStatuses } from "./treeChangeStatus";
-import { SingleSelection, opensRow, rowClickAction, rowKeyAction } from "./treeSelection";
+import { treeChangeStatuses, treeIgnoredStatuses } from "./treeChangeStatus";
+import { SingleSelection } from "./treeSelection";
 import { treeComparator, treeOrderSignature } from "./treeSort";
 import { scrollRowIntoView } from "./revealScroll";
 import { rowPathOf } from "./treeRowPath";
+import { treeRoot, useTreeRowInput } from "./useTreeRowInput";
 import { initialFolderTree, useLazyFolderTree } from "./useLazyFolderTree";
 
 /** A folder to reveal, asked for again with a new `key`. */
@@ -60,6 +74,8 @@ export interface FilesTreeProps {
   changedFiles: readonly TreeChange[];
   sort: ChangedSort;
   showHidden: boolean;
+  /** List what Git ignores, marked as ignored; otherwise the host leaves it out. */
+  showIgnored: boolean;
   refreshToken: number;
   /** `newTab` for a ⌘-click (Ctrl-click off macOS) or a middle click, which want the file in its own tab. */
   onFileSelect: (path: string, options?: { newTab: true }) => void;
@@ -72,6 +88,8 @@ export interface FilesTreeProps {
   activeReveal?: FilesTreeActiveReveal | null;
   /** The tree took up `activeReveal`, so the request can be let go. */
   onActiveRevealHandled?: (key: number) => void;
+  /** The listings left out the file `activeReveal` asked for, or a folder above it. */
+  onActiveRevealMissed?: (file: string) => void;
   label: string;
 }
 
@@ -94,9 +112,6 @@ const parentFolder = (path: string) => {
   return slash < 0 ? "" : trimmed.slice(0, slash);
 };
 const trimFolder = (path: string) => (path.endsWith("/") ? path.slice(0, -1) : path);
-/** The rendered tree inside `container`, if it has rendered. */
-const treeRoot = (container: ParentNode | null | undefined): HTMLElement | null =>
-  container?.querySelector<HTMLElement>(FILE_TREE_ROOT_SELECTOR) ?? null;
 /** Whether keyboard focus is on the tree or one of its rows. */
 const hasFocusWithin = (host: HTMLElement | null): boolean =>
   host !== null && host.contains(document.activeElement);
@@ -118,13 +133,23 @@ const FILES_TREE_THEME = {
 } as CSSProperties;
 
 export function FilesTree(props: FilesTreeProps) {
-  const { conversationId, browseLocation, showHidden, refreshToken } = props;
+  // Row paths are relative to the browsed folder; file commands resolve them against it.
+  return (
+    <RevealBaseContext.Provider value={props.browseLocation}>
+      <FilesTreeRows {...props} />
+    </RevealBaseContext.Provider>
+  );
+}
+
+function FilesTreeRows(props: FilesTreeProps) {
+  const { conversationId, browseLocation, showHidden, showIgnored, refreshToken } = props;
   const cacheKey = cacheKeyFor(conversationId, browseLocation);
   const dark = useResolvedThemeMode() === "dark";
   const prefetch = useWorkspacePrefetch({
     conversationId,
     location: browseLocation,
     refreshToken,
+    hideIgnored: !showIgnored,
   });
 
   const rootListing = useMemo<FolderListing>(
@@ -166,7 +191,10 @@ export function FilesTree(props: FilesTreeProps) {
     flattenEmptyDirectories: true,
     initialExpansion: "closed",
     initialExpandedPaths: expandedAtStart,
-    gitStatus: treeChangeStatuses(props.changedFiles),
+    gitStatus: [
+      ...treeIgnoredStatuses(rootListing.entries),
+      ...treeChangeStatuses(props.changedFiles),
+    ],
     sort: (left, right) =>
       treeComparator(sortState.current.sort, sortState.current.meta)(left, right),
     // Opening is driven by the input that chose a row; selection changes only stay single.
@@ -192,6 +220,7 @@ export function FilesTree(props: FilesTreeProps) {
     loadingFolders,
     browseLocation,
     refreshToken,
+    !showIgnored,
   );
   // Keyed on the listings' own data, so a fresh result map holding the same data changes nothing.
   const rawListings: FolderListing[] = [{ folder: "", entries: props.rootEntries }];
@@ -255,10 +284,13 @@ export function FilesTree(props: FilesTreeProps) {
     return model.subscribe(record);
   }, [model, cacheKey]);
 
-  // Change marks follow the panel's changed files.
+  // Change marks follow the panel's changed files, after the ignored marks so they win.
   useEffect(() => {
-    model.setGitStatus(treeChangeStatuses(props.changedFiles));
-  }, [model, props.changedFiles]);
+    model.setGitStatus([
+      ...treeIgnoredStatuses(listings.flatMap(({ entries }) => entries)),
+      ...treeChangeStatuses(props.changedFiles),
+    ]);
+  }, [model, listings, props.changedFiles]);
 
   // A new sort, or metadata it orders by, re-sorts in place, keeping where the reader was.
   const meta = useMemo(() => treeMetadata(listings), [listings]);
@@ -331,44 +363,11 @@ export function FilesTree(props: FilesTreeProps) {
     },
   });
 
-  // Input the tree would handle differently from the panel, caught on its root first.
+  useTreeRowInput(containerRef, selectionRef.current, activate);
+  // A double-click roots the panel on a folder; focus prefetches the row and names it.
   useEffect(() => {
     const host = treeRoot(containerRef.current);
-    const selection = selectionRef.current;
-    if (!host || !selection) return;
-    // A file opens once per click, Enter or Space on it, as that input happens. Rows are
-    // native buttons, so a key that opens one holds back the button's own click.
-    const onKeyDown = (event: KeyboardEvent) => {
-      const path = rowPathOf(event);
-      if (path === null) return;
-      if (selection.apply(rowKeyAction(event)).consumed) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      if (!opensRow(event) || path.endsWith("/")) return;
-      event.preventDefault();
-      selection.selectOnly(path);
-      activate(path);
-    };
-    const onClick = (event: globalThis.MouseEvent) => {
-      const path = rowPathOf(event);
-      const result = selection.apply(rowClickAction(event, path));
-      if (!result.consumed) {
-        if (path) activate(path);
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      if (result.activate) activate(result.activate, result.newTab);
-    };
-    // A middle click opens a file in its own tab, as in a browser.
-    const onAuxClick = (event: globalThis.MouseEvent) => {
-      const path = rowPathOf(event);
-      if (event.button !== 1 || !path || path.endsWith("/")) return;
-      event.preventDefault();
-      activate(path, true);
-    };
+    if (!host) return;
     const onDoubleClick = (event: globalThis.MouseEvent) => {
       const path = rowPathOf(event);
       if (path?.endsWith("/")) latest.current.onNavigateDir?.(trimFolder(path));
@@ -379,15 +378,9 @@ export function FilesTree(props: FilesTreeProps) {
       setFocusTick((tick) => tick + 1);
       if (path) prefetch.intend(prefetchTarget(path));
     };
-    host.addEventListener("keydown", onKeyDown, true);
-    host.addEventListener("click", onClick, true);
-    host.addEventListener("auxclick", onAuxClick);
     host.addEventListener("dblclick", onDoubleClick);
     host.addEventListener("focusin", onFocusIn);
     return () => {
-      host.removeEventListener("keydown", onKeyDown, true);
-      host.removeEventListener("click", onClick, true);
-      host.removeEventListener("auxclick", onAuxClick);
       host.removeEventListener("dblclick", onDoubleClick);
       host.removeEventListener("focusin", onFocusIn);
     };
@@ -457,7 +450,9 @@ export function FilesTree(props: FilesTreeProps) {
     file: props.activeFile ?? null,
     request: props.activeReveal ?? null,
     onRequestHandled: props.onActiveRevealHandled,
+    onRequestMissed: props.onActiveRevealMissed,
     present,
+    loadedFolders,
     cacheKey,
     containerRef,
   });
@@ -473,6 +468,22 @@ export function FilesTree(props: FilesTreeProps) {
   const pending = loadingFolders.find(
     (folder) => directories.get(folder)?.isLoading && !directories.get(folder)?.data,
   );
+  const cutOffListings = rawListings.filter(({ entries }) => listingCutOff(entries));
+  // Only a cut-off folder whose entries show is named; one status line has room for one.
+  const shownCutOffFolder = useShownFolder(
+    model,
+    cutOffListings.map(({ folder }) => folder),
+  );
+  const cutOffListing = cutOffListings.find(({ folder }) => folder === shownCutOffFolder);
+  const status = treeStatus({
+    failed,
+    pending,
+    cutOff: cutOffListing && {
+      count: cutOffListing.entries.length,
+      name:
+        (cutOffListing.folder || browseLocation).split("/").filter(Boolean).at(-1) || "this folder",
+    },
+  });
   return (
     // The tree stays mounted while its folder is empty, so its listeners are there once files arrive.
     <div ref={containerRef} className="flex min-h-0 flex-1 flex-col">
@@ -498,14 +509,12 @@ export function FilesTree(props: FilesTreeProps) {
           ...(isEmpty ? { display: "none" } : {}),
         }}
       />
-      {!isEmpty && (failed ?? pending) !== undefined && (
+      {!isEmpty && status !== null && (
         <div
           role="status"
           className="shrink-0 truncate border-t border-border px-3 py-1.5 text-ui text-muted-foreground"
         >
-          {failed !== undefined
-            ? `Couldn’t load ${failed.split("/").at(-1)}.`
-            : `Loading ${pending?.split("/").at(-1)}…`}
+          {status}
         </div>
       )}
       {rowTooltip}
@@ -529,6 +538,41 @@ export function FilesTree(props: FilesTreeProps) {
         />
       )}
     </div>
+  );
+}
+
+/** The tree's one status line: a folder that failed or is loading, then one that stopped short. */
+function treeStatus({
+  failed,
+  pending,
+  cutOff,
+}: {
+  failed?: string;
+  pending?: string;
+  cutOff?: { count: number; name: string };
+}): string | null {
+  if (failed !== undefined) return `Couldn’t load ${failed.split("/").at(-1)}.`;
+  if (pending !== undefined) return `Loading ${pending.split("/").at(-1)}…`;
+  if (cutOff)
+    return `Showing the first ${cutOff.count.toLocaleString("en-US")} entries of ${cutOff.name}.`;
+  return null;
+}
+
+/** Whether `folder`'s entries show now: the root's always do, another's while it's open in view. */
+function folderShown(model: FileTreeModel, folder: string): boolean {
+  if (folder === "") return true;
+  const path = folderTreePath(folder);
+  return (
+    model.getVisibleIndexOfPath(path) >= 0 && (asFolder(model.getItem(path))?.isExpanded() ?? false)
+  );
+}
+
+/** The first of `folders` whose entries show, followed as folders open and close; null for none. */
+function useShownFolder(model: FileTreeModel, folders: readonly string[]): string | null {
+  const subscribe = useCallback((onChange: () => void) => model.subscribe(onChange), [model]);
+  return useSyncExternalStore(
+    subscribe,
+    () => folders.find((folder) => folderShown(model, folder)) ?? null,
   );
 }
 
@@ -623,7 +667,9 @@ function useRevealActiveFile({
   file,
   request,
   onRequestHandled,
+  onRequestMissed,
   present,
+  loadedFolders,
   cacheKey,
   containerRef,
 }: {
@@ -632,7 +678,9 @@ function useRevealActiveFile({
   file: string | null;
   request: FilesTreeActiveReveal | null;
   onRequestHandled?: (key: number) => void;
+  onRequestMissed?: (file: string) => void;
   present: ReadonlySet<string>;
+  loadedFolders: ReadonlySet<string>;
   cacheKey: string;
   containerRef: React.RefObject<HTMLDivElement | null>;
 }) {
@@ -642,6 +690,8 @@ function useRevealActiveFile({
   const handledRequest = useRef<number | null>(null);
   const latestHandled = useRef(onRequestHandled);
   latestHandled.current = onRequestHandled;
+  const latestMissed = useRef(onRequestMissed);
+  latestMissed.current = onRequestMissed;
   useEffect(() => {
     if (file === null || revealedActiveFiles.get(cacheKey) === file) {
       pending.current = null;
@@ -680,12 +730,22 @@ function useRevealActiveFile({
       pending.current = null;
       revealedActiveFiles.set(cacheKey, current.file);
     };
+    // A listing that arrived without the path leaves nothing to reveal, e.g. what Git ignores.
+    const missing = (path: string) => {
+      if (!loadedFolders.has(parentFolder(path))) return false;
+      finish();
+      if (current.asked) latestMissed.current?.(current.file);
+      return true;
+    };
     const parts = current.file.split("/");
     for (let depth = 1; depth < parts.length; depth++) {
       const path = folderTreePath(parts.slice(0, depth).join("/"));
       const folder = asFolder(model.getItem(path));
-      // Its parent's listing hasn't arrived yet; the next sync carries on from here.
-      if (!folder) return;
+      if (!folder) {
+        missing(path);
+        // Otherwise its parent's listing hasn't arrived yet; the next sync carries on.
+        return;
+      }
       if (folder.isExpanded()) {
         current.seenOpen.add(path);
         continue;
@@ -696,10 +756,13 @@ function useRevealActiveFile({
       if (folder.isExpanded()) current.seenOpen.add(path);
     }
     // Scroll only once the file's own row exists, after every listing above it arrived.
-    if (!present.has(current.file)) return;
+    if (!present.has(current.file)) {
+      missing(current.file);
+      return;
+    }
     finish();
     const shown = displayedRowPath(model, current.file);
     selection.selectWithoutFocus(shown);
     scrollRowIntoView(model, treeRoot(containerRef.current), shown);
-  }, [model, selection, file, request, present, cacheKey, containerRef]);
+  }, [model, selection, file, request, present, loadedFolders, cacheKey, containerRef]);
 }
