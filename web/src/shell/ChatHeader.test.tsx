@@ -1318,6 +1318,8 @@ describe("ChatHeader — right panel toggle beside a sidebar that collapses itse
     });
     expect(toggle("Collapse right panel")).toBeNull();
     expect(toggle("Expand right panel")).toBeNull();
+    // Nothing sits in the corner, so the header keeps its usual end padding.
+    expect(document.querySelector("header")).not.toHaveAttribute("data-corner-toggle");
   });
 
   it("shows Expand right panel while the sidebar is collapsed", () => {
@@ -1330,16 +1332,6 @@ describe("ChatHeader — right panel toggle beside a sidebar that collapses itse
     expect(toggle("Expand right panel")).not.toBeNull();
     // The row ends where the open sidebar's Collapse button sits, so the toggle keeps its spot.
     expect(document.querySelector("header")).toHaveAttribute("data-corner-toggle");
-  });
-
-  it("keeps its usual end padding while the sidebar is open", () => {
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "conv_floating",
-      rightPanelOpen: true,
-      rightPanelCollapsesItself: true,
-    });
-    expect(document.querySelector("header")).not.toHaveAttribute("data-corner-toggle");
   });
 
   it("keeps Collapse right panel when the sidebar has no corner button of its own", () => {

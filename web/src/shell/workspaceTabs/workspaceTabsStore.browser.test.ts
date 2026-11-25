@@ -312,6 +312,7 @@ describe("timeline traces through the store", () => {
     expect(timelineOf(store.history.state.visits)).toEqual(["F:files"]);
     store.select("W");
     expect(timelineOf(store.history.state.visits)).toEqual(["F:files", "W:https://x.test/b"]);
+    expect(currentVisit(store.history.state)).toEqual({ tabId: "W", place: web(B) });
     expect(incoherent).toEqual([]);
   });
 
@@ -334,12 +335,5 @@ describe("timeline traces through the store", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("selecting the browser tab records the page it shows", async () => {
-    const { store } = setup({ tabs: [files, browserTab(A)], selected: "F", ...liveOn(A) });
-    await tick();
-    store.select("W");
-    expect(currentVisit(store.history.state)).toEqual(visitOf(store.findTab("W")!));
   });
 });

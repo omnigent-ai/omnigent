@@ -54,18 +54,6 @@ describe("browser tabs in the tab store: Back and Forward", () => {
     expect(incoherent).toEqual([]);
   });
 
-  it("records the page when its tab is selected", async () => {
-    const { store, shell } = setup({
-      tabs: [files, browserTab(A)],
-      selected: "F",
-      views: { [W_VIEW]: { exists: true, url: A } },
-    });
-    await tick();
-    shell.changeUrl(W_VIEW, B);
-    store.select("W");
-    expect(currentVisit(store.history.state)).toEqual({ tabId: "W", place: web(B) });
-  });
-
   it("closing the tab after a browser visit lands its page back through the owner", async () => {
     const tabs = [browserTab(A), files];
     const { store, shell, incoherent } = setup({
