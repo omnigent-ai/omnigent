@@ -136,6 +136,10 @@ def _split_from(page: Page, panes: Locator, keyboard: Locator) -> Locator:
     """Split with ⌘D from ``keyboard``, and return the new pane's terminal input once it has it."""
     before = panes.get_by_test_id("terminal-view").count()
     keyboard.focus()
+    # ⌘D splits once the pane has the keyboard and its agent's shells have loaded; its row's
+    # Split Right shows then.
+    expect(keyboard).to_be_focused()
+    expect(panes.get_by_test_id("pane-strip-split-right").first).to_be_attached(timeout=60_000)
     page.keyboard.press("Meta+d")
     terminals = panes.get_by_test_id("terminal-view")
     expect(terminals).to_have_count(before + 1, timeout=60_000)
