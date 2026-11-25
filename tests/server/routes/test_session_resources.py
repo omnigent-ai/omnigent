@@ -12154,10 +12154,8 @@ async def test_claude_native_unrecorded_slash_command_is_flagged_only_when_sent_
 ) -> None:
     """A ``/`` command an idle Claude never recorded is flagged before the next message.
 
-    A command that opens a terminal-only prompt leaves no transcript record, so its
-    bubble stayed pending below every later message. Claude holds a ``/`` command
-    only behind a running turn; sent then, it may still be recorded after the later
-    message, so it settles quietly.
+    Claude holds a ``/`` command only behind a running turn, so one sent then may
+    still be recorded after the later message and settles quietly.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes import sessions as sessions_module
