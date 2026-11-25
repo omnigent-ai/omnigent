@@ -668,13 +668,14 @@ def check_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
 
 
 def _create_keeps_approval(args: dict[str, object], event: PolicyEvent) -> bool:
-    """Whether a create's unattended runs are known not to skip approval.
+    """Whether a create's unattended runs keep approval, as far as Omnigent can tell.
 
     A run in a new session takes the request's mode, which must be stated and keep
     approval; ``null`` is the agent default, which a task can't inherit when it skips
-    approval. A run that continues a session takes that session's own mode, so only
-    the calling session itself is known. An update keeps stored settings this call
-    can't see, so it never qualifies.
+    approval. Like a mode with no launch flags, such as Codex ``default``, it can still
+    follow the host's own harness settings. A run that continues a session takes that
+    session's own mode, so only the calling session itself is known. An update keeps
+    stored settings this call can't see, so it never qualifies.
 
     :param args: The create request's arguments.
     :param event: Policy event dict, whose context names the calling session.
