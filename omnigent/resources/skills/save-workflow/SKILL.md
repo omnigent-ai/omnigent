@@ -173,10 +173,17 @@ that it leaves out, and publish it unchanged when it still fits.
   taught you.
 
 On `name_taken`, load the existing workflow if possible. If it already matches
-the requested workflow, reuse it and report its name and ID. Otherwise choose
-a descriptive, distinct name and retry, reporting the chosen name; ask only
-if the user required that exact name. Do not overwrite an existing workflow
-or keep retrying the same collision.
+the requested workflow, reuse it and report its name and ID. If the user asked
+to change that workflow, update it in place with `sys_workflow_update` instead:
+it keeps the ID and name that schedules run it by. Otherwise choose a
+descriptive, distinct name and retry, reporting the chosen name; ask only if
+the user required that exact name. Saving never overwrites an existing
+workflow, so don't keep retrying the same collision.
+
+To change a saved workflow, load it with `sys_workflow_load`, then send the
+complete new description and/or steps to `sys_workflow_update`, and report what
+its result says changed. Delete one with `sys_workflow_delete` only when the
+user asks; never delete and re-save to change it.
 
 After saving, reply with its name, description, relevant assumptions and where
 to run it: Run a workflow in the + menu of a session's composer, or Run in the

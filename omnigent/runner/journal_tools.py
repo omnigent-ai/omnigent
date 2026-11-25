@@ -943,6 +943,110 @@ async def _list_workflows(
     return json.dumps({"workflows": workflows, "next_cursor": next_cursor}, ensure_ascii=False)
 
 
+def _workflow_changes(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """What an update changed: the description, and steps added, removed or edited."""
+    old = {step["id"]: step for step in before.get("steps") or []}
+    new = {step["id"]: step for step in after.get("steps") or []}
+    return {
+        "description_changed": before.get("description") != after.get("description"),
+        "steps_added": [key for key in new if key not in old],
+        "steps_removed": [key for key in old if key not in new],
+        "steps_changed": [key for key in new if key in old and new[key] != old[key]],
+    }
+
+
+async def _resolve_workflow(
+    args: dict[str, Any], tool_name: str, *, server_client: httpx.AsyncClient, conversation_id: str
+) -> dict[str, Any] | str:
+    """The named workflow, or the error output for *tool_name*."""
+    loaded = json.loads(
+        await _load_workflow(args, server_client=server_client, conversation_id=conversation_id)
+    )
+    if "error" in loaded:
+        return json.dumps(
+            {**loaded, "error": loaded["error"].replace("sys_workflow_load", tool_name)},
+            ensure_ascii=False,
+        )
+    return loaded
+
+
+async def _update_workflow(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    """Change a workflow's description and/or steps in place, keeping its ID and name."""
+    if args.get("description") is None and args.get("steps") is None:
+        return _error("invalid_input: pass a new description, new steps, or both")
+    current = await _resolve_workflow(
+        args, "sys_workflow_update", server_client=server_client, conversation_id=conversation_id
+    )
+    if isinstance(current, str):
+        return current
+    try:
+        _, description, steps = normalize_workflow(
+            name=current["name"],
+            description=args.get("description", current["description"]),
+            steps=args.get("steps", current["steps"]),
+        )
+    except InvalidWorkflowError as exc:
+        return _error(f"invalid_workflow: {exc}")
+    body: dict[str, Any] = {}
+    if args.get("description") is not None:
+        # A description someone else saved meanwhile is kept rather than overwritten.
+        body["description"] = description
+        body["expected_description"] = current["description"]
+    if args.get("steps") is not None:
+        body["steps"] = steps
+    try:
+        response = await server_client.patch(
+            f"{_WORKFLOWS_URL}/{current['id']}",
+            json=body,
+            headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return _error(f"sys_workflow_update failed: {exc}. Load it to check before retrying.")
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    saved = response.json()
+    if "description" in body and saved.get("description") != description:
+        return _error(
+            "workflow_changed: its description changed since you loaded it, so yours wasn't "
+            "saved. Load it again and retry.",
+            workflow=current["name"],
+        )
+    return json.dumps(
+        {
+            **{key: saved.get(key) for key in ("id", "name", "description", "steps")},
+            "changed": _workflow_changes(current, saved),
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _delete_workflow(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    """Delete a workflow once its exact name is confirmed."""
+    current = await _resolve_workflow(
+        args, "sys_workflow_delete", server_client=server_client, conversation_id=conversation_id
+    )
+    if isinstance(current, str):
+        return current
+    if args.get("confirm_name") != current["name"]:
+        return _error("confirm_name must be the workflow's exact name", name=current["name"])
+    try:
+        response = await server_client.delete(
+            f"{_WORKFLOWS_URL}/{current['id']}",
+            headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return _error(f"sys_workflow_delete failed: {exc}")
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    return json.dumps({"deleted": current["id"], "name": current["name"]}, ensure_ascii=False)
+
+
 def _workflow_result(workflow: dict[str, Any]) -> str:
     return json.dumps(
         {key: workflow.get(key) for key in ("id", "name", "description", "steps")},
@@ -991,6 +1095,14 @@ async def execute_journal_tool(
         )
     if tool_name == "sys_workflow_load":
         return await _load_workflow(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+    if tool_name == "sys_workflow_update":
+        return await _update_workflow(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+    if tool_name == "sys_workflow_delete":
+        return await _delete_workflow(
             args, server_client=server_client, conversation_id=conversation_id
         )
     if tool_name == "sys_workflow_list":

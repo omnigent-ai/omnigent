@@ -429,7 +429,7 @@ class SysWorkflowSaveTool(Tool):
             "another confirmation; respect explicit draft-only or review-first instructions. "
             "Saving does not authorize executing the workflow. Returns the "
             "workflow's id and name, or name_taken when the user already has a workflow with "
-            "that name."
+            "that name; to change that workflow, use sys_workflow_update."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -542,6 +542,94 @@ class SysWorkflowListTool(Tool):
         )
 
 
+class SysWorkflowUpdateTool(Tool):
+    """Change a saved workflow in place. Runner-dispatched to ``PATCH /v1/workflows/{id}``."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_workflow_update"``."""
+        return "sys_workflow_update"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Change one of the user's saved workflows in place: its description, its steps, or "
+            "both. Its ID and name stay the same, so schedules and anything else that runs it "
+            "by name keep working. Load it with sys_workflow_load first and send the complete "
+            "new description and/or the complete new list of steps, written generically as "
+            "for sys_workflow_save. A request to change the workflow authorizes the update. "
+            "Returns the saved workflow and what changed. Fails with workflow_changed if "
+            "someone saved a new description since you loaded it; load it again and retry."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return _schema(
+            self.name(),
+            self.description(),
+            {
+                "workflow": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": WORKFLOW_NAME_MAX_CHARS,
+                    "description": "The saved workflow's ID, or its exact name.",
+                },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": WORKFLOW_DESCRIPTION_MAX_CHARS,
+                    "description": "The complete new description; omit to keep it.",
+                },
+                "steps": _steps_schema(
+                    "The complete new list of steps; omit to keep them. Unique IDs and no "
+                    "dependency cycles."
+                ),
+            },
+            ["workflow"],
+        )
+
+
+class SysWorkflowDeleteTool(Tool):
+    """Delete a saved workflow. Runner-dispatched to ``DELETE /v1/workflows/{id}``."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_workflow_delete"``."""
+        return "sys_workflow_delete"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Delete one of the user's saved workflows, only when they ask you to. It can't be "
+            "undone, and schedules that run it by name will stop finding it; to change a "
+            "workflow, use sys_workflow_update instead. Pass its exact name as confirm_name."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return _schema(
+            self.name(),
+            self.description(),
+            {
+                "workflow": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": WORKFLOW_NAME_MAX_CHARS,
+                    "description": "The saved workflow's ID, or its exact name.",
+                },
+                "confirm_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": WORKFLOW_NAME_MAX_CHARS,
+                    "description": "The workflow's exact name, to confirm which one goes.",
+                },
+            },
+            ["workflow", "confirm_name"],
+        )
+
+
 JOURNAL_TOOLS: tuple[type[Tool], ...] = (
     SysJournalReadTool,
     SysJournalWritePlanTool,
@@ -551,4 +639,6 @@ JOURNAL_TOOLS: tuple[type[Tool], ...] = (
     SysWorkflowSaveTool,
     SysWorkflowLoadTool,
     SysWorkflowListTool,
+    SysWorkflowUpdateTool,
+    SysWorkflowDeleteTool,
 )

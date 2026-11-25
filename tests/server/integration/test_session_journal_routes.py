@@ -1119,6 +1119,81 @@ async def test_a_retried_workflow_question_reuses_its_status_and_question(
     assert refused.status_code == 403, refused.text
 
 
+async def test_an_agent_updates_a_workflow_in_place_and_deletes_only_when_confirmed(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Updates keep the workflow's ID and name; only the owner's own runner may write."""
+    import json
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runner.journal_tools import execute_journal_tool
+
+    session_id = _session(db_uri, runner_token=None)
+    token = "workflow-update-runner"
+    conversations = SqlAlchemyConversationStore(db_uri)
+    assert conversations.set_runner_id(session_id, token_bound_runner_id(token)) is True
+    client.headers.update({**_headers(), RUNNER_TUNNEL_TOKEN_HEADER: token})
+
+    async def run(tool: str, args: dict[str, object]) -> dict:
+        output = await execute_journal_tool(
+            tool, json.dumps(args), server_client=client, conversation_id=session_id
+        )
+        return json.loads(output)
+
+    steps = [
+        {"id": "pull", "name": "Pull the data", "depends_on": []},
+        {"id": "chart", "name": "Chart it", "depends_on": ["pull"]},
+    ]
+    saved = await run(
+        "sys_workflow_save",
+        {"name": "Weekly refresh", "description": "Refreshes the index.", "steps": steps},
+    )
+    new_steps = [
+        {**steps[0], "goal": "Include the new source."},
+        {"id": "publish", "name": "Publish it", "depends_on": ["pull"]},
+    ]
+    updated = await run("sys_workflow_update", {"workflow": "Weekly refresh", "steps": new_steps})
+    assert (updated["id"], updated["name"]) == (saved["id"], "Weekly refresh")
+    assert updated["changed"] == {
+        "description_changed": False,
+        "steps_added": ["publish"],
+        "steps_removed": ["chart"],
+        "steps_changed": ["pull"],
+    }
+    loaded = await run("sys_workflow_load", {"workflow": saved["id"]})
+    assert [step["id"] for step in loaded["steps"]] == ["pull", "publish"]
+    assert loaded["description"] == "Refreshes the index."
+    nothing = await run("sys_workflow_update", {"workflow": saved["id"]})
+    assert nothing["error"].startswith("invalid_input")
+
+    # Another person's workflow isn't reachable; a session without its runner token can't write.
+    other = await client.post(
+        "/v1/workflows",
+        json={"name": "Bob's", "description": "x", "steps": steps},
+        headers={"X-Forwarded-Email": BOB},
+    )
+    assert other.status_code == 200, other.text
+    foreign = await run(
+        "sys_workflow_update", {"workflow": other.json()["id"], "description": "y"}
+    )
+    assert foreign["error"] == "workflow_not_found"
+    client.headers.pop(RUNNER_TUNNEL_TOKEN_HEADER)
+    unbound = await run("sys_workflow_update", {"workflow": saved["id"], "description": "z"})
+    assert "bound runner" in unbound["error"]
+    assert (await run("sys_workflow_load", {"workflow": saved["id"]}))["description"] == (
+        "Refreshes the index."
+    )
+    client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = token
+
+    wrong = await run("sys_workflow_delete", {"workflow": saved["id"], "confirm_name": "Weekly"})
+    assert wrong["error"].startswith("confirm_name")
+    deleted = await run(
+        "sys_workflow_delete", {"workflow": saved["id"], "confirm_name": "Weekly refresh"}
+    )
+    assert deleted == {"deleted": saved["id"], "name": "Weekly refresh"}
+    assert (await run("sys_workflow_load", {"workflow": saved["id"]}))["error"]
+
+
 async def test_the_workflow_tools_save_and_load_through_the_real_routes(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:

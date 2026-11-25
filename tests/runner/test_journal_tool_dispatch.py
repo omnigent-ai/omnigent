@@ -59,6 +59,8 @@ def test_every_agent_gets_the_journal_tools_unless_its_spec_opts_out() -> None:
         "sys_workflow_save",
         "sys_workflow_load",
         "sys_workflow_list",
+        "sys_workflow_update",
+        "sys_workflow_delete",
     }
     assert names == JOURNAL_TOOL_NAMES
     assert names <= _ALL_LOCAL_TOOLS and names <= _NATIVE_RELAY_BUILTIN_TOOLS
