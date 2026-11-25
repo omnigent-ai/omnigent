@@ -253,6 +253,7 @@ import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { WhatsNewSidebarCard } from "@/components/WhatsNew";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -1620,6 +1621,7 @@ function SidebarImpl({
                 </Button>
               )}
             </div>
+            <WhatsNewSidebarCard />
 
             <div className="relative flex min-h-0 flex-1 flex-col">
               <div

@@ -1,9 +1,11 @@
-// "What's New?" pill shown at the top of the app when bundled release-notes
-// entries are newer than the last one this browser has seen. Clicking it opens
-// a dialog with the unseen entries and marks them seen; × just dismisses.
+// "What's new" release notes. While bundled entries are newer than the last one
+// this browser has seen, desktop shows a card under the sidebar's main
+// navigation and phones show a pill. Clicking either opens the notes and marks
+// them seen; × just dismisses. The profile menu reopens the notes any time.
 
 import { SparklesIcon, XIcon } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { create } from "zustand";
 
 import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
@@ -23,14 +25,50 @@ import {
   writeLastSeen,
 } from "@/whatsNew/whatsNew";
 
-function formatEntryDate(date: string): string {
+interface WhatsNewState {
+  entries: WhatsNewEntry[];
+  /** Read once per page load, so the set shown stays stable while the notes are open. */
+  unseen: WhatsNewEntry[];
+  noticeVisible: boolean;
+  notesOpen: boolean;
+  /** Set while the app shell mounts the notes (not in embedded views). */
+  mounted: boolean;
+}
+
+function initialState(entries: WhatsNewEntry[]) {
+  const unseen = unseenEntries(entries, readLastSeen());
+  return { entries, unseen, noticeVisible: unseen.length > 0, notesOpen: false };
+}
+
+export const useWhatsNewStore = create<WhatsNewState>(() => ({
+  ...initialState(WHATS_NEW_ENTRIES),
+  mounted: false,
+}));
+
+/** Re-read the entries and the seen marker, as on a fresh page load. */
+export function loadWhatsNew(entries: WhatsNewEntry[] = WHATS_NEW_ENTRIES) {
+  useWhatsNewStore.setState(initialState(entries));
+}
+
+function dismissWhatsNew() {
+  const { entries } = useWhatsNewStore.getState();
+  if (entries.length > 0) writeLastSeen(entries[0].date);
+  useWhatsNewStore.setState({ noticeVisible: false });
+}
+
+export function openWhatsNew() {
+  dismissWhatsNew();
+  useWhatsNewStore.setState({ notesOpen: true });
+}
+
+/** Whether the app shows release notes here, for the profile menu's entry. */
+export function useWhatsNewAvailable() {
+  return useWhatsNewStore((state) => state.mounted && state.entries.length > 0);
+}
+
+function formatEntryDate(date: string, options: Intl.DateTimeFormatOptions): string {
   const [year, month, day] = date.split("-").map(Number);
-  return new Date(year, month - 1, day).toLocaleDateString(undefined, {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
+  return new Date(year, month - 1, day).toLocaleDateString(undefined, options);
 }
 
 function EntryList({ entries }: { entries: WhatsNewEntry[] }) {
@@ -38,7 +76,14 @@ function EntryList({ entries }: { entries: WhatsNewEntry[] }) {
     <div className="flex flex-col gap-5">
       {entries.map((entry) => (
         <section key={entry.date} aria-label={entry.title} className="flex flex-col gap-1">
-          <p className="text-xs text-muted-foreground">{formatEntryDate(entry.date)}</p>
+          <p className="text-xs text-muted-foreground">
+            {formatEntryDate(entry.date, {
+              weekday: "short",
+              month: "short",
+              day: "numeric",
+              year: "numeric",
+            })}
+          </p>
           <h3 className="text-sm font-semibold">{entry.title}</h3>
           <div className="text-sm">
             <MessageResponse>{entry.body}</MessageResponse>
@@ -49,36 +94,72 @@ function EntryList({ entries }: { entries: WhatsNewEntry[] }) {
   );
 }
 
+function DismissButton({ className }: { className?: string }) {
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      aria-label="Dismiss What's new"
+      className={cn("shrink-0 rounded-full text-muted-foreground", className)}
+      onClick={dismissWhatsNew}
+    >
+      <XIcon className="size-3.5" />
+    </Button>
+  );
+}
+
+/** Desktop: the newest update's headline, under the sidebar's main navigation. */
+export function WhatsNewSidebarCard() {
+  const visible = useWhatsNewStore((state) => state.mounted && state.noticeVisible);
+  const latest = useWhatsNewStore((state) => state.unseen[0]);
+  if (!visible || !latest) return null;
+  return (
+    <div className="relative px-2 pt-2 max-md:hidden" role="status" data-testid="whats-new-card">
+      <button
+        type="button"
+        className="flex w-full items-start gap-2.5 rounded-lg border bg-card py-2.5 pr-8 pl-2.5 text-left shadow-xs transition-colors outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+        onClick={openWhatsNew}
+      >
+        <SparklesIcon className="mt-px size-4 shrink-0 text-brand-accent" aria-hidden="true" />
+        <span className="flex min-w-0 flex-col gap-0.5">
+          <span className="text-xs text-muted-foreground">
+            What&apos;s new · {formatEntryDate(latest.date, { month: "short", day: "numeric" })}
+          </span>
+          <span className="line-clamp-2 text-sm leading-snug font-medium">{latest.title}</span>
+        </span>
+      </button>
+      <DismissButton className="absolute top-3.5 right-3.5 size-6" />
+    </div>
+  );
+}
+
 export function WhatsNew({
-  entries = WHATS_NEW_ENTRIES,
   phoneAtBottom = false,
 }: {
-  entries?: WhatsNewEntry[];
   /** Phones: sit at the bottom, for pages whose toolbar is right under the header. */
   phoneAtBottom?: boolean;
 }) {
-  // Read once per page load: the set shown stays stable while the dialog is open.
-  const [unseen] = useState(() => unseenEntries(entries, readLastSeen()));
-  const [badgeVisible, setBadgeVisible] = useState(unseen.length > 0);
-  const [open, setOpen] = useState(false);
+  const unseen = useWhatsNewStore((state) => state.unseen);
+  const entries = useWhatsNewStore((state) => state.entries);
+  const noticeVisible = useWhatsNewStore((state) => state.noticeVisible);
+  const notesOpen = useWhatsNewStore((state) => state.notesOpen);
   const [showEarlier, setShowEarlier] = useState(false);
-
-  const markSeen = () => {
-    if (entries.length > 0) writeLastSeen(entries[0].date);
-    setBadgeVisible(false);
-  };
+  useEffect(() => {
+    useWhatsNewStore.setState({ mounted: true });
+    return () => useWhatsNewStore.setState({ mounted: false });
+  }, []);
   const earlier = entries.filter((entry) => !unseen.includes(entry));
 
   return (
     <>
-      {badgeVisible && (
+      {noticeVisible && (
         <div
           role="status"
-          // Phones: a one-line pill under the header, or on project pages (toolbar under the
-          // header) above the chat composer. Desktop: a bottom-left card above the sidebar footer.
+          // Phones only (desktop shows the sidebar card): a one-line pill under the header,
+          // or on project pages (toolbar under the header) above the chat composer.
           data-testid="whats-new"
           className={cn(
-            "fixed left-1/2 z-50 flex -translate-x-1/2 items-center gap-1 rounded-full bg-success py-1 pr-1 pl-3 text-sm text-white shadow-md md:top-auto md:bottom-[calc(4.5rem+var(--omnigent-safe-bottom,0px))] md:left-3 md:w-72 md:translate-x-0 md:items-start md:rounded-lg md:py-2 md:pl-3",
+            "fixed left-1/2 z-50 flex -translate-x-1/2 items-center gap-0.5 rounded-full border bg-card py-0.5 pr-0.5 pl-3 text-sm text-foreground shadow-md md:hidden",
             phoneAtBottom
               ? "bottom-[calc(6.5rem+var(--omnigent-safe-bottom,0px))]"
               : "top-[calc(4.25rem+var(--omnigent-safe-top,0px))]",
@@ -86,39 +167,26 @@ export function WhatsNew({
         >
           <button
             type="button"
-            className="flex min-w-0 flex-1 items-center gap-1.5 whitespace-nowrap rounded-full text-left outline-none focus-visible:ring-2 focus-visible:ring-white/70 md:flex-wrap md:items-baseline md:gap-x-1.5 md:gap-y-0.5 md:whitespace-normal md:rounded-md"
-            onClick={() => {
-              markSeen();
-              setOpen(true);
-            }}
+            className="flex items-center gap-1.5 rounded-full py-1.5 whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={openWhatsNew}
           >
-            <SparklesIcon className="size-4 shrink-0 md:self-center" aria-hidden="true" />
-            <span className="font-semibold">What&apos;s New?</span>
-            {/* Phones show just the label so the pill fits between the header controls. */}
-            <span className="sr-only md:not-sr-only">
-              See features released since your last visit.
-            </span>
+            <SparklesIcon className="size-4 shrink-0 text-brand-accent" aria-hidden="true" />
+            <span className="font-medium">What&apos;s new</span>
           </button>
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="Dismiss What's New"
-            className="size-6 rounded-full text-white hover:bg-white/20 hover:text-white"
-            onClick={markSeen}
-          >
-            <XIcon className="size-3.5" />
-          </Button>
+          <DismissButton className="size-8" />
         </div>
       )}
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={notesOpen} onOpenChange={(open) => useWhatsNewStore.setState({ notesOpen: open })}>
         <DialogContent className="max-h-[80dvh] overflow-y-auto sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>What&apos;s New</DialogTitle>
-            <DialogDescription>Features released since your last visit.</DialogDescription>
+            <DialogTitle>What&apos;s new</DialogTitle>
+            <DialogDescription>
+              {unseen.length > 0 ? "Features released since your last visit." : "Recent updates."}
+            </DialogDescription>
           </DialogHeader>
-          <EntryList entries={unseen} />
+          {unseen.length > 0 && <EntryList entries={unseen} />}
           {earlier.length > 0 &&
-            (showEarlier ? (
+            (showEarlier || unseen.length === 0 ? (
               <EntryList entries={earlier} />
             ) : (
               <Button

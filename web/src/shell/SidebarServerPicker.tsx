@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, LogOutIcon, PlusIcon, SettingsIcon } from "lucide-react";
+import { CheckIcon, LogOutIcon, PlusIcon, SettingsIcon, SparklesIcon } from "lucide-react";
+import { openWhatsNew, useWhatsNewAvailable } from "@/components/WhatsNew";
 import { toast } from "sonner";
 import { signOutOfBrowserSession } from "@/lib/accountsApi";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -112,6 +113,7 @@ export function SidebarServerPicker() {
   );
   const viewerId = useViewerId();
   const serverInfo = useServerInfo();
+  const whatsNewAvailable = useWhatsNewAvailable();
   const { inSettings } = useSettingsRoute();
 
   useEffect(() => {
@@ -260,6 +262,16 @@ export function SidebarServerPicker() {
               <CompactShortcutKeys keys={settingsShortcutKeys()} className="ml-auto pl-4" />
             </Link>
           </DropdownMenuItem>
+          {whatsNewAvailable && (
+            <DropdownMenuItem
+              className="gap-2"
+              data-testid="sidebar-profile-menu-whats-new"
+              onSelect={openWhatsNew}
+            >
+              <SparklesIcon className="size-4 shrink-0" />
+              What&apos;s new
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           {nativeServerPicker ? (
             <>
