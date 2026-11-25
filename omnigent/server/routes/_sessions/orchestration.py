@@ -5775,6 +5775,8 @@ async def _bind_and_launch_managed_runner(
                 tunnel_registry,
                 tracker,
                 settle_failure=False,
+                conversation_store=conversation_store,
+                host_id=managed.host_id,
             )
             if not connected:
                 reason = "managed runner did not connect after launch"
@@ -6910,6 +6912,7 @@ async def _run_managed_wake(
                 on_stage=_on_stage,
                 agent_name=agent_name,
                 slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
+                launch_state=tracker.get(session_id),
             )
         except SandboxGoneError:
             _logger.info(

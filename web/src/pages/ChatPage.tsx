@@ -134,7 +134,7 @@ import {
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
-import { shouldQueueSend } from "@/lib/messageQueue";
+import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -926,7 +926,12 @@ export function ChatPage() {
   const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
 
   const onSend = useCallback(
-    (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
+    (
+      text: string,
+      files?: File[],
+      replyDraft?: StoredReplyDraft,
+      options?: ComposerSendOptions,
+    ) => {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
       if (isTempConvId(urlConvId)) return;
@@ -968,7 +973,7 @@ export function ChatPage() {
           chat.status,
           chat.sessionStatus,
           chat.queuedMessages,
-          readAlwaysSteer(),
+          readAlwaysSteer() && options?.queue !== true,
           opensSideChat,
           holdsInitialDraft(chat),
         )
@@ -1317,7 +1322,12 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  onSend: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    options?: ComposerSendOptions,
+  ) => void;
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
@@ -1975,7 +1985,12 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  onSend: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    options?: ComposerSendOptions,
+  ) => void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -3949,7 +3964,8 @@ function ComposerImpl(
 
   const submit = ({
     resetNativeInputSession = false,
-  }: { resetNativeInputSession?: boolean } = {}) => {
+    queue = false,
+  }: { resetNativeInputSession?: boolean } & ComposerSendOptions = {}) => {
     // The /btw overlay locks the composer — never send while it's open.
     if (composerLockedByBtw) return;
     const trimmed = fullText.trim();
@@ -4120,12 +4136,14 @@ function ComposerImpl(
     // interrupts.
     if (trimmed) appendEntry(fullText, storedReplyDraft);
     const sendFiles = attachedFiles.length > 0 ? attachedFiles : undefined;
-    if (draft.quotes.length > 0) {
+    if (queue) {
+      onSend(outgoing.text, sendFiles, outgoing.replyDraft, { queue });
+    } else if (draft.quotes.length > 0) {
       onSend(outgoing.text, sendFiles, outgoing.replyDraft);
     } else {
       onSend(outgoing.text, sendFiles);
-      if (goalMessage) refreshGoalAfterActivity();
     }
+    if (draft.quotes.length === 0 && goalMessage) refreshGoalAfterActivity();
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     // Reset first: a chip the reset drops goes to the tray, which the clear then empties.
@@ -4253,12 +4271,16 @@ function ComposerImpl(
       shouldSteerAllFromKeyboard,
     }: ComposerKeyIntent,
   ) => {
-    // Mod+Enter (Mod+Shift+Enter when Mod+Enter is already the send chord)
-    // steers everything: the draft, if any, is submitted first so it joins the
-    // queue tail (or sends directly when idle), then every queued message is
-    // sent into the running turn in FIFO order instead of draining one per idle.
+    // Mod+Enter inverts Always steer mid-turn: with it on, the draft waits in the
+    // queue; otherwise the draft joins the queue tail (or sends when idle) and the
+    // whole queue is steered into the running turn.
     if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
       e.preventDefault();
+      // An empty composer has nothing to queue, so it still steers the backlog.
+      if (hasDraft && isWorking && readAlwaysSteer()) {
+        if (!mentionListingPending) submit({ queue: true });
+        return;
+      }
       if (!mentionListingPending) submit();
       // While unreachable the queue waits for the host, so nothing is steered.
       if (!unreachable) steerAllQueuedMessages(conversationId);

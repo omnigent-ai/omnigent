@@ -173,6 +173,11 @@ vi.mock("@/hooks/usePermissions", async (importOriginal) => ({
 }));
 const isMobileMock = vi.hoisted(() => vi.fn(() => false));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
+const floatingPanesMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock("./useFloatingPanes", () => ({
+  useFloatingPanes: () => floatingPanesMock(),
+  useFloatingPanesShown: () => floatingPanesMock(),
+}));
 
 const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);
@@ -188,6 +193,7 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.restoreAllMocks();
   isMobileMock.mockReturnValue(false);
+  floatingPanesMock.mockReturnValue(false);
   canEditMock.mockReturnValue(true);
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
@@ -415,6 +421,32 @@ describe("WorkspacePanel render failures", () => {
       }
     },
   );
+});
+
+describe("WorkspacePanel beside floating panes", () => {
+  const gutter = () => document.querySelector<HTMLElement>("[data-workspace-rail-gutter-handle]");
+
+  it("drags the docked rail from a band in the gutter, with one separator inside the rail", () => {
+    floatingPanesMock.mockReturnValue(true);
+    renderWorkspace({ open: true });
+    const rail = document.querySelector('aside[aria-label="Workspace"]')!;
+    expect(rail.nextElementSibling).toBe(gutter());
+    expect(gutter()).toHaveAttribute("aria-hidden", "true");
+    expect(gutter()!.style.right).toBe("355px");
+    expect(screen.getAllByRole("separator", { name: "Resize panel", hidden: true })).toHaveLength(
+      1,
+    );
+  });
+
+  it.each([
+    ["without floating panes", false, {}],
+    ["full screen", true, { maximized: true }],
+    ["in a grid cell", true, { contained: true }],
+  ])("has no band %s", (_case, floating, overrides) => {
+    floatingPanesMock.mockReturnValue(floating);
+    renderWorkspace({ open: true, ...overrides });
+    expect(gutter()).toBeNull();
+  });
 });
 
 describe("WorkspacePanel surface presentation", () => {

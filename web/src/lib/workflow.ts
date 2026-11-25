@@ -219,12 +219,16 @@ export function parseSavedWorkflowMessage(
   return parseSavedWorkflowRun(instructions);
 }
 
-/** The automations whose prompt runs the saved workflow *workflowId*, in list order. */
-export function automationsUsingWorkflow<T extends { prompt: string }>(
+/**
+ * The automations that run the saved workflow *workflowId*, in list order: those saved
+ * with it, or, from a server that doesn't store it, whose prompt runs it.
+ */
+export function automationsUsingWorkflow<T extends { prompt: string; workflowId?: string | null }>(
   automations: readonly T[],
   workflowId: string,
 ): T[] {
   return automations.filter(
-    (automation) => parseSavedWorkflowMessage(automation.prompt)?.id === workflowId,
+    (automation) =>
+      (automation.workflowId ?? parseSavedWorkflowMessage(automation.prompt)?.id) === workflowId,
   );
 }

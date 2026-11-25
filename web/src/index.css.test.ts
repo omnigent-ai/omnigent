@@ -922,6 +922,150 @@ describe("index.css sidebar canvas", () => {
   });
 });
 
+/** Each top-level rule in `css`: its selector and its whole body, nested rules included. */
+function topLevelRules(css: string): { selector: string; body: string }[] {
+  // A comment's ";" or braces aren't the stylesheet's.
+  const source = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules: { selector: string; body: string }[] = [];
+  let depth = 0;
+  let start = 0;
+  let open = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      if (depth === 0) open = index;
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const selector = source.slice(start, open).replace(/\s+/g, " ").trim();
+        rules.push({ selector, body: source.slice(open + 1, index) });
+        start = index + 1;
+      }
+    } else if (char === ";" && depth === 0) {
+      start = index + 1;
+    }
+  }
+  return rules;
+}
+
+describe("index.css floating panes", () => {
+  const FLOATING_GATE = "@media (width >= 48rem)";
+  const topLevel = topLevelRules(indexCssSource);
+  const gates = topLevel.filter((rule) => rule.selector === FLOATING_GATE);
+  // The floating rules, read from inside their one width gate.
+  const rules = gates.flatMap((gate) => topLevelRules(gate.body));
+  // Every rule for exactly this selector, as one body.
+  const ruleFor = (selector: string) =>
+    rules
+      .filter((rule) => rule.selector === selector)
+      .map((rule) => rule.body.replace(/\s+/g, " "))
+      .join(" ");
+
+  it("gates every floating rule at 48rem alone, in a browser and the desktop app alike", () => {
+    expect(gates).toHaveLength(1);
+    for (const rule of rules) {
+      expect(rule.selector).toContain(".app-shell[data-floating-panes]");
+      // `md` is 73.8125rem in a browser and every width in the desktop app: not this gate.
+      expect(rule.body).not.toMatch(/@variant|@media/);
+    }
+    const outside = topLevel.filter(
+      (rule) => rule.selector !== FLOATING_GATE && rule.selector.includes("[data-floating-panes]"),
+    );
+    expect(outside).toEqual([]);
+  });
+
+  it("styles a standalone session's panes, not a grid's", () => {
+    // A grid portals its workspace sidebar and renders its cells outside the session column.
+    const paneRules = rules.filter((rule) =>
+      /aside\[aria-label="Workspace"\]|main-terminal-view|chat-conversation-content|> main\[/.test(
+        rule.selector,
+      ),
+    );
+    for (const rule of paneRules) {
+      for (const selector of rule.selector.split(/,\s*/)) {
+        if (selector.includes(".omnigent-sidebar-panel")) continue;
+        expect(selector).toContain("[data-main-view");
+      }
+    }
+    // The chat itself is the pane's card.
+    const card = ruleFor(
+      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id]',
+    );
+    expect(card).toContain("border-radius: var(--radius-lg, 0.5rem)");
+    expect(card).toContain("border: 1px solid var(--pane-card-border)");
+  });
+
+  it("keeps every control the edge-to-edge layout shows", () => {
+    const floating = rules.filter((each) => each.selector.includes("[data-floating-panes]"));
+    for (const rule of floating) {
+      // Only decoration goes: the header's glass layer, never a control.
+      if (!rule.selector.endsWith("::before")) expect(rule.body).not.toMatch(/display:\s*none/);
+      expect(rule.selector).not.toMatch(/data-workspace-history|data-right-panel-toggle/);
+    }
+  });
+
+  it("makes the dark backdrop one surface, measured from the window corner in the sidebar's colors", () => {
+    const backdrop = ruleFor(".dark .app-shell[data-floating-panes]");
+    expect(backdrop).toContain("background: var(--floating-backdrop-image) !important");
+    expect(backdrop).toContain("background-color: var(--sidebar) !important");
+    const overBackdrop = ruleFor(
+      ".dark .app-shell[data-floating-panes] .omnigent-sidebar-panel:not(.is-peek), .dark .app-shell[data-floating-panes] [data-main-view] .main-terminal-view",
+    );
+    expect(overBackdrop).toContain("background: none");
+    const token = (name: string) =>
+      indexCssSource
+        .match(new RegExp(`${name}:([^;]*);`))?.[1]
+        .replace(/\s+/g, " ")
+        .trim();
+    // The same layers and colors; only the diagonal's fade is an absolute length: 60% along the
+    // sidebar's own diagonal, which a sidebar-sized box puts at 60%.
+    expect(token("--sidebar-surface-image")).toBe(
+      "linear-gradient(transparent 35%, rgb(255 255 255 / 6%)), linear-gradient(135deg, rgb(255 255 255 / 4%), transparent 60%)",
+    );
+    expect(token("--floating-backdrop-image")).toBe(
+      "linear-gradient(transparent 35%, rgb(255 255 255 / 6%)), linear-gradient( 135deg, rgb(255 255 255 / 4%), transparent calc(0.6 * (var(--app-sidebar-width, 0px) + 100dvh) * 0.7071) )",
+    );
+  });
+
+  it("sets the cards' canvas on the shell, where the sidebar width it is placed by is known", () => {
+    // A token declared on :root would read the width there, where it is never set.
+    expect(indexCssSource.match(/--floating-card-canvas:/g)).toHaveLength(1);
+    expect(ruleFor(".app-shell[data-floating-panes]")).toContain(
+      '--floating-card-canvas: url("./assets/omnigent-center-glow.svg") right center / calc(100% - var(--app-sidebar-width, 0px)) 100% no-repeat fixed, var(--app-shell-bg);',
+    );
+  });
+
+  it("sits a full-screen workspace on the backdrop, opaque over the chat it covers", () => {
+    const maximized =
+      '.app-shell[data-floating-panes] [data-main-view] aside[aria-label="Workspace"][data-maximized]';
+    expect(ruleFor(maximized)).toContain("border-left-width: 0");
+    expect(ruleFor(`:root:not(.dark) ${maximized}`)).toContain(
+      "background: var(--sidebar-background, var(--sidebar)) !important",
+    );
+    const dark = ruleFor(`.dark ${maximized}`);
+    expect(dark).toMatch(
+      /background-image: var\(--floating-backdrop-image\), linear-gradient\(var\(--sidebar\), var\(--sidebar\)\) !important/,
+    );
+    expect(dark).toContain("background-attachment: fixed !important");
+    expect(dark).toContain("background-color: var(--background) !important");
+  });
+
+  it("sizes the top row as the macOS title bar, which keeps window pixels at any zoom", () => {
+    expect(ruleFor("html[data-electron-mac] .app-shell[data-floating-panes]")).toContain(
+      "--shell-top-row: var(--mac-titlebar-height)",
+    );
+    expect(ruleFor(".app-shell[data-floating-panes]")).toContain("--shell-top-row: 48px");
+  });
+
+  it("keeps the gap above the chat's card when an extension owns the header", () => {
+    const hidden = ruleFor(
+      '.app-shell[data-floating-panes] [data-main-view="chat"] > main[data-session-id][data-shell-header="hidden"]',
+    );
+    expect(hidden).toContain("margin-top: var(--pane-gap)");
+  });
+});
+
 describe("index.css composer and menu surfaces", () => {
   const darkTokens = cssSource.match(/\.dark \{\s*--app-shell-bg:[\s\S]*?\n\}/)?.[0];
   const queuedSurface = cssSource.match(/\.composer-queued-surface \{[^}]*\}/)?.[0];

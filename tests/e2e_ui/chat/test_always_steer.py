@@ -15,6 +15,7 @@ _STORAGE_KEY = "omnigent:always-steer"
 _COMPOSER_LABEL = "Message the agent"
 _INITIAL_DIRECT = "always-steer initial direct turn"
 _DIRECT_FOLLOWUP = "always-steer direct busy follow-up"
+_SHORTCUT_QUEUED = "always-steer follow-up queued with Mod+Enter"
 _INITIAL_ORDERING = "always-steer initial ordering turn"
 _EARLIER_QUEUED = "always-steer earlier queued follow-up"
 _LATER_QUEUED = "always-steer later queued follow-up"
@@ -97,7 +98,7 @@ def test_always_steer_defaults_on_and_an_opt_out_persists(
     page: Page,
     paused_mid_turn_session: tuple[str, str, str],
 ) -> None:
-    """With nothing stored, a busy follow-up sends through the real server; opting out sticks."""
+    """With nothing stored, a busy follow-up sends now and Mod+Enter queues; opting out sticks."""
     base_url, session_id, mock_url = paused_mid_turn_session
 
     toggle = _open_general_settings(page, base_url)
@@ -113,14 +114,30 @@ def test_always_steer_defaults_on_and_an_opt_out_persists(
 
     _send(page, _DIRECT_FOLLOWUP)
     _wait_for(page, lambda: posts == [_INITIAL_DIRECT, _DIRECT_FOLLOWUP])
-    expect(page.get_by_test_id("composer-queued-strip")).to_have_count(0)
+    queue = page.get_by_test_id("composer-queued-strip")
+    expect(queue).to_have_count(0)
+
+    composer = page.get_by_label(_COMPOSER_LABEL)
+    composer.fill(_SHORTCUT_QUEUED)
+    composer.press("ControlOrMeta+Enter")
+    # A queued message is held client-side, so it never reaches the server mid-turn.
+    expect(queue).to_contain_text(_SHORTCUT_QUEUED)
+    assert posts == [_INITIAL_DIRECT, _DIRECT_FOLLOWUP]
 
     _release_gate(mock_url)
     _wait_for(
         page,
-        lambda: _items_contain(base_url, session_id, _INITIAL_DIRECT, _DIRECT_FOLLOWUP),
+        lambda: posts == [_INITIAL_DIRECT, _DIRECT_FOLLOWUP, _SHORTCUT_QUEUED],
+        timeout_s=90.0,
+    )
+    _wait_for(
+        page,
+        lambda: _items_contain(
+            base_url, session_id, _INITIAL_DIRECT, _DIRECT_FOLLOWUP, _SHORTCUT_QUEUED
+        ),
         timeout_s=60.0,
     )
+    expect(queue).to_have_count(0)
 
     page.reload()
     expect(page.get_by_text(_DIRECT_FOLLOWUP, exact=True)).to_be_visible(timeout=30_000)

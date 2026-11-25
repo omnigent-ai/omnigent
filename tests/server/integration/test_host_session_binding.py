@@ -50,7 +50,7 @@ from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_WITHDRAWN
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, ConversationNotFoundError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -874,6 +874,74 @@ async def test_managed_session_create_rejects_a_taken_host_id(
     assert resp.status_code == 409, resp.text
     assert resp.json()["error"]["code"] == "already_exists"
     assert env.conv_store.list_conversations(limit=100) == sessions_before
+
+
+@pytest.mark.parametrize(
+    ("sharded", "slice_key", "keyed"),
+    [
+        (True, "f00dfeedf00dfeedf00dfeedf00dfeed", True),
+        (True, None, False),
+        (False, "f00dfeedf00dfeedf00dfeedf00dfeed", False),
+    ],
+)
+async def test_managed_create_without_host_id_keys_the_host_for_a_keyed_sharded_request(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    sharded: bool,
+    slice_key: str | None,
+    keyed: bool,
+) -> None:
+    """
+    A keyed create that names no host id gets one minted on a host-sharded
+    server, so its host keys by it instead of joining the default replica.
+    A keyless create keeps an unkeyed host, the only one its requests reach.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch
+
+    env = managed_session_env
+    monkeypatch.setattr(_host_launch, "_host_sharded", sharded)
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+    agent = await create_test_agent(env.client, name="managed-keyed-create-agent")
+
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+        headers={OMNIGENT_SLICE_KEY_HEADER: slice_key} if slice_key else {},
+    )
+
+    assert resp.status_code == 201, resp.text
+    conv = await _wait_for_managed_binding(env, resp.json()["id"])
+    tunnels = [await future for future in host_futures]
+    label = conv.labels.get(REQUESTED_HOST_ID_LABEL_KEY)
+    slice_key_config = render_host_config_write_command({"host": {"slice_key_enabled": True}})
+    if keyed:
+        assert label == conv.host_id
+        assert label != slice_key
+        assert fake.host_starts[0].host_id == conv.host_id
+        assert fake.commands.count(slice_key_config) == 1
+    else:
+        assert label is None
+        assert fake.commands.count(slice_key_config) == 0
+    del tunnels
 
 
 @pytest.mark.parametrize("requested_host_id", [None, "0123456789abcdef0123456789abcdef"])
@@ -2077,6 +2145,52 @@ async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
         "feature/x",
         None,
     )
+    assert env.app.state.managed_launches.get(session_id) is None
+
+
+async def test_keyed_move_failing_at_detach_leaves_no_requested_host_id(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A keyed move that names no host id and fails while detaching the old host
+    rolls back without a requested host id, so routing keeps to the old host.
+
+    Clients route a host-less session by that label, so one left behind would
+    steer them to a sandbox host that never launched.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch
+
+    env = managed_session_env
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+    session_id = await _session_released_from_laptop(env, agent_name="keyed-move-detach-agent")
+    clear_host_binding = env.conv_store.clear_host_binding
+
+    def failing_detach(conversation_id: str, **kwargs: Any) -> Conversation:
+        if kwargs.get("keep_runner"):
+            raise RuntimeError("detach failed")
+        return clear_host_binding(conversation_id, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "clear_host_binding", failing_detach)
+
+    with pytest.raises(RuntimeError, match="detach failed"):
+        await env.client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={OMNIGENT_SLICE_KEY_HEADER: _LAPTOP_HOST_ID},
+        )
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert (conv.host_id, conv.workspace, conv.git_branch, conv.runner_id) == (
+        _LAPTOP_HOST_ID,
+        "/Users/alice/repo",
+        "feature/x",
+        None,
+    )
+    assert REQUESTED_HOST_ID_LABEL_KEY not in conv.labels
     assert env.app.state.managed_launches.get(session_id) is None
 
 
@@ -3744,6 +3858,248 @@ async def test_managed_launch_fails_when_runner_never_connects(
         assert fake.terminated == [actual_id]
 
 
+async def test_managed_launch_waits_for_runner_a_message_relaunched(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message that replaces a slow first runner leaves the fresh sandbox serving it."""
+    from omnigent.server.managed_hosts import launch_managed_host
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation()
+    fake = FakeSandboxLauncher(
+        on_host_start=lambda invocation: host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=RESERVED_USER_LOCAL,
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+        )
+    )
+    managed = await launch_managed_host(
+        config=config, owner=RESERVED_USER_LOCAL, host_store=host_store
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+    # A successful launch is forgotten once it settles, so hold the entry.
+    launch = tracker.get(conv.id)
+    assert launch is not None
+    stages: list[tuple[str, str | None]] = []
+    awaited: list[str] = []
+    timeouts: list[float] = []
+
+    async def _launch_runner(launched: Conversation, *_args: object, **_kwargs: object) -> object:
+        conversations.replace_runner_id(launched.id, "runner_slow_first")
+        return sessions_module._HostLaunchAttempt(runner_id="runner_slow_first")
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> object | None:
+            awaited.append(runner_id)
+            timeouts.append(timeout_s)
+            if runner_id == "runner_slow_first":
+                # A message rebinds the session while the first runner is still starting;
+                # the host stops the runner it replaced, so that one never connects.
+                conversations.replace_runner_id(conv.id, "runner_message_relaunch")
+                return None
+            return object()
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(
+        sessions_module,
+        "_publish_sandbox_status",
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
+    )
+
+    await sessions_module._bind_and_launch_managed_runner(
+        session_id=conv.id,
+        managed=managed,
+        sandbox_config=config,
+        tracker=tracker,
+        conversation_store=conversations,
+        host_store=host_store,
+        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    assert awaited == ["runner_slow_first", "runner_message_relaunch"]
+    # The replacement may still be booting; the launch waits as long as its message does.
+    assert timeouts[1] >= routes_events._relaunch_connect_timeout_s(acknowledged=True)
+    assert launch.settled.is_set()
+    assert launch.error is None
+    assert stages[-1] == ("ready", None)
+    remaining = conversations.get_conversation(conv.id)
+    assert remaining is not None
+    assert remaining.host_id == managed.host_id
+    assert remaining.runner_id == "runner_message_relaunch"
+    assert host_store.get_host(managed.host_id) is not None
+    assert fake.terminated == []
+
+
+class _ManualMonotonicClock:
+    """Stands in for a module's ``time`` so a test advances ``monotonic()`` explicitly."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    ["other_host", "move_claim", "unbound", "same_runner", "deleted", "read_past_deadline"],
+)
+async def test_managed_runner_wait_does_not_follow_a_binding_it_cannot_serve(
+    binding: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a new runner on the launch's host, read before the deadline, takes over."""
+    from omnigent.server.managed_hosts import new_move_claim
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as helpers_module
+
+    bound = {
+        "other_host": SimpleNamespace(host_id="host_other", runner_id="runner_elsewhere"),
+        "move_claim": SimpleNamespace(host_id="host_launch", runner_id=new_move_claim()),
+        "unbound": SimpleNamespace(host_id="host_launch", runner_id=None),
+        "same_runner": SimpleNamespace(host_id="host_launch", runner_id="runner_launched"),
+        "deleted": None,
+        "read_past_deadline": SimpleNamespace(host_id="host_launch", runner_id="runner_replaced"),
+    }[binding]
+    awaited: list[str] = []
+    reads: list[str] = []
+    clock = _ManualMonotonicClock()
+    monkeypatch.setattr(helpers_module, "time", clock)
+
+    def _read_binding(session_id: str) -> SimpleNamespace:
+        reads.append(session_id)
+        if bound is None:
+            raise ConversationNotFoundError(session_id)
+        if binding == "read_past_deadline":
+            # The read itself outlasts the follow deadline.
+            clock.now += sessions_module._MANAGED_RUNNER_REPLACEMENT_WAIT_S
+        return bound
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> None:
+            del timeout_s
+            awaited.append(runner_id)
+
+    connected = await sessions_module._wait_for_managed_runner_tunnel(
+        "session_1",
+        "runner_launched",
+        _TunnelRegistry(),  # type: ignore[arg-type]
+        ManagedLaunchTracker(),
+        settle_failure=False,
+        conversation_store=SimpleNamespace(get_profile_host_binding=_read_binding),  # type: ignore[arg-type]
+        host_id="host_launch",
+    )
+
+    assert connected is False
+    assert awaited == ["runner_launched"]
+    assert reads == ["session_1"]
+
+
+async def test_managed_launch_stops_following_relaunched_runners_at_its_deadline(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runners that never connect, however often relaunched, still fail the launch."""
+    from omnigent.server.managed_hosts import launch_managed_host
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as helpers_module
+    from omnigent.server.routes.sessions import routes_events
+
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation()
+    fake = FakeSandboxLauncher(
+        on_host_start=lambda invocation: host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=RESERVED_USER_LOCAL,
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+        )
+    )
+    managed = await launch_managed_host(
+        config=config, owner=RESERVED_USER_LOCAL, host_store=host_store
+    )
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+    launch = tracker.get(conv.id)
+    assert launch is not None
+    awaited: list[str] = []
+    timeouts: list[float] = []
+    clock = _ManualMonotonicClock()
+
+    async def _launch_runner(launched: Conversation, *_args: object, **_kwargs: object) -> object:
+        conversations.replace_runner_id(launched.id, "runner_0")
+        return sessions_module._HostLaunchAttempt(runner_id="runner_0")
+
+    class _HostRegistry:
+        def get(self, _host_id: str) -> object:
+            return object()
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> None:
+            awaited.append(runner_id)
+            timeouts.append(timeout_s)
+            # Every wait ends with a message relaunching the runner, which never connects.
+            conversations.replace_runner_id(conv.id, f"runner_{len(awaited)}")
+            clock.now += timeout_s
+
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", lambda *_a, **_kw: None)
+    monkeypatch.setattr(helpers_module, "time", clock)
+
+    await asyncio.wait_for(
+        sessions_module._bind_and_launch_managed_runner(
+            session_id=conv.id,
+            managed=managed,
+            sandbox_config=config,
+            tracker=tracker,
+            conversation_store=conversations,
+            host_store=host_store,
+            host_registry=_HostRegistry(),  # type: ignore[arg-type]
+            tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+        ),
+        timeout=10,
+    )
+
+    # Replacements get the relaunching message's wait until the deadline cuts the last one short.
+    assert len(awaited) > 2
+    assert max(timeouts[1:]) == routes_events._relaunch_connect_timeout_s(acknowledged=True)
+    assert sum(timeouts) == sessions_module._MANAGED_RUNNER_REPLACEMENT_WAIT_S
+    assert launch.settled.is_set()
+    assert launch.error == "managed runner did not connect after launch"
+    remaining = conversations.get_conversation(conv.id)
+    assert remaining is not None
+    assert remaining.host_id is None
+    assert host_store.get_host(managed.host_id) is None
+    assert fake.terminated == ["sb-fake-1"]
+
+
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3833,7 +4189,13 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
 
     session_id = "d3a6e13f0dbf4b6ea4b6e37f4a76f2a9"
     host_id = "9e6cf6f52ebb4a2c9c9a1a5f8e8f5f42"
-    conv = SimpleNamespace(id=session_id, labels={}, terminal_launch_args=None)
+    conv = SimpleNamespace(
+        id=session_id,
+        labels={},
+        terminal_launch_args=None,
+        host_id=host_id,
+        runner_id="runner_never_connects",
+    )
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     terminated: list[object] = []
@@ -3876,6 +4238,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
             clear_host_binding=lambda _sid, **_kwargs: conv,
+            get_profile_host_binding=lambda _sid: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]

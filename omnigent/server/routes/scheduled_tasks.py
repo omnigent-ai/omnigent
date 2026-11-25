@@ -35,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.workflow import Workflow
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.runtime import pending_elicitations
@@ -75,6 +76,7 @@ from omnigent.server.routes.scheduled_task_permissions import (
     without_legacy_sandbox_workspace,
 )
 from omnigent.server.scheduled.harness_settings import (
+    scheduled_agent_harness,
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
@@ -93,8 +95,16 @@ from omnigent.server.scheduled.schedule import (
 )
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.scheduled.workflow_automations import (
+    CONTINUED_SESSION_MESSAGE,
+    is_bare_saved_workflow_run,
+    normalize_workflow_details,
     saved_workflow_id,
+    saved_workflow_run,
+    saved_workflow_run_message,
+    skill_prefix,
+    task_workflow_id,
     workflow_session_reuse_error,
+    workflow_skill_prefix,
 )
 from omnigent.server.session_mcp_selection import (
     MAX_SESSION_MCP_SERVICES,
@@ -137,6 +147,28 @@ _SOURCE_SESSION_CONTINUE_MSG = (
     "an automation with source_session_id starts each run in a new session; "
     "session_mode must be 'new'"
 )
+_PROMPT_OR_WORKFLOW_MSG = "prompt is required unless workflow_id names a saved workflow to run"
+_DETAILS_WITHOUT_WORKFLOW_MSG = "workflow_details needs a saved workflow; send workflow_id"
+_PROMPT_WITH_WORKFLOW_MSG = (
+    "with workflow_id or workflow_details, leave out prompt, or on an update resend it "
+    "unchanged: the server writes the message that runs the workflow, and "
+    "workflow_details carries this run's specifics"
+)
+# Only an explicit workflow_id null detaches a workflow, so a reworded prompt can't.
+_WORKFLOW_PROMPT_OWNED_MSG = (
+    "this automation runs a saved workflow, so the server writes its prompt: change the "
+    "run's specifics with workflow_details, or send workflow_id null with a new prompt to "
+    "stop running the workflow"
+)
+_WORKFLOW_CHANGED_MSG = "The automation's prompt or saved workflow changed. Reload and try again."
+_WORKFLOW_PROMPT_WRAPPED_MSG = (
+    "this automation's prompt runs its saved workflow inside other text, so the server "
+    "can't rewrite its specifics: send the whole prompt as it should run, or send "
+    "workflow_id null with a new prompt"
+)
+_STOP_WORKFLOW_NEEDS_PROMPT_MSG = (
+    "workflow_id null stops running the saved workflow, so it needs a new prompt that runs none"
+)
 # A continued session cannot follow a change to these, so the next run starts a new one.
 _SESSION_BOUND_FIELDS = frozenset(
     {"agent_id", "host_id", "workspace", "base_branch", "execution_target", "mcp_services"}
@@ -160,7 +192,9 @@ class CreateScheduledTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    prompt: str
+    # The message every run sends. Left out with ``workflow_id``, whose run message the
+    # server writes.
+    prompt: str | None = None
     rrule: str
     agent_id: str
     # Only explicit null opts into the owner's recorded zone; omission stays UTC.
@@ -196,9 +230,20 @@ class CreateScheduledTaskRequest(BaseModel):
     # "reminder" marks a one-time message into session_id, which clients can list
     # apart from automations.
     kind: Literal["automation", "reminder"] = "automation"
+    # A saved workflow every run starts as a run of, in a new session each time.
+    workflow_id: str | None = Field(default=None, min_length=1)
+    # This run's specifics, sent after the workflow's run request; only with workflow_id.
+    workflow_details: str | None = None
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
+        if self.workflow_id is None:
+            if self.prompt is None:
+                raise ValueError(_PROMPT_OR_WORKFLOW_MSG)
+            if self.workflow_details is not None:
+                raise ValueError(_DETAILS_WITHOUT_WORKFLOW_MSG)
+        elif self.prompt is not None:
+            raise ValueError(_PROMPT_WITH_WORKFLOW_MSG)
         if self.execution_target not in _VALID_EXECUTION_TARGETS:
             raise ValueError("execution_target must be 'connected_host' or 'managed_sandbox'")
         if self.execution_target == "managed_sandbox" and self.host_id is not None:
@@ -255,6 +300,11 @@ class UpdateScheduledTaskRequest(BaseModel):
     execution_target: str | None = Field(default=None, min_length=1)
     state: str | None = None
     project_id: str | None = None  # null unfiles future runs
+    # Runs this saved workflow from now on; the server writes the prompt. Null stops
+    # running it and needs a new ``prompt``.
+    workflow_id: str | None = Field(default=None, min_length=1)
+    # The run's specifics for the task's saved workflow; null clears them.
+    workflow_details: str | None = None
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:
@@ -292,6 +342,15 @@ def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
         )
     scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
     return scheduler.next_run_at(task.id) if scheduler is not None else None
+
+
+def _task_workflow(task: ScheduledTask) -> tuple[str | None, str | None]:
+    """The saved workflow *task*'s runs start as runs of, and the specifics they carry.
+
+    :returns: ``(workflow_id, details)``, or ``(None, None)`` for a task without one.
+    """
+    run = saved_workflow_run(task.prompt)
+    return (None, None) if run is None else (run.workflow_id, run.details)
 
 
 def _hides_trigger_rrule(request: Request) -> bool:
@@ -332,6 +391,7 @@ def _to_response(
         who may only read it.
     :param owner_display_name: The owner's name for a viewer; ``None`` for the owner.
     """
+    workflow_id, workflow_details = _task_workflow(task)
     return {
         "id": task.id,
         "name": task.name,
@@ -351,6 +411,8 @@ def _to_response(
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "source_session_id": task.source_session_id,
+        "workflow_id": workflow_id,
+        "workflow_details": workflow_details,
         "kind": task.kind,
         "workspace": task.workspace,
         "base_branch": task.base_branch,
@@ -481,12 +543,14 @@ def _resolve_create_timezone(
     return timezone
 
 
-async def _workflow_reuse_problem(prompt: str, session_mode: str) -> str | None:
+async def _workflow_reuse_problem(
+    prompt: str, session_mode: str, workflow_id: str | None = None
+) -> str | None:
     """Why an automation that runs a saved workflow can't reuse a session, if it would.
 
     Runs in a thread: reading a prompt edited outside the form can take a pass over all of it.
     """
-    return await asyncio.to_thread(workflow_session_reuse_error, prompt, session_mode)
+    return await asyncio.to_thread(workflow_session_reuse_error, prompt, session_mode, workflow_id)
 
 
 def _refuse_workflow_reuse(problem: str | None) -> None:
@@ -496,22 +560,51 @@ def _refuse_workflow_reuse(problem: str | None) -> None:
 
 def _workflow_reuse_change(
     task: ScheduledTask, requested: dict[str, Any]
-) -> tuple[str, str] | None:
-    """The prompt and session mode an update leaves *task* with, if it changes them or
-    the session; None otherwise.
+) -> tuple[str, str, str | None] | None:
+    """The prompt, session mode and saved workflow an update leaves *task* with, if it
+    changes them or the session; None otherwise.
 
     An automation saved before workflows needed new sessions keeps running until an
     update changes what it runs or the session it uses.
     """
     prompt = task.prompt if requested.get("prompt") is None else requested["prompt"]
     session_mode = requested.get("session_mode", task.session_mode)
+    workflow_before = task_workflow_id(task)
+    workflow_id = requested.get("workflow_id", workflow_before)
     if (
         prompt == task.prompt
         and session_mode == task.session_mode
+        and workflow_id == workflow_before
         and requested.get("session_id", task.session_id) == task.session_id
     ):
         return None
-    return prompt, session_mode
+    return prompt, session_mode, workflow_id
+
+
+def _breaks_workflow_prompt(locked: ScheduledTask, fields: dict[str, Any]) -> bool:
+    """Whether writing *fields* over *locked* would leave its saved workflow with a prompt
+    that doesn't run it, as an edit checked before a concurrent attach could."""
+    workflow_id = fields.get("workflow_id", locked.workflow_id)
+    if workflow_id is None:
+        return False
+    prompt = fields["prompt"] if fields.get("prompt") is not None else locked.prompt
+    return saved_workflow_id(prompt) != workflow_id
+
+
+def _align_stored_workflow(existing: ScheduledTask, fields: dict[str, Any]) -> bool:
+    """Store the workflow the prompt an update leaves runs, if the update sets none and the
+    stored one differs, as after a server that doesn't store workflows rewrote the prompt.
+
+    :returns: Whether *fields* now sets ``workflow_id``, read from the snapshot.
+    """
+    if "workflow_id" in fields:
+        return False
+    prompt = fields["prompt"] if fields.get("prompt") is not None else existing.prompt
+    workflow_id = saved_workflow_id(prompt)
+    if workflow_id == existing.workflow_id:
+        return False
+    fields["workflow_id"] = workflow_id
+    return True
 
 
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
@@ -1179,14 +1272,122 @@ def create_scheduled_tasks_router(
         :param owner: The automation's owner, e.g. ``"alice@example.com"``.
         :raises OmnigentError: If workflows are off, or the owner can't run that workflow.
         """
+        workflow_id = await asyncio.to_thread(saved_workflow_id, prompt)
+        if workflow_id is not None:
+            await _runnable_workflow(request, workflow_id, owner)
+
+    async def _runnable_workflow(request: Request, workflow_id: str, owner: str) -> Workflow:
+        """The saved workflow *workflow_id*, if its owner can start runs of it.
+
+        :param workflow_id: The workflow, e.g. ``"0123456789abcdef0123456789abcdef"``.
+        :param owner: The automation's owner, e.g. ``"alice@example.com"``.
+        :raises OmnigentError: If workflows are off, or the owner can't run that workflow.
+        """
         from omnigent.server.session_journal import load_workflow_for_run
 
-        workflow_id = await asyncio.to_thread(saved_workflow_id, prompt)
-        if workflow_id is None:
-            return
         require_workflows(request)
-        await load_workflow_for_run(
+        return await load_workflow_for_run(
             conversation_store, workflow_id, user_id=owner, permission_store=permission_store
+        )
+
+    async def _apply_workflow_update(
+        request: Request, existing: ScheduledTask, fields: dict[str, Any], owner: str
+    ) -> bool:
+        """Turn an update's ``workflow_id`` and ``workflow_details`` into the prompt it saves.
+
+        While a task runs a saved workflow the server writes its prompt, and only
+        ``workflow_id`` null stops running it, so a reworded prompt can't. A prompt in the
+        exact form that runs a workflow, as older clients write it, saves that workflow.
+
+        :param fields: The update's set fields; ``workflow_details`` is consumed, and
+            ``prompt`` and ``workflow_id`` are set to what the task saves.
+        :returns: Whether ``prompt`` or ``workflow_id`` came from the snapshot rather than
+            the request, so they mustn't land on a row that has changed since.
+        """
+        if fields.get("prompt") == existing.prompt:
+            # Resent unchanged, as the agent tool does, it mustn't undo a concurrent edit.
+            fields.pop("prompt")
+        current = await asyncio.to_thread(task_workflow_id, existing)
+        saved_run = (
+            await asyncio.to_thread(saved_workflow_run, existing.prompt)
+            if current is not None
+            else None
+        )
+        saved_details = saved_run.details if saved_run is not None else ""
+        details_given = "workflow_details" in fields
+        details = normalize_workflow_details(fields.pop("workflow_details", None) or "")
+        prompt = fields.get("prompt")
+        prompt_changed = prompt is not None and prompt != existing.prompt
+        if "workflow_id" in fields and fields["workflow_id"] is None:
+            if details_given:
+                raise OmnigentError(_DETAILS_WITHOUT_WORKFLOW_MSG, code=ErrorCode.INVALID_INPUT)
+            if (current is not None and not prompt_changed) or (
+                prompt is not None
+                and prompt_changed
+                and await asyncio.to_thread(saved_workflow_id, prompt)
+            ):
+                raise OmnigentError(_STOP_WORKFLOW_NEEDS_PROMPT_MSG, code=ErrorCode.INVALID_INPUT)
+            return False
+        if "workflow_id" in fields or details_given:
+            target = fields.get("workflow_id") or current
+            if target is None:
+                raise OmnigentError(_DETAILS_WITHOUT_WORKFLOW_MSG, code=ErrorCode.INVALID_INPUT)
+            if prompt_changed:
+                raise OmnigentError(_PROMPT_WITH_WORKFLOW_MSG, code=ErrorCode.INVALID_INPUT)
+            if target != current or (details_given and details != saved_details):
+                if current is not None and not is_bare_saved_workflow_run(existing.prompt):
+                    raise OmnigentError(_WORKFLOW_PROMPT_WRAPPED_MSG, code=ErrorCode.INVALID_INPUT)
+                workflow = await _runnable_workflow(request, target, owner)
+                agent = await _target_agent(existing, fields, owner)
+                derived = "workflow_id" not in fields or not details_given
+                fields["prompt"] = await _workflow_run_message(
+                    agent, workflow, details if details_given else saved_details
+                )
+                fields["workflow_id"] = workflow.id
+                return derived
+            # Unchanged, so other edits save without the workflow, which may be gone.
+            fields["workflow_id"] = current
+        if (
+            saved_run is not None
+            and not prompt_changed
+            and fields.get("agent_id") not in (None, existing.agent_id)
+            and is_bare_saved_workflow_run(existing.prompt)
+        ):
+            harness = await scheduled_agent_harness(
+                await _target_agent(existing, fields, owner), agent_cache
+            )
+            prefix = workflow_skill_prefix(harness)
+            # Only a harness that invokes the workflow skill another way needs a new prompt.
+            if skill_prefix(existing.prompt) != prefix:
+                fields["prompt"] = saved_workflow_run_message(
+                    prefix, saved_run.name, saved_run.workflow_id, saved_run.details
+                )
+                fields["workflow_id"] = saved_run.workflow_id
+                return True
+        if not prompt_changed or prompt is None:
+            return "workflow_id" in fields
+        run = await asyncio.to_thread(saved_workflow_run, prompt)
+        if run is not None:
+            fields["workflow_id"] = run.workflow_id
+        elif current is not None:
+            raise OmnigentError(_WORKFLOW_PROMPT_OWNED_MSG, code=ErrorCode.INVALID_INPUT)
+        return False
+
+    async def _target_agent(existing: ScheduledTask, fields: dict[str, Any], owner: str) -> Agent:
+        """The agent an update leaves *existing* bound to."""
+        return await validate_session_agent(
+            user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            agent_id=fields.get("agent_id") or existing.agent_id,
+            agent_store=agent_store,
+            permission_store=permission_store,
+            conversation_store=conversation_store,
+        )
+
+    async def _workflow_run_message(agent: Agent, workflow: Workflow, details: str) -> str:
+        """The prompt that runs *workflow*, with the skill prefix *agent*'s harness uses."""
+        harness = await scheduled_agent_harness(agent, agent_cache)
+        return saved_workflow_run_message(
+            workflow_skill_prefix(harness), workflow.name, workflow.id, details
         )
 
     @router.post("/scheduled-tasks")
@@ -1256,8 +1457,17 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         _reject_proactive_agent(body.agent_id)
-        _refuse_workflow_reuse(await _workflow_reuse_problem(body.prompt, body.session_mode))
-        await _require_runnable_workflow(request, body.prompt, owner)
+        workflow: Workflow | None = None
+        if body.workflow_id is not None:
+            # Each of its runs is a run of the workflow, in a session of its own.
+            if body.session_mode == "continue":
+                raise OmnigentError(CONTINUED_SESSION_MESSAGE, code=ErrorCode.INVALID_INPUT)
+            workflow = await _runnable_workflow(request, body.workflow_id, owner)
+        else:
+            # The request model requires a prompt without workflow_id.
+            typed_prompt = body.prompt or ""
+            _refuse_workflow_reuse(await _workflow_reuse_problem(typed_prompt, body.session_mode))
+            await _require_runnable_workflow(request, typed_prompt, owner)
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1285,6 +1495,13 @@ def create_scheduled_tasks_router(
             execution_target=body.execution_target,
             continues_session=body.session_id is not None,
         )
+        if workflow is not None:
+            prompt = await _workflow_run_message(agent, workflow, body.workflow_details or "")
+            workflow_id: str | None = workflow.id
+        else:
+            prompt = body.prompt or ""
+            # A client that writes the run message itself saves the workflow it names.
+            workflow_id = await asyncio.to_thread(saved_workflow_id, prompt)
         project_owner = _project_owner(owner)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
@@ -1304,7 +1521,7 @@ def create_scheduled_tasks_router(
                     ScheduledTask(
                         id=task_id,
                         name=body.name,
-                        prompt=body.prompt,
+                        prompt=prompt,
                         rrule=body.rrule,
                         user_id=owner_id,
                         agent_id=agent.id,
@@ -1356,7 +1573,7 @@ def create_scheduled_tasks_router(
                 task = store.create(
                     scheduled_task_id=task_id,
                     name=body.name,
-                    prompt=body.prompt,
+                    prompt=prompt,
                     rrule=body.rrule,
                     user_id=owner_id,
                     agent_id=bound.id,
@@ -1369,6 +1586,7 @@ def create_scheduled_tasks_router(
                     session_mode=body.session_mode,
                     session_id=body.session_id,
                     source_session_id=source_copy.id if source_copy is not None else None,
+                    workflow_id=workflow_id,
                     workspace=workspace,
                     base_branch=body.base_branch,
                     host_id=host_id,
@@ -1955,15 +2173,22 @@ def create_scheduled_tasks_router(
             fields.pop("session_mode", None)
         if fields.get("mcp_services") is None:
             fields.pop("mcp_services", None)
+        derives_workflow_prompt = await _apply_workflow_update(request, existing, fields, owner)
+        if await asyncio.to_thread(_align_stored_workflow, existing, fields):
+            derives_workflow_prompt = True
+        # Whether a new agent needs the prompt's skill prefix rewritten was decided on the
+        # snapshot, so a workflow attached since then conflicts too.
+        if fields.get("agent_id") not in (None, existing.agent_id):
+            derives_workflow_prompt = True
         target_session_mode = fields.get("session_mode", existing.session_mode)
         # The caller's own changes, before the ones derived below.
         requested_session = {
             name: fields[name]
-            for name in ("prompt", "session_mode", "session_id")
+            for name in ("prompt", "session_mode", "session_id", "workflow_id")
             if name in fields
         }
         # Checked on this snapshot, then again on the locked row for a concurrent edit.
-        workflow_checks: dict[tuple[str, str], str | None] = {}
+        workflow_checks: dict[tuple[str, str, str | None], str | None] = {}
         snapshot_change = _workflow_reuse_change(existing, requested_session)
         if snapshot_change is not None:
             workflow_checks[snapshot_change] = await _workflow_reuse_problem(*snapshot_change)
@@ -2167,6 +2392,12 @@ def create_scheduled_tasks_router(
         def guard(locked: ScheduledTask) -> None:
             if shared_target_guard is not None:
                 shared_target_guard(locked)
+            # Checked on the snapshot: if the prompt or workflow changed since, refuse what
+            # the snapshot decided, and a write that would split the workflow from its prompt.
+            if (locked.prompt, locked.workflow_id) != (existing.prompt, existing.workflow_id) and (
+                derives_workflow_prompt or _breaks_workflow_prompt(locked, fields)
+            ):
+                raise OmnigentError(_WORKFLOW_CHANGED_MSG, code=ErrorCode.CONFLICT)
             # Another update may have changed the prompt or session mode since the snapshot.
             locked_change = _workflow_reuse_change(locked, requested_session)
             if locked_change is not None:
