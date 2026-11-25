@@ -3834,6 +3834,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     ):
                         # A native turn's delayed input echo must retain its lifecycle fence.
+                        # A terminal harness echoes under its own id: only the first input
+                        # after a witnessed start is that turn's; any other is newer input.
+                        native_echo = (
+                            recovery.awaiting_native_echo
+                            and isinstance(item.data, MessageData)
+                            and (
+                                recovery.phase == "active" or recovery.next_response_id is not None
+                            )
+                        )
                         recovery = (
                             SessionRecovery(
                                 recovery.host_id,
@@ -3842,9 +3851,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                                 phase="active",
                                 response_id=item.response_id,
                             )
-                            if isinstance(item.data, MessageData)
-                            and not item.data.user_authored
-                            and item.response_id == recovery.next_response_id
+                            if native_echo
+                            or (
+                                isinstance(item.data, MessageData)
+                                and not item.data.user_authored
+                                and item.response_id == recovery.next_response_id
+                            )
                             else None
                         )
                         _write_session_recovery(session, conversation_id, recovery)

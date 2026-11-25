@@ -10486,6 +10486,7 @@ async def _relay_runner_stream_once(
                             runner_id,
                             turn_response_id if isinstance(turn_response_id, str) else None,
                             finished=terminal_turn or blocked_turn,
+                            delivery_frame=evt_type.startswith("response."),
                         )
 
                     if evt_type == "session.status":

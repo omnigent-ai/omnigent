@@ -42,8 +42,15 @@ def record_turn(
     response_id: str | None,
     *,
     finished: bool,
+    native_terminal: bool = False,
 ) -> None:
-    """Keep turn evidence under the input lock, independently of recovery admission."""
+    """Keep turn evidence under the input lock, independently of recovery admission.
+
+    :param native_terminal: The edge comes from a native terminal session, whose
+        input echo and completion carry the harness's own response ids. Its start
+        then waits for that echo, and its completion ends the episode whatever
+        id it names, so a finished turn is never resumed.
+    """
     if not store.supports_session_recovery or not runner_id:
         return
     conv = store.get_conversation(session_id)
@@ -55,14 +62,21 @@ def record_turn(
     ):
         return
     if finished:
-        _stop_recovery(store, conv, only_pending=True, response_id=response_id)
+        _stop_recovery(
+            store, conv, only_pending=True, response_id=None if native_terminal else response_id
+        )
         return
     if not response_id:
         return
     previous = store.get_session_recovery(session_id)
     if previous is None:
         state = SessionRecovery(
-            conv.host_id, runner_id, now_epoch(), phase="active", response_id=response_id
+            conv.host_id,
+            runner_id,
+            now_epoch(),
+            phase="active",
+            response_id=response_id,
+            awaiting_native_echo=native_terminal,
         )
     elif previous.phase in {"dispatching", "submitted"}:
         state = replace(previous, phase="submitted", response_id=response_id)
@@ -73,7 +87,12 @@ def record_turn(
         and response_id != previous.response_id
     ):
         # A new native start needs its matching input before it can authorize recovery.
-        state = replace(previous, next_response_id=response_id, interrupted_at=now_epoch())
+        state = replace(
+            previous,
+            next_response_id=response_id,
+            interrupted_at=now_epoch(),
+            awaiting_native_echo=native_terminal,
+        )
     else:
         return
     store.replace_session_recovery(session_id, previous, state, expected_conversation=conv)
@@ -148,6 +167,7 @@ def _stop_recovery(
             phase="stopped",
             response_id=(previous.next_response_id or previous.response_id) if previous else None,
             next_response_id=None,
+            awaiting_native_echo=False,
         )
         # Accepted input clears the episode atomically; output must not defeat its fence.
         if store.replace_session_recovery(
@@ -241,9 +261,22 @@ class HostSessionRecoverer:
             _record_interruption(self.store, conv, interrupted_at=interrupted_at)
 
     def record_turn(
-        self, session_id: str, runner_id: str | None, response_id: str | None, *, finished: bool
+        self,
+        session_id: str,
+        runner_id: str | None,
+        response_id: str | None,
+        *,
+        finished: bool,
+        native_terminal: bool = False,
     ) -> None:
-        record_turn(self.store, session_id, runner_id, response_id, finished=finished)
+        record_turn(
+            self.store,
+            session_id,
+            runner_id,
+            response_id,
+            finished=finished,
+            native_terminal=native_terminal,
+        )
 
     def stop_recovery(self, conv: Conversation, *, only_pending: bool = False) -> None:
         if self.store.supports_session_recovery:

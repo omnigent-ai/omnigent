@@ -980,3 +980,88 @@ async def test_policy_is_rechecked_after_dispatch_claim(recovery: Any, disabled:
         assert state is None
     else:
         assert state.phase == "stopped"
+
+
+def native_echo(store: SqlAlchemyConversationStore, session_id: str, response_id: str) -> None:
+    """A terminal harness's transcript echo of the delivered input, under its own id."""
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "Run the long task"}],
+                    user_authored=True,
+                ),
+            )
+        ],
+    )
+
+
+def native_turn(store: SqlAlchemyConversationStore, session_id: str) -> None:
+    """A native delivery starts the turn; the harness echoes the input under another id."""
+    record_turn(store, session_id, "old", "resp_delivery", finished=False, native_terminal=True)
+    native_echo(store, session_id, "resp_harness_input")
+
+
+def _user_messages(store: SqlAlchemyConversationStore, session_id: str) -> int:
+    items = store.list_items(session_id, limit=100).data
+    return sum(isinstance(item.data, MessageData) and item.data.role == "user" for item in items)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_native_turn_resumes_after_its_echo(recovery: Any) -> None:
+    store, conv, service = recovery.store, recovery.conv, recovery.service
+    user_input(store, conv.id)
+    before = _user_messages(store, conv.id)
+    native_turn(store, conv.id)
+    state = store.get_session_recovery(conv.id)
+    assert state.phase == "active" and not state.awaiting_native_echo
+    # The echo is stored once, as the turn's input.
+    assert _user_messages(store, conv.id) == before + 1
+    service.record_interruption(store.get_conversation(conv.id))
+    assert store.get_session_recovery(conv.id).phase == "pending"
+    await service.recover(recovery.connection, [])
+    recovery.launch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_stop_under_another_id_then_restart_does_not_resume(recovery: Any) -> None:
+    store, conv, service = recovery.store, recovery.conv, recovery.service
+    user_input(store, conv.id)
+    native_turn(store, conv.id)
+    # The harness's Stop hook names its assistant turn, not the delivery or echo id.
+    record_turn(store, conv.id, "old", "resp_harness_reply", finished=True, native_terminal=True)
+    assert store.get_session_recovery(conv.id).phase == "stopped"
+    service.record_interruption(store.get_conversation(conv.id))
+    await service.recover(recovery.connection, [])
+    recovery.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_newer_native_input_ends_the_episode(recovery: Any) -> None:
+    store, conv, service = recovery.store, recovery.conv, recovery.service
+    user_input(store, conv.id)
+    native_turn(store, conv.id)
+    native_echo(store, conv.id, "resp_harness_second")
+    assert store.get_session_recovery(conv.id) is None
+    await service.recover(recovery.connection, [])
+    recovery.launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_later_native_turn_is_resumable_too(recovery: Any) -> None:
+    store, conv, service = recovery.store, recovery.conv, recovery.service
+    user_input(store, conv.id)
+    native_turn(store, conv.id)
+    record_turn(store, conv.id, "old", "resp_harness_reply", finished=True, native_terminal=True)
+    recovery.clock[0] += 10
+    record_turn(store, conv.id, "old", "resp_delivery_2", finished=False, native_terminal=True)
+    native_echo(store, conv.id, "resp_harness_input_2")
+    state = store.get_session_recovery(conv.id)
+    assert state.phase == "active" and state.response_id == "resp_harness_input_2"
+    service.record_interruption(store.get_conversation(conv.id))
+    await service.recover(recovery.connection, [])
+    recovery.launch.assert_awaited_once()

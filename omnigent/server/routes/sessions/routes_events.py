@@ -3071,14 +3071,18 @@ def register_events_routes(
             if recoverer is not None and (
                 status in {"running", "failed", "waiting"} or recovery_terminal
             ):
+                turn_finished = (
+                    status in {"failed", "waiting"} or recovery_terminal or bool(blocked_on)
+                )
                 await asyncio.to_thread(
                     recoverer.record_turn,
                     session_id,
                     conv.runner_id,
                     response_id,
-                    finished=status in {"failed", "waiting"}
-                    or recovery_terminal
-                    or bool(blocked_on),
+                    finished=turn_finished,
+                    # A native hook names the harness's own turn id, so its
+                    # completion must end the episode whatever id it carries.
+                    native_terminal=turn_finished and _is_native_terminal_session(conv),
                 )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"

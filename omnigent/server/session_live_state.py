@@ -137,16 +137,25 @@ def record_recovery_turn(
     response_id: str | None,
     *,
     finished: bool,
+    delivery_frame: bool = False,
 ) -> None:
-    """Persist lifecycle fences only for an explicitly configured recovery integration."""
+    """Persist lifecycle fences only for an explicitly configured recovery integration.
+
+    :param delivery_frame: The edge is a ``response.*`` frame, which for a native
+        terminal session only acknowledges that its input was delivered.
+    """
     if _host_session_recoverer is not None and _host_session_recoverer.store is store:
         from omnigent.server.routes.sessions import _is_native_terminal_session
 
         conv = store.get_conversation(session_id)
-        # Native response frames acknowledge delivery; external status owns the turn.
-        if conv is not None and _is_native_terminal_session(conv):
+        native = conv is not None and _is_native_terminal_session(conv)
+        # A native session's response frames acknowledge delivery: that starts its
+        # turn, but only its status edges (a wait, a block, a completion) finish it.
+        if native and finished and delivery_frame:
             return
-        _host_session_recoverer.record_turn(session_id, runner_id, response_id, finished=finished)
+        _host_session_recoverer.record_turn(
+            session_id, runner_id, response_id, finished=finished, native_terminal=native
+        )
 
 
 def _remove_active_child(session_id: str) -> None:

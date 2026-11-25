@@ -4627,8 +4627,14 @@ async def test_relay_persists_recoverable_turn_and_terminal_fence(
         conv.id, _ScriptedRunnerClient(release, events), store, runner_id="runner"
     )
     state = store.get_session_recovery(conv.id)
-    if not configured or native:
+    if not configured:
         assert state is None
         return
     assert state.response_id == "turn"
+    if native:
+        # A native terminal's response frames only acknowledge delivery: the start
+        # waits for its input echo, and only a status edge (here a wait) ends it.
+        assert state.awaiting_native_echo is (outcome != "waiting")
+        assert state.phase == ("stopped" if outcome == "waiting" else "active")
+        return
     assert state.phase == ("active" if outcome in {"unfinished", "idle"} else "stopped")

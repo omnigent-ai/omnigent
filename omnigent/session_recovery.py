@@ -47,3 +47,6 @@ class SessionRecovery:
     response_id: str | None = None
     # A witnessed native start awaiting its matching input echo.
     next_response_id: str | None = None
+    # A native terminal start whose input echo carries the harness's own response
+    # id: the next user input echo is that turn's input, not newer input.
+    awaiting_native_echo: bool = False
