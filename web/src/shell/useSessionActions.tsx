@@ -60,6 +60,7 @@ export interface SessionActions {
  *     ``"sidebar.conversation"``.
  * :param reportsAfterUnmount: Whether a Leave or Stop still reports how it went once the
  *     caller has unmounted, as ⌘K's action host needs: it can be replaced before they settle.
+ *     A Leave then reads the open session from ``OpenSessionPublisher``, so mount it too.
  */
 export function useSessionActions({
   conversation,

@@ -12,13 +12,17 @@ import { useSessionActions } from "./useSessionActions";
 
 const leave = { mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false };
 const idle = { mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false };
+const stop = { mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false };
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof ConversationsModule>()),
   useLeaveSession: () => leave,
   useArchiveConversation: () => idle,
   useStopAndDeleteConversation: () => idle,
-  useStopSession: () => idle,
+  useStopSession: () => stop,
 }));
+
+const toasts = vi.hoisted(() => [] as string[]);
+vi.mock("@/components/ui/toast", () => ({ showToast: (message: string) => toasts.push(message) }));
 
 // The open session's root is the session itself here; sub-agents aren't part of these cases.
 vi.mock("@/hooks/useSession", () => ({ useActiveRootSessionId: (id: string | null) => id }));
@@ -90,13 +94,18 @@ function renderAt(path: string, onLeave: () => void) {
 }
 
 let finishLeave: () => void = () => {};
+let failLeave: (error: Error) => void = () => {};
 beforeEach(() => {
+  toasts.length = 0;
   leave.mutate.mockReset();
   leave.mutateAsync.mockReset().mockReturnValue(
-    new Promise<void>((resolve) => {
+    new Promise<void>((resolve, reject) => {
       finishLeave = resolve;
+      failLeave = reject;
     }),
   );
+  stop.mutate.mockReset();
+  stop.mutateAsync.mockReset();
 });
 afterEach(cleanup);
 
@@ -119,6 +128,16 @@ describe("useSessionActions Leave, reporting after its caller unmounts", () => {
     act(() => goTo("/c/conv_b"));
     expect(screen.queryByTestId("confirm-leave-conversation")).toBeNull();
     await act(async () => finishLeave());
+    expect(goHome).not.toHaveBeenCalled();
+  });
+
+  it("says the Leave failed once its row has gone, and stays on the session", async () => {
+    const goHome = vi.fn();
+    renderAt("/c/conv_a", goHome);
+    fireEvent.click(await screen.findByTestId("confirm-leave-conversation"));
+    act(() => dropRow());
+    await act(async () => failLeave(new Error("offline")));
+    expect(toasts).toEqual(["Couldn't leave the session: offline"]);
     expect(goHome).not.toHaveBeenCalled();
   });
 
@@ -149,5 +168,43 @@ describe("useSessionActions Leave, by default", () => {
     );
     act(() => leave.mutate.mock.calls[0]![1].onSuccess());
     expect(goHome).toHaveBeenCalledOnce();
+  });
+});
+
+/** One row's Stop confirmation, reporting as ⌘K's host does. */
+function StopRow() {
+  const actions = useSessionActions({
+    conversation: SHARED,
+    label: "Session A",
+    viewerId: "viewer@example.com",
+    serverInfo: "loading",
+    componentIdPrefix: "test.conversation",
+    reportsAfterUnmount: true,
+  });
+  const { setStopOpen } = actions;
+  useEffect(() => setStopOpen(true), [setStopOpen]);
+  return actions.dialogs;
+}
+
+describe("useSessionActions Stop, reporting after its caller unmounts", () => {
+  it("says the Stop failed once its row has gone", async () => {
+    let failStop: (error: Error) => void = () => {};
+    stop.mutateAsync.mockReturnValue(
+      new Promise<void>((_resolve, reject) => {
+        failStop = reject;
+      }),
+    );
+    const view = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <StopRow />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Stop session" }));
+    expect(stop.mutateAsync).toHaveBeenCalledWith("conv_a");
+    view.unmount();
+    await act(async () => failStop(new Error("host offline")));
+    expect(toasts).toEqual(["Couldn't stop the session: host offline"]);
   });
 });
