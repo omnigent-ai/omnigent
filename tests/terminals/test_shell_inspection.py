@@ -44,15 +44,32 @@ def snapshot(*rows: tuple[int, int, int, int, str, str]) -> str:
 BWRAP_LAUNCHERS = (frozenset({"bwrap"}), frozenset({"bwrap"}), frozenset({"python"}))
 
 
+def honest_executables(text: str) -> dict[int, str]:
+    """Each pid's executable as its ``comm`` names it, as for processes that didn't rename."""
+    executables: dict[int, str] = {}
+    for line in text.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and fields[0].isdigit():
+            executables[int(fields[0])] = "/usr/bin/" + fields[5].lstrip("-").rsplit("/", 1)[-1]
+    return executables
+
+
 def inspect(
     text: str,
     *,
     shell: str = "bash",
     pane: int = PANE,
     launchers: tuple[frozenset[str], ...] = (),
+    executables: dict[int, str] | None = None,
 ) -> ShellInspection:
+    known = honest_executables(text) if executables is None else executables
     return inspect_shell(
-        text, tmux_server_pid=TMUX, pane_pid=pane, shell_command=shell, launchers=launchers
+        text,
+        tmux_server_pid=TMUX,
+        pane_pid=pane,
+        shell_command=shell,
+        launchers=launchers,
+        executable_of=known.get,
     )
 
 
@@ -95,6 +112,17 @@ SANDBOX_SLEEP_AND_ADOPTED = (
             BWRAP_LAUNCHERS,
             ShellInspection(ShellState.BUSY, "sleep", None),
         ),
+        # Another pane or window of the terminal's tmux server ends with it too.
+        (
+            PLAIN_IDLE + snapshot((210, TMUX, 210, 210, "Ss+", "sleep")).split("\n", 1)[1],
+            (),
+            UNKNOWN,
+        ),
+        (
+            SANDBOX_IDLE + snapshot((210, TMUX, 210, 210, "Ss+", "bash")).split("\n", 1)[1],
+            BWRAP_LAUNCHERS,
+            UNKNOWN,
+        ),
     ],
     ids=[
         "plain idle",
@@ -104,6 +132,8 @@ SANDBOX_SLEEP_AND_ADOPTED = (
         "sandbox work adopted by its init",
         "sandbox work under its launcher",
         "sandbox job and adopted work",
+        "work in another window",
+        "another pane beside a sandbox",
     ],
 )
 def test_reads_the_probed_pane_layouts(
@@ -184,6 +214,37 @@ def test_a_shell_below_a_program_that_is_not_a_launcher_is_unknown() -> None:
     assert inspect(text, launchers=BWRAP_LAUNCHERS) == UNKNOWN
     # The sandbox's layout read without its launchers isn't trusted either.
     assert inspect(SANDBOX_IDLE) == UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "executable",
+    ["/usr/bin/python3.12", "/usr/bin/vim", None],
+    ids=["python renamed bash", "vim renamed bash", "executable unreadable"],
+)
+def test_a_shell_named_process_whose_executable_is_not_a_shell_is_unknown(
+    executable: str | None,
+) -> None:
+    # A program that replaced the shell can name itself ``bash``; the kernel's file can't lie.
+    executables = {} if executable is None else {PANE: executable}
+    assert inspect(PLAIN_IDLE, executables=executables) == UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/usr/bin/bash", "/usr/bin/dash", "/usr/bin/zsh-5.9", "/bin/ksh93", "/opt/homebrew/bin/fish"],
+)
+def test_a_shell_executable_is_told_by_its_file_name(path: str) -> None:
+    assert shell_inspection.is_shell_executable(path)
+    assert not shell_inspection.is_shell_executable(path.replace("/", "/x", 1) + "-wrapper")
+
+
+def test_reads_this_processs_own_executable() -> None:
+    # The interpreter running this test: a real lookup, not the name it was started under.
+    executable = shell_inspection.process_executable(os.getpid())
+    if sys.platform.startswith("linux") or sys.platform == "darwin":
+        assert executable is not None
+        assert os.path.samefile(executable, sys.executable)
+    assert shell_inspection.process_executable(2**22 + 12345) is None
 
 
 @pytest.mark.parametrize("command", ["vim", "python3", "sleep", "/usr/bin/less", "bash -l"])
@@ -317,17 +378,28 @@ def test_rebuilds_an_answer_from_the_expected_fields_only(
     assert set(rebuilt.to_dict()) == {"state", "foreground", "background_jobs"}
 
 
+# A stand-in tmux server: it starts a real ``sh`` waiting on its input, its only pane, and
+# prints that shell's pid.
+_SERVER = (
+    "import subprocess, sys; "
+    "shell = subprocess.Popen(['sh'], stdin=subprocess.PIPE); "
+    "print(shell.pid, flush=True); sys.stdin.read(); shell.kill(); shell.wait()"
+)
+
+
 @pytest.fixture
-async def pane_process() -> AsyncIterator[int]:
-    """A real ``sh`` child of this process waiting on its input, standing in for a pane's shell."""
-    process = subprocess.Popen(["sh"], stdin=subprocess.PIPE)
+async def pane_process() -> AsyncIterator[tuple[int, int]]:
+    """``(server pid, pane pid)``: a real shell whose parent plays its tmux server."""
+    server = subprocess.Popen(
+        [sys.executable, "-I", "-c", _SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    )
+    assert server.stdout is not None and server.stdin is not None
     try:
-        yield process.pid
+        yield server.pid, int(server.stdout.readline())
     finally:
-        process.kill()
-        process.wait()
-        assert process.stdin is not None
-        process.stdin.close()
+        server.stdin.close()
+        server.wait(timeout=10)
+        server.stdout.close()
 
 
 def _fake_tmux(pids: str) -> list[str]:
@@ -336,18 +408,20 @@ def _fake_tmux(pids: str) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_reads_a_real_process_table_for_the_pane(pane_process: int) -> None:
-    # The pane is this process's child, so this process plays its tmux server.
-    tmux = _fake_tmux(f"{os.getpid()} {pane_process}")
+async def test_reads_a_real_process_table_for_the_pane(pane_process: tuple[int, int]) -> None:
+    server, pane = pane_process
+    tmux = _fake_tmux(f"{server} {pane}")
     assert await read_pane_shell(tmux, "main", "sh") == ShellInspection(ShellState.IDLE)
     # The same childless process read as another configured program can't be called idle.
     assert await read_pane_shell(tmux, "main", "vim") == UNKNOWN
 
 
 @pytest.mark.asyncio
-async def test_a_pane_that_is_not_the_tmux_servers_child_is_unknown(pane_process: int) -> None:
+async def test_a_pane_that_is_not_the_tmux_servers_child_is_unknown(
+    pane_process: tuple[int, int],
+) -> None:
     # Same pane, but tmux claims another server: as if the pid had been reused.
-    tmux = _fake_tmux(f"1 {pane_process}")
+    tmux = _fake_tmux(f"1 {pane_process[1]}")
     assert await read_pane_shell(tmux, "main", "sh") == UNKNOWN
 
 
@@ -562,6 +636,7 @@ async def test_ps_is_never_asked_for_arguments_or_the_environment(
         return PLAIN_IDLE
 
     monkeypatch.setattr(shell_inspection, "_run", fake_run)
+    monkeypatch.setattr(shell_inspection, "process_executable", lambda pid: "/usr/bin/bash")
     assert await read_pane_shell(["tmux"], "main", "bash") == ShellInspection(ShellState.IDLE)
     # Exactly these arguments: no `-E` environment, no `args` or `command` column.
     assert calls[-1][1:] == ["-e", "-o", PS_COLUMNS]

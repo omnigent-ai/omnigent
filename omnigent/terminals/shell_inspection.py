@@ -41,6 +41,8 @@ _READ_CHUNK_BYTES = 64 * 1024
 ELIGIBLE_SHELLS = frozenset({"bash", "zsh", "sh", "dash", "ksh", "mksh", "fish", "tcsh", "csh"})
 # Linux keeps this many characters of an executable's name in ``comm``.
 _LINUX_COMM_LENGTH = 15
+# A shell's executable file, as installed: ``bash``, ``zsh-5.9`` or ``ksh93``.
+_SHELL_EXECUTABLE = re.compile(r"(?:bash|zsh|sh|dash|ksh|mksh|fish|tcsh|csh)(?:-?\d[\d.]*)?")
 
 _ANSI_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 
@@ -157,6 +159,48 @@ def _parse(snapshot: str) -> list[_Row] | None:
     return rows
 
 
+def process_executable(pid: int) -> str | None:
+    """The file ``pid`` runs, from the kernel rather than the name the process gave itself.
+
+    :param pid: A process this runner may inspect, e.g. a pane's shell.
+    :returns: The executable's resolved path, e.g. ``"/usr/bin/bash"``, or ``None`` when the
+        platform can't tell or the process is gone.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            path = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            return None
+        # An executable replaced on disk since the process started.
+        return path.removesuffix(" (deleted)")
+    if sys.platform == "darwin":
+        return _darwin_process_path(pid)
+    return None
+
+
+def _darwin_process_path(pid: int) -> str | None:
+    import ctypes
+    import ctypes.util
+
+    library = ctypes.util.find_library("proc")
+    if library is None:
+        return None
+    try:
+        libproc = ctypes.CDLL(library)
+    except OSError:
+        return None
+    buffer = ctypes.create_string_buffer(4096)
+    length = libproc.proc_pidpath(ctypes.c_int(pid), buffer, ctypes.c_uint32(len(buffer)))
+    if length <= 0:
+        return None
+    return buffer.value.decode(errors="replace")
+
+
+def is_shell_executable(path: str | None) -> bool:
+    """Whether ``path`` is a shell's executable, by its file name: ``/bin/sh`` resolves to dash."""
+    return path is not None and _SHELL_EXECUTABLE.fullmatch(os.path.basename(path)) is not None
+
+
 def _shell_name(command: str) -> str | None:
     return sanitize_command_name(command.rsplit("/", 1)[-1])
 
@@ -201,14 +245,17 @@ def inspect_shell(
     pane_pid: int,
     shell_command: str,
     launchers: Sequence[LauncherStep] = (),
+    executable_of: Callable[[int], str | None] = process_executable,
 ) -> ShellInspection:
     """Decide whether the pane's login shell is idle, from one ``ps`` snapshot.
 
     The pane's process must be a child of its own tmux server in this same snapshot, else its
     pid may have been reused and the answer is unknown. The terminal's command must be an
     :data:`ELIGIBLE_SHELLS` shell, and the pane must hold exactly the framework's
-    ``launchers`` and then that shell; any other layout, such as a program that replaced the
-    shell and started another, answers unknown. The shell is idle
+    ``launchers`` and then that shell, whose executable file is a shell's; any other layout,
+    such as a program that replaced the shell, even one that renamed itself ``bash``, answers
+    unknown. So does any other process on the pane's tmux server, in another pane or window,
+    since closing the terminal ends the whole server. The shell is idle
     when nothing runs under it and nothing else runs anywhere under the pane. A sandbox's
     namespace init adopts work its shell left running, and closing the pane ends that too.
 
@@ -221,6 +268,8 @@ def inspect_shell(
     :param shell_command: The terminal's configured command, e.g. ``"zsh"``.
     :param launchers: The framework's launchers between the pane and the shell, from
         :func:`sandbox_launchers`.
+    :param executable_of: The file a pid runs, e.g. :func:`process_executable`. The shell's
+        must be a shell's, since a process can give itself any ``comm``.
     :returns: The inspection; only names and counts, never a row.
     """
     rows = _parse(snapshot)
@@ -236,12 +285,16 @@ def inspect_shell(
     children: dict[int, list[_Row]] = {}
     for row in rows:
         children.setdefault(row.ppid, []).append(row)
+    # Closing the terminal ends its whole tmux server: another pane or window there, such as
+    # one ``tmux new-window`` opened, may run work this pane can't account for.
+    if any(row.pid != pane.pid for row in children.get(tmux_server_pid, [])):
+        return UNKNOWN
 
     wanted = _shell_name(shell_command)
     if wanted is None or wanted not in ELIGIBLE_SHELLS:
         return UNKNOWN
     shell = _shell_after_launchers(pane, launchers, wanted, children)
-    if shell is None:
+    if shell is None or not is_shell_executable(executable_of(shell.pid)):
         return UNKNOWN
 
     jobs = _descendants(shell, children)
@@ -401,6 +454,7 @@ async def read_pane_shell(
             pane_pid=int(fields[1]),
             shell_command=shell_command,
             launchers=launchers,
+            executable_of=process_executable,
         )
 
     try:

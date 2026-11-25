@@ -156,3 +156,41 @@ async def test_a_job_with_an_empty_name_keeps_the_shell_busy(
     await bash_terminal.send(f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}")
     await _settles_on(bash_terminal, ShellInspection(ShellState.BUSY, None, 0))
     await _settles_on(bash_terminal, _IDLE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bash_terminal", [pytest.param(None, id="plain")], indirect=True)
+async def test_work_in_another_window_of_the_terminal_is_unknown_until_it_ends(
+    bash_terminal: TerminalInstance,
+) -> None:
+    await _settles_on(bash_terminal, _IDLE)
+    # The pane's own tmux server opens it, so closing the terminal would end it too.
+    await bash_terminal.send("tmux new-window -d 'sleep 4'")
+    await _settles_on(bash_terminal, UNKNOWN)
+    # Its window closes with the job, leaving the shell alone again.
+    await _settles_on(bash_terminal, _IDLE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="renames itself with Linux's prctl")
+@pytest.mark.parametrize("bash_terminal", [pytest.param(None, id="plain")], indirect=True)
+async def test_a_program_that_replaced_the_shell_and_named_itself_bash_is_unknown(
+    bash_terminal: TerminalInstance, tmp_path: Path
+) -> None:
+    await _settles_on(bash_terminal, _IDLE)
+    marker = tmp_path / "renamed"
+    program = (
+        "import ctypes, pathlib, time; ctypes.CDLL(None).prctl(15, b'bash', 0, 0, 0); "
+        f"pathlib.Path({str(marker)!r}).touch(); time.sleep(20)"
+    )
+    await bash_terminal.send(f"exec {shlex.quote(sys.executable)} -c {shlex.quote(program)}")
+
+    async def renamed() -> None:
+        while not marker.exists():
+            await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(renamed(), timeout=30)
+    # Childless and named bash, but its executable is still Python's.
+    for _ in range(5):
+        assert await bash_terminal.inspect_shell() == UNKNOWN
+        await asyncio.sleep(0.1)
