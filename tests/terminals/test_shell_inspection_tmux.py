@@ -83,6 +83,23 @@ async def test_reads_a_real_shell_idle_then_busy_then_idle_again(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bash_terminal", [pytest.param(None, id="plain"), _SANDBOXED], indirect=True
+)
+async def test_work_the_shell_left_running_keeps_a_sandboxed_shell_busy(
+    bash_terminal: TerminalInstance, request: pytest.FixtureRequest
+) -> None:
+    sandboxed = "bubblewrap" in request.node.callspec.id
+    await _settles_on(bash_terminal, _IDLE)
+    # A subshell's background job outlives it: the shell is back at its prompt, but under a
+    # sandbox the job stays beneath the pane, adopted by the namespace's init.
+    await bash_terminal.send("(sleep 4 &)")
+    if sandboxed:
+        await _settles_on(bash_terminal, ShellInspection(ShellState.BUSY, "sleep", None))
+    await _settles_on(bash_terminal, _IDLE)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bash_terminal", [pytest.param(None, id="plain")], indirect=True)
 async def test_a_busy_jobs_arguments_and_environment_never_reach_the_answer(
     bash_terminal: TerminalInstance, caplog: pytest.LogCaptureFixture
