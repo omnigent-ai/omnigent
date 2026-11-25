@@ -989,10 +989,9 @@ async def test_forwarder_mirrors_external_session_id_after_hook_event(
         server.server_close()
         thread.join(timeout=5.0)
 
-    # Path proves the PATCH targets the right session — a bug that
-    # PATCHed e.g. the agent record would route here with a
-    # different prefix. It also opts out of the response's spawn-tree
-    # usage aggregate, which can outlast the client timeout on a big tree.
+    # Path proves the PATCH targets the right session, and that it skips the
+    # response's spawn-tree usage aggregate, which can outlast the client
+    # timeout on a big tree.
     assert patch_request["path"] == "/v1/sessions/conv_abc?include_usage=false"
     # Body asserts the captured Claude id flowed through unchanged.
     # If the bridge state read returned the wrong key or the

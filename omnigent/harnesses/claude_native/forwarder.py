@@ -193,10 +193,9 @@ _POST_TIMEOUT_S = 10.0
 # A child-history POST carries up to 100 items and can outlast the live lane's
 # budget; that lane runs off the latency-sensitive path, so it gets more room.
 _SUBAGENT_POST_TIMEOUT_S = 30.0
-# A transient external_session_id mirror failure waits before the next attempt,
-# doubling per consecutive failure up to the cap. The mirror runs inline before
-# transcript forwarding, so retrying every poll would stall live output behind
-# each timed-out PATCH.
+# A failed external_session_id mirror PATCH backs off (doubling, capped): the
+# mirror runs inline before transcript forwarding, so retrying every poll would
+# stall live output behind each timed-out PATCH.
 _EXTERNAL_SESSION_ID_RETRY_BASE_S = 5.0
 _EXTERNAL_SESSION_ID_RETRY_MAX_S = 120.0
 _MAX_SEEN_SOURCE_IDS = 2000
