@@ -901,28 +901,28 @@ def resolve_matching_text(
         # match first, so typed marker-like text stays distinct; then drop the
         # executor's one marker line per file block and compare again.
         interrupted = [entry.interrupted for _pid, entry in ordered]
+        exact = [index for index, queued in enumerate(texts) if queued == exact_needle]
+        marked = []
+        for index, (_pid, entry) in enumerate(ordered):
+            attachments = 0 if shell_command else _attachment_count(entry.content)
+            if attachments == 0 or not texts[index]:
+                continue
+            if _collapse_whitespace(_strip_generated_markers(text, attachments)) == texts[index]:
+                marked.append(index)
         match_index = _first_match(texts, exact_needle, interrupted)
         match_method = "normalized_text"
-        candidates = [index for index, queued in enumerate(texts) if queued == exact_needle]
         if match_index is None:
             match_method = "attachment_normalized_text"
-            candidates = []
-            for index, (_pid, entry) in enumerate(ordered):
-                attachments = 0 if shell_command else _attachment_count(entry.content)
-                if attachments == 0 or not texts[index]:
-                    continue
-                if (
-                    _collapse_whitespace(_strip_generated_markers(text, attachments))
-                    == texts[index]
-                ):
-                    candidates.append(index)
-            match_index = _prefer_live(candidates, interrupted)
+            match_index = _prefer_live(marked, interrupted)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
-        # Typed text can read exactly like a sender line the server added, so a tie
-        # between a named and an unnamed entry does not show whose echo this is.
-        if len({ordered[index][1].named_sender is None for index in candidates}) > 1:
+        # Typed text can read exactly like what the server typed for a named entry, so
+        # a fit with both a named and an unnamed entry does not show whose echo this is.
+        tied = {*exact, *marked}
+        if len({ordered[index][1].named_sender is None for index in tied}) > 1:
             match_method = AMBIGUOUS_MATCH
+        else:
+            tied = set()
         # Bound one drain's work: report at most a cap's worth of skipped
         # entries (oldest first) and leave the rest queued for later drains, so
         # a queue that overflowed after a rolled-back append never yields an
@@ -938,14 +938,16 @@ def resolve_matching_text(
                 entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
-        # An entry a positional drain may have settled, or that the person
-        # cancelled with Stop, is drained without an undelivered record.
+        # An entry a positional drain may have settled, that the person cancelled
+        # with Stop, or that ties with the match, is drained without an undelivered
+        # record.
         lost: list[DrainedInput] = []
         uncertain: list[DrainedInput] = []
-        for _pending_id, entry in skipped_entries:
+        for index, (_pending_id, entry) in enumerate(skipped_entries):
             if (
                 entry.uncertain
                 or entry.interrupted
+                or index in tied
                 or _is_command_entry(entry, claude_commands=claude_commands)
             ):
                 uncertain.append(_drained_input(entry))

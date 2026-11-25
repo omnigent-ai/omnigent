@@ -23,6 +23,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.routes.sessions.routes_events import _harness_runs_input
 from tests.server.routes.test_session_resources import (
     _ConversationStore,
     _FakeRunnerClient,
@@ -212,6 +213,7 @@ async def test_codex_editor_model_input_keeps_edit_access(
         ((_NAMING, "codex-native"), "admin", _typed("Explain this code"), True),
         ((_NAMING, "codex-native"), "editor", _typed("/compact"), True),
         ((_NAMING, "codex-native"), "admin", _typed("!printf authorized"), False),
+        ((_NAMING, "codex-native"), "editor", _typed("/goal ship the fix"), False),
         ((_NAMING, "claude-native"), "editor", _typed("Explain this code"), True),
         ((_NAMING, "claude-native"), "editor", _typed("/help with tests"), True),
         ((_NAMING, "claude-native"), "editor", [*_typed("/compact"), _FILE], True),
@@ -223,6 +225,7 @@ async def test_codex_editor_model_input_keeps_edit_access(
         "codex-admin",
         "codex-slash-is-a-prompt",
         "codex-shell-command",
+        "codex-goal",
         "claude-editor",
         "claude-escaped-built-in",
         "claude-attachment",
@@ -335,3 +338,32 @@ async def test_codex_automated_message_requires_target_ownership_and_stays_model
     ]
     assert "authorized_native_shell_command" not in messages[0]
     assert dict(runner.post_headers)[_EVENT_PATH] == {}
+
+
+@pytest.mark.parametrize(
+    ("harness", "native_terminal", "content", "runs"),
+    [
+        ("openai-agents", False, _typed("/tmp/example.py: explain this file"), False),
+        ("codex", False, _typed("/goal ship the fix"), True),
+        ("codex", False, _typed("/tmp/example.py: explain"), False),
+        ("claude-sdk", False, _typed("/compact"), True),
+        ("claude-sdk", False, _typed("/compact the notes"), False),
+        (None, False, _typed("!important"), False),
+        ("codex-native", True, _typed("/goal ship the fix"), True),
+        ("codex-native", True, [*_typed("/goal ship the fix"), _FILE], False),
+        ("codex-native", True, _typed("!ls"), True),
+        ("codex-native", True, _typed("/compact"), False),
+        ("claude-native", True, _typed("/compact"), True),
+        ("claude-native", True, _typed("/help with tests"), False),
+        ("claude-native", True, [*_typed("/compact"), _FILE], False),
+        ("claude-native", True, _typed("!git status"), True),
+        ("claude-native", True, _typed("exit"), True),
+        ("goose-native", True, _typed("/clear"), True),
+        ("goose-native", True, _typed("!important"), False),
+    ],
+)
+def test_harness_runs_only_its_own_commands(
+    harness: str | None, native_terminal: bool, content: list[dict[str, Any]], runs: bool
+) -> None:
+    """Only input the harness acts on itself is sent as typed; everything else is a prompt."""
+    assert _harness_runs_input(content, harness, native_terminal=native_terminal) is runs

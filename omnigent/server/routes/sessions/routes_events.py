@@ -59,6 +59,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inner.codex_goal_command import goal_objective_from_content
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
@@ -1075,21 +1076,34 @@ def _legacy_side_chat_attachment(
     return len(texts) == 1 and side_chat_question_from_text(texts[0]) is not None
 
 
-def _runs_as_native_command(content: list[dict[str, Any]], native_harness: str | None) -> bool:
+def _harness_runs_input(
+    content: list[dict[str, Any]], harness: str | None, *, native_terminal: bool
+) -> bool:
     """
-    Whether a native terminal runs message *content* itself instead of prompting.
+    Whether a session's harness acts on message *content* itself instead of prompting.
 
     :param content: Message content blocks as posted.
-    :param native_harness: The session's native pane harness, e.g. ``"codex-native"``,
-        or ``None`` when an API harness turns every message into model input.
-    :returns: ``True`` for input the terminal handles without prompting the model.
+    :param harness: The session's resolved harness, e.g. ``"codex-native"`` or
+        ``"claude-sdk"``, or ``None`` when unknown.
+    :param native_terminal: Whether a native terminal drives the session's turns.
+    :returns: ``True`` for a standalone Codex ``/goal``, a Claude SDK ``/compact``,
+        or input a native terminal runs without prompting the model.
     """
-    if native_harness is None:
-        return False
-    if native_harness == "codex-native":
-        # Codex takes every message as model input except a lone ``!command``.
+    if harness in ("codex", "codex-native") and goal_objective_from_content(content) is not None:
+        return True
+    if not native_terminal:
+        # The Claude SDK executor compacts on a message that is exactly ``/compact``.
+        return (
+            harness == "claude-sdk"
+            and len(content) == 1
+            and isinstance(content[0], dict)
+            and content[0].get("type") in {"text", "input_text"}
+            and content[0].get("text") == "/compact"
+        )
+    if harness == "codex-native":
+        # Codex takes every other message as model input except a lone ``!command``.
         return shell_command_from_input(content) is not None
-    if native_harness == "claude-native":
+    if harness == "claude-native":
         from omnigent.harnesses.claude_native.bridge import runs_as_terminal_command
 
         return runs_as_terminal_command(content)
@@ -4203,7 +4217,9 @@ def register_events_routes(
             and body.data.get("role", "user") == "user"
             and isinstance(content, list)
             and bool(content)
-            and not _runs_as_native_command(content, native_harness)
+            and not _harness_runs_input(
+                content, native_harness, native_terminal=_is_native_terminal_session(conv)
+            )
             and not await asyncio.to_thread(
                 _is_session_owner,
                 created_by,

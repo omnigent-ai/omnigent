@@ -736,6 +736,27 @@ def test_resolve_matching_text_compares_entries_as_delivered() -> None:
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+def test_resolve_matching_text_reports_a_tie_across_passes() -> None:
+    """Typed text matching exactly ties with an older named entry matching behind its marker."""
+    line = '[Message sender: "bob@example.com"]'
+    echo = f"[Attached: /tmp/x.png]\n\n{line}\n\nlook"
+    named = pending_inputs.record(
+        "conv_a",
+        [{"type": "input_image", "url": "img://1"}, _text_block("look")],
+        created_by="bob@example.com",
+        named_sender="bob@example.com",
+    )
+    typed = pending_inputs.record("conv_a", [_text_block(echo)], created_by="alice@example.com")
+
+    drain = pending_inputs.resolve_matching_text("conv_a", echo)
+
+    assert drain.matched is not None and drain.matched.pending_id == typed
+    assert drain.match_method == pending_inputs.AMBIGUOUS_MATCH
+    # The tied named entry may own the echo, so it is not reported as lost.
+    assert drain.skipped == []
+    assert [entry.pending_id for entry in drain.uncertain] == [named]
+
+
 def test_record_keeps_a_new_entry_when_every_other_entry_is_held() -> None:
     """A fresh record is never the eviction victim, even with the whole cap held."""
     cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
