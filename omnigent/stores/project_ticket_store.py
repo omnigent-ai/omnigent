@@ -2021,12 +2021,19 @@ class ProjectTicketStore:
     ) -> dict[str, Any]:
         """Delivery worker: who a person's comment at *before_position* most likely answers.
 
-        :returns: ``labels``, ``stage_id``, ``asker`` (the session that raised a still-open
-            needs-human, if any) and ``commenters`` (sessions that commented earlier, most
-            recent first).
+        :returns: ``labels``, ``stage_id``, ``completed`` (the ticket is in its project's
+            completed stage), ``asker`` (the session that raised a still-open needs-human,
+            if any) and ``commenters`` (sessions that commented earlier, most recent first).
         """
         with self._session("ticket_person_comment_context") as session:
             ticket = self._row(session, project_id, ticket_id)
+            project = session.scalar(
+                select(SqlProject).where(
+                    SqlProject.workspace_id == ticket.workspace_id,
+                    SqlProject.id == ticket.project_id,
+                )
+            )
+            completed = project is not None and _stages(project).stages[-1].id == ticket.stage_id
             asks = self._human_asks(session, ticket)
             # The ask open when the person commented, even if their comment then cleared it.
             open_ask = next(
@@ -2054,6 +2061,7 @@ class ProjectTicketStore:
             return {
                 "labels": builtins.list(ticket.labels or []),
                 "stage_id": ticket.stage_id,
+                "completed": completed,
                 "asker": open_ask.session_id if open_ask is not None else None,
                 "commenters": builtins.list(dict.fromkeys(authors)),
             }

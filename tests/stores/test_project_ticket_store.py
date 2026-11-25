@@ -15,6 +15,7 @@ from omnigent.entities.project_ticket import (
     TicketActor,
     UpdateTicket,
     UpdateTicketStages,
+    default_ticket_stages,
 )
 from omnigent.errors import OmnigentError
 from omnigent.stores import project_ticket_store
@@ -1063,6 +1064,12 @@ def test_a_routed_persons_comment_clears_needs_human_but_keeps_routing_to_the_as
     assert cleared["payload"]["cleared_by_comment"] is True
     context = tickets.person_comment_context(project.id, ticket["id"], comment["position"])
     assert context["asker"] == worker.session_id
+    assert context["completed"] is False
+    done = default_ticket_stages().stages[-1].id
+    tickets.update(project.id, ticket["id"], UpdateTicket(stage_id=done), owner)
+    later = tickets.comment(project.id, ticket["id"], CommentOnTicket(text="One more fix"), owner)
+    position = tickets.events(project.id, later["id"], user_id="alice")["data"][-1]["position"]
+    assert tickets.person_comment_context(project.id, ticket["id"], position)["completed"] is True
 
     # A person's follow-up on an ask they raised themselves doesn't clear it.
     tickets.update(

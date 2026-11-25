@@ -260,6 +260,17 @@ def test_worker_turn_says_when_a_comment_cleared_needs_human():
     assert "add needs-human back" in ticket_comment_for_worker_message("p1", event)
 
 
+def test_worker_turn_on_a_completed_ticket_says_how_to_reopen_or_follow_up():
+    from omnigent.server.project_orchestrator import ticket_comment_for_worker_message
+
+    event = {"ticket_id": "t1", "ticket_title": "502s", "payload": {"text": "Still broken"}}
+    assert "completed stage" not in ticket_comment_for_worker_message("p1", event)
+    text = ticket_comment_for_worker_message("p1", event, completed=True)
+    assert "completed stage" in text
+    assert "sys_ticket_update" in text and "sys_ticket_link" in text
+    assert "thank-you" in text
+
+
 def test_sign_off_turns_name_the_label_and_the_approved_commit():
     from omnigent.server.project_orchestrator import (
         ticket_gate_label_for_merger_message,

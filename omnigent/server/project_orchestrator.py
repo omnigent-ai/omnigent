@@ -50,8 +50,24 @@ def ticket_update_message(project_id: str, event: dict[str, Any]) -> str:
     )
 
 
-def ticket_comment_for_worker_message(project_id: str, event: dict[str, Any]) -> str:
-    """A worker's turn for a person's comment on a ticket it is linked to."""
+# A person's comment on a finished ticket may ask for more work; it must not stay hidden there.
+_COMPLETED_TICKET_COMMENT = (
+    " This ticket is in its completed stage. If the comment asks for more work on its "
+    "outcome, move the ticket back to the unfinished stage that fits with sys_ticket_update "
+    "(stage_id plus a comment saying why), or file a follow-up with sys_ticket_create, link it "
+    "with sys_ticket_link and say so in your reply here. A thank-you or a question that needs "
+    "no work leaves the ticket where it is."
+)
+
+
+def ticket_comment_for_worker_message(
+    project_id: str, event: dict[str, Any], *, completed: bool = False
+) -> str:
+    """A worker's turn for a person's comment on a ticket it is linked to.
+
+    :param completed: The ticket is in its completed stage, so the turn also says how
+        to reopen it or file a follow-up when the comment asks for more work.
+    """
     title = event.get("ticket_title") or ""
     return (
         f'A person commented on ticket {event["ticket_id"]} "{title}" in project '
@@ -70,6 +86,7 @@ def ticket_comment_for_worker_message(project_id: str, event: dict[str, Any]) ->
             if event["payload"].get("cleared_needs_human")
             else ""
         )
+        + (_COMPLETED_TICKET_COMMENT if completed else "")
     )
 
 

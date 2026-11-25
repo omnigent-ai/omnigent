@@ -10,6 +10,7 @@ import {
   Minimize2Icon,
   PencilIcon,
   PlusIcon,
+  RotateCcwIcon,
   TagsIcon,
   UserRoundIcon,
   XIcon,
@@ -74,7 +75,7 @@ import {
 } from "./ticketImages";
 import { TicketSessionAvatar, TicketSessionLink } from "./TicketSessionLink";
 import { TicketError, TicketStageIcon, TicketLabels } from "./TicketControls";
-import { TicketRelatedTickets } from "./TicketRelatedTickets";
+import { TicketFollowUps, TicketRelatedTickets } from "./TicketRelatedTickets";
 import { TicketShipBlocker } from "./TicketShipBlocker";
 import { parseAskPosition, useTicketAsk } from "./useTicketAsk";
 import { useTicketSeen } from "./useTicketSeen";
@@ -501,6 +502,7 @@ function TicketDetails({
               </div>
             )}
             <TicketShipBlocker projectId={projectId} ticketId={ticketId} variant="panel" />
+            {lifecycle && <TicketFollowUps projectId={projectId} ticket={ticket} />}
             <TicketSignOffs
               ticket={ticket}
               pending={update.isPending || comment.isPending}
@@ -556,6 +558,21 @@ function TicketDetails({
                   ))}
                 </SelectContent>
               </Select>
+              {stages.length > 1 && stages.at(-1)?.id === ticket.stage_id && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={update.isPending}
+                  title={`Move back to ${stages[0].name}`}
+                  onClick={() => {
+                    update.reset();
+                    update.mutate({ id: ticketId, changes: { stage_id: stages[0].id } });
+                  }}
+                >
+                  <RotateCcwIcon aria-hidden />
+                  Reopen
+                </Button>
+              )}
               <TicketCostBadge projectId={projectId} ticketId={ticketId} />
               {ticket.labels.length > 0 && <TicketLabels labels={ticket.labels} />}
               <LabelEditor

@@ -222,7 +222,9 @@ class ProjectTicketNotifications:
         text = (
             ticket_gate_label_for_worker_message(project.id, event)
             if _adds_gate_label(event)
-            else ticket_comment_for_worker_message(project.id, event)
+            else ticket_comment_for_worker_message(
+                project.id, event, completed=bool(context.get("completed"))
+            )
         )
         for session_id in order:
             if session_id is ROUTER:

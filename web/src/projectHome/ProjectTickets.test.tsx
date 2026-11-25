@@ -1565,6 +1565,55 @@ describe("Project ticket board", () => {
     expect(ticket.description).toBe("Original description");
   });
 
+  it("reopens a completed ticket and shows follow-ups filed after its final update", async () => {
+    ticket.stage_id = "done";
+    ticket.final_update = {
+      event_id: "final",
+      position: 4,
+      text: "Shipped the board.",
+      user_id: null,
+      session_id: null,
+      created_at: 2000,
+    };
+    const earlier: ProjectTicket = {
+      ...ticket,
+      id: "earlier",
+      title: "Older link",
+      created_at: 1500,
+    };
+    const followUp: ProjectTicket = {
+      ...ticket,
+      id: "followup",
+      title: "Clearer restart message",
+      stage_id: "in_progress",
+      created_at: 2500,
+    };
+    vi.mocked(api.listRelatedTickets).mockResolvedValue({
+      data: [earlier, followUp],
+      has_more: false,
+      last_id: followUp.id,
+    });
+    renderBoard(
+      <ProjectTicketPanel
+        projectName="Shipping"
+        ticketId="ticket"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    const followUps = await screen.findByRole("region", { name: "Follow-ups" });
+    expect(followUps).toHaveTextContent("Follow-up:Clearer restart message");
+    expect(followUps).not.toHaveTextContent("Older link");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    await waitFor(() =>
+      expect(api.updateTicket).toHaveBeenLastCalledWith("project", "ticket", { stage_id: "open" }),
+    );
+    // Off the completed stage, neither the Reopen control nor the follow-up banner shows.
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Reopen" })).toBeNull());
+    expect(screen.queryByRole("region", { name: "Follow-ups" })).toBeNull();
+  });
+
   it("shows related tickets read-only with pagination and visible query errors", async () => {
     const peer: ProjectTicket = {
       ...ticket,
