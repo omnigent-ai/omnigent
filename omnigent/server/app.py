@@ -271,7 +271,8 @@ def _server_default_executor(conversation_store: object) -> Iterator[None]:
         yield
     finally:
         loop.set_default_executor(ThreadPoolExecutor(thread_name_prefix="asyncio"))
-        executor.shutdown(wait=False)
+        # Cancelling queued jobs also stops a watchdog whose probe waits behind blocked workers.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 @dataclass(frozen=True)

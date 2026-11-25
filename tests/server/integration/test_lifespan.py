@@ -20,6 +20,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.server.helpers import create_test_agent
 
@@ -233,35 +234,51 @@ async def test_lifespan_failure_still_shuts_down_the_server_pool(
     failing_step: str,
     error: type[BaseException],
 ) -> None:
-    """A lifespan that fails to start or stop still shuts down its pool and watchdog."""
+    """A lifespan failing while its worker is blocked still stops the pool and its watchdog."""
     from omnigent.runtime import get_terminal_registry
     from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
     from omnigent.server import app as server_app
     from omnigent.util.thread_pool_watchdog import watch_thread_pool
 
     watched: list[tuple[ThreadPoolExecutor, threading.Thread]] = []
+    worker_started = threading.Event()
+    release = threading.Event()
+    blocked: list[asyncio.Future[bool]] = []
 
     def record_watchdog(executor: ThreadPoolExecutor, **kwargs: Any) -> threading.Thread:
         watchdog = watch_thread_pool(executor, **kwargs)
         watched.append((executor, watchdog))
         return watchdog
 
-    async def fail(*_args: object) -> None:
+    def block_worker() -> bool:
+        worker_started.set()
+        return release.wait()
+
+    async def block_pool_then_fail(*_args: object) -> None:
+        [(executor, _watchdog)] = watched
+        blocked.append(asyncio.get_running_loop().run_in_executor(None, block_worker))
+        await poll_until_async(worker_started.is_set, timeout_s=budget(5))
+        # The watchdog's next probe queues behind the pool's only, blocked, worker.
+        await poll_until_async(lambda: not executor._work_queue.empty(), timeout_s=budget(5))
         raise error
 
+    monkeypatch.setattr(server_app, "_server_thread_pool_workers", lambda _store: 1)
     monkeypatch.setattr(server_app, "watch_thread_pool", record_watchdog)
     if failing_step == "startup":
-        monkeypatch.setattr(HarnessProcessManager, "start", fail)
+        monkeypatch.setattr(HarnessProcessManager, "start", block_pool_then_fail)
     else:
-        monkeypatch.setattr(get_terminal_registry(), "shutdown", fail)
+        monkeypatch.setattr(get_terminal_registry(), "shutdown", block_pool_then_fail)
 
-    with pytest.raises(error):
-        async with app.router.lifespan_context(app):
-            pass
-
-    [(executor, watchdog)] = watched
-    with pytest.raises(RuntimeError, match="cannot schedule new futures"):
-        executor.submit(int)
-    watchdog.join(timeout=budget(3))
-    assert not watchdog.is_alive()
-    assert await asyncio.to_thread(bool, 1)
+    try:
+        with pytest.raises(error):
+            async with app.router.lifespan_context(app):
+                pass
+        [(executor, watchdog)] = watched
+        with pytest.raises(RuntimeError, match="cannot schedule new futures"):
+            executor.submit(int)
+        watchdog.join(timeout=budget(3))
+        assert not watchdog.is_alive()
+        assert await asyncio.to_thread(bool, 1)
+    finally:
+        release.set()
+    assert await blocked[0]
