@@ -2,6 +2,7 @@ import {
   cursorCharLeft,
   cursorCharRight,
   deleteCharBackward,
+  deleteCharForward,
   redo,
   selectCharRight,
   undo,
@@ -13,6 +14,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import { insertComposerText } from "@/lib/composerText";
+import { weaveReplyDraft } from "@/lib/replyDraftDocument";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
@@ -651,5 +653,147 @@ describe("leadingCommandSpan", () => {
     // The bare-string rule would refuse both: no word break after `!`, and \x01 isn't whitespace.
     expect(leadingCommandSpan("!ls", "!")).toBeNull();
     expect(leadingCommandSpan("\x01! ls", "!")).toBeNull();
+  });
+});
+
+describe("CodeMirrorComposerInput reply quotes", () => {
+  // CodeMirror measures text for caret motion; jsdom has no layout.
+  const originalRangeRects = {
+    getClientRects: Range.prototype.getClientRects,
+    getBoundingClientRect: Range.prototype.getBoundingClientRect,
+  };
+  beforeAll(() => {
+    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => new DOMRect();
+  });
+  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+
+  const quotedDraft = weaveReplyDraft({
+    quotes: [{ id: "q1", before: "Intro", text: "Quoted line" }],
+    text: "Reply",
+  });
+  const quoteStart = "Intro\n".length;
+  const replyStart = quotedDraft.length - "Reply".length;
+
+  function mountQuoted(props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {}) {
+    const mounted = mount({ value: quotedDraft, ...props });
+    return { ...mounted, editor: EditorView.findFromDOM(mounted.content)! };
+  }
+  const caretAt = (editor: EditorView, offset: number) =>
+    act(() => editor.dispatch({ selection: { anchor: offset } }));
+  const quoteCards = (container: HTMLElement) =>
+    container.querySelectorAll('[data-testid="composer-reply-quote"]');
+
+  it("paints each quote as a card with its text, a remove button and the text for screen readers", () => {
+    const { container } = mountQuoted();
+    const card = quoteCards(container)[0]!;
+    expect(card.querySelector("blockquote")).toHaveAttribute("title", "Quoted line");
+    expect(card.querySelector("blockquote")).toHaveTextContent("Quoted line");
+    expect(card.querySelector(".sr-only")).toHaveTextContent("Quoted line");
+    expect(card.querySelector("button")).toHaveAttribute("aria-label", "Remove quote");
+  });
+
+  it("truncates the visible preview at 120 characters, keeping the whole quote for screen readers", () => {
+    const long = "x".repeat(150);
+    const { container } = mount({
+      value: weaveReplyDraft({ quotes: [{ id: "q1", before: "", text: long }], text: "" }),
+    });
+    const preview = quoteCards(container)[0]!.querySelector('[aria-hidden="true"]')!;
+    expect(preview.textContent).toBe(`${"x".repeat(120)}…`);
+    expect(quoteCards(container)[0]!.querySelector(".sr-only")!.textContent).toBe(long);
+  });
+
+  it("steps the caret over a quote, never resting inside it", () => {
+    const { editor } = mountQuoted();
+    caretAt(editor, quoteStart);
+    act(() => void cursorCharRight(editor));
+    expect(editor.state.selection.main.head).toBe(replyStart);
+    act(() => void cursorCharLeft(editor));
+    expect(editor.state.selection.main.head).toBe(quoteStart);
+  });
+
+  it("Backspace at the start of the line after a quote removes the quote", () => {
+    const { editor, target } = mountQuoted();
+    caretAt(editor, replyStart);
+    act(() => void deleteCharBackward(editor));
+    // The text around the quote joins as paragraphs, as the textarea's removal does.
+    expect(target().value).toBe("Intro\n\nReply");
+    expect(editor.dom.querySelectorAll('[data-testid="composer-reply-quote"]')).toHaveLength(0);
+  });
+
+  it("Delete at the end of the line before a quote removes the quote", () => {
+    const { editor, target } = mountQuoted();
+    caretAt(editor, "Intro".length);
+    act(() => void deleteCharForward(editor));
+    expect(target().value).toBe("Intro\n\nReply");
+  });
+
+  it("a selection across a quote removes it with the text it covers", () => {
+    const { editor, target, container } = mountQuoted();
+    act(() => editor.dispatch({ selection: { anchor: 2, head: replyStart } }));
+    act(() => void deleteCharBackward(editor));
+    expect(target().value).toBe("InReply");
+    expect(quoteCards(container)).toHaveLength(0);
+  });
+
+  it("keeps the text before a quote when the selection ends at the quote's line start", () => {
+    const { editor, target, container } = mountQuoted();
+    // Selects "tro" and the break before the quote: the break stays so the quote keeps its line.
+    act(() => editor.dispatch({ selection: { anchor: 2, head: quoteStart } }));
+    act(() => void deleteCharBackward(editor));
+    expect(target().value).toBe(`In\n${quotedDraft.slice(quoteStart)}`);
+    expect(quoteCards(container)).toHaveLength(1);
+  });
+
+  it("removes the quote with its X button, as one edit", () => {
+    const onChange = vi.fn();
+    const { container, target } = mountQuoted({ onChange });
+    fireEvent.click(quoteCards(container)[0]!.querySelector("button")!);
+    expect(target().value).toBe("Intro\n\nReply");
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("undo brings a removed quote back with its text, and redo removes it again", () => {
+    const { editor, target, container } = mountQuoted();
+    caretAt(editor, replyStart);
+    act(() => void deleteCharBackward(editor));
+    act(() => void undo(editor));
+    expect(target().value).toBe(quotedDraft);
+    expect(quoteCards(container)[0]!.querySelector("blockquote")).toHaveAttribute(
+      "title",
+      "Quoted line",
+    );
+    act(() => void redo(editor));
+    expect(target().value).toBe("Intro\n\nReply");
+  });
+
+  it("Delete on the line above a quote removes the quote", () => {
+    const blankLineAbove = weaveReplyDraft({
+      quotes: [{ id: "q1", before: "", text: "Quoted line" }],
+      text: "Reply",
+    });
+    const { editor, target } = mountQuoted({ value: blankLineAbove });
+    caretAt(editor, 0);
+    act(() => void deleteCharForward(editor));
+    expect(target().value).toBe("Reply");
+  });
+
+  it("copies quote lines as markdown quotes, never the marked line", () => {
+    const { editor, content } = mountQuoted();
+    act(() => editor.dispatch({ selection: { anchor: 0, head: replyStart } }));
+    const clipboardData = { setData: vi.fn() };
+    fireEvent.copy(content, { clipboardData });
+    expect(clipboardData.setData).toHaveBeenCalledWith("text/plain", "Intro\n> Quoted line\n");
+  });
+
+  it("pasted text drops quote marks, so a paste can't make a quote", () => {
+    const { target, content } = mount({ value: "draft" });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => editor.dispatch({ selection: { anchor: 5 } }));
+    const clipboardData = {
+      getData: (type: string) => (type === "text/plain" ? "\uE000x" : ""),
+    };
+    fireEvent.paste(content, { clipboardData });
+    expect(target().value).toBe("draftx");
   });
 });

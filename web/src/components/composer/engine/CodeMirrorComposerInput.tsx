@@ -46,6 +46,7 @@ import type {
   ComposerTokenAt,
 } from "./composerInput";
 import { readlineKeys } from "./codeMirrorReadline";
+import { keepReplyQuoteLinesWhole, replyQuoteExtensions } from "./codeMirrorReplyQuotes";
 
 /** What the editor takes from the app, handed in by the loader. */
 export interface CodeMirrorComposerEnvironment {
@@ -571,6 +572,13 @@ function CodeMirrorComposer({
           EditorState.transactionFilter.of((transaction) =>
             adjustedInsertTransaction(transaction, environment.separateMentionEdges),
           ),
+          // A controlled value is written exactly as given, so only user edits keep quote lines whole.
+          EditorState.transactionFilter.of((transaction) =>
+            transaction.annotation(controlledUpdate)
+              ? transaction
+              : keepReplyQuoteLinesWhole(transaction),
+          ),
+          replyQuoteExtensions,
           compartments.attributes.of(attributes(initial, environment)),
           compartments.placeholder.of(placeholderText(initial.placeholder ?? "")),
           compartments.theme.of(theme(initial.heightMode ?? "compact")),
