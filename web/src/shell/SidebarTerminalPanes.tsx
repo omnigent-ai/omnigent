@@ -213,7 +213,8 @@ export function SidebarTerminalPanes({
       focusSplitPane(target, shownKey);
     }
   }, [target, shownKey, savedFocus, selectionMoved, requestedMember]);
-  const observePaneShell = usePaneShellExit(target, false);
+  // The sidebar removes no ended pane, so the keyboard never needs handing on.
+  const observePaneShell = usePaneShellExit(target, false, () => null);
   const actions = useTerminalPaneActions(target, terminals, {
     measureSizing: () => domCellSizing(panesRef.current),
   });

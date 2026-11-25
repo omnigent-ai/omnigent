@@ -6,7 +6,7 @@ import { useCallback, useRef } from "react";
 import type { ConnectionState } from "@/components/blocks/TerminalSession";
 import { terminalLayoutKeys } from "@/lib/paneSplitLayout";
 
-import { removePaneFocusingNeighbor } from "./paneShellClose";
+import { removePaneFocusingNeighbor, removeSplitPane } from "./paneShellClose";
 import type { TerminalSplitTarget } from "./terminalSplitTarget";
 
 /** The server's close code for an attach whose terminal is gone (`WS_CLOSE_TERMINAL_NOT_FOUND`). */
@@ -72,18 +72,22 @@ export function shellEndedOnClose(state: ConnectionState | null, wasConnected: b
 /**
  * Watch the split's shell panes, given each connection change as ``observe(paneKey, state)``. A
  * pane that connects is no longer taken as ended, on every surface. With `removesEndedPanes`, a
- * pane whose shell ends leaves the split and the pane beside it takes the keyboard; panes the
- * split can't close, such as the agent's own, stay.
+ * pane whose shell ends leaves the split; panes the split can't close, such as the agent's own,
+ * stay. The pane beside it takes the keyboard only if ``keyboardOwner`` says the ended pane had
+ * it, so typing elsewhere, such as in a sidebar editor, keeps its place.
  */
 export function usePaneShellExit(
   target: TerminalSplitTarget,
   removesEndedPanes: boolean,
+  keyboardOwner: () => string | null,
 ): (paneKey: string, state: ConnectionState | null) => void {
   const connected = useRef(new Set<string>());
   const latestTarget = useRef(target);
   latestTarget.current = target;
   const latestRemoves = useRef(removesEndedPanes);
   latestRemoves.current = removesEndedPanes;
+  const latestOwner = useRef(keyboardOwner);
+  latestOwner.current = keyboardOwner;
   return useCallback((paneKey, state) => {
     if (state?.kind === "connected") {
       connected.current.add(paneKey);
@@ -97,8 +101,8 @@ export function usePaneShellExit(
     if (!current.canClosePane(paneKey)) return;
     markPaneShellEnded(current.conversationId, paneKey);
     const split = current.read();
-    if (split && terminalLayoutKeys(split.layout).includes(paneKey)) {
-      removePaneFocusingNeighbor(current, paneKey);
-    }
+    if (!split || !terminalLayoutKeys(split.layout).includes(paneKey)) return;
+    if (latestOwner.current() === paneKey) removePaneFocusingNeighbor(current, paneKey);
+    else removeSplitPane(current, paneKey);
   }, []);
 }

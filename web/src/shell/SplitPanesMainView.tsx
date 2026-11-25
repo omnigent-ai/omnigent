@@ -178,8 +178,9 @@ function MainSplitPanes({
   const savedSplit = usePaneSplit(conversationId);
   const appPaneTitles = useAppPaneTitles(conversationId);
   const { setTerminalConnectionState, markTerminalActive } = useTerminalStatuses(terminals);
-  const observePaneShell = usePaneShellExit(target, cards);
   const panesRef = useRef<HTMLDivElement>(null);
+  const keyboardOwner = usePaneKeyboardOwner(panesRef);
+  const observePaneShell = usePaneShellExit(target, cards, keyboardOwner);
   // One recovery per opening: a healthy agent spends it, so a later reap waits for Resume session.
   const agentRecovery = useRef<AgentRecoveryAllowance>({ attempted: false });
   const agentHealthy =
@@ -205,7 +206,6 @@ function MainSplitPanes({
   const chatInPane = visible && chatShown && splitBesideChat;
   const split = visible ? savedSplit : undefined;
 
-  const keyboardOwner = usePaneKeyboardOwner(panesRef);
   useReconcileMainSplit(
     conversationId,
     agentKey,

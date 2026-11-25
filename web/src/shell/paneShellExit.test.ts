@@ -11,7 +11,9 @@ import {
   shellEndedOnClose,
   usePaneShellExit,
 } from "./paneShellExit";
+import { pendingTerminalFocus } from "./terminalFocusRequest";
 import type { TerminalSplitTarget } from "./terminalSplitTarget";
+import { usePaneKeyboardOwner } from "./usePaneKeyboardOwner";
 
 const AGENT_KEY = "terminal:terminal_claude_main";
 const ZSH_KEY = "terminal:terminal_zsh_s1";
@@ -58,7 +60,29 @@ function memoryTarget(initial: TerminalSplitState) {
 const panesOf = (state: TerminalSplitState | undefined): string[] =>
   state ? terminalLayoutKeys(state.layout) : [];
 
-afterEach(resetEndedPaneShellsForTests);
+const noOwner = () => null;
+
+/** A panes host with an input in each pane, and an input outside it, as a sidebar editor. */
+function panesHost(keys: readonly string[]) {
+  const host = document.createElement("div");
+  const inputs = new Map<string, HTMLInputElement>();
+  for (const key of keys) {
+    const pane = document.createElement("div");
+    pane.dataset.terminalPane = key;
+    const input = document.createElement("input");
+    pane.append(input);
+    host.append(pane);
+    inputs.set(key, input);
+  }
+  const outside = document.createElement("input");
+  document.body.append(host, outside);
+  return { hostRef: { current: host }, inputs, outside };
+}
+
+afterEach(() => {
+  resetEndedPaneShellsForTests();
+  document.body.replaceChildren();
+});
 
 describe("shellEndedOnClose", () => {
   it.each([
@@ -81,22 +105,47 @@ describe("shellEndedOnClose", () => {
 });
 
 describe("usePaneShellExit", () => {
-  it("removes a pane whose shell exits and gives its neighbour the keyboard", () => {
+  it("removes a pane whose shell exits and gives its neighbour the keyboard it had", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target, true));
+    const { hostRef, inputs } = panesHost(panesOf(THREE_PANES));
+    const { result } = renderHook(() => {
+      const owner = usePaneKeyboardOwner(hostRef);
+      return usePaneShellExit(target, true, owner);
+    });
+    act(() => inputs.get(ZSH_KEY)?.focus());
     act(() => result.current(ZSH_KEY, CONNECTED));
     act(() => result.current(ZSH_KEY, ENDED));
     expect(panesOf(read())).toEqual([AGENT_KEY, BASH_KEY]);
     expect(read()?.focusedKey).not.toBe(ZSH_KEY);
+    expect(pendingTerminalFocus(target.conversationId, "main")).toMatchObject({
+      tabKey: read()?.focusedKey,
+    });
     expect(isPaneShellEnded(target.conversationId, ZSH_KEY)).toBe(true);
     // A shell relaunched under the same key connects again, and is no longer taken as ended.
     act(() => result.current(ZSH_KEY, CONNECTED));
     expect(isPaneShellEnded(target.conversationId, ZSH_KEY)).toBe(false);
   });
 
+  it("removes a pane whose shell exits but leaves the keyboard with an input outside the panes", () => {
+    const { target, read } = memoryTarget(THREE_PANES);
+    const { hostRef, inputs, outside } = panesHost(panesOf(THREE_PANES));
+    const { result } = renderHook(() => {
+      const owner = usePaneKeyboardOwner(hostRef);
+      return usePaneShellExit(target, true, owner);
+    });
+    // The shell had the keyboard, then the user moved to an editor before it exited.
+    act(() => inputs.get(ZSH_KEY)?.focus());
+    act(() => result.current(ZSH_KEY, CONNECTED));
+    act(() => outside.focus());
+    act(() => result.current(ZSH_KEY, ENDED));
+    expect(panesOf(read())).toEqual([AGENT_KEY, BASH_KEY]);
+    expect(pendingTerminalFocus(target.conversationId, "main")).toBeNull();
+    expect(document.activeElement).toBe(outside);
+  });
+
   it("without removal, leaves an exited pane and marks nothing, but still forgets on connect", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target, false));
+    const { result } = renderHook(() => usePaneShellExit(target, false, noOwner));
     act(() => result.current(ZSH_KEY, CONNECTED));
     act(() => result.current(ZSH_KEY, ENDED));
     expect(read()).toEqual(THREE_PANES);
@@ -108,7 +157,7 @@ describe("usePaneShellExit", () => {
 
   it("keeps a pane closed before it ever connected, or dropped by the transport", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target, true));
+    const { result } = renderHook(() => usePaneShellExit(target, true, noOwner));
     act(() => result.current(ZSH_KEY, ENDED));
     act(() => result.current(BASH_KEY, CONNECTED));
     act(() => result.current(BASH_KEY, DROPPED));
@@ -118,7 +167,7 @@ describe("usePaneShellExit", () => {
 
   it("keeps a pane whose attach is refused after connecting, across a reconnect", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target, true));
+    const { result } = renderHook(() => usePaneShellExit(target, true, noOwner));
     for (let attempt = 0; attempt < 2; attempt += 1) {
       act(() => result.current(ZSH_KEY, CONNECTED));
       act(() => result.current(ZSH_KEY, REFUSED));
@@ -129,7 +178,7 @@ describe("usePaneShellExit", () => {
 
   it("keeps the agent's own pane when its terminal ends", () => {
     const { target, read } = memoryTarget(THREE_PANES);
-    const { result } = renderHook(() => usePaneShellExit(target, true));
+    const { result } = renderHook(() => usePaneShellExit(target, true, noOwner));
     act(() => result.current(AGENT_KEY, CONNECTED));
     act(() => result.current(AGENT_KEY, ENDED));
     expect(read()).toEqual(THREE_PANES);

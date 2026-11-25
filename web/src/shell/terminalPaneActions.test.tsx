@@ -239,7 +239,7 @@ describe("useTerminalPaneActions", () => {
     markPaneShellEnded(target.conversationId, ZSH_KEY);
     // The same name and session key relaunched, and its pane connects on a surface that
     // doesn't remove ended panes.
-    const { result: observe } = renderHook(() => usePaneShellExit(target, false));
+    const { result: observe } = renderHook(() => usePaneShellExit(target, false, () => null));
     act(() => observe.current(ZSH_KEY, { kind: "connected" }));
     const { result } = renderHook(() => useTerminalPaneActions(target, [AGENT, ZSH]));
     act(() => result.current.closePane(ZSH_KEY));
