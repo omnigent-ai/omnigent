@@ -364,7 +364,7 @@ export function CodeMirrorFileViewer({
           commentLayer.extension,
           lineNumbers(),
           indentationFolding(),
-          stickyLines.of(initial.stickyScrollOn ? stickyScroll() : []),
+          stickyLines.of(initial.stickyScrollOn ? stickyScroll : []),
           detectedIndentation(initial.content),
           selectionWhitespacePlugin,
           indentGuides,
@@ -514,7 +514,7 @@ export function CodeMirrorFileViewer({
 
   useEffect(() => {
     viewRef.current?.dispatch({
-      effects: stickyLines.reconfigure(stickyScrollOn ? stickyScroll() : []),
+      effects: stickyLines.reconfigure(stickyScrollOn ? stickyScroll : []),
     });
   }, [stickyScrollOn, stickyLines]);
 

@@ -1,7 +1,12 @@
-import { EditorState, Text } from "@codemirror/state";
+import { Compartment, EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
-import { pinnedLineAt, revealStickyLine, STICKY_LINE_CLASS } from "./codeMirrorStickyScroll";
+import {
+  pinnedLineAt,
+  revealStickyLine,
+  STICKY_LINE_CLASS,
+  stickyScroll,
+} from "./codeMirrorStickyScroll";
 
 function docOf(lines: string[]): Text {
   return Text.of(lines);
@@ -70,5 +75,25 @@ describe("pinnedLineAt", () => {
     expect(pinnedLineAt(view, null)).toBeNull();
     expect(pinnedLineAt(view, pinnedRow(other, "1", "0"))).toBeNull();
     expect(pinnedLineAt(view, pinnedRow(view, "two", "0"))).toBeNull();
+  });
+});
+
+describe("stickyScroll", () => {
+  it("keeps its pinned rows when the viewer reconfigures it with the same choice", () => {
+    const lines = new Compartment();
+    const view = new EditorView({
+      parent: document.body,
+      state: EditorState.create({ doc: "a\n  b", extensions: lines.of(stickyScroll) }),
+    });
+    try {
+      const root = view.dom.querySelector(".cm-stickyScroll");
+      expect(root).not.toBeNull();
+      view.dispatch({ effects: lines.reconfigure(stickyScroll) });
+      expect(view.dom.querySelector(".cm-stickyScroll")).toBe(root);
+      view.dispatch({ effects: lines.reconfigure([]) });
+      expect(view.dom.querySelector(".cm-stickyScroll")).toBeNull();
+    } finally {
+      view.destroy();
+    }
   });
 });

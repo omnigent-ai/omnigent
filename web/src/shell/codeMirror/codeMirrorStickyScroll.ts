@@ -285,7 +285,8 @@ export function revealStickyLine(view: EditorView, lineNumber: number, depth: nu
   view.focus();
 }
 
-/** Pins the lines that open the indentation scopes around the top of the view. */
-export function stickyScroll(): Extension {
-  return ViewPlugin.define((view) => new StickyScrollView(view));
-}
+/**
+ * Pins the lines that open the indentation scopes around the top of the view. One shared
+ * instance, so reconfiguring with the same choice keeps the pinned rows.
+ */
+export const stickyScroll: Extension = ViewPlugin.define((view) => new StickyScrollView(view));
