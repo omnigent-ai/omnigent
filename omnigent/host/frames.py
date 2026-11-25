@@ -1359,6 +1359,8 @@ class HostWorkspaceReplyFrame:
     :param done: Whether this is the call's last frame.
     :param error_code: On a failed call's last frame, its Connect code, e.g. ``"not_found"``.
     :param error_message: The failure's message.
+    :param error_reason: A refused pull request call's machine-readable reason, e.g.
+        ``"comment_changed"``; ``None`` otherwise, and from hosts that send none.
     """
 
     request_id: str
@@ -1366,6 +1368,7 @@ class HostWorkspaceReplyFrame:
     done: bool = False
     error_code: str | None = None
     error_message: str | None = None
+    error_reason: str | None = None
 
 
 @dataclass
@@ -2331,6 +2334,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "done": frame.done,
                 "error_code": frame.error_code,
                 "error_message": frame.error_message,
+                **({"error_reason": frame.error_reason} if frame.error_reason else {}),
             }
         )
     if isinstance(frame, HostFsResultFrame):
@@ -2941,6 +2945,7 @@ def _decode_known_host_frame(
                 done=_optional_bool(msg, "done"),
                 error_code=_optional_nullable_str(msg, "error_code"),
                 error_message=_optional_nullable_str(msg, "error_message"),
+                error_reason=_optional_nullable_str(msg, "error_reason"),
             )
         case HostFrameKind.FS_WRITE_REQUEST:
             return _decode_fs_write_request(msg)
