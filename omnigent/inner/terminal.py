@@ -382,6 +382,17 @@ def _is_transient_tmux_process_start_error(exc: OSError) -> bool:
     return exc.errno in _TRANSIENT_TMUX_PROCESS_START_ERRNOS
 
 
+async def _communicate_or_kill(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    """A tmux command's output; if its caller gives up, e.g. at a deadline, it's killed."""
+    try:
+        return await proc.communicate()
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+
+
 def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
     """Classify a tmux launch failure without masking permanent errors."""
     detail = f"tmux command could not start: {' '.join(cmd)}: {exc}"
@@ -3024,14 +3035,7 @@ class TerminalInstance:
             return False
 
         try:
-            try:
-                stdout, stderr = await proc.communicate()
-            finally:
-                # A caller that gives up, e.g. past its deadline, leaves no tmux probe behind.
-                if proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
-                    await proc.wait()
+            stdout, stderr = await _communicate_or_kill(proc)
             if proc.returncode != 0:
                 detail = stderr.decode(errors="replace").strip() or "<no stderr>"
                 if not _tmux_reports_target_gone(detail):
@@ -3152,7 +3156,7 @@ class TerminalInstance:
             )
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await _communicate_or_kill(proc)
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
         return stdout.decode()

@@ -2090,6 +2090,42 @@ async def test_is_alive_kills_and_reaps_its_probe_when_cancelled(
 
 
 @pytest.mark.asyncio
+async def test_is_alive_kills_and_reaps_a_dead_panes_capture_when_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that gives up while a dead pane's last screen is captured leaves no tmux child."""
+    capture = _StalledProcess()
+
+    async def fake_create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _ProcessWithStdout | _StalledProcess:
+        del stdout, stderr
+        if "list-panes" in cmd:
+            return _ProcessWithStdout(stdout=b"1 2\n", returncode=0)
+        return capture
+
+    monkeypatch.setattr(
+        terminal_mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(instance.is_alive(), 0.05)
+    assert capture.killed and capture.reaped
+    # The capture didn't finish, so the exit watcher still owns marking it stopped.
+    assert instance.running is True
+
+
+@pytest.mark.asyncio
 async def test_is_alive_preserves_running_state_when_probe_cannot_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
