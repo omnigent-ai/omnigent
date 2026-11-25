@@ -215,19 +215,25 @@ export function useKeptDescriptionTime(workflowId: string): KeptDescriptionTime 
   return data ?? undefined;
 }
 
-/** Keep the description's time read before a steps-only write, when the server reports none. */
+/**
+ * Keep the description's time read before a steps-only write, when the server reports none: the
+ * time already kept for the workflow as read, as after an earlier such write, or else its write.
+ */
 function useKeepDescriptionTime(workflowId: string) {
   const queryClient = useQueryClient();
   return (saved: WorkflowDetail, read: WorkflowDetail) => {
     const { updated_at: after, description_updated_at: reported } = saved;
     if (reported != null || after === undefined || read.updated_at === undefined) return;
     if (saved.description !== read.description || after <= read.updated_at) return;
+    const key = keptDescriptionTimeKey(workflowId);
+    const earlier = queryClient.getQueryData<KeptDescriptionTime | null>(key);
+    const carried = earlier?.after === read.updated_at && earlier.description === read.description;
     const kept: KeptDescriptionTime = {
       after,
-      describedAt: read.updated_at,
+      describedAt: carried ? earlier.describedAt : read.updated_at,
       description: saved.description,
     };
-    queryClient.setQueryData(keptDescriptionTimeKey(workflowId), kept);
+    queryClient.setQueryData(key, kept);
   };
 }
 

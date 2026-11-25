@@ -185,8 +185,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
   // Only a proposal newer than that source, or else than the description's last write in whole
   // seconds (a tie keeps the description), offers its description, so an edit made since stands.
-  // An older server keeps no such time, so the workflow's last write stands in for it, but for
-  // the page's own write of the steps alone, across which it goes by the time it read.
+  // For an older server, that's the time kept across the page's own writes, or its last write.
   const keptDescribedAt =
     keptDescriptionTime?.after === workflow.updated_at &&
     keptDescriptionTime?.description === workflow.description

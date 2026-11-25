@@ -7,6 +7,7 @@ import {
   withTimeLimitLength,
   timeLimitLength,
   timeLimitMinutes,
+  sameStepsApartFromTimeLimits,
   withChosenTimeLimit,
   withSavedTimeLimits,
   withStepTimeLimit,
@@ -343,6 +344,27 @@ describe("withSavedTimeLimits", () => {
   it("leaves a step the saved workflow doesn't have as proposed", () => {
     const report = { id: "report", name: "Report", goal: "**Time limit:** 1 day", depends_on: [] };
     expect(withSavedTimeLimits([report], saved)).toEqual([report]);
+  });
+});
+
+describe("sameStepsApartFromTimeLimits", () => {
+  const steps = [
+    { id: "fix", name: "Fix", goal: "Fix it.", depends_on: [] },
+    { id: "ship", name: "Ship", goal: null, depends_on: ["fix"] },
+  ];
+
+  it("holds two plans the same when only their time limits differ", () => {
+    const limited = [{ ...steps[0]!, goal: "Fix it.\n\n**Time limit:** 2 hours" }, steps[1]!];
+    expect(sameStepsApartFromTimeLimits(limited, steps)).toBe(true);
+  });
+
+  it.each([
+    ["a name", [{ ...steps[0]!, name: "Repair" }, steps[1]!]],
+    ["a goal", [{ ...steps[0]!, goal: "Fix it twice." }, steps[1]!]],
+    ["a dependency", [steps[0]!, { ...steps[1]!, depends_on: [] }]],
+    ["the order", [steps[1]!, steps[0]!]],
+  ])("tells two plans apart by %s", (_, changed) => {
+    expect(sameStepsApartFromTimeLimits(changed, steps)).toBe(false);
   });
 });
 

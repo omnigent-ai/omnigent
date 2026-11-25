@@ -11,6 +11,7 @@ import {
   useCloneWorkflow,
   useSaveStepTimeLimit,
   useSaveWorkflowDescription,
+  useKeptDescriptionTime,
   useSaveWorkflowPlan,
   useWorkflow,
   useWorkflowRunDescendants,
@@ -278,6 +279,27 @@ describe("useSaveStepTimeLimit", () => {
       "Read 3.",
     ]);
     expect(reads).toBe(3);
+  });
+
+  it("keeps the first description time across saves to a server that keeps none", async () => {
+    let stored = { ...saved, updated_at: 10 };
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) => {
+      if (init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body));
+        stored = { ...stored, steps: body.steps, updated_at: stored.updated_at + 100 };
+      }
+      return Response.json(stored);
+    });
+    const { result } = renderQuery(() => ({
+      kept: useKeptDescriptionTime("workflow"),
+      limit: useSaveStepTimeLimit("workflow"),
+    }));
+    await act(() => result.current.limit.mutateAsync({ stepId: "review", limit: "1 hour" }));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(result.current.kept).toMatchObject({ after: 110, describedAt: 10 });
+    await act(() => result.current.limit.mutateAsync({ stepId: "review", limit: "2 hours" }));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(result.current.kept).toMatchObject({ after: 210, describedAt: 10 });
   });
 
   it("writes nothing for a step no longer in the saved plan", async () => {
