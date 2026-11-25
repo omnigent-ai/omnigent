@@ -18,7 +18,7 @@
 // incompatibly, except that ListDirectory and ReadFile keep their wire shapes.
 
 import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
-import type { Message } from "@bufbuild/protobuf";
+import type { JsonObject, Message } from "@bufbuild/protobuf";
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 
 /**
@@ -1467,6 +1467,352 @@ export declare type ResolveRepositoryContextResponse = Message<"omnigent.api.wor
 export declare const ResolveRepositoryContextResponseSchema: GenMessage<ResolveRepositoryContextResponse>;
 
 /**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestRequest
+ */
+export declare type GetPullRequestRequest = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestRequest.
+ * Use `create(GetPullRequestRequestSchema)` to create a new message.
+ */
+export declare const GetPullRequestRequestSchema: GenMessage<GetPullRequestRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestResponse
+ */
+export declare type GetPullRequestResponse = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestResponse.
+ * Use `create(GetPullRequestResponseSchema)` to create a new message.
+ */
+export declare const GetPullRequestResponseSchema: GenMessage<GetPullRequestResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListPullRequestFilesRequest
+ */
+export declare type ListPullRequestFilesRequest = Message<"omnigent.api.workspace.v1alpha1.ListPullRequestFilesRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * Pins the revision; both empty for the current one.
+   *
+   * @generated from field: string head_sha = 2;
+   */
+  headSha: string;
+
+  /**
+   * @generated from field: string base_sha = 3;
+   */
+  baseSha: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListPullRequestFilesRequest.
+ * Use `create(ListPullRequestFilesRequestSchema)` to create a new message.
+ */
+export declare const ListPullRequestFilesRequestSchema: GenMessage<ListPullRequestFilesRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListPullRequestFilesResponse
+ */
+export declare type ListPullRequestFilesResponse = Message<"omnigent.api.workspace.v1alpha1.ListPullRequestFilesResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListPullRequestFilesResponse.
+ * Use `create(ListPullRequestFilesResponseSchema)` to create a new message.
+ */
+export declare const ListPullRequestFilesResponseSchema: GenMessage<ListPullRequestFilesResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestDiffRequest
+ */
+export declare type GetPullRequestDiffRequest = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestDiffRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string head_sha = 2;
+   */
+  headSha: string;
+
+  /**
+   * @generated from field: string base_sha = 3;
+   */
+  baseSha: string;
+
+  /**
+   * One file's diff, relative to the repository root; empty for the whole diff.
+   *
+   * @generated from field: string path = 4;
+   */
+  path: string;
+
+  /**
+   * The file's path before a rename.
+   *
+   * @generated from field: string previous_path = 5;
+   */
+  previousPath: string;
+
+  /**
+   * Without a pull request, the ref the working copy is compared with.
+   *
+   * @generated from field: string base = 6;
+   */
+  base: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestDiffRequest.
+ * Use `create(GetPullRequestDiffRequestSchema)` to create a new message.
+ */
+export declare const GetPullRequestDiffRequestSchema: GenMessage<GetPullRequestDiffRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetPullRequestDiffResponse
+ */
+export declare type GetPullRequestDiffResponse = Message<"omnigent.api.workspace.v1alpha1.GetPullRequestDiffResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetPullRequestDiffResponse.
+ * Use `create(GetPullRequestDiffResponseSchema)` to create a new message.
+ */
+export declare const GetPullRequestDiffResponseSchema: GenMessage<GetPullRequestDiffResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListPullRequestCommitsRequest
+ */
+export declare type ListPullRequestCommitsRequest = Message<"omnigent.api.workspace.v1alpha1.ListPullRequestCommitsRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string head_sha = 2;
+   */
+  headSha: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListPullRequestCommitsRequest.
+ * Use `create(ListPullRequestCommitsRequestSchema)` to create a new message.
+ */
+export declare const ListPullRequestCommitsRequestSchema: GenMessage<ListPullRequestCommitsRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListPullRequestCommitsResponse
+ */
+export declare type ListPullRequestCommitsResponse = Message<"omnigent.api.workspace.v1alpha1.ListPullRequestCommitsResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListPullRequestCommitsResponse.
+ * Use `create(ListPullRequestCommitsResponseSchema)` to create a new message.
+ */
+export declare const ListPullRequestCommitsResponseSchema: GenMessage<ListPullRequestCommitsResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetCommitDiffRequest
+ */
+export declare type GetCommitDiffRequest = Message<"omnigent.api.workspace.v1alpha1.GetCommitDiffRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string commit_sha = 2;
+   */
+  commitSha: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetCommitDiffRequest.
+ * Use `create(GetCommitDiffRequestSchema)` to create a new message.
+ */
+export declare const GetCommitDiffRequestSchema: GenMessage<GetCommitDiffRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.GetCommitDiffResponse
+ */
+export declare type GetCommitDiffResponse = Message<"omnigent.api.workspace.v1alpha1.GetCommitDiffResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.GetCommitDiffResponse.
+ * Use `create(GetCommitDiffResponseSchema)` to create a new message.
+ */
+export declare const GetCommitDiffResponseSchema: GenMessage<GetCommitDiffResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ComparePullRequestRangeRequest
+ */
+export declare type ComparePullRequestRangeRequest = Message<"omnigent.api.workspace.v1alpha1.ComparePullRequestRangeRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string head_sha = 2;
+   */
+  headSha: string;
+
+  /**
+   * The earlier head the reader last saw.
+   *
+   * @generated from field: string from_sha = 3;
+   */
+  fromSha: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ComparePullRequestRangeRequest.
+ * Use `create(ComparePullRequestRangeRequestSchema)` to create a new message.
+ */
+export declare const ComparePullRequestRangeRequestSchema: GenMessage<ComparePullRequestRangeRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ComparePullRequestRangeResponse
+ */
+export declare type ComparePullRequestRangeResponse = Message<"omnigent.api.workspace.v1alpha1.ComparePullRequestRangeResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ComparePullRequestRangeResponse.
+ * Use `create(ComparePullRequestRangeResponseSchema)` to create a new message.
+ */
+export declare const ComparePullRequestRangeResponseSchema: GenMessage<ComparePullRequestRangeResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListReviewThreadsRequest
+ */
+export declare type ListReviewThreadsRequest = Message<"omnigent.api.workspace.v1alpha1.ListReviewThreadsRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string page_token = 2;
+   */
+  pageToken: string;
+
+  /**
+   * @generated from field: string head_sha = 3;
+   */
+  headSha: string;
+
+  /**
+   * @generated from field: string base_sha = 4;
+   */
+  baseSha: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListReviewThreadsRequest.
+ * Use `create(ListReviewThreadsRequestSchema)` to create a new message.
+ */
+export declare const ListReviewThreadsRequestSchema: GenMessage<ListReviewThreadsRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListReviewThreadsResponse
+ */
+export declare type ListReviewThreadsResponse = Message<"omnigent.api.workspace.v1alpha1.ListReviewThreadsResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListReviewThreadsResponse.
+ * Use `create(ListReviewThreadsResponseSchema)` to create a new message.
+ */
+export declare const ListReviewThreadsResponseSchema: GenMessage<ListReviewThreadsResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListReviewThreadCommentsRequest
+ */
+export declare type ListReviewThreadCommentsRequest = Message<"omnigent.api.workspace.v1alpha1.ListReviewThreadCommentsRequest"> & {
+  /**
+   * @generated from field: string pr_url = 1;
+   */
+  prUrl: string;
+
+  /**
+   * @generated from field: string thread_id = 2;
+   */
+  threadId: string;
+
+  /**
+   * @generated from field: string page_token = 3;
+   */
+  pageToken: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListReviewThreadCommentsRequest.
+ * Use `create(ListReviewThreadCommentsRequestSchema)` to create a new message.
+ */
+export declare const ListReviewThreadCommentsRequestSchema: GenMessage<ListReviewThreadCommentsRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListReviewThreadCommentsResponse
+ */
+export declare type ListReviewThreadCommentsResponse = Message<"omnigent.api.workspace.v1alpha1.ListReviewThreadCommentsResponse"> & {
+  /**
+   * @generated from field: google.protobuf.Struct payload = 1;
+   */
+  payload?: JsonObject | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListReviewThreadCommentsResponse.
+ * Use `create(ListReviewThreadCommentsResponseSchema)` to create a new message.
+ */
+export declare const ListReviewThreadCommentsResponseSchema: GenMessage<ListReviewThreadCommentsResponse>;
+
+/**
  * @generated from enum omnigent.api.workspace.v1alpha1.EntryType
  */
 export enum EntryType {
@@ -2092,6 +2438,87 @@ export declare const WorkspaceService: GenService<{
     methodKind: "unary";
     input: typeof ResolveRepositoryContextRequestSchema;
     output: typeof ResolveRepositoryContextResponseSchema;
+  },
+  /**
+   * The pull request's overview, checks, reviews, labels and merge state. Only
+   * the session's owner may call it, since it lists the host account's identities.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetPullRequest
+   */
+  getPullRequest: {
+    methodKind: "unary";
+    input: typeof GetPullRequestRequestSchema;
+    output: typeof GetPullRequestResponseSchema;
+  },
+  /**
+   * The files the pull request changes.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListPullRequestFiles
+   */
+  listPullRequestFiles: {
+    methodKind: "unary";
+    input: typeof ListPullRequestFilesRequestSchema;
+    output: typeof ListPullRequestFilesResponseSchema;
+  },
+  /**
+   * The pull request's whole diff, or one file's, optionally at a pinned revision.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetPullRequestDiff
+   */
+  getPullRequestDiff: {
+    methodKind: "unary";
+    input: typeof GetPullRequestDiffRequestSchema;
+    output: typeof GetPullRequestDiffResponseSchema;
+  },
+  /**
+   * The pull request's commits.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListPullRequestCommits
+   */
+  listPullRequestCommits: {
+    methodKind: "unary";
+    input: typeof ListPullRequestCommitsRequestSchema;
+    output: typeof ListPullRequestCommitsResponseSchema;
+  },
+  /**
+   * One of the pull request's commits, as a diff.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.GetCommitDiff
+   */
+  getCommitDiff: {
+    methodKind: "unary";
+    input: typeof GetCommitDiffRequestSchema;
+    output: typeof GetCommitDiffResponseSchema;
+  },
+  /**
+   * The diff between an earlier head of the pull request and its head.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ComparePullRequestRange
+   */
+  comparePullRequestRange: {
+    methodKind: "unary";
+    input: typeof ComparePullRequestRangeRequestSchema;
+    output: typeof ComparePullRequestRangeResponseSchema;
+  },
+  /**
+   * The pull request's review threads, a page at a time.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListReviewThreads
+   */
+  listReviewThreads: {
+    methodKind: "unary";
+    input: typeof ListReviewThreadsRequestSchema;
+    output: typeof ListReviewThreadsResponseSchema;
+  },
+  /**
+   * One review thread's comments, a page at a time.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListReviewThreadComments
+   */
+  listReviewThreadComments: {
+    methodKind: "unary";
+    input: typeof ListReviewThreadCommentsRequestSchema;
+    output: typeof ListReviewThreadCommentsResponseSchema;
   },
 }>;
 

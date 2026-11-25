@@ -38,6 +38,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.host.frames import PullRequestVouch
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -65,6 +66,9 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
@@ -2831,7 +2835,9 @@ def register_resources_routes(
     ) -> Response:
         """Serve the workspace API to any client, answered by the session's host.
 
-        Same read gate as the file routes; the API never takes absolute paths.
+        Each method has its gate (:mod:`omnigent.server.workspace_access`): the file
+        methods the file routes' read gate, the pull request reads their REST routes'
+        gates, and an unknown method a 404. The API never takes absolute paths.
         Side chats and sub-agents use the host and workspace of the session that
         owns them. Unconfined sessions only, because the host applies no sandbox's
         hidden paths. A host on another replica gets the REST wrong-replica error,
@@ -2852,13 +2858,37 @@ def register_resources_routes(
             WorkspaceServiceASGIApplication,
         )
         from omnigent.host.frames import CAP_WORKSPACE_API
+        from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
         from omnigent.server.workspace_api import (
             ConnectCallResponse,
             HostTarget,
             HostWorkspaceService,
+            PullRequestRoute,
         )
 
-        conv = await _authorize_browse_read(session_id, request)
+        gate = gate_for(method)
+        if gate is None:
+            raise HTTPException(status_code=404, detail="Unknown workspace method")
+        if gate is WorkspaceGate.BROWSE:
+            conv = await _authorize_browse_read(session_id, request)
+        else:
+            conv = await _validate_session(session_id, request, LEVEL_READ)
+        # The owner grant itself, with no admin pass: only the owner reads as the host's account.
+        # Only an owner-gated method and GetCapabilities, which lists them, need it.
+        session_owner = (
+            gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities"
+        ) and await asyncio.to_thread(
+            _is_session_owner,
+            _get_user_id(request, auth_provider),
+            conv,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+        if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
+            raise OmnigentError(
+                "Only the session's owner can read this through the workspace API",
+                code=ErrorCode.FORBIDDEN,
+            )
         _host_id, host, workspace = await _session_host(conv, request)
         # The session's own spec decides confinement, even on an inherited host.
         reach = await _environment_reach_for_session(conv, workspace) if host is not None else None
@@ -2874,7 +2904,19 @@ def register_resources_routes(
         else:
             target = HostTarget(host_registry, host, reach[2])
         forwarder = HostWorkspaceService(
-            target, content_search=flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH)
+            target,
+            content_search=flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH),
+            pull_requests=PullRequestRoute(
+                session_id,
+                vouch=lambda pr_url: _workspace_pull_request_vouch(session_id, pr_url),
+                overview=lambda payload, sent_at: _with_server_pull_requests(
+                    session_id, payload, sent_at
+                ),
+            ),
+            # Only GetCapabilities lists methods, and it needs the browse gate.
+            callable_methods=callable_methods(
+                browse=gate is WorkspaceGate.BROWSE, session_owner=session_owner
+            ),
         )
         app = WorkspaceServiceASGIApplication(forwarder)
         # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
@@ -3550,6 +3592,30 @@ def register_resources_routes(
             return {**params, **server_prs.vouch(stored, params.get("pr_url"))}
         except server_prs.NotAssociatedError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def _workspace_pull_request_vouch(
+        session_id: str, pr_url: str
+    ) -> PullRequestVouch | None:
+        """The server's vouch for a workspace API pull request read, as REST gives it.
+
+        :returns: ``None`` until the server stores the session's PRs, so the host's own
+            record decides.
+        :raises ConnectError: FAILED_PRECONDITION for a PR the session doesn't link.
+        """
+        from connectrpc.code import Code
+        from connectrpc.errors import ConnectError
+
+        try:
+            params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        except HTTPException as exc:
+            raise ConnectError(Code.FAILED_PRECONDITION, str(exc.detail)) from exc
+        if params.get("server_tracked") is not True:
+            return None
+        default_pr_url = params.get("default_pr_url")
+        return PullRequestVouch(
+            server_tracked=True,
+            default_pr_url=default_pr_url if isinstance(default_pr_url, str) else None,
+        )
 
     async def _with_server_pull_requests(
         session_id: str, info: dict[str, Any], requested_at: float

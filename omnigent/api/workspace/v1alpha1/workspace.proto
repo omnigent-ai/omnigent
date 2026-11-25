@@ -16,6 +16,7 @@ syntax = "proto3";
 // incompatibly, except that ListDirectory and ReadFile keep their wire shapes.
 package omnigent.api.workspace.v1alpha1;
 
+import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
 service WorkspaceService {
@@ -81,6 +82,56 @@ service WorkspaceService {
   // client can find the branch's pull request. Configuration values and remote
   // URLs never appear in the answer.
   rpc ResolveRepositoryContext(ResolveRepositoryContextRequest) returns (ResolveRepositoryContextResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // Pull requests: one of the session's pull requests on its code host, read
+  // through the host's `gh`. Each answers with the payload the REST route under
+  // /v1/sessions/{id}/resources/github returns, so a client reads both alike.
+  // Only the server's route serves them, for a pull request the session links;
+  // another one answers FAILED_PRECONDITION. GetPullRequest, ListPullRequestFiles
+  // and GetPullRequestDiff read the session's first pull request, or the
+  // workspace branch's, when `pr_url` is empty; the others need it set, as their
+  // REST routes do.
+
+  // The pull request's overview, checks, reviews, labels and merge state. Only
+  // the session's owner may call it, since it lists the host account's identities.
+  rpc GetPullRequest(GetPullRequestRequest) returns (GetPullRequestResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The files the pull request changes.
+  rpc ListPullRequestFiles(ListPullRequestFilesRequest) returns (ListPullRequestFilesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull request's whole diff, or one file's, optionally at a pinned revision.
+  rpc GetPullRequestDiff(GetPullRequestDiffRequest) returns (GetPullRequestDiffResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull request's commits.
+  rpc ListPullRequestCommits(ListPullRequestCommitsRequest) returns (ListPullRequestCommitsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // One of the pull request's commits, as a diff.
+  rpc GetCommitDiff(GetCommitDiffRequest) returns (GetCommitDiffResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The diff between an earlier head of the pull request and its head.
+  rpc ComparePullRequestRange(ComparePullRequestRangeRequest) returns (ComparePullRequestRangeResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // The pull request's review threads, a page at a time.
+  rpc ListReviewThreads(ListReviewThreadsRequest) returns (ListReviewThreadsResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+
+  // One review thread's comments, a page at a time.
+  rpc ListReviewThreadComments(ListReviewThreadCommentsRequest) returns (ListReviewThreadCommentsResponse) {
     option idempotency_level = NO_SIDE_EFFECTS;
   }
 }
@@ -710,4 +761,89 @@ message ResolveRepositoryContextResponse {
   repeated RepositoryRemote remotes = 7;
   uint32 unsupported_remote_count = 8;
   bool truncated_remotes = 9;
+}
+
+message GetPullRequestRequest {
+  string pr_url = 1;
+}
+
+message GetPullRequestResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListPullRequestFilesRequest {
+  string pr_url = 1;
+  // Pins the revision; both empty for the current one.
+  string head_sha = 2;
+  string base_sha = 3;
+}
+
+message ListPullRequestFilesResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetPullRequestDiffRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+  string base_sha = 3;
+  // One file's diff, relative to the repository root; empty for the whole diff.
+  string path = 4;
+  // The file's path before a rename.
+  string previous_path = 5;
+  // Without a pull request, the ref the working copy is compared with.
+  string base = 6;
+}
+
+message GetPullRequestDiffResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListPullRequestCommitsRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+}
+
+message ListPullRequestCommitsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message GetCommitDiffRequest {
+  string pr_url = 1;
+  string commit_sha = 2;
+}
+
+message GetCommitDiffResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ComparePullRequestRangeRequest {
+  string pr_url = 1;
+  string head_sha = 2;
+  // The earlier head the reader last saw.
+  string from_sha = 3;
+}
+
+message ComparePullRequestRangeResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListReviewThreadsRequest {
+  string pr_url = 1;
+  string page_token = 2;
+  string head_sha = 3;
+  string base_sha = 4;
+}
+
+message ListReviewThreadsResponse {
+  google.protobuf.Struct payload = 1;
+}
+
+message ListReviewThreadCommentsRequest {
+  string pr_url = 1;
+  string thread_id = 2;
+  string page_token = 3;
+}
+
+message ListReviewThreadCommentsResponse {
+  google.protobuf.Struct payload = 1;
 }
