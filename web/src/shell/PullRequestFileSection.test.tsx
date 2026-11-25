@@ -180,6 +180,36 @@ describe("PullRequestFileSection overrides", () => {
     expect(screen.getByTestId("diff")).toBeInTheDocument();
   });
 
+  it("keeps a sparse diff inline after its unchanged lines load", async () => {
+    const { hydratePartialDiff } = await import("@pierre/diffs");
+    const changedLines = [10, 1500];
+    const fileText = (marker: string) =>
+      Array.from({ length: 4300 }, (_, index) =>
+        changedLines.includes(index + 1) ? `${marker} ${index + 1}\n` : `context ${index + 1}\n`,
+      ).join("");
+    const context = (from: number) =>
+      [0, 1, 2].map((offset) => ` context ${from + offset}\n`).join("");
+    const hunks = changedLines.map(
+      (line) =>
+        `@@ -${line - 3},7 +${line - 3},7 @@\n${context(line - 3)}` +
+        `-old ${line}\n+new ${line}\n${context(line + 1)}`,
+    );
+    const patch = `diff --git a/${FILE.path} b/${FILE.path}\n--- a/${FILE.path}\n+++ b/${FILE.path}\n${hunks.join("")}`;
+    const [fileDiff] = parsePatchFiles(patch)[0].files;
+    const { rerender } = renderSection({ forceMount: true, fileDiff });
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+
+    // Expanding context hydrates the diff in place, so its file-level count grows to the whole file.
+    hydratePartialDiff("merge", fileDiff, {
+      oldFile: { name: FILE.path, contents: fileText("old") },
+      newFile: { name: FILE.path, contents: fileText("new") },
+    });
+    expect(fileDiff.unifiedLineCount).toBeGreaterThan(LARGE_DIFF_THRESHOLD);
+    rerender({ forceMount: true, fileDiff });
+    expect(screen.queryByText(/^Large diff/)).toBeNull();
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+  });
+
   it("keeps the reader's committed selection through a find highlight", () => {
     const { rerender } = renderSection({ forceMount: true });
     fireEvent.click(screen.getByRole("button", { name: "Select lines" }));
