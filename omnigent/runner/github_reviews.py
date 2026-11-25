@@ -79,6 +79,16 @@ def _pending_mutate(root: str, reference: PullRequestRef, *args: Any, **kwargs: 
         pending_reviews.forget_pending_review(reference)
 
 
+def _confirm_review(payload: dict[str, Any], review_id: str) -> None:
+    """Refuse to report success when GitHub's answer names another review than ``review_id``.
+
+    A deletion may answer with no review, so only a review that's there is checked.
+    """
+    review = payload.get("pullRequestReview")
+    if review is not None and (not isinstance(review, dict) or review.get("id") != review_id):
+        raise github_failures.unknown_outcome()
+
+
 def get_pending_review(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """The viewer's pending review and its drafts, in the page's shape; see the module."""
     return pending_reviews.get_pending_review(root, reference)
@@ -349,7 +359,7 @@ def delete_pending_review_comment(
 ) -> dict[str, Any]:
     """Delete a draft from the viewer's pending review on this pull request."""
     _own_draft(root, reference, comment_node_id, pending_review_id)
-    _pending_mutate(
+    payload = _pending_mutate(
         root,
         reference,
         _DELETE_DRAFT_MUTATION,
@@ -357,6 +367,7 @@ def delete_pending_review_comment(
         action="delete this draft",
         input={"id": comment_node_id},
     )
+    _confirm_review(payload, pending_review_id)
     return {
         "object": "session.github.pr_comment_delete",
         "pr_url": reference.url,
@@ -421,7 +432,7 @@ def discard_pending_review(
 ) -> dict[str, Any]:
     """Delete the pending review the page saw, with its draft comments."""
     review_id = _same_pending_review(root, reference, pending_review_id)["id"]
-    _pending_mutate(
+    payload = _pending_mutate(
         root,
         reference,
         _DISCARD_MUTATION,
@@ -429,6 +440,7 @@ def discard_pending_review(
         action="discard this review",
         input={"pullRequestReviewId": review_id},
     )
+    _confirm_review(payload, review_id)
     return {
         "object": "session.github.pr_review_discard",
         "pr_url": reference.url,
@@ -715,6 +727,7 @@ def _set_reaction(
         action="change this reaction",
         input={"subjectId": node_id, "content": content},
     )
+    _confirm_reaction(payload, content=content, reacted=verb == "add")
     return {
         "object": "session.github.reaction",
         "pr_url": reference.url,
@@ -723,6 +736,28 @@ def _set_reaction(
         "reacted": verb == "add",
         **_reactions_after(payload),
     }
+
+
+def _confirm_reaction(payload: dict[str, Any], *, content: str, reacted: bool) -> None:
+    """Refuse to report success when GitHub's answer contradicts the reaction change.
+
+    The reaction and the comment's reaction groups are optional; only what's there is checked.
+    """
+    reaction = payload.get("reaction")
+    if reaction is not None and (
+        not isinstance(reaction, dict) or reaction.get("content") != content
+    ):
+        raise github_failures.unknown_outcome()
+    subject = payload.get("subject")
+    groups = subject.get("reactionGroups") if isinstance(subject, dict) else None
+    for group in groups if isinstance(groups, list) else []:
+        if (
+            isinstance(group, dict)
+            and group.get("content") == content
+            and isinstance(group.get("viewerHasReacted"), bool)
+            and group["viewerHasReacted"] is not reacted
+        ):
+            raise github_failures.unknown_outcome()
 
 
 def _reactions_after(payload: dict[str, Any]) -> dict[str, Any]:

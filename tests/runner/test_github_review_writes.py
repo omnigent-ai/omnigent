@@ -820,6 +820,42 @@ def test_a_reaction_is_added_to_the_comments_node(fake: FakeGitHub) -> None:
     assert result["can_react"] is True
 
 
+def _answer(mutation: str, payload: dict[str, Any]) -> tuple[int, str, str]:
+    """A sent mutation's answer, as ``gh`` prints it on success."""
+    return 0, json.dumps({"data": {mutation: payload}}), ""
+
+
+def _group(content: str, reacted: bool) -> dict[str, Any]:
+    return {"content": content, "viewerHasReacted": reacted, "reactors": {"totalCount": 1}}
+
+
+@pytest.mark.parametrize(
+    ("verb", "payload"),
+    [
+        ("add", {"reaction": {"content": "HEART"}}),
+        ("add", {"subject": {"reactionGroups": [_group("THUMBS_UP", False)]}}),
+        ("remove", {"subject": {"reactionGroups": [_group("THUMBS_UP", True)]}}),
+    ],
+    ids=["add-another-reaction", "add-not-reacted", "remove-still-reacted"],
+)
+def test_a_reaction_change_github_contradicts_is_an_unknown_outcome(
+    fake: FakeGitHub, verb: str, payload: dict[str, Any]
+) -> None:
+    mutation = f"{verb}Reaction"
+    fake.graphql_failure = _answer(mutation, payload)
+    change = pr_actions.add_reaction if verb == "add" else pr_actions.remove_reaction
+    with pytest.raises(UnknownOutcomeError):
+        change(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            kind="issue",
+            comment_id=5,
+            content="THUMBS_UP",
+        )
+    assert len(fake.mutations(mutation)) == 1
+
+
 def test_a_reaction_change_github_answers_without_the_comment_says_none(
     fake: FakeGitHub,
 ) -> None:
@@ -1145,6 +1181,35 @@ def test_a_draft_in_the_viewers_pending_review_is_deleted(fake: FakeGitHub) -> N
     assert sent["input"] == {"id": "PRRC_draft"}
 
 
+@pytest.mark.parametrize(
+    ("review", "confirmed"),
+    [({"id": "R_other"}, False), ("R_1", False), (None, True)],
+    ids=["another-review", "not-a-review", "no-review"],
+)
+def test_a_draft_deletion_naming_another_review_is_an_unknown_outcome(
+    fake: FakeGitHub, review: Any, confirmed: bool
+) -> None:
+    fake.pending = _own_pending(_DRAFT)
+    answer = {"pullRequestReview": review}
+    fake.graphql_failure = _answer("deletePullRequestReviewComment", answer)
+
+    def delete() -> dict[str, Any]:
+        return pr_actions.delete_pending_review_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            comment_node_id="PRRC_draft",
+            pending_review_id="R_1",
+        )
+
+    if confirmed:
+        assert delete()["comment_id"] == "PRRC_draft"
+    else:
+        with pytest.raises(UnknownOutcomeError):
+            delete()
+    assert len(fake.mutations("deletePullRequestReviewComment")) == 1
+
+
 def test_a_draft_reply_joins_the_viewers_pending_review_in_a_conversation_on_this_pr(
     fake: FakeGitHub,
 ) -> None:
@@ -1381,6 +1446,31 @@ def test_a_discard_names_the_review_it_deleted(fake: FakeGitHub) -> None:
         "pr_url": PR_URL,
         "review_id": "R_1",
     }
+
+
+@pytest.mark.parametrize(
+    ("review", "confirmed"),
+    [({"id": "R_other"}, False), (None, True)],
+    ids=["another-review", "no-review"],
+)
+def test_a_discard_naming_another_review_is_an_unknown_outcome(
+    fake: FakeGitHub, review: Any, confirmed: bool
+) -> None:
+    fake.pending = _own_pending()
+    answer = {"pullRequestReview": review}
+    fake.graphql_failure = _answer("deletePullRequestReview", answer)
+
+    def discard() -> dict[str, Any]:
+        return pr_actions.discard_pending_review(
+            "/workspace", session_id=SESSION, pr_url=PR_URL, pending_review_id="R_1"
+        )
+
+    if confirmed:
+        assert discard()["review_id"] == "R_1"
+    else:
+        with pytest.raises(UnknownOutcomeError):
+            discard()
+    assert len(fake.mutations("deletePullRequestReview")) == 1
 
 
 def test_a_started_review_answers_only_itself(fake: FakeGitHub) -> None:
