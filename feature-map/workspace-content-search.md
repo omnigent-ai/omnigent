@@ -40,6 +40,7 @@ Filename search remains in Files.
   **New tab → Search text** to search in a tab of its own, and move between tabs
   from the strip or tab search. The Workspace panel's **Cmd+Shift+F** isn't
   bound while the tabs show.
+  **Ctrl+Cmd+O** on macOS (**Ctrl+Alt+O** on Windows/Linux) opens the same search.
 
 ## Driving it with the repro environment
 
