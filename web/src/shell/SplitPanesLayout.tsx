@@ -50,6 +50,7 @@ import { PaneTitleStrip } from "./paneStrip/PaneTitleStrip";
 import { usePaneMoveDrag } from "./paneStrip/usePaneMoveDrag";
 import { type PaneStripSource, usePaneStrips } from "./paneStrip/usePaneStrips";
 import { usePendingAppPaneDrop } from "./appPanes";
+import { PaneDropPreview } from "./PaneDropPreview";
 
 /** A row along the window's top, as tall as index.css makes it: the Mac title bar there. */
 export const WINDOW_TOP_ROW_HEIGHT = `var(--pane-window-top-row, ${PANE_ROW_PX}px)`;
@@ -446,34 +447,10 @@ export function SplitPanesLayout({
             onAbort={abortDrag}
           />
         ))}
-      {shownDrop ? (
-        // The half the dragged pane or tab would take, edged in the accent on the side it meets.
-        <div
-          aria-hidden
-          data-pane-drop={`${shownDrop.targetKey}:${shownDrop.side}`}
-          className={cn(
-            "pointer-events-none absolute z-20 border-primary bg-primary/15",
-            DROP_EDGE[shownDrop.side],
-          )}
-          style={{
-            left: `${shownDrop.area.left}%`,
-            top: `${shownDrop.area.top}%`,
-            width: `${shownDrop.area.width}%`,
-            height: `${shownDrop.area.height}%`,
-          }}
-        />
-      ) : null}
+      {shownDrop ? <PaneDropPreview drop={shownDrop} /> : null}
     </div>
   );
 }
-
-/** The drop half's edge against the rest of its target, where the two panes will meet. */
-const DROP_EDGE: Record<TerminalPaneSide, string> = {
-  left: "border-r-2",
-  right: "border-l-2",
-  top: "border-b-2",
-  bottom: "border-t-2",
-};
 
 /**
  * When a pane may take keyboard focus on its own. A pane split off may take it once, as it
