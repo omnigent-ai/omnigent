@@ -117,6 +117,23 @@ def human_request_routing(
     return reason, responders or {project.user_id}
 
 
+def is_plain_ask(
+    project: Any, labels: list[dict[str, Any]] | None, requested_by: str | None
+) -> bool:
+    """Whether a ``needs-human`` ask is a plain question rather than a sign-off.
+
+    It is one when :func:`human_request_routing` routes it to nobody for a sign-off
+    (no missing ``product-ok`` on a feature, no missing ``risk-ok``) and no
+    ``owner-ok`` is owed.
+    """
+    keys = {label.get("key") for label in labels or []}
+    if ticket_kind(labels) == FEATURE_KIND and PRODUCT_OK_LABEL not in keys:
+        return False
+    if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
+        return False
+    return not owner_sign_off_pending(labels, requested_by)
+
+
 # The owner's own sign-offs; mirrors the landing gate's labels.
 RISK_LABEL = "risk"
 RISK_OK_LABEL = "risk-ok"

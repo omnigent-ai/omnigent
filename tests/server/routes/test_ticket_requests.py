@@ -253,8 +253,8 @@ async def test_an_approver_cannot_clear_what_only_the_owner_can_answer(multi_use
     product_ok = {"key": "product-ok", "value": "yes"}
     risk = {"key": "risk", "value": "migration"}
 
-    def raise_ask(title: str, labels: list[dict]) -> str:
-        ticket = store.create(project["id"], CreateTicket(title=title), TicketActor(BOB))
+    def raise_ask(title: str, labels: list[dict], requester: str = BOB) -> str:
+        ticket = store.create(project["id"], CreateTicket(title=title), TicketActor(requester))
         store.update(
             project["id"],
             ticket["id"],
@@ -273,8 +273,8 @@ async def test_an_approver_cannot_clear_what_only_the_owner_can_answer(multi_use
     )
     assert approved.status_code == 200, approved.text
 
-    # An owner-only question on an already approved feature: Bob's comment doesn't answer it.
-    question = raise_ask("Owner question", [*feature, product_ok])
+    # A question on the owner's own approved feature: Bob's comment doesn't answer it.
+    question = raise_ask("Owner question", [*feature, product_ok], requester=ALICE)
     commented = await client.post(
         f"{question}/comments", json={"text": "Looks fine to me."}, headers=_as_user(BOB)
     )
@@ -397,3 +397,69 @@ async def test_an_approver_gives_risk_ok_on_others_tickets_only(multi_user_clien
     assert given.status_code == 200, given.text
     assert {label["key"] for label in given.json()["labels"]} == {"risk", "risk-ok"}
     assert await _requests(client, ALICE) == [bobs[1]]
+
+
+async def test_a_plain_question_goes_to_the_member_who_requested_the_ticket(
+    multi_user_client, db_uri
+):
+    client = multi_user_client
+    carol = "carol@example.com"
+    project = (
+        await client.post("/v1/projects", json={"name": "Routing"}, headers=_as_user(ALICE))
+    ).json()
+    for member in (BOB, carol):
+        shared = await client.post(
+            f"/v1/projects/{project['id']}/shares",
+            json={"user_id": member},
+            headers=_as_user(ALICE),
+        )
+        assert shared.status_code == 200, shared.text
+    await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [carol]}},
+        headers=_as_user(ALICE),
+    )
+    store = ProjectTicketStore(db_uri)
+    worker = TicketActor(ALICE, uuid4().hex, uuid4().hex)
+    base = f"/v1/projects/{project['id']}/tickets"
+
+    def raise_ask(title: str, question: str, labels: list[dict] | None = None) -> str:
+        ticket = store.create(project["id"], CreateTicket(title=title), TicketActor(BOB))
+        store.update(
+            project["id"],
+            ticket["id"],
+            UpdateTicket(labels=[*(labels or []), {"key": "needs-human"}], comment=question),
+            worker,
+        )
+        return ticket["id"]
+
+    plain = raise_ask("Bob's export", "CSV or JSON?")
+    named = raise_ask("Bob's report", "@Carol can you pick the chart type?")
+    risky = raise_ask("Bob's migration", "OK to migrate?", [{"key": "risk", "value": "db"}])
+
+    async def responders(ticket_id: str) -> list[str]:
+        got = await client.get(f"{base}/{ticket_id}", headers=_as_user(ALICE))
+        return got.json()["waiting_on"]["responders"]
+
+    # A plain question waits on the requester; one that names someone waits on them.
+    assert await responders(plain) == [BOB]
+    assert await responders(named) == [carol]
+    # A sign-off ask keeps its approvers: the owner and the approver who didn't request it.
+    assert await responders(risky) == sorted([ALICE, carol])
+    assert await _requests(client, BOB) == ["Bob's export"]
+    assert await _requests(client, carol) == ["Bob's migration", "Bob's report"]
+    assert await _requests(client, ALICE) == ["Bob's migration"]
+
+    # The requester can't clear a sign-off ask by commenting.
+    commented = await client.post(
+        f"{base}/{risky}/comments", json={"text": "Sure, go ahead."}, headers=_as_user(BOB)
+    )
+    assert commented.status_code == 201, commented.text
+    assert await responders(risky) == sorted([ALICE, carol])
+
+    # The owner isn't asked a member's question but can still answer it.
+    answered = await client.post(
+        f"{base}/{plain}/comments", json={"text": "JSON, please."}, headers=_as_user(ALICE)
+    )
+    assert answered.status_code == 201, answered.text
+    assert await _requests(client, BOB) == []

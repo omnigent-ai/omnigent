@@ -18,6 +18,7 @@ from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlProject,
+    SqlProjectShare,
     SqlProjectTicket,
     SqlProjectTicketEvent,
     SqlProjectTicketLink,
@@ -1086,11 +1087,6 @@ class ProjectTicketStore:
         Mirrors the Inbox: the commenter must be someone the ask is routed to, and a
         person's follow-up on their own ask doesn't answer it.
         """
-        from omnigent.server.product_approval import (
-            human_request_routing,
-            owner_sign_off_pending,
-        )
-
         if actor.session_id is not None or actor.agent_id is not None:
             return False
         if not _has_needs_human(ticket.labels):
@@ -1098,10 +1094,8 @@ class ProjectTicketStore:
         routing_project = SimpleNamespace(
             user_id=project.user_id, config=_decode_config(project.config)
         )
-        _, responders = human_request_routing(routing_project, ticket.labels, ticket.requested_by)
-        if owner_sign_off_pending(ticket.labels, ticket.requested_by):
-            responders = {project.user_id}
-        if actor.user_id not in responders:
+        _, _, answerers = self._ask_routing(session, routing_project, ticket)
+        if actor.user_id not in answerers:
             return False
         asks = self._human_asks(session, ticket)
         if asks and asks[-1].end is None and asks[-1].session_id is None:
@@ -1872,6 +1866,114 @@ class ProjectTicketStore:
                     }
         return builtins.list(entries.values())
 
+    def _ask_routing(
+        self, session: Session, routing_project: Any, ticket: SqlProjectTicket
+    ) -> tuple[str, set[str | None], set[str | None]]:
+        """A ``needs-human`` ask's reason, the people it's routed to, and who may answer it.
+
+        Sign-off asks keep :func:`human_request_routing`; only the owner answers one still
+        owed their own sign-off. A plain question goes to the people its question
+        @mentions, else to the member who requested the ticket, else to the owner; the
+        owner may always answer it.
+        """
+        from omnigent.server.product_approval import (
+            human_request_routing,
+            is_plain_ask,
+            owner_sign_off_pending,
+        )
+
+        reason, responders = human_request_routing(
+            routing_project, ticket.labels, ticket.requested_by
+        )
+        owner = routing_project.user_id
+        if owner_sign_off_pending(ticket.labels, ticket.requested_by):
+            return reason, responders, {owner}
+        if not is_plain_ask(routing_project, ticket.labels, ticket.requested_by):
+            return reason, responders, responders
+        responders = self._plain_ask_responders(session, owner, ticket)
+        return reason, responders, {*responders, owner}
+
+    def _plain_ask_responders(
+        self, session: Session, owner: str | None, ticket: SqlProjectTicket
+    ) -> set[str | None]:
+        from omnigent.server.persona_mentions import find_mentions, person_aliases, split_mentions
+
+        asks = self._human_asks(session, ticket)
+        ask = asks[-1] if asks and asks[-1].end is None else None
+        raised = (
+            session.scalar(
+                select(SqlProjectTicketEvent).where(
+                    SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+                    SqlProjectTicketEvent.project_id == ticket.project_id,
+                    SqlProjectTicketEvent.ticket_id == ticket.id,
+                    SqlProjectTicketEvent.position == ask.start,
+                )
+            )
+            if ask is not None
+            else None
+        )
+        # A person who raised the ask is asking someone else.
+        asker = (
+            raised.user_id
+            if raised is not None and raised.session_id is None and raised.agent_id is None
+            else None
+        )
+        members = {
+            *session.scalars(
+                select(SqlProjectShare.user_id).where(
+                    SqlProjectShare.workspace_id == ticket.workspace_id,
+                    SqlProjectShare.project_id == ticket.project_id,
+                )
+            ),
+            *([owner] if owner else []),
+        }
+        question = self._ask_question_text(session, ticket, asks, asker)
+        if question and "@" in question:
+            _, named = split_mentions(
+                find_mentions(question, person_aliases(sorted(members - {asker}), []))
+            )
+            if named:
+                return {entry["user_id"] for entry in named}
+        requester = ticket.requested_by
+        if requester in members and requester != asker:
+            return {requester}
+        return {owner}
+
+    def _ask_question_text(
+        self,
+        session: Session,
+        ticket: SqlProjectTicket,
+        asks: builtins.list[_HumanAsk],
+        asker: str | None,
+    ) -> str | None:
+        """The open ask's question, as the decision box shows it."""
+        if not asks or asks[-1].end is not None:
+            return None
+        scope = (
+            SqlProjectTicketEvent.workspace_id == ticket.workspace_id,
+            SqlProjectTicketEvent.project_id == ticket.project_id,
+            SqlProjectTicketEvent.ticket_id == ticket.id,
+        )
+        if asker is not None:
+            position = session.scalar(
+                select(func.min(SqlProjectTicketEvent.position)).where(
+                    *scope,
+                    SqlProjectTicketEvent.session_id.is_(None),
+                    SqlProjectTicketEvent.agent_id.is_(None),
+                    SqlProjectTicketEvent.position >= asks[-1].start,
+                    SqlProjectTicketEvent.kind.in_(NEW_COMMENT_KINDS),
+                    SqlProjectTicketEvent.user_id == asker,
+                )
+            )
+        else:
+            position = self._latest_ask_position(session, ticket, asks)
+        if position is None:
+            return None
+        row = session.scalar(
+            select(SqlProjectTicketEvent).where(*scope, SqlProjectTicketEvent.position == position)
+        )
+        return str(row.payload.get("text") or "") if row is not None else None
+
     def _routed_ask(
         self,
         session: Session,
@@ -1887,21 +1989,15 @@ class ProjectTicketStore:
         from omnigent.server.product_approval import (
             REQUEST_PRODUCT_OK,
             RISK_OK_LABEL,
-            human_request_routing,
             owner_sign_off_pending,
             pending_sign_offs,
             product_approvers,
         )
 
-        reason, responders = human_request_routing(
-            routing_project, ticket.labels, ticket.requested_by
-        )
+        reason, responders, answerers = self._ask_routing(session, routing_project, ticket)
         if only_for_viewer and viewer not in responders:
             return reason, responders, None
-        # Only the owner can clear an ask still waiting on their own sign-off;
-        # otherwise an approver adding product-ok answers a feature's ask.
         owner_pending = owner_sign_off_pending(ticket.labels, ticket.requested_by)
-        answerers = {routing_project.user_id} if owner_pending else responders
         # An approver's product-ok answers the ask only when no risk-ok is also owed.
         risk_owed = RISK_OK_LABEL in pending_sign_offs(
             routing_project, ticket.labels, ticket.requested_by
