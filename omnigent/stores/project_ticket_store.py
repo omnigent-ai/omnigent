@@ -221,6 +221,16 @@ def _human_asks(rows: builtins.list[SqlProjectTicketEvent]) -> builtins.list[_Hu
     return asks
 
 
+def _partial_sign_off(row: SqlProjectTicketEvent) -> bool:
+    """A person's edit that added sign-off labels without answering the open ask."""
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    return (
+        row.kind in NEW_UPDATE_KINDS
+        and bool(payload.get("gate_labels_added"))
+        and not payload.get("answered_ask")
+    )
+
+
 def _labeled_event(
     row: SqlProjectTicketEvent,
     orchestrator_session_id: str | None,
@@ -1120,9 +1130,9 @@ class ProjectTicketStore:
         answerers = [
             r for r in responders if r is not None and not (raised_by_person and r == asker)
         ]
-        answered = (
-            session.scalar(
-                select(SqlProjectTicketEvent.position)
+        candidates = (
+            session.scalars(
+                select(SqlProjectTicketEvent)
                 .where(
                     *scope,
                     *by_person,
@@ -1132,12 +1142,13 @@ class ProjectTicketStore:
                     if answerers
                     else SqlProjectTicketEvent.user_id.is_(None),
                 )
-                .limit(1)
+                .order_by(SqlProjectTicketEvent.position)
             )
             if answerers or not raised_by_person
-            else None
+            else []
         )
-        if answered is not None:
+        # A sign-off that left the ask open gave one of several requested; the rest still wait.
+        if any(not _partial_sign_off(event) for event in candidates):
             return None
         if product_ok_from and self._product_ok_added_since(
             session, ticket, start, product_ok_from

@@ -1109,6 +1109,65 @@ def test_a_persons_sign_off_label_answers_the_ask_but_an_agents_does_not(board):
     assert tickets.human_requests(user_id="alice")["data"] == []
 
 
+def test_each_requested_sign_off_is_given_independently(board, db_uri):
+    tickets, projects, project = board
+    projects.update(project.id, user_id="alice", config={"product_approvers": ["carol"]})
+    projects.add_share(project.id, "carol", user_id="alice")
+    worker = TicketActor("alice", uuid4().hex, uuid4().hex)
+    owner, approver = TicketActor("alice"), TicketActor("carol")
+
+    def offers(ticket_id: str, viewer: str) -> list[str]:
+        from types import SimpleNamespace
+
+        from omnigent.server.product_approval import sign_offs_for
+
+        read = tickets.get(project.id, ticket_id, user_id="alice")
+        config = projects.get(project.id, user_id="alice").config
+        routing = SimpleNamespace(user_id="alice", config=config)
+        return [offer["key"] for offer in sign_offs_for(routing, read, viewer)]
+
+    def labels_of(ticket_id: str) -> set[str]:
+        return {
+            label["key"] for label in tickets.get(project.id, ticket_id, user_id="alice")["labels"]
+        }
+
+    # Bob's risky feature asks for both risk-ok (the owner's) and product-ok (approvers').
+    asked = [{"key": "kind", "value": "feature"}, {"key": "risk", "value": "auth"}]
+    ticket = tickets.create(
+        project.id, CreateTicket(title="Both", labels=asked), worker, requested_by="bob"
+    )["id"]
+    tickets.update(project.id, ticket, UpdateTicket(add_labels=[{"key": "needs-human"}]), worker)
+    assert offers(ticket, "alice") == ["risk-ok", "product-ok"]
+
+    # Giving risk-ok keeps the ask, and product-ok is still offered.
+    tickets.update(project.id, ticket, UpdateTicket(add_labels=[{"key": "risk-ok"}]), owner)
+    event = tickets.events(project.id, ticket, user_id="alice")["data"][-1]
+    assert event["payload"]["gate_labels_added"] == ["risk-ok"]
+    assert "answered_ask" not in event["payload"]
+    assert "needs-human" in labels_of(ticket)
+    assert offers(ticket, "alice") == ["product-ok"]
+    assert len(tickets.human_requests(user_id="alice")["data"]) == 1
+
+    # The last requested sign-off answers the ask.
+    tickets.update(project.id, ticket, UpdateTicket(add_labels=[{"key": "product-ok"}]), owner)
+    event = tickets.events(project.id, ticket, user_id="alice")["data"][-2]
+    assert event["payload"]["gate_labels_added"] == ["product-ok"]
+    assert event["payload"]["answered_ask"] is True
+    assert "needs-human" not in labels_of(ticket)
+    assert tickets.human_requests(user_id="alice")["data"] == []
+
+    # An approver's product-ok, given first, leaves risk-ok offered to the owner and to
+    # that approver (who may give it on a ticket they didn't request).
+    other = tickets.create(
+        project.id, CreateTicket(title="Approver first", labels=asked), worker, requested_by="bob"
+    )["id"]
+    tickets.update(project.id, other, UpdateTicket(add_labels=[{"key": "needs-human"}]), worker)
+    tickets.update(project.id, other, UpdateTicket(add_labels=[{"key": "product-ok"}]), approver)
+    assert "needs-human" in labels_of(other)
+    assert offers(other, "alice") == ["risk-ok"] and offers(other, "carol") == ["risk-ok"]
+    assert len(tickets.human_requests(user_id="alice")["data"]) == 1
+
+
 def test_concurrent_single_label_changes_both_survive(board):
     import threading
 
