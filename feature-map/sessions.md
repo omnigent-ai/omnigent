@@ -352,6 +352,11 @@ the header menu), and each place is a separate entry point.
   **⋯** menu with **Gadget details** and **Delete gadget**. A gadget that asks to
   read the viewer's sessions waits for **Allow** / **Don’t allow** first; a gadget
   that navigated itself stops with **Reload gadget**, after which it asks again.
+  The Gadget page lists the viewer's gadgets and a **Shared with you** section; each
+  row's **⋯** menu has **Rename**, **Pin to sidebar** / **Unpin from sidebar** and
+  **Delete gadget**, as the viewer's access allows. Closing a gadget's tab takes it out
+  of that session's side panel for the viewer who closed it only; it stays linked for
+  others who show it there.
 
 ## How to get to it (user POV)
 

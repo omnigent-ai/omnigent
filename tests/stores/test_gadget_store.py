@@ -182,6 +182,16 @@ def test_each_user_has_their_own_files(store: LocalGadgetStore) -> None:
     assert store.user_files("../odd/user").read_json("shelf/pins.json") == {"owner": "../odd/user"}
 
 
+def test_a_user_id_holding_a_separator_never_names_another_registrations_files(
+    store: LocalGadgetStore,
+) -> None:
+    store.user_files("a", owner_registration="b").mkdirs("shelf")
+    store.user_files("a", owner_registration="b").create_json("shelf/pins.json", {"owner": "a"})
+    # An ID that spells "a" and "b" joined by a newline is another person's scope.
+    with pytest.raises(NotFound):
+        store.user_files("a\nb").read_json("shelf/pins.json")
+
+
 def test_metadata_with_the_wrong_shape_is_corrupt(store: LocalGadgetStore, tmp_path: Path) -> None:
     gadget = store.create(ALICE, "Board")
     metadata = tmp_path / "gadgets" / "gadgets" / gadget.id / "gadget.json"

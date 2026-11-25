@@ -83,7 +83,9 @@ _HEAD_PROBES_PER_CALL = 8
 
 
 def _user_key(user_id: str, registration: str | None = None) -> str:
-    material = user_id if registration is None else f"{user_id}\n{registration}"
+    # A JSON array keeps the parts apart whatever characters a user ID holds.
+    parts = [user_id] if registration is None else [user_id, registration]
+    material = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 

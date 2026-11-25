@@ -204,7 +204,7 @@ interface Client {
   context: {
     app: { id: string; name: string };
     revisionId: string;
-    viewer: { id: string; displayName: string }; // store viewer.id, not the name
+    viewer: { id: string; displayName: string }; // who is viewing; store viewer.id, not the name
     permissions: { writeData: boolean; publish: boolean };
     preview: boolean; // template preview: data in memory, actions off
   };
@@ -278,6 +278,17 @@ interface ActionProgress {
 // viewer's gadget session. A newSession prompt is a draft the viewer reads before sending (in
 // the composer, or in the Create session menu when the gadget fills the screen), so write it
 // for them to read.
+// The viewer's own sessions, newest first. The first call asks the viewer to allow it.
+interface Sessions {
+  readonly canList: boolean; // false without sessions.read
+  list(params?: { limit?: number /* 1–100 */; after?: string }): Promise<{
+    items: { id: string; title: string; status: string; harness?: string; agentName?: string;
+             createdAt: number | null; updatedAt: number | null; unread: boolean;
+             needsInput: boolean; backgroundWork: boolean }[];
+    nextCursor: string | null; // pass as `after` for the next page
+  }>;
+}
+
 interface Navigation {
   newSession(params?: { prompt?: string; display?: string }): Promise<{ opened: true }>;
   openSession(sessionId: string, options?: { display?: string }): Promise<{ opened: true }>;
