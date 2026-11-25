@@ -7787,3 +7787,60 @@ describe("AppShell desktop Close", () => {
     expect(screen.getByText("home")).toBeInTheDocument();
   });
 });
+
+describe("desktop recent-session switcher", () => {
+  beforeEach(() => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: () => () => {},
+      setDesktopCommandState: () => {},
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    resetDesktopCommandsForTests();
+  });
+
+  it("lists the sidebar's loaded sessions, most recent first", () => {
+    const listed = (id: string, title: string, updatedAt: number) => ({
+      id,
+      object: "conversation" as const,
+      title,
+      created_at: updatedAt,
+      updated_at: updatedAt,
+      labels: {},
+      permission_level: null,
+      host_id: null,
+      runner_id: null,
+      workspace: null,
+    });
+    useConvMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [
+              listed("conv_recent_open", "Open session", 3),
+              listed("conv_recent_older", "Older session", 1),
+              listed("conv_recent_newer", "Newer session", 2),
+            ],
+            first_id: null,
+            last_id: null,
+            has_more: false,
+          },
+        ],
+        pageParams: [undefined],
+      },
+    } as ReturnType<typeof useConversations>);
+    renderShell("/c/conv_recent_open");
+
+    fireEvent.keyDown(window, { key: "Tab", code: "Tab", ctrlKey: true });
+
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      expect.stringContaining("Open session"),
+      expect.stringContaining("Newer session"),
+      expect.stringContaining("Older session"),
+    ]);
+  });
+});
