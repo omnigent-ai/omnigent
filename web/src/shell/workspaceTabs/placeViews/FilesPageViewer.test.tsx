@@ -32,7 +32,15 @@ vi.mock("@/hooks/useComparisonFileDiff", () => ({
 vi.mock("@/shell/codeMirror/CodeMirrorFileEditor", () => ({
   CodeMirrorFileEditor: (props: ComponentProps<typeof CodeMirrorFileEditor>) => {
     captured.editor = props;
-    return <div data-testid="editor">{props.content}</div>;
+    // As the real find bar does, an opened find takes focus.
+    return (
+      <div data-testid="editor">
+        {props.content}
+        {props.searchOpen ? (
+          <input aria-label="Find" data-testid="file-find-input" autoFocus />
+        ) : null}
+      </div>
+    );
   },
 }));
 vi.mock("@/shell/FileViewer", () => ({
@@ -88,7 +96,12 @@ beforeEach(() => {
   comparison.useDiff.mockClear();
   vi.mocked(useFileContent).mockReset();
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // The finder store is app-wide; reset it even when a test fails part-way.
+  useFileFinderStore.getState().setAvailableSession(null);
+  useFileFinderStore.setState({ request: null });
+});
 
 describe("showsInFileViewer", () => {
   it("sends Markdown, images, PDFs, 3D models and binary files to the app's viewer, and other text to the editor", () => {
@@ -160,9 +173,17 @@ describe("FilesPageViewer", () => {
     expect(captured.editor!.searchOpen).toBe(false);
     await userEvent.click(within(menu).getByRole("menuitem", { name: "Find in file" }));
     expect(captured.editor!.searchOpen).toBe(true);
+    // The closing menu leaves focus in the find field rather than taking it back to ⋯.
+    await waitFor(() => expect(screen.getByTestId("file-find-input")).toHaveFocus());
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 20);
+        }),
+    );
+    expect(screen.getByTestId("file-find-input")).toHaveFocus();
     act(() => captured.editor!.onSearchHandled!());
     expect(captured.editor!.searchOpen).toBe(false);
-    useFileFinderStore.getState().setAvailableSession(null);
   });
 
   it("leaves the finders out of File actions while the session can't search", async () => {
@@ -173,7 +194,7 @@ describe("FilesPageViewer", () => {
     expect(screen.queryByRole("menuitem", { name: "Search Text in Workspace…" })).toBeNull();
   });
 
-  it("opens a finder from File actions only once focus is back on ⋯, so cancelling it lands there", async () => {
+  it("opens a finder from File actions only once focus is back on ⋯", async () => {
     useFileFinderStore.getState().setAvailableSession("conv_1");
     renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
     const trigger = screen.getByRole("button", { name: "File actions" });
@@ -191,7 +212,6 @@ describe("FilesPageViewer", () => {
     };
     await openFromMenu("Go to File in Workspace…", "files");
     await openFromMenu("Search Text in Workspace…", "text");
-    useFileFinderStore.getState().setAvailableSession(null);
   });
 
   it("shows the editor's save status in the toolbar", () => {

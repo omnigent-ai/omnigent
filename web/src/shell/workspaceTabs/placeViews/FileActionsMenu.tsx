@@ -66,7 +66,11 @@ export function FileActionsMenu({ conversationId, path, onFind }: FileActionsMen
     {
       key: "find",
       rows: [
-        <DropdownMenuItem key="find" onSelect={onFind}>
+        <DropdownMenuItem
+          key="find"
+          // The find field takes focus in place of ⋯, once the menu has closed.
+          onSelect={() => menuHandOff.runAfterClose(onFind)}
+        >
           <SearchIcon />
           {FIND_IN_FILE_LABEL}
         </DropdownMenuItem>,
