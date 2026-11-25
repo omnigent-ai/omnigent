@@ -22,7 +22,13 @@ from omnigent.entities.project_kpi import (
     SetProjectKpis,
 )
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.project_kpis import KpiInputs, KpiStatus, kpi_rows, load_series
+from omnigent.server.project_kpis import (
+    KpiInputs,
+    KpiStatus,
+    kpi_history_since,
+    kpi_rows,
+    load_series,
+)
 from omnigent.server.project_status import (
     StatusPeriod,
     StatusSources,
@@ -203,18 +209,26 @@ def create_project_kpis_router(
         return project
 
     def inputs_for(
-        request: Request, project: Project, period: StatusPeriod, user_id: str | None
+        request: Request,
+        project: Project,
+        period: StatusPeriod,
+        user_id: str | None,
+        since: int | None,
     ) -> KpiInputs:
+        """Readers bounded to what a range starting at *since* can count."""
         return KpiInputs(
             project=project,
             period=period,
             sources=sources(request),
             stage_histories=functools.cache(
-                lambda: ticket_store.stage_histories(project.id, user_id=user_id)
+                lambda: ticket_store.stage_histories(
+                    project.id, user_id=user_id, since_epoch=since
+                )
             ),
             stages=functools.cache(
                 lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
             ),
+            history_since=since,
         )
 
     def build(
@@ -226,7 +240,7 @@ def create_project_kpis_router(
     ) -> dict[str, Any]:
         period = status_period(window, now_epoch())
         kpis = current.kpis if current else []
-        inputs = inputs_for(request, project, period, user_id)
+        inputs = inputs_for(request, project, period, user_id, kpi_history_since(period))
         series = load_series((kpi.metric for kpi in kpis), inputs)
         return {
             "object": "project.kpis",
@@ -311,7 +325,7 @@ def create_project_kpis_router(
         user_id: str | None,
     ) -> dict[str, Any]:
         period = status_period("7d" if range_id == "trend" else range_id, now_epoch())
-        inputs = inputs_for(request, project, period, user_id)
+        inputs = inputs_for(request, project, period, user_id, range_bounds(range_id, period)[0])
         member_of = move_member_resolver(project, conversation_store)
         series = load_series([metric], inputs, member_of)[metric]
         result = drilldown(series, period, range_id, member) if series.dated else None

@@ -127,6 +127,8 @@ class KpiInputs:
     sources: StatusSources
     stage_histories: Callable[[], StageHistories]
     stages: Callable[[], list[dict[str, Any]]]
+    #: The earliest time any range in the request starts; ``None`` reads all history.
+    history_since: int | None = None
 
 
 def _day_start(day_utc: str) -> int:
@@ -317,6 +319,13 @@ def _covering(period: StatusPeriod, trend_since_day: str) -> StatusPeriod:
     )
 
 
+def kpi_history_since(period: StatusPeriod) -> int | None:
+    """The earliest moment a KPI request needs: its window's start or the trend's."""
+    if period.since_epoch is None:
+        return None
+    return min(period.since_epoch, _day_start(trend_since_day(period.today_utc)))
+
+
 def trend_since_day(today_utc: str) -> str:
     return (date.fromisoformat(today_utc) - timedelta(days=TREND_DAYS)).isoformat()
 
@@ -336,7 +345,7 @@ def load_series(
         merged = (
             None
             if source is None or not hasattr(source, "merged_items")
-            else (_call(source, "merged_items", project))
+            else (_call(source, "merged_items", project, inputs.history_since))
         )
         if merged is not None:
             items = [

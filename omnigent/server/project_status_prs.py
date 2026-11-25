@@ -211,13 +211,21 @@ class ProjectPrsMergedSource:
         )
 
     def prs_merged(self, project: Project, period: StatusPeriod) -> MemberTotals:
-        return totals(self.merged_items(project), period)
+        return totals(self.merged_items(project, period.since_epoch), period)
 
-    def merged_items(self, project: Project) -> list[MergedItem]:
-        """Every counted merge with its date and member, for per-day series."""
+    def merged_items(self, project: Project, since_epoch: int | None = None) -> list[MergedItem]:
+        """Every counted merge with its date and member, for per-day series.
+
+        :param since_epoch: Skip Merged-stage tickets not moved since then; they can't
+            count in a range starting there. ``None`` reads every ticket.
+        """
+        session_prs = self._session_prs(project)
+        if any(pr.merged_at is None for pr in session_prs):
+            # An undated session PR takes its date from its ticket's move, however old.
+            since_epoch = None
         return combine(
-            self._session_prs(project),
-            self._merged_tickets(project),
+            session_prs,
+            self._merged_tickets(project, since_epoch),
             self._member_resolver(project),
         )
 
@@ -242,7 +250,9 @@ class ProjectPrsMergedSource:
                     )
         return merged
 
-    def _merged_tickets(self, project: Project) -> list[MergedTicket]:
+    def _merged_tickets(
+        self, project: Project, since_epoch: int | None = None
+    ) -> list[MergedTicket]:
         stages = self._tickets.stages(project.id, user_id=project.user_id)["stages"]
         completed = next((stage for stage in reversed(stages) if stage.get("is_complete")), None)
         if completed is None:
@@ -262,6 +272,22 @@ class ProjectPrsMergedSource:
                     )
                 ).all()
             )
+            if ticket_ids and since_epoch is not None:
+                # A ticket's latest move into the stage is an update; none since means
+                # it was moved there before the range.
+                ticket_ids = list(
+                    session.scalars(
+                        select(SqlProjectTicketEvent.ticket_id)
+                        .where(
+                            SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                            SqlProjectTicketEvent.project_id == project_hex,
+                            SqlProjectTicketEvent.ticket_id.in_(ticket_ids),
+                            SqlProjectTicketEvent.kind == EVENT_CODES["updated"],
+                            SqlProjectTicketEvent.created_at >= since_epoch,
+                        )
+                        .distinct()
+                    ).all()
+                )
             if not ticket_ids:
                 return []
             events = session.scalars(

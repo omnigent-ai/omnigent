@@ -171,7 +171,7 @@ def test_trend_covers_seven_full_days_and_today() -> None:
         SimpleNamespace(key="pr1", merged_at=yesterday + 5),
         SimpleNamespace(key="pr2", merged_at=None),
     ]
-    prs = SimpleNamespace(merged_items=lambda project: merged)
+    prs = SimpleNamespace(merged_items=lambda project, since=None: merged)
     inputs = _inputs(spend, prs, lambda: histories)
     shipped = ProjectKpi(
         name="S", metric="tickets_shipped", why="w", target=2, direction="at_least"
@@ -372,7 +372,9 @@ def test_drilldown_days_match_the_tile_and_list_what_is_left_out() -> None:
         SimpleNamespace(key="https://git.example.com/o/r/pull/1", merged_at=yesterday + 5),
         SimpleNamespace(key="https://git.example.com/o/r/pull/2", merged_at=None),
     ]
-    inputs = _inputs(None, SimpleNamespace(merged_items=lambda project: merged), lambda: histories)
+    inputs = _inputs(
+        None, SimpleNamespace(merged_items=lambda project, since=None: merged), lambda: histories
+    )
     series = load_series(["tickets_shipped", "merged_prs"], inputs, member_of)
     shipped = ProjectKpi(
         name="S", metric="tickets_shipped", why="w", target=1, direction="at_least"

@@ -494,7 +494,7 @@ class ProjectTicketStore:
             return moves
 
     def stage_histories(
-        self, project_id: str, *, user_id: str | None
+        self, project_id: str, *, user_id: str | None, since_epoch: int | None = None
     ) -> builtins.dict[str, builtins.list[dict[str, Any]]]:
         """Each ticket's stages in time order, starting with the one it was created in.
 
@@ -502,20 +502,27 @@ class ProjectTicketStore:
         "is_complete", "at", "created", "user_id", "session_id"}`` entries: who made
         each move. ``created`` marks the ticket's creation, missing for tickets
         created before stages were recorded.
+
+        :param since_epoch: Only tickets created or updated at or after it, each with
+            its whole history, so a move's previous stage and the ticket's creation
+            are still there. ``None`` reads every ticket.
         """
         with self._session("list_ticket_stage_histories") as session:
             self._project(session, project_id, user_id)
-            stmt = (
-                select(SqlProjectTicketEvent)
-                .where(
-                    SqlProjectTicketEvent.workspace_id == current_workspace_id(),
-                    SqlProjectTicketEvent.project_id == _identifier(project_id),
-                    SqlProjectTicketEvent.kind.in_(
-                        (EVENT_CODES["created"], EVENT_CODES["updated"])
-                    ),
-                )
-                .order_by(SqlProjectTicketEvent.ticket_id, SqlProjectTicketEvent.position)
+            scope = (
+                SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                SqlProjectTicketEvent.project_id == _identifier(project_id),
+                SqlProjectTicketEvent.kind.in_((EVENT_CODES["created"], EVENT_CODES["updated"])),
             )
+            stmt = select(SqlProjectTicketEvent).where(*scope)
+            if since_epoch is not None:
+                active = (
+                    select(SqlProjectTicketEvent.ticket_id)
+                    .where(*scope, SqlProjectTicketEvent.created_at >= since_epoch)
+                    .distinct()
+                )
+                stmt = stmt.where(SqlProjectTicketEvent.ticket_id.in_(active))
+            stmt = stmt.order_by(SqlProjectTicketEvent.ticket_id, SqlProjectTicketEvent.position)
             histories: dict[str, builtins.list[dict[str, Any]]] = {}
             for row in session.scalars(stmt):
                 payload = row.payload or {}
