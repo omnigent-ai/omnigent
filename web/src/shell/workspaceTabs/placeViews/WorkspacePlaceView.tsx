@@ -20,6 +20,8 @@ import { isFilePositionPending } from "@/shell/filePositionState";
 import type { FilePosition } from "@/shell/FileViewerContext";
 import { PullRequestPanel } from "@/shell/PullRequestPanel";
 import { PullRequestPageBody } from "@/pullRequestPage/PullRequestPageBody";
+import { usePullRequestPageRoute } from "@/pullRequestPage/pullRequestPageRoute";
+import { usePullRequestsV2 } from "@/lib/workspaceSurfaces";
 
 import type { OpenOptions } from "../planOpen";
 import type { TabLanding } from "../workspaceTabsStore";
@@ -52,6 +54,7 @@ import {
   type PullRequestPlace,
 } from "./placeViewActions";
 import { FILES_TREE_WIDTH } from "./filesTreeWidth";
+import { PullRequestPlaceView as NewPullRequestPlaceView } from "./PullRequestPlaceView";
 import { FilesPageTree } from "./FilesPageTree";
 import { FilesTreeOptionsMenu, useFilesTreeOptionCommands } from "./filesTreeOptions";
 import { type FilesPageLeaveGuard, FilesPageViewer } from "./FilesPageViewer";
@@ -155,6 +158,28 @@ export function WorkspacePlaceView(props: WorkspacePlaceViewProps) {
     default:
       return <PullRequestPlaceView {...props} place={props.place} />;
   }
+}
+
+/**
+ * The new PR page with Pull Requests v2 on, where the session's route serves the PR methods;
+ * else the classic one. Neither shows while the route is asked, so nothing flashes.
+ */
+function PullRequestPlaceView(props: WorkspacePlaceViewProps & { place: PullRequestPlace }) {
+  if (!usePullRequestsV2()) return <ClassicPullRequestPlaceView {...props} />;
+  return <RoutedPullRequestPlaceView {...props} />;
+}
+
+/** The new PR page where the session's route serves the PR methods, else the classic one. */
+function RoutedPullRequestPlaceView(props: WorkspacePlaceViewProps & { place: PullRequestPlace }) {
+  const route = usePullRequestPageRoute(props.conversationId);
+  if (route === "loading") {
+    return <div className="flex min-h-0 flex-1" data-testid="workspace-pull-request-place" />;
+  }
+  return route ? (
+    <NewPullRequestPlaceView {...props} />
+  ) : (
+    <ClassicPullRequestPlaceView {...props} />
+  );
 }
 
 function FilesPlaceView({
@@ -346,7 +371,7 @@ function ChangesPlaceView({
   );
 }
 
-function PullRequestPlaceView({
+function ClassicPullRequestPlaceView({
   conversationId,
   place,
   active,

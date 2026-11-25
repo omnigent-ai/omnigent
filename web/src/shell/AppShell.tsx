@@ -171,7 +171,13 @@ import { ChatHeader } from "./ChatHeader";
 import { ProjectHomeHeaderActions, ProjectHomeTitle } from "@/projectHome/ProjectHomeHeader";
 import { projectNameFromHomePath } from "@/projectHome/projectHomeNavigation";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
-import type { FilePosition, OpenFileOptions, FileNavigationGuard } from "./FileViewerContext";
+import type {
+  FilePosition,
+  OpenFileOptions,
+  FileNavigationGuard,
+  PullRequestsTarget,
+  ShowPullRequestsOptions,
+} from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
 import { selectPullRequestInPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
@@ -2984,6 +2990,24 @@ function AppShellImpl() {
       setRightPanelOpenAnimated,
     ],
   );
+  // In the tabs sidebar, one PR or the list shows in a tab of its own; elsewhere, as `options` say.
+  const showPullRequests = useCallback(
+    (target: PullRequestsTarget, options: ShowPullRequestsOptions) => {
+      const tabsSession = tabsSessionRef.current;
+      if (!tabsModeRef.current || tabsSession === null) {
+        if (options.classic === "open")
+          openGithubTab(target.kind === "pull" ? target.url : undefined);
+        return;
+      }
+      void routeToWorkspaceTabs((tabs) =>
+        tabs.showWorkspacePullRequests(tabsSession, target, { background: options.background }),
+      );
+      if (options.background) return;
+      revealTabsSidebar();
+      writeSessionWorkspaceState(tabsSession, { open: true });
+    },
+    [openGithubTab, revealTabsSidebar],
+  );
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
@@ -3053,6 +3077,7 @@ function AppShellImpl() {
       registerNavigationGuard,
       guardFileNavigation,
       openGithubTab,
+      showPullRequests,
       openFolder: showFilesPanel ? openFolderInFiles : undefined,
       isChangedPath,
       conversationId,
@@ -3065,6 +3090,7 @@ function AppShellImpl() {
       registerNavigationGuard,
       guardFileNavigation,
       openGithubTab,
+      showPullRequests,
       showFilesPanel,
       openFolderInFiles,
       isChangedPath,
