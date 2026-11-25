@@ -84,7 +84,7 @@ export interface TabSettingsStrip {
   canOpen: (page: DefaultWorkspaceTab) => boolean;
   /** The strip shows only its empty New tab, so nothing was chosen yet. */
   untouched: boolean;
-  /** Someone picked a tab since the settings last arranged the strip. */
+  /** The user opened, moved or selected something since the settings last arranged the strip. */
   choseSince: boolean;
 }
 
