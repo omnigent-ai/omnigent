@@ -3086,7 +3086,9 @@ function createWindow(targetUrl, opts = {}) {
     height: savedBounds?.height ?? defaultSize.height,
     // Without saved coordinates Electron centers the window.
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
-    minWidth: 720,
+    // Narrow enough to tile beside other windows; the docked sidebar (at most half the window)
+    // still leaves the chat room for its composer.
+    minWidth: 480,
     // Tall enough that the bundled setup page (logo, Start-locally, divider,
     // URL field, Connect, and a few recents) fits without overflowing.
     minHeight: 600,

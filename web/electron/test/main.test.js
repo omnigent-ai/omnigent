@@ -2941,7 +2941,7 @@ describe("panel windows", () => {
     assert.equal(h.api.mainWindows()[0], h.win);
     assert.equal(h.api.activeWindow(), h.win);
     assert.equal(h.calls.overlays, 1);
-    assert.equal(h.calls.windowOptions.at(-1).minWidth, 720);
+    assert.equal(h.calls.windowOptions.at(-1).minWidth, 480);
     h.emitWindow("close");
     assert.deepEqual(savedBounds(h), { x: 0, y: 0, width: 1280, height: 860, maximized: false });
   });
@@ -7956,10 +7956,8 @@ describe("session windows (src/main.js)", () => {
     t.after(h.cleanup);
     assert.equal(openSessionWindow(h, "conv_1"), true);
     await flush();
-    assert.deepEqual(
-      { width: h.calls.windowOptions.at(-1).width, height: h.calls.windowOptions.at(-1).height },
-      { width: 960, height: 820 },
-    );
+    const { width, height, minWidth } = h.calls.windowOptions.at(-1);
+    assert.deepEqual({ width, height, minWidth }, { width: 960, height: 820, minWidth: 480 });
     assert.equal(h.calls.loadURL.at(-1)[0], `${serverUrl}/c/conv_1?window=session`);
     const state = h.api.windows.get(h.win);
     assert.equal(state.serverUrl, serverUrl);
