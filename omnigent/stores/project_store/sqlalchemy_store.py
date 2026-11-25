@@ -66,6 +66,7 @@ from omnigent.entities.project import (
 from omnigent.entities.project_routing import choose_router
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.project_status_cache import invalidate_after_commit
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
 from omnigent.stores.project_store.access import (
     SHARE_ROLES,
@@ -1151,6 +1152,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 # A Manager re-inviting someone never changes their role.
                 existing.role = role
                 session.flush()
+            invalidate_after_commit(session, project_id)
             return self._share_entity(existing)
 
         return run_write_transaction(self._session_immediate, "add_project_share", write)
@@ -1190,6 +1192,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 )
             session.delete(existing)
             session.flush()
+            invalidate_after_commit(session, project_id)
             return True
 
         return run_write_transaction(self._session_immediate, "remove_project_share", write)
@@ -1326,6 +1329,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 created_by_session_id=created_by_session_id,
             )
             row.scope = stored_scope
+            invalidate_after_commit(session, project_id)
             return _identity_entity(row)
 
         return run_write_transaction(self._session_immediate, "insert_project_identity", write)
@@ -1404,6 +1408,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             if row is None:
                 return False
             session.delete(row)
+            invalidate_after_commit(session, project_id)
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project_identity", write)

@@ -181,5 +181,6 @@ def test_sources_are_found_by_module_and_missing_ones_stay_none(
     # As if the PRs-merged module weren't installed.
     monkeypatch.setitem(sys.modules, project_status.PRS_MERGED_SOURCE_MODULE, None)
     loaded = project_status.load_status_sources("state")
-    assert loaded.spend == ("state", spend)
+    # Installed sources are wrapped in the status cache.
+    assert loaded.spend._source == ("state", spend)
     assert loaded.prs_merged is None

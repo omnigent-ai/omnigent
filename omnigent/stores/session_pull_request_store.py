@@ -42,6 +42,7 @@ from omnigent.db.utils import (
     now_epoch_us,
     run_write_transaction,
 )
+from omnigent.server.project_status_cache import invalidate_after_commit
 
 _logger = logging.getLogger(__name__)
 
@@ -390,6 +391,15 @@ def _apply_fetch(document: _Document, fetched: FetchedState, checked_at: float) 
     return replace(document, prs=tuple(refresh(pr) for pr in document.prs))
 
 
+def _merged_prs(document: _Document) -> set[tuple[str, str, float | None]]:
+    """What a project's PRs-merged count reads from this session's document."""
+    return {
+        (pr.url, pr.relationship, pr.merged_at)
+        for pr in document.prs
+        if pr.merged_at is not None or pr.state == "MERGED"
+    }
+
+
 def _result(document: _Document) -> SessionPullRequests:
     return SessionPullRequests(entries=list(document.prs), synced=document.synced_at is not None)
 
@@ -498,6 +508,17 @@ class SessionPullRequestStore:
                     )
                     .values(pull_requests=_encode(updated))
                 )
+                if _merged_prs(updated) != _merged_prs(current):
+                    invalidate_after_commit(
+                        session,
+                        session.scalar(
+                            select(SqlConversationMetadata.project_id).where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlConversationMetadata.id == conversation_id,
+                            )
+                        ),
+                        ("prs",),
+                    )
             return updated
 
         written = cast(

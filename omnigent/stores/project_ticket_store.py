@@ -55,6 +55,7 @@ from omnigent.entities.project_ticket import (
 from omnigent.entities.project_ticket_legacy import legacy_ticket_notes
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.project_status_cache import invalidate_after_commit
 from omnigent.stores.project_store.access import accessible_project_ids, project_role
 from omnigent.stores.project_store.sqlalchemy_store import (
     _decode_config,
@@ -448,6 +449,9 @@ class ProjectTicketStore:
         )
         ticket.next_event_position += 1
         ticket.updated_at = now_epoch()
+        if kind not in ("comment", "execution"):
+            # Creates, moves and outputs change the project's Summary numbers.
+            invalidate_after_commit(session, project.id)
 
     def require_project(self, project_id: str, *, user_id: str | None) -> None:
         """Raise NOT_FOUND unless ``user_id`` owns the project."""
@@ -1640,6 +1644,7 @@ class ProjectTicketStore:
                     )
             project.ticket_stages = configuration.model_dump()
             project.updated_at = now_epoch()
+            invalidate_after_commit(session, project.id, ("tickets",))
             for row in affected:
                 previous = before[_stage_id(row)]
                 target = after[body.moves[previous.id]]

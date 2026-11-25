@@ -36,6 +36,7 @@ from omnigent.server.project_status import (
     load_status_sources,
     status_period,
 )
+from omnigent.server.project_status_cache import project_status_cache
 from omnigent.server.project_status_items import DrilldownRange, drilldown, range_bounds
 from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_user
@@ -220,13 +221,24 @@ def create_project_kpis_router(
             project=project,
             period=period,
             sources=sources(request),
+            # Cached per project, shared by the KPI tiles and their drill-downs.
             stage_histories=functools.cache(
-                lambda: ticket_store.stage_histories(
-                    project.id, user_id=user_id, since_epoch=since
+                lambda: project_status_cache.get_or_compute(
+                    project.id,
+                    "tickets",
+                    ("stage_histories", since),
+                    lambda: ticket_store.stage_histories(
+                        project.id, user_id=user_id, since_epoch=since
+                    ),
                 )
             ),
             stages=functools.cache(
-                lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
+                lambda: project_status_cache.get_or_compute(
+                    project.id,
+                    "tickets",
+                    ("stages",),
+                    lambda: ticket_store.stages(project.id, user_id=user_id)["stages"],
+                )
             ),
             history_since=since,
         )

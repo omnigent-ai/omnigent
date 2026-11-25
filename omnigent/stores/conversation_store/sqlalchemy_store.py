@@ -193,6 +193,23 @@ _RUNNER_BINDING_LIMIT = 200
 _RUNNER_HOST_LOOKUP_LIMIT = 10_000
 
 
+def _status_cache_active() -> bool:
+    from omnigent.server.project_status_cache import project_status_cache
+
+    return project_status_cache.has_entries()
+
+
+def _clear_status_cache(
+    *project_ids: str | None, inputs: tuple[str, ...] = ("spend", "prs", "tickets")
+) -> None:
+    """Drop the projects' cached Summary inputs after a committed write."""
+    from omnigent.server.project_status_cache import project_status_cache
+
+    for project_id in dict.fromkeys(project_ids):
+        if project_id:
+            project_status_cache.invalidate(str(project_id), inputs)  # type: ignore[arg-type]
+
+
 def _decode_session_state(
     value: str | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -2281,7 +2298,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
                 return True
 
-            return run_write_transaction(self._session_immediate, "move_session", move_standalone)
+            moved = run_write_transaction(self._session_immediate, "move_session", move_standalone)
+            if moved:
+                _clear_status_cache(source.project_id, project_id)
+            return moved
         family_id = source.family_id
 
         def family_members(session: Session) -> list[str]:
@@ -2336,6 +2356,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             run_write_transaction(
                 self._session_immediate, "clear_family_project_labels", clear_labels
             )
+        if changed:
+            _clear_status_cache(source.project_id, project_id)
         return changed
 
     def increment_session_usage(
@@ -2591,6 +2613,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                 existing.updated_at = now
 
         run_write_transaction(self._session_immediate, "add_session_daily_cost", write)
+        if _status_cache_active():
+            _clear_status_cache(self._spend_project_id(conversation_id), inputs=("spend",))
+
+    def _spend_project_id(self, conversation_id: str) -> str | None:
+        """The project a session's spend counts for: its own, else its root's."""
+        workspace_id = current_workspace_id()
+        with self._session("resolve_spend_project") as session:
+            meta = session.get(SqlConversationMetadata, (workspace_id, conversation_id))
+            if meta is not None and meta.project_id:
+                return str(meta.project_id)
+            root_id = session.scalar(
+                select(SqlConversation.root_conversation_id).where(
+                    SqlConversation.workspace_id == workspace_id,
+                    SqlConversation.id == conversation_id,
+                )
+            )
+            if not root_id or root_id == conversation_id:
+                return None
+            root = session.get(SqlConversationMetadata, (workspace_id, root_id))
+            return str(root.project_id) if root is not None and root.project_id else None
 
     def sum_project_daily_cost(self, project_id: str, since_day_utc: str) -> float:
         """See :meth:`ConversationStore.sum_project_daily_cost`."""

@@ -164,7 +164,10 @@ class StatusSources:
 
 
 def load_status_sources(app_state: Any) -> StatusSources:
-    """Find each source's module when it's installed; a missing one stays ``None``."""
+    """Find each source's module when it's installed; a missing one stays ``None``.
+
+    Installed sources are wrapped in the project status cache.
+    """
 
     def load(module_name: str) -> Any:
         try:
@@ -175,7 +178,12 @@ def load_status_sources(app_state: Any) -> StatusSources:
             return None
         return module.build_source(app_state)
 
-    return StatusSources(load(SPEND_SOURCE_MODULE), load(PRS_MERGED_SOURCE_MODULE))
+    from omnigent.server.project_status_cache import cached_source
+
+    # Reads go through the per-project cache, so Summary, KPIs and drill-downs share them.
+    return StatusSources(
+        cached_source(load(SPEND_SOURCE_MODULE)), cached_source(load(PRS_MERGED_SOURCE_MODULE))
+    )
 
 
 def _cents_per_pr(spend: int | None, prs: int | None) -> int | None:

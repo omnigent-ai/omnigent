@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
@@ -26,6 +28,7 @@ from omnigent.server.project_status import (
     summary_members,
     user_member_key,
 )
+from omnigent.server.project_status_cache import period_key, project_status_cache
 from omnigent.server.routes._auth_helpers import require_user
 
 if TYPE_CHECKING:
@@ -35,6 +38,8 @@ if TYPE_CHECKING:
     from omnigent.stores.project_ticket_store import ProjectTicketStore
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class ProjectStatusTotals(BaseModel):
@@ -174,22 +179,45 @@ def create_project_status_router(
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         period = status_period(window, now_epoch())
-        identities = await asyncio.to_thread(
-            project_store.list_identities, project.id, user_id=user_id
-        )
-        shares = await asyncio.to_thread(project_store.list_shares, project.id, user_id=user_id)
-        moves = await asyncio.to_thread(
-            ticket_store.completed_moves,
-            project.id,
-            user_id=user_id,
-            since_epoch=period.since_epoch,
-        )
-        tickets_done = await asyncio.to_thread(
-            tickets_done_by_member, project, moves, conversation_store
-        )
         active = sources(request)
-        spend = await asyncio.to_thread(_measure, active.spend, "spend", project, period)
-        prs = await asyncio.to_thread(_measure, active.prs_merged, "prs_merged", project, period)
+
+        def count_tickets_done() -> MemberTotals:
+            moves = ticket_store.completed_moves(
+                project.id, user_id=user_id, since_epoch=period.since_epoch
+            )
+            return tickets_done_by_member(project, moves, conversation_store)
+
+        timings: dict[str, float] = {}
+
+        async def timed(name: str, call: Callable[..., T], *args: Any) -> T:
+            started = time.perf_counter()
+            try:
+                return await asyncio.to_thread(call, *args)
+            finally:
+                timings[name] = round((time.perf_counter() - started) * 1000, 1)
+
+        # Independent reads run side by side; each source is cached per project and window.
+        identities, shares, tickets_done, spend, prs = await asyncio.gather(
+            timed(
+                "identities",
+                functools.partial(project_store.list_identities, user_id=user_id),
+                project.id,
+            ),
+            timed(
+                "shares", functools.partial(project_store.list_shares, user_id=user_id), project.id
+            ),
+            timed(
+                "tickets_done",
+                project_status_cache.get_or_compute,
+                project.id,
+                "tickets",
+                ("tickets_done", period_key(period)),
+                count_tickets_done,
+            ),
+            timed("spend", _measure, active.spend, "spend", project, period),
+            timed("prs_merged", _measure, active.prs_merged, "prs_merged", project, period),
+        )
+        logger.debug("Project status summary %s %s timings (ms): %s", project.id, window, timings)
         seen = {*tickets_done.by_member, *spend.by_member, *prs.by_member}
         roster = summary_members(project, identities, [share.user_id for share in shares], seen)
         summary = build_summary(
