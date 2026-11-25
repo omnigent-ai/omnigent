@@ -75,6 +75,11 @@ export interface ScheduledTask {
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
   sessionId: string | null;
+  /**
+   * What the task is: an `automation` (the Automations page), a `reminder`, or a
+   * `timer` (a saved `sys_timer_set` timer or `/loop`). Older servers omit it.
+   */
+  kind?: string;
   /** Host directory or sandbox repository URL; null uses the target default. */
   workspace: string | null;
   /** Base ref for a fresh random worktree; null/absent uses the selected directory. */
@@ -294,6 +299,7 @@ interface ScheduledTaskWire {
   mcp_services?: string[];
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
+  kind?: string;
   workspace: string | null;
   base_branch?: string | null;
   host_id: string | null;
@@ -393,6 +399,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     mcpServices: wire.mcp_services ?? [],
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
+    kind: wire.kind ?? "automation",
     workspace: wire.workspace,
     baseBranch: wire.base_branch ?? null,
     hostId: wire.host_id,
@@ -433,8 +440,23 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
 }
 
 /** List the caller's scheduled tasks (owner-scoped server-side). */
+/** List the caller's automations (the Automations page). */
 export async function listScheduledTasks(): Promise<ScheduledTask[]> {
-  const res = await authenticatedFetch("/v1/scheduled-tasks");
+  return listScheduledTasksOfKind("automation");
+}
+
+/**
+ * List every kind of scheduled task the caller owns: the automations plus the
+ * reminders and timers agents set for their own sessions, which the Automations
+ * page leaves out.
+ */
+export async function listAllScheduledTasks(): Promise<ScheduledTask[]> {
+  return listScheduledTasksOfKind("all");
+}
+
+async function listScheduledTasksOfKind(kind: "automation" | "all"): Promise<ScheduledTask[]> {
+  const query = kind === "all" ? "?kind=all" : "";
+  const res = await authenticatedFetch(`/v1/scheduled-tasks${query}`);
   const body = await readJsonOrThrow<{ scheduled_tasks: ScheduledTaskWire[] }>(res);
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }

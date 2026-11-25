@@ -412,7 +412,7 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   });
 });
 
-describe.each(["session_claude_sdk_clear", "session_rewind"] as const)(
+describe.each(["session_claude_sdk_clear", "session_rewind", "session_timers"] as const)(
   "resolveServerInfo %s",
   (capability) => {
     it.each([

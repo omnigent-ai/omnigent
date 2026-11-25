@@ -21,6 +21,7 @@ import {
   buildPendingBubbles,
   buildSlashCommandMap,
   composerOffersClear,
+  composerOffersLoop,
   composerOffersRewind,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
@@ -1511,8 +1512,46 @@ describe("composer /clear and /rewind gating", () => {
   });
 });
 
+describe("composer /loop gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+  const topLevel = { parentSessionId: null, labels: {} };
+
+  it.each([
+    ["claude-native", true],
+    ["claude-sdk", true],
+    ["codex-native", true],
+    ["codex", true],
+    ["pi-native", false],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)("offers /loop for %s when the server saves session timers", (harness, offered) => {
+    expect(composerOffersLoop(harness, info({ session_timers: true }), topLevel)).toBe(offered);
+    expect(composerOffersLoop(harness, info({}), topLevel)).toBe(false);
+    expect(composerOffersLoop(harness, "loading", topLevel)).toBe(false);
+  });
+
+  it("withholds /loop from a sub-agent's session and a side chat, whose timers aren't saved", () => {
+    const saves = info({ session_timers: true });
+    expect(composerOffersLoop("claude-sdk", saves, { parentSessionId: "conv_parent" })).toBe(false);
+    expect(composerOffersLoop("claude-sdk", saves, { labels: { "omnigent.side_chat": "1" } })).toBe(
+      false,
+    );
+    // The session snapshot may still be loading; the server confirms on arm.
+    expect(composerOffersLoop("claude-sdk", saves, null)).toBe(true);
+  });
+});
+
 describe("buildSlashCommandMap", () => {
-  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind", "/goal"];
+  const gatedOffByDefault = [
+    "/btw",
+    "/side",
+    "/mcp",
+    "/clear",
+    "/permissions",
+    "/rewind",
+    "/goal",
+    "/loop",
+  ];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
@@ -1672,6 +1711,15 @@ describe("buildSlashCommandMap", () => {
 });
 
 describe("buildSlashCommandWithArgsSet", () => {
+  it("includes /loop only when the session offers it, so selecting it fills the interval", () => {
+    expect(buildSlashCommandWithArgsSet([], false, false, false, false, "/", true)).toEqual(
+      new Set(["/loop"]),
+    );
+    expect(buildSlashCommandWithArgsSet([], false, false, false, false, "/").has("/loop")).toBe(
+      false,
+    );
+  });
+
   it("includes /effort even when no skills are loaded", () => {
     const s = buildSlashCommandWithArgsSet([], true, false);
     // ``/effort`` is the built-in that requires an arg; selecting it

@@ -36,6 +36,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/mcp": "Show MCP servers enabled for this session",
   "/permissions": "Change the approval mode for this session",
   "/goal": "View or set the goal for this session",
+  "/loop": "Repeat a prompt on an interval: /loop <interval> <prompt> | /loop stop",
   "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":

@@ -135,6 +135,13 @@ import {
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
 import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
+import { formatLoopInterval, parseLoopCommand } from "@/lib/loopCommand";
+import {
+  cancelSessionTimer,
+  listSessionLoops,
+  sessionTakesSavedTimers,
+  setSessionTimer,
+} from "@/lib/sessionTimersApi";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -2143,6 +2150,7 @@ export function buildSlashCommandMap(
   showPermissions = false,
   showRewind = false,
   showGoal = false,
+  showLoop = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2154,6 +2162,7 @@ export function buildSlashCommandMap(
     if (name === "/permissions" && !showPermissions) continue;
     if (name === "/rewind" && !showRewind) continue;
     if (name === "/goal" && !showGoal) continue;
+    if (name === "/loop" && !showLoop) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2200,6 +2209,32 @@ export function composerOffersRewind(
   return (harness === "claude-native" || harness === "claude-sdk") && info.session_rewind === true;
 }
 
+/** Harnesses whose sessions the composer offers ``/loop`` on. */
+const LOOP_HARNESSES: ReadonlySet<string> = new Set([
+  "claude-native",
+  "claude-sdk",
+  "codex-native",
+  "codex",
+]);
+
+/**
+ * Whether the composer offers ``/loop`` for *session* on *harness*: the server
+ * saves session timers (``session_timers``), the harness is one the loop was
+ * verified on, and the session is top-level (a sub-agent's or side chat's
+ * timers are not saved). Elsewhere a typed /loop stays plaintext, so Claude
+ * Code's own ``/loop`` still runs on claude-native.
+ */
+export function composerOffersLoop(
+  harness: string | null,
+  info: ServerInfo | "loading",
+  session:
+    { parentSessionId?: string | null; labels?: Record<string, string> | null } | null | undefined,
+): boolean {
+  if (info === "loading" || info.session_timers !== true) return false;
+  if (harness === null || !LOOP_HARNESSES.has(harness)) return false;
+  return sessionTakesSavedTimers(session);
+}
+
 /**
  * Set of slash commands that should fill the textarea with
  * ``"/cmd "`` on menu selection rather than executing immediately.
@@ -2222,10 +2257,13 @@ export function buildSlashCommandWithArgsSet(
   showBtw = false,
   showSide = false,
   skillPrefix: "/" | "$" = "/",
+  showLoop = false,
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
+  // Selecting /loop fills "/loop " so the user types the interval and prompt after it.
+  if (showLoop) s.add("/loop");
   // Selecting /btw fills "/btw " so the user types the side question after it.
   if (showBtw) s.add("/btw");
   // Selecting /side fills "/side " so the user types the side question after it.
@@ -2979,6 +3017,11 @@ function ComposerImpl(
   );
   const showClear = composerOffersClear(sessionHarness, composerServerInfo);
   const showRewind = composerOffersRewind(sessionHarness, composerServerInfo);
+  // /loop arms a repeating saved timer on the server, so it needs a session the
+  // server will save timers for; see composerOffersLoop.
+  const showLoop =
+    composerSessionId !== null &&
+    composerOffersLoop(sessionHarness, composerServerInfo, composerSession);
   const [rewindPickerOpen, setRewindPickerOpen] = useState(false);
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
@@ -3063,6 +3106,7 @@ function ComposerImpl(
         showCodexApprovalMode,
         showRewind,
         showGoal,
+        showLoop,
       ),
     [
       showEffort,
@@ -3077,6 +3121,7 @@ function ComposerImpl(
       showCodexApprovalMode,
       showRewind,
       showGoal,
+      showLoop,
     ],
   );
   const goalBuiltinNames = useMemo(() => new Set(showGoal ? ["/goal"] : []), [showGoal]);
@@ -3120,8 +3165,9 @@ function ComposerImpl(
         showBtw,
         showSide,
         skillPrefix,
+        showLoop,
       ),
-    [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
+    [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix, showLoop],
   );
 
   const nativeShell = permissionPending
@@ -3543,6 +3589,47 @@ function ComposerImpl(
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Failed to set model");
           });
+        return true;
+      }
+      case "/loop": {
+        if (!showLoop || composerSessionId === null) return false;
+        const command = parseLoopCommand(arg);
+        if (command.kind === "error") {
+          setCommandError(command.message);
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        const loopSessionId = composerSessionId;
+        void (async () => {
+          // One loop per session: a new /loop replaces the running one.
+          const existing = await listSessionLoops(loopSessionId);
+          await Promise.all(existing.map((loop) => cancelSessionTimer(loopSessionId, loop.id)));
+          if (command.kind === "stop") {
+            setCommandError(
+              existing.length === 0 ? "No loop is running in this session." : "Loop stopped.",
+            );
+            return;
+          }
+          const timer = await setSessionTimer(loopSessionId, {
+            seconds: command.seconds,
+            repeat: true,
+            note: command.prompt,
+          });
+          const every = formatLoopInterval(timer.intervalSeconds ?? command.seconds);
+          const firstRun = new Date(timer.fireAt);
+          const firstRunLabel = Number.isNaN(firstRun.getTime())
+            ? ""
+            : `, first run at ${firstRun.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+          setCommandError(
+            `Loop armed: every ${every}${firstRunLabel}${existing.length > 0 ? ", replacing the previous loop" : ""}. ` +
+              "It repeats until /loop stop and survives runner restarts; each run is sent " +
+              "as a message, so it joins a turn already in progress.",
+          );
+        })().catch((err: unknown) => {
+          setCommandError(err instanceof Error ? err.message : "Loop failed");
+        });
         return true;
       }
       case "/context": {
@@ -4099,7 +4186,7 @@ function ComposerImpl(
         runCommand(() =>
           executeSlashCommand(
             cmd,
-            cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg,
+            cmd === "/compact" || cmd === "/loop" ? trimmed.slice(parts[0].length).trim() : arg,
           ),
         );
         return;
