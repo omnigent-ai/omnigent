@@ -3591,6 +3591,10 @@ async def _persist_external_conversation_item_unlocked(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
+    if isinstance(item.data, MessageData) and item.data.sender_in_context:
+        # Only a proven named delivery below may set it; a transcript cannot.
+        unnamed = item.data.model_copy(update={"sender_in_context": False})
+        item = item.model_copy(update={"data": unnamed})
     source_id = body.data.get("source_id")
     is_peer_wake_marker = (
         isinstance(source_id, str)

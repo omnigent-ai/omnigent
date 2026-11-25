@@ -15,7 +15,7 @@ from omnigent.inner.codex_native_executor import (
     _content_to_input_items as _codex_content_to_input_items,
 )
 from omnigent.runtime import pending_inputs
-from omnigent.runtime.message_sender import with_message_sender
+from omnigent.runtime.message_sender import replayed_content, with_message_sender
 from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -228,3 +228,31 @@ async def test_codex_disk_attachment_echo_is_stored_as_typed(
     assert item.data.sender_in_context is True
     assert item.created_by == "bob@example.com"
     assert pending_inputs.snapshot_for(conv.id) == []
+
+
+@pytest.mark.asyncio
+async def test_transcript_cannot_mark_its_message_named(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript item's own sender_in_context is dropped; replay sends it as typed."""
+    typed = [_text("mine")]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": typed, "sender_in_context": True},
+            "response_id": "claude:turn-1",
+            "source_id": "claude:turn-1:0",
+        },
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Review")
+    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
+
+    await _persist_external_conversation_item(
+        conv.id, conv, body, store, created_by="alice@example.com"
+    )
+
+    [item] = store.list_items(conv.id, type="message").data
+    assert item.data.sender_in_context is False
+    assert replayed_content(item.to_api_dict()) == typed
