@@ -1213,7 +1213,9 @@ describe("folder listings past one page", () => {
     const entries = await listFolder("conv_stuck");
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(entries.map((file) => file.name)).toEqual(["d0000", "d0999", "d0000", "d0999"]);
+    // The resent page is left out, and the folder still reads as cut off.
+    expect(entries.map((file) => file.name)).toEqual(["d0000", "d0999"]);
+    expect(listingCutOff(entries)).toBe(true);
   });
 
   it("keeps has_more when a page arrives with no cursor to continue from", async () => {
@@ -1229,25 +1231,26 @@ describe("folder listings past one page", () => {
   });
 
   it("stops before asking again for a cursor it already asked for, keeping has_more", async () => {
-    // The server cycles: first → A → B → A.
-    const pages: Record<string, [string[], string]> = {
-      "": [["d0"], "a"],
-      "experimental/a": [["a"], "b"],
-      "experimental/b": [["b"], "a"],
+    // The server cycles: after b it resends the page after d0, which ends on a.
+    const pages: Record<string, string> = {
+      "": "d0",
+      "experimental/d0": "a",
+      "experimental/a": "b",
+      "experimental/b": "a",
     };
     const asked: string[] = [];
     const listing = await readListingPages(async (after) => {
       asked.push(after ?? "");
-      const [names, last] = pages[after ?? ""]!;
+      const name = pages[after ?? ""]!;
       return {
         object: "list",
-        data: names.map(entry),
+        data: [entry(name)],
         has_more: true,
-        last_id: `experimental/${last}`,
+        last_id: `experimental/${name}`,
       };
     });
 
-    expect(asked).toEqual(["", "experimental/a", "experimental/b"]);
+    expect(asked).toEqual(["", "experimental/d0", "experimental/a", "experimental/b"]);
     expect(listing?.has_more).toBe(true);
     expect(listing?.data.map((file) => file.name)).toEqual(["d0", "a", "b"]);
   });

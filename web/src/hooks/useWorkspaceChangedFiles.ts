@@ -487,8 +487,8 @@ export async function readListingPages(
   // Each request needs the cursor returned by the previous page.
   /* oxlint-disable no-await-in-loop */
   while (page.has_more && data.length < LISTING_ENTRY_LIMIT) {
-    // A page that names no new cursor would only repeat itself.
-    if (page.data.length === 0 || !page.last_id || requested.has(page.last_id)) break;
+    // A page that names no cursor to continue from would only repeat itself.
+    if (page.data.length === 0 || !page.last_id) break;
     const after = page.last_id;
     requested.add(after);
     // Nobody waits for the listing any more, as when its folder closed.
@@ -496,6 +496,8 @@ export async function readListingPages(
     const next = await fetchPage(after);
     // Half a folder would read as the whole of it.
     if (next === null) throw new Error("the folder was removed while it was being listed");
+    // A page ending on a cursor already asked for repeats entries the listing holds.
+    if (next.last_id && requested.has(next.last_id)) break;
     page = next;
     truncated ||= next.truncated ?? false;
     data.push(...next.data);
