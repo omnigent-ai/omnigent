@@ -38,6 +38,8 @@ import { cn } from "@/lib/utils";
 import { PANE_ZOOM_LABELS, paneCommandLabel } from "../paneCommandTable";
 import { MOVE_PANE_LABEL, NO_ROOM_TO_MOVE_REASON } from "../paneMove";
 import type { PaneMenuChoice } from "./paneMenu";
+import { useFloatingPanes } from "../useFloatingPanes";
+import { type PaneStripZone, paneStripZone, zoneMaximizes, zoneMoves } from "./paneStripGrip";
 import { PANE_STRIP_CONTROL } from "./usePaneMoveDrag";
 import { paneShortcutAria, paneShortcutKeys } from "./paneShortcutHints";
 import { type PaneStripLayout, type PaneStripParts, STRIP_BUTTON_WIDTH } from "./paneStripLayout";
@@ -247,6 +249,8 @@ export function PaneTitleStrip({
   held = false,
 }: PaneTitleStripProps) {
   const movable = onDragStart !== undefined;
+  // Floating panes split a wide row's blank space into a move band and the rest.
+  const gripBand = useFloatingPanes();
   // A click on the row's own space, not a control, is a click into the pane.
   const focusFromRow = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (onAControl(event)) return;
@@ -260,10 +264,29 @@ export function PaneTitleStrip({
     event.preventDefault();
     pane.focus();
   };
-  // A double-click on the row's own space maximizes or restores the pane, as a title bar's does.
+  // Which part of the row's blank space the pointer is over: the band around the move handle,
+  // or the rest. A row that can't move has no band; without floating panes, the whole row is both.
+  const zoneOf = (event: { currentTarget: HTMLElement; clientX: number }): PaneStripZone => {
+    if (!movable) return "row";
+    if (!gripBand) return "whole";
+    return paneStripZone(event.currentTarget.getBoundingClientRect(), event.clientX);
+  };
+  // A press in the band moves the pane; elsewhere it only focuses it, so a double-click there
+  // doesn't lift the pane first.
+  const moveFromRow = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (onDragStart && zoneMoves(zoneOf(event))) onDragStart(event);
+  };
+  // The grab cursor shows over the band's blank space, not over the row's controls.
+  const showGrip = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const overGrip = movable && zoneOf(event) === "grip" && !onAControl(event);
+    event.currentTarget.toggleAttribute("data-pane-strip-over-grip", overGrip);
+  };
+  // A double-click on the row's own space maximizes or restores the pane, as a title bar's does,
+  // except in the band around the move handle, which is for moving it.
   const toggleZoomFromRow = (event: ReactMouseEvent<HTMLDivElement>) => {
     const toggleZoom = pane.commands?.toggleZoom;
     if (event.button !== 0 || !toggleZoom || onAControl(event)) return;
+    if (!zoneMaximizes(zoneOf(event))) return;
     event.preventDefault();
     toggleZoom();
     pane.focus?.();
@@ -287,10 +310,15 @@ export function PaneTitleStrip({
           data-pane-strip-primary={pane.primary ? "" : undefined}
           className={cn(
             "group/pane-strip relative flex shrink-0 items-center gap-1 overflow-hidden bg-background px-1 text-xs",
+            "data-[pane-strip-over-grip]:cursor-grab data-[pane-strip-held]:data-[pane-strip-over-grip]:cursor-grabbing",
             PANE_STRIP_HEIGHT_CLASS,
           )}
-          // The row's blank space drags the pane; it keeps the normal pointer.
-          onPointerDown={onDragStart}
+          // The band around the handle drags the pane, under the grab cursor.
+          onPointerDown={moveFromRow}
+          onPointerMove={showGrip}
+          onPointerLeave={(event) =>
+            event.currentTarget.removeAttribute("data-pane-strip-over-grip")
+          }
           onMouseDown={focusFromRow}
           onDoubleClick={toggleZoomFromRow}
           onKeyDown={(event) => returnFromPaneToolbar(event, pane.focus)}
