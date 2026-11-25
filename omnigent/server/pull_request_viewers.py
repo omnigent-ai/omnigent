@@ -1,11 +1,4 @@
-"""What a shared session's pull request info shows to someone other than its owner.
-
-Every change to a session's pull requests runs as its host's code-host account, which is
-the session owner's, so on a shared session only that owner may make one; an admin doesn't
-count. Everyone else sees the pull requests without the controls that change them, and
-without the host's other accounts. An editor still sees which account the owner's changes
-come from; a viewer, who can't act in the session, doesn't.
-"""
+"""Hides a shared session's pull request accounts and change controls from all but its owner."""
 
 from __future__ import annotations
 
