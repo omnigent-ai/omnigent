@@ -22,7 +22,7 @@ from omnigent.server.project_kpis import (
     kpi_status,
     load_series,
     nearest_rank,
-    rework_events,
+    rework_items,
     series_value,
 )
 from omnigent.server.project_status import MemberTotals, StatusSources, status_period
@@ -71,7 +71,7 @@ def test_rework_counts_backward_moves_and_reopens_in_the_window() -> None:
         "forward-only": [_entry("open", recent, created=True), _entry("merged", recent + 5)],
         "long-ago": [_entry("code_review", OLD), _entry("open", OLD + 1)],
     }
-    rework = MetricSeries("distinct", events=rework_events(histories, ORDER))
+    rework = MetricSeries("distinct", items=rework_items(histories, ORDER))
     # A ticket sent back twice counts once.
     assert _window(rework, period) == 2
     assert _window(rework, status_period("all", NOW)) == 3
@@ -94,10 +94,14 @@ def test_time_to_merged_uses_tickets_now_in_the_final_stage() -> None:
         # No recorded creation: its age is unknown.
         "legacy": [_entry("open", created), _entry("merged", created + HOUR)],
     }
-    samples = hours_to_final_stage(histories, "merged")
-    median = series_value(MetricSeries("median", samples=samples), period.since_epoch, NOW + 1)
+    samples, excluded = hours_to_final_stage(histories, "merged")
+    median = series_value(MetricSeries("median", items=samples), period.since_epoch, NOW + 1)
     assert (median.value, median.sample_size) == (5.0, 2)
-    assert hours_to_final_stage(histories, None) == []
+    assert sorted(entry.reason for entry in excluded) == [
+        "Left the final stage after reaching it",
+        "No recorded creation time",
+    ]
+    assert hours_to_final_stage(histories, None) == ([], [])
     assert nearest_rank([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9) == 9
     assert nearest_rank([4], 0.9) == 4
 
@@ -157,9 +161,11 @@ def test_trend_covers_seven_full_days_and_today() -> None:
         "o": [_entry("open", OLD, created=True), _entry("merged", eight_days_ago, complete=True)],
     }
     by_day = {"2026-03-03": 100, "2026-03-09": 250, "2026-03-10": 999, "2026-03-01": 5000}
+    # (root session, day, micro-dollars, member) rows, as the spend source returns them.
+    rows = [("s1", day, cents * 10_000, "user:local") for day, cents in by_day.items()]
     spend = SimpleNamespace(
-        spend=lambda project, period: MemberTotals(total=1349),
-        breakdown=lambda project, period: SimpleNamespace(by_day=by_day),
+        spend=lambda project, period: MemberTotals(total=1249),
+        root_days=lambda project, period: rows,
     )
     merged = [
         SimpleNamespace(key="pr1", merged_at=yesterday + 5),
@@ -172,24 +178,25 @@ def test_trend_covers_seven_full_days_and_today() -> None:
     )
     budget = ProjectKpi(name="B", metric="spend_usd", why="w", target=3, direction="at_most")
     prs_kpi = ProjectKpi(name="P", metric="merged_prs", why="w", target=1, direction="at_least")
-    rows = kpi_rows(
+    tiles = kpi_rows(
         [shipped, budget, prs_kpi],
         load_series(["tickets_shipped", "spend_usd", "merged_prs"], inputs),
         inputs.period,
     )
-    trend = rows[0]["trend"]
+    trend = tiles[0]["trend"]
     assert (trend["since_day_utc"], trend["until_day_utc"]) == ("2026-03-03", "2026-03-09")
     assert [day["day_utc"] for day in trend["days"]][-1] == "2026-03-10"
     assert len(trend["days"]) == 8
     assert (trend["last_7_days"], trend["today"], trend["status"]) == (1, 1, "missed")
     # The 7d window includes today, so it sees both tickets.
-    assert rows[0]["value"] == 2
-    spend_trend = rows[1]["trend"]
+    assert tiles[0]["value"] == 2
+    spend_trend = tiles[1]["trend"]
     assert (spend_trend["last_7_days"], spend_trend["today"]) == (3.5, 9.99)
     assert spend_trend["status"] == "missed"
-    assert rows[1]["value"] == 13.49
+    # The 7d window (from 2026-03-04) holds 2026-03-09 and today: $2.50 + $9.99.
+    assert tiles[1]["value"] == 12.49
     # Undated merges count only without a lower bound, so not in the trend.
-    assert (rows[2]["trend"]["last_7_days"], rows[2]["trend"]["status"]) == (1, "met")
+    assert (tiles[2]["trend"]["last_7_days"], tiles[2]["trend"]["status"]) == (1, "met")
     unmeasured = ProjectKpi(name="N", metric="none", why="w", not_measured_reason="Later.")
     assert kpi_rows([unmeasured], {}, inputs.period)[0]["trend"] is None
 
@@ -337,4 +344,112 @@ async def test_members_read_kpis_but_only_the_owner_writes(
     assert refused.status_code == 403
     assert (await multi_user_client.get(f"{path}/kpis", headers=stranger)).status_code == 404
     hidden = await multi_user_client.put(f"{path}/kpis", json={"kpis": []}, headers=stranger)
+    assert hidden.status_code == 404
+
+
+def test_drilldown_days_match_the_tile_and_list_what_is_left_out() -> None:
+    """Each day's row count is the tile's day value; the total counts a ticket once."""
+    from omnigent.server.project_status_items import drilldown
+
+    today = _epoch("2026-03-10T00:00:00")
+    yesterday = today - DAY
+    histories = {
+        # Done two days running: a row each day, counted once in the total, on its latest day.
+        "twice": [
+            _entry("open", OLD, created=True),
+            _entry("merged", yesterday - DAY + HOUR, complete=True),
+            _entry("open", yesterday),
+            {**_entry("merged", yesterday + HOUR, complete=True), "user_id": "b@example.com"},
+        ],
+        "once": [_entry("open", OLD, created=True), _entry("merged", NOW - HOUR, complete=True)],
+        "born-done": [_entry("merged", yesterday, complete=True, created=True)],
+    }
+
+    def member_of(entry):
+        return f"user:{entry.get('user_id') or 'a@example.com'}"
+
+    merged = [
+        SimpleNamespace(key="https://git.example.com/o/r/pull/1", merged_at=yesterday + 5),
+        SimpleNamespace(key="https://git.example.com/o/r/pull/2", merged_at=None),
+    ]
+    inputs = _inputs(None, SimpleNamespace(merged_items=lambda project: merged), lambda: histories)
+    series = load_series(["tickets_shipped", "merged_prs"], inputs, member_of)
+    shipped = ProjectKpi(
+        name="S", metric="tickets_shipped", why="w", target=1, direction="at_least"
+    )
+    tile = kpi_rows([shipped], series, inputs.period)[0]["trend"]
+    result = drilldown(series["tickets_shipped"], inputs.period, "trend")
+    assert [(day["day_utc"], day["value"]) for day in result["days"]] == [
+        (day["day_utc"], day["value"]) for day in tile["days"]
+    ]
+    assert all(day["items"] == day["value"] for day in result["days"])
+    assert result["total"] == 2
+    twice = [row for row in result["items"] if row["id"] == "twice"]
+    assert [(row["day_utc"], row["counted_in_total"]) for row in twice] == [
+        ("2026-03-09", True),
+        ("2026-03-08", False),
+    ]
+    assert [(row["id"], row["reason"]) for row in result["excluded"]] == [
+        ("born-done", "Created in a completed stage, never moved into it")
+    ]
+    # A member sees what's credited to them: the latest move decides.
+    mine = drilldown(series["tickets_shipped"], inputs.period, "trend", "user:b@example.com")
+    assert (mine["total"], {row["id"] for row in mine["items"]}) == (1, {"twice"})
+    prs = drilldown(series["merged_prs"], inputs.period, "7d")
+    assert prs["total"] == 1
+    assert [row["reason"] for row in prs["excluded"]] == [
+        "No merge time recorded, so it counts only in All time"
+    ]
+    everything = drilldown(series["merged_prs"], inputs.period, "all")
+    assert (everything["total"], everything["excluded"]) == (2, [])
+
+
+async def test_status_items_endpoint_lists_tickets_with_titles(
+    multi_user_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+) -> None:
+    owner, stranger = _as_user("owner@example.com"), _as_user("stranger@example.com")
+    created = (
+        await multi_user_client.post("/v1/projects", json={"name": "Items"}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    stages = (await multi_user_client.get(f"{path}/tickets", headers=owner)).json()["stages"]
+    done = next(stage["id"] for stage in stages if stage["is_complete"])
+    ticket = (
+        await multi_user_client.post(f"{path}/tickets", json={"title": "Ship it"}, headers=owner)
+    ).json()
+    await multi_user_client.patch(
+        f"{path}/tickets/{ticket['id']}", json={"stage_id": done}, headers=owner
+    )
+    response = await multi_user_client.get(
+        f"{path}/status/items",
+        params={"metric": "tickets_shipped", "range": "trend"},
+        headers=owner,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["total"], body["unit"], len(body["days"])) == (1, "count", 8)
+    assert body["days"][-1]["items"] == 1
+    [row] = body["items"]
+    assert (row["kind"], row["title"], row["member"]) == (
+        "ticket",
+        "Ship it",
+        "user:owner@example.com",
+    )
+    mine = await multi_user_client.get(
+        f"{path}/status/items",
+        params={"metric": "tickets_shipped", "member": "user:someone@example.com"},
+        headers=owner,
+    )
+    assert mine.json()["total"] == 0
+    spend = await multi_user_client.get(
+        f"{path}/status/items", params={"metric": "spend_usd"}, headers=owner
+    )
+    assert (spend.json()["total"], spend.json()["items"]) == (0, [])
+    bad = await multi_user_client.get(
+        f"{path}/status/items", params={"metric": "nope"}, headers=owner
+    )
+    assert bad.status_code == 422
+    hidden = await multi_user_client.get(
+        f"{path}/status/items", params={"metric": "tickets_shipped"}, headers=stranger
+    )
     assert hidden.status_code == 404

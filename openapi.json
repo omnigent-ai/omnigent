@@ -7922,6 +7922,319 @@
         "title": "ProjectSessionCreateRequest",
         "type": "object"
       },
+      "ProjectStatusItem": {
+        "description": "One ticket, PR or session behind a number.",
+        "properties": {
+          "at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When it happened; null for day-granular spend.",
+            "title": "At"
+          },
+          "counted_in_total": {
+            "default": true,
+            "description": "False when the total counts it on a later day (it counts once).",
+            "title": "Counted In Total",
+            "type": "boolean"
+          },
+          "day_utc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Its UTC day; null for an undated merge.",
+            "title": "Day Utc"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "id": {
+            "description": "Ticket ID, PR URL, or root session ID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "ticket",
+              "pull_request",
+              "session"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "member": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The member key it counts for, when known.",
+            "title": "Member"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why it's left out (excluded only).",
+            "title": "Reason"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The PR's URL; null for tickets and sessions.",
+            "title": "Url"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Hours for time metrics, USD for spend, else null.",
+            "title": "Value"
+          }
+        },
+        "required": [
+          "day_utc",
+          "at",
+          "kind",
+          "id",
+          "title",
+          "url",
+          "member",
+          "value"
+        ],
+        "title": "ProjectStatusItem",
+        "type": "object"
+      },
+      "ProjectStatusItemDay": {
+        "properties": {
+          "day_utc": {
+            "title": "Day Utc",
+            "type": "string"
+          },
+          "items": {
+            "description": "Rows behind it; equals value for count metrics.",
+            "format": "int64",
+            "title": "Items",
+            "type": "integer"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The day's value, as on the tile.",
+            "title": "Value"
+          }
+        },
+        "required": [
+          "day_utc",
+          "value",
+          "items"
+        ],
+        "title": "ProjectStatusItemDay",
+        "type": "object"
+      },
+      "ProjectStatusItems": {
+        "description": "The items behind one status number, by UTC day.",
+        "properties": {
+          "available": {
+            "description": "False when this server has no source for the metric.",
+            "title": "Available",
+            "type": "boolean"
+          },
+          "days": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectStatusItemDay"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "excluded": {
+            "description": "Items the counting rules leave out, each with its reason.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectStatusItem"
+            },
+            "title": "Excluded",
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectStatusItem"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "member": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member"
+          },
+          "metric": {
+            "enum": [
+              "merged_prs",
+              "spend_usd",
+              "tickets_shipped",
+              "rework_tickets",
+              "time_to_merged_median_hours",
+              "time_to_merged_p90_hours"
+            ],
+            "title": "Metric",
+            "type": "string"
+          },
+          "object": {
+            "const": "project.status_items",
+            "title": "Object",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "range": {
+            "enum": [
+              "7d",
+              "30d",
+              "all",
+              "trend"
+            ],
+            "title": "Range",
+            "type": "string"
+          },
+          "sample_size": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sample Size"
+          },
+          "since_day_utc": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Day Utc"
+          },
+          "today_utc": {
+            "title": "Today Utc",
+            "type": "string"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "unit": {
+            "enum": [
+              "count",
+              "usd",
+              "hours"
+            ],
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "project_id",
+          "metric",
+          "unit",
+          "range",
+          "member",
+          "since_day_utc",
+          "today_utc",
+          "available",
+          "total",
+          "sample_size",
+          "days",
+          "items",
+          "excluded",
+          "truncated"
+        ],
+        "title": "ProjectStatusItems",
+        "type": "object"
+      },
       "ProjectStatusMember": {
         "description": "One member's numbers: a person, an agent identity, or the other-agents pool.",
         "properties": {
@@ -24152,6 +24465,104 @@
           }
         },
         "summary": "Update Project Share",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/status/items": {
+      "get": {
+        "description": "The tickets, PRs or sessions behind a Summary number or KPI tile, by day.\n\nAny project member may read it. Each day's value is computed by the same code\nas the number it drills into; items the counting rules leave out are listed\nseparately with the reason.",
+        "operationId": "project_status_items_v1_projects__project_id__status_items_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The metric to list items for.",
+            "in": "query",
+            "name": "metric",
+            "required": true,
+            "schema": {
+              "description": "The metric to list items for.",
+              "enum": [
+                "merged_prs",
+                "spend_usd",
+                "tickets_shipped",
+                "rework_tickets",
+                "time_to_merged_median_hours",
+                "time_to_merged_p90_hours"
+              ],
+              "title": "Metric",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all as on the Summary, or trend: the KPI tiles' 7 full UTC days ending yesterday plus today.",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all as on the Summary, or trend: the KPI tiles' 7 full UTC days ending yesterday plus today.",
+              "enum": [
+                "7d",
+                "30d",
+                "all",
+                "trend"
+              ],
+              "title": "Range",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only what counts for this member key, e.g. user:a@example.com.",
+            "in": "query",
+            "name": "member",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only what counts for this member key, e.g. user:a@example.com.",
+              "title": "Member"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectStatusItems"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Project Status Items",
         "tags": [
           "projects"
         ]

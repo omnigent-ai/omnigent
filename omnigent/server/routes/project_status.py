@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
@@ -82,17 +83,11 @@ class ProjectStatusSummary(BaseModel):
     description: str | None = None
 
 
-def tickets_done_by_member(
-    project: Project,
-    moves: list[dict[str, Any]],
-    conversations: ConversationStore | None,
-) -> MemberTotals:
-    """Count distinct tickets completed per member: the session's, else the person's.
-
-    A ticket reopened and completed again in the window counts once, for whoever
-    made its latest completing move (*moves* are in time order).
-    """
-    cache: dict[str, MemberKey] = {}
+def move_member_resolver(
+    project: Project, conversations: ConversationStore | None
+) -> Callable[[dict[str, Any]], MemberKey]:
+    """Credit a ticket move to its session's member, else to the person who made it."""
+    cache: dict[str, MemberKey | None] = {}
 
     def session_member(session_id: str, user_id: str | None) -> MemberKey | None:
         if session_id in cache:
@@ -106,13 +101,30 @@ def tickets_done_by_member(
         cache[session_id] = key
         return key
 
+    def resolve(move: dict[str, Any]) -> MemberKey:
+        session_id = move.get("session_id")
+        return (session_member(session_id, move.get("user_id")) if session_id else None) or (
+            user_member_key(move.get("user_id") or project.user_id)
+        )
+
+    return resolve
+
+
+def tickets_done_by_member(
+    project: Project,
+    moves: list[dict[str, Any]],
+    conversations: ConversationStore | None,
+) -> MemberTotals:
+    """Count distinct tickets completed per member: the session's, else the person's.
+
+    A ticket reopened and completed again in the window counts once, for whoever
+    made its latest completing move (*moves* are in time order).
+    """
+    member_of = move_member_resolver(project, conversations)
     latest = {move["ticket_id"]: move for move in moves}
     by_member: dict[MemberKey, int] = {}
     for move in latest.values():
-        session_id = move.get("session_id")
-        key = (session_member(session_id, move.get("user_id")) if session_id else None) or (
-            user_member_key(move.get("user_id") or project.user_id)
-        )
+        key = member_of(move)
         by_member[key] = by_member.get(key, 0) + 1
     return MemberTotals(total=len(latest), by_member=by_member)
 

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowDownIcon, ArrowUpIcon, PencilIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -19,6 +19,7 @@ import {
 import { cn } from "@/lib/utils";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { ProjectKpiTiles } from "./ProjectKpis";
+import { ProjectStatusItemsDialog, type StatusDrilldown } from "./ProjectStatusItems";
 import { useProjectMandate } from "./ProjectMandateDialog";
 import { TicketError } from "./TicketControls";
 import { TicketMarkdown } from "./ticketImages";
@@ -28,12 +29,17 @@ import { useTicketProject } from "./useProjectTickets";
 export function ProjectSummary({ projectName }: { projectName: string }) {
   const { projectId, projects } = useTicketProject(projectName);
   const [statusWindow, setStatusWindow] = useState<ProjectStatusWindow>("7d");
+  const [drilldown, setDrilldown] = useState<StatusDrilldown | null>(null);
   const summary = useQuery({
     queryKey: projectStatusSummaryKey(projectId, statusWindow),
     queryFn: ({ signal }) => getProjectStatusSummary(projectId as string, statusWindow, signal),
     enabled: projectId !== null,
     staleTime: 30_000,
   });
+  const memberNames = useMemo(
+    () => new Map((summary.data?.members ?? []).map((member) => [member.key, member.name])),
+    [summary.data],
+  );
   if (projects.isLoading) return <Spinner aria-label="Loading project" />;
   if (projectId === null)
     return <TicketError error={projects.error ?? new Error("Project not found.")} />;
@@ -56,7 +62,7 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
           </div>
         ) : (
           <>
-            <HeadlineNumbers summary={summary.data} />
+            <HeadlineNumbers summary={summary.data} onDrill={setDrilldown} />
             <p className="text-xs text-muted-foreground">
               {summary.data.since_day_utc
                 ? `${summary.data.since_day_utc} to ${summary.data.today_utc}, UTC`
@@ -65,7 +71,7 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
           </>
         )}
       </section>
-      <ProjectKpiTiles projectId={projectId} />
+      <ProjectKpiTiles projectId={projectId} onDrill={setDrilldown} />
       <section aria-label="Members" className="space-y-3">
         <h2 className="text-[length:calc(var(--text-ui)+2px)] font-bold">Members</h2>
         {summary.isPending ? (
@@ -73,9 +79,22 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
         ) : summary.isError ? (
           <p className="text-sm text-muted-foreground">Members are unavailable right now.</p>
         ) : (
-          <MembersTable members={summary.data.members} />
+          <MembersTable
+            members={summary.data.members}
+            statusWindow={statusWindow}
+            onDrill={setDrilldown}
+          />
         )}
       </section>
+      {drilldown && (
+        <ProjectStatusItemsDialog
+          projectId={projectId}
+          projectName={projectName}
+          drilldown={drilldown}
+          memberNames={memberNames}
+          onClose={() => setDrilldown(null)}
+        />
+      )}
     </div>
   );
 }
@@ -152,31 +171,74 @@ function WindowPicker({
   );
 }
 
-function HeadlineNumbers({ summary }: { summary: ProjectStatusSummary }) {
-  const { totals, sources } = summary;
+function HeadlineNumbers({
+  summary,
+  onDrill,
+}: {
+  summary: ProjectStatusSummary;
+  onDrill: (drilldown: StatusDrilldown) => void;
+}) {
+  const { totals, sources, window: range } = summary;
   return (
     <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
       <StatTile
         label="PRs merged"
         value={totals.prs_merged === null ? "—" : String(totals.prs_merged)}
         note={sources.prs_merged === "unavailable" ? "Not tracked on this server" : undefined}
+        onOpen={
+          totals.prs_merged === null
+            ? undefined
+            : () => onDrill({ label: "PRs merged", metric: "merged_prs", range })
+        }
       />
       <StatTile
         label="Spent"
         value={formatCents(totals.spend_cents)}
         note={sources.spend === "unavailable" ? "Not tracked on this server" : undefined}
+        onOpen={
+          totals.spend_cents === null
+            ? undefined
+            : () => onDrill({ label: "Spent", metric: "spend_usd", range })
+        }
       />
       <StatTile label="Team members" value={String(totals.members)} />
-      <StatTile label="Tickets done" value={String(totals.tickets_done)} />
+      <StatTile
+        label="Tickets done"
+        value={String(totals.tickets_done)}
+        onOpen={() => onDrill({ label: "Tickets done", metric: "tickets_shipped", range })}
+      />
     </dl>
   );
 }
 
-function StatTile({ label, value, note }: { label: string; value: string; note?: string }) {
+function StatTile({
+  label,
+  value,
+  note,
+  onOpen,
+}: {
+  label: string;
+  value: string;
+  note?: string;
+  onOpen?: () => void;
+}) {
   return (
     <div className="rounded-lg border border-border/60 p-3">
       <dt className="text-sm text-muted-foreground">{label}</dt>
-      <dd className="mt-1 text-2xl font-semibold tabular-nums">{value}</dd>
+      <dd className="mt-1 text-2xl font-semibold tabular-nums">
+        {onOpen ? (
+          <button
+            type="button"
+            className="rounded-sm underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+            aria-label={`${label}: ${value}. Show the items behind it`}
+            onClick={onOpen}
+          >
+            {value}
+          </button>
+        ) : (
+          value
+        )}
+      </dd>
       {note && <dd className="mt-1 text-xs text-muted-foreground">{note}</dd>}
     </div>
   );
@@ -190,7 +252,15 @@ const COLUMNS: { key: ProjectStatusSortKey; label: string; numeric: boolean }[] 
   { key: "cost_per_merged_pr_cents", label: "Cost per merged PR", numeric: true },
 ];
 
-function MembersTable({ members }: { members: ProjectStatusMember[] }) {
+function MembersTable({
+  members,
+  statusWindow,
+  onDrill,
+}: {
+  members: ProjectStatusMember[];
+  statusWindow: ProjectStatusWindow;
+  onDrill: (drilldown: StatusDrilldown) => void;
+}) {
   const [sort, setSort] = useState<{ key: ProjectStatusSortKey; direction: "asc" | "desc" }>({
     key: "tickets_done",
     direction: "desc",
@@ -258,11 +328,51 @@ function MembersTable({ members }: { members: ProjectStatusMember[] }) {
                   </Badge>
                 </span>
               </th>
-              <NumberCell>{String(member.tickets_done)}</NumberCell>
-              <NumberCell>
+              <NumberCell
+                label={`Tickets done by ${member.name}`}
+                onOpen={() =>
+                  onDrill({
+                    label: "Tickets done",
+                    metric: "tickets_shipped",
+                    range: statusWindow,
+                    member: member.key,
+                  })
+                }
+              >
+                {String(member.tickets_done)}
+              </NumberCell>
+              <NumberCell
+                label={`PRs merged by ${member.name}`}
+                onOpen={
+                  member.prs_merged === null
+                    ? undefined
+                    : () =>
+                        onDrill({
+                          label: "PRs merged",
+                          metric: "merged_prs",
+                          range: statusWindow,
+                          member: member.key,
+                        })
+                }
+              >
                 {member.prs_merged === null ? "—" : String(member.prs_merged)}
               </NumberCell>
-              <NumberCell>{formatCents(member.spend_cents)}</NumberCell>
+              <NumberCell
+                label={`Spend by ${member.name}`}
+                onOpen={
+                  member.spend_cents === null
+                    ? undefined
+                    : () =>
+                        onDrill({
+                          label: "Spent",
+                          metric: "spend_usd",
+                          range: statusWindow,
+                          member: member.key,
+                        })
+                }
+              >
+                {formatCents(member.spend_cents)}
+              </NumberCell>
               <NumberCell>{formatCents(member.cost_per_merged_pr_cents)}</NumberCell>
             </tr>
           ))}
@@ -272,8 +382,31 @@ function MembersTable({ members }: { members: ProjectStatusMember[] }) {
   );
 }
 
-function NumberCell({ children }: { children: ReactNode }) {
-  return <td className="px-3 py-2 text-right tabular-nums">{children}</td>;
+function NumberCell({
+  children,
+  label,
+  onOpen,
+}: {
+  children: ReactNode;
+  label?: string;
+  onOpen?: () => void;
+}) {
+  return (
+    <td className="px-3 py-2 text-right tabular-nums">
+      {onOpen ? (
+        <button
+          type="button"
+          className="rounded-sm underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+          aria-label={label ? `${label}: show the items behind it` : undefined}
+          onClick={onOpen}
+        >
+          {children}
+        </button>
+      ) : (
+        children
+      )}
+    </td>
+  );
 }
 
 /** Switches the project page between its ticket board and its Summary. */

@@ -30,7 +30,8 @@ from omnigent.entities.project_kpi import (
     UNMEASURED_METRIC,
     ProjectKpi,
 )
-from omnigent.server.project_status import MemberTotals, StatusPeriod, StatusSources
+from omnigent.server.project_status import MemberKey, MemberTotals, StatusPeriod, StatusSources
+from omnigent.server.project_status_spend import micros_to_cents
 
 if TYPE_CHECKING:
     from omnigent.entities import Project
@@ -62,25 +63,53 @@ class MetricValue:
 UNAVAILABLE_VALUE = MetricValue(None, available=False)
 
 
+ItemKind = Literal["ticket", "pull_request", "session"]
+
+
+@dataclass(frozen=True)
+class SeriesItem:
+    """One counted thing behind a metric: a ticket move, a merge or a session's day of spend.
+
+    :param at: When it happened (Unix seconds); ``None`` is undated.
+    :param key: What distinct counts count: a ticket ID, a PR key or a root session ID.
+    :param value: Hours for time metrics, micro-dollars for spend, else ``None``.
+    :param day_utc: The UTC day for day-granular items (spend); else derived from *at*.
+    :param member: Who it counts for, a member key, when known.
+    :param detail: Extra display fields, e.g. the stages of a backward move.
+    """
+
+    at: int | None
+    key: str
+    kind: ItemKind
+    value: float | None = None
+    day_utc: str | None = None
+    member: MemberKey | None = None
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExcludedItem:
+    """An item the counting rules leave out, with the reason, for the drill-down."""
+
+    item: SeriesItem
+    reason: str
+    #: Only left out of ranges with a lower bound (it's undated).
+    only_when_bounded: bool = False
+
+
 @dataclass(frozen=True)
 class MetricSeries:
-    """A metric's dated data, summed over a range by :func:`series_value`.
+    """A metric's items, aggregated over a range by :func:`series_value`.
 
-    :param kind: ``distinct`` counts distinct keys, ``daily_sum`` sums per-day
-        amounts, ``median``/``p90`` aggregate samples.
-    :param events: ``(epoch, key)`` for ``distinct``; ``None`` epochs are undated
-        and count only in a range without a lower bound.
-    :param days: UTC day ``"YYYY-MM-DD"`` to amount, for ``daily_sum``.
-    :param samples: ``(epoch, value)`` for ``median`` and ``p90``.
-    :param scale: Divides ``daily_sum`` amounts, e.g. 100 for cents to dollars.
-    :param window_value: Overrides the window's value when only a total is known.
+    :param kind: ``distinct`` counts distinct keys, ``daily_sum`` sums micro-dollars
+        (reported in dollars, rounded to cents once), ``median``/``p90`` aggregate values.
+    :param window_value: Overrides the window's value when a source has only a total.
+    :param dated: ``False`` when the items aren't known, so per-day values can't be given.
     """
 
     kind: SeriesKind
-    events: list[tuple[int | None, str]] = field(default_factory=list)
-    days: dict[str, int] = field(default_factory=dict)
-    samples: list[tuple[int, float]] = field(default_factory=list)
-    scale: int = 1
+    items: list[SeriesItem] = field(default_factory=list)
+    excluded: list[ExcludedItem] = field(default_factory=list)
     available: bool = True
     dated: bool = True
     window_value: MetricValue | None = None
@@ -111,39 +140,63 @@ def _in_range(epoch: int | None, since: int | None, until: int) -> bool:
     return (since is None or epoch >= since) and epoch < until
 
 
+def item_epoch(item: SeriesItem) -> int | None:
+    """When an item counts: its day's start for day-granular items, else its time."""
+    return _day_start(item.day_utc) if item.day_utc is not None else item.at
+
+
+def item_day(item: SeriesItem) -> str | None:
+    if item.day_utc is not None:
+        return item.day_utc
+    if item.at is None:
+        return None
+    return datetime.fromtimestamp(item.at, tz=UTC).date().isoformat()
+
+
+def items_in_range(series: MetricSeries, since: int | None, until: int) -> list[SeriesItem]:
+    return [item for item in series.items if _in_range(item_epoch(item), since, until)]
+
+
 def nearest_rank(values: Iterable[float], percentile: float) -> float:
     """The nearest-rank percentile of non-empty *values*, e.g. ``0.9`` for p90."""
     ordered = sorted(values)
     return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
 
 
+def aggregate(kind: SeriesKind, items: list[SeriesItem]) -> MetricValue:
+    """The metric's value for a set of in-range items."""
+    if kind == "distinct":
+        return MetricValue(len({item.key for item in items}))
+    if kind == "daily_sum":
+        return MetricValue(micros_to_cents(sum(int(item.value or 0) for item in items)) / 100)
+    sample = [item.value for item in items if item.value is not None]
+    if not sample:
+        return MetricValue(None, sample_size=0)
+    measure = statistics.median(sample) if kind == "median" else nearest_rank(sample, 0.9)
+    return MetricValue(round(measure, 1), sample_size=len(sample))
+
+
 def series_value(series: MetricSeries, since: int | None, until: int) -> MetricValue:
     """The series' value over ``[since, until)``; ``since=None`` has no lower bound."""
     if not series.available:
         return UNAVAILABLE_VALUE
-    if series.kind == "distinct":
-        keys = {key for epoch, key in series.events if _in_range(epoch, since, until)}
-        return MetricValue(len(keys))
-    if series.kind == "daily_sum":
-        total = sum(
-            amount
-            for day, amount in series.days.items()
-            if _in_range(_day_start(day), since, until)
-        )
-        return MetricValue(total / series.scale if series.scale != 1 else total)
-    sample = [value for epoch, value in series.samples if _in_range(epoch, since, until)]
-    if not sample:
-        return MetricValue(None, sample_size=0)
-    measure = statistics.median(sample) if series.kind == "median" else nearest_rank(sample, 0.9)
-    return MetricValue(round(measure, 1), sample_size=len(sample))
+    return aggregate(series.kind, items_in_range(series, since, until))
 
 
-def rework_events(
-    histories: StageHistories, stage_order: list[str]
-) -> list[tuple[int | None, str]]:
-    """Each backward move as ``(epoch, ticket_id)`` (see the module docstring)."""
+MemberOfMove = Callable[[dict[str, Any]], "MemberKey | None"]
+
+
+def _no_member(entry: dict[str, Any]) -> MemberKey | None:
+    del entry
+    return None
+
+
+def rework_items(
+    histories: StageHistories, stage_order: list[str], member_of: MemberOfMove = _no_member
+) -> list[SeriesItem]:
+    """Each backward move (see the module docstring), credited to whoever made it."""
     rank = {stage_id: index for index, stage_id in enumerate(stage_order)}
-    events: list[tuple[int | None, str]] = []
+    items: list[SeriesItem] = []
     for ticket_id, history in histories.items():
         for before, after in itertools.pairwise(history):
             reopened = before["is_complete"] and not after["is_complete"]
@@ -153,37 +206,86 @@ def rework_events(
                 and rank[after["stage_id"]] < rank[before["stage_id"]]
             )
             if reopened or earlier:
-                events.append((after["at"], ticket_id))
-    return events
+                items.append(
+                    SeriesItem(
+                        after["at"],
+                        ticket_id,
+                        "ticket",
+                        member=member_of(after),
+                        detail={
+                            "from_stage_id": before["stage_id"],
+                            "to_stage_id": after["stage_id"],
+                        },
+                    )
+                )
+    return items
 
 
-def shipped_events(histories: StageHistories) -> list[tuple[int | None, str]]:
-    """Each move into a completed stage as ``(epoch, ticket_id)``."""
-    return [
-        (entry["at"], ticket_id)
-        for ticket_id, history in histories.items()
-        for entry in history
-        if entry["is_complete"] and not entry.get("created")
-    ]
+def shipped_items(
+    histories: StageHistories, member_of: MemberOfMove = _no_member
+) -> tuple[list[SeriesItem], list[ExcludedItem]]:
+    """Each move into a completed stage; tickets created already complete are left out."""
+    items: list[SeriesItem] = []
+    excluded: list[ExcludedItem] = []
+    for ticket_id, history in histories.items():
+        for entry in history:
+            if not entry["is_complete"]:
+                continue
+            item = SeriesItem(
+                entry["at"],
+                ticket_id,
+                "ticket",
+                member=member_of(entry),
+                detail={"to_stage_id": entry["stage_id"]},
+            )
+            if entry.get("created"):
+                excluded.append(
+                    ExcludedItem(item, "Created in a completed stage, never moved into it")
+                )
+            else:
+                items.append(item)
+    return items, excluded
 
 
 def hours_to_final_stage(
-    histories: StageHistories, final_stage_id: str | None
-) -> list[tuple[int, float]]:
-    """``(moved_at, hours)`` from creation to the latest move into *final_stage_id*.
+    histories: StageHistories, final_stage_id: str | None, member_of: MemberOfMove = _no_member
+) -> tuple[list[SeriesItem], list[ExcludedItem]]:
+    """Hours from creation to the latest move into *final_stage_id*, per ticket now there.
 
-    Only tickets now in that stage with a recorded creation count.
+    Tickets that left the final stage, or have no recorded creation, are left out.
     """
     if final_stage_id is None:
-        return []
-    samples = []
-    for history in histories.values():
-        if len(history) < 2 or not history[0].get("created"):
+        return [], []
+    items: list[SeriesItem] = []
+    excluded: list[ExcludedItem] = []
+    for ticket_id, history in histories.items():
+        reached = [entry for entry in history[1:] if entry["stage_id"] == final_stage_id]
+        if not reached:
             continue
         last = history[-1]
-        if last["stage_id"] == final_stage_id:
-            samples.append((last["at"], max(0, last["at"] - history[0]["at"]) / 3600))
-    return samples
+        if last["stage_id"] != final_stage_id:
+            excluded.append(
+                ExcludedItem(
+                    SeriesItem(
+                        reached[-1]["at"], ticket_id, "ticket", member=member_of(reached[-1])
+                    ),
+                    "Left the final stage after reaching it",
+                )
+            )
+            continue
+        if not history[0].get("created"):
+            excluded.append(
+                ExcludedItem(
+                    SeriesItem(last["at"], ticket_id, "ticket", member=member_of(last)),
+                    "No recorded creation time",
+                )
+            )
+            continue
+        hours = max(0, last["at"] - history[0]["at"]) / 3600
+        items.append(
+            SeriesItem(last["at"], ticket_id, "ticket", value=hours, member=member_of(last))
+        )
+    return items, excluded
 
 
 def _call(source: Any, method: str, *args: Any) -> Any:
@@ -219,24 +321,44 @@ def trend_since_day(today_utc: str) -> str:
     return (date.fromisoformat(today_utc) - timedelta(days=TREND_DAYS)).isoformat()
 
 
-def load_series(metric_ids: Iterable[str], inputs: KpiInputs) -> dict[str, MetricSeries]:
-    """Each requested metric's series; only the data those metrics need is read."""
+def load_series(
+    metric_ids: Iterable[str], inputs: KpiInputs, member_of: MemberOfMove = _no_member
+) -> dict[str, MetricSeries]:
+    """Each requested metric's series; only the data those metrics need is read.
+
+    :param member_of: Credits a ticket move (a stage-history entry) to a member.
+    """
     wanted = set(metric_ids) - {UNMEASURED_METRIC}
     project, period = inputs.project, inputs.period
     series: dict[str, MetricSeries] = {}
     if "merged_prs" in wanted:
         source = inputs.sources.prs_merged
-        items = (
+        merged = (
             None
             if source is None or not hasattr(source, "merged_items")
             else (_call(source, "merged_items", project))
         )
-        if items is not None:
+        if merged is not None:
+            items = [
+                SeriesItem(
+                    None if merge.merged_at is None else int(merge.merged_at),
+                    merge.key,
+                    "ticket" if merge.key.startswith("ticket:") else "pull_request",
+                    member=getattr(merge, "member", None),
+                )
+                for merge in merged
+            ]
             series["merged_prs"] = MetricSeries(
                 "distinct",
-                events=[
-                    (None if item.merged_at is None else int(item.merged_at), item.key)
+                items=items,
+                excluded=[
+                    ExcludedItem(
+                        item,
+                        "No merge time recorded, so it counts only in All time",
+                        only_when_bounded=True,
+                    )
                     for item in items
+                    if item.at is None
                 ],
             )
         elif source is not None:
@@ -249,21 +371,23 @@ def load_series(metric_ids: Iterable[str], inputs: KpiInputs) -> dict[str, Metri
     if "spend_usd" in wanted:
         source = inputs.sources.spend
         covering = _covering(period, trend_since_day(period.today_utc))
-        breakdown = (
-            _call(source, "breakdown", project, covering)
-            if source is not None and hasattr(source, "breakdown")
+        rows = (
+            _call(source, "root_days", project, covering)
+            if source is not None and hasattr(source, "root_days")
             else None
         )
-        if source is not None:
-            # The window total is rounded once, like the Summary; the days feed the trend.
-            window = _total(_call(source, "spend", project, period), scale=100)
+        if rows is not None:
             series["spend_usd"] = MetricSeries(
                 "daily_sum",
-                days={} if breakdown is None else dict(breakdown.by_day),
-                scale=100,
-                available=window.available,
-                dated=breakdown is not None,
-                window_value=window,
+                items=[
+                    SeriesItem(None, root_id, "session", value=micros, day_utc=day, member=member)
+                    for root_id, day, micros, member in rows
+                ],
+            )
+        elif source is not None:
+            window = _total(_call(source, "spend", project, period), scale=100)
+            series["spend_usd"] = MetricSeries(
+                "daily_sum", available=window.available, dated=False, window_value=window
             )
         else:
             series["spend_usd"] = UNAVAILABLE_SERIES
@@ -276,25 +400,26 @@ def load_series(metric_ids: Iterable[str], inputs: KpiInputs) -> dict[str, Metri
     if ticket_metrics:
         histories = inputs.stage_histories()
         if "tickets_shipped" in ticket_metrics:
-            series["tickets_shipped"] = MetricSeries("distinct", events=shipped_events(histories))
+            items, excluded = shipped_items(histories, member_of)
+            series["tickets_shipped"] = MetricSeries("distinct", items=items, excluded=excluded)
         if ticket_metrics - {"tickets_shipped"}:
             stages = inputs.stages()
             if "rework_tickets" in ticket_metrics:
                 order = [str(stage["id"]) for stage in stages]
                 series["rework_tickets"] = MetricSeries(
-                    "distinct", events=rework_events(histories, order)
+                    "distinct", items=rework_items(histories, order, member_of)
                 )
             final = next(
                 (str(stage["id"]) for stage in reversed(stages) if stage.get("is_complete")),
                 None,
             )
-            samples = hours_to_final_stage(histories, final)
+            items, excluded = hours_to_final_stage(histories, final, member_of)
             for metric_id, kind in (
                 ("time_to_merged_median_hours", "median"),
                 ("time_to_merged_p90_hours", "p90"),
             ):
                 if metric_id in ticket_metrics:
-                    series[metric_id] = MetricSeries(kind, samples=samples)  # type: ignore[arg-type]
+                    series[metric_id] = MetricSeries(kind, items=items, excluded=excluded)  # type: ignore[arg-type]
     return series
 
 

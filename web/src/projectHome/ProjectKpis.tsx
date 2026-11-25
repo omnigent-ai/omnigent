@@ -42,6 +42,8 @@ import type { ProjectStatusWindow } from "@/lib/projectStatusApi";
 const KPI_WINDOW: ProjectStatusWindow = "7d";
 import { formatUploadTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
+import type { StatusItemMetric } from "@/lib/projectStatusItemsApi";
+import type { StatusDrilldown } from "./ProjectStatusItems";
 import { TicketError } from "./TicketControls";
 
 const TIME_METRICS = new Set<KpiMetricId>([
@@ -50,7 +52,14 @@ const TIME_METRICS = new Set<KpiMetricId>([
 ]);
 
 /** The Summary's KPI section: one tile per KPI, who set them, and the owner's Edit. */
-export function ProjectKpiTiles({ projectId }: { projectId: string }) {
+export function ProjectKpiTiles({
+  projectId,
+  onDrill,
+}: {
+  projectId: string;
+  /** Opens the items behind a tile. */
+  onDrill?: (drilldown: StatusDrilldown) => void;
+}) {
   const [editing, setEditing] = useState(false);
   // Tiles always show the last 7 full days, whatever window the page shows.
   const kpis = useQuery({
@@ -88,7 +97,7 @@ export function ProjectKpiTiles({ projectId }: { projectId: string }) {
         <>
           <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {kpis.data.kpis.map((kpi) => (
-              <KpiTile key={kpi.position} kpi={kpi} />
+              <KpiTile key={kpi.position} kpi={kpi} onDrill={onDrill} />
             ))}
           </ul>
           <KpiFooter kpis={kpis.data} />
@@ -144,7 +153,13 @@ function StatusBadge({ status }: { status: KpiStatus }) {
   );
 }
 
-export function KpiTile({ kpi }: { kpi: ProjectKpiValue }) {
+export function KpiTile({
+  kpi,
+  onDrill,
+}: {
+  kpi: ProjectKpiValue;
+  onDrill?: (drilldown: StatusDrilldown) => void;
+}) {
   const trend = kpi.trend;
   const target = formatKpiTarget(kpi);
   const measured = kpi.metric !== UNMEASURED_METRIC && trend !== null;
@@ -182,6 +197,22 @@ export function KpiTile({ kpi }: { kpi: ProjectKpiValue }) {
             </p>
           </div>
           <KpiBars kpi={kpi} />
+          {onDrill && trend.status !== "unavailable" && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-2 self-start"
+              onClick={() =>
+                onDrill({
+                  label: kpi.name,
+                  metric: kpi.metric as StatusItemMetric,
+                  range: "trend",
+                })
+              }
+            >
+              See the items
+            </Button>
+          )}
         </>
       ) : (
         <p className="text-sm text-muted-foreground">

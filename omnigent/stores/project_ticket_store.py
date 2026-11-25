@@ -499,8 +499,9 @@ class ProjectTicketStore:
         """Each ticket's stages in time order, starting with the one it was created in.
 
         Readable by any project member. Maps ticket ID to ``{"stage_id",
-        "is_complete", "at", "created"}`` entries; ``created`` marks the ticket's
-        creation, missing for tickets created before stages were recorded.
+        "is_complete", "at", "created", "user_id", "session_id"}`` entries: who made
+        each move. ``created`` marks the ticket's creation, missing for tickets
+        created before stages were recorded.
         """
         with self._session("list_ticket_stage_histories") as session:
             self._project(session, project_id, user_id)
@@ -533,9 +534,28 @@ class ProjectTicketStore:
                         "is_complete": stage.get("is_complete") is True,
                         "at": row.created_at,
                         "created": row.kind == EVENT_CODES["created"],
+                        "user_id": row.user_id,
+                        "session_id": row.session_id,
                     }
                 )
             return histories
+
+    def ticket_titles(
+        self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None
+    ) -> dict[str, str]:
+        """Titles by ticket ID for the given tickets in one project; unknown IDs are omitted."""
+        if not ticket_ids:
+            return {}
+        with self._session("list_ticket_titles") as session:
+            self._project(session, project_id, user_id)
+            rows = session.execute(
+                select(SqlProjectTicket.id, SqlProjectTicket.title).where(
+                    SqlProjectTicket.workspace_id == current_workspace_id(),
+                    SqlProjectTicket.project_id == _identifier(project_id),
+                    SqlProjectTicket.id.in_([_identifier(ticket_id) for ticket_id in ticket_ids]),
+                )
+            ).all()
+            return dict(rows)
 
     @classmethod
     def _human_asks(cls, session: Session, ticket: SqlProjectTicket) -> builtins.list[_HumanAsk]:

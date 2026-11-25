@@ -118,6 +118,29 @@ class ProjectSpend:
             },
         )
 
+    def root_days(
+        self, project: Project, period: StatusPeriod
+    ) -> list[tuple[str, str, int, MemberKey]] | None:
+        """Spend per root session and UTC day, as ``(root_id, day_utc, micros, member)``.
+
+        The rows :meth:`breakdown` sums; ``None`` without a store.
+        """
+        conversations = self._conversations
+        if conversations is None:
+            return None
+        members: dict[str, MemberKey] = {}
+        micros_by_root_day: dict[tuple[str, str], int] = defaultdict(int)
+        for root_id, day_utc, micros in _window_rows(
+            conversations, project.id, period.since_day_utc, period.today_utc
+        ):
+            if root_id not in members:
+                members[root_id] = _member_for_root(conversations, project, root_id)
+            micros_by_root_day[(root_id, day_utc)] += micros
+        return [
+            (root_id, day_utc, micros, members[root_id])
+            for (root_id, day_utc), micros in sorted(micros_by_root_day.items())
+        ]
+
 
 def _window_rows(
     conversations: ConversationStore,

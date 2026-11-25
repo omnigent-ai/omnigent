@@ -1,9 +1,11 @@
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as kpisApi from "@/lib/projectKpisApi";
 import * as statusApi from "@/lib/projectStatusApi";
+import * as itemsApi from "@/lib/projectStatusItemsApi";
 import * as projectsApi from "@/lib/projectsApi";
 import { draftToDefinition } from "./ProjectKpis";
 import { ProjectSummary } from "./ProjectSummary";
@@ -22,6 +24,10 @@ vi.mock("@/lib/projectsApi", async (importOriginal) => ({
 vi.mock("@/lib/projectStatusApi", async (importOriginal) => ({
   ...(await importOriginal<typeof statusApi>()),
   getProjectStatusSummary: vi.fn(),
+}));
+vi.mock("@/lib/projectStatusItemsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof itemsApi>()),
+  getProjectStatusItems: vi.fn(),
 }));
 vi.mock("@/lib/projectKpisApi", async (importOriginal) => ({
   ...(await importOriginal<typeof kpisApi>()),
@@ -115,7 +121,9 @@ function renderSummary() {
   clients.push(client);
   render(<ProjectSummary projectName="Shipping" />, {
     wrapper: ({ children }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      <MemoryRouter>
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      </MemoryRouter>
     ),
   });
 }
@@ -248,6 +256,111 @@ describe("ProjectSummary", () => {
       ],
       3,
       "7d",
+    );
+  });
+});
+
+describe("drill-down", () => {
+  const items: itemsApi.ProjectStatusItems = {
+    object: "project.status_items",
+    project_id: "project",
+    metric: "tickets_shipped",
+    unit: "count",
+    range: "7d",
+    member: "user:owner@example.com",
+    since_day_utc: "2026-03-04",
+    today_utc: "2026-03-10",
+    available: true,
+    total: 1,
+    sample_size: null,
+    days: [{ day_utc: "2026-03-10", value: 1, items: 1 }],
+    items: [
+      {
+        day_utc: "2026-03-10",
+        at: 1,
+        kind: "ticket",
+        id: "ticket-a",
+        title: "Ship it",
+        url: null,
+        member: "user:owner@example.com",
+        value: null,
+        counted_in_total: true,
+      },
+    ],
+    excluded: [
+      {
+        day_utc: "2026-03-09",
+        at: 2,
+        kind: "ticket",
+        id: "ticket-b",
+        title: "Imported",
+        url: null,
+        member: "user:owner@example.com",
+        value: null,
+        counted_in_total: true,
+        reason: "Created in a completed stage, never moved into it",
+      },
+    ],
+    truncated: false,
+  };
+
+  it("opens the items behind a member's cell, with what's left out and why", async () => {
+    vi.mocked(statusApi.getProjectStatusSummary).mockResolvedValue(
+      summary({
+        members: [
+          {
+            key: "user:owner@example.com",
+            kind: "human",
+            name: "Owner",
+            user_id: "owner@example.com",
+            identity_id: null,
+            tickets_done: 1,
+            prs_merged: null,
+            spend_cents: 0,
+            cost_per_merged_pr_cents: null,
+          },
+        ],
+      }),
+    );
+    vi.mocked(itemsApi.getProjectStatusItems).mockResolvedValue(items);
+    renderSummary();
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "Tickets done by Owner: show the items behind it",
+      }),
+    );
+    const dialog = await screen.findByTestId("project-status-items");
+    expect(itemsApi.getProjectStatusItems).toHaveBeenCalledWith(
+      "project",
+      expect.objectContaining({
+        metric: "tickets_shipped",
+        range: "7d",
+        member: "user:owner@example.com",
+      }),
+      expect.anything(),
+    );
+    expect(within(dialog).getByText("Tickets done for Owner")).toBeTruthy();
+    expect(within(dialog).getByRole("link", { name: "Ship it" }).getAttribute("href")).toContain(
+      "ticket=ticket-a",
+    );
+    const [left] = within(dialog).getAllByTestId("project-status-excluded-row");
+    expect(
+      within(left).getByText("Created in a completed stage, never moved into it"),
+    ).toBeTruthy();
+  });
+
+  it("opens a KPI tile's items over the tile's 8 days", async () => {
+    vi.mocked(kpisApi.getProjectKpis).mockResolvedValue(
+      kpis({ revision: 1, updated_at: 1, kpis: [kpi({})] }),
+    );
+    vi.mocked(itemsApi.getProjectStatusItems).mockResolvedValue({ ...items, range: "trend" });
+    renderSummary();
+    await userEvent.click(await screen.findByRole("button", { name: "See the items" }));
+    await screen.findByTestId("project-status-items");
+    expect(itemsApi.getProjectStatusItems).toHaveBeenCalledWith(
+      "project",
+      expect.objectContaining({ metric: "tickets_shipped", range: "trend" }),
+      expect.anything(),
     );
   });
 });

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from omnigent.db.utils import now_epoch
 from omnigent.entities.project_kpi import (
     KPI_METRICS,
+    KPI_METRICS_BY_ID,
     KPI_REVISIONS_PAGE_MAX,
     KpiDirection,
     KpiMetric,
@@ -23,13 +24,16 @@ from omnigent.entities.project_kpi import (
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.project_kpis import KpiInputs, KpiStatus, kpi_rows, load_series
 from omnigent.server.project_status import (
+    StatusPeriod,
     StatusSources,
     StatusWindow,
     load_status_sources,
     status_period,
 )
+from omnigent.server.project_status_items import DrilldownRange, drilldown, range_bounds
 from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes.project_status import move_member_resolver
 from omnigent.server.routes.projects import refuse_unless_owner_or_lead
 
 if TYPE_CHECKING:
@@ -111,6 +115,63 @@ class ProjectKpis(BaseModel):
     metrics: list[KpiMetric] = Field(description="The metrics a KPI may track.")
 
 
+StatusItemMetric = Literal[
+    "merged_prs",
+    "spend_usd",
+    "tickets_shipped",
+    "rework_tickets",
+    "time_to_merged_median_hours",
+    "time_to_merged_p90_hours",
+]
+
+
+class ProjectStatusItem(BaseModel):
+    """One ticket, PR or session behind a number."""
+
+    day_utc: str | None = Field(description="Its UTC day; null for an undated merge.")
+    at: int | None = Field(description="When it happened; null for day-granular spend.")
+    kind: Literal["ticket", "pull_request", "session"]
+    id: str = Field(description="Ticket ID, PR URL, or root session ID.")
+    title: str | None
+    url: str | None = Field(description="The PR's URL; null for tickets and sessions.")
+    member: str | None = Field(description="The member key it counts for, when known.")
+    value: float | None = Field(description="Hours for time metrics, USD for spend, else null.")
+    detail: dict[str, Any] | None = None
+    counted_in_total: bool = Field(
+        default=True,
+        description="False when the total counts it on a later day (it counts once).",
+    )
+    reason: str | None = Field(default=None, description="Why it's left out (excluded only).")
+
+
+class ProjectStatusItemDay(BaseModel):
+    day_utc: str
+    value: float | None = Field(description="The day's value, as on the tile.")
+    items: int = Field(description="Rows behind it; equals value for count metrics.")
+
+
+class ProjectStatusItems(BaseModel):
+    """The items behind one status number, by UTC day."""
+
+    object: Literal["project.status_items"]
+    project_id: str
+    metric: StatusItemMetric
+    unit: KpiUnit
+    range: Literal["7d", "30d", "all", "trend"]
+    member: str | None
+    since_day_utc: str | None
+    today_utc: str
+    available: bool = Field(description="False when this server has no source for the metric.")
+    total: float | None
+    sample_size: int | None
+    days: list[ProjectStatusItemDay]
+    items: list[ProjectStatusItem]
+    excluded: list[ProjectStatusItem] = Field(
+        description="Items the counting rules leave out, each with its reason."
+    )
+    truncated: bool
+
+
 class ProjectKpiRevisionPage(BaseModel):
     object: Literal["list"]
     data: list[ProjectKpiRevision]
@@ -141,16 +202,10 @@ def create_project_kpis_router(
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return project
 
-    def build(
-        request: Request,
-        project: Project,
-        window: StatusWindow,
-        current: ProjectKpiRevision | None,
-        user_id: str | None,
-    ) -> dict[str, Any]:
-        period = status_period(window, now_epoch())
-        kpis = current.kpis if current else []
-        inputs = KpiInputs(
+    def inputs_for(
+        request: Request, project: Project, period: StatusPeriod, user_id: str | None
+    ) -> KpiInputs:
+        return KpiInputs(
             project=project,
             period=period,
             sources=sources(request),
@@ -161,6 +216,17 @@ def create_project_kpis_router(
                 lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
             ),
         )
+
+    def build(
+        request: Request,
+        project: Project,
+        window: StatusWindow,
+        current: ProjectKpiRevision | None,
+        user_id: str | None,
+    ) -> dict[str, Any]:
+        period = status_period(window, now_epoch())
+        kpis = current.kpis if current else []
+        inputs = inputs_for(request, project, period, user_id)
         series = load_series((kpi.metric for kpi in kpis), inputs)
         return {
             "object": "project.kpis",
@@ -235,6 +301,95 @@ def create_project_kpis_router(
             base_revision=body.base_revision,
         )
         return await asyncio.to_thread(build, request, project, window, revision, user_id)
+
+    def build_items(
+        request: Request,
+        project: Project,
+        metric: StatusItemMetric,
+        range_id: DrilldownRange,
+        member: str | None,
+        user_id: str | None,
+    ) -> dict[str, Any]:
+        period = status_period("7d" if range_id == "trend" else range_id, now_epoch())
+        inputs = inputs_for(request, project, period, user_id)
+        member_of = move_member_resolver(project, conversation_store)
+        series = load_series([metric], inputs, member_of)[metric]
+        result = drilldown(series, period, range_id, member) if series.dated else None
+        rows = [] if result is None else [*result["items"], *result["excluded"]]
+        ticket_ids = {row["id"].removeprefix("ticket:") for row in rows if row["kind"] == "ticket"}
+        titles = ticket_store.ticket_titles(project.id, sorted(ticket_ids), user_id=user_id)
+        session_titles: dict[str, str | None] = {}
+        for row in rows:
+            if row["kind"] == "session" and row["id"] not in session_titles:
+                session = (
+                    conversation_store.get_conversation(row["id"]) if conversation_store else None
+                )
+                session_titles[row["id"]] = getattr(session, "title", None)
+            if row["kind"] == "ticket":
+                row["id"] = row["id"].removeprefix("ticket:")
+                row["title"] = titles.get(row["id"])
+                row["url"] = None
+            elif row["kind"] == "session":
+                row["title"] = session_titles[row["id"]]
+                row["url"] = None
+            else:
+                row["title"] = None
+                row["url"] = row["id"]
+        metric_info = KPI_METRICS_BY_ID[metric]
+        base = {
+            "object": "project.status_items",
+            "project_id": project.id,
+            "metric": metric,
+            "unit": metric_info.unit,
+            "range": range_id,
+            "member": member,
+            "today_utc": period.today_utc,
+        }
+        if result is None:
+            window = series.window_value
+            return {
+                **base,
+                "since_day_utc": range_bounds(range_id, period)[1],
+                "available": False,
+                "total": None if window is None else window.value,
+                "sample_size": None,
+                "days": [],
+                "items": [],
+                "excluded": [],
+                "truncated": False,
+            }
+        return {**base, **result, "available": series.available}
+
+    @router.get("/projects/{project_id}/status/items", response_model=ProjectStatusItems)
+    async def project_status_items(
+        request: Request,
+        project_id: str,
+        metric: Annotated[StatusItemMetric, Query(description="The metric to list items for.")],
+        range: Annotated[
+            DrilldownRange,
+            Query(
+                description=(
+                    "7d, 30d or all as on the Summary, or trend: the KPI tiles' 7 full UTC "
+                    "days ending yesterday plus today."
+                )
+            ),
+        ] = "7d",
+        member: Annotated[
+            str | None,
+            Query(description="Only what counts for this member key, e.g. user:a@example.com."),
+        ] = None,
+    ) -> dict[str, Any]:
+        """The tickets, PRs or sessions behind a Summary number or KPI tile, by day.
+
+        Any project member may read it. Each day's value is computed by the same code
+        as the number it drills into; items the counting rules leave out are listed
+        separately with the reason.
+        """
+        user_id = require_user(request, auth_provider)
+        project = await load_project(project_id, user_id)
+        return await asyncio.to_thread(
+            build_items, request, project, metric, range, member, user_id
+        )
 
     @router.get("/projects/{project_id}/kpis/revisions", response_model=ProjectKpiRevisionPage)
     async def list_project_kpi_revisions(
