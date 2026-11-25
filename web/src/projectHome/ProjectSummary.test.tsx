@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as kpisApi from "@/lib/projectKpisApi";
 import * as statusApi from "@/lib/projectStatusApi";
+import type * as telemetryApi from "@/lib/projectTelemetryApi";
 import * as itemsApi from "@/lib/projectStatusItemsApi";
 import * as projectsApi from "@/lib/projectsApi";
 import { draftToDefinition } from "./ProjectKpis";
@@ -28,6 +29,53 @@ vi.mock("@/lib/projectStatusApi", async (importOriginal) => ({
 vi.mock("@/lib/projectStatusItemsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof itemsApi>()),
   getProjectStatusItems: vi.fn(),
+}));
+// The Insights section loads its own numbers; these tests cover the rest of the Summary.
+vi.mock("@/lib/projectTelemetryApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof telemetryApi>()),
+  getProjectTelemetry: vi.fn(async () => ({
+    object: "project.telemetry",
+    project_id: "project",
+    project_name: "Shipping",
+    window: "7d",
+    since_day_utc: null,
+    today_utc: "2026-03-10",
+    work_start: {
+      sessions_started_by_people: 0,
+      tickets_filed_directly: 0,
+      tickets_filed_from_a_chat: 0,
+      tickets_filed_by_agents: 0,
+      people: { session_first: 0, ticket_first: 0, both: 0 },
+    },
+    role_interaction: {
+      messages_to_lead: null,
+      messages_to_roles: null,
+      people_messaging_roles: null,
+      side_chats_opened: 0,
+      side_chats_with_roles: 0,
+      ticket_comments_by_people: 0,
+      people_ticket_only: null,
+    },
+    team_building: {
+      roles: 0,
+      roles_created_by_lead: 0,
+      roles_created_by_hand: 0,
+      roles_created_in_window: 0,
+      roles_created_in_window_by_lead: 0,
+      roles_edited_after_creation: 0,
+      median_hours_to_last_role_edit: null,
+    },
+    throughput: {
+      tickets_shipped: 0,
+      merged_prs: 0,
+      rework_tickets: 0,
+      time_to_merged_median_hours: null,
+      spend_usd: 0,
+      review_rounds_per_shipped_ticket: null,
+      stalled_tickets: 0,
+    },
+    people: null,
+  })),
 }));
 vi.mock("@/lib/projectKpisApi", async (importOriginal) => ({
   ...(await importOriginal<typeof kpisApi>()),

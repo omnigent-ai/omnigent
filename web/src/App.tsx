@@ -63,6 +63,10 @@ const ProjectHomePage = withPageView(
   lazy(() => import("@/pages/ProjectHomePage").then((m) => ({ default: m.ProjectHomePage }))),
 );
 const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
+const InsightsPage = withPageView(
+  "insights",
+  lazy(() => import("@/pages/InsightsPage").then((m) => ({ default: m.InsightsPage }))),
+);
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
@@ -285,6 +289,14 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/insights`}
+            element={
+              <FeatureGatedPage feature="project_kanban">
+                <InsightsPage />
               </FeatureGatedPage>
             }
           />

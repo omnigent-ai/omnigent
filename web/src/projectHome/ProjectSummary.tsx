@@ -26,6 +26,7 @@ import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { MemberName, memberDisplayName } from "./MemberName";
+import { ProjectInsightsSection } from "./ProjectInsights";
 import { ProjectKpiTiles } from "./ProjectKpis";
 import { useProjectIdentities } from "./useProjectIdentities";
 import { ProjectStatusItemsDialog, type StatusDrilldown } from "./ProjectStatusItems";
@@ -46,6 +47,7 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
     enabled: projectId !== null,
     staleTime: 30_000,
   });
+  const projectRow = useProjectMandate(projectId);
   const memberNames = useMemo(
     () =>
       new Map(
@@ -123,6 +125,11 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
           <p className="text-sm text-muted-foreground">People are unavailable right now.</p>
         )}
       </section>
+      <ProjectInsightsSection
+        projectId={projectId}
+        statusWindow={statusWindow}
+        isOwner={projectRow.data !== undefined && projectRow.data.shared !== true}
+      />
       {drilldown && (
         <ProjectStatusItemsDialog
           projectId={projectId}
@@ -189,7 +196,7 @@ function ProjectCharter({
   );
 }
 
-function WindowPicker({
+export function WindowPicker({
   value,
   onChange,
 }: {
