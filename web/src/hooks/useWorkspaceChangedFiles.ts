@@ -488,6 +488,8 @@ export async function readListingPages(
   const first = await fetchPage(null);
   if (first === null) return null;
   const data = [...first.data];
+  // A server whose cursor entry was deleted starts its listing over, resending what it gave.
+  const held = new Set(first.data.map((entry) => entry.id));
   let page = first;
   let truncated = first.truncated ?? false;
   // A server that hands back a cursor already asked for is cycling.
@@ -499,7 +501,7 @@ export async function readListingPages(
     if (page.data.length === 0 || !page.last_id) break;
     const after = page.last_id;
     requested.add(after);
-    // Nobody waits for the listing any more, as when its folder closed.
+    // Nobody waits for the listing any more, as when the session changed or the tree closed.
     signal?.throwIfAborted();
     const next = await fetchPage(after);
     // Half a folder would read as the whole of it.
@@ -508,7 +510,11 @@ export async function readListingPages(
     if (next.last_id && requested.has(next.last_id)) break;
     page = next;
     truncated ||= next.truncated ?? false;
-    data.push(...next.data);
+    const fresh = next.data.filter((entry) => !held.has(entry.id));
+    // A page of only entries already held would never end the listing; the rest stays unread.
+    if (fresh.length === 0) break;
+    for (const entry of fresh) held.add(entry.id);
+    data.push(...fresh);
   }
   /* oxlint-enable no-await-in-loop */
   // Exactly the limit, so the tree can tell a listing that stopped there.

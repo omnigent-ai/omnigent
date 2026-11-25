@@ -396,6 +396,8 @@ async function listDirectory(
   { signal, hideIgnored = false, collapseSingleChildDirectories = false }: ListDirectoryOptions,
 ): Promise<{ data: ListedEntry[]; hasMore: boolean }> {
   const data: ListedEntry[] = [];
+  // A host whose token's entry was deleted starts its listing over, resending what it gave.
+  const held = new Set<string>();
   let pageToken = "";
   // A host that hands back a token already asked for is cycling; stop before asking again.
   const requested = new Set<string>();
@@ -415,10 +417,12 @@ async function listDirectory(
     );
     // A page ending on a token already asked for resends one the listing holds; stop before keeping it.
     if (page.nextPageToken && requested.has(page.nextPageToken)) break;
-    data.push(...page.entries.map(listedEntry));
+    const fresh = page.entries.filter((entry) => !held.has(entry.path));
+    for (const entry of fresh) held.add(entry.path);
+    data.push(...fresh.map(listedEntry));
     pageToken = page.nextPageToken;
     // A page that adds nothing would never end the listing; report the rest as more.
-    if (page.entries.length === 0) break;
+    if (fresh.length === 0) break;
   } while (pageToken && data.length < maxEntries);
   /* oxlint-enable no-await-in-loop */
   // A host may ignore the page size; keep to the caller's limit and report the rest as more.

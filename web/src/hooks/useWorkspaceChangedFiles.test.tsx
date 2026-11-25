@@ -1218,6 +1218,29 @@ describe("folder listings past one page", () => {
     expect(listingCutOff(entries)).toBe(true);
   });
 
+  it("keeps each entry once when the server starts over because the cursor's entry was deleted", async () => {
+    // A server that starts from the top when the `after` entry is gone, as the hosts do.
+    let names = Array.from({ length: 1500 }, (_, i) => `f${String(i).padStart(4, "0")}`);
+    const listing = await readListingPages(async (after) => {
+      const found = names.findIndex((name) => `experimental/${name}` === after);
+      const start = found < 0 ? 0 : found + 1;
+      const slice = names.slice(start, start + 1000);
+      // Its first page's last entry is deleted before the second is asked for.
+      if (after === null) names = names.filter((name) => name !== "f0999");
+      return {
+        object: "list",
+        data: slice.map(entry),
+        has_more: start + slice.length < names.length,
+        last_id: `experimental/${slice.at(-1)}`,
+      };
+    });
+
+    const ids = listing.data.map((file) => file.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toHaveLength(1500);
+    expect(listing.has_more).toBe(false);
+  });
+
   it("keeps has_more when a page arrives with no cursor to continue from", async () => {
     const listing = await readListingPages(async () => ({
       object: "list",

@@ -523,6 +523,27 @@ describe("readFileViaWorkspaceApi", () => {
     ).toEqual(["", "A", "B"]);
   });
 
+  it("keeps each entry once when the host starts over because the token's entry was deleted", async () => {
+    enable("workspace_api_server_access");
+    // `src/b.ts` is deleted after the first page, so the host lists from the top for "b".
+    const pages: Record<string, { paths: string[]; next: string }> = {
+      "": { paths: ["src/a.ts", "src/b.ts"], next: "b" },
+      b: { paths: ["src/a.ts", "src/c.ts"], next: "c" },
+      c: { paths: ["src/d.ts"], next: "" },
+    };
+    scriptPages((token) => pages[token]!);
+
+    const listed = await listDirectoryViaWorkspaceApi("s-list-restart", "src", 1000);
+
+    expect(listed?.data.map((entry) => entry.path)).toEqual([
+      "src/a.ts",
+      "src/b.ts",
+      "src/c.ts",
+      "src/d.ts",
+    ]);
+    expect(listed?.hasMore).toBe(false);
+  });
+
   it("keeps a listing to the caller's limit when the host ignores the page size", async () => {
     enable("workspace_api_server_access");
     // 51,000 entries in pages of 3,000, then the end: a complete listing past the limit.
