@@ -17,7 +17,6 @@ import { MenuShortcut } from "@/components/ui/menu-item";
 import { readClipboardText } from "@/lib/clipboard";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isElectronShell } from "@/lib/nativeBridge";
-import { searchQueryFromSelection } from "@/lib/selectedText";
 import { requestTextSearch, useFileFinderAvailable } from "@/store/fileFinder";
 import { EDITOR_COMMAND_RUNS } from "./codeMirrorEditorCommands";
 import { pinnedLineAt, revealStickyLine } from "./codeMirrorStickyScroll";
@@ -25,6 +24,7 @@ import {
   type EditorMenuAction,
   type EditorMenuEntry,
   editorMenuEntries,
+  selectionSearchQuery,
 } from "./editorContextMenuEntries";
 import type { CodeMirrorSelectionActions } from "./useCodeMirrorCommentLayer";
 
@@ -116,9 +116,7 @@ export function EditorContextMenu({
     const open = (x: number, y: number) => {
       const { state } = view;
       const main = state.selection.main;
-      const query = main.empty
-        ? null
-        : searchQueryFromSelection(state.sliceDoc(main.from, main.to));
+      const query = selectionSearchQuery(state);
       const current = latest.current;
       leavesFocus.current = false;
       setMenu({

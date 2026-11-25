@@ -1,8 +1,10 @@
 // What the file editor's right-click menu lists, from the same labels and
 // shortcuts as ⌘K, given what the editor can do at the click.
 
+import type { EditorState } from "@codemirror/state";
 import type { FileEditorCommandId } from "@/components/fileEditorCommands";
 import { GO_TO_LINE_LABEL } from "@/components/GoToLineBar";
+import { searchQueryFromSelection } from "@/lib/selectedText";
 import { shortcutBinding } from "@/lib/shortcuts/registry";
 import type { ShortcutId } from "@/lib/shortcuts/registry";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
@@ -159,4 +161,21 @@ export function editorMenuEntries(context: EditorMenuContext): EditorMenuEntry[]
   return groups.flatMap((group, index) =>
     index === 0 ? group : [{ kind: "separator", key: `separator-${index}` } as const, ...group],
   );
+}
+
+/**
+ * The main selection's search query, reading only up to its first non-blank line, so a
+ * menu opened over a select-all doesn't copy the whole file.
+ */
+export function selectionSearchQuery(state: EditorState): string | null {
+  const { from, to, empty } = state.selection.main;
+  if (empty) return null;
+  for (let number = state.doc.lineAt(from).number; ; number += 1) {
+    const line = state.doc.line(number);
+    const text = line.text.slice(
+      Math.max(from, line.from) - line.from,
+      Math.min(to, line.to) - line.from,
+    );
+    if (/\S/.test(text) || line.to >= to) return searchQueryFromSelection(text);
+  }
 }

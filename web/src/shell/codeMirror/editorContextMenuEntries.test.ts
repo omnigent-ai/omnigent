@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { EditorSelection, EditorState } from "@codemirror/state";
+import { describe, expect, it, vi } from "vitest";
 import {
   type EditorMenuContext,
   type EditorMenuEntry,
   editorMenuEntries,
   pasteWithKeysDescription,
+  selectionSearchQuery,
 } from "./editorContextMenuEntries";
 
 const READ_ONLY: EditorMenuContext = {
@@ -111,5 +113,40 @@ describe("editorMenuEntries", () => {
       "Ctrl",
       "C",
     ]);
+  });
+});
+
+describe("selectionSearchQuery", () => {
+  const selected = (doc: string, from: number, to: number) =>
+    EditorState.create({ doc, selection: EditorSelection.single(from, to) });
+
+  it("takes the selection's first non-blank line, trimmed and clipped to the selection", () => {
+    const doc = "alpha beta\n   \n  needle here  \nsecond";
+    expect(selectionSearchQuery(selected(doc, 6, doc.length))).toBe("beta");
+    expect(selectionSearchQuery(selected(doc, 10, doc.length))).toBe("needle here");
+    expect(selectionSearchQuery(selected(doc, 13, 23))).toBe("needle");
+  });
+
+  it("makes no query from an empty or blank selection", () => {
+    expect(selectionSearchQuery(selected("alpha", 2, 2))).toBeNull();
+    expect(selectionSearchQuery(selected("a\n  \n\t\nb", 1, 7))).toBeNull();
+  });
+
+  it("makes no query from a line longer than the search routes accept", () => {
+    expect(selectionSearchQuery(selected("x".repeat(4097), 0, 4097))).toBeNull();
+  });
+
+  it("reads only up to the first non-blank line of a select-all", () => {
+    const state = selected(
+      Array.from({ length: 5000 }, (_, index) => `line ${index}`).join("\n"),
+      0,
+      0,
+    );
+    const all = state.update({ selection: EditorSelection.single(0, state.doc.length) }).state;
+    const sliceDoc = vi.spyOn(all, "sliceDoc");
+    const line = vi.spyOn(all.doc, "line");
+    expect(selectionSearchQuery(all)).toBe("line 0");
+    expect(sliceDoc).not.toHaveBeenCalled();
+    expect(line).toHaveBeenCalledTimes(1);
   });
 });
