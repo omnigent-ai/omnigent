@@ -225,7 +225,7 @@ describe("assistant workspace markdown images", () => {
     VIEWER.openFile.mockClear();
     renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
 
-    const chip = await screen.findByRole("button", { name: "Open shot.png" });
+    const chip = await screen.findByRole("button", { name: "Open Screenshot (shot.png)" });
     expect(VIEWER.openFile).not.toHaveBeenCalled();
     fireEvent.click(chip);
 
@@ -249,18 +249,34 @@ describe("assistant workspace markdown images", () => {
       finishRequest(new Response("missing", { status: 404 }));
       await request;
     });
-    fireEvent.click(screen.getByRole("button", { name: "Open shot.png" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Screenshot (shot.png)" }));
 
     expect(VIEWER.openFile).toHaveBeenCalledOnce();
     expect(VIEWER.openFile).toHaveBeenCalledWith("shots/shot.png");
   });
+
+  it("names the open button by its filename when the image has no alt text", async () => {
+    renderMarkdown("![](/workspace/project-worktrees/worker/shot.png)");
+    expect(await screen.findByRole("button", { name: "Open shot.png" })).toHaveTextContent(
+      "shot.png",
+    );
+  });
+
+  it.each(["/workspace/project-worktrees/worker/.env", "diagram.svg"])(
+    "keeps a non-raster image path %s inert",
+    async (path) => {
+      renderMarkdown(`![Screenshot](${path})`);
+      expect(await screen.findByRole("img", { name: "Screenshot" })).toBeVisible();
+      expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
+    },
+  );
 
   it.each(["../shot.png", "/workspace/project/../shot.png"])(
     "keeps an unresolvable image path %s inert",
     async (path) => {
       renderMarkdown(`![Screenshot](${path})`);
       expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveTextContent("shot.png");
-      expect(screen.queryByRole("button", { name: "Open shot.png" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
     },
   );
 
@@ -271,7 +287,7 @@ describe("assistant workspace markdown images", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveTextContent("shot.png");
-    expect(screen.queryByRole("button", { name: "Open shot.png" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
   });
 
   it("keeps images disabled for other markdown surfaces", async () => {

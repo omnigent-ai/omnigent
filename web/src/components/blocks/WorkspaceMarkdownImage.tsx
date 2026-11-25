@@ -23,6 +23,11 @@ const RASTER_IMAGE_TYPES_BY_EXTENSION = new Map([
 ]);
 const RASTER_IMAGE_TYPES = new Set(RASTER_IMAGE_TYPES_BY_EXTENSION.values());
 
+function rasterImageType(path: string): string | undefined {
+  const extension = path.match(/\.([^.]+)$/)?.[1].toLowerCase() ?? "";
+  return RASTER_IMAGE_TYPES_BY_EXTENSION.get(extension);
+}
+
 /** An assistant's workspace image, fetched with the displayed session's permissions. */
 export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: string }) {
   const scopedId = useContext(ConversationScopeContext);
@@ -36,10 +41,10 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   const resolved = root ? resolveChatFilePath(path.replace(/^(\.\/)+/, ""), root, home) : null;
   const relativePath = resolved && !resolved.path.startsWith("/") ? resolved.path : null;
   const openFile = useFileViewer();
-  // The viewer opens paths in its own session, so another session's image stays inert. A path
+  // The viewer opens paths in its own session, so another session's image stays inert. An image
   // outside the workspace (e.g. a worker's worktree) opens on click only; previews never read it.
   const openInViewer =
-    openFile && conversationId && usesViewerWorkspace && resolved
+    openFile && conversationId && usesViewerWorkspace && resolved && rasterImageType(resolved.path)
       ? () => openFile(resolved.path)
       : null;
   const imageKey = `${conversationId ?? ""}\0${root ?? ""}\0${relativePath ?? ""}`;
@@ -54,8 +59,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
 
   useEffect(() => {
     if (!conversationId || !relativePath) return;
-    const extension = relativePath.match(/\.([^.]+)$/)?.[1].toLowerCase() ?? "";
-    const extensionType = RASTER_IMAGE_TYPES_BY_EXTENSION.get(extension);
+    const extensionType = rasterImageType(relativePath);
     if (!extensionType) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
@@ -104,7 +108,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
             "cursor-pointer transition-colors hover:bg-accent hover:text-foreground",
           )}
           title={path}
-          aria-label={`Open ${filename}`}
+          aria-label={alt && alt !== filename ? `Open ${alt} (${filename})` : `Open ${filename}`}
           onClick={openInViewer}
         >
           {chipContent}
