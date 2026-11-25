@@ -568,7 +568,7 @@ class ProjectTicketStore:
         routing_project = SimpleNamespace(
             user_id=project.user_id, config=_decode_config(project.config)
         )
-        _, responders = human_request_routing(routing_project, ticket.labels)
+        _, responders = human_request_routing(routing_project, ticket.labels, ticket.requested_by)
         if owner_sign_off_pending(ticket.labels, ticket.requested_by):
             responders = {project.user_id}
         if actor.user_id not in responders:
@@ -586,6 +586,17 @@ class ProjectTicketStore:
             if raised is not None and raised.agent_id is None and raised.user_id == actor.user_id:
                 return False
         return True
+
+    @staticmethod
+    def _sign_offs_left(
+        project: SqlProject, ticket: SqlProjectTicket, labels: list[dict[str, Any]] | None
+    ) -> list[str]:
+        from omnigent.server.product_approval import pending_sign_offs
+
+        routing_project = SimpleNamespace(
+            user_id=project.user_id, config=_decode_config(project.config)
+        )
+        return pending_sign_offs(routing_project, labels, ticket.requested_by)
 
     def _clear_answered_ask(
         self,
@@ -907,8 +918,10 @@ class ProjectTicketStore:
         """
         from omnigent.server.product_approval import (
             FEATURE_KIND,
+            RISK_OK_LABEL,
             human_request_routing,
             owner_sign_off_pending,
+            pending_sign_offs,
             product_approvers,
             ticket_kind,
         )
@@ -941,16 +954,24 @@ class ProjectTicketStore:
                 for ticket in rows[:TICKET_SUMMARY_SCAN_MAX]:
                     if not _has_needs_human(ticket.labels):
                         continue
-                    reason, responders = human_request_routing(routing_project, ticket.labels)
+                    reason, responders = human_request_routing(
+                        routing_project, ticket.labels, ticket.requested_by
+                    )
                     if user_id not in responders:
                         continue
                     # Only the owner can clear an ask still waiting on their own sign-off;
                     # otherwise an approver adding product-ok answers a feature's ask.
                     owner_pending = owner_sign_off_pending(ticket.labels, ticket.requested_by)
                     answerers = {project.user_id} if owner_pending else responders
+                    # An approver's product-ok answers the ask only when no risk-ok is also owed.
+                    risk_owed = RISK_OK_LABEL in pending_sign_offs(
+                        routing_project, ticket.labels, ticket.requested_by
+                    )
                     product_ok_from = (
                         product_approvers(routing_project)
-                        if not owner_pending and ticket_kind(ticket.labels) == FEATURE_KIND
+                        if not owner_pending
+                        and not risk_owed
+                        and ticket_kind(ticket.labels) == FEATURE_KIND
                         else set()
                     )
                     request = self._open_human_request(
@@ -1032,8 +1053,7 @@ class ProjectTicketStore:
                 for row, ticket in rows:
                     cc = row.payload.get("cc")
                     if not isinstance(cc, builtins.list) or not any(
-                        isinstance(entry, dict) and entry.get("user_id") == user_id
-                        for entry in cc
+                        isinstance(entry, dict) and entry.get("user_id") == user_id for entry in cc
                     ):
                         continue
                     key = (project.id, ticket.id)
@@ -1518,8 +1538,11 @@ class ProjectTicketStore:
                 if touches_labels and person
                 else []
             )
-            label_answers_ask = bool(gates_added) and self._answers_open_ask(
-                session, project, row, actor
+            # One sign-off answers the ask only when it was the last one the ticket waited on.
+            label_answers_ask = (
+                bool(gates_added)
+                and self._answers_open_ask(session, project, row, actor)
+                and not self._sign_offs_left(project, row, changes.get("labels"))
             )
             for key, value in changes.items():
                 setattr(row, key, value)

@@ -329,3 +329,42 @@ async def test_a_persons_cc_lists_the_ticket_in_a_members_inbox_until_read(
     )
     assert seen.status_code == 200, seen.text
     assert await _requests(client, BOB) == []
+
+
+async def test_an_approver_gives_risk_ok_on_others_tickets_only(multi_user_client, db_uri):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Approver risk"}, headers=_as_user(ALICE))
+    ).json()
+    await client.post(
+        f"/v1/projects/{project['id']}/shares", json={"user_id": BOB}, headers=_as_user(ALICE)
+    )
+    await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [BOB]}},
+        headers=_as_user(ALICE),
+    )
+    store = ProjectTicketStore(db_uri)
+    worker = TicketActor(ALICE, uuid4().hex, uuid4().hex)
+    base = f"/v1/projects/{project['id']}/tickets"
+    risk = [{"key": "risk", "value": "migration"}, {"key": "needs-human"}]
+
+    def ask(title: str, requester: str) -> str:
+        ticket = store.create(project["id"], CreateTicket(title=title), TicketActor(requester))
+        store.update(project["id"], ticket["id"], UpdateTicket(labels=risk), worker)
+        return f"{base}/{ticket['id']}"
+
+    alices = ask("Alice's risky fix", ALICE), "Alice's risky fix"
+    bobs = ask("Bob's risky fix", BOB), "Bob's risky fix"
+    # Bob is asked for risk-ok only where he didn't request the work.
+    assert await _requests(client, BOB) == [alices[1]]
+    refused = await client.patch(
+        bobs[0], json={"add_labels": [{"key": "risk-ok"}]}, headers=_as_user(BOB)
+    )
+    assert refused.status_code == 403, refused.text
+    given = await client.patch(
+        alices[0], json={"add_labels": [{"key": "risk-ok"}]}, headers=_as_user(BOB)
+    )
+    assert given.status_code == 200, given.text
+    assert {label["key"] for label in given.json()["labels"]} == {"risk", "risk-ok"}
+    assert await _requests(client, ALICE) == [bobs[1]]

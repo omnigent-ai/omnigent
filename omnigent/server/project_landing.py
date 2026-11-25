@@ -3,7 +3,8 @@
 A worker submits ``(ticket, sha)`` with ``sys_ticket_land``. The server lands it
 only when the project turned landing on, the ticket's ``approved`` label is that
 exact SHA and was set by the Reviewer's session or the owner, any ``risk`` label
-has an owner-set ``risk-ok``, and the SHA fast-forwards the target branch.
+has a ``risk-ok`` from the owner or a product approver who didn't request the
+ticket, and the SHA fast-forwards the target branch.
 
 Submissions that arrive close together form one batch: each is fast-forwarded in
 turn, the web app is rebuilt once if any landed change touched ``web/``, the
@@ -58,6 +59,7 @@ from omnigent.server.product_approval import (
     needs_product_ok,
     product_approvers,
     product_gate_problem,
+    risk_ok_givers,
 )
 
 _logger = logging.getLogger(__name__)
@@ -606,6 +608,18 @@ class LandingQueue:
         )
 
     @staticmethod
+    def _may_give_risk_ok(
+        project: Any, event: dict[str, Any] | None, requested_by: str | None
+    ) -> bool:
+        """A person's own edit, by the owner or a product approver who didn't request it."""
+        return (
+            event is not None
+            and event.get("session_id") is None
+            and event.get("agent_id") is None
+            and event.get("user_id") in risk_ok_givers(project, requested_by)
+        )
+
+    @staticmethod
     def _is_product_approver(project: Any, event: dict[str, Any] | None) -> bool:
         """A person's own edit, by someone on the project's product-approver list."""
         return (
@@ -657,12 +671,12 @@ class LandingQueue:
             )
         if RISK_LABEL in labels:
             risk_ok = setters.get((RISK_OK_LABEL, labels.get(RISK_OK_LABEL, "")), [])
-            if RISK_OK_LABEL not in labels or not self._is_owner(
-                project, risk_ok[0] if risk_ok else None
+            if RISK_OK_LABEL not in labels or not self._may_give_risk_ok(
+                project, risk_ok[0] if risk_ok else None, ticket.get("requested_by")
             ):
                 raise refuse(
-                    f"The ticket has `risk: {labels[RISK_LABEL]}`; "
-                    "the owner must add `risk-ok` first"
+                    f"The ticket has `risk: {labels[RISK_LABEL]}`; the owner or a product "
+                    "approver who didn't request it must add `risk-ok` first"
                 )
         problem = product_gate_problem(project, ticket)
         if problem is not None:

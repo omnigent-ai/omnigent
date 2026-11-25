@@ -383,10 +383,12 @@ def create_project_tickets_router(
         before_labels: list[dict[str, Any]] | None,
         after_labels: list[dict[str, Any]],
         who: TicketActor,
+        requested_by: str | None,
     ) -> None:
         """Sign-off labels are a person's own edit, and only the right person's.
 
-        - ``owner-ok`` and ``risk-ok``: the owner only, never an agent.
+        - ``owner-ok``: the owner only, never an agent.
+        - ``risk-ok``: the owner, or a product approver who didn't request the ticket.
         - ``product-ok``: a product approver only, never an agent.
         - ``approved``: people other than the owner are refused (the Reviewer's session
           is checked separately).
@@ -458,10 +460,15 @@ def create_project_tickets_router(
             raise OmnigentError(
                 product_approval.approver_refusal(project), code=ErrorCode.FORBIDDEN
             )
+        if RISK_OK_LABEL in changed and who.user_id not in product_approval.risk_ok_givers(
+            project, requested_by
+        ):
+            raise OmnigentError(
+                product_approval.risk_ok_refusal(project, requested_by),
+                code=ErrorCode.FORBIDDEN,
+            )
         owner_only = [
-            key
-            for key in changed
-            if key in (APPROVED_LABEL, RISK_OK_LABEL, github_pr_intake.OWNER_OK_LABEL)
+            key for key in changed if key in (APPROVED_LABEL, github_pr_intake.OWNER_OK_LABEL)
         ]
         if owner_only and project.user_id != who.user_id:
             raise OmnigentError(
@@ -724,6 +731,7 @@ def create_project_tickets_router(
             [],
             [label.model_dump() for label in body.labels],
             who,
+            who.user_id,
         )
         with _storage_errors():
             ticket = await asyncio.to_thread(store.create, project_id, body, who)
@@ -883,6 +891,7 @@ def create_project_tickets_router(
                 before.get("labels"),
                 proposed,
                 who,
+                before.get("requested_by"),
             )
         if proposed is not None:
             approved_after = label_value(proposed, APPROVED_LABEL)

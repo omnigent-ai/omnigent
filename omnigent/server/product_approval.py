@@ -92,17 +92,23 @@ REQUEST_OWNER = "owner"
 
 
 def human_request_routing(
-    project: Any, labels: list[dict[str, Any]] | None
+    project: Any, labels: list[dict[str, Any]] | None, requested_by: str | None = None
 ) -> tuple[str, set[str | None]]:
     """Who answers a ticket's ``needs-human`` ask, and why.
 
     A feature still missing ``product-ok`` waits on any product approver (the owner
-    plus ``product_approvers``); every other ask, including ``risk-ok``, waits on the owner.
+    plus ``product_approvers``). A ``risk`` ticket still missing ``risk-ok`` also waits on
+    whoever may give it (:func:`risk_ok_givers`). Every other ask waits on the owner.
     """
     keys = {label.get("key") for label in labels or []}
+    responders: set[str | None] = set()
+    reason = REQUEST_OWNER
     if ticket_kind(labels) == FEATURE_KIND and PRODUCT_OK_LABEL not in keys:
-        return REQUEST_PRODUCT_OK, {*product_approvers(project), project.user_id}
-    return REQUEST_OWNER, {project.user_id}
+        reason = REQUEST_PRODUCT_OK
+        responders |= {*product_approvers(project), project.user_id}
+    if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
+        responders |= risk_ok_givers(project, requested_by)
+    return reason, responders or {project.user_id}
 
 
 # The owner's own sign-offs; mirrors the landing gate's labels.
@@ -114,13 +120,51 @@ OWNER_OK_LABEL = "owner-ok"
 def owner_sign_off_pending(labels: list[dict[str, Any]] | None, requested_by: str | None) -> bool:
     """Whether the ticket still waits on a sign-off only the owner can give.
 
-    That is ``risk-ok`` on a ``risk`` ticket, or ``owner-ok`` on an imported outside PR.
+    That is ``owner-ok`` on an imported outside PR. ``risk-ok`` can also come from a
+    product approver; see :func:`risk_ok_givers`.
     """
     from omnigent.server.github_pr_intake import is_outside_requester
 
     keys = {label.get("key") for label in labels or []}
-    return (RISK_LABEL in keys and RISK_OK_LABEL not in keys) or (
-        is_outside_requester(requested_by) and OWNER_OK_LABEL not in keys
+    return is_outside_requester(requested_by) and OWNER_OK_LABEL not in keys
+
+
+def pending_sign_offs(
+    project: Any, labels: list[dict[str, Any]] | None, requested_by: str | None
+) -> list[str]:
+    """The sign-off labels a ticket still waits on: ``risk-ok``, ``product-ok``, ``owner-ok``."""
+    from omnigent.server.github_pr_intake import is_outside_requester
+
+    keys = {label.get("key") for label in labels or []}
+    ticket = {"labels": labels or [], "requested_by": requested_by}
+    pending = []
+    if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
+        pending.append(RISK_OK_LABEL)
+    if needs_product_ok(project, ticket) and PRODUCT_OK_LABEL not in keys:
+        pending.append(PRODUCT_OK_LABEL)
+    if is_outside_requester(requested_by) and OWNER_OK_LABEL not in keys:
+        pending.append(OWNER_OK_LABEL)
+    return pending
+
+
+def risk_ok_givers(project: Any, requested_by: str | None) -> set[str | None]:
+    """Who may give ``risk-ok``: the owner, and product approvers on tickets they didn't request.
+
+    Keeping the requester out means nobody but the owner signs off risk on their own change.
+    """
+    givers: set[str | None] = {
+        approver for approver in product_approvers(project) if approver != requested_by
+    }
+    givers.add(project.user_id)
+    return givers
+
+
+def risk_ok_refusal(project: Any, requested_by: str | None) -> str:
+    """Why a person can't give ``risk-ok`` on this ticket, and who can."""
+    givers = sorted(giver for giver in risk_ok_givers(project, requested_by) if giver)
+    return (
+        f"Only the project owner or a product approver who didn't request this ticket can add "
+        f"`{RISK_OK_LABEL}`" + (f": {', '.join(givers)}" if givers else "")
     )
 
 
@@ -129,9 +173,9 @@ def sign_offs_for(
 ) -> list[dict[str, Any]]:
     """The sign-off labels a ticket's open ``needs-human`` ask waits on that *viewer* may add.
 
-    Each is ``{"key", "value"}`` as it would be added: ``risk-ok`` on a ``risk`` ticket and
-    ``owner-ok`` (bound to the approved SHA) on an outside PR for the owner, and
-    ``product-ok`` on another requester's feature for product approvers.
+    Each is ``{"key", "value"}`` as it would be added: ``risk-ok`` on a ``risk`` ticket for
+    :func:`risk_ok_givers`, ``owner-ok`` (bound to the approved SHA) on an outside PR for the
+    owner, and ``product-ok`` on another requester's feature for product approvers.
     """
     from omnigent.server.github_pr_intake import is_outside_requester
 
@@ -142,7 +186,11 @@ def sign_offs_for(
     # Single-user servers have no user ID: there the one person is the owner.
     owner = viewer == project.user_id
     offers: list[dict[str, Any]] = []
-    if owner and RISK_LABEL in values and RISK_OK_LABEL not in values:
+    if (
+        RISK_LABEL in values
+        and RISK_OK_LABEL not in values
+        and viewer in risk_ok_givers(project, ticket.get("requested_by"))
+    ):
         offers.append({"key": RISK_OK_LABEL, "value": None})
     if (
         needs_product_ok(project, ticket)

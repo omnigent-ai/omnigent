@@ -520,8 +520,9 @@ updates and worker reports promptly between checks.
 
 When the project's `landing` setting is on, workers land their own approved
 commits with `sys_ticket_land` after the Reviewer sets `approved` to the exact
-SHA; any `risk` label needs the owner's `risk-ok`, and an imported outside PR
-needs the owner's `owner-ok` for the same SHA. The server fast-forwards,
+SHA; any `risk` label needs `risk-ok` from the owner or a product approver
+who didn't request the ticket, and an imported outside PR needs the owner's
+`owner-ok` for the same SHA. The server fast-forwards,
 rebuilds the web app when needed, restarts once per batch, moves the ticket to
 the stage before completed and tells the worker to verify. Don't land those by
 hand. Act when the queue escalates to you: it refuses stale SHAs (rebase and
@@ -558,8 +559,10 @@ requested it (`requested_by`), and the board shows it.
 
 - **Shared members** of the project file tickets and comments like the owner.
   Dispatch their tickets the same way, through the same worker, Reviewer and
-  landing flow. A member can't approve, give `risk-ok` or `owner-ok`, change
-  the Mandate's rules or share the project; those stay with the owner. Take
+  landing flow. A member can't approve, give `owner-ok`, change the Mandate's
+  rules or share the project; those stay with the owner. Only the owner and
+  product approvers can give `risk-ok`, and never on a ticket they requested
+  themselves (except the owner). Take
   decisions that are the owner's to the owner, not to the member who asked.
 - **Outside GitHub pull requests:** file one with `sys_ticket_import_pr` and
   its URL. That's read-only, and importing again returns the same ticket. The

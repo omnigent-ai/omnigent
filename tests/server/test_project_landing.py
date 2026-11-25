@@ -580,3 +580,26 @@ async def test_a_verification_doesnt_carry_over_a_tip_commit_touching_its_files(
     world.tickets.label("approved", rebased, session_id="rs")
     with pytest.raises(OmnigentError, match="touch its files"):
         await world.queue.submit(world.project, "t1", rebased, None, dry_run=True)
+
+
+async def test_a_product_approver_can_give_risk_ok_but_not_on_their_own_request(world) -> None:
+    world.project.user_id = "owner@example.com"
+    world.project.config = {
+        "landing": {"enabled": True},
+        "product_approvers": ["approver@example.com"],
+    }
+    sha = feature(world, "f-approver-risk")
+    world.tickets.label("approved", sha, session_id="rs")
+    world.tickets.label("risk", "auth", session_id="rs")
+    world.tickets.label("kind", "fix", session_id="rs")
+    world.tickets.ticket["requested_by"] = "approver@example.com"
+    world.tickets.label("risk-ok", "yes", user_id="approver@example.com")
+    with pytest.raises(OmnigentError, match="didn't request it"):
+        await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
+    world.tickets.ticket["requested_by"] = "owner@example.com"
+    assert (await world.queue.submit(world.project, "t1", sha, None, dry_run=True))["ok"]
+    # A member who isn't an approver still can't stand in.
+    world.tickets.unlabel("risk-ok", user_id="owner@example.com")
+    world.tickets.label("risk-ok", "yes", user_id="member@example.com")
+    with pytest.raises(OmnigentError, match="risk-ok"):
+        await world.queue.submit(world.project, "t1", sha, None, dry_run=True)
