@@ -64,7 +64,6 @@ const SHOWN: SettingsAvailability = {
   sessionTitleInstructions: true,
   floatingPanes: true,
   proactiveAgent: true,
-  quickPickPalette: true,
 };
 const HIDDEN: SettingsAvailability = {
   globalShortcut: false,
@@ -81,7 +80,6 @@ const HIDDEN: SettingsAvailability = {
   sessionTitleInstructions: false,
   floatingPanes: false,
   proactiveAgent: false,
-  quickPickPalette: false,
 };
 
 const targets = settingsSearchTargets(
@@ -248,12 +246,12 @@ describe("availability", () => {
     expect(settingsSearchTargets([LINKS], SECTIONS, HIDDEN)).toEqual([]);
   });
 
-  it("offers the Shortcuts page's search field only with quickPickPalette", () => {
+  it("offers the Shortcuts page's search field wherever the page shows", () => {
     const shortcuts = [{ id: "shortcuts", label: "Keyboard shortcuts" }] as const;
     const offered = (availability: SettingsAvailability) =>
       settingsSearchTargets(SETTINGS_ENTRIES, shortcuts, availability).map((target) => target.key);
     expect(offered(SHOWN)).toContain("shortcuts-search");
-    expect(offered({ ...SHOWN, quickPickPalette: false })).not.toContain("shortcuts-search");
+    expect(offered(HIDDEN)).toContain("shortcuts-search");
   });
 
   it("keeps a row without an availability rule, whatever is hidden", () => {

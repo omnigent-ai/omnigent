@@ -1,8 +1,7 @@
 """UI e2e: finding a shortcut on Settings' Keyboard shortcuts page.
 
-With ``quick_pick_palette`` on, the page's own field filters the rows by name, group or keys,
-and a Settings search pick for a shortcut row reveals it even while the field hides it. With the
-flag off the page lists its rows as before, with no field.
+The page's own field filters the rows by name, group or keys, and a Settings search pick for a
+shortcut row reveals it even while the field hides it.
 """
 
 from __future__ import annotations
@@ -11,14 +10,12 @@ import sys
 
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette
 from tests.e2e_ui._settings_search import expect_settings_row_revealed, settings_search_field
 
 
 def test_keyboard_shortcuts_search_filters_the_table(page: Page, live_server: str) -> None:
     """The Shortcuts page's field filters its rows; a Settings search pick shows them all again."""
     page.set_viewport_size({"width": 1280, "height": 800})
-    enable_quick_pick_palette(page)
     page.goto(f"{live_server}/settings/shortcuts")
     main = page.get_by_role("main")
     filter_field = main.get_by_role("searchbox", name="Search shortcuts")
@@ -60,12 +57,3 @@ def test_keyboard_shortcuts_search_filters_the_table(page: Page, live_server: st
     expect(page.get_by_role("option").first).to_contain_text("Send message")
     page.keyboard.press("Enter")
     expect_settings_row_revealed(page, "shortcut.composer.send")
-
-
-def test_flag_off_keeps_the_shortcuts_page_without_a_field(page: Page, live_server: str) -> None:
-    """Without ``quick_pick_palette`` the page lists its rows with no search field."""
-    page.set_viewport_size({"width": 1280, "height": 800})
-    page.goto(f"{live_server}/settings/shortcuts")
-    main = page.get_by_role("main")
-    expect(main.get_by_role("heading", name="General", exact=True)).to_be_visible(timeout=30_000)
-    expect(main.get_by_role("searchbox", name="Search shortcuts")).to_have_count(0)

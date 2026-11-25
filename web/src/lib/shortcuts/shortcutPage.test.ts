@@ -29,10 +29,9 @@ const CONTEXT_FLAGS = Object.keys({
   splitTerminal: true,
   siblingSessions: true,
   desktopCommands: true,
-  quickPick: true,
 } satisfies Record<keyof ShortcutPageContext, true>) as (keyof ShortcutPageContext)[];
 
-/** Every combination of the context flags: 2^12 contexts. */
+/** Every combination of the context flags: 2^11 contexts. */
 function everyContext(): ShortcutPageContext[] {
   return Array.from({ length: 1 << CONTEXT_FLAGS.length }, (_, bits) =>
     Object.fromEntries(CONTEXT_FLAGS.map((flag, index) => [flag, (bits & (1 << index)) !== 0])),
@@ -110,7 +109,7 @@ describe("shortcutPageGroups against the recorded rows", () => {
     { platform: "other platforms", mac: false },
   ])("lists exactly the recorded rows in every context on $platform", ({ mac }) => {
     const pages = everyPage(mac);
-    expect(pages).toHaveLength(4096);
+    expect(pages).toHaveLength(2048);
     // One assertion per kind of failure: per-context expects dominate the run time.
     const missingKeys = new Set<string>();
     const differing = pages.flatMap(({ context, groups }) => {
@@ -140,7 +139,6 @@ const BROWSER_TAB: ShortcutPageContext = {
   splitTerminal: false,
   siblingSessions: false,
   desktopCommands: false,
-  quickPick: false,
 };
 
 function labelsIn(context: ShortcutPageContext, title: string): string[] {

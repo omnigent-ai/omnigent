@@ -75,7 +75,6 @@ const mocks = vi.hoisted(() => ({
   projectKanban: false,
   floatingComposer: false,
   workspaceSidebarV2: false,
-  quickPickPalette: false,
   nestedAgents: false,
   advisorAvailable: false,
   authenticatedFetch: vi.fn(),
@@ -121,7 +120,6 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
             project_kanban: mocks.projectKanban,
             floating_composer: mocks.floatingComposer,
             workspace_sidebar_v2: mocks.workspaceSidebarV2,
-            quick_pick_palette: mocks.quickPickPalette,
           },
         },
 }));
@@ -367,7 +365,6 @@ beforeEach(() => {
   mocks.projectKanban = false;
   mocks.floatingComposer = false;
   mocks.workspaceSidebarV2 = false;
-  mocks.quickPickPalette = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
   mocks.authenticatedFetch.mockReset();
@@ -401,24 +398,16 @@ afterEach(() => {
 });
 
 describe("Keyboard shortcuts", () => {
-  it.each([false, true])("offers a search field only with quick_pick_palette (%s)", (quickPick) => {
-    mocks.quickPickPalette = quickPick;
+  it("offers a search field, and lets Settings search reveal every row", () => {
     renderPage("/settings/shortcuts");
 
     expect(screen.getByRole("heading", { name: "Keyboard shortcuts" })).toBeTruthy();
-    expect(screen.queryAllByRole("searchbox", { name: "Search shortcuts" })).toHaveLength(
-      quickPick ? 1 : 0,
-    );
-  });
-
-  it("lets search reveal only the rows it finds, without quick_pick_palette", () => {
-    renderPage("/settings/shortcuts");
-
+    expect(screen.getAllByRole("searchbox", { name: "Search shortcuts" })).toHaveLength(1);
     const row = (label: string) => screen.getByText(label, { selector: "span" }).closest("li");
     expect(row("Open command palette")?.getAttribute("data-settings-item")).toBe(
       "shortcut.palette.commands",
     );
-    expect(row("Stop response")?.hasAttribute("data-settings-item")).toBe(false);
+    expect(row("Stop response")?.getAttribute("data-settings-item")).toBe("shortcut.response.stop");
   });
 });
 

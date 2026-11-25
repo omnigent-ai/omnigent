@@ -29,7 +29,6 @@ import {
   type ShortcutPageGroup,
   shortcutPageGroups,
 } from "@/lib/shortcuts/shortcutPage";
-import { isSearchedShortcutRow } from "@/pages/settings/search/shortcutEntries";
 import { ShortcutSettingsRow } from "@/pages/settings/search/ShortcutSettingsRow";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
@@ -61,7 +60,6 @@ export function useShortcutPageContext(): ShortcutPageContext {
     splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
     desktopCommands: supportsDesktopCommands(),
     siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
-    quickPick: isFeatureEnabled(serverInfo, "quick_pick_palette"),
   };
 }
 
@@ -130,8 +128,8 @@ export function KeyboardShortcutsList({
                   </span>
                 </>
               );
-              // Settings lists each row search finds so it can reveal it; the dialog doesn't.
-              return settings && isSearchedShortcutRow(item, context) ? (
+              // Settings lists each row so search can reveal it; the dialog doesn't.
+              return settings ? (
                 <ShortcutSettingsRow
                   key={item.label}
                   row={item}

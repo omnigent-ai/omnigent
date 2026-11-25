@@ -21,8 +21,6 @@ vi.mock("@/hooks/useCuratedOutHarnesses", async (importOriginal) => ({
 
 const HARNESSES = NATIVE_CODING_AGENTS.map((spec) => spec.harness);
 
-const QUICK_PICK_INFO = { features: { quick_pick_palette: true } } as unknown as ServerInfo;
-
 function settingsWrapper(info: ServerInfo | "loading") {
   return ({ children }: { children: ReactNode }) => (
     <CapabilitiesContext.Provider value={info}>
@@ -81,23 +79,13 @@ describe("useSettingsSearchTargets and harness curation", () => {
 });
 
 describe("useSettingsSearchTargets and the Keyboard shortcuts page", () => {
-  it("offers every row the page lists with quick_pick_palette, the composer's keys included", () => {
-    const { targets, shortcutRows } = searchTargets(QUICK_PICK_INFO);
+  it("offers every row the page lists, the composer's keys included", () => {
+    const { targets, shortcutRows } = searchTargets();
     const shortcutIds = targets.flatMap((target) => target.entry.shortcutId ?? []);
-    expect(shortcutIds.toSorted()).toEqual(pageShortcutIds(QUICK_PICK_INFO).toSorted());
+    expect(shortcutIds.toSorted()).toEqual(pageShortcutIds("loading").toSorted());
     expect([...shortcutRows.keys()].toSorted()).toEqual(shortcutIds.toSorted());
     expect(shortcutIds).toEqual(
       expect.arrayContaining(["composer.send", "slash.apply", "response.stop"]),
     );
-  });
-
-  it("offers only the rows it offered before without quick_pick_palette", () => {
-    const { targets, shortcutRows } = searchTargets();
-    const shortcutIds = targets.flatMap((target) => target.entry.shortcutId ?? []);
-    expect(shortcutIds.toSorted()).toEqual([...shortcutRows.keys()].toSorted());
-    expect(shortcutIds).toContain("palette.commands");
-    for (const id of ["composer.send", "slash.apply", "response.stop", "session.number"]) {
-      expect(shortcutIds, id).not.toContain(id);
-    }
   });
 });

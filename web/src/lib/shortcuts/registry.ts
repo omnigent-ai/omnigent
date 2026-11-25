@@ -98,8 +98,6 @@ export interface ShortcutPageContext {
   desktopCommands: boolean;
   /** Always steer is on, so ⌘↵ queues a follow-up instead of sending now. */
   alwaysSteer: boolean;
-  /** quick_pick_palette is on, whose Keyboard shortcuts page and Settings search find every row. */
-  quickPick: boolean;
 }
 
 /** What a page row's keys may depend on. */

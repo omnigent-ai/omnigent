@@ -23,8 +23,6 @@ const CONTEXT: ShortcutPageContext = {
   siblingSessions: true,
   desktopCommands: false,
   alwaysSteer: false,
-  // The page offers its search field only with quick_pick_palette on.
-  quickPick: true,
 };
 const page = shortcutPageGroups(CONTEXT, true);
 const labels = (query: string) =>

@@ -183,7 +183,6 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, signOutOfBrowserSession } from "@/lib/accountsApi";
 import {
   beginGithubConnect,
@@ -2759,11 +2758,9 @@ function StepperButton({
 }
 
 function ShortcutsSection() {
-  // The page's search field is offered only with the quick_pick_palette flag.
-  const quickPick = isFeatureEnabled(useServerInfo(), "quick_pick_palette");
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      {quickPick ? <SearchableShortcutsList /> : <KeyboardShortcutsList variant="settings" />}
+      <SearchableShortcutsList />
     </Section>
   );
 }
