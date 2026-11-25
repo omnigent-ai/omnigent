@@ -313,8 +313,8 @@ interface StorePatch {
 }
 
 // Answers like the workflow store: steps and a description apply only while still the expected
-// ones. `hold` delays PATCHes, `fail` refuses them, `unknown` fields and `keepsDescriptionTime`
-// off act like an older server, and `afterRead` runs once just after a read.
+// ones. `hold` delays PATCHes, `fail` refuses them, `unknown` fields get an older server's 422,
+// and `afterRead` runs once just after a read.
 function serveLikeTheStore(initial: WorkflowDetail) {
   const held: (() => void)[] = [];
   const server = {
@@ -323,7 +323,6 @@ function serveLikeTheStore(initial: WorkflowDetail) {
     hold: false,
     fail: false,
     unknown: [] as string[],
-    keepsDescriptionTime: true,
     afterRead: undefined as (() => void) | undefined,
     release: () =>
       act(async () => {
@@ -369,13 +368,9 @@ function serveLikeTheStore(initial: WorkflowDetail) {
         description_source: describes
           ? (body.description_source ?? null)
           : stored.description_source,
-        ...(server.keepsDescriptionTime
-          ? {
-              description_updated_at: describes
-                ? now
-                : (stored.description_updated_at ?? stored.updated_at),
-            }
-          : {}),
+        description_updated_at: describes
+          ? now
+          : (stored.description_updated_at ?? stored.updated_at),
         updated_at: now,
       };
       return new Response(JSON.stringify(server.stored));
@@ -699,24 +694,14 @@ describe("WorkflowDetailPage", () => {
 
   const newDescription = "Finds flaky tests and fixes the worst one.";
   it.each([
-    ["a newer proposal", true, [plan(5, WORKFLOW.steps)], plan(15, WORKFLOW.steps, newDescription)],
-    [
-      "a newer proposal",
-      false,
-      [plan(5, WORKFLOW.steps)],
-      plan(15, WORKFLOW.steps, newDescription),
-    ],
-    ["the first proposal", true, [], plan(50, WORKFLOW.steps, newDescription)],
-    ["the first proposal", false, [], plan(50, WORKFLOW.steps, newDescription)],
-  ] as [string, boolean, JournalEntry[], JournalEntry][])(
-    "keeps offering %s's description when it arrives while a time limit saves (description time kept: %s)",
-    async (_, keepsDescriptionTime, before, arriving) => {
+    ["a newer proposal", [plan(5, WORKFLOW.steps)], plan(15, WORKFLOW.steps, newDescription)],
+    ["the first proposal", [], plan(50, WORKFLOW.steps, newDescription)],
+  ] as [string, JournalEntry[], JournalEntry][])(
+    "keeps offering %s's description when it arrives while a time limit saves",
+    async (_, before, arriving) => {
       // The description was last written by hand, so it names no proposal it was saved from.
       const { patches, server, release } = await workflowWithProposals(WORKFLOW.steps, before);
       server.hold = true;
-      // A server from before the description's time was kept knows no steps check either.
-      server.keepsDescriptionTime = keepsDescriptionTime;
-      if (!keepsDescriptionTime) server.unknown = ["expected_steps"];
       const client = new QueryClient();
       const view = renderPage(client);
       fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
@@ -734,7 +719,7 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
       expect(screen.getByText(newDescription)).toBeInTheDocument();
       expect(runButton()).toBeDisabled();
-      // Read again, the workflow is still at that write, so the offer stays.
+      // Read again, the workflow keeps the description's time, so the offer stays.
       await act(() => client.invalidateQueries({ queryKey: ["workflow", WORKFLOW.id] }));
       expect(screen.getByText(newDescription)).toBeInTheDocument();
     },
@@ -859,15 +844,20 @@ describe("WorkflowDetailPage", () => {
     ]);
   });
 
-  it("saves a time limit on a server too old to check the steps it read", async () => {
+  it("saves no time limit on a server too old to check the steps it read", async () => {
     const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
     server.unknown = ["expected_steps"];
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
     await waitFor(() =>
-      expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
+      expect(showToast).toHaveBeenCalledWith(
+        "Couldn’t save the time limit. This server is too old to save a step's time limit safely.",
+      ),
     );
-    expect(patches.map((patch) => "expected_steps" in patch)).toEqual([true, false]);
+    // The refused write was the only one, so the plan is as it was.
+    expect(patches).toHaveLength(1);
+    expect(server.stored.steps).toEqual(WORKFLOW.steps);
+    expect(graphGoals()).toEqual([null, "The suite passes"]);
   });
 
   it("offers time limits only to the owner, and not while a proposal is unsaved", () => {

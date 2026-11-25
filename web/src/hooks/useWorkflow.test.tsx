@@ -11,7 +11,6 @@ import {
   useCloneWorkflow,
   useSaveStepTimeLimit,
   useSaveWorkflowDescription,
-  useKeptDescriptionTime,
   useSaveWorkflowPlan,
   useWorkflow,
   useWorkflowRunDescendants,
@@ -281,25 +280,31 @@ describe("useSaveStepTimeLimit", () => {
     expect(reads).toBe(3);
   });
 
-  it("keeps the first description time across saves to a server that keeps none", async () => {
-    let stored = { ...saved, updated_at: 10 };
+  it("writes nothing unchecked to a server too old to check the steps it read", async () => {
+    // Another client adds a step after the read, and the server can't tell.
+    let stored: Record<string, unknown> = { ...saved };
+    const added = { id: "report", name: "Report", goal: null, depends_on: ["review"] };
+    const refusal = { detail: [{ type: "extra_forbidden", loc: ["body", "expected_steps"] }] };
     vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) => {
       if (init?.method === "PATCH") {
+        // It refuses the field it doesn't know, and would write steps sent without it.
         const body = JSON.parse(String(init.body));
-        stored = { ...stored, steps: body.steps, updated_at: stored.updated_at + 100 };
+        if ("expected_steps" in body) return Response.json(refusal, { status: 422 });
+        stored = { ...stored, steps: body.steps };
+        return Response.json(stored);
       }
-      return Response.json(stored);
+      const read = Response.json(stored);
+      stored = { ...stored, steps: [...steps, added] };
+      return read;
     });
-    const { result } = renderQuery(() => ({
-      kept: useKeptDescriptionTime("workflow"),
-      limit: useSaveStepTimeLimit("workflow"),
-    }));
-    await act(() => result.current.limit.mutateAsync({ stepId: "review", limit: "1 hour" }));
-    await act(() => vi.advanceTimersByTimeAsync(1));
-    expect(result.current.kept).toMatchObject({ after: 110, describedAt: 10 });
-    await act(() => result.current.limit.mutateAsync({ stepId: "review", limit: "2 hours" }));
-    await act(() => vi.advanceTimersByTimeAsync(1));
-    expect(result.current.kept).toMatchObject({ after: 210, describedAt: 10 });
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow(
+        "This server is too old to save a step's time limit safely.",
+      );
+    });
+    expect(patchCount()).toBe(1);
+    expect(stored.steps).toEqual([...steps, added]);
   });
 
   it("writes nothing for a step no longer in the saved plan", async () => {

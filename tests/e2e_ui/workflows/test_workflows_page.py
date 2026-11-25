@@ -86,6 +86,8 @@ def test_clone_workflow(page: Page, seeded_session: tuple[str, str], draft: bool
                 client.delete(f"/v1/workflows/{workflow_id}")
 
 
+# An older server can't check the steps a time limit was set on, so the menu saves nothing there.
+@pytest.mark.min_server_version("0.24.0")
 def test_a_step_time_limit_is_a_line_in_its_description(page: Page, live_server: str) -> None:
     """A step's time limit menu writes and clears the Time limit line in its description."""
     name = f"Fix flaky tests {uuid4().hex[:8]}"
@@ -107,7 +109,6 @@ def test_a_step_time_limit_is_a_line_in_its_description(page: Page, live_server:
             expect(graph.get_by_test_id("workflow-step-node")).to_have_count(2)
 
             def choose(button: str, item: str) -> dict[str, str | None]:
-                # The save that lands: an older server refuses the steps check first.
                 with page.expect_response(
                     lambda response: (
                         response.url == f"{live_server}/v1/workflows/{workflow_id}"

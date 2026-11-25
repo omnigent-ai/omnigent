@@ -43,7 +43,6 @@ import {
   useCloneWorkflow,
   useWorkflow,
   useWorkflowRuns,
-  useKeptDescriptionTime,
   useSaveStepTimeLimit,
   useSaveWorkflowDescription,
   useSaveWorkflowPlan,
@@ -128,7 +127,6 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   );
   const savePlan = useSaveWorkflowPlan(workflowId);
   const saveTimeLimit = useSaveStepTimeLimit(workflowId);
-  const keptDescriptionTime = useKeptDescriptionTime(workflowId);
   useEffect(() => {
     if (plannerFlash === 0) return;
     const timer = setTimeout(() => setPlannerFlash(0), PLANNING_CHAT_FLASH_MS);
@@ -185,14 +183,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
   // Only a proposal newer than that source, or else than the description's last write in whole
   // seconds (a tie keeps the description), offers its description, so an edit made since stands.
-  // For an older server, that's the time kept across the page's own writes, or its last write.
-  const keptDescribedAt =
-    keptDescriptionTime?.after === workflow.updated_at &&
-    keptDescriptionTime?.description === workflow.description
-      ? keptDescriptionTime.describedAt
-      : undefined;
-  const describedAt =
-    workflow.description_updated_at ?? keptDescribedAt ?? workflow.updated_at ?? 0;
+  // An older server keeps no such time, so the workflow's last write stands in for it.
+  const describedAt = workflow.description_updated_at ?? workflow.updated_at ?? 0;
   const proposalIsNewer =
     proposal !== null &&
     (!source || sourceAt === null
