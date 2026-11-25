@@ -853,6 +853,31 @@ def _chosen_login_signed_out(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(github._config, "github_account_preference", lambda _repository: "octocat")
 
 
+def test_a_login_cleared_during_the_token_lookup_still_refuses_the_mutation(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another request clearing the saved login mid-write must not let this one run as another."""
+    _chosen_login_signed_out(monkeypatch)
+    cleared = False
+    monkeypatch.setattr(
+        github._config,
+        "github_account_preference",
+        lambda _repository: None if cleared else "octocat",
+    )
+
+    def lookup_cleared_mid_write(_root: str, _reference: PullRequestRef) -> str | None:
+        nonlocal cleared
+        if github._gh_deadline.get() is None:
+            return TOKEN
+        cleared = True  # Another request clears the login while the write's lookup runs.
+        return None
+
+    monkeypatch.setattr(github, "_pr_token", lookup_cleared_mid_write)
+    with pytest.raises(ValueError, match="octocat isn't signed in on the host"):
+        _resolve()
+    assert fake.mutations("resolveReviewThread") == []
+
+
 def test_a_mutation_for_a_signed_out_chosen_login_is_never_sent(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
