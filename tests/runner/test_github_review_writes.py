@@ -1507,6 +1507,23 @@ def test_a_line_draft_needs_its_lines_picked_on_the_expected_head(fake: FakeGitH
     assert fake.json_calls == []
 
 
+def test_a_line_draft_refuses_a_moved_base_with_nothing_sent(fake: FakeGitHub) -> None:
+    """Lines picked against another base would land on a different diff."""
+    fake.pending = _own_pending()
+    anchor = {"path": "a.py", "side": "RIGHT", "line": 1, "head_sha": HEAD, "base_sha": MOVED}
+    with pytest.raises(PullRequestChangedError):
+        pr_actions.add_pending_review_comment(
+            "/workspace",
+            session_id=SESSION,
+            pr_url=PR_URL,
+            body="New",
+            anchor=anchor,
+            pending_review_id="R_1",
+            expected_head=HEAD,
+        )
+    assert fake.mutations("addPullRequestReviewThread(") == []
+
+
 def test_a_discard_names_the_review_it_deleted(fake: FakeGitHub) -> None:
     fake.pending = _own_pending()
     result = pr_actions.discard_pending_review(
@@ -1557,6 +1574,26 @@ def test_a_started_review_answers_only_itself(fake: FakeGitHub) -> None:
     }
     assert fake.mutations("on PullRequestReview {") == []
     assert fake.mutations("reviewThreads(") == []
+
+
+@pytest.mark.parametrize(
+    "review",
+    [
+        {"id": "R_1", "state": "COMMENTED", "viewerDidAuthor": True, "commit": {"oid": HEAD}},
+        {"id": "R_1", "state": "PENDING", "viewerDidAuthor": True, "commit": {"oid": MOVED}},
+        {"id": "R_1", "state": "PENDING", "viewerDidAuthor": False, "commit": {"oid": HEAD}},
+    ],
+    ids=["submitted", "another-commit", "someone-elses"],
+)
+def test_a_start_github_did_not_confirm_is_an_unknown_outcome(
+    fake: FakeGitHub, review: dict[str, Any]
+) -> None:
+    fake.graphql_failure = _answer("addPullRequestReview", {"pullRequestReview": review})
+    with pytest.raises(UnknownOutcomeError):
+        pr_actions.start_pending_review(
+            "/workspace", session_id=SESSION, pr_url=PR_URL, commit_oid=HEAD
+        )
+    assert len(fake.mutations("addPullRequestReview(")) == 1
 
 
 def test_a_start_refuses_a_moved_head_with_nothing_sent(fake: FakeGitHub) -> None:
