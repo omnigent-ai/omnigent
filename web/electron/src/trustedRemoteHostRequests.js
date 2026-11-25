@@ -6,6 +6,8 @@
 
 const { normalizeTrustedHostId, trustedRemoteTarget } = require("./trustedRemoteHosts");
 
+const TRUSTED_HOST_INPUT_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
 /**
  * @param {{ isTrusted?: (serverUrl: string, hostId: string) => boolean,
  *   add?: (serverUrl: string, hostId: string) => boolean }} deps
@@ -17,7 +19,7 @@ function createTrustedRemoteHostRequests({ isTrusted, add } = {}) {
   const keyFor = (serverUrl, hostId) => {
     const server = trustedRemoteTarget(serverUrl);
     const host = normalizeTrustedHostId(hostId);
-    if (server === null || host === null) return null;
+    if (server === null || host === null || !TRUSTED_HOST_INPUT_RE.test(host)) return null;
     return JSON.stringify([server, host]);
   };
 

@@ -36,22 +36,6 @@ describe("trusted remote hosts", () => {
     assert.equal(normalizeTrustedHostId("host_ABC"), "abc");
     assert.equal(normalizeTrustedHostId(""), null);
     assert.equal(normalizeTrustedHostId(null), null);
-    assert.equal(normalizeTrustedHostId("a".repeat(64)), "a".repeat(64));
-    assert.equal(
-      normalizeTrustedHostId("01234567-89ab-cdef-0123-456789abcdef"),
-      "01234567-89ab-cdef-0123-456789abcdef",
-    );
-    for (const invalid of [
-      " leading",
-      "trailing ",
-      "line\nbreak",
-      "tab\tname",
-      "nul\0name",
-      "name\u202e",
-      "a".repeat(65),
-    ]) {
-      assert.equal(normalizeTrustedHostId(invalid), null);
-    }
   });
 
   it("keeps valid settings entries and drops malformed ones", () => {
@@ -73,9 +57,10 @@ describe("trusted remote hosts", () => {
   });
 
   it("adds and removes entries in canonical, deduplicated form", () => {
-    const added = addTrustedRemoteHost([], `${SERVER}/`, "ABC123");
+    const existing = [{ server_url: SERVER, host_id: "existing.host" }];
+    const added = addTrustedRemoteHost(existing, `${SERVER}/`, "ABC123");
     assert.equal(added.added, true);
-    assert.deepEqual(added.entries, [{ server_url: SERVER, host_id: "abc123" }]);
+    assert.deepEqual(added.entries, [...existing, { server_url: SERVER, host_id: "abc123" }]);
     const duplicate = addTrustedRemoteHost(added.entries, SERVER, "abc123");
     assert.equal(duplicate.added, false);
     assert.deepEqual(duplicate.entries, added.entries);
@@ -84,7 +69,13 @@ describe("trusted remote hosts", () => {
     assert.deepEqual(invalid.entries, added.entries);
     const removed = removeTrustedRemoteHost(added.entries, SERVER, "ABC123");
     assert.equal(removed.removed, true);
-    assert.deepEqual(removed.entries, []);
+    assert.deepEqual(removed.entries, existing);
+    const preserved = readTrustedRemoteHosts(removed.entries);
+    assert.equal(
+      isTrustedRemoteContext(preserved, { ...context, sourceHostId: "existing.host" }, SERVER),
+      true,
+    );
+    assert.deepEqual(removeTrustedRemoteHost(removed.entries, SERVER, "existing.host").entries, []);
     assert.equal(removeTrustedRemoteHost([], SERVER, HOST).removed, false);
     assert.deepEqual(serializeTrustedRemoteHosts([{ server_url: SERVER, host_id: HOST }]), [
       { server_url: SERVER, host_id: HOST },

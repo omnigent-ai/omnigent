@@ -115,7 +115,11 @@ describe("trusted remote host requests", () => {
       return true;
     };
     assert.equal(await requests.request("not a url", HOST, approve), false);
-    assert.equal(await requests.request(SERVER, "", approve), false);
+    await Promise.all(
+      ["", "existing.host", "line\nbreak", "name\u202e", "a".repeat(65)].map(async (invalid) => {
+        assert.equal(await requests.request(SERVER, invalid, approve), false);
+      }),
+    );
     assert.equal(approvals, 0);
   });
 });

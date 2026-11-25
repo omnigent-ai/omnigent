@@ -445,12 +445,17 @@ async function approveSshPreviewHost(win, serverUrl, destination, needsVerificat
 
 /** Persisted trusted remote hosts, reread on each check so hand edits apply. */
 const trustedRemoteHostRequests = createTrustedRemoteHostRequests({
-  isTrusted: (serverUrl, hostId) =>
-    isTrustedRemoteContext(
-      readTrustedRemoteHosts(loadSettings().trusted_remote_hosts),
-      { serverTarget: serverUrl, sourceHostId: hostId },
-      serverUrl,
-    ),
+  isTrusted: (serverUrl, hostId) => {
+    try {
+      return isTrustedRemoteContext(
+        readTrustedRemoteHosts(loadSettings({ strict: true }).trusted_remote_hosts),
+        { serverTarget: serverUrl, sourceHostId: hostId },
+        serverUrl,
+      );
+    } catch {
+      return false;
+    }
+  },
   add: (serverUrl, hostId) => {
     const settings = loadSettings({ strict: true });
     const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
@@ -2204,7 +2209,7 @@ function settingsPath() {
 function loadSettings({ strict = false } = {}) {
   try {
     const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
-    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    if (strict && (!settings || typeof settings !== "object" || Array.isArray(settings))) {
       throw new Error("Desktop settings must be a JSON object.");
     }
     return settings;
