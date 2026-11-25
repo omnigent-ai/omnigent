@@ -17465,6 +17465,72 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   );
 
   it.each([
+    { timing: "during the gap", shellCount: 1, receiptCount: 1 },
+    { timing: "before the gap", shellCount: 1, receiptCount: 1 },
+    { timing: "during the gap", shellCount: 2, receiptCount: 2 },
+    { timing: "before the gap", shellCount: 2, receiptCount: 2 },
+    { timing: "during the gap", shellCount: 1, receiptCount: 2 },
+    { timing: "before the gap", shellCount: 1, receiptCount: 2 },
+  ])(
+    "does not double-ack $receiptCount legacy receipts for $shellCount shell inputs settled $timing",
+    async ({ timing, shellCount, receiptCount }) => {
+      const id = "conv_shell_receipts";
+      const before = userMessage("before", "hello");
+      seedSession(id, [before]);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const queued = (tempId: string, text: string) => ({
+        tempId,
+        content: [{ type: "input_text" as const, text }],
+        posted: true,
+      });
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [
+          ...Array.from({ length: receiptCount }, (_, i) => queued(`shell_${i}`, "!echo hi")),
+          queued("thanks", "thanks"),
+          queued("more", "more"),
+        ],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      const shellInputs: ConversationItem[] = Array.from({ length: shellCount }, (_, i) => ({
+        id: `term_input_${i}`,
+        response_id: `resp_shell_${i}`,
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "echo hi",
+      }));
+      if (timing === "before the gap") {
+        for (const item of shellInputs) {
+          sinks[0]!.push(sse("response.output_item.done", { item }));
+        }
+        await drainAsync();
+      }
+
+      // Legacy servers also persist a user-message receipt for each consumed command.
+      const receipts = Array.from({ length: receiptCount }, (_, i) =>
+        userMessage(`shell_receipt_${i}`, "!echo hi"),
+      );
+      seedSessionItems(id, [before, ...shellInputs, ...receipts, userMessage("ack", "thanks")]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["more"]);
+
+      const last = sinks[1]!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each([
     { path: "ordinary backfill", gapLength: 5 },
     { path: "the fresh-window fallback", gapLength: 100 },
   ])(

@@ -6569,9 +6569,7 @@ async function reconcileOnReconnect(
     // get one: settle their `!cmd` bubbles by command first.
     const shellSettled = settleRecoveredShellInputs(s, unseen);
     if (shellSettled !== s) patch.settledShellInputs = shellSettled.settledShellInputs;
-    const recoveredUserInputs = unseen.filter(
-      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-    ).length;
+    const recoveredUserInputs = recoveredUserAcks(unseen, shellSettled.settledShellInputs);
     if (recoveredUserInputs > 0 || shellSettled.pendingUserMessages !== s.pendingUserMessages) {
       patch.pendingUserMessages = shellSettled.pendingUserMessages.slice(recoveredUserInputs);
     }
@@ -8664,6 +8662,21 @@ function settleRecoveredShellInputs(
         : next,
     state,
   );
+}
+
+/** Exclude legacy receipts for shell bubbles already settled by their input items. */
+function recoveredUserAcks(
+  recovered: AnyBlock[],
+  settled: ShellInputSettlement["settledShellInputs"],
+): number {
+  const receipts = settled.flatMap((entry) => (entry.contentKey ? [entry.contentKey] : []));
+  return recovered.filter((block) => {
+    if (block.type !== "user_message" || isSystemUserContent(block.content)) return false;
+    const at = receipts.indexOf(contentKeyOf(block.content));
+    if (at === -1) return true;
+    receipts.splice(at, 1);
+    return false;
+  }).length;
 }
 
 /**
