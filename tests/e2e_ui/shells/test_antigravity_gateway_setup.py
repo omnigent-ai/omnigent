@@ -63,6 +63,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     tool_completed = threading.Event()
     control_calls: dict[str, str] = {}
     control_results: dict[str, list[dict]] = {}
+    control_result_offsets: dict[str, int] = {}
     missing_tools: dict[str, list[str]] = {}
     agent_id: str | None = None
     control_tools = {
@@ -204,6 +205,9 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                         (d for d in declarations if d["name"].endswith(control_tools[stage])),
                         None,
                     )
+                    generic = next((d for d in declarations if d["name"] == "call_mcp_tool"), None)
+                    if declaration is None:
+                        declaration = generic
                     if declaration is None:
                         missing_tools[stage] = sorted(d["name"] for d in declarations)
                         parts = [{"text": f"{stage}_TOOL_MISSING"}]
@@ -222,6 +226,27 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                             if stage == "AGY_RELAY_REVIEW"
                             else {"session_id": session_id}
                         )
+                        if declaration is generic:
+                            properties = declaration["parameters"]["properties"]
+                            fields = {key.replace("_", "").lower(): key for key in properties}
+                            assert {"servername", "toolname", "arguments"} <= fields.keys(), (
+                                f"Unexpected native MCP call schema: {properties}"
+                            )
+                            argument_key = fields["arguments"]
+                            arguments = {
+                                fields["servername"]: "omnigent",
+                                fields["toolname"]: control_tools[stage],
+                                argument_key: (
+                                    json.dumps(arguments)
+                                    if properties[argument_key].get("type", "").lower() == "string"
+                                    else arguments
+                                ),
+                            }
+                        control_result_offsets[stage] = sum(
+                            part.get("functionResponse", {}).get("name") == name
+                            for content in request.get("contents", [])
+                            for part in content.get("parts", [])
+                        )
                         parts = [{"functionCall": {"name": name, "args": arguments}}]
                 else:
                     results = [
@@ -229,7 +254,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                         for content in request.get("contents", [])
                         for part in content.get("parts", [])
                         if part.get("functionResponse", {}).get("name") == control_calls[stage]
-                    ]
+                    ][control_result_offsets[stage] :]
                     if results:
                         control_results[stage] = results
                     parts = [{"text": f"{stage}_DONE" if results else f"{stage}_RESULT_MISSING"}]
@@ -563,6 +588,13 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 ),
                 "control_calls": control_calls,
                 "missing_tools": missing_tools,
+                "native_mcp_call_schemas": [
+                    declaration
+                    for body in captured
+                    for tool in body.get("tools", [])
+                    for declaration in tool.get("functionDeclarations", [])
+                    if declaration["name"] == "call_mcp_tool"
+                ][:1],
             }
             if session_id is not None:
                 relay_file = (
