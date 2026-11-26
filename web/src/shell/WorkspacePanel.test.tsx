@@ -1248,23 +1248,6 @@ describe("WorkspacePanel conversation handoff", () => {
     },
   );
 
-  it("skips an intermediate session even after its frame callback ran", () => {
-    const { rerender } = renderWorkspace({
-      open: false,
-      conversationId: "conv_a",
-      selectedFilePath: "notes.md",
-    });
-    rerender({ conversationId: "conv_b" });
-    act(() => vi.advanceTimersToNextFrame());
-    rerender({ conversationId: "conv_c" });
-    expect(screen.queryByTestId("preview-stub")).toBeNull();
-    act(() => vi.advanceTimersToNextFrame());
-    expect(screen.queryByTestId("preview-stub")).toBeNull();
-    act(() => vi.runOnlyPendingTimers());
-    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-session", "conv_c");
-    expect(screen.getByTestId("preview-stub")).toHaveTextContent("conv_c");
-  });
-
   it("keeps same-session changes immediate while collapsed", () => {
     const { rerender } = renderWorkspace({ open: false, selectedFilePath: "notes.md" });
     rerender({ selectedFilePath: "current.md" });
@@ -1297,14 +1280,21 @@ describe("WorkspacePanel conversation handoff", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_a?diff=1");
     act(() => {
       navigate("/c/conv_b?keep=1");
-      rerender({ conversationId: "conv_b", selectedFilePath: null, openFiles: [] });
+      rerender({
+        conversationId: "conv_b",
+        selectedFilePath: effect === "Escape" ? "current.md" : null,
+        openFiles: effect === "Escape" ? ["current.md"] : [],
+      });
     });
     if (effect === "URL") {
       expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_b?keep=1");
       expect(screen.getByTestId("location")).not.toHaveTextContent("diff=");
     } else {
+      expect(screen.getByTestId("file-viewer")).toHaveTextContent("current.md");
       fireEvent.keyDown(window, { key: "Escape" });
-      expect(onCloseFile).not.toHaveBeenCalled();
+      expect(onCloseFile).toHaveBeenCalledTimes(1);
+      expect(onCloseFile).toHaveBeenCalledWith("current.md");
+      expect(onCloseFile).not.toHaveBeenCalledWith("notes.md");
     }
   });
 

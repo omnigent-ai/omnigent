@@ -407,6 +407,7 @@ function PreviewWithSearch({
     () => [content, tableRowsVersion],
     [content, tableRowsVersion],
   );
+  const markdownSearchVersion = useMemo(() => [content, deferred], [content, deferred]);
   const handleTableRowsChange = useCallback(
     () => setTableRowsVersion((version) => version + 1),
     [],
@@ -414,7 +415,13 @@ function PreviewWithSearch({
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
-      contentVersion={kind === "table" || kind === "spreadsheet" ? tableSearchVersion : content}
+      contentVersion={
+        kind === "markdown"
+          ? markdownSearchVersion
+          : kind === "table" || kind === "spreadsheet"
+            ? tableSearchVersion
+            : content
+      }
       open={searchOpen}
       onClose={onSearchHandled}
       inputRef={searchInputRef}

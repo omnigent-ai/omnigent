@@ -224,10 +224,50 @@ describe("hidden workspace Markdown preview", () => {
     }
   });
 
+  it("refreshes an open Find query when the deferred preview renders", () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+    const rangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
+    Range.prototype.getBoundingClientRect = () => ({ width: 0, height: 0 }) as DOMRect;
+    try {
+      const tree = (conversationId: string, content: string, visible: boolean) => (
+        <WorkspacePreviewProvider conversationId={conversationId} visible={visible}>
+          {viewerElement(content, true, "find.md", {
+            viewMode: "preview",
+            searchOpen: true,
+            conversationId,
+          })}
+        </WorkspacePreviewProvider>
+      );
+      const { rerender } = render(tree("conv_a", "# alpha", true));
+      const input = screen.getByPlaceholderText("Find…");
+      fireEvent.change(input, { target: { value: "alpha" } });
+      expect(screen.getByText("1 / 1")).toBeInTheDocument();
+      rerender(tree("conv_b", "# alpha\n\nalpha", false));
+      expect(input).toHaveValue("alpha");
+      expect(screen.getByText("No results")).toBeInTheDocument();
+      act(() => vi.advanceTimersToNextFrame());
+      expect(screen.getByText("No results")).toBeInTheDocument();
+      act(() => vi.runOnlyPendingTimers());
+      expect(input).toHaveValue("alpha");
+      expect(screen.getByText("1 / 2")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+      expect(screen.getByText("2 / 2")).toBeInTheDocument();
+    } finally {
+      cleanup();
+      if (rangeRect) Object.defineProperty(Range.prototype, "getBoundingClientRect", rangeRect);
+      else Reflect.deleteProperty(Range.prototype, "getBoundingClientRect");
+      vi.useRealTimers();
+    }
+  });
+
   it("defers parsing and restores scroll without remounting the scroller", () => {
     vi.useFakeTimers({
       toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
     });
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
     try {
       const tree = (conversationId: string, visible: boolean) => (
         <WorkspacePreviewProvider conversationId={conversationId} visible={visible}>
@@ -261,9 +301,15 @@ describe("hidden workspace Markdown preview", () => {
       scroller.scrollTop = 0;
       fireEvent.scroll(scroller);
       expect(getSavedScrollTop("viewer-preview:conv_b:handoff.md")).toBe(240);
+      now += 2000;
       act(() => vi.advanceTimersByTime(2000));
       rerender(tree("conv_b", true));
       expect(scroller.scrollTop).toBe(240);
+      scroller.scrollTop = 20;
+      fireEvent.scroll(scroller);
+      act(() => vi.advanceTimersToNextFrame());
+      expect(scroller.scrollTop).toBe(240);
+      expect(getSavedScrollTop("viewer-preview:conv_b:handoff.md")).toBe(240);
 
       rerender(tree("conv_a", false));
       expect(scroller).toBeEmptyDOMElement();

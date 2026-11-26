@@ -121,7 +121,7 @@ export function useScrollRestore(
   ready: boolean,
   restore = true,
 ): (event: UIEvent<HTMLElement>) => void {
-  const pendingRef = useRef<{ target: number; deadline: number } | null>(null);
+  const pendingRef = useRef<{ target: number; deadline: number | null } | null>(null);
   const keyRef = useRef<string | null>(null);
 
   // Arm a restore once per content identity / readiness change — NOT every
@@ -131,19 +131,16 @@ export function useScrollRestore(
     // Only committed navigation may replace or cancel the active restore.
     if (key !== keyRef.current) {
       keyRef.current = key;
-      // Keep the deadline stable across readiness changes and StrictMode replay.
-      pendingRef.current = key
-        ? {
-            target: scrollTopCache.get(key) ?? 0,
-            deadline: performance.now() + SCROLL_RESTORE_BUDGET_MS,
-          }
-        : null;
+      pendingRef.current = key ? { target: scrollTopCache.get(key) ?? 0, deadline: null } : null;
     }
     if (!restore) pendingRef.current = null;
 
     const el = ref.current;
     const pending = pendingRef.current;
+    if (pending && !ready) pending.deadline = null;
     if (!el || !pending || !ready) return;
+    // Readiness starts the budget; StrictMode replay keeps the same deadline.
+    const deadline = (pending.deadline ??= performance.now() + SCROLL_RESTORE_BUDGET_MS);
 
     let frame = 0;
     let done = false;
@@ -182,7 +179,7 @@ export function useScrollRestore(
     // so growth-driven scroll events can't overwrite the saved offset.
     const tick = () => {
       if (done) return;
-      if (pendingRef.current !== pending || performance.now() >= pending.deadline) {
+      if (pendingRef.current !== pending || performance.now() >= deadline) {
         finish();
         return;
       }

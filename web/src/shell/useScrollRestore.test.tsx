@@ -187,6 +187,35 @@ describe("useScrollRestore", () => {
     expect(el.scrollTop).toBe(0);
   });
 
+  it("starts a fresh restore budget when delayed content becomes ready", async () => {
+    const key = "view:delayed-ready";
+    saveScrollTop(key, 180);
+    const { view, el } = mount(key, false);
+    now += SCROLL_RESTORE_BUDGET_MS + 100;
+    view.rerender(<Scroller scrollKey={key} ready />);
+    expect(el.scrollTop).toBe(180);
+    el.scrollTop = 20;
+    fireEvent.scroll(el);
+    await nextFrame();
+    expect(el.scrollTop).toBe(180);
+    expect(getSavedScrollTop(key)).toBe(180);
+
+    now += 100;
+    view.rerender(<Scroller scrollKey={key} ready={false} />);
+    now += SCROLL_RESTORE_BUDGET_MS + 100;
+    view.rerender(<Scroller scrollKey={key} ready />);
+    el.scrollTop = 30;
+    fireEvent.scroll(el);
+    await nextFrame();
+    expect(el.scrollTop).toBe(180);
+    expect(getSavedScrollTop(key)).toBe(180);
+
+    await settleRestore();
+    el.scrollTop = 60;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop(key)).toBe(60);
+  });
+
   it("persists nothing when the key is null", async () => {
     const { el } = mount(null);
     await settleRestore();
