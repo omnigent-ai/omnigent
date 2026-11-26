@@ -63,7 +63,6 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     tool_completed = threading.Event()
     control_calls: dict[str, str] = {}
     control_results: dict[str, list[dict]] = {}
-    rejected_requests: dict[str, dict[str, object]] = {}
     control_result_offsets: dict[str, int] = {}
     missing_tools: dict[str, list[str]] = {}
     agent_id: str | None = None
@@ -564,7 +563,6 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                             card.get_by_role("button", name="Reject", exact=True).click()
                         assert rejection.value.status == 202
                         assert rejection.value.json() == {"queued": False}
-                        rejected_requests[marker] = {"action": "decline", "status": 202}
                     expect(replies.filter(has_text=f"{marker}_DONE")).to_have_count(
                         1, timeout=60_000
                     )
@@ -588,7 +586,6 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                         tasks = client.get("/v1/scheduled-tasks")
                         tasks.raise_for_status()
                         assert not tasks.json()["scheduled_tasks"]
-                        assert rejected_requests[marker] == {"action": "decline", "status": 202}
                         # agy can poll after synchronous resolution removed the elicitation.
                         declined = declined or (
                             "error" in result
@@ -616,7 +613,6 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                     discovered = {
                         "native_tool_names": sorted({d["name"] for d in declarations}),
                         "control_calls": control_calls,
-                        "rejected_requests": rejected_requests,
                         "control_results": {
                             marker: redact_log_text(
                                 json.dumps(results), include_whitespace_credentials=True
