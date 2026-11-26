@@ -105,6 +105,12 @@ GUARD_BACKOFF_MAX_S = 0.4
 _ON_DELETE = ("restrict", "cascade", "unset")
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _EPOCH = re.compile(r"^e[0-9]{6,12}$")
+
+
+def _epoch_name(number: int) -> str:
+    return f"e{number:06d}"
+
+
 _GENERATION = re.compile(r"^g([0-9]{1,12})$")
 _GUARD_COLLECTION = "epochs"
 _STALE = "stale"
@@ -1125,12 +1131,47 @@ class ConstraintGuard:
                     self._index_add(directory, record.id)
 
     def _epochs(self) -> list[str]:
+        """The newest epochs, oldest first: all of them where old ones are retired (a few),
+        else the last two, found by probing numbered epochs instead of listing them all."""
+        root = f"{self.guard_root}/{_GUARD_COLLECTION}"
+        if not self.files.supports_delete:
+            newest = self._newest_epoch_number(root)
+            if not newest:
+                return []
+            return [_epoch_name(n) for n in range(max(1, newest - 1), newest + 1)]
         try:
-            paths = self.files.list_paths(f"{self.guard_root}/{_GUARD_COLLECTION}")
+            paths = self.files.list_paths(root)
         except NotFound:
             paths = []
         names = (path.rsplit("/", 1)[-1] for path in paths)
         return sorted((name for name in names if _EPOCH.fullmatch(name)), key=lambda n: int(n[1:]))
+
+    def _epoch_exists(self, root: str, number: int) -> bool:
+        try:
+            self.files.list_page(f"{root}/{_epoch_name(number)}", after=None, limit=1)
+        except NotFound:
+            return False
+        return True
+
+    def _newest_epoch_number(self, root: str) -> int:
+        """The highest epoch number, or 0 for none, in O(log epochs) probes.
+
+        On a store that can't delete, epochs are never removed and each is made only after
+        its predecessor, so they run from 1 with no gaps.
+        """
+        if not self._epoch_exists(root, 1):
+            return 0
+        low, high = 1, 2
+        while self._epoch_exists(root, high):
+            low, high = high, high * 2
+        # low exists, high does not.
+        while high - low > 1:
+            middle = (low + high) // 2
+            if self._epoch_exists(root, middle):
+                low = middle
+            else:
+                high = middle
+        return low
 
     def _current(self) -> tuple[str, Document]:
         epochs = self._epochs()
@@ -1206,7 +1247,7 @@ class ConstraintGuard:
             )
 
     def _advance(self, epoch: str, sealed: dict) -> None:
-        successor = f"e{int(epoch[1:]) + 1:06d}"
+        successor = _epoch_name(int(epoch[1:]) + 1)
         self._create_epoch(successor, {**sealed, "sealed": False, "writes": 0})
 
     def _guard_operation(self, state: Document, purpose: str, primary: dict | None = None) -> str:

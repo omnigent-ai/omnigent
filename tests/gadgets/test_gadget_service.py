@@ -2027,7 +2027,17 @@ def test_an_epoch_on_a_store_that_cannot_delete_rotates_before_its_record_is_ful
     epochs = gadgets.store.gadget_files(app["id"]).list_paths("data/_guard/epochs")
     # Sealed before each record's revision limit, so no write was refused for a full epoch.
     assert len(epochs) >= 2
+    # Finding the current epoch probes numbered epochs: it never reads the epoch list, and
+    # the probes grow with the log of the epochs kept, not with their number.
+    reads: list[str] = []
+    gadgets.store.after_list = lambda path, _entries: reads.append(path)
     move(service, app, document, "doing", "e-last")
+    gadgets.store.after_list = None
+    epoch_reads = [path for path in reads if path.startswith("data/_guard/epochs")]
+    assert "data/_guard/epochs" not in epoch_reads
+    probes_per_lookup = 2 * len(epochs).bit_length() + 2
+    lookups = 3  # A guarded write looks the epoch up a few times.
+    assert len(epoch_reads) <= lookups * probes_per_lookup
     with pytest.raises(ConstraintViolation):
         card(service, app, "b", "doing")
 
