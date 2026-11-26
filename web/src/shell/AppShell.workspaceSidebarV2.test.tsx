@@ -1011,6 +1011,10 @@ describe("⇧⌘F and ⌘K's full screen row", () => {
     setViewport(DESKTOP);
     renderShell(withFlag(false));
     await screen.findByRole("complementary", { name: "Workspace" });
+    // A row registered late, once some lazy code loads, would still count.
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
     expect(pressFullScreen().defaultPrevented).toBe(false);
     expect(fullScreenRow()).toBeUndefined();
   });
