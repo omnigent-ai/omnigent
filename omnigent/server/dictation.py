@@ -87,6 +87,10 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 _logger = logging.getLogger(__name__)
+# websockets logs every handshake header at DEBUG, including the raw
+# Authorization bearer; keep its transport logger at INFO.
+_ws_transport_logger = logging.getLogger(f"{__name__}.websocket_transport")
+_ws_transport_logger.setLevel(logging.INFO)
 
 ENGINE_ENV = "OMNIGENT_DICTATION_ENGINE"
 MODEL_DIR_ENV = "OMNIGENT_DICTATION_MODEL_DIR"
@@ -634,7 +638,9 @@ class _RemoteStream:
         from websockets.sync.client import connect
 
         headers = {"Authorization": f"Bearer {token}"} if token is not None else None
-        self._ws = connect(url, open_timeout=5, additional_headers=headers)
+        self._ws = connect(
+            url, open_timeout=5, additional_headers=headers, logger=_ws_transport_logger
+        )
         try:
             deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
             while True:

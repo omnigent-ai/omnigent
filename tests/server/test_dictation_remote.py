@@ -118,6 +118,22 @@ def test_remote_engine_relays_partials_and_finish(worker_url: str, token: str | 
     assert handle.finish() == " ".join(_WORDS[:3])
 
 
+@pytest.mark.parametrize("token", [_TOKEN])
+def test_handshake_debug_logs_omit_token(
+    worker_url: str, token: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Root DEBUG logging must not capture the bearer from either handshake."""
+    wrong_token = "fake-wrong-token-for-logs"
+    with caplog.at_level("DEBUG"):
+        handle = dictation.RemoteDictationEngine(worker_url, token=token).create_stream()
+        handle.feed_pcm16(_WORD)
+        handle.finish()
+        with pytest.raises(InvalidStatus):
+            dictation.RemoteDictationEngine(worker_url, token=wrong_token).create_stream()
+    assert token not in caplog.text
+    assert wrong_token not in caplog.text
+
+
 @pytest.mark.parametrize("token", [None, _TOKEN], ids=["open", "token"])
 def test_remote_engine_relays_finalized_utterances(worker_url: str, token: str | None) -> None:
     """A worker 'final' event surfaces as DictationUpdate.finalized."""
