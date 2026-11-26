@@ -212,6 +212,9 @@ SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
 # Server-owned: the web composer's running /loop for one user (the suffix hashes the
 # user), holding its timer's task id so a new loop replaces it and a stop finds it.
 LOOP_TIMER_LABEL_PREFIX = "omnigent.loop_timer."
+# Server-owned: set once another session supersedes this one (/clear, /rewind). No loop
+# arms or fires here afterwards, so one armed as its viewers moved on can't tick unseen.
+LOOP_TIMER_SUPERSEDED_LABEL_KEY = LOOP_TIMER_LABEL_PREFIX + "superseded"
 
 
 def loop_timer_label_key(user_id: str | None) -> str:

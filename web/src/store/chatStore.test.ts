@@ -11975,6 +11975,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(tickBlock).toMatchObject({ type: "user_message", origin: "loop" });
       expect(tickBlock?.content).toEqual([{ type: "input_text", text: "check CI" }]);
     });
+
+    it("a replayed /loop run leaves the user's own pending message alone", () => {
+      // The run is already committed, e.g. its mirrored item beat this event through the
+      // stream. Acknowledging it again must not drop the message the user has pending.
+      const tickEvent: SessionInputConsumedEvent = {
+        type: "session_input_consumed",
+        itemId: "msg_tick",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", origin: "loop", content: [{ type: "input_text", text: "check CI" }] },
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+      handleSessionEvent(tickEvent);
+      const mine = { tempId: "pend_mine", content: [{ type: "input_text" as const, text: "hi" }] };
+      useChatStore.setState({ pendingUserMessages: [mine] });
+
+      handleSessionEvent(tickEvent);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([mine]);
+      expect(state.blocks).toHaveLength(1);
+    });
   });
 
   describe("slash_command (claude-native skill / surfaced command)", () => {

@@ -6093,32 +6093,25 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
 
 async def _stop_superseded_loops(session_id: str, conversation_store: ConversationStore) -> None:
     """
-    Stop every user's ``/loop`` in a session another one has superseded.
+    End every user's ``/loop`` in a session another one has superseded.
 
     Its viewers follow to the successor, where a loop left ticking here would run
-    unseen and out of reach of ``/loop stop``. Each loop's label is cleared, so its
-    next firing retires the timer instead of sending. Best-effort.
+    unseen and out of reach of ``/loop stop``. The session is marked, and a marked
+    session neither arms a loop nor fires one, so a loop being armed at this moment
+    ends too. Best-effort.
 
     :param session_id: The superseded session, e.g. ``"conv_old"``.
     :param conversation_store: Store holding the session's labels.
     """
-    from omnigent.stores.conversation_store import LOOP_TIMER_LABEL_PREFIX
+    from omnigent.stores.conversation_store import LOOP_TIMER_SUPERSEDED_LABEL_KEY
 
     try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        loops = {} if conv is None else conv.labels
-        for key, timer_id in loops.items():
-            if key.startswith(LOOP_TIMER_LABEL_PREFIX):
-                await asyncio.to_thread(
-                    conversation_store.replace_label_if,
-                    session_id,
-                    key,
-                    expected=timer_id,
-                    value=None,
-                )
+        await asyncio.to_thread(
+            conversation_store.set_labels, session_id, {LOOP_TIMER_SUPERSEDED_LABEL_KEY: "1"}
+        )
     except Exception:  # noqa: BLE001
         _logger.warning(
-            "Failed to stop the loops of superseded session %s", session_id, exc_info=True
+            "Failed to end the loops of superseded session %s", session_id, exc_info=True
         )
 
 

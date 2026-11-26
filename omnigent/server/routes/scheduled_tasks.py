@@ -119,6 +119,7 @@ from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    LOOP_TIMER_SUPERSEDED_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     loop_timer_label_key,
 )
@@ -2548,6 +2549,9 @@ def create_scheduled_tasks_router(
     # changed by compare-and-swap, so clients arming or stopping at once, on any
     # replica, agree on which loop runs without listing timers.
     _LOOP_STOP_ATTEMPTS = 5
+    _LOOP_SUPERSEDED = (
+        "This chat continued in a new session, so a loop can't run here; run /loop there"
+    )
 
     async def _running_loop(
         conv: Conversation, user_id: str | None, timer_id: str | None
@@ -2642,6 +2646,8 @@ def create_scheduled_tasks_router(
                 "This session is closed to new messages, so it can't take timers",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if origin is not None and LOOP_TIMER_SUPERSEDED_LABEL_KEY in conv.labels:
+            raise OmnigentError(_LOOP_SUPERSEDED, code=ErrorCode.INVALID_INPUT)
         if conv.agent_id is None:
             raise OmnigentError(
                 "This session has no agent for a timer to wake", code=ErrorCode.INVALID_INPUT
@@ -2692,10 +2698,17 @@ def create_scheduled_tasks_router(
             # one replaces, however many clients arm at once. The swap and its undo run in
             # one thread, so a request cancelled meanwhile can't undo a swap that commits.
             def record() -> str | None:
+                label = loop_timer_label_key(user_id)
                 try:
-                    return conversation_store.swap_label(
-                        conv.id, loop_timer_label_key(user_id), task.id
-                    )
+                    previous = conversation_store.swap_label(conv.id, label, task.id)
+                    # Superseded while this loop was being saved: its viewers moved on.
+                    current = conversation_store.get_conversation(conv.id)
+                    if current and LOOP_TIMER_SUPERSEDED_LABEL_KEY in current.labels:
+                        conversation_store.replace_label_if(
+                            conv.id, label, expected=task.id, value=None
+                        )
+                        raise OmnigentError(_LOOP_SUPERSEDED, code=ErrorCode.INVALID_INPUT)
+                    return previous
                 except Exception:
                     # A loop the session can't find could never be stopped.
                     store.delete(task.id)

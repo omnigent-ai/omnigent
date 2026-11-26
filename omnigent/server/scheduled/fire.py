@@ -183,6 +183,7 @@ from omnigent.server.session_mcp_selection import (
 from omnigent.server.workflows import workflows_enabled
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    LOOP_TIMER_SUPERSEDED_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -3350,8 +3351,8 @@ async def _fire_timer(
 
     A session that was deleted, archived or closed, or that the timer's owner can no
     longer send to, stops the timer instead: it is never woken or recreated. So does a
-    ``/loop`` timer the session no longer names as its user's running loop: replaced or
-    stopped, nothing else can reach it, so it retires rather than ticking on. A session
+    ``/loop`` timer the session no longer names as its user's running loop, or whose
+    session another has superseded: nothing else can reach it, so it retires. A session
     that moved to another host gets the firing back unsent, for the replica that owns
     that host to claim at its next poll. The session's input policies check the wake as
     they would a message. A cancel stops later firings; one already on its way may still
@@ -3368,11 +3369,12 @@ async def _fire_timer(
         await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
         return
     assert conv is not None
-    if (
-        timer_origin(task.name) == "loop"
-        and conv.labels.get(loop_timer_label_key(task.user_id)) != task.id
+    if timer_origin(task.name) == "loop" and (
+        LOOP_TIMER_SUPERSEDED_LABEL_KEY in conv.labels
+        or conv.labels.get(loop_timer_label_key(task.user_id)) != task.id
     ):
-        # The session's label, not the timer rows, says which loop runs for its user.
+        # The session's labels, not the timer rows, say which loop runs for its user,
+        # and none runs in a session another one has superseded.
         _logger.info("scheduled fire: loop %s stopped: the session no longer runs it", task.id)
         await recorder.finish(
             "skipped", error="the session no longer runs this loop", error_code="loop_superseded"

@@ -53,7 +53,10 @@ from omnigent.server.scheduled.workflow_automations import (
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.conversation_store import loop_timer_label_key
+from omnigent.stores.conversation_store import (
+    LOOP_TIMER_SUPERSEDED_LABEL_KEY,
+    loop_timer_label_key,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -8364,7 +8367,7 @@ async def test_a_loops_label_stays_on_the_server_and_goes_when_the_loop_does(
     assert label not in conversations.get_conversation(session_id).labels
 
     # Superseded, as /clear and /rewind leave a session: its viewers follow the new one,
-    # so the loop is forgotten here and its next firing retires it (test_claimed_fire).
+    # so the session is marked and its loop's next firing retires it (test_claimed_fire).
     second = await arm()
     superseded = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
@@ -8375,12 +8378,82 @@ async def test_a_loops_label_stays_on_the_server_and_goes_when_the_loop_does(
         headers=_headers(),
     )
     assert superseded.status_code == 202, superseded.text
-    assert label not in conversations.get_conversation(session_id).labels
-    assert SqlAlchemyScheduledTaskStore(db_uri).get(second).state == "active"
+    assert LOOP_TIMER_SUPERSEDED_LABEL_KEY in conversations.get_conversation(session_id).labels
+    snapshot = (await auth_client.get(f"/v1/sessions/{session_id}", headers=_headers())).json()
+    assert not [key for key in snapshot["labels"] if key.startswith("omnigent.loop_timer.")]
+    # No new loop arms here, and the refusal says where to run it instead.
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    refused = await auth_client.post(
+        f"/v1/sessions/{session_id}/timers",
+        json={"seconds": 300, "repeat": True, "note": "again", "origin": "loop"},
+        headers=_headers(),
+    )
+    assert refused.status_code == 400 and "continued in a new session" in refused.text
+    assert [task.id for task in tasks.list(kinds=("timer",))] == [second]
+    # The agent's own timers are not loops, and the earlier loop can still be stopped.
+    agent_timer = await auth_client.post(
+        f"/v1/sessions/{session_id}/timers", json={"seconds": 300}, headers=_headers()
+    )
+    assert agent_timer.status_code == 201, agent_timer.text
     stopped = await auth_client.delete(
         f"/v1/sessions/{session_id}/timers", params={"origin": "loop"}, headers=_headers()
     )
-    assert stopped.json() == {"timer_id": None, "status": "none"}
+    assert stopped.json() == {"timer_id": second, "status": "cancelled"}
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("replacing", [False, True])
+async def test_supersession_fences_an_in_flight_loop_arm(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    replacing: bool,
+) -> None:
+    """An arm that saved its timer, then swapped the label only after ``/clear`` or
+    ``/rewind`` superseded the session, must not leave a loop ticking where its viewers
+    no longer are: the arm is refused and undone, whether or not it was replacing one."""
+    session_id = _owned_session(db_uri)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    url = f"/v1/sessions/{session_id}/timers"
+    body = {"seconds": 300, "repeat": True, "note": "check CI", "origin": "loop"}
+    earlier = None
+    if replacing:
+        earlier = (await auth_client.post(url, json=body, headers=_headers())).json()["timer_id"]
+
+    at_swap, superseded = threading.Event(), threading.Event()
+    real_swap = SqlAlchemyConversationStore.swap_label
+
+    def paused_swap(self: Any, *args: Any, **kwargs: Any) -> str | None:
+        at_swap.set()
+        assert superseded.wait(10)
+        return real_swap(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "swap_label", paused_swap)
+    arming = asyncio.create_task(auth_client.post(url, json=body, headers=_headers()))
+    try:
+        assert await asyncio.to_thread(at_swap.wait, 10)
+        moved = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_session_superseded",
+                "data": {"target_conversation_id": uuid.uuid4().hex},
+            },
+            headers=_headers(),
+        )
+        assert moved.status_code == 202, moved.text
+    finally:
+        superseded.set()
+    refused = await arming
+
+    assert refused.status_code == 400 and "continued in a new session" in refused.text
+    labels = conversations.get_conversation(session_id).labels
+    assert LOOP_TIMER_SUPERSEDED_LABEL_KEY in labels
+    # The session names no loop. The one being replaced is all that is left, and the
+    # mark retires it at its next firing (test_claimed_fire).
+    assert loop_timer_label_key("alice@example.com") not in labels
+    assert [task.id for task in tasks.list(kinds=("timer",))] == ([earlier] if replacing else [])
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)

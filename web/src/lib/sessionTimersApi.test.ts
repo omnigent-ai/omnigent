@@ -43,9 +43,13 @@ const SAVED = {
 };
 
 describe("sendLoopPrompt", () => {
-  it("posts the prompt as a user message tagged with the loop origin", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, item_id: "msg_1" }, 202));
-    await sendLoopPrompt("sess", "check CI");
+  it.each([
+    ["accepted", { queued: true, item_id: "msg_1" }],
+    // Held until the session finishes starting: sent, not a refused first run.
+    ["held for the session's startup", { queued: true, pending_id: "pending_1" }],
+  ])("posts the prompt as a user message tagged with the loop origin (%s)", async (_, reply) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(reply, 202));
+    await expect(sendLoopPrompt("sess", "check CI")).resolves.toBeUndefined();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/sess/events");
     // Nothing resends it when the host is offline, so the send must not say it will.

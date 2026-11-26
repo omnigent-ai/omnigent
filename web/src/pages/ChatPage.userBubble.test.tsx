@@ -64,11 +64,14 @@ function assistantBubble(
 }
 
 function renderBubble(bubble: Bubble) {
-  // File mention pills check the workspace through a query.
+  // File mention pills check the workspace through a query; a /loop run's label
+  // explains itself in a tooltip.
   return render(
     <QueryClientProvider client={new QueryClient()}>
       <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-        <BubbleView bubble={bubble} />
+        <TooltipProvider>
+          <BubbleView bubble={bubble} />
+        </TooltipProvider>
       </FileViewerContext.Provider>
     </QueryClientProvider>,
   );
@@ -212,16 +215,7 @@ describe("/btw answer pull request references", () => {
 
 describe("UserBubble loop runs", () => {
   it("labels a message a /loop sent, beside the bubble", () => {
-    render(
-      <QueryClientProvider client={new QueryClient()}>
-        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-          {/* The label explains itself in a tooltip. */}
-          <TooltipProvider>
-            <BubbleView bubble={userBubble("check CI", { origin: "loop" })} />
-          </TooltipProvider>
-        </FileViewerContext.Provider>
-      </QueryClientProvider>,
-    );
+    renderBubble(userBubble("check CI", { origin: "loop" }));
     expect(screen.getByTestId("message-origin")).toHaveTextContent("Loop");
     expect(screen.getByText("check CI")).toBeInTheDocument();
   });

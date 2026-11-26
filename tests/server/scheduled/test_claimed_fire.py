@@ -53,7 +53,10 @@ from omnigent.server.scheduled.schedule import (
 from omnigent.server.session_journal import open_store as open_journal_store
 from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.server.workflows import open_store as open_workflow_store
-from omnigent.stores.conversation_store import loop_timer_label_key
+from omnigent.stores.conversation_store import (
+    LOOP_TIMER_SUPERSEDED_LABEL_KEY,
+    loop_timer_label_key,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
@@ -2507,18 +2510,26 @@ async def test_a_timer_stops_without_waking_a_session_it_may_no_longer_wake(
     assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
 
 
-@pytest.mark.parametrize("names", ["another loop", "no loop"])
+@pytest.mark.parametrize("names", ["another loop", "no loop", "this loop, but superseded"])
 async def test_a_loop_the_session_no_longer_names_retires_instead_of_ticking(
     store, caplog, names
 ) -> None:
-    """The session's label, not the timer rows, says which loop runs for its user.
+    """The session's labels, not the timer rows, say which loop runs for its user.
 
     A replace or stop that failed after moving the label, or a server that died between
-    the two, leaves a timer the label no longer names; nothing else can reach it.
+    the two, leaves a timer the label no longer names; nothing else can reach it. Nor
+    does any loop run in a session another has superseded, even one armed as it was.
     """
     caplog.set_level(logging.INFO)
     claimed = _claim_timer(store, repeat=True, loop_prompt="check CI")
-    labels = {loop_timer_label_key(None): "st_other"} if names == "another loop" else {}
+    labels = {
+        "another loop": {loop_timer_label_key(None): "st_other"},
+        "no loop": {},
+        "this loop, but superseded": {
+            loop_timer_label_key(None): claimed.task.id,
+            LOOP_TIMER_SUPERSEDED_LABEL_KEY: "1",
+        },
+    }[names]
     dispatch = AsyncMock()
     await ClaimedRunExecutor(
         _timer_deps(

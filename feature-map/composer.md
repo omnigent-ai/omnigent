@@ -247,8 +247,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   (`DELETE /v1/sessions/{id}/timers?origin=loop`). A loop ticks only while the
   session still names it as the caller's loop, so one a failed replace or stop
   left behind retires itself at its next firing. A loop stays with its session:
-  when `/clear` or `/rewind` continues in a new session the old one's loops stop,
-  and a fork starts with none, so arm it again there. The agent's own
+  when `/clear` or `/rewind` continues in a new session the old one's loops stop
+  and it takes no new one ("This chat continued in a new session, so a loop
+  can't run here; run /loop there"), and a fork starts with none. The agent's own
   `sys_timer_set` timers are never touched, and in a shared session each
   collaborator's loop is their own. Intervals are a leading `5m`, `2h` or `1d`
   token, from 2 minutes (the server's saved-timer floor) to 7 days. A prompt
