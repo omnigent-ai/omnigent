@@ -1681,13 +1681,26 @@ remove only the submission named by the input's server-owned `submission`:
 before the POST response arrives. This identity is persisted with the item and
 included in live events and history, so reconnect can acknowledge a missed input.
 Forwarded shell submissions retain correlation beyond the pending-entry cleanup
-timeout while awaiting their mirror; cancellation and the existing queue cap still apply.
-An empty `submission: {}` explicitly means no web entry was consumed. Missing
+timeout while awaiting their mirror, under the existing queue cap. Active-pending
+eligibility still expires after ten minutes and ends on an identity-linked failure,
+rejection or cancellation. A runner turn completing after typing into the native CLI
+does not establish shell execution. Retained correlation alone does not keep a
+session working or replay a bubble.
+A sufficiently delayed command can therefore disappear from a reload's pending list
+while its later terminal record still acknowledges the original submission.
+An empty `submission: {}` means no web submission was correlated to the record. Missing
 `submission` means a legacy record; clients must not infer history acknowledgements
 from command text. Output items carry no submission identity. During a mixed-version
 rollout, an older client can retain that bubble until refreshing its snapshot;
 an older server can still report the command as `native_prompt_not_recorded`.
 Updated clients preserve later bubbles when that older server's receipt arrives.
+
+Reconnect settlement covers the fetched history window. The fresh-window fallback
+loads only the newest 100 items; a terminal input older than that window cannot
+acknowledge an outstanding bubble through this recovery path. Paging older history
+currently renders those records without repeating shell settlement. Correlation
+before terminal persistence still uses the existing server command matcher; loss of
+a command followed by identical text can remain ambiguous within that matcher.
 
 ### Sessions Typical Flow
 

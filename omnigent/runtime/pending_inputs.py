@@ -101,7 +101,8 @@ later message follows: stale entries are evicted lazily on the next
 same conversation.
 
 Forwarded shell commands can wait behind a native turn longer than the TTL.
-Their identities remain matchable until a mirror, cancellation, or cap eviction.
+Their identities remain matchable under the queue cap, but their active pending
+lease still expires. Failure, rejection, or cancellation retires its shell input.
 """
 
 from __future__ import annotations
@@ -120,9 +121,8 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
-# Expire ghost inputs after ten minutes. Forwarded shells can wait behind
-# a native turn longer; retain their identities until settled or cancelled.
-# The per-conversation cap still applies.
+# Active pending work expires after ten minutes. Forwarded shell correlation
+# survives that lease under the per-conversation cap for delayed mirrors.
 _TTL_S: float = 600.0
 
 # Hard cap on unheld queued entries per conversation, enforced by
@@ -252,6 +252,8 @@ class DrainedInput:
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
     uncertain: bool = False
+    created_at: float | None = None
+    retired: bool = False
 
 
 @dataclass
@@ -329,6 +331,7 @@ class _Entry:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    retired: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -350,8 +353,18 @@ def _awaits_shell_mirror(entry: _Entry) -> bool:
             "native_turn_started",
             "native_turn_accepted",
             "native_turn_completed",
+            "native_turn_failed",
         }
         and entry.cause_class not in {"rejected_before_handoff", "rejected_by_native"}
+    )
+
+
+def _active_entries(entries: dict[str, _Entry], now: float) -> Iterable[tuple[str, _Entry]]:
+    """Exclude correlation-only records from every active-pending reader."""
+    return (
+        (pending_id, entry)
+        for pending_id, entry in entries.items()
+        if not entry.retired and now - entry.created_at <= _TTL_S
     )
 
 
@@ -474,7 +487,7 @@ def _evict_beyond_cap(entries: dict[str, _Entry]) -> None:
 
 def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None:
     """
-    Return the live pending id recorded for a web client's stable message id.
+    Return a recorded pending id, including retained shell correlation.
 
     Called by the native message route before it records a send. A stable id
     that is already queued is a client retry of a message the runner already
@@ -597,6 +610,13 @@ def mark_lifecycle(
             ):
                 continue
             entry.last_delivery_stage = stage
+            if _shell_command_text(entry.content) and stage in {
+                "native_turn_failed",
+                "native_turn_cancelled",
+                "native_turn_incomplete",
+                "rejected_before_handoff",
+            }:
+                entry.retired = True
             if cause_class is not None:
                 entry.cause_class = cause_class
             if reason_code is not None:
@@ -698,13 +718,18 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
         entry was pending, or only held or interrupted ones remain.
     """
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         entries = _pending.get(conversation_id)
         if entries is None:
             return None
         # Insertion order = FIFO; the first live, unheld key is the oldest entry.
         oldest_id = next(
-            (pid for pid, entry in entries.items() if not entry.held and not entry.interrupted),
+            (
+                pid
+                for pid, entry in _active_entries(entries, now)
+                if not entry.held and not entry.interrupted
+            ),
             None,
         )
         if oldest_id is None:
@@ -749,10 +774,11 @@ def pending_ids(conversation_id: str) -> list[str]:
         is queued.
     """
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         return [
             pending_id
-            for pending_id, entry in _pending.get(conversation_id, {}).items()
+            for pending_id, entry in _active_entries(_pending.get(conversation_id, {}), now)
             if not entry.held
         ]
 
@@ -815,6 +841,12 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         reason_code=drained.reason_code,
         native_turn_id=drained.native_turn_id,
         lifecycle_response_id=drained.lifecycle_response_id,
+        created_at=(
+            drained.created_at
+            if _shell_command_text(drained.content) and drained.created_at is not None
+            else _now()
+        ),
+        retired=drained.retired,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
@@ -892,11 +924,13 @@ def resolve_matching_text(
     if not exact_needle:
         return MatchedDrain(matched=None, skipped=[])
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
-        ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
+        candidates = entries.items() if shell_command else _active_entries(entries, now)
+        ordered = [(pid, entry) for pid, entry in candidates if not entry.held]
         texts = [
             _shell_command_text(entry.content)
             if shell_command
@@ -975,8 +1009,12 @@ def has_pending(conversation_id: str) -> bool:
         person has not cancelled by interrupting (see :func:`mark_interrupted`).
     """
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
-        return any(not entry.interrupted for entry in _pending.get(conversation_id, {}).values())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
+        return any(
+            not entry.interrupted
+            for _pending_id, entry in _active_entries(_pending.get(conversation_id, {}), now)
+        )
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -1009,7 +1047,8 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
         session has no un-consumed messages.
     """
     with _lock:
-        _evict_stale_locked(conversation_id, _now())
+        now = _now()
+        _evict_stale_locked(conversation_id, now)
         entries = _pending.get(conversation_id)
         if entries is None:
             return []
@@ -1019,7 +1058,7 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
                 "content": copy.deepcopy(entry.content),
                 **({"created_by": entry.created_by} if entry.created_by is not None else {}),
             }
-            for entry in entries.values()
+            for _pending_id, entry in _active_entries(entries, now)
             if not entry.interrupted
         ]
 
@@ -1041,6 +1080,8 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         reason_code=entry.reason_code,
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
+        created_at=entry.created_at,
+        retired=entry.retired,
     )
 
 

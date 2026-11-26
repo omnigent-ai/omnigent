@@ -58,7 +58,12 @@ import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import {
+  isMessageItem,
+  isTerminalCommandItem,
+  type ConversationItem,
+  type MessageItem,
+} from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -830,6 +835,7 @@ export interface ConversationState {
     itemId: string;
     tempId?: string;
     pendingId?: string;
+    stableId?: string;
     contentKey?: string;
   }[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
@@ -8900,8 +8906,8 @@ async function boundedSendVerdict(
  * reloaded or closed mid-send, e.g. while the server held the POST for a
  * sandbox wake, which persists nothing until the wake ends. Only the sender
  * gets the text back, and only if the snapshot holds no item under its stable
- * id. Matching text is no proof: `pending_inputs` entries and native mirrors
- * carry no stable id, and another message can say the same thing. Messages the
+ * id or a terminal input's submission identity. Matching text is no proof:
+ * another message can say the same thing. Messages the
  * page still held in its queue come back the same way, joined after any such send.
  *
  * @param conversationId - The session being bound.
@@ -8910,10 +8916,11 @@ async function boundedSendVerdict(
  */
 function unsentSendToRestore(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): ConversationState["failedSendDraft"] {
   // A send still open in this tab, or a message parked on its bubble, owns its own record.
-  const parkedHere = conversationRegistry.peek(conversationId)?.getState().failedUploads ?? [];
+  const current = conversationRegistry.peek(conversationId)?.getState();
+  const parkedHere = current?.failedUploads ?? [];
   const unsent = peekUnsentSends(conversationId).filter(
     (record) =>
       !inFlightSends.has(record.stableId) &&
@@ -8937,9 +8944,27 @@ function unsentSendToRestore(
       stored.filter((send) => queuedHere.has(send.stableId)),
     );
   }
+  const deliveredIds = new Set(
+    items.flatMap((item) => [
+      item.id,
+      ...(isTerminalCommandItem(item) && item.kind === "input" && item.submission?.stable_id
+        ? [item.submission.stable_id]
+        : []),
+    ]),
+  );
+  // Identity can resolve after a live acknowledgement, before its block flushes.
+  for (const shell of current?.settledShellInputs ?? []) {
+    if (shell.stableId) deliveredIds.add(shell.stableId);
+  }
+  for (const block of current?.blocks ?? []) {
+    if (block.ctx.itemId) deliveredIds.add(block.ctx.itemId);
+    if (block.type === "terminal_command" && block.kind === "input" && block.submission?.stableId) {
+      deliveredIds.add(block.submission.stableId);
+    }
+  }
   const sends = [...unsent, ...queued].filter(
     // Another account may have signed in to this tab since.
-    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+    (send) => send.authorId === viewerId && !deliveredIds.has(send.stableId),
   );
   const [first] = sends;
   if (first === undefined) return null;
@@ -8970,7 +8995,7 @@ function unsentSendToRestore(
  */
 function restoreUnsentSendOnceIdentified(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly ConversationItem[],
 ): void {
   const unsubscribe = subscribeIdentity(() => {
     if (getCurrentUserId() === null) return;
@@ -9287,6 +9312,7 @@ function settleShellInputs(
         itemId,
         tempId: popped?.tempId ?? previous?.tempId,
         pendingId: submission?.pendingId ?? popped?.pendingId ?? previous?.pendingId,
+        stableId: submission?.stableId ?? previous?.stableId,
         // Modern shells never generate legacy skip receipts; text is not an identity.
         contentKey: submission === undefined && popped ? contentKeyOf(popped.content) : undefined,
       },

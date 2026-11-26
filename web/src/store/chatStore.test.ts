@@ -19315,9 +19315,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
     { path: "legacy history", gapLength: 5, submission: undefined, clears: false },
     { path: "direct terminal history", gapLength: 100, submission: {}, clears: false },
+    {
+      path: "an input before the fresh history window",
+      gapLength: 101,
+      submission: { pending_id: "pending_shell" },
+      clears: false,
+      shellFirst: true,
+    },
   ])(
     "recovers a shell submission by identity through $path",
-    async ({ gapLength, submission, clears }) => {
+    async ({ gapLength, submission, clears, ...placement }) => {
       const id = `conv_shell_identity_${gapLength}`;
       const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
       const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
@@ -19354,14 +19361,20 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         ...gapUser("gap", i),
         role: "assistant" as const,
       }));
-      seedSessionItems(id, [...preGap, ...gap, shell]);
+      const shellFirst = "shellFirst" in placement && placement.shellFirst;
+      seedSessionItems(id, [...preGap, ...(shellFirst ? [shell, ...gap] : [...gap, shell])]);
       sinks[0]!.error();
       await drainAsync();
       const expected = clears ? [later] : pending;
       expect(useChatStore.getState().pendingUserMessages).toEqual(expected);
       expect(useChatStore.getState().blocks.filter((b) => b.ctx.itemId === shell.id)).toHaveLength(
-        1,
+        shellFirst ? 0 : 1,
       );
+      if (shellFirst) {
+        await useChatStore.getState().loadMoreHistory();
+        expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === shell.id)).toBe(true);
+        expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+      }
       if (clears)
         handleSessionEvent({
           type: "session_input_consumed",
@@ -25693,6 +25706,74 @@ describe("a send cut off by a reload", () => {
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
     expect(peekQueuedSends("conv_reload").map((send) => send.stableId)).toEqual(["stable_held"]);
   });
+
+  it.each([
+    { identified: true, remaining: "none" },
+    { identified: false, remaining: "none" },
+    { identified: true, remaining: "unsent" },
+    { identified: false, remaining: "unsent" },
+    { identified: true, remaining: "queued" },
+    { identified: false, remaining: "queued" },
+    { identified: false, remaining: "none", delivery: "event" },
+    { identified: false, remaining: "none", delivery: "history" },
+  ])(
+    "filters delivered shells before reload restoration ($identified, $remaining)",
+    async ({ identified, remaining, ...timing }) => {
+      const delivery = "delivery" in timing ? timing.delivery : "snapshot";
+      const stableId = "a".repeat(32);
+      const unresolvedId = "b".repeat(32);
+      const shell: ConversationItem = {
+        id: "terminal_mirror",
+        response_id: "resp_shell",
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "echo hello",
+        submission: { pending_id: "pending_shell", stable_id: stableId },
+      };
+      seedSession("conv_reload", delivery === "snapshot" ? [shell] : []);
+      rememberUnsentSend("conv_reload", { stableId, text: "!echo hello", authorId: "user_a" });
+      const unresolved = { stableId: unresolvedId, text: "still unsent", authorId: "user_a" };
+      if (remaining === "unsent") rememberUnsentSend("conv_reload", unresolved);
+      if (remaining === "queued") rememberQueuedSends("conv_reload", [unresolved]);
+      let identityChanged: (() => void) | undefined;
+      if (!identified) {
+        vi.mocked(getCurrentUserId).mockReturnValue(null);
+        vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+          identityChanged = listener;
+          return () => {};
+        });
+      }
+      await useChatStore.getState().switchTo("conv_reload");
+      if (!identified) {
+        expect(useChatStore.getState().failedSendDraft).toBeNull();
+        if (delivery === "event") {
+          handleSessionEvent({
+            type: "terminal_command",
+            kind: "input",
+            itemId: "terminal_mirror",
+            responseId: "resp_shell",
+            input: "echo hello",
+            stdout: null,
+            stderr: null,
+            submission: { pendingId: "pending_shell", stableId },
+          });
+        } else if (delivery === "history") {
+          useChatStore.setState({ blocks: itemsToBlocks([shell]) });
+        }
+        vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+        identityChanged!();
+      }
+      if (remaining === "none") expect(useChatStore.getState().failedSendDraft).toBeNull();
+      else
+        expect(useChatStore.getState().failedSendDraft).toMatchObject({
+          text: "still unsent",
+          stableId: unresolvedId,
+        });
+      expect(peekUnsentSends("conv_reload")).toEqual([]);
+      expect(peekQueuedSends("conv_reload")).toEqual([]);
+    },
+  );
 
   it("drops a send the snapshot shows persisted", async () => {
     seedSession("conv_reload", [
