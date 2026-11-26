@@ -40,6 +40,7 @@ afterEach(() => {
   for (const view of views.splice(0)) view.destroy();
   useFileFinderStore.setState({
     availableSessionId: null,
+    textSearchAvailable: false,
     request: null,
   });
   vi.unstubAllGlobals();
@@ -149,7 +150,7 @@ describe("EditorContextMenu", () => {
   });
 
   it("searches the workspace for the selection's first line, as ⌃⌘O does", async () => {
-    useFileFinderStore.setState({ availableSessionId: "session-1" });
+    useFileFinderStore.setState({ availableSessionId: "session-1", textSearchAvailable: true });
     const { view } = editorWithMenu("  needle here\nmore", EditorSelection.single(0, 18));
     rightClick(view);
     await userEvent.click(screen.getByRole("menuitem", { name: /Search Text in Workspace/ }));
@@ -161,6 +162,13 @@ describe("EditorContextMenu", () => {
   });
 
   it("offers no workspace search where the finder doesn't serve the session", () => {
+    const { view } = editorWithMenu("needle", EditorSelection.single(0, 6));
+    rightClick(view);
+    expect(menuItems().some((label) => label?.startsWith("Search Text"))).toBe(false);
+  });
+
+  it("offers no workspace search where the finder finds files but can't search text", () => {
+    useFileFinderStore.setState({ availableSessionId: "session-1", textSearchAvailable: false });
     const { view } = editorWithMenu("needle", EditorSelection.single(0, 6));
     rightClick(view);
     expect(menuItems().some((label) => label?.startsWith("Search Text"))).toBe(false);

@@ -48,8 +48,8 @@ Filename search remains in Files.
 - File viewer menu: in the tabs sidebar's file viewer, select text and
   right-click it (or press **Shift+F10** or the Menu key), then choose **Search
   Text in Workspace…** to search for the selection's first non-blank line. The
-  row shows only where the session's file finder is available and that line is
-  at most 4,096 characters.
+  row shows only where the session can search text and that line is at most 4,096
+  characters.
 - Tabs sidebar's Files tab: with a text file open, choose **File actions (⋯) →
   Search Text in Workspace…**, shown while the session can search.
 
