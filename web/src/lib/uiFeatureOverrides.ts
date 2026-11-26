@@ -132,6 +132,18 @@ export function writeUiFeatureOverride(feature: FeatureKey, value: boolean | nul
   }
 }
 
+export function clearUiFeatureOverrides(): boolean {
+  const key = storageKey();
+  if (key === null) return false;
+  try {
+    window.localStorage.removeItem(key);
+    cache.set(key, {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function effectiveQuickPickEnabled(
   info: ServerInfo | "loading",
   overrides: UiFeatureOverrides,

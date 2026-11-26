@@ -1,11 +1,13 @@
-import { FlagIcon } from "lucide-react";
+import { FlagIcon, RotateCcwIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { type QuickPickItem, QuickPickDialog, useQuickPickPages } from "@/components/ui/quick-pick";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { type FeatureKey, isFeatureEnabled } from "@/lib/capabilities";
 import {
+  activeUiFeatureOverrides,
   canOverrideUiFeatures,
+  clearUiFeatureOverrides,
   OVERRIDABLE_UI_FEATURES,
   readUiFeatureOverrides,
   writeUiFeatureOverride,
@@ -17,7 +19,8 @@ import type { PaletteTarget } from "./paletteTarget";
 import { settingFailedStatus } from "./settingChoiceStatus";
 import { choiceItemId, pageStatusSummary, settingChoiceItems } from "./settingChoicesPage";
 
-type PickerValue = { kind: "flag"; settingId: string } | PaletteTarget;
+type PickerValue =
+  { kind: "flag"; settingId: string } | { kind: "clear-overrides" } | PaletteTarget;
 
 type FeatureFlagSetting = PaletteSetting & { id: FeatureKey };
 
@@ -87,6 +90,7 @@ export function FeatureFlagsPicker() {
     items = settings.map((entry): QuickPickItem<PickerValue> => ({
       id: entry.id,
       label: entry.label,
+      description: entry.id,
       detail: currentChoiceLabel(entry),
       keywords: entry.keywords,
       icon: <FlagIcon aria-hidden className="size-4 text-muted-foreground" />,
@@ -97,7 +101,10 @@ export function FeatureFlagsPicker() {
 
   const handleAccept = (item: QuickPickItem<PickerValue>) => {
     const value = item.value;
-    if (value.kind === "flag") {
+    if (value.kind === "clear-overrides") {
+      if (clearUiFeatureOverrides()) location.reload();
+      else setStatus("Couldn't clear the flag overrides.");
+    } else if (value.kind === "flag") {
       const chosen = settings.find((entry) => entry.id === value.settingId);
       if (chosen) {
         setOpened(chosen.id);
@@ -134,7 +141,25 @@ export function FeatureFlagsPicker() {
       placeholder={onChoices ? "Choose a value…" : "Find a feature…"}
       backLabel="Back to features"
       heading={setting ? { label: setting.label } : undefined}
-      segments={[{ sourceId: "flags", ranking: "client", items }]}
+      segments={[
+        { sourceId: "flags", ranking: "client", items },
+        {
+          sourceId: "actions",
+          ranking: "client",
+          items:
+            !onChoices && activeUiFeatureOverrides(info).length > 0
+              ? [
+                  {
+                    id: "clear-overrides",
+                    label: "Clear all flag overrides",
+                    icon: <RotateCcwIcon aria-hidden className="size-4 text-muted-foreground" />,
+                    rememberInHistory: false,
+                    value: { kind: "clear-overrides" },
+                  },
+                ]
+              : [],
+        },
+      ]}
       {...pages.pickerProps}
       onBack={onChoices ? backToFlags : undefined}
       summary={status ? pageStatusSummary(status) : undefined}
