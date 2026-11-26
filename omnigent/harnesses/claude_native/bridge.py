@@ -4582,6 +4582,8 @@ _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
 _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
 _BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset({"agent", "local_agent", "subagent"})
 _TURN_END_SCAN_BYTES = 256 * 1024
+# Claude can append its tool definitions after a turn's reply, so the scan widens up to this.
+_TURN_END_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
 
 
 def _is_background_shell(raw: object) -> bool:
@@ -4634,21 +4636,31 @@ def _offset_after_last_main_reply(transcript_path: str) -> int | None:
     """Byte offset just past the transcript's last main ``assistant`` entry, if near the end.
 
     Claude runs ``Stop`` hooks in parallel and may already have appended a blocking
-    hook's feedback, so the file size at ``Stop`` is not the turn's end.
+    hook's feedback, so the file size at ``Stop`` is not the turn's end. The scan
+    widens until it reaches a main conversation entry.
     """
     try:
         with open(transcript_path, "rb") as handle:
-            start = max(0, handle.seek(0, os.SEEK_END) - _TURN_END_SCAN_BYTES)
-            handle.seek(start)
-            tail = handle.read()
+            end = handle.seek(0, os.SEEK_END)
+            window = _TURN_END_SCAN_BYTES
+            while True:
+                start = max(0, end - window)
+                handle.seek(start)
+                tail = handle.read(end - start)
+                position, reached, found = start, False, None
+                for line in tail.splitlines(keepends=True):
+                    position += len(line)
+                    if not line.endswith(b"\n"):
+                        continue
+                    entry_type = _main_conversation_entry_type(line)
+                    reached = reached or entry_type in {"user", "assistant"}
+                    if entry_type == "assistant":
+                        found = position
+                if reached or start == 0 or window >= _TURN_END_SCAN_LIMIT_BYTES:
+                    return found
+                window *= 2
     except OSError:
         return None
-    position, found = start, None
-    for line in tail.splitlines(keepends=True):
-        position += len(line)
-        if line.endswith(b"\n") and _main_conversation_entry_type(line) == "assistant":
-            found = position
-    return found
 
 
 def _main_conversation_entry_type(line: bytes) -> str | None:

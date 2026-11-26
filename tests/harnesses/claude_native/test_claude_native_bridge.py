@@ -40,6 +40,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,
     _TURN_END_SCAN_BYTES,
+    _TURN_END_SCAN_LIMIT_BYTES,
     BackgroundAgentsAfterTurnReader,
     TurnEndReader,
     _claude_prompt_rendered,
@@ -767,10 +768,18 @@ def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
 def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
     tmp_path: Path, background_tasks: list[dict[str, str]] | None, agent_running: bool
 ) -> None:
-    """Each main-session Stop records its turn end and whether it left a background agent."""
+    """Each main-session Stop records its turn end and whether it left a background agent.
+
+    Claude can append its tool definitions after the reply, before the Stop hook runs.
+    """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
-    _write_turn(transcript_path, {"type": "system", "subtype": "stop_hook_summary"})
+    tool_definitions = {"type": "prompt_snapshot", "tools": "x" * _TURN_END_SCAN_BYTES}
+    _write_turn(
+        transcript_path,
+        {"type": "attachment", "attachment": tool_definitions},
+        {"type": "system", "subtype": "stop_hook_summary"},
+    )
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
     reader = BackgroundAgentsAfterTurnReader(bridge_dir)
     assert reader.read() is True
@@ -902,22 +911,25 @@ def test_background_agent_mark_ignores_a_stop_another_hook_already_blocked(
     "transcript", ["missing_at_stop", "deleted_after_stop", "no_reply", "reply_beyond_scan"]
 )
 def test_background_agent_mark_needs_a_readable_turn_end(tmp_path: Path, transcript: str) -> None:
-    """Without the turn's last reply in the transcript, a busy session stays running."""
+    """Without the turn's last reply in the transcript, no Stop mark settles a busy session."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
     if transcript == "no_reply":
         transcript_path.write_text('{"type": "user", "message": {"content": "go"}}\n')
     elif transcript == "reply_beyond_scan":
-        _write_turn(transcript_path, {"type": "attachment", "padding": "x" * _TURN_END_SCAN_BYTES})
+        _write_turn(
+            transcript_path, {"type": "attachment", "padding": "x" * _TURN_END_SCAN_LIMIT_BYTES}
+        )
     elif transcript == "deleted_after_stop":
         _write_turn(transcript_path)
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
     reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    turn_end = TurnEndReader(bridge_dir)
     if transcript == "deleted_after_stop":
-        assert reader.read() is True
+        assert (reader.read(), turn_end.read()) == (True, True)
         transcript_path.unlink()
 
-    assert reader.read() is False
+    assert (reader.read(), turn_end.read()) == (False, False)
 
 
 def test_background_agent_mark_parses_each_complete_appended_line_once(
