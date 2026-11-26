@@ -229,13 +229,13 @@ def test_session_pr_list_long_title(
     stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
-    open_session_pull_requests(page, mobile=viewport_width < 768)
+    open_session_pull_requests(page, mobile=viewport_width < 1181)
     panel = (
         page.get_by_test_id("github-panel-drawer")
-        if viewport_width < 768
+        if viewport_width < 1181
         else page.get_by_role("complementary", name="Workspace")
     )
-    if viewport_width < 768:
+    if viewport_width < 1181:
         expect(panel.get_by_role("heading", name="Pull Requests", exact=True)).to_have_count(1)
         header = panel.locator("header")
         header.get_by_role("button", name="Refresh", exact=True).click()
@@ -261,7 +261,7 @@ def test_session_pr_list_long_title(
     row.press("Enter")
     expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
     expect(panel.get_by_role("link", name=f"{title} #42")).to_be_visible()
-    if viewport_width < 768:
+    if viewport_width < 1181:
         expect(panel.get_by_role("heading", name="Pull Requests", exact=True)).to_have_count(0)
         expect(header.get_by_role("button", name="All pull requests (2)")).to_be_visible()
         expect(header.get_by_role("button", name="Unlink PR", exact=True)).to_be_visible()

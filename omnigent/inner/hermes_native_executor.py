@@ -19,6 +19,8 @@ from pathlib import Path
 
 from omnigent.harnesses.hermes_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
+    HermesDeliveryUnconfirmed,
+    HermesInputNotSent,
     inject_interrupt,
     inject_user_message,
 )
@@ -28,6 +30,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ToolSpec,
     TurnComplete,
@@ -72,6 +75,8 @@ class HermesNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
+        except HermesDeliveryUnconfirmed as exc:
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         except RuntimeError:
             return False
         return True
@@ -92,6 +97,26 @@ class HermesNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await asyncio.to_thread(inject_user_message, self._bridge_dir, content=text)
+        except HermesDeliveryUnconfirmed as exc:
+            yield ExecutorError(
+                message=describe_exception(exc),
+                code="hermes_delivery_unconfirmed",
+                title="Hermes delivery is unconfirmed",
+                remediation="Check the native terminal for the message before sending it again.",
+                preserve_session=True,
+                undelivered=False,
+            )
+            return
+        except HermesInputNotSent as exc:
+            yield ExecutorError(
+                message=describe_exception(exc),
+                code="hermes_input_not_sent",
+                title="Hermes input is not ready",
+                remediation="Wait for the native terminal to become ready, then send the message.",
+                preserve_session=True,
+                undelivered=True,
+            )
+            return
         except RuntimeError as exc:
             yield ExecutorError(message=describe_exception(exc))
             return

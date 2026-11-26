@@ -294,6 +294,36 @@ async def test_equivalent_gateway_pick_launches_without_reset(
 
 
 @pytest.mark.asyncio
+async def test_launch_with_omnigent_memory_turns_codex_memory_off_and_offers_its_notes(
+    codex_launch_harness: _LaunchHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memory override reaches Codex's config and the import offer its instructions."""
+    harness = codex_launch_harness
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    notes = tmp_path / "codex-home" / "memories" / "MEMORY.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("# Task Group: repo\n")
+    harness.snapshot["model_override"] = "gpt-5.6-sol"
+    harness.seed_catalog([{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}])
+
+    def request(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"memory": True})
+        if request.url.path == "/v1/memory/entries":
+            return httpx.Response(200, json={"entries": [], "next_page_token": None})
+        return httpx.Response(200, json=harness.snapshot)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(request), base_url="http://runner.test"
+    ) as memory_server:
+        harness.server_client = memory_server
+        await harness.launch()
+
+    assert harness.builds[0]["extra_config_overrides"][-1] == "features.memories=false"
+    assert "## Codex's own memory" in harness.builds[0]["developer_instructions"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("live_listing", "cached_listing", "kept"),
     [

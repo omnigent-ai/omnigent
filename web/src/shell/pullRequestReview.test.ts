@@ -4,6 +4,8 @@ import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
 import {
   MATCH_LIMIT,
   buildSearchCorpus,
+  changedFilesFromPatch,
+  unquoteGitPath,
   filterChangedPaths,
   findMatches,
   firstMatchAtOrBelow,
@@ -512,5 +514,153 @@ describe("pullRequestFileUrl", () => {
       ...override,
     });
     expect(link).toBeNull();
+  });
+});
+
+describe("changedFilesFromPatch", () => {
+  it("maps each file's status, path and line counts from one commit's patch", () => {
+    const patch = [
+      "diff --git a/new.ts b/new.ts",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/new.ts",
+      "@@ -0,0 +1,2 @@",
+      "+one",
+      "+two",
+      "diff --git a/gone.ts b/gone.ts",
+      "deleted file mode 100644",
+      "--- a/gone.ts",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-bye",
+      "diff --git a/old/name.ts b/new/name.ts",
+      "similarity index 90%",
+      "rename from old/name.ts",
+      "rename to new/name.ts",
+      "--- a/old/name.ts",
+      "+++ b/new/name.ts",
+      "@@ -1 +1 @@",
+      "-x",
+      "+y",
+      "diff --git a/mod.ts b/mod.ts",
+      "--- a/mod.ts",
+      "+++ b/mod.ts",
+      "@@ -1,2 +1,2 @@",
+      " keep",
+      "-was",
+      "+now",
+      "",
+    ].join("\n");
+    const diffs = parsed(patch);
+
+    expect(
+      changedFilesFromPatch(diffs).map(
+        ({ path, name, status, lines_added, lines_removed, previous_path }) => ({
+          path,
+          name,
+          status,
+          lines_added,
+          lines_removed,
+          previous_path,
+        }),
+      ),
+    ).toEqual([
+      {
+        path: "new.ts",
+        name: "new.ts",
+        status: "created",
+        lines_added: 2,
+        lines_removed: 0,
+        previous_path: null,
+      },
+      {
+        path: "gone.ts",
+        name: "gone.ts",
+        status: "deleted",
+        lines_added: 0,
+        lines_removed: 1,
+        previous_path: null,
+      },
+      {
+        path: "new/name.ts",
+        name: "name.ts",
+        status: "renamed",
+        lines_added: 1,
+        lines_removed: 1,
+        previous_path: "old/name.ts",
+      },
+      {
+        path: "mod.ts",
+        name: "mod.ts",
+        status: "modified",
+        lines_added: 1,
+        lines_removed: 1,
+        previous_path: null,
+      },
+    ]);
+  });
+  it("gives hunk-less renames and mode-only changes their status and zero counts", () => {
+    const patch = [
+      "diff --git a/a.ts b/b.ts",
+      "similarity index 100%",
+      "rename from a.ts",
+      "rename to b.ts",
+      "diff --git a/run.sh b/run.sh",
+      "old mode 100644",
+      "new mode 100755",
+      "",
+    ].join("\n");
+
+    expect(
+      changedFilesFromPatch(parsed(patch)).map(
+        ({ path, status, lines_added, lines_removed, previous_path }) => ({
+          path,
+          status,
+          lines_added,
+          lines_removed,
+          previous_path,
+        }),
+      ),
+    ).toEqual([
+      { path: "b.ts", status: "renamed", lines_added: 0, lines_removed: 0, previous_path: "a.ts" },
+      { path: "run.sh", status: "modified", lines_added: 0, lines_removed: 0, previous_path: null },
+    ]);
+  });
+  it("names files git quoted by their repository path", () => {
+    const patch = [
+      'diff --git "a/caf\\303\\251.ts" "b/docs/caf\\303\\251 v2.ts"',
+      "similarity index 90%",
+      'rename from "caf\\303\\251.ts"',
+      'rename to "docs/caf\\303\\251 v2.ts"',
+      '--- "a/caf\\303\\251.ts"',
+      '+++ "b/docs/caf\\303\\251 v2.ts"',
+      "@@ -1 +1 @@",
+      "-x",
+      "+y",
+      "",
+    ].join("\n");
+    const diffs = new Map(
+      [...parsed(patch).values()].map((diff) => [unquoteGitPath(diff.name), diff] as const),
+    );
+
+    expect(
+      changedFilesFromPatch(diffs).map(({ path, name, previous_path }) => ({
+        path,
+        name,
+        previous_path,
+      })),
+    ).toEqual([{ path: "docs/café v2.ts", name: "café v2.ts", previous_path: "café.ts" }]);
+  });
+});
+
+describe("unquoteGitPath", () => {
+  it.each([
+    ["an unquoted path", "src/a.ts", "src/a.ts"],
+    ["octal UTF-8 bytes", '"caf\\303\\251.ts"', "café.ts"],
+    ["C escapes", '"tab\\there \\"q\\" back\\\\slash\\n"', 'tab\there "q" back\\slash\n'],
+    ["an unknown escape, left as is", '"bad\\qescape"', '"bad\\qescape"'],
+    ["a lone quote", '"', '"'],
+  ])("decodes %s", (_label, input, expected) => {
+    expect(unquoteGitPath(input)).toBe(expected);
   });
 });

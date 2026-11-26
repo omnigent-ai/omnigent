@@ -14,6 +14,9 @@ import os
 import queue
 import re
 import shlex
+import shutil
+import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -43,11 +46,14 @@ from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.runtime import workflow
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec import load_omnigent_yaml
+from omnigent.telemetry.request_headers import client_user_agent
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
@@ -181,6 +187,44 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_claude_tool_env_gives_heredoc_commands_eof_on_stdin(shell: str) -> None:
+    """
+    A stdin reader after a heredoc in one Bash call must not wait on Claude's pipe.
+
+    Claude Code inlines the env script ahead of each command, spawns the shell
+    with a stdin pipe it never closes, and skips its own ``< /dev/null`` when the
+    command has a heredoc. A pathless ``rg`` then hangs reading that pipe.
+    """
+    shell_path = shutil.which(shell)
+    if shell_path is None:
+        pytest.skip(f"{shell} is not installed")
+    script = Path(claude_native.claude_tool_env_file()).read_text(encoding="utf-8").strip()
+    command = "python3 - <<'EOF'\nprint('heredoc ran')\nEOF\ncat; echo stdin-closed"
+    # Mirrors how Claude Code assembles the Bash tool command line.
+    command_line = f"{script}\n: && eval {shlex.quote(command)}"
+
+    held_stdin, child_stdin = socket.socketpair()
+    with held_stdin, child_stdin:
+        process = subprocess.Popen(
+            [shell_path, "-c", command_line],
+            stdin=child_stdin.fileno(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # The blocked reader is a grandchild holding stdout open; end the group.
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            pytest.fail("stdin reader blocked on the shell's open stdin socket")
+
+    assert process.returncode == 0, stderr.decode()
+    assert stdout.decode().splitlines() == ["heredoc ran", "stdin-closed"]
+
+
 def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -189,6 +233,8 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
 
     monkeypatch.chdir(tmp_path)
     _install_managed_mcp_config(tmp_path, monkeypatch)
+    socket_root = tmp_path / "harness-sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     captured_warnings: list[str] = []
     monkeypatch.setattr(
@@ -208,6 +254,105 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     # The runner recovers the bridge from the settings path, and hooks still load.
     assert Path(args[args.index("--settings") + 1]).parent == bridge_dir
     assert "SessionStart" in _load_invocation_settings(args)["hooks"]
+    # A static relay entry in the managed file reaches this bridge through the env.
+    relay_env = body["spec"]["env"]
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == str(bridge_dir)
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_PYTHON_ENV] == sys.executable
+    # serve-mcp keeps the operator's harness socket root once Claude expands the entry.
+    entry_env = claude_native_bridge.managed_mcp_relay_entry()["env"]
+    assert expand_entry_value(entry_env["OMNIGENT_HARNESS_TMP_PARENT"], relay_env) == str(
+        socket_root
+    )
+
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(
+        json.dumps({"mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}}),
+        encoding="utf-8",
+    )
+    captured_warnings.clear()
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+    assert "--mcp-config" not in body["spec"]["args"]
+    assert captured_warnings == []
+
+
+_RELAY_ARGS = [
+    "-I",
+    "-m",
+    "omnigent.harnesses.claude_native.bridge",
+    "serve-mcp",
+    "--bridge-dir",
+    "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+]
+
+
+@pytest.mark.parametrize(
+    ("entry", "configured"),
+    [
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": _RELAY_ARGS}, True, id="documented"
+        ),
+        pytest.param(
+            {
+                "command": "/usr/bin/corp-run",
+                "args": ["${OMNIGENT_MCP_RELAY_PYTHON}", *_RELAY_ARGS],
+            },
+            True,
+            id="wrapper",
+        ),
+        pytest.param(
+            {
+                "command": "/bin/sh",
+                "args": [
+                    "-c",
+                    "exec python -m x serve-mcp --bridge-dir=${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+                ],
+            },
+            True,
+            id="shell-wrapper",
+        ),
+        pytest.param(
+            {"command": "/bin/false", "env": {"NOTE": "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"}},
+            False,
+            id="prefix-only-in-env",
+        ),
+        pytest.param(
+            {"command": "/usr/bin/other", "args": ["--dir", "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"]},
+            False,
+            id="not-the-relay",
+        ),
+        pytest.param(
+            {"url": "https://relay.example/${OMNIGENT_MCP_RELAY_BRIDGE_DIR}/serve-mcp"},
+            False,
+            id="http",
+        ),
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": "serve-mcp"}, False, id="bad-args"
+        ),
+    ],
+)
+def test_managed_relay_entry_must_launch_serve_mcp_for_the_session_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: dict[str, object], configured: bool
+) -> None:
+    """Only an entry whose launch reaches serve-mcp with the session's bridge dir counts,
+    so the warning and the tools prompt never rest on an entry that cannot connect."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(json.dumps({"mcpServers": {"omnigent": entry}}), encoding="utf-8")
+
+    assert claude_native_bridge.managed_mcp_relay_configured() is configured
+
+
+def test_documented_managed_relay_entry_matches_the_one_omnigent_reads() -> None:
+    """Operators copy the entry from the docs, so it must be the shape the relay expands."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    doc = (Path(__file__).parents[3] / "docs" / "CLAUDE_MANAGED_MCP.md").read_text()
+    documented = json.loads(doc.split("```json\n", 1)[1].split("```", 1)[0])
+    assert documented == {
+        "mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}
+    }
 
 
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
@@ -1020,46 +1165,92 @@ def test_unpinned_family_alias_passes_through_on_the_anthropic_api() -> None:
     assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
 
 
-def test_launch_model_takes_the_custom_slot_when_no_alias_names_it() -> None:
-    """A routed older generation gets its own spelling for later ``/model``."""
+@pytest.mark.parametrize(
+    ("launch_model", "alias_env", "alias_model", "custom_slot", "display_name"),
+    [
+        (
+            "databricks-claude-opus-4-8",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 4.8",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-6",
+            "databricks-claude-sonnet-5",
+            "Sonnet 5",
+        ),
+        (
+            "databricks-claude-opus-5[1m]",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "databricks-claude-opus-5",
+            None,
+            "Opus 5",
+        ),
+        (
+            "databricks-claude-sonnet-5[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "databricks-claude-sonnet-5",
+            None,
+            "Sonnet 5",
+        ),
+    ],
+    ids=["older-generation", "bare-custom-slot", "bare-opus-alias", "bare-sonnet-alias"],
+)
+def test_launch_model_takes_the_custom_slot_when_no_alias_names_it(
+    launch_model: str, alias_env: str, alias_model: str, custom_slot: str | None, display_name: str
+) -> None:
+    """A launch model gets a slot preserving its exact generation and context."""
     from omnigent.models.claude_model_vocabulary import claude_model_command_arg
 
     config = claude_native.ClaudeNativeUcodeConfig(
         env={
-            "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+            "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
+            alias_env: alias_model,
         },
-        model="databricks-claude-opus-5",
+        model=alias_model,
     )
+    if custom_slot is not None:
+        config.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = custom_slot
+    initial_env = dict(config.env)
 
-    pinned = claude_native.claude_config_with_launch_model_pinned(
-        config, "databricks-claude-opus-4-8"
-    )
+    pinned = claude_native.claude_config_with_launch_model_pinned(config, launch_model)
 
     assert pinned is not None
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-8"
-    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == "Opus 4.8"
-    assert config.env.get("ANTHROPIC_CUSTOM_MODEL_OPTION") is None
-    assert (
-        claude_model_command_arg("databricks-claude-opus-4-8", pinned.env)
-        == "databricks-claude-opus-4-8"
-    )
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == launch_model
+    assert pinned.env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] == display_name
+    assert config.env == initial_env
+    assert claude_model_command_arg(launch_model, pinned.env) == launch_model
 
 
 @pytest.mark.parametrize(
-    "launch_model",
-    ["opus", "databricks-claude-opus-5", None, ""],
+    ("launch_model", "opus_pin"),
+    [
+        ("opus", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5", "databricks-claude-opus-5"),
+        ("databricks-claude-opus-5[1m]", "databricks-claude-opus-5[1m]"),
+        (None, "databricks-claude-opus-5"),
+        ("", "databricks-claude-opus-5"),
+    ],
 )
 def test_launch_model_needs_no_custom_slot_when_already_speakable(
     launch_model: str | None,
+    opus_pin: str,
 ) -> None:
     """Aliases and the pinned id resolve without the extra slot."""
     config = claude_native.ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
-        model="databricks-claude-opus-5",
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus_pin,
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "other-picker-model",
+        },
+        model=opus_pin,
     )
+    initial_env = dict(config.env)
 
     assert claude_native.claude_config_with_launch_model_pinned(config, launch_model) is config
+    assert config.env == initial_env
     assert claude_native.claude_config_with_launch_model_pinned(None, "x") is None
 
 
@@ -4833,6 +5024,7 @@ async def test_is_terminal_resource_gone_reports_404_as_gone(
         does not recurse into the patched name when constructing
         the underlying client.
         """
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -4875,6 +5067,7 @@ async def test_is_terminal_resource_gone_reports_running_false_as_gone(
 
     def _mock_client_cls(**kwargs: Any) -> httpx.AsyncClient:
         """Real AsyncClient bound to the mock transport; see above."""
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -4909,6 +5102,7 @@ async def test_is_terminal_resource_gone_treats_transport_errors_as_not_gone(
 
     def _mock_client_cls(**kwargs: Any) -> httpx.AsyncClient:
         """Real AsyncClient bound to the mock transport; see above."""
+        kwargs.pop("transport", None)
         return real_client_cls(transport=transport, **kwargs)
 
     monkeypatch.setattr(claude_native.httpx, "AsyncClient", _mock_client_cls)
@@ -5604,6 +5798,7 @@ def test_websocket_connect_sets_short_close_timeout(monkeypatch: pytest.MonkeyPa
             "Authorization": "Bearer tok",
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
         },
+        "user_agent_header": client_user_agent(),
         "close_timeout": claude_native._CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
     }
 
@@ -6069,6 +6264,147 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
         if line.strip()
     ]
     assert [record["message"]["content"] for record in records] == ["fresh Omnigent text"]
+
+
+@pytest.mark.parametrize("resume_cost_usd", [1.25, None], ids=["cost", "no-cost"])
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    resume_cost_usd: float | None,
+) -> None:
+    """
+    The rebuilt transcript ends with the record Claude restores its cost from.
+
+    ``claude --resume`` reads its running cost back only from a ``cost-state``
+    record and skips a partial one. Without the record a cold-resumed session
+    counts from zero, and its reports stay below the session's stored total,
+    which only moves up. The bridge dir records the seeded cost for the
+    forwarder's check, replacing an earlier launch's, and drops the previous
+    process's statusLine snapshot, which would read as the new process's cost.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = claude_bridge.bridge_dir_for_conversation_id("conv_abc")
+    claude_bridge.record_resume_cost_baseline(
+        bridge_dir, claude_session_id="sid-earlier", cost_usd=0.5
+    )
+    snapshots = [bridge_dir / "context.json", bridge_dir / "context_raw.json"]
+    for snapshot in snapshots:
+        snapshot.write_text('{"total_cost_usd": 0.5}', encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    client = await _httpx_client_with_canned_response(None, 200)
+    async with client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=tmp_path / "workspace",
+            resume_cost_usd=resume_cost_usd,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    cost_states = [record for record in records if record.get("type") == "cost-state"]
+    if resume_cost_usd is None:
+        assert cost_states == []
+        assert claude_bridge.read_resume_cost_baseline(bridge_dir) is None
+        assert all(snapshot.exists() for snapshot in snapshots)
+        return
+    assert claude_bridge.read_resume_cost_baseline(bridge_dir) == (
+        claude_bridge.ResumeCostBaseline(claude_session_id="sid123", cost_usd=1.25)
+    )
+    assert not any(snapshot.exists() for snapshot in snapshots)
+    assert cost_states == [records[-1]]
+    assert set(records[-1]) == {
+        "type",
+        "sessionId",
+        "totalCostUSD",
+        "totalAPIDuration",
+        "totalAPIDurationWithoutRetries",
+        "totalToolDuration",
+        "totalLinesAdded",
+        "totalLinesRemoved",
+        "totalDuration",
+        "startTime",
+        "hasUnknownModelCost",
+        "modelUsage",
+    }
+    assert records[-1]["sessionId"] == "sid123"
+    assert records[-1]["totalCostUSD"] == 1.25
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_restores_the_session_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A CLI cold resume carries the server's own-session cost into the transcript."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "projects"
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    snapshot = _conversation_response_body(
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+        external_session_id="claude-uuid-abc",
+    )
+    snapshot["native_usage_baseline"] = {"cumulative_cost_usd": 2.5}
+    client = await _httpx_client_with_canned_response(snapshot, 200)
+    async with client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args == ("--resume", "claude-uuid-abc")
+    transcript = (
+        projects
+        / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+        / "claude-uuid-abc.jsonl"
+    )
+    last_record = json.loads(transcript.read_text(encoding="utf-8").splitlines()[-1])
+    assert last_record["type"] == "cost-state"
+    assert last_record["totalCostUSD"] == 2.5
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        ({"native_usage_baseline": {"cumulative_cost_usd": 2.5}}, 2.5),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 3}}, 3.0),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": -1.0}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("nan")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": float("inf")}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": 10**400}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": True}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": "2.5"}}, None),
+        ({"native_usage_baseline": {"cumulative_cost_usd": None}}, None),
+        ({"native_usage_baseline": None}, None),
+        ({}, None),
+        (None, None),
+    ],
+    ids=[
+        "float",
+        "int",
+        "zero",
+        "negative",
+        "nan",
+        "inf",
+        "overflow",
+        "bool",
+        "string",
+        "null-cost",
+        "null-baseline",
+        "older-server",
+        "not-a-dict",
+    ],
+)
+def test_claude_resume_cost_from_snapshot_accepts_only_a_positive_cost(
+    snapshot: object, expected: float | None
+) -> None:
+    """Only a positive, finite own-session cost is restored into Claude."""
+    assert claude_native._claude_resume_cost_from_snapshot(snapshot) == expected
 
 
 @pytest.mark.asyncio
@@ -6772,7 +7108,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     assert prepared.reattached is False
 
 
-def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
     """The ``omnigent claude`` wrapper's own materialized spec is resolvable.
 
     Its ``prompt`` field is real ``AgentSpec.instructions`` content (the
@@ -6781,16 +7117,19 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     instructions.
     """
     spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
-    result = claude_native._wrapper_spec_raw_instructions(spec_path)
+    result = claude_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Claude Code is running in the session terminal" in result
+    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
 
 
-def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert claude_native._wrapper_spec_raw_instructions(bad_spec) is None
+    assert (
+        claude_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
+    )
 
 
 @pytest.mark.asyncio
@@ -8302,6 +8641,57 @@ def test_copy_transcript_with_cwd_keeps_background_handles_for_the_same_session(
     assert moved["cwd"] == str(tmp_path)
 
 
+def test_clone_claude_transcript_drops_the_source_cost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A fork counts its own spend, so its clone drops the source's ``cost-state``.
+
+    Claude restores its running cost from that record on ``--resume``; a clone
+    that kept it would start the fork at the source's total and count that
+    spend twice. Moving a session's own transcript keeps the record.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    source_path = (
+        projects_dir
+        / claude_native._sanitize_claude_project_name(str(source_workspace.resolve()))
+        / f"{source_uuid}.jsonl"
+    )
+    source_path.parent.mkdir(parents=True)
+    turn = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+    }
+    cost_state = claude_native._claude_cost_state_record(source_uuid, 2.5)
+    source_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in (turn, cost_state)), encoding="utf-8"
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    clone = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id="22222222-2222-2222-2222-222222222222",
+        clone_workspace=clone_workspace.resolve(),
+    )
+    moved = tmp_path / "moved.jsonl"
+    claude_native._copy_transcript_with_cwd(source=source_path, target=moved, current=tmp_path)
+
+    assert clone is not None
+    cloned_types = [json.loads(line)["type"] for line in clone.read_text().splitlines()]
+    assert cloned_types == ["user"]
+    moved_records = [json.loads(line) for line in moved.read_text().splitlines()]
+    assert moved_records[-1] == cost_state
+
+
 def test_clone_claude_transcript_repairs_stale_image_duplication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8314,8 +8704,8 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     in both the structured content and the metadata) — or one holding an
     MCP screenshot as a raw string — would overflow the clone's first
     ``--resume`` before any later rebuild could heal it. The copy must
-    repair image-bearing tool-result records on the way through: exactly
-    one structured image copy per payload, redacted metadata, and no
+    repair image- and PDF-bearing tool-result records on the way through:
+    exactly one structured copy per payload, redacted metadata, and no
     string-valued content carrying base64. Records without image
     duplication must pass through unchanged.
     """
@@ -8385,15 +8775,101 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
         },
         "toolUseResult": json.dumps("file written"),
     }
+    b64_pdf = base64.b64encode(b"%PDF-1.7\n" + b"0" * 3000).decode()
+    pdf_blocks = [
+        {"type": "text", "text": "PDF file read: report.pdf"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_pdf},
+        },
+    ]
+    pdf_string = json.dumps(pdf_blocks, separators=(",", ":"))
+    stale_pdf = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u4",
+        "parentUuid": "u3",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_4", "content": pdf_string}],
+        },
+        "toolUseResult": claude_native._json_safe_tool_use_result(pdf_string),
+    }
+    b64_native_pdf = base64.b64encode(b"%PDF-1.7\n" + b"1" * 3000).decode()
+    native_pdf_blocks = [
+        {"type": "text", "text": "PDF file read: notes.pdf"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_native_pdf},
+        },
+    ]
+    native_pdf = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u5",
+        "parentUuid": "u4",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_5", "content": native_pdf_blocks}
+            ],
+        },
+        # Older Claude Code kept the payload in its own Read metadata.
+        "toolUseResult": {"type": "pdf", "file": {"base64": b64_native_pdf, "originalSize": 3009}},
+    }
+    stripped_pdf_meta = {"type": "pdf", "file": {"base64": "", "originalSize": 3009}}
+    stripped_native_pdf = {
+        **native_pdf,
+        "uuid": "u6",
+        "parentUuid": "u5",
+        "toolUseResult": stripped_pdf_meta,
+    }
+    b64_native_image = "iVBORw0KGgo" + "L" * 4000 + "="
+    native_image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64_native_image},
+    }
+    stripped_image_meta = {
+        "type": "image",
+        "file": {"base64": "", "type": "image/png", "originalSize": 3009},
+    }
+    native_image = {
+        **native_pdf,
+        "uuid": "u7",
+        "parentUuid": "u6",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_7", "content": [native_image_block]}
+            ],
+        },
+        "toolUseResult": {
+            **stripped_image_meta,
+            "file": {**stripped_image_meta["file"], "base64": b64_native_image},
+        },
+    }
     source_path.write_text(
         "".join(
-            json.dumps(record) + "\n" for record in (stale_structured, stale_mixed, plain_result)
+            json.dumps(record) + "\n"
+            for record in (
+                stale_structured,
+                stale_mixed,
+                plain_result,
+                stale_pdf,
+                native_pdf,
+                stripped_native_pdf,
+                native_image,
+            )
         ),
         encoding="utf-8",
     )
     source_text = source_path.read_text(encoding="utf-8")
     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
+    assert source_text.count(b64_native_pdf) == 3
+    assert source_text.count(b64_native_image) == 2
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
 
     result = claude_native._clone_claude_transcript(
@@ -8426,6 +8902,18 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     # No image duplication: the plain record is preserved untouched.
     assert records[2]["message"]["content"][0]["content"] == "file written"
     assert records[2]["toolUseResult"] == json.dumps("file written")
+    # A PDF replayed as a raw string becomes a document block, kept once.
+    assert records[3]["message"]["content"][0]["content"] == pdf_blocks
+    assert text.count(b64_pdf) == 1
+    # Claude Code's Read metadata keeps its native shape, as current releases store it.
+    assert records[4]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert records[4]["toolUseResult"] == stripped_pdf_meta
+    assert records[5]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert records[5]["toolUseResult"] == stripped_pdf_meta
+    assert text.count(b64_native_pdf) == 2
+    assert records[6]["message"]["content"][0]["content"] == [native_image_block]
+    assert records[6]["toolUseResult"] == stripped_image_meta
+    assert text.count(b64_native_image) == 1
     # The fork must not mutate the source session's transcript.
     assert source_path.read_text(encoding="utf-8") == source_text
 
@@ -9362,7 +9850,7 @@ def test_bedrock_config_for_native_claude_keeps_betas_under_use_gateway(
 ) -> None:
     """A bedrock-style gateway with CLAUDE_CODE_USE_GATEWAY=1 keeps betas on.
 
-    Bedrock-compatible corporate gateways can run in gateway-aware mode; when
+    Bedrock-compatible enterprise gateways can run in gateway-aware mode; when
     CLAUDE_CODE_USE_GATEWAY=1 the beta-disable flag is skipped so MCP tool
     search stays enabled, matching the generic gateway provider path.
     """
@@ -10417,6 +10905,31 @@ def test_tool_use_result_redacts_inline_image_base64() -> None:
     assert tool_use_result[1]["width"] == 1280
     # Whole-record invariant: the payload exists exactly once.
     assert json.dumps(record).count(b64) == 1
+
+
+def test_claude_transcript_pdf_read_result_replays_as_one_document_block() -> None:
+    """
+    A PDF Read result resumes as a document block, not base64 prompt text.
+
+    The payload must appear exactly once in the rebuilt record.
+    """
+    pdf_b64 = base64.b64encode(b"%PDF-1.7\n" + b"0" * 30_000).decode()
+    text_block = {"type": "text", "text": "PDF file read: /tmp/test/report.pdf (29.3KB)"}
+    document_block = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+    }
+    records = _image_output_records(
+        json.dumps([text_block, document_block], separators=(",", ":"))
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == [text_block, document_block]
+    redacted = json.loads(record["toolUseResult"])[1]["source"]["data"]
+    assert pdf_b64 not in redacted
+    assert "application/pdf" in redacted
+    assert json.dumps(record).count(pdf_b64) == 1
 
 
 def test_tool_use_result_redaction_is_tool_name_independent() -> None:
@@ -11639,8 +12152,8 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
             "plugin-wrapper" if with_launcher else expected_command, *prefix, "-p"
         )
         assert (command, *args)[: len(expected_argv)] == expected_argv
-        # No --settings without an apiKeyHelper to deliver.
-        assert "--settings" not in args
+        # Without an apiKeyHelper to deliver, the settings only disable hooks.
+        assert json.loads(args[args.index("--settings") + 1]) == {"disableAllHooks": True}
         return _FakeProcess()
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
@@ -11783,7 +12296,7 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert args[probe_start : probe_start + 3] == ["-p", "--input-format", "stream-json"]
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     settings_payload = json.loads(args[args.index("--settings") + 1])
-    assert settings_payload == {"apiKeyHelper": "printf token"}
+    assert settings_payload == {"disableAllHooks": True, "apiKeyHelper": "printf token"}
     env = captured["env"]
     assert env["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
     assert env["DISABLE_TELEMETRY"] == "1"

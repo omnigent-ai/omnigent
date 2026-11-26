@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.parse
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -34,6 +35,16 @@ _logger = logging.getLogger(__name__)
 # the wire fixtures were captured on. Widen only after validating a newer minor.
 OPENCODE_MIN_VERSION = "2.0.18"
 OPENCODE_MAX_VERSION_EXCLUSIVE = "2.1.0"
+
+# Escape hatch: any non-empty value accepts an OpenCode CLI outside the supported
+# range (a newer 2.x minor, or an as-yet-unvalidated 3.x) at launch and in setup.
+OPENCODE_SKIP_VERSION_CHECK_ENV = "OMNIGENT_OPENCODE_SKIP_VERSION_CHECK"
+
+
+def opencode_version_check_skipped() -> bool:
+    """Return whether the OpenCode version range check is disabled by env."""
+    return bool(os.environ.get(OPENCODE_SKIP_VERSION_CHECK_ENV))
+
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 

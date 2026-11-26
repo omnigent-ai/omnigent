@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cancelHarnessLogin,
   fetchHarnessLogin,
+  fetchHostsNow,
   installHarnessOnHost,
   logoutHarnessOnHost,
   refreshHarnessAccountsOnHost,
@@ -17,6 +18,7 @@ import {
   useInstallHarness,
   useInstallingHarnesses,
   useStoreCredential,
+  withoutSandboxHosts,
 } from "./useHosts";
 import * as host from "@/lib/host";
 import { ApiError } from "@/lib/sessionsApi";
@@ -327,13 +329,12 @@ describe("useHosts", () => {
     expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_sandbox", "host_laptop"]);
   });
 
-  it("keeps the filtered and unfiltered lists in separate cache entries", async () => {
-    // The filtered (picker) and unfiltered (badge) calls share an
-    // endpoint but use distinct query keys. If they ever collapsed back
-    // to a bare ["hosts"] key, the second queryFn's result would clobber
-    // the first in cache and both consumers would see the same list.
-    // Mounting both in ONE QueryClient and asserting they diverge guards
-    // that regression. mockResolvedValue (persistent) feeds both fetches.
+  it("gives filtered and unfiltered consumers their own view of the shared list", async () => {
+    // The filtered (picker) and unfiltered (badge) consumers share one cached
+    // host list; each observer filters its own view. If the filter leaked into
+    // the shared entry, both consumers would see the same list. Mounting both
+    // in ONE QueryClient and asserting they diverge guards that regression.
+    // mockResolvedValue (persistent) feeds any fetch.
     fetchMock.mockResolvedValue(
       mockResponse({
         hosts: [
@@ -369,6 +370,86 @@ describe("useHosts", () => {
 
     expect(result.current.filtered.data?.map((h) => h.host_id)).toEqual(["host_laptop"]);
     expect(result.current.all.data?.map((h) => h.host_id)).toEqual(["host_sandbox", "host_laptop"]);
+  });
+
+  it("polls /v1/hosts once for filtered and unfiltered consumers", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    fetchMock.mockImplementation(async () =>
+      mockResponse({
+        hosts: [
+          {
+            host_id: "host_sandbox",
+            name: "managed-abc123",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: "modal",
+          },
+        ],
+      }),
+    );
+    try {
+      const { result } = renderHook(
+        () => ({
+          filtered: useHosts(),
+          sourced: useHosts({ sourceHostId: "host_sandbox" }),
+          all: useHosts({ includeSandbox: true }),
+        }),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.all.isSuccess).toBe(true));
+      expect(result.current.filtered.data).toEqual([]);
+      expect(result.current.sourced.data?.map((h) => h.host_id)).toEqual(["host_sandbox"]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // One 60 s poll tick refetches the shared list once.
+      await act(async () => vi.advanceTimersByTimeAsync(60_000));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      await act(async () => vi.advanceTimersByTimeAsync(1_000));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a freshly fetched host in the pickers without another poll, sandbox hosts excluded", async () => {
+    // The connect-a-machine poll and the harness fix dialog fetch the list on demand
+    // and select a host from it; the picker must list that host right away.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const clientWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const laptop = { host_id: "host_laptop", name: "Laptop", owner: "alice", status: "online" };
+    const vm = { host_id: "host_vm", name: "Remote VM", owner: "alice", status: "online" };
+    const sandbox = { ...vm, host_id: "host_sandbox", sandbox_provider: "modal" };
+    fetchMock.mockResolvedValueOnce(mockResponse({ hosts: [laptop] }));
+    const { result } = renderHook(() => useHosts({ refetchOnFocus: true }), {
+      wrapper: clientWrapper,
+    });
+    await waitFor(() =>
+      expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop"]),
+    );
+
+    fetchMock.mockResolvedValueOnce(mockResponse({ hosts: [laptop, vm, sandbox] }));
+    let fetched: string[] = [];
+    await act(async () => {
+      fetched = (await fetchHostsNow(client)).map((h) => h.host_id);
+    });
+    // The refresh returns and caches the full list; only the picker's view drops sandboxes.
+    expect(fetched).toEqual(["host_laptop", "host_vm", "host_sandbox"]);
+    expect(
+      client
+        .getQueryData<{ host_id: string }[]>(["hosts", { includeSandbox: true }])
+        ?.map((h) => h.host_id),
+    ).toEqual(["host_laptop", "host_vm", "host_sandbox"]);
+    expect(
+      withoutSandboxHosts(client.getQueryData(["hosts", { includeSandbox: true }]) ?? []).map(
+        (h) => h.host_id,
+      ),
+    ).toEqual(["host_laptop", "host_vm"]);
+    await waitFor(() =>
+      expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_vm"]),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("refetches on window focus so a missed readiness push recovers on tab return", async () => {

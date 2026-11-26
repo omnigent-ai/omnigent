@@ -37,7 +37,7 @@ import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { copyText } from "@/lib/clipboard";
-import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { getSessionSignInLink, SIGN_IN_EXPIRED_CODE } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
@@ -81,10 +81,12 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   terminal_launch_failed: "The agent's terminal couldn't be started on the host.",
   runner_error: "Something went wrong setting up the turn on the host.",
   runner_disconnected: "The connection to the host dropped unexpectedly.",
+  session_recovery_failed: "Automatic resume failed. Please send a new message to continue.",
   runner_unavailable: "The session's runner isn't connected to the server.",
   connection_error:
     "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
+  output_limit_exceeded: "The model's response hit its maximum output length and was cut off.",
   executor_error: "The agent runtime hit an error while running the turn.",
   workspace_missing: "The session workspace no longer exists on the host.",
   session_agent_missing:
@@ -109,6 +111,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex couldn't get a token from the model provider's sign-in command on the host.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+  content_policy_refusal:
+    "The model's safeguards refused this message. Start a new session and rephrase it without the flagged content.",
   host_disk_full: "The host's disk is full, so the agent can't save the conversation.",
   harness_not_configured: "The harness isn't set up on the host, so this session can't start.",
 };
@@ -284,6 +288,18 @@ function ErrorForkAction({
       </DisabledActionTooltip>
     </div>
   );
+}
+
+/**
+ * Reload the top frame, so a sign-in that expired inside an embed is renewed by
+ * the page that owns it. Falls back to this frame when the top is cross-origin.
+ */
+function reloadTopLevelPage(): void {
+  try {
+    (window.top ?? window).location.reload();
+  } catch {
+    window.location.reload();
+  }
 }
 
 /**
@@ -578,6 +594,21 @@ export function ErrorBanner({
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
+        {code === SIGN_IN_EXPIRED_CODE ? (
+          <div className="mx-[4px] mt-[8px] flex">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={(event) => {
+                event.stopPropagation();
+                reloadTopLevelPage();
+              }}
+            >
+              Reload page
+            </Button>
+          </div>
+        ) : null}
         {workspaceMissing ? (
           <ErrorForkAction
             label="Continue in another directory…"

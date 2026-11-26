@@ -43,6 +43,24 @@ struct DatabricksOAuthConfiguration: Sendable {
   }
 }
 
+/// The transport error behind a `networkUnavailable` failure, reduced to its domain and code so
+/// DNS, TLS, timeout, and offline failures stay distinguishable without carrying the request URL.
+struct DatabricksTransportFailure: Equatable, Sendable, CustomStringConvertible {
+  let domain: String
+  let code: Int
+
+  init(_ error: Error) {
+    let nsError = error as NSError
+    domain = nsError.domain
+    code = nsError.code
+  }
+
+  var description: String { "\(domain) \(code)" }
+
+  /// A screenshot of the connect screen is often the only report, so the message names the code.
+  var message: String { "Could not reach Databricks. Please try again. (\(self))" }
+}
+
 enum DatabricksOAuthError: Error, Equatable, LocalizedError {
   case invalidClientID
   case invalidRedirectURL
@@ -56,7 +74,7 @@ enum DatabricksOAuthError: Error, Equatable, LocalizedError {
   case loginInProgress
   case browserUnavailable
   case authenticationFailed
-  case networkUnavailable
+  case networkUnavailable(DatabricksTransportFailure)
   case tokenExchangeFailed
   case invalidRefreshGrant
   case invalidTokenResponse
@@ -75,7 +93,7 @@ enum DatabricksOAuthError: Error, Equatable, LocalizedError {
     case .loginInProgress: "A Databricks sign-in is already in progress."
     case .browserUnavailable: "Could not present the sign-in browser."
     case .authenticationFailed: "Databricks browser sign-in failed."
-    case .networkUnavailable: "Could not reach Databricks. Please try again."
+    case .networkUnavailable(let failure): failure.message
     case .tokenExchangeFailed: "Databricks could not complete sign-in. Please sign in again."
     case .invalidRefreshGrant: "The saved Databricks session has expired. Please sign in again."
     case .invalidTokenResponse: "Databricks returned an invalid token response."

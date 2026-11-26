@@ -9,6 +9,7 @@ import {
   HEALTHY_CONNECTION_MS,
   HEARTBEAT_WATCHDOG_MS,
   nextPushedSession,
+  SessionUpdatesSocket,
   sessionUpdatesSocket,
 } from "./sessionUpdatesSocket";
 
@@ -88,11 +89,32 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
     const { resolveModalHost, setSessionHost } = await import("./sessionHost");
     const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
     setSessionHost("sess_oss", "host_oss");
-    resolveModalHost();
+    resolveModalHost(["host_oss"]);
     try {
       socket.start();
       const first = latestWs();
       expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+      first.open();
+      first.close();
+      vi.advanceTimersByTime(RECONNECT_CEILING_MS);
+      expect(latestWs()).not.toBe(first);
+      expect(latestWs().url).toBe(first.url);
+    } finally {
+      socket.stop();
+      vi.resetModules();
+    }
+  });
+
+  it("routes by the per-client key when no modal host was picked", async () => {
+    vi.resetModules();
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    const { resolveModalHost } = await import("./sessionHost");
+    const { sessionUpdatesSocket: socket } = await import("./sessionUpdatesSocket");
+    resolveModalHost([]);
+    try {
+      socket.start();
+      const first = latestWs();
+      expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toMatch(/^[0-9a-f]{32}$/);
       first.open();
       first.close();
       vi.advanceTimersByTime(RECONNECT_CEILING_MS);
@@ -395,5 +417,50 @@ describe("nextPushedSession", () => {
     // already committed to the authoritative id would be handed a second one.
     latestWs().emit({ type: "changed", items: [{ id: "conv_late" }] });
     await expect(mine).resolves.toBeNull();
+  });
+});
+
+describe("SessionUpdatesSocket.isWatching", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("follows the watch-set the server has reached, not the one last asked for", () => {
+    const socket = new SessionUpdatesSocket();
+    socket.setWatched(["a"]);
+    socket.start();
+    // Opening sends the set once; nothing is watched until the server answers.
+    latestWs().open();
+    expect(socket.isWatching("a")).toBe(false);
+
+    // A second request goes out before the first is answered.
+    socket.setWatched(["b"]);
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("a")).toBe(true);
+    expect(socket.isWatching("b")).toBe(false);
+    // A delta between the two answers still comes from the first set.
+    latestWs().emit({ type: "changed", items: [] });
+    expect(socket.isWatching("a")).toBe(true);
+
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("a")).toBe(false);
+    expect(socket.isWatching("b")).toBe(true);
+
+    // A new connection starts over: the server watches nothing until it answers.
+    latestWs().close();
+    vi.advanceTimersByTime(60_000);
+    latestWs().open();
+    expect(socket.isWatching("b")).toBe(false);
+    latestWs().emit({ type: "snapshot", items: [] });
+    expect(socket.isWatching("b")).toBe(true);
+    socket.stop();
   });
 });

@@ -1,6 +1,31 @@
 import { describe, expect, it } from "vitest";
 
-import { parentIdFromLabels } from "./sessionHost";
+import {
+  getSessionHostRouting,
+  parentIdFromLabels,
+  setSessionHost,
+  setSessionParent,
+} from "./sessionHost";
+
+describe("getSessionHostRouting", () => {
+  it("tracks observations along the routing ancestry without including unrelated sessions", () => {
+    setSessionHost("routing-parent", "host-a");
+    setSessionParent("routing-child", "routing-parent");
+    const inherited = getSessionHostRouting("routing-child");
+    expect(inherited).toMatchObject({ ownerId: "routing-parent", hostId: "host-a" });
+
+    setSessionHost("unrelated-session", "host-b");
+    expect(getSessionHostRouting("routing-child")).toEqual(inherited);
+
+    setSessionHost("routing-parent", "host-a");
+    const refreshed = getSessionHostRouting("routing-child");
+    expect(refreshed.revision).toBeGreaterThan(inherited.revision);
+    setSessionHost("routing-child", "host-a");
+    const bound = getSessionHostRouting("routing-child");
+    expect(bound).toMatchObject({ ownerId: "routing-child", hostId: "host-a" });
+    expect(bound.revision).toBeGreaterThan(refreshed.revision);
+  });
+});
 
 describe("parentIdFromLabels", () => {
   it("reads the explicit side-chat source id", () => {

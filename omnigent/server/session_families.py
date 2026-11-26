@@ -14,6 +14,7 @@ from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionFamily
 from omnigent.server.session_orchestration import require_owned_session
+from omnigent.server.sharing_settings import SiblingSessionDestinations
 from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -35,6 +36,7 @@ def authorize_sibling_source(
     *,
     parent_id: str | None,
     host_id: str | None,
+    host_type: str,
 ) -> Conversation:
     if not request.app.state.feature_flags.enabled(Feature.SIBLING_SESSIONS):
         raise OmnigentError("Nested agents are disabled", code=ErrorCode.FORBIDDEN)
@@ -54,6 +56,7 @@ def authorize_sibling_source(
             permissions,
             private=True,
         )
+    require_sibling_destination(request, source.host_id, host_id=host_id, host_type=host_type)
     if host_id is not None:
         host_store = getattr(request.app.state, "host_store", None)
         host = host_store.get_host(host_id) if host_store else None
@@ -62,6 +65,41 @@ def authorize_sibling_source(
                 "Only the source session's sandbox can be reused", code=ErrorCode.FORBIDDEN
             )
     return source
+
+
+def require_sibling_destination(
+    request: Request,
+    source_host_id: str | None,
+    *,
+    host_id: str | None,
+    host_type: str,
+) -> None:
+    """Apply the same destination policy to creation and subsequent host launches."""
+    destinations = SiblingSessionDestinations.coerce(
+        getattr(
+            request.app.state,
+            "sibling_session_destinations",
+            lambda: SiblingSessionDestinations.ANY_HOST,
+        )()
+    )
+    if host_type == "managed":
+        if destinations is SiblingSessionDestinations.CURRENT_HOST:
+            raise OmnigentError(
+                "Add nested agent is limited to the current host by server policy",
+                code=ErrorCode.FORBIDDEN,
+            )
+    elif destinations is not SiblingSessionDestinations.ANY_HOST and (
+        host_id is None or host_id != source_host_id
+    ):
+        allowed = (
+            "the current host"
+            if destinations is SiblingSessionDestinations.CURRENT_HOST
+            else "the current host or a new managed sandbox"
+        )
+        raise OmnigentError(
+            f"Add nested agent is limited to {allowed} by server policy",
+            code=ErrorCode.FORBIDDEN,
+        )
 
 
 async def complete_sibling_creation(
@@ -131,9 +169,11 @@ def project_families(
         members = members_by_family.get(family_id, [])
         owned = [member for member in members if member.id in member_owners]
         active = [member for member in owned if not member.archived]
+        representative = (active or owned)[0] if owned else None
         info = SessionFamily(
             id=family_id,
-            representative_id=(active or owned)[0].id if owned else None,
+            representative_id=representative.id if representative else None,
+            representative_title=representative.title if representative else None,
             pinned=pin_key in item.labels,
             pinned_at=item.labels.get(pin_key),
         )

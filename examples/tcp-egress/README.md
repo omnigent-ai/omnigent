@@ -1,0 +1,55 @@
+# Named TCP egress configuration examples
+
+`local-http.yaml` and `public-ssh.yaml` illustrate a single named TCP route
+through `omnigent-egress-connect`, with direct networking disabled. They are
+configuration references, not runnable end-to-end Claude SDK demos.
+
+Both files select the Claude SDK harness. Its preparation path does not start
+the parent TCP-egress broker, so these configurations are rejected before the
+Claude CLI launches. They cannot perform the prompted connector checks.
+Configuring model credentials with `omnigent setup` or passing `--model` does
+not supply the TCP-egress broker. An unwrapped CLI fallback is not supported.
+
+Both files also set `allow_network: false`, which blocks direct external
+connections from the CLI. Claude SDK's owned worker environment already provides
+supported model inference through a separate broker. That model transport does
+not implement the named TCP routes these examples require.
+
+Named TCP routes grant access only through the connector. They do not authorize
+ordinary provider HTTPS requests. Supporting these examples as agent-driven
+demos requires Claude SDK integration with the parent TCP-egress broker.
+Do not enable unrestricted networking to make the network-denial checks appear
+to pass.
+
+## Local connector verification
+
+The isolated connector test exercises a local echo fixture, a granted route,
+an ungranted route, and broker revocation without requiring a model provider:
+
+```sh
+PYTHONPATH="$PWD:$PWD/sdks/python-client:$PWD/sdks/ui" \
+  uv run --no-sync pytest tests/inner/sandbox/test_tcp_egress.py \
+  -k test_tcp_connector_round_trip_and_revocation --reruns 0 -q
+```
+
+This verifies the connector contract; it does not establish that a Claude
+worker can use named TCP routes.
+
+## Route templates
+
+`local-http.yaml` uses the documentation address `192.0.2.10`, port `8765`,
+and the exact CIDR `192.0.2.10/32`. For a listener you control, replace all
+three address occurrences with its reachable IPv4 address. Loopback and
+link-local destinations remain denied. The prompt documents the expected
+connector response, direct-connection denial, and ungranted-route denial for
+a compatible execution environment.
+
+`public-ssh.yaml` grants `github.com:22` and describes reading an SSH greeting
+without authentication. The broker requires every DNS answer to be public;
+networks that block port 22 prevent the connection. A greeting does not verify
+the remote server's identity. This template has the same TCP-egress integration
+requirement as the local example.
+
+`sandbox.type: auto` selects Seatbelt on macOS and Bubblewrap on Linux; Linux
+requires `bwrap` and enabled user namespaces. Opaque TCP routes cannot use ports
+80 or 443 and cannot coexist with HTTP `egress_rules`.

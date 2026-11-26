@@ -225,7 +225,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
 
       - name: Install dependencies
         if: steps.creds.outputs.available == 'true'
@@ -234,7 +234,7 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: claude
 

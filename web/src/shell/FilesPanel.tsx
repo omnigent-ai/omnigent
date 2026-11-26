@@ -1,20 +1,18 @@
 import {
-  ArrowDownAZIcon,
   ArrowDownUpIcon,
-  ArrowDownWideNarrowIcon,
   EyeIcon,
   EyeOffIcon,
-  FileClockIcon,
-  FileTypeIcon,
   FilterIcon,
   MoonIcon,
   RefreshCwIcon,
   SearchIcon,
   XIcon,
 } from "lucide-react";
+import { CHANGED_SORT_OPTIONS } from "./fileTree/changedSortOptions";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
+import { useSandboxStarting } from "@/hooks/useSessionReconnect";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
@@ -153,13 +151,6 @@ function HiddenFilesToggle({
 // SortSelector
 // ---------------------------------------------------------------------------
 
-const SORT_OPTIONS: { value: ChangedSort; label: string; Icon: typeof ArrowDownAZIcon }[] = [
-  { value: "alpha", label: "Filename", Icon: ArrowDownAZIcon },
-  { value: "recent", label: "Last edited", Icon: FileClockIcon },
-  { value: "size", label: "Size", Icon: ArrowDownWideNarrowIcon },
-  { value: "type", label: "Type", Icon: FileTypeIcon },
-];
-
 function SortSelector({
   sort,
   onChange,
@@ -167,7 +158,7 @@ function SortSelector({
   sort: ChangedSort;
   onChange: (next: ChangedSort) => void;
 }) {
-  const active = SORT_OPTIONS.find((o) => o.value === sort) ?? SORT_OPTIONS[0];
+  const active = CHANGED_SORT_OPTIONS.find((o) => o.value === sort) ?? CHANGED_SORT_OPTIONS[0];
   return (
     <TooltipProvider>
       <DropdownMenu>
@@ -190,7 +181,7 @@ function SortSelector({
         </Tooltip>
         <DropdownMenuContent align="end" className="w-40">
           <DropdownMenuRadioGroup value={sort} onValueChange={(v) => onChange(v as ChangedSort)}>
-            {SORT_OPTIONS.map(({ value, label, Icon }) => (
+            {CHANGED_SORT_OPTIONS.map(({ value, label, Icon }) => (
               <DropdownMenuRadioItem key={value} value={value}>
                 <Icon className="size-3.5" />
                 {label}
@@ -505,6 +496,7 @@ export function FilesPanel({
   // lists can't load. Say so rather than "No files in workspace"; a list
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
+  const sandboxWaking = useSandboxStarting(conversationId);
 
   return (
     <div
@@ -695,7 +687,7 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline waking={sandboxWaking} />}
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
@@ -707,6 +699,7 @@ export function FilesPanel({
             sort={changedSort}
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
+            scrollParentRef={scrollRef}
           />
         )}
         {!showAsleepHint && !flatView && (

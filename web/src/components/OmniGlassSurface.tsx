@@ -2,7 +2,7 @@ import GlassSurface from "@/components/ui/glass-surface/GlassSurface";
 import { cn } from "@/lib/utils";
 
 interface OmniGlassSurfaceProps {
-  variant?: "default" | "menu";
+  variant?: "default" | "menu" | "composer";
   width?: number | string;
   height?: number | string;
   borderRadius?: number;
@@ -17,6 +17,11 @@ const GLASS_VARIANTS = {
   menu: {
     blur: 32,
     background: "hsl(0 0% 100% / 0%)",
+  },
+  // Typed text needs a near-opaque palette backing over light or dark transcript content.
+  composer: {
+    blur: 8,
+    background: "color-mix(in srgb, var(--card-solid) 94%, transparent)",
   },
 };
 
@@ -58,7 +63,7 @@ export function OmniGlassSurface({
             "inset 0 -1px 0 0 light-dark(hsl(0 0% 100% / 0.35), hsl(0 0% 100% / 0.04))",
             "inset 0 0 2px 1px rgba(212, 212, 216, 0.08)",
             "inset 0 0 12px 3px light-dark(color-mix(in oklch, white, transparent 72%), color-mix(in oklch, white, transparent 95%))",
-            "0 2px 6px 1px rgba(17, 17, 26, 0.08)",
+            "var(--omni-glass-drop-shadow, 0 2px 6px 1px rgba(17, 17, 26, 0.08))",
           ].join(", "),
         }}
       />

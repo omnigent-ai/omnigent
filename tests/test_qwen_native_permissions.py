@@ -283,7 +283,11 @@ async def test_supervise_mirror_parks_then_releases_on_control_response(
             self.posts.append((url, json))
             return httpx.Response(200, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(qnp.httpx, "AsyncClient", _FakeAsyncClient)
+    # Patch the factory, not httpx.AsyncClient: SessionRoutingTransport builds its own
+    # inner AsyncClient, which would otherwise be recorded as the posting client.
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client", lambda *_a, **_kw: _FakeAsyncClient()
+    )
 
     # Hold the park task pending so the release branch is taken (a completed task
     # means the web verdict already landed → no release needed).

@@ -21,10 +21,12 @@ from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, Scheduled
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.schedule import (
     host_ownership_key,
+    is_trigger_automation,
     manual_trigger_key,
     next_scheduled_time,
     occurrence_host_id,
     scheduled_trigger_key,
+    timer_interval,
 )
 from omnigent.server.scheduled.telemetry import (
     run_log_context,
@@ -227,32 +229,62 @@ class StartupLease:
             )
 
         finished_at = self._now()
-
-        def log_outcome(_previous: ScheduledTaskRun) -> None:
-            _logger.info(
-                "Scheduled run %s startup ended with status %s",
-                self.run.id,
-                status,
-                extra=_run_event(
-                    "scheduled_run_startup_ended",
-                    self.run,
-                    target=self._target,
-                    outcome=status,
-                    error_code=error_code,
-                    failure_stage=failure_stage or startup_failure_stage(error_code),
-                    startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
-                    prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
-                    if status in ("running", "succeeded")
-                    else None,
-                ),
-            )
-
         await self._transition(
             status,
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
-            committed=log_outcome,
+            committed=lambda _previous: self._log_startup_ended(
+                status, error_code=error_code, failure_stage=failure_stage, finished_at=finished_at
+            ),
+        )
+
+    async def hand_back_timer_firing(self, host_id: str) -> None:
+        """Return this timer firing unsent, for the replica that owns *host_id* to claim.
+
+        The run records ``skipped``: ``timer_host_moved``, or ``timer_cancelled`` when the
+        timer was cancelled first, which leaves nothing to claim.
+
+        :param host_id: The host the timer's session moved to, e.g. ``"host_2"``.
+        :raises StartupLeaseLost: If the run's lease no longer matches.
+        """
+        finished_at = self._now()
+        await self._write(
+            lambda: self._store.hand_back_timer_firing(self.run, now=self._now, host_id=host_id),
+            committed=lambda _previous: self._log_startup_ended(
+                "skipped",
+                error_code=self.run.error_code,
+                failure_stage=None,
+                finished_at=finished_at,
+            ),
+        )
+
+    def _log_startup_ended(
+        self, status: str, *, error_code: str | None, failure_stage: str | None, finished_at: float
+    ) -> None:
+        """Log how this run's startup ended, once that outcome is committed.
+
+        :param status: The run's outcome, e.g. ``"skipped"``.
+        :param error_code: Its error code, e.g. ``"timer_host_moved"``, or ``None``.
+        :param failure_stage: The stage that failed, or ``None`` to derive it from the code.
+        :param finished_at: When the outcome was decided, as a Unix time.
+        """
+        _logger.info(
+            "Scheduled run %s startup ended with status %s",
+            self.run.id,
+            status,
+            extra=_run_event(
+                "scheduled_run_startup_ended",
+                self.run,
+                target=self._target,
+                outcome=status,
+                error_code=error_code,
+                failure_stage=failure_stage or startup_failure_stage(error_code),
+                startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
+                prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
+                if status in ("running", "succeeded")
+                else None,
+            ),
         )
 
     def _when_writes_settle(self, callback: Callable[[], None]) -> None:
@@ -358,6 +390,13 @@ FireIdentity = Callable[[ScheduledTask], AbstractAsyncContextManager[object]]
 DispatchEnabled = Callable[[], bool]
 # Read before each wait between polls.
 PollInterval = Callable[[], float]
+# Given the current time, when a trigger automation's busy session should next be checked,
+# skipping this poll unrecorded; ``None`` polls now. Asked only for trigger automations.
+BusyUntil = Callable[[ScheduledTask, int], Awaitable[int | None]]
+
+# With a busy check, the server tries to poll a trigger automation this often instead of
+# following the trigger's saved schedule.
+TRIGGER_POLL_SECONDS = 2 * 60
 
 
 class FireIdentityRevoked(Exception):
@@ -419,6 +458,7 @@ class PersistentTaskScheduler:
         owned_hosts: OwnedHosts = _owns_every_host,
         dispatch_enabled: DispatchEnabled = _always_enabled,
         poll_interval: PollInterval | None = None,
+        busy_until: BusyUntil | None = None,
         now: Callable[[], float] = time.time,
         poll_seconds: float = DEFAULT_SCHEDULER_CONFIG.poll_seconds,
         renewal_seconds: float = DEFAULT_SCHEDULER_CONFIG.renewal_seconds,
@@ -437,12 +477,14 @@ class PersistentTaskScheduler:
         )
         store.check_dispatch_support()
         store.configure_dispatch(True)
+        store.configure_trigger_polling(TRIGGER_POLL_SECONDS if busy_until is not None else None)
         self._store = store
         self._on_fire = on_fire
         self._on_expired = on_expired
         self._owned_hosts = owned_hosts
         self._dispatch_enabled = dispatch_enabled
         self._poll_interval = poll_interval
+        self._busy_until = busy_until
         self._now = now
         self._poll_seconds = config.poll_seconds
         self._renewal_seconds = config.renewal_seconds
@@ -630,7 +672,7 @@ class PersistentTaskScheduler:
             try:
                 if not await self._validate_schedule(task):
                     continue
-                next_run = await asyncio.to_thread(next_scheduled_time, task, int(self._now()))
+                next_run = await self._next_occurrence(task, int(self._now()))
                 with workspace_scope(task.workspace_id):
                     if next_run is None:
                         await asyncio.to_thread(self._store.complete_schedule, task)
@@ -651,14 +693,75 @@ class PersistentTaskScheduler:
         if len(tasks) < self._batch_size:
             self._initialization_cursor = None
 
+    async def _next_occurrence(self, task: ScheduledTask, now: int) -> int | None:
+        """The saved schedule's next occurrence, or sooner for a trigger the server can check.
+
+        A trigger polls every ``TRIGGER_POLL_SECONDS`` but never past its saved schedule's
+        next occurrence, so a schedule that ends (``COUNT`` or ``UNTIL``) still ends it.
+        """
+        occurrence = await asyncio.to_thread(next_scheduled_time, task, now)
+        if occurrence is not None and self._busy_until is not None and is_trigger_automation(task):
+            return min(occurrence, now + TRIGGER_POLL_SECONDS)
+        return occurrence
+
+    async def _skip_busy_occurrence(self, task: ScheduledTask, *, now: int, next_run: int) -> bool:
+        """Move a busy trigger automation's due poll to its next check, recording no run.
+
+        The next check is no later than *next_run*, the schedule's next occurrence. Returns
+        True when this occurrence must not be claimed. A failed busy check returns False, so
+        the occurrence is sent as it would be without skipping.
+        """
+        if self._busy_until is None or not is_trigger_automation(task):
+            return False
+        assert task.next_run_at is not None
+        try:
+            with workspace_scope(task.workspace_id):
+                until = await self._busy_until(task, now)
+        except Exception:
+            _logger.exception(
+                "Could not check whether task %s's session is busy; sending its prompt", task.id
+            )
+            return False
+        if until is None or until <= now:
+            return False
+        until = min(until, next_run)
+        with workspace_scope(task.workspace_id):
+            advanced = await asyncio.to_thread(
+                self._store.skip_scheduled_occurrence, task, now=now, next_run_at=until
+            )
+        _log_event(
+            _logger.info,
+            "Skipped occurrence %s of task %s: its session is still busy",
+            task.next_run_at,
+            task.id,
+            extra=debug_event(
+                "scheduled_run_skipped_busy",
+                task_id=task.id,
+                task_workspace_id=task.workspace_id,
+                scheduled_at=task.next_run_at,
+                trigger_key=scheduled_trigger_key(task.next_run_at),
+                target=task.execution_target,
+                next_check_at=until,
+                advanced=advanced,
+            ),
+        )
+        # A task that changed since it was listed is re-read on the next poll.
+        return True
+
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
         try:
-            await asyncio.to_thread(
-                validate_rrule,
-                task.rrule,
-                session_mode=task.session_mode,
-                execution_target=task.execution_target,
-            )
+            if task.kind == "timer":
+                # A timer keeps its own whole-second interval, not an automation's minimum.
+                timer_interval(task.rrule)
+            else:
+                await asyncio.to_thread(
+                    validate_rrule,
+                    task.rrule,
+                    session_mode=task.session_mode,
+                    execution_target=task.execution_target,
+                    # COUNT counts from creation here, so a one-time rule fires once.
+                    allow_single_fire=True,
+                )
         except RRuleSearchError:
             raise
         except RRuleValidationError:
@@ -867,9 +970,15 @@ class PersistentTaskScheduler:
                             target=task.execution_target,
                         ),
                     )
-                    next_run = await asyncio.to_thread(next_scheduled_time, task, now)
+                    next_run = await self._next_occurrence(task, now)
                     if self._stopped:
                         return
+                    # A skip only defers a poll, so the last occurrence of a schedule that ends
+                    # is always sent.
+                    if next_run is not None and await self._skip_busy_occurrence(
+                        task, now=now, next_run=next_run
+                    ):
+                        continue
                     with workspace_scope(task.workspace_id):
                         run = await asyncio.to_thread(
                             self._store.claim_scheduled_run,

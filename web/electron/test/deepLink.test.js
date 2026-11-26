@@ -56,10 +56,38 @@ describe("parseOmnigentDeepLink", () => {
     );
   });
 
-  it("drops a query string and hash (v1 forwards only the path)", () => {
+  it("drops unrelated query parameters and hashes", () => {
     const parsed = parseOmnigentDeepLink("omnigent://localhost:8000/c/conv_abc?reply=1#frag");
     assert.equal(parsed.path, "/c/conv_abc");
     assert.equal(parsed.origin, "http://localhost:8000");
+  });
+
+  it("preserves fullscreen file links while dropping unrelated parameters and hashes", () => {
+    const file = "/repo/My notes/plot #1 & a+b.html";
+    const query = new URLSearchParams({ file, fullscreen: "1", view: "terminal", reply: "1" });
+    const parsed = parseOmnigentDeepLink(`omnigent://example.com/c/conv_abc?${query}#frag`);
+    const route = new URL(parsed.path, parsed.origin);
+
+    assert.equal(route.pathname, "/c/conv_abc");
+    assert.deepEqual(
+      [...route.searchParams],
+      [
+        ["file", file],
+        ["fullscreen", "1"],
+      ],
+    );
+    assert.equal(route.hash, "");
+  });
+
+  it("preserves percent-encoded file paths without interpreting them as URL structure", () => {
+    const query = "file=%2Frepo%2Freport%20%23draft%3Fview%3D1%26x%3D2%2B3.html&fullscreen=1";
+    const parsed = parseOmnigentDeepLink(`omnigent://localhost:8000/c/x/?${query}#frag`);
+
+    assert.equal(parsed.path, `/c/x/?${query}`);
+    assert.equal(
+      new URL(parsed.path, parsed.origin).searchParams.get("file"),
+      "/repo/report #draft?view=1&x=2+3.html",
+    );
   });
 
   it("rejects a non-omnigent scheme", () => {

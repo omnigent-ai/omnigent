@@ -13,6 +13,10 @@ import json as _json
 import re as _re
 from typing import Literal
 
+from omnigent.native.permission_modes import (
+    AGENT_DEFAULT_PERMISSION_MODE_HINT,
+    APPROVAL_SKIPPING_PERMISSION_MODES,
+)
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -391,7 +395,7 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
 # ``ask_on_scheduled_task_change`` into every engine and exempts these names
 # from its no-policy fast path; both read this set so they cannot drift.
 SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
-    {"sys_scheduled_task_create", "sys_scheduled_task_update"}
+    {"sys_scheduled_task_create", "sys_scheduled_task_update", "sys_reminder_set"}
 )
 
 
@@ -414,12 +418,16 @@ _SCHEDULED_TASK_SETTINGS = (
     "max_cost_usd",
     "model_override",
     "reasoning_effort",
+    "workflow_id",
     "prompt",
 )
 _PREVIEW_VALUE_CHARS = 60
 _PREVIEW_EXTRA_CHARS = 200
 
 _SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
+# Free text the review renders in full rather than among the bounded settings.
+_SCHEDULED_TASK_FULL_TEXT_FIELDS = frozenset({"prompt", "workflow_details"})
+_PERMISSION_MODE_VALUES = f"a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
 
 
 def _clip(value: str) -> str:
@@ -429,8 +437,8 @@ def _clip(value: str) -> str:
     return value
 
 
-def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
-    """``key=value`` pairs for every argument but ``skip``, each value bounded.
+def _scheduled_task_settings(args: dict[str, object], *, skip: frozenset[str]) -> str:
+    """``key=value`` pairs for every argument but those in ``skip``, each value bounded.
 
     Known settings come first and are never dropped; other arguments follow and
     are capped as a group. The free-text prompt is rendered separately in full.
@@ -440,8 +448,8 @@ def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
         value = str(args[key])
         return f"{key}={_clip(value)}"
 
-    known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key != skip]
-    keys = sorted(key for key in args if key not in _SCHEDULED_TASK_SETTINGS and key != skip)
+    known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key not in skip]
+    keys = sorted(key for key in args if key not in _SCHEDULED_TASK_SETTINGS and key not in skip)
     extra: list[str] = []
     remaining = _PREVIEW_EXTRA_CHARS
     for index, key in enumerate(keys):
@@ -460,22 +468,41 @@ def scheduled_task_review_error(
     args: dict[str, object], *, action: str, require_complete: bool = True
 ) -> str | None:
     """Validate review values, allowing omitted fields only for legacy callers."""
-    missing = sorted(_SCHEDULED_TASK_REVIEW_FIELDS.difference(args))
+    # The server writes the prompt of a task created to run a saved workflow.
+    runs_workflow = action == "create" and args.get("workflow_id") is not None
+    required = (
+        _SCHEDULED_TASK_REVIEW_FIELDS - {"prompt"}
+        if runs_workflow
+        else _SCHEDULED_TASK_REVIEW_FIELDS
+    )
+    missing = sorted(required.difference(args))
     if require_complete and missing:
-        hint = (
-            "List the task and retry with its full prompt and permission_mode."
-            if action == "update"
-            else "Retry with prompt and permission_mode (null for the agent default)."
-        )
+        if action == "update":
+            hint = "List the task and retry with its full prompt and permission_mode."
+        elif runs_workflow:
+            hint = f"Retry with permission_mode: {_PERMISSION_MODE_VALUES}."
+        else:
+            hint = f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
         return f"Missing review fields ({', '.join(missing)}). {hint}"
-    if "prompt" in args or action == "create":
+    if runs_workflow:
+        workflow_id = args["workflow_id"]
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            return "workflow_id must be the ID of one of your saved workflows."
+        if "prompt" in args:
+            return (
+                "Leave out prompt with workflow_id: the server writes the prompt that runs "
+                "the workflow. Give this run's specifics as workflow_details."
+            )
+    elif "prompt" in args or action == "create":
         prompt = args.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return "The automation prompt must be a non-empty string."
     if "permission_mode" in args:
         mode = args["permission_mode"]
-        if mode is not None and (not isinstance(mode, str) or not mode.strip()):
-            return "permission_mode must be a non-empty string or null for the agent default."
+        if mode is not None and (
+            not isinstance(mode, str) or mode.strip().lower() in ("", "null")
+        ):
+            return f"permission_mode must be {_PERMISSION_MODE_VALUES}."
     if action == "update" and not args.get("scheduled_task_id"):
         return "Provide the scheduled_task_id of the automation to update."
     return None
@@ -483,13 +510,62 @@ def scheduled_task_review_error(
 
 def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
     """Render supplied instructions in full and identify legacy omissions."""
-    prompt = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+    workflow_id = args.get("workflow_id")
+    supplied = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+    if action == "create" and "prompt" not in args and workflow_id is not None:
+        prompt: object = f"Runs the saved workflow {workflow_id}"
+    elif action == "update" and (workflow_id or "workflow_details" in args):
+        # Read as the server reads the task's prompt: its specifics stay only if it runs a
+        # saved workflow.
+        from omnigent.server.scheduled.workflow_automations import (
+            is_bare_saved_workflow_run,
+            saved_workflow_run,
+        )
+
+        details_given = "workflow_details" in args
+        if "prompt" not in args:
+            effect = (
+                "keeping the specifics of the stored prompt if it already runs a saved "
+                "workflow, unless workflow_details replaces them, and otherwise in its place"
+            )
+        elif not isinstance(supplied, str) or saved_workflow_run(supplied) is None:
+            effect = (
+                "in place of the current prompt below, whose instructions no longer run; "
+                "each run gets only the specifics in workflow_details"
+                if workflow_id
+                else "but the current prompt below runs no saved workflow, so the server "
+                "refuses the update"
+            )
+        elif not is_bare_saved_workflow_run(supplied):
+            effect = (
+                "but the current prompt below runs its workflow inside other text, so the "
+                "server keeps it only if this is the workflow it runs and workflow_details "
+                "is left out, and otherwise refuses the update"
+            )
+        elif details_given:
+            effect = (
+                "with the specifics in workflow_details in place of those in the current "
+                "prompt below"
+            )
+        else:
+            effect = "keeping the specifics of the current prompt below"
+        runs = f"the saved workflow {workflow_id}" if workflow_id else "its saved workflow"
+        prompt = f"Runs {runs}. The server writes the prompt that runs it, {effect}.\n{supplied}"
+    else:
+        prompt = supplied
+    if "workflow_details" in args:
+        details = args["workflow_details"] or "(none)"
+        prompt = f"{prompt}\nSpecifics for each run of its saved workflow:\n{details}"
     raw_permission_mode = args.get("permission_mode")
     permission_mode = (
         "agent default (no task override)"
         if raw_permission_mode is None
         else str(raw_permission_mode)
     )
+    if isinstance(raw_permission_mode, str) and raw_permission_mode in (
+        APPROVAL_SKIPPING_PERMISSION_MODES
+    ):
+        permission_mode += " (skips approval prompts, so unattended runs act without asking)"
     legacy_notice = ""
     if action == "update" and _SCHEDULED_TASK_REVIEW_FIELDS.difference(args):
         legacy_notice = (
@@ -504,11 +580,13 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
                 if "agent_id" in args
                 else "unchanged (not supplied by legacy caller)"
             )
-    settings = _scheduled_task_settings(args, skip="prompt")
+    if args.get("session_mode") == "continue":
+        permission_mode += "; a continued session keeps its own permission mode"
+    settings = _scheduled_task_settings(args, skip=_SCHEDULED_TASK_FULL_TEXT_FIELDS)
     return (
         f"Agent wants to {action} {subject}.\n"
         f"{legacy_notice}"
-        f"Effective task permission mode: {permission_mode}\n"
+        f"Task permission setting: {permission_mode}\n"
         f"Settings: {settings or '(none)'}\n"
         "Full automation instructions:\n"
         f"{prompt}\n"
@@ -516,8 +594,44 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
     )
 
 
+def _reminder_review(args: dict[str, object]) -> PolicyResponse:
+    """ASK to set a reminder, showing when it fires and its full message."""
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return {
+            "result": "DENY",
+            "reason": "Cannot set a reminder. The reminder message must be a non-empty string.",
+        }
+    from datetime import UTC, datetime
+
+    from omnigent.tools.builtins.scheduled_tasks import resolve_reminder_time
+
+    # Resolve the time exactly as the tool will, so padding or a long fraction in
+    # the raw argument can't hide the moment being approved.
+    resolved = resolve_reminder_time(args, datetime.now(UTC))
+    if isinstance(resolved, str):
+        return {"result": "DENY", "reason": f"Cannot set a reminder. {resolved}"}
+    if args.get("at") is not None:
+        when = f"at {resolved:%Y-%m-%d %H:%M} UTC"
+    else:
+        when = f"{args['delay_seconds']} seconds after approval, rounded up to the next minute"
+    # Quote every line, so a multiline message can't pass for the prompt's own text.
+    quoted = "\n".join(f"> {line}" for line in message.splitlines())
+    return {
+        "result": "ASK",
+        "reason": (
+            f"Agent wants to set a reminder for this session {when}.\n"
+            "When it fires, this message is sent into the session as a new turn, "
+            "even if nobody is watching (each line quoted with '> '):\n"
+            f"{quoted}\n"
+            "Approve?"
+        ),
+    }
+
+
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
-    """ASK for user approval before an agent creates or updates a scheduled task.
+    """ASK for user approval before an agent creates or updates a scheduled task,
+    or sets a reminder (a one-time task that continues the session).
 
     Matches ``event["target"]`` (the dispatched tool identity) rather than
     ``data["name"]``, which an earlier policy may have transformed. Reads
@@ -537,6 +651,8 @@ def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
     args = data.get("arguments") if isinstance(data, dict) else None
     if not isinstance(args, dict):
         args = {}
+    if tool == "sys_reminder_set":
+        return _reminder_review(args)
     action = "create" if tool == "sys_scheduled_task_create" else "update"
     # Older runners expose optional review fields. Current runners enforce the
     # complete contract before dispatch, including when paired with an old server.

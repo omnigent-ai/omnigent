@@ -26,6 +26,18 @@ import {
   type ManagedAgent,
 } from "@/hooks/useCustomAgents";
 import { CustomAgentConfigForm } from "./CustomAgentConfigForm";
+import {
+  CUSTOM_AGENT_CREATE_ENTRY,
+  CUSTOM_AGENT_DETAIL_ENTRY,
+  CUSTOM_AGENTS_LIST_ENTRY,
+} from "@/pages/settings/search/catalog/customAgents";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import {
+  SettingsDataRegion,
+  SettingsOwner,
+  settingsOverlayProps,
+} from "@/pages/settings/search/settingsOwnership";
 import { BackButton } from "./HarnessCatalog";
 import { ApiError } from "@/lib/sessionsApi";
 
@@ -86,15 +98,20 @@ export function SettingsCustomAgentsSection() {
   if (!enabled) return null;
   if (!supported) return <UnsupportedServer />;
   const back = (
-    <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+    <SettingsOwner entry={CUSTOM_AGENT_DETAIL_ENTRY} part="back">
+      <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+    </SettingsOwner>
   );
   if (agentId === "new") {
     return (
-      <div className="@container">
-        {back}
-        <h1 className="settings-page-title mb-6 text-2xl font-medium">Create custom agent</h1>
+      <SettingsItem entry={CUSTOM_AGENT_CREATE_ENTRY} className="@container">
+        <SettingsOwner entry={CUSTOM_AGENT_CREATE_ENTRY} part="back">
+          <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+        </SettingsOwner>
+        <h1 className="settings-page-title mb-6 text-2xl font-medium">
+          {CUSTOM_AGENT_CREATE_ENTRY.label}
+        </h1>
         <CreateAgentForm
-          submitLabel="Save agent"
           notice="Reusing an installed agent's name replaces its configuration and updates its sessions. Use a new name to keep both agents."
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {
@@ -102,17 +119,21 @@ export function SettingsCustomAgentsSection() {
             navigate(agentPath(agent.id));
           }}
         />
-      </div>
+      </SettingsItem>
     );
   }
   if (detailId) {
     return (
-      <div className="@container">
+      <SettingsItem entry={CUSTOM_AGENT_DETAIL_ENTRY} className="@container">
         {!detail.data && back}
         {detail.isError && detail.data && (
           <p role="alert" className="mb-4 text-ui">
             Could not refresh this agent.{" "}
-            <Button variant="link" onClick={() => void detail.refetch()}>
+            <Button
+              {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "retry")}
+              variant="link"
+              onClick={() => void detail.refetch()}
+            >
               Retry
             </Button>
           </p>
@@ -123,7 +144,11 @@ export function SettingsCustomAgentsSection() {
           ) : (
             <p role="alert">
               Could not load this agent.{" "}
-              <Button variant="link" onClick={() => void detail.refetch()}>
+              <Button
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "retry")}
+                variant="link"
+                onClick={() => void detail.refetch()}
+              >
                 Retry
               </Button>
             </p>
@@ -139,7 +164,7 @@ export function SettingsCustomAgentsSection() {
           />
         ) : (
           <>
-            <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agent</h1>
+            <h1 className="mb-6 text-2xl font-medium">Custom agent</h1>
             <p className="text-ui text-muted-foreground">
               {detail.isPending
                 ? "Loading agent…"
@@ -147,18 +172,18 @@ export function SettingsCustomAgentsSection() {
             </p>
           </>
         )}
-      </div>
+      </SettingsItem>
     );
   }
   return (
-    <div className="@container">
-      <h1 className="settings-page-title pb-6 text-2xl font-medium">Custom agents</h1>
+    <SettingsItem entry={CUSTOM_AGENTS_LIST_ENTRY} className="@container">
+      <h1 className="pb-6 text-2xl font-medium">Custom agents</h1>
       <div className="mb-6 flex items-center gap-2">
         <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
           <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
           <input
+            {...settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "search")}
             type="search"
-            aria-label="Search agents"
             placeholder="Search agents…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -166,7 +191,11 @@ export function SettingsCustomAgentsSection() {
           />
         </div>
         <Button asChild size="sm">
-          <Link to={`${BASE}/new`} componentId="settings.custom_agents.create">
+          <Link
+            {...settingsControlProps(CUSTOM_AGENTS_LIST_ENTRY, "create")}
+            to={`${BASE}/new`}
+            componentId="settings.custom_agents.create"
+          >
             <PlusIcon />
             Create
           </Link>
@@ -181,24 +210,30 @@ export function SettingsCustomAgentsSection() {
         <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
           Built-in &amp; server agents
         </h2>
-        <div className="grid gap-3 @lg:grid-cols-2">
+        <SettingsDataRegion
+          entry={CUSTOM_AGENTS_LIST_ENTRY}
+          region="serverAgents"
+          className="grid gap-3 @lg:grid-cols-2"
+        >
           {builtins.map((agent) => (
-            <Link
-              key={agent.id}
-              to={agentPath(agent.id)}
-              componentId="settings.custom_agents.review_server"
-              className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
-            >
-              <span className="flex items-center gap-3 font-medium">
-                <BotIcon className="size-5 shrink-0" aria-hidden />
-                {capitalizeAgentName(agent.name)}
-              </span>
-              <span className="text-sm text-muted-foreground">
-                {agent.description || "Server-provided agent"}
-              </span>
-            </Link>
+            <div key={agent.id} data-settings-region-row className="contents">
+              <Link
+                data-settings-row-action="open"
+                to={agentPath(agent.id)}
+                componentId="settings.custom_agents.review_server"
+                className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
+              >
+                <span className="flex items-center gap-3 font-medium">
+                  <BotIcon className="size-5 shrink-0" aria-hidden />
+                  {capitalizeAgentName(agent.name)}
+                </span>
+                <span className="text-sm text-muted-foreground">
+                  {agent.description || "Server-provided agent"}
+                </span>
+              </Link>
+            </div>
           ))}
-        </div>
+        </SettingsDataRegion>
         <ListStatus
           query={servers}
           scope="server"
@@ -211,7 +246,11 @@ export function SettingsCustomAgentsSection() {
           Yours
         </h2>
         {filtered.length > 0 && (
-          <div className="overflow-x-auto">
+          <SettingsDataRegion
+            entry={CUSTOM_AGENTS_LIST_ENTRY}
+            region="yourAgents"
+            className="overflow-x-auto"
+          >
             <table className="w-full min-w-[36rem] text-left text-ui">
               <thead>
                 <tr className="border-b border-border">
@@ -233,10 +272,12 @@ export function SettingsCustomAgentsSection() {
                 {filtered.map((agent) => (
                   <tr
                     key={agent.id}
+                    data-settings-region-row
                     className="relative border-b border-border transition-colors last:border-0 hover:bg-muted/40 focus-within:bg-muted/40"
                   >
                     <td className="max-w-0 p-2">
                       <Link
+                        data-settings-row-action="open"
                         to={agentPath(agent.id)}
                         componentId="settings.custom_agents.review"
                         className="flex items-center gap-2.5 rounded-sm outline-none after:absolute after:inset-0 focus-visible:ring-2 focus-visible:ring-ring"
@@ -262,7 +303,7 @@ export function SettingsCustomAgentsSection() {
                 ))}
               </tbody>
             </table>
-          </div>
+          </SettingsDataRegion>
         )}
         <ListStatus
           query={yours}
@@ -275,14 +316,14 @@ export function SettingsCustomAgentsSection() {
           }
         />
       </section>
-    </div>
+    </SettingsItem>
   );
 }
 
 function UnsupportedServer() {
   return (
     <div>
-      <h1 className="settings-page-title mb-6 text-2xl font-medium">Custom agents</h1>
+      <h1 className="mb-6 text-2xl font-medium">Custom agents</h1>
       <p role="alert" className="text-ui text-muted-foreground">
         Custom agents settings is unavailable on this server. Update the server and reload to enable
         it.
@@ -309,6 +350,10 @@ function ListStatus({
       <p role="alert" className="py-4 text-ui">
         Could not load agents.{" "}
         <Button
+          {...settingsControlProps(
+            CUSTOM_AGENTS_LIST_ENTRY,
+            scope === "user" ? "retryYours" : "retryServer",
+          )}
           variant="link"
           onClick={() => void client.resetQueries({ queryKey: ["settings-agents", scope] })}
         >
@@ -321,6 +366,10 @@ function ListStatus({
       {empty && <p className="py-4 text-ui text-muted-foreground">{emptyText}</p>}
       {query.hasNextPage && (
         <Button
+          {...settingsControlProps(
+            CUSTOM_AGENTS_LIST_ENTRY,
+            scope === "user" ? "loadMoreYours" : "loadMoreServer",
+          )}
           className="mt-4"
           variant="outline"
           loading={query.isFetchingNextPage}
@@ -371,13 +420,18 @@ function AgentDetail({
         <CustomAgentConfigForm id={agent.id} name={agent.name} onDelete={confirmDelete} />
       ) : (
         <>
-          <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+          <SettingsOwner entry={CUSTOM_AGENT_DETAIL_ENTRY} part="back">
+            <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+          </SettingsOwner>
           <div className="flex items-start justify-between gap-4">
-            <h1 className="settings-page-title min-w-0 break-words text-2xl font-medium">
-              {agent.name}
-            </h1>
+            <h1 className="min-w-0 break-words text-2xl font-medium">{agent.name}</h1>
             {owned === true && (
-              <Button variant="ghost" size="icon" aria-label="Delete agent" onClick={confirmDelete}>
+              <Button
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "delete")}
+                variant="ghost"
+                size="icon"
+                onClick={confirmDelete}
+              >
                 <TrashIcon className="size-4" />
               </Button>
             )}
@@ -461,7 +515,10 @@ function AgentDetail({
           if (!remove.isPending) setConfirm(open);
         }}
       >
-        <DialogContent showCloseButton={!remove.isPending}>
+        <DialogContent
+          showCloseButton={!remove.isPending}
+          {...settingsOverlayProps(CUSTOM_AGENT_DETAIL_ENTRY, "delete")}
+        >
           <DialogHeader>
             <DialogTitle>Delete {agent.name}?</DialogTitle>
             <DialogDescription>
@@ -476,10 +533,20 @@ function AgentDetail({
             </p>
           )}
           <DialogFooter>
-            <Button variant="ghost" disabled={remove.isPending} onClick={() => setConfirm(false)}>
+            <Button
+              data-settings-dialog-action="Cancel"
+              variant="ghost"
+              disabled={remove.isPending}
+              onClick={() => setConfirm(false)}
+            >
               Cancel
             </Button>
             <Button
+              {...settingsControlProps(
+                CUSTOM_AGENT_DETAIL_ENTRY,
+                "confirmDelete",
+                inUse === null ? undefined : { alternative: "inUse" },
+              )}
               variant="destructive"
               loading={remove.isPending}
               disabled={remove.isPending}

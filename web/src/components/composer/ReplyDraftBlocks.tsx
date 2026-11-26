@@ -2,17 +2,24 @@ import { useRef, type ComponentProps } from "react";
 import { XIcon } from "lucide-react";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import type { ReplyQuote } from "@/lib/replyDraft";
-import { ComposerTextInput } from "./ChatComposer";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import { ComposerEngineInput } from "./ChatComposer";
 
-type TextInputProps = ComponentProps<typeof ComposerTextInput>;
+type TextInputProps = ComponentProps<typeof ComposerEngineInput>;
 
 function ReplyTextInput({ input, keyboard, onGrowth }: TextInputProps & { onGrowth?: () => void }) {
-  const ref = useRef<HTMLTextAreaElement>(null);
+  // The textarea grows by measuring itself; the CodeMirror engine grows on its own.
+  const ref = useRef<ComposerTextTarget | null>(null);
   useAutoGrowTextarea(ref, String(input.value ?? ""), Infinity, onGrowth);
   return (
-    <ComposerTextInput
+    <ComposerEngineInput
       keyboard={keyboard}
-      input={{ ...input, ref, className: "min-h-[20.8px] max-h-none overflow-y-hidden" }}
+      input={{
+        ...input,
+        ref,
+        heightMode: "unbounded",
+        className: "min-h-[20.8px] max-h-none overflow-y-hidden",
+      }}
     />
   );
 }
@@ -44,6 +51,7 @@ export function ReplyDraftBlocks({
               onGrowth={onGrowth}
               input={{
                 ...inputFor(quote),
+                inputId: quote.id,
                 value: quote.before,
                 "aria-label": `Reply text before quote ${index + 1}`,
                 disabled,

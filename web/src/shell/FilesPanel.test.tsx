@@ -1,3 +1,4 @@
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { type ComponentProps, useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -69,6 +70,10 @@ vi.mock("./WorkspacePicker", async (importOriginal) => ({
 }));
 
 // The panel reads the session's host to point the directory browser at it.
+let sandboxStarting = false;
+vi.mock("@/hooks/useSessionReconnect", () => ({
+  useSandboxStarting: () => sandboxStarting,
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: { hostId: "host_test" } })),
 }));
@@ -487,6 +492,18 @@ describe("FilesPanel on an asleep sandbox", () => {
       expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
     },
   );
+
+  it("says the sandbox is starting while Reconnect host wakes it", () => {
+    useAsleepMock.mockReturnValue(true);
+    sandboxStarting = true;
+    try {
+      renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
+      expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
+      expect(screen.queryByText("Send a message in the chat to start it again.")).toBeNull();
+    } finally {
+      sandboxStarting = false;
+    }
+  });
 
   it("keeps showing a list cached before the sandbox went offline", () => {
     useAsleepMock.mockReturnValue(true);
@@ -1497,6 +1514,19 @@ describe("FilesPanel scroll position persistence", () => {
     if (!section) throw new Error("scroll section not found");
     return { result, section };
   }
+
+  it("windows the Changes list against the same scroll container", () => {
+    const { container } = renderPanel({
+      conversationId: "conv_scroll_changes",
+      flatView: true,
+      files: [],
+      changedFiles: [changedFile("src/app.ts")],
+    });
+
+    const section = container.querySelector("section");
+    expect(section).not.toBeNull();
+    expect(vi.mocked(useVirtualizer).mock.lastCall?.[0].getScrollElement()).toBe(section);
+  });
 
   it("restores the saved scroll position when returning to a conversation", () => {
     const files = Array.from({ length: 50 }, (_, i) => file(`file-${i}.ts`));

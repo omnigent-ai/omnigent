@@ -27,6 +27,10 @@ interface ParsedSource {
 }
 
 interface SourceBlocks {
+  /** The loaded Markdown as given, before line endings are normalised into `source`. */
+  markdown: string;
+  /** The document the editor held once it loaded `markdown`. */
+  loadedDoc: ProseMirrorNode;
   source: string;
   segments: { start: number; end: number; nodes: ProseMirrorNode[] }[];
   segmentOf: Map<ProseMirrorNode, number>;
@@ -227,11 +231,25 @@ export function rememberSourceBlocks(editor: Editor, markdown: string): void {
     return { start, end, nodes };
   });
   editorBlocks.set(editor, {
+    markdown: parsed.markdown,
+    loadedDoc: doc,
     source: parsed.source,
     segments,
     segmentOf,
     definitions: definitionSources(doc),
   });
+}
+
+/**
+ * The Markdown last passed to :func:`rememberSourceBlocks` for *editor*, and
+ * the document the editor held once it loaded it.
+ *
+ * :param editor: The Markdown editor.
+ * :returns: The load, or null when its blocks were not recorded.
+ */
+export function rememberedLoad(editor: Editor): { markdown: string; doc: ProseMirrorNode } | null {
+  const blocks = editorBlocks.get(editor);
+  return blocks ? { markdown: blocks.markdown, doc: blocks.loadedDoc } : null;
 }
 
 /** *text* without leading newlines or trailing blank lines. */
