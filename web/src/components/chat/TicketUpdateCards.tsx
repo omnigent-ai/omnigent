@@ -1,11 +1,17 @@
 // Shows an automatic ticket-update turn as one quiet card: a single ticket, or a
 // grouped list for a digest. The agent still receives the original text.
 
-import { useContext, type ReactNode } from "react";
+import { useContext, useId, useState, type ReactNode } from "react";
 import { useInRouterContext } from "react-router-dom";
 import { Link } from "@/lib/routing";
 import { QueryClientContext, useQuery } from "@tanstack/react-query";
-import { ArrowUpRightIcon, BotIcon, CircleAlertIcon, UserIcon } from "lucide-react";
+import {
+  ArrowUpRightIcon,
+  BotIcon,
+  ChevronRightIcon,
+  CircleAlertIcon,
+  UserIcon,
+} from "lucide-react";
 import { useProjects } from "@/hooks/useConversations";
 import { getTicket, getTicketStages, type TicketStage } from "@/lib/projectTicketsApi";
 import type { TicketUpdateCard, TicketUpdateMessage } from "@/lib/ticketUpdateMessage";
@@ -174,6 +180,38 @@ function OpenHint() {
   );
 }
 
+/** The notification exactly as the agent received it, folded away by default. */
+function SystemDetails({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  return (
+    <div className="border-t border-border/60">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen(!open)}
+        className="flex w-full items-center justify-end gap-1 px-3.5 py-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset"
+      >
+        System details
+        <ChevronRightIcon
+          aria-hidden
+          className={cn("size-3.5 transition-transform", open && "rotate-90")}
+        />
+      </button>
+      {open && (
+        <pre
+          id={panelId}
+          data-testid="ticket-update-system-text"
+          className="max-h-72 overflow-auto border-t border-border/60 bg-muted/40 px-3.5 py-2.5 font-mono text-[11px] leading-4 break-words whitespace-pre-wrap text-muted-foreground"
+        >
+          {text}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 interface CardView {
   card: TicketUpdateCard;
   title: string;
@@ -182,7 +220,7 @@ interface CardView {
 }
 
 /** The full card for a turn about one ticket. */
-function SingleCard({ view }: { view: CardView }) {
+function SingleCard({ view, footer }: { view: CardView; footer: ReactNode }) {
   const { card, title, stage, href } = view;
   const ask = askOf(card);
   const attention = ask !== null || card.escalated;
@@ -210,6 +248,7 @@ function SingleCard({ view }: { view: CardView }) {
         {ask && <p className="mt-2 text-sm font-medium text-pretty text-foreground">{ask}</p>}
         <Quote card={card} oneLine={ask !== null} />
       </TicketLink>
+      {footer}
     </div>
   );
 }
@@ -279,26 +318,42 @@ function offlineView(card: TicketUpdateCard): CardView {
   return { card, title: card.title ?? "Ticket", stage: card.movedTo, href: null };
 }
 
-function LiveSingle({ projectId, card }: { projectId: string; card: TicketUpdateCard }) {
-  return <SingleCard view={useCardView(projectId, card)} />;
+function LiveSingle({
+  projectId,
+  card,
+  footer,
+}: {
+  projectId: string;
+  card: TicketUpdateCard;
+  footer: ReactNode;
+}) {
+  return <SingleCard view={useCardView(projectId, card)} footer={footer} />;
 }
 
 function LiveRow({ projectId, card }: { projectId: string; card: TicketUpdateCard }) {
   return <DigestRow view={useCardView(projectId, card)} />;
 }
 
-export function TicketUpdateCards({ message }: { message: TicketUpdateMessage }) {
+export function TicketUpdateCards({
+  message,
+  systemText,
+}: {
+  message: TicketUpdateMessage;
+  /** The original notification, shown on request. */
+  systemText?: string;
+}) {
   // Isolated renders (tests, previews) have no query client: show what the text holds.
   const live = useContext(QueryClientContext) !== undefined;
   const { cards, projectId } = message;
+  const footer = systemText ? <SystemDetails text={systemText} /> : null;
   if (cards.length === 1) {
     const card = cards[0]!;
     return (
       <div data-testid="ticket-update-cards" className="w-full max-w-[640px]">
         {live ? (
-          <LiveSingle projectId={projectId} card={card} />
+          <LiveSingle projectId={projectId} card={card} footer={footer} />
         ) : (
-          <SingleCard view={offlineView(card)} />
+          <SingleCard view={offlineView(card)} footer={footer} />
         )}
       </div>
     );
@@ -330,6 +385,7 @@ export function TicketUpdateCards({ message }: { message: TicketUpdateMessage })
           ),
         )}
       </div>
+      {footer}
     </div>
   );
 }

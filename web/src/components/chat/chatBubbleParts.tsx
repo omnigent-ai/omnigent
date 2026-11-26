@@ -1152,15 +1152,22 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
     // The server's automatic ticket notifications read as ticket cards, including
-    // one that wasn't delivered: nobody typed it, so it isn't shown as their message.
-    if (!isShellCommand && (!bubble.pending || bubble.undelivered)) {
-      const ticketUpdate = parseTicketUpdateMessage(
-        stripAutomationContext(joinTextBlocks(bubble.content)),
-      );
+    // one still queued or not delivered: nobody typed it, so it isn't their message.
+    if (!isShellCommand) {
+      const systemText = stripAutomationContext(joinTextBlocks(bubble.content));
+      const ticketUpdate = parseTicketUpdateMessage(systemText);
       if (ticketUpdate)
         return (
           <div data-message-id={bubble.itemId} className="flex w-full flex-col items-start">
-            <TicketUpdateCards message={ticketUpdate} />
+            <TicketUpdateCards message={ticketUpdate} systemText={systemText} />
+            {bubble.pending && !bubble.undelivered && (
+              <span
+                className="pt-1 pl-1 text-xs text-muted-foreground"
+                data-testid="ticket-update-queued"
+              >
+                Queued for the agent
+              </span>
+            )}
             {bubble.undelivered && (
               <UndeliveredMessageNotice
                 sessionId={sessionId}

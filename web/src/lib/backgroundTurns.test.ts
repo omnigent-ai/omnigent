@@ -58,6 +58,14 @@ describe("automaticInputKind", () => {
     expect(automaticInputKind(user("s", "[System: timer reminder fired]"))).toBe("system");
     expect(automaticInputKind(user("h", "What's the status?"))).toBeNull();
   });
+
+  it("counts a queued ticket update but not a queued person's message", () => {
+    expect(automaticInputKind({ ...ticketUpdate("t"), pending: true } as Bubble)).toBe(
+      "ticket_update",
+    );
+    const queued = { ...user("h", "What's the status?"), pending: true } as Bubble;
+    expect(automaticInputKind(queued)).toBeNull();
+  });
 });
 
 describe("foldBackgroundTurns", () => {
@@ -141,6 +149,20 @@ describe("foldBackgroundTurns", () => {
       assistant("a2"),
     ]);
     expect(rows.map((row) => row.kind)).toEqual(["background_updates", "user", "assistant"]);
+  });
+
+  it("folds queued ticket updates and keeps a new needs-human ticket visible", () => {
+    const created = user(
+      "t3",
+      `Automatic ticket update for project p1. Use the orchestrator skill to handle it.\n\nTicket ${TICKET} · created\n{"title": "Cover", "labels": [{"key": "needs-human", "value": "Which cover?"}]}`,
+    );
+    const queued = { ...ticketUpdate("t4"), pending: true } as Bubble;
+    const rows = foldBackgroundTurns([ticketUpdate("t1"), assistant("a1"), created, queued]);
+    expect(rows.map((row) => row.kind)).toEqual([
+      "background_updates",
+      "user",
+      "background_updates",
+    ]);
   });
 
   it("folds digest turns and keeps a batch that marks a ticket needs-human visible", () => {

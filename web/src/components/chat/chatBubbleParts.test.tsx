@@ -1523,6 +1523,26 @@ describe("automatic ticket updates", () => {
     expect(screen.queryByRole("button", { name: "Show raw" })).toBeNull();
   });
 
+  it("shows a queued ticket update as a card with its system text on request", () => {
+    render(
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "pending_update",
+          pending: true,
+          content: [{ type: "input_text", text }],
+        }}
+      />,
+    );
+    expect(screen.getByTestId("ticket-update-card")).toHaveTextContent("Board overflow");
+    expect(screen.getByTestId("ticket-update-queued")).toBeInTheDocument();
+    expect(screen.queryByTestId("ticket-update-system-text")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "System details" }));
+    expect(screen.getByTestId("ticket-update-system-text")).toHaveTextContent(
+      `- ${ticketId} "Board overflow": agent note`,
+    );
+  });
+
   it("shows a worker's person-comment turn as a card, keeping undelivered actions", () => {
     const notice =
       `A person commented on ticket ${ticketId} "tabs on project page shift" in project ${"d".repeat(32)}, which you are linked to:\n\n` +

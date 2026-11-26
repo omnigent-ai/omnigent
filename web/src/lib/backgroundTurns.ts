@@ -15,8 +15,8 @@ const TICKET_UPDATE_PREFIXES = [
 ];
 // A full event section ("Ticket <id> · <kind>") or a digest line ("- <id> \"title\": …").
 const TICKET_ID_RE = /^(?:Ticket ([0-9a-f]{32}) · |- ([0-9a-f]{32}) ")/gm;
-// An urgent update section: its header line, then its payload as one JSON line.
-const TICKET_UPDATED_RE = /^Ticket [0-9a-f]{32} · updated\n(\{.*\})$/gm;
+// A created or updated section: its header line, then its payload as one JSON line.
+const TICKET_LABELS_RE = /^Ticket [0-9a-f]{32} · (?:created|updated)\n(\{.*\})$/gm;
 
 export type AutomaticInputKind = "ticket_update" | "session_message" | "system";
 
@@ -34,9 +34,11 @@ function userText(bubble: UserBubble): string {
 
 /** What started *bubble*, when no person wrote it; null for a person's message. */
 export function automaticInputKind(bubble: Bubble): AutomaticInputKind | null {
-  if (bubble.kind !== "user" || bubble.pending || bubble.shellCommand !== undefined) return null;
+  if (bubble.kind !== "user" || bubble.shellCommand !== undefined) return null;
   const text = userText(bubble);
+  // A ticket update still queued for a busy agent folds like a delivered one.
   if (TICKET_UPDATE_PREFIXES.some((prefix) => text.startsWith(prefix))) return "ticket_update";
+  if (bubble.pending) return null;
   if (splitSessionMessageOrigin(text) !== null) return "session_message";
   if (isSystemUserContent(bubble.content)) return "system";
   return null;
@@ -78,9 +80,10 @@ function isTurnBody(bubble: Bubble): boolean {
 
 function payloadAddsNeedsHuman(payload: string): boolean {
   try {
-    const parsed: unknown = JSON.parse(payload);
-    const changes = (parsed as { changes?: Record<string, unknown> } | null)?.changes;
-    return changes !== undefined && changes !== null && addsNeedsHuman(changes);
+    const parsed = JSON.parse(payload) as { changes?: Record<string, unknown> | null } | null;
+    if (parsed === null || typeof parsed !== "object") return false;
+    // An update carries labels under "changes"; a new ticket carries them at the top.
+    return addsNeedsHuman(parsed.changes ?? (parsed as Record<string, unknown>));
   } catch {
     return false;
   }
@@ -89,7 +92,7 @@ function payloadAddsNeedsHuman(payload: string): boolean {
 /** Whether a ticket-update input reports a ticket now marked ``needs-human``. */
 function reportsNeedsHuman(bubble: Bubble): boolean {
   if (bubble.kind !== "user") return false;
-  for (const match of userText(bubble).matchAll(TICKET_UPDATED_RE)) {
+  for (const match of userText(bubble).matchAll(TICKET_LABELS_RE)) {
     if (payloadAddsNeedsHuman(match[1]!)) return true;
   }
   return false;
