@@ -78,6 +78,11 @@ def workspace_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, st
         _cleanup_session_workdir(session_id)
 
 
+def _start_with_no_pinned_pages(page: Page) -> None:
+    """Start the session's strips with nothing pinned, for a journey that opens its own tabs."""
+    page.add_init_script(f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))")
+
+
 def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None:
     """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``.
 
@@ -85,9 +90,7 @@ def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None
     pinned unless ``settings_pins`` keeps Settings as shipped.
     """
     if enabled and not settings_pins:
-        page.add_init_script(
-            f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))"
-        )
+        _start_with_no_pinned_pages(page)
 
     def answer(route: Route) -> None:
         response = route.fetch()
