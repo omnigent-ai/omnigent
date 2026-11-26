@@ -30,16 +30,17 @@ HEAD = "a" * 40
 MOVED = "1" * 40
 PR_URL = "https://github.com/example-org/example-repo/pull/7"
 OTHER_URL = "https://github.com/example-org/example-repo/pull/8"
+THIRD_URL = "https://github.com/example-org/example-repo/pull/9"
 GITLAB_URL = "https://gitlab.com/example-org/example-repo/-/merge_requests/7"
 
 
 class FakeGitHub:
-    """Answers ``gh pr`` commands and GraphQL requests for pull requests 7 and 8."""
+    """Answers ``gh pr`` commands and GraphQL requests for pull requests 7, 8 and 9."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.state = {"state": "OPEN", "isDraft": False}
-        self.heads = {7: HEAD, 8: HEAD}
-        self.node_states = {7: "OPEN", 8: "OPEN"}
+        self.heads = {7: HEAD, 8: HEAD, 9: HEAD}
+        self.node_states = {7: "OPEN", 8: "OPEN", 9: "OPEN"}
         self.gh_calls: list[tuple[list[str], str | None]] = []
         self.mutations: list[dict[str, Any]] = []
         # The answer to the next ``gh pr`` change: (exit code, stderr).
@@ -309,14 +310,19 @@ def test_auto_merge_sends_each_pull_request_at_the_head_the_user_saw(fake: FakeG
 def test_auto_merge_stops_at_the_first_moved_head_and_sends_nothing_after_it(
     fake: FakeGitHub,
 ) -> None:
-    fake.heads[7] = MOVED
+    fake.heads[8] = MOVED
 
-    result = _auto_merge(_item(PR_URL), _item(OTHER_URL))
+    result = _auto_merge(_item(PR_URL), _item(OTHER_URL), _item(THIRD_URL))
 
     assert result["results"] == [
-        {"pr_url": PR_URL, "error": PULL_REQUEST_CHANGED_MESSAGE, "reason": "pull_request_changed"}
+        {"pr_url": PR_URL, "enabled_at": "t"},
+        {
+            "pr_url": OTHER_URL,
+            "error": PULL_REQUEST_CHANGED_MESSAGE,
+            "reason": "pull_request_changed",
+        },
     ]
-    assert fake.mutations == []
+    assert [mutation["pullRequestId"] for mutation in fake.mutations] == ["PR_7"]
 
 
 def test_auto_merge_reports_each_refusal_and_goes_on(fake: FakeGitHub) -> None:
