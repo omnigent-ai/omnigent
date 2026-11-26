@@ -645,7 +645,7 @@ function createSurface(view: EditorView): ComposerEditorSurface {
     blur() {
       view.contentDOM.blur();
     },
-    insertText(text, start, end) {
+    insertText(text, start, end, options) {
       // Shared composer edits (paste, ⌥↵, list continuation) never change a locked draft.
       if (view.state.readOnly) return false;
       const from = clamp(start);
@@ -655,7 +655,10 @@ function createSurface(view: EditorView): ComposerEditorSurface {
         selection: { anchor: from + insert.length },
         userEvent: "input",
         // Each programmatic insert is its own undo step, not joined to the typing around it.
-        annotations: isolateHistory.of("full"),
+        annotations:
+          options?.history === false
+            ? Transaction.addToHistory.of(false)
+            : isolateHistory.of("full"),
       });
       return true;
     },

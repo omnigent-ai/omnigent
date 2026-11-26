@@ -94,10 +94,14 @@ function splice(
 export function useDictationInsert(
   draft: string,
   /**
-   * Writes `next`, which is `draft` with `change` made. A setter that writes through the input
-   * itself returns the text the input then holds, since an editor may adjust a write.
+   * Writes `next`, which is `draft` with `change` made; `final` when it pins an utterance. A
+   * setter that writes through the input returns the text it then holds, as an editor may adjust it.
    */
-  setDraft: (next: string, change: { from: number; to: number; insert: string }) => string | void,
+  setDraft: (
+    next: string,
+    change: { from: number; to: number; insert: string },
+    final: boolean,
+  ) => string | void,
   textareaRef?: RefObject<ComposerTextTarget | null>,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
@@ -208,7 +212,7 @@ export function useDictationInsert(
         to: spliced.region.start + (region?.text.length ?? 0),
         insert: spliced.region.text,
       };
-      const written = setDraft(spliced.next, change) ?? spliced.next;
+      const written = setDraft(spliced.next, change, pin) ?? spliced.next;
       // A write the input adjusted or refused leaves nothing here to revise; its text is the base.
       const kept = written === spliced.next;
       draftRef.current = written;

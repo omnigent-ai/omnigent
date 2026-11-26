@@ -2537,13 +2537,18 @@ function ComposerImpl(
   // whether anything else edited it since. See onVoiceDiscard.
   const voiceTakeRef = useRef<{ before: string; last: string; clean: boolean } | null>(null);
   // In the one document dictation writes through the editor, so its card rules apply.
-  const writeDictation = (next: string, change: { from: number; to: number; insert: string }) => {
+  // Only a final is an undo step, so undo takes back a whole utterance and never shows a partial.
+  const writeDictation = (
+    next: string,
+    change: { from: number; to: number; insert: string },
+    final: boolean,
+  ) => {
     const target = textareaRef.current;
     if (replyDocument === null) return setValue(next);
     if (!target || isComposerTextarea(target)) return setReplyDocument(next);
     const take = voiceTakeRef.current;
     if (take && target.value !== take.last) take.clean = false;
-    target.insertText(change.insert, change.from, change.to);
+    target.insertText(change.insert, change.from, change.to, { history: final });
     if (take) take.last = target.value;
     return target.value;
   };
@@ -4946,6 +4951,8 @@ function ComposerImpl(
                 onListeningChange={setDictating}
                 inputRef={textareaRef}
                 onTranscript={(text) => {
+                  // In the editor the partial goes first, so the final is inserted as one step.
+                  if (replyDocument !== null) dictation.replaceInterim("");
                   dictation.appendFinal(text);
                   dirtyRef.current = true;
                   // Dictation is a user-driven edit — exit prompt-recall mode

@@ -809,7 +809,11 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     run(undo);
     fireEvent.click(removeButtons()[1]!);
     expect(target().value).toBe(lines("Opener", a, ""));
-    run(undo);
+  });
+
+  it("removes a card with its X, which undo brings back exactly", () => {
+    const value = lines("Opener", a, "", b, "");
+    const { target, run, removeButtons } = mountQuotes(value);
     fireEvent.click(removeButtons()[0]!);
     expect(target().value).toBe(lines("Opener", b, ""));
     run(undo);
@@ -830,14 +834,22 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     expect(separated.target().value).toBe(lines(b, "Reply"));
   });
 
-  it("copies quotes as markdown", () => {
+  it("copies, drags and cuts quotes as markdown", () => {
     const value = lines("Intro", b, "Reply");
-    const { content, caretAt, target } = mountQuotes(value);
+    const markdown = lines("Intro", "> Beta", "> more", "Reply");
+    const { content, caretAt, target, run } = mountQuotes(value);
     act(() => target().focus());
     caretAt(0, value.length);
     const setData = vi.fn();
     fireEvent.copy(content, { clipboardData: { setData, clearData: vi.fn() } });
-    expect(setData).toHaveBeenCalledWith("text/plain", lines("Intro", "> Beta", "> more", "Reply"));
+    expect(setData).toHaveBeenLastCalledWith("text/plain", markdown);
+    fireEvent.dragStart(content, { dataTransfer: { setData } });
+    expect(setData).toHaveBeenLastCalledWith("Text", markdown);
+    fireEvent.cut(content, { clipboardData: { setData, clearData: vi.fn() } });
+    expect(setData).toHaveBeenLastCalledWith("text/plain", markdown);
+    expect(target().value).toBe("");
+    run(undo);
+    expect(target().value).toBe(value);
   });
 
   it("strips tokens from a paste the composer inserts itself", () => {

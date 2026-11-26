@@ -36,6 +36,8 @@ import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engin
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 import { quoteLine } from "@/lib/replyDraftDocument";
+import { redo, undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
 import type * as ComposerMicButtonModule from "@/components/ComposerMicButton";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -10710,27 +10712,43 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
   });
 
   it.each([
-    ["under the card", (value: string) => value.length, (spoken: string) => spoken],
-    ["above the card", () => "Intro".length, () => ""],
-  ])("streams dictation into the draft with the caret %s", async (_where, caret, tail) => {
-    const { reply } = await renderEditor();
-    type("Intro");
-    reply("First point");
-    act(() => editor().setSelectionRange(caret(editor().value), caret(editor().value)));
-    act(() => mic.current!.onVoiceStart!());
-    act(() => mic.current!.onInterim!("hel"));
-    act(() => mic.current!.onInterim!("hello wor"));
-    act(() => mic.current!.onTranscript("hello world"));
-    act(() => mic.current!.onInterim!("and"));
-    act(() => mic.current!.onTranscript("and more"));
-    const spoken = "hello world and more";
-    const lines = editor().value.split("\n");
-    expect([lines[0], lines[2]]).toEqual([
-      tail(spoken) ? "Intro" : `Intro ${spoken}`,
-      tail(spoken),
-    ]);
-    expect(cards()).toHaveLength(1);
-  });
+    [
+      "under the card",
+      (base: string) => base.length,
+      (base: string, spoken: string) => base + spoken,
+    ],
+    [
+      "above the card",
+      () => "Intro".length,
+      (base: string, spoken: string) => base.replace("Intro", `Intro ${spoken}`),
+    ],
+  ])(
+    "streams dictation with the caret %s, each final one undo step",
+    async (_where, caret, dictated) => {
+      const { reply } = await renderEditor();
+      type("Intro");
+      reply("First point");
+      const base = editor().value;
+      act(() => editor().setSelectionRange(caret(base), caret(base)));
+      act(() => mic.current!.onVoiceStart!());
+      act(() => mic.current!.onInterim!("hel"));
+      act(() => mic.current!.onInterim!("hello wor"));
+      expect(editor().value).toBe(dictated(base, "hello wor"));
+      act(() => mic.current!.onTranscript("hello world"));
+      act(() => mic.current!.onInterim!("and"));
+      act(() => mic.current!.onTranscript("and more"));
+      expect(editor().value).toBe(dictated(base, "hello world and more"));
+      expect(cards()).toHaveLength(1);
+
+      const view = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
+      act(() => void undo(view));
+      expect(editor().value).toBe(dictated(base, "hello world"));
+      act(() => void undo(view));
+      expect(editor().value).toBe(base);
+      act(() => void redo(view));
+      expect(editor().value).toBe(dictated(base, "hello world"));
+    },
+  );
 
   it("discards a take that only dictated, back to the text before it", async () => {
     const { reply } = await renderEditor();
