@@ -322,6 +322,35 @@ def landed_stage_index(config: dict[str, Any], stages: list[dict[str, Any]]) -> 
     return next((index for index, stage in enumerate(stages) if stage.get("is_complete")), None)
 
 
+def ticket_times(
+    histories: StageHistories, stages: list[dict[str, Any]], config: dict[str, Any]
+) -> dict[str, dict[str, int | None]]:
+    """Each ticket's ``completed_at`` and ``landed_at`` from its stage history.
+
+    ``completed_at`` is its latest move into a completed stage, while it's still in one.
+    ``landed_at`` is its latest move from before the landed stage to it or later, while
+    it's still at or past it. Either is ``None`` otherwise.
+    """
+    start = landed_stage_index(config, stages)
+    rank = {str(stage["id"]): index for index, stage in enumerate(stages)}
+    times: dict[str, dict[str, int | None]] = {}
+    for ticket_id, history in histories.items():
+        last = history[-1] if history else None
+        completed = (
+            last["at"] if last and last["is_complete"] and not last.get("created") else None
+        )
+        landed = None
+        if start is not None and last and rank.get(last["stage_id"], -1) >= start:
+            crossings = [
+                after["at"]
+                for before, after in itertools.pairwise(history)
+                if rank.get(before["stage_id"], -1) < start <= rank.get(after["stage_id"], -1)
+            ]
+            landed = crossings[-1] if crossings else None
+        times[ticket_id] = {"completed_at": completed, "landed_at": landed}
+    return times
+
+
 def landed_commit(labels: dict[str, str]) -> str | None:
     """The ticket's landed commit: its first full-SHA label in ``LANDED_COMMIT_LABELS``."""
     for key in LANDED_COMMIT_LABELS:

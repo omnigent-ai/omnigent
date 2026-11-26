@@ -33,9 +33,11 @@ if TYPE_CHECKING:
     from omnigent.entities import Conversation, Project
     from omnigent.entities.project import ProjectIdentity
 
-StatusWindow = Literal["7d", "30d", "all"]
-STATUS_WINDOWS: tuple[StatusWindow, ...] = ("7d", "30d", "all")
+StatusWindow = Literal["24h", "7d", "30d", "all"]
+STATUS_WINDOWS: tuple[StatusWindow, ...] = ("24h", "7d", "30d", "all")
 _WINDOW_DAYS: dict[str, int | None] = {"7d": 7, "30d": 30, "all": None}
+#: The rolling window's length; day-granular sources (spend) count every UTC day it touches.
+ROLLING_WINDOW_SECONDS = {"24h": 86_400}
 STATUS_TIME_ZONE = "UTC"
 
 # Member keys: "user:<user_id>", "identity:<identity_id>" (the Lead is
@@ -62,10 +64,11 @@ def identity_member_key(identity_id: str) -> MemberKey:
 class StatusPeriod:
     """The window every metric is measured over.
 
-    :param window: ``"7d"``, ``"30d"`` or ``"all"``.
+    :param window: ``"24h"`` (rolling), ``"7d"``, ``"30d"`` or ``"all"``.
     :param today_utc: The UTC calendar day at request time, ``"YYYY-MM-DD"``.
     :param since_day_utc: The window's inclusive first UTC day, or ``None`` for ``"all"``.
-    :param since_epoch: 00:00:00 UTC of ``since_day_utc``, or ``None`` for ``"all"``.
+    :param since_epoch: 00:00:00 UTC of ``since_day_utc`` (for ``"24h"``, exactly 24 hours
+        before request time), or ``None`` for ``"all"``.
     :param until_epoch: Request time; nothing later exists yet.
     """
 
@@ -91,11 +94,18 @@ class StatusPeriod:
 def status_period(window: StatusWindow, now_epoch: int) -> StatusPeriod:
     """Resolve *window* at *now_epoch* into its UTC day bounds.
 
-    :raises ValueError: for a window other than ``"7d"``, ``"30d"`` or ``"all"``.
+    ``"24h"`` starts exactly 24 hours before *now_epoch*; its first UTC day is the one
+    that moment falls in.
+
+    :raises ValueError: for a window other than ``"24h"``, ``"7d"``, ``"30d"`` or ``"all"``.
     """
+    today = datetime.fromtimestamp(now_epoch, tz=UTC).date()
+    if window in ROLLING_WINDOW_SECONDS:
+        since_epoch = now_epoch - ROLLING_WINDOW_SECONDS[window]
+        since_day = datetime.fromtimestamp(since_epoch, tz=UTC).date().isoformat()
+        return StatusPeriod(window, today.isoformat(), since_day, since_epoch, now_epoch)
     if window not in _WINDOW_DAYS:
         raise ValueError(f"unknown status window {window!r}")
-    today = datetime.fromtimestamp(now_epoch, tz=UTC).date()
     days = _WINDOW_DAYS[window]
     if days is None:
         return StatusPeriod(window, today.isoformat(), None, None, now_epoch)

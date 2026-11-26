@@ -64,6 +64,7 @@ from omnigent.server.persona_mentions import (
     person_aliases,
     split_mentions,
 )
+from omnigent.server.project_kpis import ticket_times
 from omnigent.server.project_landing import RISK_OK_LABEL, could_supersede, is_pure_rebase
 from omnigent.server.project_reliability import settings as reliability_settings
 from omnigent.server.project_router import router_session_ids
@@ -772,6 +773,19 @@ def create_project_tickets_router(
                 )
                 ticket["working"] = ticket_working(workers)
 
+    def add_ticket_times(project_id: str, page: dict[str, Any], user_id: str | None) -> None:
+        """Set each row's ``completed_at`` and ``landed_at`` from one history read."""
+        rows = page["data"]
+        if not rows:
+            return
+        histories = store.stage_histories(
+            project_id, user_id=user_id, ticket_ids=[row["id"] for row in rows]
+        )
+        record = projects.get(project_id, user_id=user_id) if projects is not None else None
+        times = ticket_times(histories, page["stages"], (record.config if record else None) or {})
+        for row in rows:
+            row.update(times.get(row["id"], {"completed_at": None, "landed_at": None}))
+
     async def board_stall(
         request: Request, page: dict[str, Any], who: TicketActor
     ) -> BoardStall | None:
@@ -799,15 +813,32 @@ def create_project_tickets_router(
         limit: int = Query(50, ge=1, le=100),
         include_guidance: bool = False,
         mine: bool = Query(False, description="Only tickets the caller requested."),
+        completed_since: int | None = Query(
+            None,
+            ge=0,
+            description=(
+                "Only tickets now in a completed stage that last entered it at or after this "
+                "Unix time, e.g. what finished in the last 24 hours."
+            ),
+        ),
     ) -> dict[str, Any]:
         """List a page of tickets.
 
         Each ticket's ``latest_comment`` is its newest comment by a person or for the
         human (``text``, ``user_id``, ``session_id``, ``by_person``, ``position``,
         ``created_at``), or null. Unlike ``latest_update``, stage moves and label edits
-        don't replace it.
+        don't replace it. ``completed_at`` and ``landed_at`` come from its stage history:
+        its latest move into a completed stage, and into the landed stage or later, while
+        it's still there; else null.
         """
         who = await actor(request, project_id)
+        finished = (
+            None
+            if completed_since is None
+            else await asyncio.to_thread(
+                store.completed_since, project_id, completed_since, user_id=who.user_id
+            )
+        )
         page = await asyncio.to_thread(
             store.list,
             project_id,
@@ -816,7 +847,9 @@ def create_project_tickets_router(
             after=after,
             limit=limit,
             requested_by=who.user_id if mine else None,
+            ticket_ids=finished,
         )
+        await asyncio.to_thread(add_ticket_times, project_id, page, who.user_id)
         # Project sessions already carry this guidance in their instructions.
         if include_guidance and who.session_id is not None:
             page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION

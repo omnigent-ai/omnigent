@@ -90,7 +90,7 @@ class ProjectStatusSummary(BaseModel):
 
     object: Literal["project.status_summary"]
     project_id: str
-    window: Literal["7d", "30d", "all"]
+    window: StatusWindow
     time_zone: Literal["UTC"]
     today_utc: str
     since_day_utc: str | None

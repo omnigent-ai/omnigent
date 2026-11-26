@@ -47,7 +47,11 @@ from omnigent.server.project_telemetry import (
     visible_people,
 )
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes.project_kpis import WindowParam
+from omnigent.server.routes.project_kpis import (
+    ProjectStatusTrendDay,
+    WindowParam,
+    daily_trends,
+)
 from omnigent.server.routes.project_status import _measure, move_member_resolver
 from omnigent.server.usage_events import usage_event_store
 
@@ -199,6 +203,13 @@ class SpendSplit(BaseModel):
     by_ticket: TicketSpendSplit
 
 
+class TelemetryDailySeries(BaseModel):
+    """The Summary's trend buckets: one per UTC day, or per week past 90 days."""
+
+    bucket: Literal["day", "week"]
+    days: list[ProjectStatusTrendDay]
+
+
 class TelemetryRole(BaseModel):
     identity_id: str
     name: str
@@ -229,6 +240,11 @@ class ProjectTelemetry(BaseModel):
     throughput: Throughput
     spend: SpendSplit | None = Field(
         default=None, description="Spend by role and by ticket; null without a spend source."
+    )
+    daily: TelemetryDailySeries | None = Field(
+        default=None,
+        description="Per-day tickets filed and finished, open tickets, changes landed, PRs "
+        "and spend, as the Summary's trend charts; only with series=daily.",
     )
     role: TelemetryRole | None = Field(
         default=None,
@@ -353,6 +369,37 @@ def create_project_telemetry_router(
             **review_rounds_and_stalled(role_histories, stages(), stage_ages, period),
         }
 
+    def daily_series(
+        request: Request,
+        project: Project,
+        period: Any,
+        user_id: str | None,
+        role: RoleScope | None,
+    ) -> dict[str, Any]:
+        """The trend buckets for *period*, narrowed to *role* when given."""
+        inputs = KpiInputs(
+            project=project,
+            period=period,
+            sources=sources(request),
+            stage_histories=functools.cache(
+                lambda: ticket_store.stage_histories(project.id, user_id=user_id)
+            ),
+            stages=functools.cache(
+                lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
+            ),
+            ticket_labels=functools.cache(
+                lambda: ticket_store.label_values(
+                    project.id, LANDED_COMMIT_LABELS, user_id=user_id
+                )
+            ),
+        )
+        filed = ticket_store.requested_tickets(
+            project.id, user_id=user_id, since_epoch=period.since_epoch
+        )
+        if role is None:
+            return daily_trends(inputs, filed)
+        return daily_trends(inputs, filed, role.ticket_ids, role.session_ids)
+
     def spend_split(
         project: Project,
         period: Any,
@@ -394,6 +441,7 @@ def create_project_telemetry_router(
         window: StatusWindow,
         user_id: str | None,
         identity_id: str | None = None,
+        series: str | None = None,
     ) -> dict[str, Any]:
         period = status_period(window, now_epoch())
         identities = project_store.list_identities(project.id, user_id=user_id)
@@ -475,6 +523,9 @@ def create_project_telemetry_router(
             **result,
             "throughput": throughput(request, project, period, user_id, histories, stages, role),
             "spend": spend_split(project, period, user_id, spend_rows, identities),
+            "daily": None
+            if series != "daily"
+            else daily_series(request, project, period, user_id, role),
             "role": None
             if identity is None
             else {"identity_id": identity.id, "name": identity.name},
@@ -497,6 +548,10 @@ def create_project_telemetry_router(
                 description="Only this role's throughput and spend; the rest stays project-wide."
             ),
         ] = None,
+        series: Annotated[
+            Literal["daily"] | None,
+            Query(description="daily adds the Summary's per-day trend series as `daily`."),
+        ] = None,
     ) -> dict[str, Any]:
         """How people work in a project: starting work, talking to roles, building the team.
 
@@ -507,7 +562,9 @@ def create_project_telemetry_router(
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-        return await asyncio.to_thread(build, request, project, window, user_id, identity_id)
+        return await asyncio.to_thread(
+            build, request, project, window, user_id, identity_id, series
+        )
 
     @router.get("/telemetry", response_model=TelemetryOverview)
     async def telemetry_overview(

@@ -36,6 +36,12 @@ class ListTickets(BaseModel):
     )
     after: str | None = Field(default=None, description="Previous page's last_id.")
     limit: int = Field(default=50, ge=1, le=100)
+    completed_since: int | None = Field(
+        default=None,
+        ge=0,
+        description="Only tickets that finished (entered a completed stage) at or after this "
+        "Unix time and are still finished, e.g. now minus 86400 for the last 24 hours.",
+    )
     compact: bool = Field(
         default=True,
         description="Compact rows (no descriptions, truncated latest_update, stage IDs and "
@@ -251,8 +257,9 @@ class SysTicketListTool(_TicketTool):
     read_only = True
     help_text = (
         "List tickets, oldest first, and this project's ordered stages. By default rows are "
-        "compact (ID, title, stage, labels, truncated latest update, updated_at, running "
-        "agents) and stages carry only ID, name and completion; pass compact=false for "
+        "compact (ID, title, stage, labels, truncated latest update, updated_at, "
+        "completed_at and landed_at, running agents) and stages carry only ID, name and "
+        "completion; pass compact=false for "
         "descriptions and full stage definitions, or read one with sys_ticket_get. "
         "The first stage starts new tickets; the last means complete. Read these before choosing "
         "a stage; do not assume fixed names. Filtering by the last stage lists newest first. "
@@ -629,8 +636,10 @@ _KPI_ROLE = Field(
 
 class GetProjectKpis(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    window: Literal["7d", "30d", "all"] = Field(
-        default="7d", description="The UTC window values are measured over, as on the Summary."
+    window: Literal["24h", "7d", "30d", "all"] = Field(
+        default="7d",
+        description="The UTC window values are measured over, as on the Summary; 24h is the "
+        "rolling last 24 hours (spend counts whole UTC days it touches).",
     )
     role: str | None = _KPI_ROLE
 
@@ -652,6 +661,14 @@ class SysProjectKpisGetTool(_TicketTool):
     arguments = GetProjectKpis
 
 
+class GetProjectTelemetry(GetProjectKpis):
+    series: Literal["daily"] | None = Field(
+        default=None,
+        description="daily adds per-day tickets filed and finished, open tickets, changes "
+        "landed, PRs and spend over the window, as the Summary's trend charts.",
+    )
+
+
 class SysProjectTelemetryGetTool(_TicketTool):
     tool_name = "sys_project_telemetry_get"
     read_only = True
@@ -664,7 +681,7 @@ class SysProjectTelemetryGetTool(_TicketTool):
         "sessions; the other sections stay project-wide. Totals only; per-person rows are "
         "never returned to agents. Numbers that aren't measured on this server are null."
     )
-    arguments = GetProjectKpis
+    arguments = GetProjectTelemetry
 
 
 class SysProjectKpisSetTool(_TicketTool):

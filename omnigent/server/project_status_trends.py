@@ -55,7 +55,9 @@ def buckets(period: StatusPeriod, earliest_day: str | None) -> tuple[str, list[B
     result = []
     for begin in reversed(starts):
         since = day_start(begin.isoformat())
-        result.append(Bucket(begin.isoformat(), since, min(since + step * DAY, end)))
+        # A rolling window starts mid-day; its first bucket counts only from then.
+        start = max(since, period.since_epoch or since)
+        result.append(Bucket(begin.isoformat(), start, min(since + step * DAY, end)))
     return size, result
 
 

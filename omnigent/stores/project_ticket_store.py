@@ -711,7 +711,12 @@ class ProjectTicketStore:
             return moves
 
     def stage_histories(
-        self, project_id: str, *, user_id: str | None, since_epoch: int | None = None
+        self,
+        project_id: str,
+        *,
+        user_id: str | None,
+        since_epoch: int | None = None,
+        ticket_ids: Collection[str] | None = None,
     ) -> builtins.dict[str, builtins.list[dict[str, Any]]]:
         """Each ticket's stages in time order, starting with the one it was created in.
 
@@ -723,6 +728,7 @@ class ProjectTicketStore:
         :param since_epoch: Only tickets created or updated at or after it, each with
             its whole history, so a move's previous stage and the ticket's creation
             are still there. ``None`` reads every ticket.
+        :param ticket_ids: Only these tickets, e.g. one page of a list.
 
         With a move resolver set, entries come from the stage-move table and add
         ``member_key``; tickets are those with a move since *since_epoch*.
@@ -735,6 +741,12 @@ class ProjectTicketStore:
                     SqlProjectTicketStageMove.project_id == project.id,
                 )
                 stmt = select(SqlProjectTicketStageMove).where(*scope)
+                if ticket_ids is not None:
+                    stmt = stmt.where(
+                        SqlProjectTicketStageMove.ticket_id.in_(
+                            [_identifier(ticket_id) for ticket_id in ticket_ids]
+                        )
+                    )
                 if since_epoch is not None:
                     active = (
                         select(SqlProjectTicketStageMove.ticket_id)
@@ -765,6 +777,12 @@ class ProjectTicketStore:
                 SqlProjectTicketEvent.kind.in_((EVENT_CODES["created"], EVENT_CODES["updated"])),
             )
             stmt = select(SqlProjectTicketEvent).where(*scope)
+            if ticket_ids is not None:
+                stmt = stmt.where(
+                    SqlProjectTicketEvent.ticket_id.in_(
+                        [_identifier(ticket_id) for ticket_id in ticket_ids]
+                    )
+                )
             if since_epoch is not None:
                 active = (
                     select(SqlProjectTicketEvent.ticket_id)
@@ -796,6 +814,21 @@ class ProjectTicketStore:
                     }
                 )
             return histories
+
+    def completed_since(
+        self, project_id: str, since_epoch: int, *, user_id: str | None
+    ) -> builtins.set[str]:
+        """Tickets now in a completed stage that last entered it at or after *since_epoch*."""
+        return {
+            ticket_id
+            for ticket_id, history in self.stage_histories(
+                project_id, user_id=user_id, since_epoch=since_epoch
+            ).items()
+            if history
+            and history[-1]["is_complete"]
+            and not history[-1].get("created")
+            and history[-1]["at"] >= since_epoch
+        }
 
     def activity_actors(
         self, project_id: str, *, user_id: str | None, since_epoch: int | None
@@ -1296,8 +1329,9 @@ class ProjectTicketStore:
         after: str | None = None,
         limit: int = 50,
         requested_by: str | None = None,
+        ticket_ids: Collection[str] | None = None,
     ) -> dict[str, Any]:
-        """List a page of tickets, optionally only one stage or one requester's."""
+        """List a page of tickets, optionally only one stage, one requester's or some IDs."""
         limit = max(1, min(limit, TICKET_PAGE_MAX))
         with self._session("list_tickets") as session:
             project = self._project(session, project_id, user_id)
@@ -1311,6 +1345,7 @@ class ProjectTicketStore:
                 after=self._row(session, project_id, after) if after is not None else None,
                 limit=limit + 1,
                 requested_by=requested_by,
+                ticket_ids=ticket_ids,
             )
             latest_comments = self._latest_comments(session, project, rows[:limit])
             page: dict[str, Any] = {
@@ -1330,7 +1365,13 @@ class ProjectTicketStore:
                 # The first page carries the full match count, so a board lane can show
                 # its real size without paging through every ticket.
                 page["total"] = (
-                    self._stage_count(session, project, stage_id, requested_by=requested_by)
+                    self._stage_count(
+                        session,
+                        project,
+                        stage_id,
+                        requested_by=requested_by,
+                        ticket_ids=ticket_ids,
+                    )
                     if page["has_more"]
                     else len(page["data"])
                 )
@@ -1809,6 +1850,7 @@ class ProjectTicketStore:
         stage_id: str | None,
         *,
         requested_by: str | None = None,
+        ticket_ids: Collection[str] | None = None,
     ) -> int:
         """Count the tickets ``_stage_rows`` would list, on the same index."""
         stmt = (
@@ -1821,6 +1863,10 @@ class ProjectTicketStore:
         )
         if requested_by is not None:
             stmt = stmt.where(SqlProjectTicket.requested_by == requested_by)
+        if ticket_ids is not None:
+            stmt = stmt.where(
+                SqlProjectTicket.id.in_([_identifier(ticket_id) for ticket_id in ticket_ids])
+            )
         if stage_id is not None:
             stmt = stmt.where(SqlProjectTicket.stage_id == stage_id)
         return int(session.scalar(stmt) or 0)
@@ -1835,6 +1881,7 @@ class ProjectTicketStore:
         after: SqlProjectTicket | None = None,
         write: bool = False,
         requested_by: str | None = None,
+        ticket_ids: Collection[str] | None = None,
     ) -> builtins.list[SqlProjectTicket]:
         # The completed stage only grows, so it lists the most recently created first.
         descending = stage_id is not None and _stages(project).stages[-1].id == stage_id
@@ -1844,6 +1891,10 @@ class ProjectTicketStore:
         )
         if requested_by is not None:
             stmt = stmt.where(SqlProjectTicket.requested_by == requested_by)
+        if ticket_ids is not None:
+            stmt = stmt.where(
+                SqlProjectTicket.id.in_([_identifier(ticket_id) for ticket_id in ticket_ids])
+            )
         if after is not None:
             stmt = stmt.where(
                 keyset_after(

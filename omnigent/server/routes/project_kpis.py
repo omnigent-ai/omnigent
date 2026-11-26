@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Request
@@ -218,7 +219,7 @@ class ProjectStatusTrends(BaseModel):
 
     object: Literal["project.status_trends"]
     project_id: str
-    window: Literal["7d", "30d", "all"]
+    window: StatusWindow
     today_utc: str
     bucket: Literal["day", "week"]
     days: list[ProjectStatusTrendDay]
@@ -237,6 +238,37 @@ def submitted_series(project: Project, rows: list[dict[str, Any]]) -> MetricSeri
             )
             for row in rows
         ],
+    )
+
+
+def daily_trends(
+    inputs: KpiInputs,
+    filed: list[dict[str, Any]],
+    ticket_ids: Collection[str] | None = None,
+    session_ids: Collection[str] = (),
+) -> dict[str, Any]:
+    """The Summary's trend buckets (see ``project_status_trends``) for *inputs*' window.
+
+    With *ticket_ids*, only that role's tickets and *session_ids* count, as for role KPIs.
+    *inputs* should read the whole stage history, which the burndown replays.
+    """
+    series = load_series(["tickets_shipped", "merged_prs", "spend_usd", "changes_landed"], inputs)
+    filed_series = submitted_series(inputs.project, filed)
+    histories = inputs.stage_histories()
+    if ticket_ids is not None:
+        series = role_series(series, ticket_ids, session_ids)
+        filed_series = role_series({"filed": filed_series}, ticket_ids, session_ids)["filed"]
+        histories = {key: value for key, value in histories.items() if key in ticket_ids}
+    return trend_rows(
+        inputs.period,
+        {
+            "tickets_filed": filed_series,
+            "tickets_finished": series["tickets_shipped"],
+            "changes_landed": series["changes_landed"] if has_landed_commits(inputs) else None,
+            "prs_merged": series["merged_prs"] if series["merged_prs"].dated else None,
+            "spend_usd": series["spend_usd"] if series["spend_usd"].dated else None,
+        },
+        histories,
     )
 
 
@@ -599,32 +631,15 @@ def create_project_kpis_router(
         period = status_period(window, now_epoch())
         # The burndown replays every ticket's moves, so read the whole history.
         inputs = inputs_for(request, project, period, user_id, None)
-        series = load_series(
-            ["tickets_shipped", "merged_prs", "spend_usd", "changes_landed"], inputs
-        )
-        filed = submitted_series(
-            project,
-            ticket_store.requested_tickets(
-                project.id, user_id=user_id, since_epoch=period.since_epoch
-            ),
-        )
-        result = trend_rows(
-            period,
-            {
-                "tickets_filed": filed,
-                "tickets_finished": series["tickets_shipped"],
-                "changes_landed": series["changes_landed"] if has_landed_commits(inputs) else None,
-                "prs_merged": series["merged_prs"] if series["merged_prs"].dated else None,
-                "spend_usd": series["spend_usd"] if series["spend_usd"].dated else None,
-            },
-            inputs.stage_histories(),
+        filed = ticket_store.requested_tickets(
+            project.id, user_id=user_id, since_epoch=period.since_epoch
         )
         return {
             "object": "project.status_trends",
             "project_id": project.id,
             "window": window,
             "today_utc": period.today_utc,
-            **result,
+            **daily_trends(inputs, filed),
         }
 
     @router.get("/projects/{project_id}/status/trends", response_model=ProjectStatusTrends)

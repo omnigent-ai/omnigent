@@ -27,6 +27,7 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import current_workspace_id
+from omnigent.server.project_status import ROLLING_WINDOW_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -186,9 +187,19 @@ def _drop_pending(session: Session) -> None:
         pending.clear()
 
 
-def period_key(period: Any) -> tuple[str, str, str | None]:
-    """A status period's cache key: its window and days, not the request's second."""
-    return (period.window, period.today_utc, period.since_day_utc)
+def period_key(period: Any) -> tuple[str, str, str | None, int | None]:
+    """A status period's cache key: its window and days, not the request's second.
+
+    A rolling window's start moves every second, so it's part of the key; those reads
+    effectively bypass the cache.
+    """
+    rolling = period.window in ROLLING_WINDOW_SECONDS
+    return (
+        period.window,
+        period.today_utc,
+        period.since_day_utc,
+        period.since_epoch if rolling else None,
+    )
 
 
 class CachedSource:

@@ -310,6 +310,8 @@ _COMPACT_TICKET_FIELDS = (
     "labels",
     "latest_update",
     "updated_at",
+    "completed_at",
+    "landed_at",
     "comment_count",
     "has_running_agents",
     "needs_final_update",
