@@ -1,13 +1,13 @@
 # Automations (scheduled tasks)
 
-Recurring schedules have a minimum interval
-of **10 minutes** on connected hosts in either session mode, and in sandboxes
-when continuing the existing session. Starting a new sandbox session each run
-requires **one hour**. Use `FREQ=MINUTELY;INTERVAL=10` for a ten-minute schedule.
+Recurring schedules have a minimum interval of **10 minutes** on every execution
+target and session mode, including a sandbox that starts a new session each run.
+Use `FREQ=MINUTELY;INTERVAL=10` for a ten-minute schedule.
 The custom editor requires `automations_v2`. Servers advertise support through
-`scheduled_task_subhour` in `/v1/info`; this is a fixed capability, with no rollout
-switch. Older servers that omit the field keep the hourly client limit without
-rewriting saved schedules.
+`scheduled_task_subhour` in `/v1/info`, and `scheduled_task_subhour_new_sandbox` for
+new sandbox sessions; these are fixed capabilities, with no rollout switch. Against
+an older server that omits one, the client keeps the hourly limit where that server
+needs it, without rewriting saved schedules.
 See the [rollout guidance](../omnigent/server/scheduled/README.md#sub-hour-schedule-rollout).
 
 An automation is a saved instruction that fires an agent session on a recurring schedule. Each firing starts or continues a real session, bound to an agent, that runs a stored prompt -- so "triage new issues every weekday at 9" or "summarize yesterday's alerts each morning" runs without anyone at the keyboard.
@@ -157,14 +157,13 @@ the scheduler logs the reason and clears its next-run time instead of leaving
 an expired timestamp. Update the rule to resume scheduling.
 An empty search stops at the horizon even when filters yield no candidates.
 Schedules with no occurrence in the window are not armed; validation requires
-at least two occurrences and a ten-minute minimum for connected hosts or
-continued sessions, or an hourly minimum for new sandbox sessions.
+at least two occurrences and a ten-minute minimum.
 
 A schedule is an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545) recurrence rule evaluated in the task's IANA timezone.
 
 | Intent | `rrule` |
 | --- | --- |
-| Every 10 minutes (connected host or continued sandbox session) | `FREQ=MINUTELY;INTERVAL=10` |
+| Every 10 minutes | `FREQ=MINUTELY;INTERVAL=10` |
 | Every hour | `FREQ=HOURLY` |
 | Daily at 09:00 local | `FREQ=DAILY;BYHOUR=9;BYMINUTE=0` |
 | Weekdays at 09:00 local | `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0` |
@@ -173,7 +172,7 @@ The rule is anchored at midnight of the local day, which gives occurrences a det
 
 Beyond syntax checks, create and update reject these cases with a 400:
 
-- **Gaps below the execution target and session mode’s minimum in the validation sample.** The validator checks consecutive occurrences from a fixed UTC anchor, stopping when it reaches an occurrence at least 25 hours after the first or samples 2,000 occurrences. It rejects gaps below ten minutes for connected hosts or continued sessions, or one hour for new sandbox sessions, within that sample. Irregular recurrence sets can contain shorter gaps later, so passing validation does not guarantee the minimum for every future firing or a bound on cost.
+- **Gaps below the ten-minute minimum in the validation sample.** The validator checks consecutive occurrences from a fixed UTC anchor, stopping when it reaches an occurrence at least 25 hours after the first or samples 2,000 occurrences. It rejects gaps below ten minutes within that sample. Irregular recurrence sets can contain shorter gaps later, so passing validation does not guarantee the minimum for every future firing or a bound on cost.
 - **Never fires.**
 - **Fires only once**, unless the rule says so with an explicit `COUNT=1` and the server creates one-time automations (it advertises `scheduled_task_one_time`; see Scheduler compatibility and rollback). A rule that fires once only because of a tight `UNTIL` is still rejected. `COUNT` counts from the task's creation, also after an edit, so changing an older task to a `COUNT=1` rule whose first match after creation has passed saves it as `completed` with no next run; create a new task instead. The legacy timer counts `COUNT` from midnight of each re-arm rather than from the task's creation, so it would fire a one-time rule again after a restart; it rejects them.
 

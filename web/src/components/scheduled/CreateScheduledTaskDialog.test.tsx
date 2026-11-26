@@ -7402,6 +7402,47 @@ describe("CreateScheduledTaskDialog workflow", () => {
     });
   });
 
+  it("saves a workflow's ten-minute schedule in a new sandbox each run", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt: run(""),
+          rrule: "FREQ=MINUTELY;INTERVAL=10",
+          executionTarget: "managed_sandbox",
+        })}
+      />,
+      {
+        info: {
+          ...SESSION_MODE_INFO,
+          scheduled_task_subhour: true,
+          scheduled_task_subhour_new_sandbox: true,
+          managed_sandboxes_enabled: true,
+        },
+      },
+    );
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "New session each run",
+    );
+    openAutomationSection("Schedule");
+    expect(screen.getByLabelText("Repeat every")).toHaveValue(10);
+    expect(screen.queryByTestId("schedule-error")).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("Automation title"), {
+      target: { value: "Frequent triage" },
+    });
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).toMatchObject({ name: "Frequent triage", rrule: "FREQ=MINUTELY;INTERVAL=10" });
+    // Unchanged fields stay out of the PATCH, so the run target stays the sandbox.
+    expect(input).not.toHaveProperty("executionTarget");
+    expect(input).not.toHaveProperty("sessionMode");
+  });
+
   it("keeps instructions an automation already saved with its workflow editable", async () => {
     renderWithWorkflows(
       <CreateScheduledTaskDialog

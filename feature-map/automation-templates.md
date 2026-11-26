@@ -156,10 +156,12 @@ to customize.
   Custom schedule expands inline into Repeats, Every, On (for weekly/monthly/yearly),
   Month (yearly), and Start time rows. Changes apply to the form immediately;
   saving the automation persists them, and cancelling discards them.
-  The initial interval respects the server, target, and session-mode minimum.
+  The initial interval respects the server's minimum, which older servers set by target
+  and session mode.
   Custom schedule remains available for other recurrence patterns.
-  The shared modal supports ten-minute connected-host schedules in
-  either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
+  The shared modal supports ten-minute schedules on connected hosts and in sandboxes, in
+  either session mode; against a server without `scheduled_task_subhour_new_sandbox`,
+  new sandbox sessions stay hourly.
 - `rrule-editor`: the schedule picker opens with a Visual | RRULE toggle (RRULE needs
   `automations_v2`). RRULE takes one rule line, seeded from the current schedule, with
   the timezone below it and the end under Ends; the form checks only its shape, and the
@@ -251,8 +253,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching
   to continuation while preserving ten minutes. In either edit entry point, also
-  select a sandbox and turn **Start each run in a new session** off: ten minutes is valid;
-  turning it on blocks saving until the interval reaches sixty.
+  select a sandbox: ten minutes is valid in either session mode. Against a server without
+  `scheduled_task_subhour_new_sandbox`, starting each run in a new session blocks saving
+  until the interval reaches sixty.
   Repeat through the row menu and detail page. Without sub-hour support, the
   editor keeps the hourly minimum and displays saved minute rules without rewriting them.
 - `web/src/components/scheduled/triggerTemplates.test.ts` (`Slack thread replies`)

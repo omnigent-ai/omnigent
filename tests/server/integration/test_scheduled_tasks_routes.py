@@ -5603,9 +5603,11 @@ async def test_random_worktree_requires_pinned_repository(
     "execution_target,session_mode,minutes,status",
     [
         ("connected_host", "new", 10, 200),
+        ("connected_host", "new", 9, 400),
         ("connected_host", "continue", 10, 200),
         ("managed_sandbox", "continue", 10, 200),
-        ("managed_sandbox", "new", 10, 400),
+        ("managed_sandbox", "new", 10, 200),
+        ("managed_sandbox", "new", 9, 400),
         ("managed_sandbox", "new", 60, 200),
     ],
 )
@@ -5631,7 +5633,7 @@ async def test_create_interval_policy(
         assert response.json()["session_id"] is None
 
 
-async def test_update_validates_effective_schedule_and_session_mode(auth_client, auth_app):
+async def test_update_allows_ten_minutes_for_every_target_and_session_mode(auth_client, auth_app):
     auth_app.state.sandbox_config = _sandbox_deployment()
     response = await auth_client.post(
         "/v1/scheduled-tasks",
@@ -5641,14 +5643,14 @@ async def test_update_validates_effective_schedule_and_session_mode(auth_client,
     assert response.status_code == 200, response.text
     url = f"/v1/scheduled-tasks/{response.json()['id']}"
     for patch, expected in [
-        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 400),
+        ({"rrule": "FREQ=MINUTELY;INTERVAL=10"}, 200),
         ({"rrule": "FREQ=MINUTELY;INTERVAL=10", "session_mode": "continue"}, 200),
         ({"rrule": "FREQ=MINUTELY;INTERVAL=15"}, 200),
         ({"rrule": "FREQ=MINUTELY;INTERVAL=9"}, 400),
-        ({"session_mode": "new"}, 400),
+        ({"session_mode": "new"}, 200),
         ({"name": "Renamed"}, 200),
         ({"execution_target": "connected_host", "session_mode": "new"}, 200),
-        ({"execution_target": "managed_sandbox"}, 400),
+        ({"execution_target": "managed_sandbox"}, 200),
         ({"execution_target": "managed_sandbox", "session_mode": "continue"}, 200),
     ]:
         response = await auth_client.patch(url, json=patch, headers=_headers())
@@ -5662,31 +5664,25 @@ async def test_update_validates_effective_schedule_and_session_mode(auth_client,
     assert response.json()["session_mode"] == "new"
 
 
-@pytest.mark.parametrize("policy_field", ["session_mode", "execution_target"])
-@pytest.mark.parametrize("recurrence_first", [False, True])
+@pytest.mark.parametrize("ten_minutes_first", [False, True])
 async def test_concurrent_schedule_edits_reject_stale_validation(
-    auth_client, auth_app, monkeypatch, policy_field, recurrence_first
+    auth_client, auth_app, monkeypatch, ten_minutes_first
 ):
     auth_app.state.sandbox_config = _sandbox_deployment()
-    initial = _create_body(
-        execution_target="managed_sandbox" if policy_field == "session_mode" else "connected_host",
-        session_mode="continue" if policy_field == "session_mode" else "new",
-        host_id=None,
-        workspace=None,
-    )
+    initial = _create_body(execution_target="managed_sandbox", host_id=None, workspace=None)
     response = await auth_client.post("/v1/scheduled-tasks", json=initial, headers=_headers())
     assert response.status_code == 200, response.text
     url = f"/v1/scheduled-tasks/{response.json()['id']}"
-    recurrence_patch = {"rrule": "FREQ=MINUTELY;INTERVAL=10"}
-    policy_patch = {policy_field: "new" if policy_field == "session_mode" else "managed_sandbox"}
+    ten_minutes = {"rrule": "FREQ=MINUTELY;INTERVAL=10"}
+    half_hourly = {"rrule": "FREQ=MINUTELY;INTERVAL=30"}
     validate = scheduled_tasks_routes._validate_rrule_or_400
     validated = asyncio.Barrier(2)
     first_saved = asyncio.Event()
 
-    async def validate_together(rrule, session_mode, execution_target, *, allow_single_fire):
-        await validate(rrule, session_mode, execution_target, allow_single_fire=allow_single_fire)
+    async def validate_together(rrule, *, allow_single_fire):
+        await validate(rrule, allow_single_fire=allow_single_fire)
         await validated.wait()
-        if (rrule == recurrence_patch["rrule"]) != recurrence_first:
+        if (rrule == ten_minutes["rrule"]) != ten_minutes_first:
             await first_saved.wait()
 
     async def patch(fields, first):
@@ -5699,14 +5695,14 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     with monkeypatch.context() as patcher:
         patcher.setattr(scheduled_tasks_routes, "_validate_rrule_or_400", validate_together)
         async with asyncio.timeout(10):
-            recurrence_response, policy_response = await asyncio.gather(
-                patch(recurrence_patch, recurrence_first),
-                patch(policy_patch, not recurrence_first),
+            ten_minutes_response, half_hourly_response = await asyncio.gather(
+                patch(ten_minutes, ten_minutes_first),
+                patch(half_hourly, not ten_minutes_first),
             )
     winner, loser = (
-        (recurrence_response, policy_response)
-        if recurrence_first
-        else (policy_response, recurrence_response)
+        (ten_minutes_response, half_hourly_response)
+        if ten_minutes_first
+        else (half_hourly_response, ten_minutes_response)
     )
     assert winner.status_code == 200, winner.text
     assert loser.status_code == 409, loser.text
@@ -5719,10 +5715,9 @@ async def test_concurrent_schedule_edits_reject_stale_validation(
     )
     assert saved["state"] == "active"
     retry = await auth_client.patch(
-        url, json=policy_patch if recurrence_first else recurrence_patch, headers=_headers()
+        url, json=half_hourly if ten_minutes_first else ten_minutes, headers=_headers()
     )
-    assert retry.status_code == 400, retry.text
-    assert "Minimum interval is 60 minutes" in retry.text
+    assert retry.status_code == 200, retry.text
 
 
 # ── Sharing an automation ──────────────────────────────────────────────────
