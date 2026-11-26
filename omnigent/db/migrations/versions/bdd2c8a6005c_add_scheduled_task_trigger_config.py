@@ -153,7 +153,7 @@ def _refuse_while_a_task_has_no_rule() -> None:
         rows = bind.execute(_guard_page(tasks, after, bind.dialect.name)).all()
         if any(row.rrule is None for row in rows):
             raise RuntimeError(
-                "Delete the event-triggered scheduled tasks, which have no rrule, "
+                "Remove all task rows with NULL rrule, including retained deleted tasks, "
                 "before downgrading"
             )
         if len(rows) < _GUARD_BATCH:

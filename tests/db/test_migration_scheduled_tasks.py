@@ -1465,6 +1465,27 @@ def test_downgrade_guard_seeks_to_its_cursor_on_sqlite(db_engine: Engine) -> Non
     assert "scheduled_tasks.workspace_id = %s" in predicate
     assert "scheduled_tasks.id > %s" in predicate
     assert " OR " in predicate and " AND " in predicate
+    stored_tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    values = {
+        "name": "n",
+        "prompt": b"p",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with db_engine.begin() as conn:
+        conn.execute(
+            stored_tasks.insert(),
+            [
+                {"workspace_id": 0, "id": b"a" * 16, "rrule": "FREQ=DAILY", **values},
+                {"workspace_id": 0, "id": b"b" * 16, "rrule": "FREQ=DAILY", **values},
+                {"workspace_id": 1, "id": bytes(16), "rrule": None, **values},
+            ],
+        )
+        assert conn.execute(migration._guard_page(tasks, (0, b"a" * 16), "mysql")).all() == [
+            (0, b"b" * 16, "FREQ=DAILY"),
+            (1, bytes(16), None),
+        ]
 
 
 @pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
@@ -1598,7 +1619,7 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
             ).scalar_one()
             == 2
         )
-    with pytest.raises(RuntimeError, match="no rrule"):
+    with pytest.raises(RuntimeError, match="NULL rrule"):
         command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
     with engine.begin() as conn:
         conn.execute(tasks.delete().where(tasks.c.id == b"b" * 16))
@@ -1631,7 +1652,7 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
     sa.event.listen(sa.engine.Engine, "rollback", boundary)
     sa.event.listen(sa.engine.Engine, "before_cursor_execute", observe)
     try:
-        with pytest.raises(RuntimeError, match="no rrule"):
+        with pytest.raises(RuntimeError, match="NULL rrule"):
             command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
         assert len(pages) == 2
         assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
@@ -1639,7 +1660,7 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
             conn.execute(tasks.update().where(tasks.c.rrule.is_(None)).values(rrule="FREQ=DAILY"))
             conn.execute(tasks.insert().values(workspace_id=7, id=bytes(16), rrule=None, **values))
         pages.clear()
-        with pytest.raises(RuntimeError, match="no rrule"):
+        with pytest.raises(RuntimeError, match="NULL rrule"):
             command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
     finally:
         sa.event.remove(sa.engine.Engine, "commit", boundary)
