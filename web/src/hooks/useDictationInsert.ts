@@ -213,12 +213,27 @@ export function useDictationInsert(
         insert: spliced.region.text,
       };
       const written = setDraft(spliced.next, change, pin) ?? spliced.next;
-      // A write the input adjusted or refused leaves nothing here to revise; its text is the base.
-      const kept = written === spliced.next;
       draftRef.current = written;
-      producedRef.current = kept ? settled : null;
-      wantCaretRef.current = kept ? spliced.caret : null;
-      setInterimPending(kept && settled.region !== null);
+      // A refused write changed nothing, so what this hook owned still stands.
+      if (written === current) return;
+      // An editor may adjust a write, as it keeps a card's line its own. What it wrote between
+      // the text on either side is then the region; anything else leaves nothing to revise.
+      const head = base.slice(0, spliced.region.start);
+      const rest = base.slice(spliced.region.start);
+      const end = written.length - rest.length;
+      if (end < head.length || !written.startsWith(head) || !written.endsWith(rest)) {
+        producedRef.current = null;
+        wantCaretRef.current = null;
+        setInterimPending(false);
+        return;
+      }
+      const body = written.slice(head.length, end);
+      // The caret stays as far before the region's end as the splice put it.
+      const caret = end - (spliced.region.start + spliced.region.text.length - spliced.caret);
+      const owned = settled.region && body ? { start: head.length, text: body } : null;
+      producedRef.current = { value: written, region: owned, tail: caret };
+      wantCaretRef.current = caret;
+      setInterimPending(owned !== null);
     },
     [setDraft, textareaRef],
   );

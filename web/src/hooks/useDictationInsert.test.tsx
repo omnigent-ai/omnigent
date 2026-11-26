@@ -382,27 +382,23 @@ describe("useDictationInsert", () => {
 
 describe("useDictationInsert with a setter that writes through its input", () => {
   it.each([
-    ["adjusts", (next: string) => `${next}\n`, ["hel\n", "hel\nhello\n"]],
-    ["refuses", () => null, ["", ""]],
-  ])(
-    "builds on what the input holds when it %s a write, with no partial left to revise",
-    (_how, write, expected) => {
-      const { result } = renderHook(() => {
-        const [value, setValue] = useState("");
-        const dictation = useDictationInsert(value, (next) => {
-          const written = write(next) ?? value;
-          setValue(written);
-          return written;
-        });
-        return { value, ...dictation };
+    ["adjusts", (next: string) => `${next}\n`, ["hel\n", true, "hello\n"]],
+    ["refuses", () => null, ["", false, ""]],
+  ] as const)("revises only its own text when the input %s a write", (_how, write, expected) => {
+    const { result } = renderHook(() => {
+      const [value, setValue] = useState("");
+      const dictation = useDictationInsert(value, (next) => {
+        const written = write(next) ?? value;
+        setValue(written);
+        return written;
       });
-      act(() => result.current.replaceInterim("hel"));
-      expect(result.current.value).toBe(expected[0]);
-      expect(result.current.hasInterim).toBe(false);
-      act(() => result.current.replaceInterim("hello"));
-      expect(result.current.value).toBe(expected[1]);
-    },
-  );
+      return { value, ...dictation };
+    });
+    act(() => result.current.replaceInterim("hel"));
+    expect([result.current.value, result.current.hasInterim]).toEqual(expected.slice(0, 2));
+    act(() => result.current.replaceInterim("hello"));
+    expect(result.current.value).toBe(expected[2]);
+  });
 });
 
 describe("useDictationInsert on a non-textarea composer surface", () => {

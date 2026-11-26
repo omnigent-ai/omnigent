@@ -36,8 +36,6 @@ import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engin
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 import { quoteLine } from "@/lib/replyDraftDocument";
-import { redo, undo } from "@codemirror/commands";
-import { EditorView } from "@codemirror/view";
 import type * as ComposerMicButtonModule from "@/components/ComposerMicButton";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -10634,23 +10632,16 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     expect(await send(codeMirrorInfo)).toEqual(textareaCalls);
   });
 
-  it("shows the tail and its quote blocks in the textarea while the editor loads", () => {
-    resetCodeMirrorComposerLoadForTests(() => new Promise(() => {}));
-    const { reply } = renderComposer();
-    fireEvent.change(textarea(), { target: { value: "My introduction" } });
-    reply("First point");
-    fireEvent.change(textarea(), { target: { value: "My answer" } });
-    expect(textarea()).toHaveValue("My answer");
-    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
-    expect(cards()).toHaveLength(1);
-  });
-
   it("keeps the quotes and text when the engine switches mid-draft, either way", async () => {
     const finishLoad = deferEditorLoad();
     const { reply, switchTo } = renderComposer();
     fireEvent.change(textarea(), { target: { value: "My introduction" } });
     reply("First point");
     fireEvent.change(textarea(), { target: { value: "My answer" } });
+    // While the editor loads, the textarea shows the tail and its quote blocks.
+    expect(textarea()).toHaveValue("My answer");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(cards()).toHaveLength(1);
     await finishLoad();
     const lines = editor().value.split("\n");
     expect([lines[0], lines[2]]).toEqual(["My introduction", "My answer"]);
@@ -10662,6 +10653,46 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     expect(textarea()).toHaveValue("My answer");
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
     expect(cards()).toHaveLength(1);
+  });
+
+  it.each([
+    ["the textarea", plainInfo, codeMirrorInfo],
+    ["the editor", codeMirrorInfo, plainInfo],
+  ])("restores a draft saved on %s on the other engine", async (_saved, saveOn, restoreOn) => {
+    const awaitEngine = async (info: ServerInfo) => {
+      if (info === codeMirrorInfo) {
+        await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+      }
+    };
+    const saved = renderComposer(composerProps(), saveOn);
+    await awaitEngine(saveOn);
+    type("My introduction");
+    saved.reply("First point");
+    type("My answer");
+    await waitFor(() => expect(getSessionDraft("conv_cm_quotes")?.replyDraft).toBeDefined());
+    saved.unmount();
+
+    const props = composerProps();
+    renderComposer(props, restoreOn);
+    await awaitEngine(restoreOn);
+    await waitFor(() => expect(cards()).toHaveLength(1));
+    if (restoreOn === codeMirrorInfo) {
+      const lines = editor().value.split("\n");
+      expect([lines.length, lines[0], lines[2]]).toEqual([3, "My introduction", "My answer"]);
+    } else {
+      expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+      expect(textarea()).toHaveValue("My answer");
+    }
+    fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
+      "My introduction\n\n> First point\n\nMy answer",
+      undefined,
+      {
+        version: 1,
+        quotes: [{ before: "My introduction", text: "First point" }],
+        text: "My answer",
+      },
+    );
   });
 
   it("makes no card of a token typed into the textarea while the editor loads", async () => {
@@ -10730,6 +10761,10 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
       reply("First point");
       const base = editor().value;
       act(() => editor().setSelectionRange(caret(base), caret(base)));
+      // A take runs with focus on the mic button. jsdom renders none, so another composer button
+      // stands in for it.
+      act(() => screen.getByRole("button", { name: "Add" }).focus());
+      act(() => mic.current!.onListeningChange!(true));
       act(() => mic.current!.onVoiceStart!());
       act(() => mic.current!.onInterim!("hel"));
       act(() => mic.current!.onInterim!("hello wor"));
@@ -10740,12 +10775,15 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
       expect(editor().value).toBe(dictated(base, "hello world and more"));
       expect(cards()).toHaveLength(1);
 
-      const view = EditorView.findFromDOM(screen.getByLabelText("Message the agent"))!;
-      act(() => void undo(view));
+      // The take ends, as Enter or a click on the mic ends it; undo and redo are keys from here.
+      act(() => mic.current!.onListeningChange!(false));
+      const press = (key: string) =>
+        fireEvent.keyDown(document.activeElement!, { key, ctrlKey: true });
+      press("z");
       expect(editor().value).toBe(dictated(base, "hello world"));
-      act(() => void undo(view));
+      press("z");
       expect(editor().value).toBe(base);
-      act(() => void redo(view));
+      press("y");
       expect(editor().value).toBe(dictated(base, "hello world"));
     },
   );

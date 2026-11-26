@@ -158,7 +158,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
-import { quoteTextStart } from "@/lib/replyDraftDocument";
+import { quoteTextStart, settleQuoteLines } from "@/lib/replyDraftDocument";
 import {
   appendReplyDraft,
   appendReplyQuote,
@@ -2545,7 +2545,8 @@ function ComposerImpl(
   ) => {
     const target = textareaRef.current;
     if (replyDocument === null) return setValue(next);
-    if (!target || isComposerTextarea(target)) return setReplyDocument(next);
+    // No editor to apply the card rules, so the document is settled here.
+    if (!target || isComposerTextarea(target)) return setReplyDocument(settleQuoteLines(next));
     const take = voiceTakeRef.current;
     if (take && target.value !== take.last) take.clean = false;
     target.insertText(change.insert, change.from, change.to, { history: final });
@@ -4948,7 +4949,18 @@ function ComposerImpl(
                   const untouched = take?.clean && textareaRef.current?.value === take.last;
                   if (untouched && take.last !== take.before) setReplyDocument(take.before);
                 }}
-                onListeningChange={setDictating}
+                onListeningChange={(listening) => {
+                  setDictating(listening);
+                  // A take leaves focus on the mic button, where the editor's undo and redo keys
+                  // don't reach; give it back to the editor once the take ends.
+                  const active = document.activeElement;
+                  const onOwnButton =
+                    active instanceof HTMLButtonElement &&
+                    composerFormRef.current?.contains(active);
+                  if (!listening && replyDocument !== null && onOwnButton && !isMobileRef.current) {
+                    textareaRef.current?.focus({ preventScroll: true });
+                  }
+                }}
                 inputRef={textareaRef}
                 onTranscript={(text) => {
                   // In the editor the partial goes first, so the final is inserted as one step.

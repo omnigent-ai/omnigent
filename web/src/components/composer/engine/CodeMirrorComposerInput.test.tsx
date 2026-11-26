@@ -798,7 +798,7 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     ["Delete before the first card", "Opener".length, deleteCharForward, lines("Opener", b, "")],
   ])("removes a card with %s, which undo brings back exactly", (_key, caret, command, removed) => {
     const value = lines("Opener", a, "", b, "");
-    const { target, caretAt, run, removeButtons } = mountQuotes(value);
+    const { target, caretAt, run } = mountQuotes(value);
     caretAt(caret);
     run(command);
     expect(target().value).toBe(removed);
@@ -807,18 +807,26 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     run(redo);
     expect(target().value).toBe(removed);
     run(undo);
-    fireEvent.click(removeButtons()[1]!);
-    expect(target().value).toBe(lines("Opener", a, ""));
-  });
-
-  it("removes a card with its X, which undo brings back exactly", () => {
-    const value = lines("Opener", a, "", b, "");
-    const { target, run, removeButtons } = mountQuotes(value);
-    fireEvent.click(removeButtons()[0]!);
-    expect(target().value).toBe(lines("Opener", b, ""));
-    run(undo);
     expect(target().value).toBe(value);
   });
+
+  it.each([
+    ["first", 0, lines("Opener", b, "")],
+    ["last", 1, lines("Opener", a, "")],
+  ])(
+    "removes the %s card with its X after an undo, and undo brings it back",
+    (_which, index, removed) => {
+      const value = lines("Opener", a, "", b, "");
+      const { target, caretAt, run, removeButtons } = mountQuotes(value);
+      caretAt(value.length);
+      run(deleteCharBackward);
+      run(undo);
+      fireEvent.click(removeButtons()[index]!);
+      expect(target().value).toBe(removed);
+      run(undo);
+      expect(target().value).toBe(value);
+    },
+  );
 
   it("removes adjacent cards one per keystroke", () => {
     const { target, caretAt, run } = mountQuotes(lines(a, b, "Reply"));

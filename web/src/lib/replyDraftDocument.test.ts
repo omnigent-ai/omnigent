@@ -4,6 +4,7 @@ import {
   appendQuoteToDocument,
   parseQuoteLine,
   quoteLine,
+  quoteRemovalRange,
   quotesAsMarkdown,
   quoteTextStart,
   removeQuoteFromDocument,
@@ -50,6 +51,29 @@ describe("weaveReplyDraft and unweaveReplyDraft", () => {
     });
     expect(parseQuoteLine("\uFDD0bm90IGpzb24\uFDD1")).toBeNull();
   });
+
+  it("round-trips any text, its token using base64url's - and _", () => {
+    const text = "héllo 👋 日本語 ~~~???";
+    const line = quoteLine("id-1", text);
+    expect(line).toMatch(/-/);
+    expect(line).toMatch(/_/);
+    expect(parseQuoteLine(line)).toEqual({ id: "id-1", text });
+  });
+
+  it.each([
+    ["three fields", ["a", "b", "c"]],
+    ["a numeric id", [1, "b"]],
+    ["non-string text", ["a", null]],
+  ])("rejects a token with %s", (_name, payload) => {
+    const encoded = btoa(JSON.stringify(payload)).replace(/=+$/, "");
+    expect(
+      parseQuoteLine(`\uFDD0${encoded.replace(/\+/g, "-").replace(/\//g, "_")}\uFDD1`),
+    ).toBeNull();
+  });
+
+  it("weaves adjacent cards back with the blank line the textarea shows as an empty input", () => {
+    expect(weaveReplyDraft(unweaveReplyDraft(doc(a, b, "")))).toBe(doc(a, "", b, ""));
+  });
 });
 
 describe("document edits", () => {
@@ -65,6 +89,13 @@ describe("document edits", () => {
     ["a blank line that is text", doc("X", "", a, "Y"), "a", doc("X", "", "Y")],
   ])("removes %s", (_name, document, id, expected) => {
     expect(removeQuoteFromDocument(document, id)).toBe(expected);
+  });
+
+  it("removes a card by its line's offsets, and leaves an unknown quote alone", () => {
+    expect(quoteRemovalRange(doc("X", a, "Y"), "a")).toEqual({ from: 2, to: 2 + a.length + 1 });
+    expect(quoteRemovalRange(doc("X", a, ""), "a")).toEqual({ from: 1, to: 2 + a.length + 1 });
+    expect(quoteRemovalRange(doc("X", a, ""), "missing")).toBeNull();
+    expect(removeQuoteFromDocument(doc("X", a, ""), "missing")).toBe(doc("X", a, ""));
   });
 
   it("replaces only the tail, keeping every card", () => {

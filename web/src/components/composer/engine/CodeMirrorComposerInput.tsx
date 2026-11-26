@@ -331,13 +331,32 @@ function quoteCards(state: EditorState): DecorationSet {
   return Decoration.set(cards);
 }
 
-/** Each quote's atomic card, rebuilt on an edit and when read-only changes, which its X follows. */
+/** Whether `transaction` inserts a mark or edits a line holding one, so a card may change. */
+function touchesQuotes(transaction: Transaction): boolean {
+  const { doc } = transaction.startState;
+  let touches = false;
+  transaction.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+    touches ||= hasQuoteMark(inserted.toString());
+    const last = doc.lineAt(toA).number;
+    for (let number = doc.lineAt(fromA).number; !touches && number <= last; number += 1) {
+      touches = hasQuoteMark(doc.line(number).text);
+    }
+  });
+  return touches;
+}
+
+/** Each quote's atomic card, rebuilt when an edit reaches one and when read-only changes. */
 const quoteCardField = StateField.define<DecorationSet>({
   create: quoteCards,
-  update: (cards, transaction) =>
-    transaction.docChanged || transaction.startState.readOnly !== transaction.state.readOnly
+  update: (cards, transaction) => {
+    if (transaction.startState.readOnly !== transaction.state.readOnly) {
+      return quoteCards(transaction.state);
+    }
+    if (!transaction.docChanged) return cards;
+    return touchesQuotes(transaction)
       ? quoteCards(transaction.state)
-      : cards,
+      : cards.map(transaction.changes);
+  },
   provide: (field) => [
     EditorView.decorations.from(field),
     EditorView.atomicRanges.of((view) => view.state.field(field)),
@@ -407,8 +426,8 @@ function caretOffCards(doc: Text, selection: EditorSelection, previous: number):
  */
 function settleQuoteCards(transaction: Transaction): Transaction | readonly TransactionSpec[] {
   if (isSyncOrHistory(transaction)) return transaction;
-  // Arrows, clicks and other selection-only changes need only the caret moved off a card.
-  if (!transaction.docChanged) {
+  // An edit that reaches no card, like an arrow or typing in text, needs only the caret kept off one.
+  if (!touchesQuotes(transaction)) {
     const { newDoc, newSelection, startState } = transaction;
     const selection = caretOffCards(newDoc, newSelection, startState.selection.main.head);
     return selection.eq(newSelection)
@@ -420,9 +439,6 @@ function settleQuoteCards(transaction: Transaction): Transaction | readonly Tran
     inserts.push({ from, to, text: text.toString() }),
   );
   const start = transaction.startState.doc.toString();
-  if (!hasQuoteMark(start) && !inserts.some((insert) => hasQuoteMark(insert.text))) {
-    return transaction;
-  }
   const after = transaction.newDoc.toString();
   const removed = removedQuote(transaction);
   let settled = after;
