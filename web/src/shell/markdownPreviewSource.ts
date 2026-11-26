@@ -50,7 +50,7 @@ export function rehypeSourceOffsets() {
   };
 }
 
-interface SourceRun {
+export interface SourceRun {
   /** The span's only text node. */
   text: Text;
   /** Source offset of the rendered text's first character, when it maps linearly. */
@@ -81,7 +81,8 @@ function toSource(run: SourceRun, localOffset: number, edge: "start" | "end"): n
   return edge === "start" ? run.sliceStart : run.sliceEnd;
 }
 
-function runsIn(root: Element, source: string): SourceRun[] {
+/** Every mappable text run in the preview, in document order. */
+export function previewRuns(root: Element, source: string): SourceRun[] {
   return Array.from(root.querySelectorAll(SPAN_SELECTOR))
     .map((span) => readRun(span, source))
     .filter((run): run is SourceRun => run !== null);
@@ -102,7 +103,7 @@ export function previewSelectionToSource(
   root: Element,
   source: string,
 ): SourceSelection | null {
-  const runs = runsIn(root, source).filter((run) => range.intersectsNode(run.text));
+  const runs = previewRuns(root, source).filter((run) => range.intersectsNode(run.text));
   if (runs.length === 0) return null;
   const first = runs[0];
   const last = runs[runs.length - 1];
@@ -128,15 +129,17 @@ export function previewCaretToSource(
   return toSource(run, node === run.text ? offset : 0, "start");
 }
 
-/** DOM ranges covering the rendered text of a source range, in document order. */
+/**
+ * DOM ranges covering the rendered text of a source range, in document order.
+ * Pass the runs from one `previewRuns` call when painting several ranges.
+ */
 export function sourceRangeToPreviewRanges(
-  root: Element,
-  source: string,
+  runs: readonly SourceRun[],
   start: number,
   end: number,
 ): Range[] {
   const ranges: Range[] = [];
-  for (const run of runsIn(root, source)) {
+  for (const run of runs) {
     if (run.sliceEnd <= start || run.sliceStart >= end) continue;
     const length = run.text.data.length;
     let localStart = 0;

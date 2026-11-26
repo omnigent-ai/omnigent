@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import { describe, expect, it } from "vitest";
 import {
   previewCaretToSource,
+  previewRuns,
   previewSelectionToSource,
   rehypeSourceOffsets,
   sourceRangeToPreviewRanges,
@@ -117,7 +118,7 @@ describe("sourceRangeToPreviewRanges", () => {
     const root = renderPreview(source);
     const start = source.indexOf("the");
     const end = source.indexOf(" today");
-    const painted = sourceRangeToPreviewRanges(root, source, start, end)
+    const painted = sourceRangeToPreviewRanges(previewRuns(root, source), start, end)
       .map((range) => range.toString())
       .join("");
     expect(painted).toBe("the weekly report");

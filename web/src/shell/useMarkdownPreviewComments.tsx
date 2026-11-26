@@ -11,7 +11,9 @@ import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import {
   previewCaretToSource,
+  previewRuns,
   previewSelectionToSource,
+  type SourceRun,
   type SourceSelection,
   sourceRangeToPreviewRanges,
 } from "./markdownPreviewSource";
@@ -22,28 +24,25 @@ const HIGHLIGHT_ACTIVE = "md-preview-comment-active";
 export const UNMAPPABLE_SELECTION_HINT =
   "That part of the preview can't take a comment. Select nearby text, or switch to Source.";
 
-function paintHighlights(
-  root: HTMLElement,
-  content: string,
-  comments: readonly Comment[],
-  active: ActiveSelection | null,
-): Range | null {
-  if (!highlightsSupported()) return null;
-  const all = comments.flatMap((comment) =>
-    sourceRangeToPreviewRanges(root, content, comment.start_index, comment.end_index),
-  );
-  const activeRanges = active
-    ? sourceRangeToPreviewRanges(root, content, active.start_index, active.end_index)
-    : [];
-  CSS.highlights.set(HIGHLIGHT_COMMENTS, new Highlight(...all));
-  CSS.highlights.set(HIGHLIGHT_ACTIVE, new Highlight(...activeRanges));
-  return activeRanges[0] ?? null;
+// One Highlight per name for the whole page (CSS names its ::highlight styles
+// statically); each preview adds and removes only its own ranges, so previews
+// open side by side never overwrite or clear each other.
+function sharedHighlight(name: string): Highlight {
+  let highlight = CSS.highlights.get(name);
+  if (!highlight) {
+    highlight = new Highlight();
+    CSS.highlights.set(name, highlight);
+  }
+  return highlight;
 }
 
-function clearHighlights() {
-  if (!highlightsSupported()) return;
-  CSS.highlights.delete(HIGHLIGHT_COMMENTS);
-  CSS.highlights.delete(HIGHLIGHT_ACTIVE);
+function addRanges(name: string, ranges: readonly Range[]): () => void {
+  if (!highlightsSupported() || ranges.length === 0) return () => {};
+  const highlight = sharedHighlight(name);
+  for (const range of ranges) highlight.add(range);
+  return () => {
+    for (const range of ranges) highlight.delete(range);
+  };
 }
 
 export function useMarkdownPreviewComments({
@@ -74,21 +73,44 @@ export function useMarkdownPreviewComments({
     latest.current = { comments, canEdit, content, onSetActiveSelection };
   });
 
-  // Paint after every render that can move text: content, comments or selection.
+  // Read the rendered runs once per content change; painting reuses them.
+  const [runs, setRuns] = useState<readonly SourceRun[]>([]);
   useLayoutEffect(() => {
     const root = rootRef.current;
-    if (!enabled || !root) return;
-    const first = paintHighlights(root, content, comments, activeSelection);
+    setRuns(enabled && root ? previewRuns(root, content) : []);
+  }, [rootRef, enabled, content]);
+
+  // Each cleanup removes exactly what it painted, so turning commenting off or
+  // unmounting clears this preview's highlights and no one else's.
+  useLayoutEffect(
+    () =>
+      addRanges(
+        HIGHLIGHT_COMMENTS,
+        comments.flatMap((comment) =>
+          sourceRangeToPreviewRanges(runs, comment.start_index, comment.end_index),
+        ),
+      ),
+    [runs, comments],
+  );
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!activeSelection || !root) return;
+    const ranges = sourceRangeToPreviewRanges(
+      runs,
+      activeSelection.start_index,
+      activeSelection.end_index,
+    );
+    const first = ranges[0];
     // Bring a comment picked from the panel into view, without jumping when it's visible.
-    if (first && activeSelection?.comment_id) {
+    if (first && activeSelection.comment_id) {
       const rect = first.getBoundingClientRect();
       const box = root.getBoundingClientRect();
       if (rect.top < box.top || rect.bottom > box.bottom) {
         first.startContainer.parentElement?.scrollIntoView({ block: "center" });
       }
     }
-  }, [rootRef, enabled, content, comments, activeSelection]);
-  useEffect(() => clearHighlights, []);
+    return addRanges(HIGHLIGHT_ACTIVE, ranges);
+  }, [rootRef, runs, activeSelection]);
 
   useEffect(() => {
     const root = rootRef.current;
