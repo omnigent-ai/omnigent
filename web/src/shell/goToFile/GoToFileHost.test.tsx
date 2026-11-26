@@ -62,12 +62,22 @@ vi.mock("../codeMirror/CodeMirrorFileViewer", () => ({
 const textSearches = vi.hoisted(() => ({
   calls: [] as unknown[],
   held: null as Promise<void> | null,
+  // A search's own hold, by its query, so searches can answer out of order.
+  heldByQuery: {} as Record<string, Promise<void>>,
 }));
 vi.mock("@/lib/contentSearch", async (importOriginal) => ({
   ...(await importOriginal<typeof ContentSearchModule>()),
   runContentSearch: async (_sessionId: string, input: { query: string }) => {
     textSearches.calls.push(input);
-    await textSearches.held;
+    await (textSearches.heldByQuery[input.query] ?? textSearches.held);
+    if (input.query === "gizmo") {
+      const gizmo = { path: "src/gizmo.ts", line: 12, column: 1, text: "gizmo();" };
+      return {
+        matches: [{ ...gizmo, match_start: 0, match_end: 5 }],
+        truncated: false,
+        warning: null,
+      };
+    }
     return {
       matches: input.query.includes("needle")
         ? [
@@ -137,6 +147,7 @@ beforeEach(() => {
   window.localStorage.clear();
   textSearches.calls = [];
   textSearches.held = null;
+  textSearches.heldByQuery = {};
 });
 
 afterEach(() => {
@@ -309,6 +320,44 @@ describe("GoToFileHost", () => {
     });
     // The page it shows takes the keyboard.
     expect(useFileFinderStore.getState().textSearchFocus).toMatchObject({ sessionId: SESSION });
+  });
+
+  it("keeps the newer search's lines when an older one answers after it, and hands those over", async () => {
+    let answerOlder = () => {};
+    let answerNewer = () => {};
+    textSearches.heldByQuery = {
+      needle: new Promise<void>((resolve) => {
+        answerOlder = resolve;
+      }),
+      gizmo: new Promise<void>((resolve) => {
+        answerNewer = resolve;
+      }),
+    };
+    const { showTextSearch, queryClient } = renderHost();
+    act(() => void requestTextSearch(SESSION));
+    const field = await screen.findByRole("combobox", { name: "Search text in files" });
+    const asked = (query: string) =>
+      waitFor(() => expect(textSearches.calls).toContainEqual(expect.objectContaining({ query })));
+    await userEvent.type(field, "needle");
+    await asked("needle");
+    await userEvent.clear(field);
+    await userEvent.type(field, "gizmo");
+    await asked("gizmo");
+
+    await act(async () => answerNewer());
+    expect(await screen.findByRole("option", { name: /gizmo\(\)/ })).toBeInTheDocument();
+    await act(async () => answerOlder());
+    // The next keystroke renders the list again; the older answer still doesn't show.
+    fireEvent.keyDown(field, { key: "ArrowDown" });
+    expect(screen.queryByRole("option", { name: /const needle/ })).toBeNull();
+    expect(screen.getByRole("option", { name: /gizmo\(\)/ })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /Open in Search/ }));
+    await waitFor(() => expect(showTextSearch).toHaveBeenCalledTimes(1));
+    expect(queryClient.getQueryData(contentSearchResultKey(SESSION))).toMatchObject({
+      query: "gizmo",
+      matches: [expect.objectContaining({ path: "src/gizmo.ts", line: 12 })],
+    });
   });
 
   it("hands a search that hasn't answered yet to the Search page to run there", async () => {
