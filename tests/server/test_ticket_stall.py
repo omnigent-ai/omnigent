@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from omnigent.server.project_reliability import settings
@@ -9,7 +11,9 @@ from omnigent.server.ticket_stall import (
     CARD_STALL_MIN_S,
     WorkerState,
     card_stall_after,
+    in_working_stage,
     ticket_stall,
+    ticket_wait,
     ticket_working,
 )
 
@@ -92,3 +96,68 @@ def test_working_names_the_running_worker_and_when_it_started() -> None:
     assert ticket_working(workers) == {"name": "Platform Engineer", "since": 1_234}
     assert ticket_working([_worker("running")]) == {"name": "Platform Engineer", "since": None}
     assert ticket_working([_worker("idle")]) is None
+
+
+OWNER = SimpleNamespace(user_id="owner@example.com", config={})
+
+
+def _labels(**labels: str | None) -> list[dict[str, str | None]]:
+    return [{"key": key.replace("_", "-"), "value": value} for key, value in labels.items()]
+
+
+@pytest.mark.parametrize(
+    ("ticket", "expected"),
+    [
+        (_ticket(labels=_labels(needs_human="Pick A or B")), {"kind": "person", "on": []}),
+        (
+            _ticket(waiting_on={"reason": "ask", "responders": ["owner@example.com"]}),
+            {"kind": "person", "on": []},
+        ),
+        (
+            _ticket(labels=_labels(waiting="2026-11-27T10:00Z release is out")),
+            {"kind": "until", "on": ["2026-11-27T10:00Z release is out"]},
+        ),
+        (
+            _ticket(labels=_labels(risk="migration", approved="abc")),
+            {"kind": "sign_off", "on": ["risk-ok"]},
+        ),
+        (
+            _ticket(
+                labels=_labels(kind="feature", approved="abc"), requested_by="kasey@example.com"
+            ),
+            {"kind": "sign_off", "on": ["product-ok"]},
+        ),
+        (
+            _ticket(
+                labels=_labels(risk="migration", risk_ok=None, approved="abc", verified="abc")
+            ),
+            {"kind": "land", "on": []},
+        ),
+        (_ticket(labels=_labels(approved="abc", verified="old")), None),
+        (_ticket(labels=_labels(risk="migration")), None),
+        (_ticket(), None),
+    ],
+    ids=[
+        "needs-human",
+        "open-ask",
+        "waiting-label",
+        "risk-ok-missing",
+        "product-ok-missing",
+        "ready-to-land",
+        "verified-elsewhere",
+        "risk-but-not-approved-yet",
+        "nothing",
+    ],
+)
+def test_what_a_card_waits_on(ticket, expected) -> None:
+    assert ticket_wait(ticket, OWNER) == expected
+
+
+def test_only_started_unfinished_stages_wait_or_stall() -> None:
+    assert [in_working_stage(STAGES, stage["id"]) for stage in STAGES] == [
+        False,
+        True,
+        True,
+        True,
+        False,
+    ]

@@ -9,6 +9,10 @@ The stages and thresholds follow the reliability loop's (see
 it only flags work the automatic checks didn't get moving. The router's sessions
 (the Lead's) don't count as the ticket's workers: they hear about every ticket.
 
+Work that waits on something gets a quiet waiting state instead, and no stall
+clock (see :func:`ticket_wait`): a person's answer, a sign-off label on approved
+work, landing once fully approved and verified, or a ``waiting`` wake-up.
+
 The server sends the idle start and the threshold; the board compares them with
 the clock, so a card turns stalled without another request.
 """
@@ -37,11 +41,13 @@ class BoardStall:
     :param stages: The project's stages, in board order.
     :param settings: Its reliability settings.
     :param router_session_ids: The router's sessions, which aren't any ticket's worker.
+    :param project: The project, for which sign-offs its tickets need.
     """
 
     stages: Sequence[Mapping[str, Any]]
     settings: Settings
     router_session_ids: frozenset[str]
+    project: Any = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,11 @@ class WorkerState:
     running_since: float | None = None
 
 
+def in_working_stage(stages: Sequence[Mapping[str, Any]], stage_id: str) -> bool:
+    """Whether *stage_id* is started and unfinished: neither the first stage nor the last."""
+    return stage_id in [stage["id"] for stage in stages[1:-1]]
+
+
 def card_stall_after(
     stages: Sequence[Mapping[str, Any]], stage_id: str, config: Settings
 ) -> float | None:
@@ -70,8 +81,7 @@ def card_stall_after(
     completed one and any whose ``stage_minutes`` is 0. The stage holding
     finished work waiting to ship uses the loop's ship reminder wait instead.
     """
-    working = [stage["id"] for stage in stages[1:-1]]
-    if stage_id not in working or stage_id in config.unwatched_stages:
+    if not in_working_stage(stages, stage_id) or stage_id in config.unwatched_stages:
         return None
     if stage_id == ship_stage_id(list(stages)):
         return max(CARD_STALL_MIN_S, config.ship_wait_s)
@@ -103,6 +113,56 @@ def ticket_stall(
         return None
     idle_since = max([int(ticket.get("updated_at") or 0), *(w.updated_at for w in workers)])
     return {"idle_since": idle_since, "after_s": int(after_s)}
+
+
+def missing_sign_offs(project: Any, ticket: Mapping[str, Any]) -> list[str]:
+    """The sign-off labels the ticket still needs before it can land, e.g. ``["risk-ok"]``."""
+    from omnigent.server.github_pr_intake import is_outside_requester
+    from omnigent.server.product_approval import (
+        OWNER_OK_LABEL,
+        PRODUCT_OK_LABEL,
+        RISK_LABEL,
+        RISK_OK_LABEL,
+        needs_product_ok,
+    )
+
+    keys = {label.get("key") for label in ticket.get("labels") or []}
+    missing = []
+    if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
+        missing.append(RISK_OK_LABEL)
+    if project is not None and needs_product_ok(project, dict(ticket)):
+        if PRODUCT_OK_LABEL not in keys:
+            missing.append(PRODUCT_OK_LABEL)
+    if is_outside_requester(ticket.get("requested_by")) and OWNER_OK_LABEL not in keys:
+        missing.append(OWNER_OK_LABEL)
+    return missing
+
+
+def ticket_wait(ticket: Mapping[str, Any], project: Any) -> dict[str, Any] | None:
+    """What a card waits on, ``{"kind", "on"}``, or ``None`` when nothing is awaited.
+
+    Kinds, first match wins:
+
+    - ``person``: an open ``needs-human`` ask; the board names its responders.
+    - ``until``: a ``waiting`` wake-up; ``on`` is its value, ``"<ISO time> <note>"``.
+    - ``sign_off``: Reviewer-approved work missing sign-off labels; ``on`` lists them.
+    - ``land``: approved and verified at the same commit, with every sign-off in:
+      it waits its turn to land, often behind other tickets.
+    """
+    values = {label.get("key"): label.get("value") for label in ticket.get("labels") or []}
+    if ticket.get("waiting_on") or _NEEDS_HUMAN_LABEL in values:
+        return {"kind": "person", "on": []}
+    if WAITING_LABEL in values:
+        return {"kind": "until", "on": [values[WAITING_LABEL] or ""]}
+    approved = values.get("approved")
+    if not approved:
+        return None
+    missing = missing_sign_offs(project, ticket)
+    if missing:
+        return {"kind": "sign_off", "on": missing}
+    if values.get("verified") == approved:
+        return {"kind": "land", "on": []}
+    return None
 
 
 def ticket_working(workers: Sequence[WorkerState]) -> dict[str, Any] | None:

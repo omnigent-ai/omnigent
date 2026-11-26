@@ -49,7 +49,7 @@ import { usePlayfulTouches } from "@/lib/playfulTouchesPreferences";
 import { TicketBoardRequesterFilter, useBoardRequesterFilter } from "./TicketBoardRequesterFilter";
 import { NEEDS_YOU_PARAM } from "./needsYouFilter";
 import { STALLED_PARAM, ticketStalled } from "./ticketStall";
-import { TicketStallFooter } from "./TicketStallFooter";
+import { TicketCardStatus, TicketCardStatusSpace } from "./TicketCardStatus";
 import { ticketPanelSearch } from "./projectHomeNavigation";
 import { needsWhom } from "./ticketWaitingOn";
 import { collapsedLanes, useContentWidth, useLanePreferences } from "./boardLaneLayout";
@@ -320,7 +320,7 @@ function TicketBoard({
               <div className="flex flex-col gap-3 rounded-xl border bg-card p-3.5 shadow-lg">
                 <TicketCardContent ticket={dragged} />
               </div>
-              <TicketAgentIcons ticket={dragged} className="absolute right-3.5 bottom-3" />
+              <TicketCardCorner ticket={dragged} nowMs={Date.now()} />
             </div>
           )}
         </DragOverlay>
@@ -637,48 +637,52 @@ function TicketCard({
 }) {
   const [search] = useSearchParams();
   const now = useNow().getTime();
-  const stalled = ticketStalled(ticket, now);
   const { setNodeRef, listeners, attributes, isDragging } = useDraggable({
     id: ticket.id,
     data: { ticket },
     disabled,
   });
   return (
-    <div className={cn(isDragging && "opacity-40")}>
-      <div className="relative">
-        <Link
-          ref={setNodeRef}
-          {...attributes}
-          {...listeners}
-          role="link"
-          to={ticketPanelSearch(ticket.id, search)}
-          aria-label={`Open ticket: ${ticket.title}`}
-          data-related-highlight={related || undefined}
-          onMouseEnter={() => onHover(ticket.id)}
-          onMouseLeave={() => onHover(null)}
-          onFocus={() => onFocus(ticket.id)}
-          onBlur={() => onFocus(null)}
-          onClick={(event) => {
-            if (suppressClick()) event.preventDefault();
-          }}
-          className={cn(
-            "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
-            related && "border-muted-foreground/50",
-            // Cards waiting on the viewer stand out in a lane, until they answer.
-            needsWhom(ticket.waiting_on, getCurrentUserId())?.kind === "you" &&
-              // Important: dark mode's glass-card rule resets every card border.
-              "border-l-4! border-l-brand-accent!",
-            selected && "border-primary ring-1 ring-primary/20",
-            stalled && "rounded-b-none",
-          )}
-        >
-          <TicketCardContent ticket={ticket} finished={finished} />
-        </Link>
-        {/* Over the card's footer corner, outside the link so each icon stays its own control. */}
-        <TicketAgentIcons ticket={ticket} className="absolute right-3.5 bottom-3" />
-      </div>
-      {/* Outside the link too: Wake the Lead is its own control. */}
-      <TicketStallFooter ticket={ticket} nowMs={now} />
+    <div className={cn("relative", isDragging && "opacity-40")}>
+      <Link
+        ref={setNodeRef}
+        {...attributes}
+        {...listeners}
+        role="link"
+        to={ticketPanelSearch(ticket.id, search)}
+        aria-label={`Open ticket: ${ticket.title}`}
+        data-related-highlight={related || undefined}
+        onMouseEnter={() => onHover(ticket.id)}
+        onMouseLeave={() => onHover(null)}
+        onFocus={() => onFocus(ticket.id)}
+        onBlur={() => onFocus(null)}
+        onClick={(event) => {
+          if (suppressClick()) event.preventDefault();
+        }}
+        className={cn(
+          "flex min-w-0 flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-primary/70 hover:bg-primary/5 hover:ring-2 hover:ring-primary/20 focus-visible:bg-primary/5 focus-visible:ring-2 focus-visible:ring-ring",
+          related && "border-muted-foreground/50",
+          // Cards waiting on the viewer stand out in a lane, until they answer.
+          needsWhom(ticket.waiting_on, getCurrentUserId())?.kind === "you" &&
+            // Important: dark mode's glass-card rule resets every card border.
+            "border-l-4! border-l-brand-accent!",
+          selected && "border-primary ring-1 ring-primary/20",
+        )}
+      >
+        <TicketCardContent ticket={ticket} finished={finished} />
+      </Link>
+      {/* Over the card's footer corner, outside the link so each icon stays its own control. */}
+      <TicketCardCorner ticket={ticket} nowMs={now} />
+    </div>
+  );
+}
+
+/** The card's footer corner: its status icon, then its agents. */
+function TicketCardCorner({ ticket, nowMs }: { ticket: ProjectTicket; nowMs: number }) {
+  return (
+    <div className="absolute right-3.5 bottom-3 z-10 flex items-center gap-2">
+      <TicketCardStatus ticket={ticket} nowMs={nowMs} />
+      <TicketAgentIcons ticket={ticket} />
     </div>
   );
 }
@@ -734,7 +738,8 @@ function TicketCardContent({
         <div className="flex shrink-0 items-center gap-2">
           {showDone && <OttoDoneMark />}
           <TicketCommentCount ticket={ticket} />
-          {/* Room for the agent icons drawn over this corner. */}
+          {/* Room for the status and agent icons drawn over this corner. */}
+          <TicketCardStatusSpace ticket={ticket} nowMs={now.getTime()} />
           <TicketAgentIconsSpace ticket={ticket} />
         </div>
       </div>

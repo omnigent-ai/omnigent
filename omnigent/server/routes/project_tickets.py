@@ -98,7 +98,9 @@ from omnigent.server.ticket_stall import (
     BoardStall,
     WorkerState,
     card_stall_after,
+    in_working_stage,
     ticket_stall,
+    ticket_wait,
     ticket_working,
 )
 from omnigent.server.ticket_summary import TicketSummarizer, build_ticket_summarizer
@@ -765,11 +767,20 @@ def create_project_tickets_router(
                     or (sid in sessions and sessions[sid].archived is not None)
                     for sid in linked.session_ids
                 )
-                ticket["stall"] = ticket_stall(
-                    ticket,
-                    card_stall_after(board.stages, ticket["stage_id"], board.settings),
-                    workers,
-                    workers_known=known,
+                ticket["wait"] = (
+                    ticket_wait(ticket, board.project)
+                    if in_working_stage(board.stages, ticket["stage_id"])
+                    else None
+                )
+                ticket["stall"] = (
+                    None
+                    if ticket["wait"] is not None
+                    else ticket_stall(
+                        ticket,
+                        card_stall_after(board.stages, ticket["stage_id"], board.settings),
+                        workers,
+                        workers_known=known,
+                    )
                 )
                 ticket["working"] = ticket_working(workers)
 
@@ -802,6 +813,7 @@ def create_project_tickets_router(
             stages=page.get("stages") or [],
             settings=reliability_settings(project.config),
             router_session_ids=frozenset(await router_session_ids(request.app, project)),
+            project=project,
         )
 
     @router.get("")

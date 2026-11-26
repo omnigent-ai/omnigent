@@ -1,10 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type * as identity from "@/lib/identity";
 import * as api from "@/lib/projectTicketsApi";
 import type { ProjectTicket } from "@/lib/projectTicketsApi";
 import { workingFor } from "./ProjectTicketBoard";
-import { TicketStallFooter } from "./TicketStallFooter";
+import { cardStatus, TicketCardStatus } from "./TicketCardStatus";
 import { ticketStalled } from "./ticketStall";
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -13,6 +14,10 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 const projects = vi.hoisted(() => ({ router: { identity_id: "orchestrator", name: "Lead" } }));
 vi.mock("./useProjectAgentSession", () => ({
   useProjectRecord: () => ({ data: { id: "project", name: "Shipping", router: projects.router } }),
+}));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof identity>()),
+  getCurrentUserId: () => "viewer@example.com",
 }));
 vi.mock("@/lib/projectTicketsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof api>()),
@@ -36,10 +41,17 @@ afterEach(() => {
 });
 
 function renderFooter(card: ProjectTicket) {
+  const view = renderStatus(card);
+  const icon = screen.queryByTestId("ticket-stalled");
+  if (icon) fireEvent.mouseEnter(icon);
+  return view;
+}
+
+function renderStatus(card: ProjectTicket) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <TicketStallFooter ticket={card} nowMs={NOW_MS} />
+      <TicketCardStatus ticket={card} nowMs={NOW_MS} />
     </QueryClientProvider>,
   );
 }
@@ -54,7 +66,11 @@ describe("stalled cards", () => {
   it("explain the stall and wake the Lead with an @Lead comment", async () => {
     vi.mocked(api.commentOnTicket).mockResolvedValue(ticket);
     renderFooter(ticket);
-    expect(screen.getByTestId("ticket-stalled").textContent).toContain(
+    expect(screen.getByTestId("ticket-stalled")).toHaveAttribute(
+      "aria-label",
+      "Stalled · no one on this for 2h",
+    );
+    expect(screen.getByTestId("ticket-status-popover").textContent).toContain(
       "Stalled · no one on this for 2h",
     );
     fireEvent.click(screen.getByRole("button", { name: "Wake the Lead" }));
@@ -81,6 +97,37 @@ describe("stalled cards", () => {
 
   it("show nothing before the threshold", () => {
     renderFooter({ ...ticket, stall: { idle_since: TWO_HOURS_AGO + 60, after_s: 2 * 3600 } });
+    expect(screen.queryByTestId("ticket-stalled")).toBeNull();
+  });
+
+  it("say what waiting work waits on, and never count it as stalled", () => {
+    const waiting = (wait: ProjectTicket["wait"], extra: Partial<ProjectTicket> = {}) =>
+      cardStatus({ ...ticket, ...extra, stall: null, wait }, NOW_MS, "viewer@example.com");
+    expect(waiting({ kind: "sign_off", on: ["risk-ok"] })).toMatchObject({
+      kind: "waiting",
+      label: "Waiting on risk-ok",
+    });
+    expect(waiting({ kind: "land", on: [] })).toMatchObject({ label: "Waiting to land" });
+    expect(
+      waiting(
+        { kind: "person", on: [] },
+        {
+          waiting_on: {
+            reason: "ask",
+            responders: ["viewer@example.com"],
+            raised_by_user_id: null,
+          },
+        },
+      ),
+    ).toMatchObject({ label: "Waiting on you" });
+    expect(waiting({ kind: "until", on: ["2026-11-27T10:00Z release is out"] })).toMatchObject({
+      detail: "release is out",
+    });
+    renderStatus({ ...ticket, stall: null, wait: { kind: "sign_off", on: ["product-ok"] } });
+    expect(screen.getByTestId("ticket-waiting")).toHaveAttribute(
+      "aria-label",
+      "Waiting on product-ok",
+    );
     expect(screen.queryByTestId("ticket-stalled")).toBeNull();
   });
 

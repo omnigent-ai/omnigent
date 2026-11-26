@@ -1313,6 +1313,17 @@ async def test_board_cards_carry_a_stall_clock_and_who_is_working(
     assert card(ticket["id"])["working"] is None
     # A ticket nobody has started isn't stalled; it's waiting its turn.
     assert card(backlog["id"])["stall"] is None
+    assert card(ticket["id"])["wait"] is None
+    # Approved work missing its sign-off waits on it instead of stalling.
+    gated = {
+        "labels": [{"key": "risk", "value": "migration"}, {"key": "approved", "value": "a" * 40}]
+    }
+    patched = await project_client.patch(f"{base}/{ticket['id']}", json=gated)
+    assert patched.status_code == 200, patched.text
+    page = (await project_client.get(base)).json()["data"]
+    assert card(ticket["id"])["wait"] == {"kind": "sign_off", "on": ["risk-ok"]}
+    assert card(ticket["id"])["stall"] is None
+    await project_client.patch(f"{base}/{ticket['id']}", json={"labels": []})
     ticket_routes._session_status_cache[worker.id] = "running"
     page = (await project_client.get(base)).json()["data"]
     assert card(ticket["id"])["stall"] is None

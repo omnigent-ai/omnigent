@@ -110,6 +110,12 @@ export interface ProjectTicket {
    * a watched working stage). It reads as stalled once `after_s` passes since `idle_since`.
    */
   stall?: TicketStall | null;
+  /**
+   * Board lists: what the ticket waits on instead of stalling. `person`: an open ask;
+   * `until`: a `waiting` wake-up (`on` holds its value); `sign_off`: approved work missing
+   * the labels in `on`; `land`: approved and verified, waiting its turn to land.
+   */
+  wait?: { kind: "person" | "until" | "sign_off" | "land"; on: string[] } | null;
   /** Board lists: a worker at work on the ticket; `since` is null when unknown. */
   working?: { name: string; since: number | null } | null;
   /** Whether the landed commit runs in this server; absent when unknown. Single-ticket reads. */
