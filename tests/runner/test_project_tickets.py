@@ -913,6 +913,11 @@ async def test_ticket_list_query_searches_and_keeps_the_match():
                 "sys_ticket_list", {"query": "login", "stage_id": "open"}, client, SOURCE
             )
         )
+        refused_since = json.loads(
+            await execute_ticket_tool(
+                "sys_ticket_list", {"query": "login", "completed_since": 1}, client, SOURCE
+            )
+        )
     assert len(seen) == 1
     assert seen[0].url.path == f"/v1/projects/{PROJECT}/tickets/search"
     assert dict(seen[0].url.params) == {"q": "login", "limit": "5", "after": SOURCE}
@@ -926,3 +931,4 @@ async def test_ticket_list_query_searches_and_keeps_the_match():
     ]
     assert found["has_more"] is True and found["last_id"] == TICKET
     assert "stage_id" in refused["error"]
+    assert "completed_since" in refused_since["error"]

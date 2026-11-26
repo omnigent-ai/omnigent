@@ -239,9 +239,12 @@ async def execute_ticket_tool(
             compact = body.pop("compact", True)
             query = body.pop("query", None)
             if query is not None:
-                if body.get("stage_id") is not None:
+                if body.get("stage_id") is not None or body.get("completed_since") is not None:
                     return json.dumps(
-                        {"error": "query searches every stage; omit stage_id with it"}
+                        {
+                            "error": "query searches every stage; omit stage_id and "
+                            "completed_since with it"
+                        }
                     )
                 params = {"q": query, "limit": min(body.get("limit", 20), 100)}
                 if body.get("after") is not None:

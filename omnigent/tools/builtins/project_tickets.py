@@ -40,7 +40,7 @@ class ListTickets(BaseModel):
         max_length=200,
         description="Keywords: lists only tickets holding every word in their title, "
         "description, labels, ID prefix or recent comments, most recently updated first, "
-        "each with a match snippet. Searches every stage, so omit stage_id.",
+        "each with a match snippet. Searches every stage, so omit stage_id and completed_since.",
     )
     after: str | None = Field(default=None, description="Previous page's last_id.")
     limit: int = Field(default=50, ge=1, le=100)
