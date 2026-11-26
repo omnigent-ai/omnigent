@@ -167,11 +167,8 @@ _OPENCODE_INSTALL_SCRIPT = (
 # ``install_hint``, not a ``package``.
 GOOSE_KEY = "goose"
 
-# Copilot runs in-process via the ``github-copilot-sdk`` package, which bundles
-# the Copilot CLI binary it drives — so, like cursor, there is no separately
-# installed CLI to gate on; readiness is whether a GitHub token resolves (see
-# :func:`omnigent.onboarding.harness_readiness.harness_is_configured`). The key
-# is kept here purely as the canonical harness id the readiness layer shares.
+# The Copilot SDK manages its runtime; there is no separate CLI to install.
+# Readiness uses GitHub credentials rather than binary presence.
 COPILOT_KEY = "copilot"
 
 # Hermes Agent is installed via a curl installer from Nous Research and

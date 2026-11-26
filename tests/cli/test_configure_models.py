@@ -3250,7 +3250,7 @@ def test_antigravity_overview_install_command_is_selection_only(
 
 @pytest.fixture()
 def _copilot_sdk_absent(monkeypatch):
-    """Force the ``github-copilot-sdk`` extra absent and clear ambient Copilot tokens.
+    """Force the ``microsoft-copilot-sdk`` extra absent and clear ambient Copilot tokens.
 
     Copilot is the third soft-SDK-extra harness (like Cursor / Antigravity): its
     readiness is a GitHub token, and a missing SDK is surfaced as an install
@@ -3282,6 +3282,19 @@ def test_copilot_overview_install_command_is_selection_only(
     copilot = names.index("Copilot")
     assert "omnigent[copilot]" in Text.from_markup(descriptions[copilot]).plain
     assert "pip install" not in Text.from_markup(options[copilot]).plain
+
+
+def test_copilot_drillin_offers_install_when_sdk_missing(
+    isolated_config, _copilot_sdk_absent
+) -> None:
+    """Drilling into Copilot with the SDK absent names ``microsoft-copilot-sdk``."""
+    # L1 13=Copilot → install offer 3=show command → token menu q=back → L1 q.
+    stdin = "\n".join(["13", "3", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup"], input=stdin)
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "microsoft-copilot-sdk" in out
+    assert "omnigent[copilot]" in out
 
 
 @pytest.mark.parametrize(

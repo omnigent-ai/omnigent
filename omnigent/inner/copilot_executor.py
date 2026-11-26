@@ -1,6 +1,6 @@
-"""CopilotExecutor: run agents through the GitHub Copilot SDK (``github-copilot-sdk``).
+"""CopilotExecutor: run agents through the GitHub Copilot SDK (``microsoft-copilot-sdk``).
 
-Drives GitHub Copilot via :mod:`copilot` (the ``github-copilot-sdk`` package) —
+Drives GitHub Copilot via :mod:`copilot` (the ``microsoft-copilot-sdk`` package) —
 one persistent :class:`copilot.CopilotClient` + :class:`copilot.CopilotSession`
 per Omnigent conversation, created once and reused turn to turn. Each
 ``run_turn`` issues one ``session.send_and_wait`` and translates the session's
@@ -15,15 +15,15 @@ bridged into Copilot **in-process** via the SDK's ``tools``: each
 :class:`~omnigent.inner.executor.ToolSpec` becomes a :class:`copilot.Tool`
 whose async ``handler`` routes back to the executor's ``_tool_executor`` — the
 same pattern the claude-sdk / cursor harnesses use. So a Copilot agent can call
-``sys_*``, orchestrate sub-agents, and respect policies, i.e. full first-party
-parity. Unlike cursor's daemon-thread bridge, the Copilot SDK awaits tool
+``sys_*`` and orchestrate sub-agents through Omnigent's policy checks.
+Unlike cursor's daemon-thread bridge, the Copilot SDK awaits tool
 handlers *in its own event loop* (``CopilotSession._execute_tool_and_respond``),
 so the bridged handler is a plain coroutine that ``await``\\s ``_tool_executor``
 directly — no ``run_coroutine_threadsafe`` hop.
 
 Native tools — Copilot's built-in ``create`` / ``view`` / ``edit`` / ``bash`` run
-*inside* the SDK rather than through Omnigent's bridged-tool dispatch. They are
-gated through a two-stage check inside the SDK ``on_permission_request`` handler
+*inside* the SDK rather than through Omnigent's bridged-tool dispatch. Permission
+requests surfaced by the runtime pass through ``permissions.on_request``
 (:meth:`CopilotExecutor._on_permission_request`, parity with the cursor harness):
 
 1. **Policy hard-deny**: if the policy evaluator returns ``POLICY_ACTION_DENY``
@@ -37,7 +37,8 @@ gated through a two-stage check inside the SDK ``on_permission_request`` handler
 Native tool calls still leave no ``function_call`` item in the persisted
 transcript — only the streamed narration is recorded — so an ``on:[tool_call]``
 guardrail won't *see* them as items, but the policy IS evaluated for them at
-permission time. Bridged ``sys_*`` tools are gated + recorded server-side via
+permission time. Runtime-auto-approved calls do not reach this handler.
+Bridged ``sys_*`` tools are gated + recorded server-side via
 ``_tool_executor`` (and registered ``skip_permission=True``, so they never reach
 the permission handler).
 
@@ -45,13 +46,13 @@ Auth: a **GitHub token** that carries Copilot access — a fine-grained PAT with
 the "Copilot Requests" permission, or an OAuth token from the GitHub CLI (``gh``)
 / Copilot CLI app. Resolved from a spec ``api_key`` or the ambient
 ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN`` (the same precedence
-the bundled CLI uses). Classic ``ghp_`` tokens are not accepted by Copilot.
+the Copilot CLI uses). Classic ``ghp_`` tokens are not accepted by Copilot.
 
 Requirements:
-    The ``github-copilot-sdk`` package must be installed (it bundles the
-    Copilot CLI binary it drives as a backing server). Installed via the
-    ``copilot`` extra; imported lazily so a missing install surfaces as a
-    request-time error, not an app-boot crash.
+    The ``microsoft-copilot-sdk`` package must be installed. It provides (or
+    downloads on first use) the Copilot CLI runtime, spawned here over stdio.
+    Installed via the ``copilot`` extra; imported lazily so a missing install
+    surfaces as a request-time error, not an app-boot crash.
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
@@ -88,6 +89,15 @@ from .executor import (
 )
 from .sandbox import reject_unsupported_harness_sandbox
 
+if TYPE_CHECKING:
+    from copilot import (
+        PermissionRequest,
+        PermissionRequestResult,
+        SessionEvent,
+        SystemMessageConfig,
+    )
+    from copilot.session import PermissionInvocation
+
 logger = logging.getLogger(__name__)
 
 # Omnigent's bridged-tool callback: (tool_name, args) -> awaitable result.
@@ -106,7 +116,7 @@ GITHUB_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # pins the two spellings equal.
 COPILOT_HOST_ENV_VAR = "COPILOT_GH_HOST"
 
-# The user's ambient host, captured before we ever write the var ourselves.
+# The user's ambient host, captured at module import.
 _AMBIENT_HOST = os.environ.get(COPILOT_HOST_ENV_VAR) or None
 
 # Upper bound (seconds) on one ``send_and_wait``. The SDK default is 60s, far
@@ -145,7 +155,7 @@ def _resolve_reasoning_effort(config: ExecutorConfig | None) -> str | None:
     The runtime adapter threads a web ``/reasoning`` pick into
     ``config.extra["reasoning_effort"]`` (see
     :class:`~omnigent.runtime.harnesses._executor_adapter.ExecutorAdapter`).
-    The Copilot SDK exposes it only as ``create_session(reasoning_effort=...)``,
+    The Copilot SDK takes it in ``create_session(inference={"reasoning_effort": ...})``,
     so like the model it is fixed at session creation (a change recreates the
     session in :meth:`run_turn`). ``None`` lets the model use its default.
 
@@ -278,7 +288,7 @@ def _encode_tool_result(result: object) -> object:
 class _CopilotSession(Protocol):
     """SDK session methods used by the executor."""
 
-    def on(self, callback: Callable[[object], None]) -> Callable[[], None]:
+    def on(self, handler: Callable[[SessionEvent], None]) -> Callable[[], None]:
         pass
 
     async def send_and_wait(self, prompt: str, *, timeout: float) -> object:
@@ -299,6 +309,8 @@ class _CopilotSessionState:
     reasoning_effort: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
+    # Set once torn down, so a startup still in flight discards what it builds.
+    closed: bool = False
     # call_id -> tool name, populated on TOOL_EXECUTION_START so the matching
     # TOOL_EXECUTION_COMPLETE (which carries only the id) can name its tool.
     call_names: dict[str, str] = field(default_factory=dict)
@@ -461,12 +473,12 @@ class CopilotExecutor(Executor):
 
     async def _on_permission_request(
         self,
-        request: object,
-        _invocation: dict[str, str],
-    ) -> object:
+        request: PermissionRequest,
+        _invocation: PermissionInvocation,
+    ) -> PermissionRequestResult:
         """Gate a Copilot NATIVE-tool permission request through policy + elicitation.
 
-        Installed as ``create_session(on_permission_request=...)``. The SDK awaits
+        Installed as ``create_session(permissions={"on_request": ...})``. The SDK awaits
         this in its own event loop, so it ``await``\\s ``_policy_evaluator`` and
         ``_elicitation_handler`` directly (no thread hop). Only Copilot's built-in
         tools (``bash`` / ``edit`` / ``view`` / ``create`` / ``url``) reach here;
@@ -483,7 +495,7 @@ class CopilotExecutor(Executor):
            evaluator wired), invoke ``_elicitation_handler`` so the user can
            approve or reject from the web-UI card. When no handler is wired
            (single-process / pre-turn paths) the call is approved by default,
-           preserving prior behavior.
+           unless managed settings require human approval, then it is rejected.
         """
         from copilot.rpc import (  # lazy: optional dependency
             PermissionDecisionApproveOnce,
@@ -506,7 +518,14 @@ class CopilotExecutor(Executor):
             approved = await handler(name, args)
             if not approved:
                 return PermissionDecisionReject(feedback="Denied via Omnigent approval UI")
+            return PermissionDecisionApproveOnce()
 
+        # No human to ask: never auto-approve what managed settings require a
+        # person to approve (the SDK's ``approve_all`` refuses these too).
+        if _invocation.get("managed_settings_enabled", False) or (
+            getattr(request, "managed_approval_required", False) is True
+        ):
+            return PermissionDecisionReject(feedback="Managed approval required")
         return PermissionDecisionApproveOnce()
 
     async def _ensure_session(
@@ -520,19 +539,19 @@ class CopilotExecutor(Executor):
         """Start the SDK client and create the session if not already live.
 
         On any bring-up failure the partially-started client is stopped before
-        propagating, so a bad token / launch error can't orphan the bundled
+        propagating, so a bad token / launch error can't orphan the Copilot
         CLI subprocess.
         """
         if state.session is not None:
             return
         try:
-            from copilot import CopilotClient
+            from copilot import CopilotClient, RuntimeConnection
         except ImportError as exc:
             from omnigent.onboarding.copilot_auth import COPILOT_EXTRA
             from omnigent.onboarding.extra_install import extra_install_display
 
             raise ImportError(
-                "CopilotExecutor requires the 'github-copilot-sdk' package. "
+                "CopilotExecutor requires the 'microsoft-copilot-sdk' package. "
                 f"Install it with: {extra_install_display(COPILOT_EXTRA)}"
             ) from exc
 
@@ -540,23 +559,21 @@ class CopilotExecutor(Executor):
         # must be absolute"), and a spec / os_env can hand us a relative cwd
         # (e.g. ``.``), so always resolve to an absolute path.
         cwd = os.path.abspath(self._cwd or os.getcwd())
-        # A GHE hostname reaches the bundled CLI only as an env var; the SDK has
-        # no host parameter. Set it in our own environment rather than passing
-        # ``env=`` — the SDK inherits ``os.environ`` only when ``env`` is None,
-        # so handing it a dict would strip everything else from the subprocess.
-        # Assign both ways so a hostless executor can't inherit a host another
-        # one left behind.
-        if self._github_host:
-            os.environ[COPILOT_HOST_ENV_VAR] = self._github_host
-        else:
-            os.environ.pop(COPILOT_HOST_ENV_VAR, None)
-        client = CopilotClient(
-            github_token=self._github_token,
-            working_directory=cwd,
-            log_level="error",
+        # SDK 2 defaults to in-process hosting, but this harness needs a child env
+        # and cwd. Construction may download the runtime, so keep it off the loop.
+        client = await asyncio.to_thread(
+            CopilotClient,
+            mode="coding-agent",
+            runtime=RuntimeConnection.for_spawned_stdio(
+                working_directory=cwd, env=_runtime_env(self._github_host)
+            ),
+            github={"token": self._github_token},
+            observability={"log_level": "error"},
         )
+        if state.closed:
+            return
         try:
-            # ``start()`` is inside the try: it spawns the bundled Copilot CLI
+            # ``start()`` is inside the try: it spawns the Copilot CLI
             # subprocess *before* connecting/verifying, and the SDK's own error
             # path re-raises without terminating that subprocess — only
             # ``client.stop()`` reaps it. So a start failure (bad token, version
@@ -566,18 +583,22 @@ class CopilotExecutor(Executor):
             # its built-in tools) and layers the Omnigent agent's system prompt
             # on top — a ``replace`` would strip the tool-use guidance the model
             # relies on. ``None`` when the spec carries no system prompt.
-            system_message = (
+            system_message: SystemMessageConfig | None = (
                 {"mode": "append", "content": system_prompt} if system_prompt else None
             )
             session = await client.create_session(
                 model=model,
-                streaming=True,
                 system_message=system_message,
-                tools=self._make_tools(tools) or None,
-                on_permission_request=self._on_permission_request,
                 working_directory=cwd,
-                reasoning_effort=reasoning_effort or None,
+                permissions={"on_request": self._on_permission_request},
+                events={"streaming": True},
+                tools={"definitions": self._make_tools(tools) or None},
+                inference={"reasoning_effort": reasoning_effort or None},
             )
+            if state.closed:
+                await _safe_stop(session)
+                await _safe_stop(client)
+                return
         except BaseException:
             await _safe_stop(client)
             raise
@@ -621,6 +642,8 @@ class CopilotExecutor(Executor):
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start copilot-sdk session: {exc}")
+            return
+        if state.closed or state.session is None:
             return
 
         prompt = _build_copilot_prompt(messages, is_first_turn=is_first_turn)
@@ -828,6 +851,7 @@ class CopilotExecutor(Executor):
         yield TurnComplete(response=final, usage=usage)
 
     async def _close_state(self, state: _CopilotSessionState) -> None:
+        state.closed = True
         if state.session is not None:
             await _safe_stop(state.session)
             state.session = None
@@ -846,7 +870,7 @@ class CopilotExecutor(Executor):
         if state is None:
             return False
         # Best-effort SDK abort first, to cleanly cancel the in-flight turn on
-        # the bundled CLI *before* teardown. ``session.abort()`` is the SDK's
+        # the Copilot CLI *before* teardown. ``session.abort()`` is the SDK's
         # blessed cancel (it keeps the session valid), so it stops the next
         # ``stop()`` from racing a live generation — which can orphan the CLI's
         # tool subprocesses or dump a post-cancel stream. Mirrors pi / claude-sdk.
@@ -878,6 +902,16 @@ class CopilotExecutor(Executor):
 # ---------------------------------------------------------------------------
 
 
+def _runtime_env(github_host: str | None) -> dict[str, str]:
+    """Return a copy of ``os.environ`` for the CLI with the GHE host set or cleared."""
+    env = os.environ.copy()
+    if github_host:
+        env[COPILOT_HOST_ENV_VAR] = github_host
+    else:
+        env.pop(COPILOT_HOST_ENV_VAR, None)
+    return env
+
+
 def _ambient_github_token(host: str | None = None) -> str | None:
     """Return an ambient GitHub token: env vars first, then the ``gh`` CLI login.
 
@@ -902,10 +936,8 @@ def _ambient_github_token(host: str | None = None) -> str | None:
 def _configured_github_host() -> str | None:
     """Return the configured GHE hostname: env var first, then the config block.
 
-    Reads the *ambient* env var captured at import, not the live one — the
-    executor writes ``COPILOT_HOST_ENV_VAR`` to hand the host to the bundled CLI,
-    and reading that back would let one executor's host leak into a later
-    hostless one.
+    Reads the *ambient* env var captured at import, so a later change to the
+    process env cannot leak into a hostless executor.
     """
     from omnigent.onboarding.copilot_auth import copilot_github_host
 
@@ -1059,7 +1091,7 @@ def _finalize_usage(acc: dict[str, int]) -> dict[str, Any] | None:  # type: igno
 async def _safe_stop(obj: Any) -> None:  # type: ignore[explicit-any]
     """Best-effort async teardown of a ``copilot`` client / session.
 
-    :class:`copilot.CopilotClient` exposes ``stop()`` (terminates the bundled
+    :class:`copilot.CopilotClient` exposes ``stop()`` (terminates the spawned
     CLI subprocess it launched); :class:`copilot.CopilotSession` exposes
     ``disconnect()``. Prefer ``stop`` then ``disconnect``; a teardown failure
     must not mask the original error or leave the closer raising.

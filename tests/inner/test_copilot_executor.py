@@ -1,6 +1,6 @@
 """Tests for :class:`omnigent.inner.copilot_executor.CopilotExecutor`.
 
-The copilot harness drives the GitHub Copilot SDK (``github-copilot-sdk``,
+The copilot harness drives the GitHub Copilot SDK (``microsoft-copilot-sdk``,
 imported as ``copilot``). The SDK is replaced with an injected fake module (so
 no real backing CLI, GitHub token, or network is needed), letting us exercise
 the ``SessionEvent`` → ExecutorEvent mapping, the tool bridge into
@@ -16,7 +16,9 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -205,8 +207,14 @@ def _install_fake_copilot(
             self.result_type = result_type
             self.error = error
 
+    class _RuntimeConnection:
+        @staticmethod
+        def for_spawned_stdio(**kwargs: Any) -> dict[str, Any]:
+            return {"transport": "spawned_stdio", **kwargs}
+
     module = types.ModuleType("copilot")
     module.CopilotClient = _FakeClient  # type: ignore[attr-defined]
+    module.RuntimeConnection = _RuntimeConnection  # type: ignore[attr-defined]
     module.Tool = _Tool  # type: ignore[attr-defined]
     module.ToolResult = _ToolResult  # type: ignore[attr-defined]
     module.PermissionHandler = _PermissionHandler  # type: ignore[attr-defined]
@@ -394,22 +402,25 @@ def test_host_env_var_spelling_matches_onboarding() -> None:
 
 
 async def test_github_host_exported_for_bundled_cli(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The SDK has no host parameter, so the GHE host only reaches the bundled
-    CLI as an env var it inherits from us."""
-    _install_fake_copilot(monkeypatch, [[]])
+    """The SDK has no host parameter, so the GHE host reaches the CLI through
+    its runtime env copy, never the process env."""
+    state = _install_fake_copilot(monkeypatch, [[]])
     monkeypatch.delenv(COPILOT_HOST_ENV_VAR, raising=False)
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
+    monkeypatch.setenv("UNRELATED_VAR", "kept")
     ex = CopilotExecutor(github_host="acme.ghe.com")
     assert ex._github_host == "acme.ghe.com"
-    assert COPILOT_HOST_ENV_VAR not in os.environ, "set at session start, not construction"
     async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
         pass
-    assert os.environ[COPILOT_HOST_ENV_VAR] == "acme.ghe.com"
+    runtime_env = state["client_kwargs"][0]["runtime"]["env"]
+    assert runtime_env[COPILOT_HOST_ENV_VAR] == "acme.ghe.com"
+    assert runtime_env["UNRELATED_VAR"] == "kept"
+    assert COPILOT_HOST_ENV_VAR not in os.environ
 
 
 async def test_hostless_executor_clears_a_leftover_host(monkeypatch: pytest.MonkeyPatch) -> None:
     """A hostless executor must not inherit a host another one left in the env."""
-    _install_fake_copilot(monkeypatch, [[]])
+    state = _install_fake_copilot(monkeypatch, [[]])
     monkeypatch.setenv(COPILOT_HOST_ENV_VAR, "stale.ghe.com")
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
     monkeypatch.setattr(copilot_executor, "_AMBIENT_HOST", None)
@@ -418,7 +429,8 @@ async def test_hostless_executor_clears_a_leftover_host(monkeypatch: pytest.Monk
     assert ex._github_host is None
     async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
         pass
-    assert COPILOT_HOST_ENV_VAR not in os.environ
+    assert COPILOT_HOST_ENV_VAR not in state["client_kwargs"][0]["runtime"]["env"]
+    assert os.environ[COPILOT_HOST_ENV_VAR] == "stale.ghe.com"
 
 
 def test_capabilities() -> None:
@@ -580,7 +592,7 @@ async def test_run_turn_streams_text_reasoning_and_usage(
         "total_tokens": 12,
     }
     # github_token threaded to the client; unsubscribed after the turn.
-    assert state["client_kwargs"][0]["github_token"] == "gho_x"
+    assert state["client_kwargs"][0]["github"] == {"token": "gho_x"}
     assert state["unsub_calls"] >= 1
     await ex.close()
 
@@ -787,7 +799,84 @@ async def test_system_message_and_model_threaded(monkeypatch: pytest.MonkeyPatch
     # system prompt delivered as an append-mode system_message.
     assert kwargs["system_message"] == {"mode": "append", "content": "SYS"}
     # native-tool permission requests route through the policy-gating handler.
-    assert kwargs["on_permission_request"] == ex._on_permission_request
+    assert kwargs["permissions"] == {"on_request": ex._on_permission_request}
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_sdk_v2_grouped_client_and_session_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK 2.x takes grouped options and must spawn the CLI over stdio, not in-process."""
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x", cwd="/work")
+    tools = [{"name": "sys_echo", "description": "", "parameters": {"type": "object"}}]
+    _ = [e async for e in ex.run_turn([_user("hi")], tools, "SYS")]
+    client_kwargs = state["client_kwargs"][0]
+    assert client_kwargs["mode"] == "coding-agent"
+    assert client_kwargs["runtime"]["transport"] == "spawned_stdio"
+    assert client_kwargs["runtime"]["working_directory"] == "/work"
+    assert isinstance(client_kwargs["runtime"]["env"], dict)
+    assert client_kwargs["observability"] == {"log_level": "error"}
+    create_kwargs = state["create_kwargs"][0]
+    assert create_kwargs["events"] == {"streaming": True}
+    assert create_kwargs["working_directory"] == "/work"
+    assert [tool.name for tool in create_kwargs["tools"]["definitions"]] == ["sys_echo"]
+    assert create_kwargs["tools"]["definitions"][0].skip_permission is True
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_serializes_executor_options(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Drive the installed SDK up to its ``session.create`` RPC and check the wire payload."""
+    copilot = pytest.importorskip("copilot")
+    assert hasattr(copilot, "RuntimeConnection"), "requires microsoft-copilot-sdk 2.x"
+    # A pinned runtime path stops the real client from downloading the CLI.
+    monkeypatch.setenv("COPILOT_CLI_PATH", str(tmp_path / "copilot-runtime"))
+    monkeypatch.delenv(COPILOT_HOST_ENV_VAR, raising=False)
+    captured: dict[str, Any] = {}
+
+    class _RpcCaptured(Exception):
+        pass
+
+    class _FakeRpc:
+        async def request(self, method: str, params: dict[str, Any], **_: Any) -> None:
+            captured[method] = params
+            raise _RpcCaptured
+
+    async def _start(client: Any) -> None:
+        captured["client"] = client
+        client._client = _FakeRpc()
+
+    monkeypatch.setattr(copilot.CopilotClient, "start", _start)
+    ex = CopilotExecutor(github_token="gho_x", github_host="acme.ghe.com", cwd=str(tmp_path))
+    tools = [{"name": "sys_echo", "description": "echo", "parameters": {"type": "object"}}]
+    events = [
+        e
+        async for e in ex.run_turn(
+            [_user("hi")], tools, "SYS", ExecutorConfig(extra={"reasoning_effort": "high"})
+        )
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+
+    options = captured["client"]._options
+    assert options.mode == "coding-agent"
+    assert options.github_token == "gho_x"
+    assert options.log_level == "error"
+    assert options.connection.working_directory == str(tmp_path)
+    assert options.connection.env[COPILOT_HOST_ENV_VAR] == "acme.ghe.com"
+    assert COPILOT_HOST_ENV_VAR not in os.environ
+
+    payload = captured["session.create"]
+    assert payload["workingDirectory"] == str(tmp_path)
+    assert payload["systemMessage"] == {"mode": "append", "content": "SYS"}
+    assert payload["permissions"]["request"] is True
+    assert payload["events"]["streaming"] is True
+    assert payload["inference"]["reasoningEffort"] == "high"
+    [tool] = payload["tools"]["definitions"]
+    assert tool["name"] == "sys_echo" and tool["skipPermission"] is True
     await ex.close()
 
 
@@ -804,7 +893,7 @@ async def test_reasoning_effort_threaded_to_create_session(
         )
     ]
     # The /reasoning pick reaches the SDK's create_session.
-    assert state["create_kwargs"][0]["reasoning_effort"] == "high"
+    assert state["create_kwargs"][0]["inference"]["reasoning_effort"] == "high"
     await ex.close()
 
 
@@ -814,7 +903,7 @@ async def test_reasoning_effort_omitted_when_unset(monkeypatch: pytest.MonkeyPat
     ex = CopilotExecutor(github_token="gho_x")
     _ = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
     # No effort pinned -> None, so the model uses its default.
-    assert state["create_kwargs"][0]["reasoning_effort"] is None
+    assert state["create_kwargs"][0]["inference"]["reasoning_effort"] is None
     await ex.close()
 
 
@@ -844,7 +933,7 @@ async def test_session_restart_on_reasoning_effort_change(
     ]
     # Reasoning effort is fixed at session creation, so a change recreates it.
     assert len(state["create_kwargs"]) == 2
-    assert [k["reasoning_effort"] for k in state["create_kwargs"]] == ["low", "high"]
+    assert [k["inference"]["reasoning_effort"] for k in state["create_kwargs"]] == ["low", "high"]
     assert state["client_closed"] >= 1
     await ex.close()
 
@@ -856,7 +945,7 @@ async def test_relative_cwd_resolved_to_absolute(monkeypatch: pytest.MonkeyPatch
     state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
     ex = CopilotExecutor(github_token="gho_x", cwd=".")
     _ = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
-    client_wd = state["client_kwargs"][0]["working_directory"]
+    client_wd = state["client_kwargs"][0]["runtime"]["working_directory"]
     session_wd = state["create_kwargs"][0]["working_directory"]
     import os as _os
 
@@ -1150,6 +1239,152 @@ async def test_permission_policy_allow_then_elicitation(monkeypatch: pytest.Monk
     assert decision.kind == "approve-once"
     assert elicitation_calls == ["write"]
     await ex.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("managed_required", "managed_settings", "policy", "human", "expected"),
+    [
+        # No human handler: managed flags turn the default approve into a reject.
+        (False, False, None, None, "approve-once"),
+        (True, False, None, None, "managed"),
+        (False, True, None, None, "managed"),
+        (True, True, "POLICY_ACTION_ALLOW", None, "managed"),
+        # Policy hard-deny still wins first.
+        (True, True, "POLICY_ACTION_DENY", None, "policy"),
+        # A human handler decides even when managed approval is required.
+        (True, True, None, True, "approve-once"),
+        (True, False, None, False, "approval UI"),
+    ],
+)
+async def test_permission_managed_approval_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    managed_required: bool,
+    managed_settings: bool,
+    policy: str | None,
+    human: bool | None,
+    expected: str,
+) -> None:
+    _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+    if policy is not None:
+
+        async def evaluate(phase: str, ctx: dict[str, Any]) -> Any:
+            return _verdict(policy, "blocked")
+
+        ex._policy_evaluator = evaluate
+    if human is not None:
+
+        async def elicit(name: str, args: dict[str, Any]) -> bool:
+            return human
+
+        ex._elicitation_handler = elicit
+    req = _perm_request("shell", fullCommandText="ls")
+    req.managed_approval_required = managed_required
+    decision = await ex._on_permission_request(
+        req, {"session_id": "conv1", "managed_settings_enabled": managed_settings}
+    )
+    if expected == "approve-once":
+        assert decision.kind == "approve-once"
+    else:
+        assert decision.kind == "reject"
+        feedback = {"managed": "Managed approval required", "policy": "Omnigent policy"}
+        assert feedback.get(expected, expected) in decision.feedback
+    await ex.close()
+
+
+def _install_blocking_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event]:
+    """Make the fake ``CopilotClient`` constructor block until released."""
+    module = sys.modules["copilot"]
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingClient(module.CopilotClient):  # type: ignore[name-defined, misc]
+        def __init__(self, **kwargs: Any) -> None:
+            entered.set()
+            assert release.wait(timeout=10)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(module, "CopilotClient", _BlockingClient)
+    return entered, release
+
+
+@pytest.mark.asyncio
+async def test_client_construction_runs_off_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK2 constructor may download the runtime synchronously; the loop must stay free."""
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    entered, release = _install_blocking_constructor(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def run() -> list[Any]:
+        return [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+
+    turn = asyncio.create_task(run())
+    assert await asyncio.to_thread(entered.wait, 10)
+    # The constructor is still blocked; another coroutine can run meanwhile.
+    loop_ran = asyncio.Event()
+    asyncio.get_running_loop().call_soon(loop_ran.set)
+    await asyncio.wait_for(loop_ran.wait(), timeout=5)
+    assert not turn.done() and state["started"] == 0
+    release.set()
+    events = await asyncio.wait_for(turn, timeout=10)
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert state["started"] == 1
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_client_construction_never_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    entered, release = _install_blocking_constructor(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def run() -> list[Any]:
+        return [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+
+    turn = asyncio.create_task(run())
+    assert await asyncio.to_thread(entered.wait, 10)
+    assert await ex.interrupt_session("conv1") is True
+    release.set()
+    assert await asyncio.wait_for(turn, timeout=10) == []
+    assert state["started"] == 0 and state["create_kwargs"] == [] and state["sent"] == []
+    await ex.close()
+    assert state["client_closed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_session_create_stops_once_without_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    module = sys.modules["copilot"]
+    create_entered = asyncio.Event()
+    create_release = asyncio.Event()
+
+    class _GatedClient(module.CopilotClient):  # type: ignore[name-defined, misc]
+        async def create_session(self, **kwargs: Any) -> Any:
+            create_entered.set()
+            await create_release.wait()
+            return await super().create_session(**kwargs)
+
+    monkeypatch.setattr(module, "CopilotClient", _GatedClient)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def run() -> list[Any]:
+        return [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+
+    turn = asyncio.create_task(run())
+    await asyncio.wait_for(create_entered.wait(), timeout=10)
+    assert await ex.interrupt_session("conv1") is True
+    create_release.set()
+    assert await asyncio.wait_for(turn, timeout=10) == []
+    assert state["sent"] == []
+    await ex.close()
+    assert state["session_closed"] == 1 and state["client_closed"] == 1
 
 
 # ---------------------------------------------------------------------------

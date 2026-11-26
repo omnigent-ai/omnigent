@@ -49,7 +49,7 @@ def test_help_lists_copilot_under_harnesses() -> None:
     # Extras-gated harnesses (cursor) are hidden from the roster until their SDK
     # is importable; only assert the row when the Copilot SDK is installed.
     if importlib.util.find_spec("copilot") is None:
-        pytest.skip("github-copilot-sdk is not installed")
+        pytest.skip("microsoft-copilot-sdk is not installed")
 
     output, exit_code = _run_cli("--help")
 

@@ -255,11 +255,9 @@ agents-sdk = [
 # >=6,<8, so this constraint selects the 7.x slot and prevents the
 # "gencode/runtime version mismatch" error at import time.
 antigravity = ["google-antigravity>=0.1,<1", "protobuf>=7,<8"]
-# GitHub Copilot SDK harness (`harness: copilot`). Optional: the harness module
-# imports the SDK lazily on first turn, so only users of the harness need this
-# extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
-# why it is not part of the baseline install. Pin major.
-copilot = ["github-copilot-sdk>=1,<2"]
+# Optional Copilot SDK 2 harness. The SDK downloads its runtime on first use;
+# `python -m copilot download-runtime` can provision it ahead of time.
+copilot = ["microsoft-copilot-sdk>=2,<3"]
 # Server-side streaming dictation (`WS /v1/dictation/stream`,
 # designs/server-dictation.md). Local CPU speech-to-text via sherpa-onnx;
 # the engine module imports it lazily, so only servers offering dictation
