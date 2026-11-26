@@ -139,6 +139,66 @@
       "pattern": "{**/**/,a}x",
       "path": "**/**/x",
       "matches": true
+    },
+    {
+      "pattern": "file?.ts",
+      "path": "file😀.ts",
+      "matches": true
+    },
+    {
+      "pattern": "?.ts",
+      "path": "😀.ts",
+      "matches": true
+    },
+    {
+      "pattern": "file??.ts",
+      "path": "file😀.ts",
+      "matches": false
+    },
+    {
+      "pattern": "*.k",
+      "path": "note.\u212a",
+      "matches": true
+    },
+    {
+      "pattern": "*.i",
+      "path": "note.\u0130",
+      "matches": true
+    },
+    {
+      "pattern": "s.txt",
+      "path": "\u017f.txt",
+      "matches": true
+    },
+    {
+      "pattern": "\u0390.txt",
+      "path": "\u1fd3.txt",
+      "matches": true
+    },
+    {
+      "pattern": "*.ts",
+      "path": "a.ts\n",
+      "matches": true
+    },
+    {
+      "pattern": "*.ts",
+      "path": "a.ts\n\n",
+      "matches": false
+    },
+    {
+      "pattern": "**",
+      "path": "a\rb",
+      "matches": true
+    },
+    {
+      "pattern": "**",
+      "path": "a\u2028b",
+      "matches": true
+    },
+    {
+      "pattern": "**",
+      "path": "a\nb",
+      "matches": false
     }
   ]
 }
