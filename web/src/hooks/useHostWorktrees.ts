@@ -60,6 +60,11 @@ function matchKind(root: string, workspace: string): MatchKind {
   return { kind: "none" };
 }
 
+/** Whether ``path`` is worktree ``root`` itself, compared as {@link matchWorktree} does. */
+export function isWorktreeRoot(root: string, path: string): boolean {
+  return matchKind(root, path).kind === "exact";
+}
+
 /**
  * The worktree whose root contains ``workspace`` — exact match, else the
  * deepest root ``workspace`` sits under (a workspace bound to a subdir of a

@@ -3,7 +3,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { useHostWorktrees } from "./useHostWorktrees";
+import { isWorktreeRoot, useHostWorktrees } from "./useHostWorktrees";
 
 const authenticatedFetchMock = vi.fn();
 vi.mock("@/lib/identity", () => ({
@@ -135,5 +135,19 @@ describe("useHostWorktrees", () => {
     const { result } = renderHook(() => useHostWorktrees(hostId, path), { wrapper: wrapper() });
     expect(result.current.data).toBeUndefined();
     expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("isWorktreeRoot", () => {
+  it.each([
+    ["the same POSIX path", "/repo", "/repo", true],
+    ["a trailing slash", "/repo/", "/repo", true],
+    ["a folder inside it", "/repo", "/repo/src", false],
+    ["POSIX case", "/Repo", "/repo", false],
+    ["Windows separators", "C:/repo", "C:\\repo", true],
+    ["a Windows drive in another case", "C:\\repo", "c:\\repo", true],
+    ["a Windows folder inside it", "C:/repo", "C:\\repo\\app", false],
+  ])("compares %s", (_case, root, path, same) => {
+    expect(isWorktreeRoot(root, path)).toBe(same);
   });
 });
