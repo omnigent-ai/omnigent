@@ -170,8 +170,6 @@ describe("pathInWorktree", () => {
     ["a folder of a Windows drive's root", "C:\\", "c:/repo", "repo"],
     ["a Windows folder with mixed separators", "c:/repo", "C:\\repo\\app\\", "app"],
     ["a Windows folder in another case, in its own spelling", "C:/repo", "c:\\REPO\\Src", "Src"],
-    ["a folder of a UNC share", "\\\\server\\share\\repo", "//server/share/repo/src", "src"],
-    ["outside a UNC share", "\\\\server\\share\\repo", "\\\\server\\other\\src", null],
   ])("places %s", (_case, root, path, relative) => {
     expect(pathInWorktree(root, path)).toBe(relative);
   });
@@ -182,7 +180,8 @@ describe("isAbsoluteHostPath and trimHostPath", () => {
     ["/repo", true],
     ["C:\\repo", true],
     ["c:/repo", true],
-    ["\\\\server\\share", true],
+    // UNC shares aren't read as Windows paths by the worktree matcher.
+    ["\\\\server\\share", false],
     ["src/a.ts", false],
     ["C:repo", false],
   ])("reads %s as absolute: %s", (path, absolute) => {
@@ -194,7 +193,6 @@ describe("isAbsoluteHostPath and trimHostPath", () => {
     ["/", "/"],
     ["/repo/worktree\\", "/repo/worktree\\"],
     ["C:\\repo\\", "C:\\repo"],
-    ["\\\\server\\share\\", "\\\\server\\share"],
   ])("trims %s to %s", (path, trimmed) => {
     expect(trimHostPath(path)).toBe(trimmed);
   });

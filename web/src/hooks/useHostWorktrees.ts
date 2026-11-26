@@ -32,10 +32,10 @@ export interface HostWorktree {
   updated_at?: number | null;
 }
 
-/** Windows absolute path: a drive (``C:\repo`` / ``C:/repo``) or a UNC share (``\\server\share``). */
-const WINDOWS_ABS_PATH = /^(?:[A-Za-z]:[/\\]|\\\\)/;
+/** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
+const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
 
-/** Whether ``path`` is absolute on its host: POSIX, a Windows drive, or a UNC share. */
+/** Whether ``path`` is absolute on its host: POSIX or a Windows drive. */
 export function isAbsoluteHostPath(path: string): boolean {
   return path.startsWith("/") || WINDOWS_ABS_PATH.test(path);
 }

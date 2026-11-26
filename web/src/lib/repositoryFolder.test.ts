@@ -153,22 +153,14 @@ describe("paths between a worktree's review and its session", () => {
       "src/A.ts",
     );
     expect(repositoryPathOf(".WORKTREES/Feature/src/a.ts", FOLDER, "C:\\repo")).toBe("src/a.ts");
-    expect(
-      repositoryPathOf("\\\\server\\share\\repo\\src\\a.ts", "", "\\\\server\\share\\repo"),
-    ).toBe("src/a.ts");
-    expect(
-      repositoryPathOf(
-        "\\\\server\\share\\repo\\.worktrees\\feature\\a.ts",
-        FOLDER,
-        "\\\\server\\share\\repo",
-      ),
-    ).toBe("a.ts");
-    expect(repositoryPathOf("\\\\server\\other\\a.ts", "", "\\\\server\\share\\repo")).toBeNull();
-    expect(
-      repositoryPathOf("\\\\server\\other\\a.ts", FOLDER, "\\\\server\\share\\repo"),
-    ).toBeNull();
     expect(repositoryPathOf(".worktrees/feature", FOLDER, "/repo")).toBeNull();
     expect(repositoryPathOf("/elsewhere/a.ts", FOLDER, "/repo")).toBeNull();
     expect(repositoryPathOf("/repo/src/a.ts", "", "/repo")).toBe("src/a.ts");
+  });
+
+  it("leaves UNC shares unmapped, since the worktree matcher doesn't read them as Windows paths", () => {
+    const share = "\\\\server\\share\\repo";
+    expect(repositoryPathOf(`${share}\\.worktrees\\feature\\a.ts`, FOLDER, share)).toBeNull();
+    expect(repositoryFolderOf(`${share}\\.worktrees\\feature`, share)).toBeNull();
   });
 });
