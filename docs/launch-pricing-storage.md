@@ -7,7 +7,9 @@ also prevent a later model switch from fitting.
 
 The schema proposal adds nullable `launch_pricing_context_id` to
 `omnigent_conversation_metadata`, using the existing `Uuid16` type. It adds no
-application mapping or writer. The reference occupies 16 bytes, with
+pricing reader or writer. The canonical metadata schema declares the column as
+deferred: metadata-based database initialization includes it, while ordinary
+session reads leave it unloaded. The reference occupies 16 bytes, with
 `BINARY(16)` on MySQL and the existing binary representation on other engines.
 The complete provider name belongs in the existing artifact store, alongside
 the harness needed to select the correct pricing family. This preserves names
@@ -63,5 +65,7 @@ Validate the migration on an isolated database with
 `pytest tests/db/test_migration_launch_pricing_context.py --reruns 0 -n 0`.
 The checks render upgrade DDL for SQLite, PostgreSQL and MySQL. SQLite lifecycle
 checks cover existing rows and overrides, older SQL writes, reference round trips
-and pre-activation downgrade. They do not replace deployment validation of the
-revision guard or application acceptance.
+and pre-activation downgrade. A metadata-create/stamp/downgrade scenario also
+covers the initialization boundary used by CockroachDB tests, including ordinary
+ORM reads after downgrade. They do not replace live-engine deployment validation
+of the revision guard or application acceptance.

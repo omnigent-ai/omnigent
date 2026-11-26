@@ -9,6 +9,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 
+from omnigent.db.db_models import ConversationBase, OmnigentBase, SqlConversationMetadata
 from omnigent.db.utils import _build_alembic_config
 
 _PREVIOUS = "47d3e8fc3e25"
@@ -43,6 +44,28 @@ def test_launch_pricing_reference_ddl_is_additive(uri: str, column_type: str) ->
     assert "DROP " not in sql
     assert f"UPDATE {_TABLE}" not in sql
     assert "CREATE INDEX" not in sql
+
+
+def test_metadata_bootstrap_can_downgrade_the_reserved_reference(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'bootstrap.db'}"
+    engine = sa.create_engine(uri)
+    try:
+        ConversationBase.metadata.create_all(engine)
+        OmnigentBase.metadata.create_all(engine)
+        _migrate(uri, engine, "stamp", _REVISION)
+
+        _migrate(uri, engine, "downgrade", _PREVIOUS)
+
+        assert _COLUMN not in {column["name"] for column in sa.inspect(engine).get_columns(_TABLE)}
+        with engine.connect() as connection:
+            connection.execute(sa.select(SqlConversationMetadata).limit(1)).first()
+        _migrate(uri, engine, "upgrade", _REVISION)
+        column = SqlConversationMetadata.__table__.c[_COLUMN]
+        assert column.nullable and column.server_default is None
+        assert SqlConversationMetadata.launch_pricing_context_id.property.deferred
+        assert _COLUMN in {column["name"] for column in sa.inspect(engine).get_columns(_TABLE)}
+    finally:
+        engine.dispose()
 
 
 def test_launch_pricing_reference_preserves_legacy_rows_and_writes(tmp_path: Path) -> None:
