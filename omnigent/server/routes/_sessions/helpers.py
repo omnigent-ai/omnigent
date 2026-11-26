@@ -118,7 +118,13 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
+from omnigent.server import (
+    background_session_titles,
+    presence,
+    session_live_state,
+    session_pull_requests,
+    shutdown_state,
+)
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -5469,9 +5475,11 @@ def _publish_status(
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
-        # A turn can open or merge a PR while nobody watches; refresh what the server
-        # stores. Stops and archives publish idle without persisting it, and skip this.
+        # A turn can open or merge a PR while nobody watches, and the first turn's
+        # reply can name a session better than its first message did. Stops and
+        # archives publish idle without persisting it, and skip both.
         session_pull_requests.notify_turn_end(session_id)
+        background_session_titles.notify_turn_end(session_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import re
 import time
@@ -18,6 +19,7 @@ from omnigent.entities.workflow import WORKFLOW_NAME_MAX_CHARS
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
 from omnigent.runner.background_titles.service import (
+    BACKGROUND_TITLE_MAX_PROMPT_CHARS,
     CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
     FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
     LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS,
@@ -118,6 +120,56 @@ def normalize_background_title(
     return title
 
 
+#: Share of the runner's title prompt kept for the first message when refining,
+#: so the agent's reply still fits after a long request.
+REFINED_TITLE_MESSAGE_MAX_CHARS = 1_500
+#: Turn ends that may each find the first reply missing (a native pane idling
+#: before its transcript mirrors, or a mid-turn lull) before refinement gives up.
+_MAX_REFINEMENT_TURN_END_CHECKS = 5
+#: Bounds memory for sessions whose first turn never ends.
+_MAX_PENDING_REFINEMENTS = 1_000
+
+
+def refined_title_prompt(first_message: str, reply: str) -> str:
+    """Combine the first message and the agent's reply within the runner's prompt limit.
+
+    :param first_message: Text of the session's first message, e.g. ``"look at <link>"``.
+    :param reply: The agent's reply to it, e.g. ``"The PR adds retry backoff to the uploader."``.
+    """
+    message = first_message.strip()[:REFINED_TITLE_MESSAGE_MAX_CHARS]
+    head = f"User request:\n{message}\n\nAgent reply:\n"
+    return head + reply.strip()[: BACKGROUND_TITLE_MAX_PROMPT_CHARS - len(head)]
+
+
+def _first_reply_text(conversation_store: ConversationStore, session_id: str) -> str | None:
+    """Read the latest assistant reply that follows the latest user message."""
+    # Imported lazily: the sessions helpers import this module.
+    from omnigent.server.routes._sessions.helpers import _latest_assistant_text_from_store
+
+    return _latest_assistant_text_from_store(
+        conversation_store, session_id, stop_at_user_message=True
+    )
+
+
+def _session_is_running(session_id: str) -> bool:
+    from omnigent.server.routes._sessions.common import _session_status_cache
+
+    return _session_status_cache.get(session_id) == "running"
+
+
+@dataclass(frozen=True)
+class _PendingTitleRefinement:
+    """A session waiting for its first turn to end so its title can be refined."""
+
+    request: BackgroundTitleRequest
+    #: Resolves to the title the refinement may replace, or ``None`` when a user or
+    #: agent rename already took the session's title.
+    initial_title: asyncio.Task[str | None]
+    #: The scheduling request's context, so the store reads the session's workspace.
+    context: contextvars.Context
+    turn_end_checks: int = 0
+
+
 def _with_language_rule(instructions: str) -> str:
     if not instructions:
         return FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
@@ -204,11 +256,15 @@ class BackgroundSessionTitleCoordinator:
         max_concurrency: int = 4,
         additional_instructions: str | None = None,
         user_instructions: UserTitleInstructionsResolver | None = None,
+        turn_settle_seconds: float = 3.0,
     ) -> None:
         """
         :param additional_instructions: Server-configured title guidance.
         :param user_instructions: Optional lookup of the session owner's saved
             guidance, called off the event loop with the session id.
+        :param turn_settle_seconds: Delay after the first turn ends before its
+            reply is read, so a native transcript can mirror and a brief idle
+            lull mid-turn is not mistaken for the turn's end.
         """
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least 1")
@@ -218,10 +274,13 @@ class BackgroundSessionTitleCoordinator:
         self._seed_wait_seconds = seed_wait_seconds
         self._additional_instructions = additional_instructions
         self._user_instructions = user_instructions
+        self._turn_settle_seconds = turn_settle_seconds
         self._generation_slots = asyncio.Semaphore(max_concurrency)
-        self._pending: set[asyncio.Task[None]] = set()
+        self._pending: set[asyncio.Task[Any]] = set()
         self._scheduled_session_ids: set[str] = set()
         self._scheduled_task_summary_ids: set[str] = set()
+        self._pending_refinements: dict[str, _PendingTitleRefinement] = {}
+        self._closed = False
 
     async def format_agent_title(self, request: BackgroundTitleRequest) -> str | None:
         """Apply configured title requirements without changing the stored title.
@@ -301,31 +360,144 @@ class BackgroundSessionTitleCoordinator:
         model_override: str | None = None,
         sub_agent_name: str | None = None,
     ) -> None:
-        """Schedule at most one title attempt and return without awaiting it."""
+        """Schedule at most one title attempt and return without awaiting it.
+
+        The session is also registered for one refinement once its first turn
+        ends (see :meth:`turn_ended`).
+        """
         if session_id in self._scheduled_session_ids:
             return
         self._scheduled_session_ids.add(session_id)
+        request = BackgroundTitleRequest(
+            session_id=session_id,
+            prompt=prompt,
+            agent_id=agent_id,
+            harness_override=harness_override,
+            model_override=model_override,
+            sub_agent_name=sub_agent_name,
+        )
         task = asyncio.create_task(
-            self._run(
-                request=BackgroundTitleRequest(
-                    session_id=session_id,
-                    prompt=prompt,
-                    agent_id=agent_id,
-                    harness_override=harness_override,
-                    model_override=model_override,
-                    sub_agent_name=sub_agent_name,
-                ),
-                expected_seed_title=expected_seed_title,
-            ),
+            self._run(request=request, expected_seed_title=expected_seed_title),
             name=f"background-session-title-{session_id}",
         )
         self._pending.add(task)
 
-        def _discard(completed: asyncio.Task[None]) -> None:
+        def _discard(completed: asyncio.Task[str | None]) -> None:
             self._pending.discard(completed)
             self._scheduled_session_ids.discard(session_id)
 
         task.add_done_callback(_discard)
+        if session_id not in self._pending_refinements:
+            self._register_refinement(
+                _PendingTitleRefinement(
+                    request=request,
+                    initial_title=task,
+                    context=contextvars.copy_context(),
+                )
+            )
+
+    def turn_ended(self, session_id: str) -> None:
+        """Refine a session's generated title from its first reply, at most once.
+
+        Does nothing for sessions without a pending refinement, so later turns,
+        child sessions, and sessions titled by a user or automation are untouched.
+        """
+        refinement = self._pending_refinements.pop(session_id, None)
+        if refinement is None or self._closed:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            self._refine(refinement),
+            name=f"background-session-title-refinement-{session_id}",
+            context=refinement.context,
+        )
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    def _register_refinement(self, refinement: _PendingTitleRefinement) -> None:
+        if self._closed:
+            return
+        self._pending_refinements[refinement.request.session_id] = refinement
+        while len(self._pending_refinements) > _MAX_PENDING_REFINEMENTS:
+            del self._pending_refinements[next(iter(self._pending_refinements))]
+
+    async def _refine(self, refinement: _PendingTitleRefinement) -> None:
+        """Retitle from the first message and reply if the generated title is still current."""
+        session_id = refinement.request.session_id
+        started = time.perf_counter()
+        try:
+            owned_title = await asyncio.shield(refinement.initial_title)
+            if owned_title is None:
+                return
+            await asyncio.sleep(self._turn_settle_seconds)
+            reply = None
+            if not _session_is_running(session_id):
+                reply = await asyncio.to_thread(
+                    _first_reply_text, self._conversation_store, session_id
+                )
+            if reply is None or not reply.strip():
+                if refinement.turn_end_checks + 1 < _MAX_REFINEMENT_TURN_END_CHECKS:
+                    self._register_refinement(
+                        replace(refinement, turn_end_checks=refinement.turn_end_checks + 1)
+                    )
+                return
+            # Skip the inference when a rename already won; the guarded rename covers races.
+            conversation = await asyncio.to_thread(
+                self._conversation_store.get_conversation, session_id
+            )
+            if conversation is None or conversation.title != owned_title:
+                return
+            request = replace(
+                refinement.request,
+                prompt=refined_title_prompt(refinement.request.prompt, reply),
+            )
+            async with self._generation_slots:
+                request = await self._with_session_instructions(request)
+                title = await self._generate_title(request)
+            if title is None or title == owned_title:
+                _logger.info(
+                    "background session title refinement skipped session=%s "
+                    "reason=%s elapsed_ms=%.1f",
+                    session_id,
+                    "invalid_title" if title is None else "unchanged",
+                    (time.perf_counter() - started) * 1000,
+                    extra={"session_id": session_id},
+                )
+                return
+            updated = await asyncio.to_thread(
+                self._conversation_store.rename_conversation_if_title_matches,
+                session_id,
+                owned_title,
+                title,
+            )
+            _logger.info(
+                "background session title refinement completed session=%s renamed=%s "
+                "elapsed_ms=%.1f",
+                session_id,
+                updated is not None,
+                (time.perf_counter() - started) * 1000,
+                extra={"session_id": session_id},
+            )
+        except TimeoutError:
+            _logger.info(
+                "background session title refinement timed out session=%s elapsed_ms=%.1f",
+                session_id,
+                (time.perf_counter() - started) * 1000,
+                extra={"session_id": session_id},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # background metadata must never fail the user turn
+            _logger.warning(
+                "background session title refinement failed session=%s elapsed_ms=%.1f",
+                session_id,
+                (time.perf_counter() - started) * 1000,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
 
     def schedule_task_summary(
         self,
@@ -369,6 +541,8 @@ class BackgroundSessionTitleCoordinator:
 
     async def shutdown(self) -> None:
         """Cancel and drain pending title jobs during server shutdown."""
+        self._closed = True
+        self._pending_refinements.clear()
         pending = tuple(self._pending)
         for task in pending:
             task.cancel()
@@ -380,7 +554,12 @@ class BackgroundSessionTitleCoordinator:
         *,
         request: BackgroundTitleRequest,
         expected_seed_title: str,
-    ) -> None:
+    ) -> str | None:
+        """Replace the seed title; return the title a refinement may replace.
+
+        :returns: The generated title, the seed when generation produced none,
+            or ``None`` when a user or agent rename already replaced the seed.
+        """
         started = time.perf_counter()
         try:
             async with self._generation_slots:
@@ -396,7 +575,7 @@ class BackgroundSessionTitleCoordinator:
                         (time.perf_counter() - started) * 1000,
                         extra={"session_id": request.session_id},
                     )
-                    return
+                    return None
                 request = await self._with_session_instructions(request)
                 title = await self._generate_title(request)
             if title is None:
@@ -407,7 +586,7 @@ class BackgroundSessionTitleCoordinator:
                     (time.perf_counter() - started) * 1000,
                     extra={"session_id": request.session_id},
                 )
-                return
+                return expected_seed_title
             updated = await asyncio.to_thread(
                 self._conversation_store.rename_conversation_if_title_matches,
                 request.session_id,
@@ -421,6 +600,7 @@ class BackgroundSessionTitleCoordinator:
                 (time.perf_counter() - started) * 1000,
                 extra={"session_id": request.session_id},
             )
+            return None if updated is None else title
         except TimeoutError:
             _logger.info(
                 "background session title timed out session=%s elapsed_ms=%.1f",
@@ -438,6 +618,7 @@ class BackgroundSessionTitleCoordinator:
                 exc_info=True,
                 extra={"session_id": request.session_id},
             )
+        return expected_seed_title
 
     async def _run_task_summary(
         self,
@@ -636,3 +817,19 @@ def background_title_prompt(event: SessionEventInput) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return " ".join(parts)[:4000]
+
+
+# The app's coordinator, for turn ends published outside a request.
+_installed_coordinator: BackgroundSessionTitleCoordinator | None = None
+
+
+def install_coordinator(coordinator: BackgroundSessionTitleCoordinator | None) -> None:
+    """Make ``coordinator`` the one :func:`notify_turn_end` uses; ``None`` uninstalls it."""
+    global _installed_coordinator
+    _installed_coordinator = coordinator
+
+
+def notify_turn_end(session_id: str) -> None:
+    """Refine a session's generated title after its first turn ended."""
+    if _installed_coordinator is not None:
+        _installed_coordinator.turn_ended(session_id)
