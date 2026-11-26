@@ -204,7 +204,10 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "post-success", "poll-error", "diagnostic-error"])
-def test_native_failure_traceback_and_junit_exclude_request_bodies(tmp_path, monkeypatch, outcome):
+@pytest.mark.parametrize("control", ["switch", "strict"])
+def test_native_failure_traceback_and_junit_exclude_request_bodies(
+    tmp_path, monkeypatch, outcome, control
+):
     from tests.e2e import test_mcp_disabled_servers as scenario
 
     client = MagicMock()
@@ -267,10 +270,15 @@ def test_native_failure_traceback_and_junit_exclude_request_bodies(tmp_path, mon
     monkeypatch.setattr(scenario, "poll_until", poll)
     if outcome == "diagnostic-error":
         monkeypatch.setattr(scenario, "_mcp_failure_metadata", fail_diagnostics)
+    request = MagicMock()
+    request.getfixturevalue.return_value = "http://server.example.test"
     with pytest.raises((AssertionError, RuntimeError, ValueError)) as captured:
         scenario.test_disabled_server_absent_from_real_native_session(
-            "http://server.example.test", "http://provider.example.test", tmp_path, "codex"
+            request, "http://provider.example.test", tmp_path, "codex", control
         )
+    request.getfixturevalue.assert_called_once_with(
+        "mcp_enabled_server" if control == "switch" else "mcp_flagless_server"
+    )
     representation = captured.getrepr(style="long", showlocals=True)
     formatted = str(representation)
     report = pytest.TestReport(
