@@ -249,7 +249,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   left behind retires itself at its next firing. A loop stays with its session:
   when `/clear` or `/rewind` continues in a new session the old one's loops stop
   and it takes no new one ("This chat continued in a new session, so a loop
-  can't run here; run /loop there"), and a fork starts with none. The agent's own
+  can't run here; run /loop there"), and a fork starts with none. A tab moved on
+  from a session where its user had a loop shows a toast: "Your loop stopped when
+  this chat moved to a new session. Run /loop again to restart it." The agent's own
   `sys_timer_set` timers are never touched, and in a shared session each
   collaborator's loop is their own. Intervals are a leading `5m`, `2h` or `1d`
   token, from 2 minutes (the server's saved-timer floor) to 7 days. A prompt

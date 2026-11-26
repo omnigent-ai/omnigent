@@ -31,6 +31,7 @@ import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import { useSetConversationMuted } from "@/hooks/useConversations";
 import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import * as sessionTimersApi from "@/lib/sessionTimersApi";
 import type {
   AnyBlock,
   ElicitationBlock,
@@ -9121,6 +9122,74 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         reason: "clear",
       });
       expect(useChatStore.getState().redirectToConversationId).toBeNull();
+    });
+
+    /** Stub the server's answer to stopping the viewer's loop in a session. */
+    function stubLoopStop(answer: string | null | Error) {
+      const stop = vi.spyOn(sessionTimersApi, "stopSessionLoop");
+      if (answer instanceof Error) stop.mockRejectedValue(answer);
+      else stop.mockResolvedValue(answer);
+      const info = vi.spyOn(toast, "info").mockReturnValue("loop-stopped");
+      onTestFinished(() => {
+        stop.mockRestore();
+        info.mockRestore();
+      });
+      return { stop, info };
+    }
+    const settled = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+
+    it.each(["clear", "rewind"] as const)(
+      "stops the viewer's loop in a session a /%s moved them on from, and says so",
+      async (reason) => {
+        const { stop, info } = stubLoopStop("st_loop");
+        useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+        handleSessionEvent({
+          type: "session_superseded",
+          conversationId: "conv_old",
+          targetConversationId: "conv_new",
+          reason,
+        });
+        await vi.waitFor(() => expect(info).toHaveBeenCalledTimes(1));
+        expect(stop).toHaveBeenCalledExactlyOnceWith("conv_old");
+        expect(info.mock.calls[0]?.[0]).toBe(
+          "Your loop stopped when this chat moved to a new session. Run /loop again to restart it.",
+        );
+      },
+    );
+
+    it.each([
+      ["the viewer had no loop there", null],
+      ["the server can't say, as an older one can't", new Error("Not Found")],
+    ])("says nothing about a loop when %s", async (_, answer) => {
+      const { stop, info } = stubLoopStop(answer);
+      useChatStore.setState({ conversationId: "conv_old", redirectToConversationId: null });
+      handleSessionEvent({
+        type: "session_superseded",
+        conversationId: "conv_old",
+        targetConversationId: "conv_new",
+        reason: "clear",
+      });
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(1));
+      await settled();
+      expect(info).not.toHaveBeenCalled();
+      // The redirect never waits on it.
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+    });
+
+    it("leaves a loop alone in a session the viewer is not being moved on from", async () => {
+      const { stop } = stubLoopStop("st_loop");
+      useChatStore.setState({ conversationId: "conv_current", redirectToConversationId: null });
+      handleSessionEvent({
+        type: "session_superseded",
+        conversationId: "conv_other",
+        targetConversationId: "conv_new",
+        reason: "clear",
+      });
+      await settled();
+      expect(stop).not.toHaveBeenCalled();
     });
   });
 

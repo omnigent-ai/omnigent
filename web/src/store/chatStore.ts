@@ -88,6 +88,7 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
+import { runSessionTimerMutation, stopSessionLoop } from "@/lib/sessionTimersApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
@@ -9008,6 +9009,25 @@ function committedUserBlock(
   };
 }
 
+/**
+ * A superseded session runs no loop, and the one that continues it starts without
+ * one, so stop this user's loop there now and say so. Best-effort.
+ */
+function reportLoopStoppedBySupersession(sessionId: string): void {
+  // Queued behind a /loop this tab is still arming in that session.
+  runSessionTimerMutation(sessionId, () => stopSessionLoop(sessionId))
+    .then((stopped) => {
+      if (stopped === null) return;
+      toast.info(
+        "Your loop stopped when this chat moved to a new session. Run /loop again to restart it.",
+        { id: `loop-stopped-${sessionId}` },
+      );
+    })
+    .catch(() => {
+      // An older server or a session that is gone has no loop to report.
+    });
+}
+
 /** The `origin` a consumed user message carries, e.g. `"loop"` for a /loop run. */
 function consumedMessageOrigin(event: SessionInputConsumedEvent): string | undefined {
   const origin = event.data.origin;
@@ -10161,11 +10181,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // `applyToConversation`: the redirect only makes sense for the
       // conversation on screen, and a background conversation that gets
       // superseded should redirect when the user switches to it, not before.
+      const viewed = useChatStore.getState().conversationId;
+      const movedOn = viewed === event.conversationId && event.targetConversationId !== viewed;
       useChatStore.setState((s) => {
         if (s.conversationId !== event.conversationId) return {};
         if (event.targetConversationId === s.conversationId) return {};
         return { redirectToConversationId: event.targetConversationId };
       });
+      // The user is being moved on from this session, so their loop here ends.
+      if (movedOn) reportLoopStoppedBySupersession(event.conversationId);
       // The rotation happened mid-input: the `/clear` (or whatever the user just
       // sent) never gets a `session.input.consumed` on THIS conversation — the
       // runner moved to the new one — so its optimistic bubble would otherwise
