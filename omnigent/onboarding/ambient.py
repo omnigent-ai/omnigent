@@ -31,6 +31,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -587,6 +588,7 @@ def claude_user_settings_path(
     configured = env.get("CLAUDE_CONFIG_DIR")
     home = env.get("HOME") or str(claude_account_home_dir())
     config_dir = configured if configured is not None else os.path.join(home, ".claude")
+    config_dir = unicodedata.normalize("NFC", config_dir)
     filename = (
         "cowork_settings.json"
         if env.get("CLAUDE_CODE_USE_COWORK_PLUGINS", "").lower() in {"1", "true", "yes", "on"}

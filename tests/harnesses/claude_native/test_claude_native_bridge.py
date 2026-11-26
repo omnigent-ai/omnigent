@@ -10949,12 +10949,14 @@ def test_ensure_trusted_refuses_a_non_file_config(
     assert (home / ".claude" / ".config.json").is_dir()
 
 
+@pytest.mark.parametrize("cowork", [False, True])
 def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cowork: bool,
 ) -> None:
     """
-    The legacy lookup uses the NFC config dir; the modern path keeps its spelling.
+    User settings and legacy lookup use NFC; the modern config keeps its spelling.
 
     Claude Code normalizes its config dir to NFC before checking for a legacy
     ``.config.json`` but joins ``.claude.json`` onto the raw value, which
@@ -10962,13 +10964,19 @@ def test_claude_global_config_path_normalizes_legacy_lookup_to_nfc(
     """
     import unicodedata
 
+    from omnigent.onboarding.ambient import claude_user_settings_path
+
     _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     decomposed = str(tmp_path / unicodedata.normalize("NFD", "caf\u00e9"))
     composed = unicodedata.normalize("NFC", decomposed)
     env = {"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": decomposed}
+    if cowork:
+        env["CLAUDE_CODE_USE_COWORK_PLUGINS"] = "1"
 
+    filename = "cowork_settings.json" if cowork else "settings.json"
+    assert claude_user_settings_path(workspace, env) == Path(composed) / filename
     assert claude_global_config_path(workspace, env) == Path(decomposed) / ".claude.json"
     Path(composed).mkdir()
     (Path(composed) / ".config.json").write_text("{}")
