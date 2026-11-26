@@ -497,15 +497,28 @@ describe("New ticket from anywhere on the project page", () => {
     );
   });
 
-  function OpenDialog({ closes }: { closes: boolean }) {
+  function OpenDialog({ closes, closeDelayMs = 0 }: { closes: boolean; closeDelayMs?: number }) {
     const [open, setOpen] = useState(true);
+    // A file preview closes through the URL, so it goes away a few frames later.
+    const close = (next: boolean) =>
+      closeDelayMs ? window.setTimeout(() => setOpen(next), closeDelayMs) : setOpen(next);
     return (
-      <Dialog open={open} onOpenChange={(next) => closes && setOpen(next)}>
+      <Dialog open={open} onOpenChange={(next) => closes && close(next)}>
         <DialogContent aria-describedby={undefined}>
           <DialogTitle>Project description</DialogTitle>
         </DialogContent>
       </Dialog>
     );
+  }
+
+  async function renderFrames(count: number): Promise<void> {
+    if (count === 0) return;
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 16);
+      });
+    });
+    await renderFrames(count - 1);
   }
 
   async function pressOverlayOver(name: string, role: "link" | "button") {
@@ -521,15 +534,28 @@ describe("New ticket from anywhere on the project page", () => {
     fireEvent.pointerDown(overlay, { button: 0, clientX: 150, clientY: 20 });
     fireEvent.pointerUp(overlay, { button: 0, clientX: 150, clientY: 20 });
     fireEvent.click(overlay, { button: 0, clientX: 150, clientY: 20 });
-    await act(async () => {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 0);
-      });
-    });
+    // Past the hook's wait for a slow-closing dialog, in steps so each update renders.
+    await renderFrames(22);
   }
 
   it("closes a dialog covering New ticket and opens the form in one click", async () => {
     renderNavigation("board", true, false, true, "?tab=summary", <OpenDialog closes />);
+    await pressOverlayOver("New ticket", "link");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      /^\/projects\/Billing%20%26%20Payments\?ticket=new$/,
+    );
+  });
+
+  it("waits for a dialog that closes a few frames later, like a file preview", async () => {
+    renderNavigation(
+      "board",
+      true,
+      false,
+      true,
+      "?tab=summary",
+      <OpenDialog closes closeDelayMs={50} />,
+    );
     await pressOverlayOver("New ticket", "link");
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.getByTestId("location")).toHaveTextContent(
