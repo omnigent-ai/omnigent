@@ -366,12 +366,8 @@ function bubbleIndexByItemId(committed: Bubble[]): Map<string, number> {
   return indexes;
 }
 
-/**
- * The committed bubble index an undelivered message goes before: after the bubble
- * showing the newest item saved before it, or first when none is shown (they're
- * older than the loaded history, or nothing preceded it). Without those items
- * (an older server), it goes above the startup failure notice, or last.
- */
+// After the newest rendered item saved before the message, or first when none is loaded.
+// An older server names no items: above the startup failure notice, or last.
 function undeliveredIndex(
   input: PendingInput,
   rendered: Map<string, number>,
@@ -386,13 +382,7 @@ function undeliveredIndex(
   return 0;
 }
 
-/**
- * Place undelivered messages where they were sent, in submission order.
- *
- * @param committed - Bubbles built from the transcript.
- * @param failedInputs - The snapshot's undelivered startup messages, in submission order.
- * @param selfAuthor - The viewer's attribution id, or null.
- */
+/** Place undelivered messages where they were sent, in submission order. */
 export function placeUndeliveredBubbles(
   committed: Bubble[],
   failedInputs: PendingInput[],
