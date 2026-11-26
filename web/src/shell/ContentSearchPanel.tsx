@@ -34,7 +34,7 @@ export function ContentSearchPanel({
 }) {
   const ownInputRef = useRef<HTMLInputElement | null>(null);
   const fieldRef = inputRef ?? ownInputRef;
-  // A text search's chord, ⌘K row or "Open in Search" shows this page ready to type into.
+  // Go to File's "Open in Search" shows this page ready to type into.
   useTextSearchFocus(conversationId, fieldRef);
   const queryClient = useQueryClient();
   const cachedInput = useQuery<ContentSearchInput>({
