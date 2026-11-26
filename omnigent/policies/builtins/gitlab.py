@@ -183,16 +183,21 @@ def _project_ref(value: str, hosts: frozenset[str]) -> _Project | None:
 
 def _has_unmodelled_shell_effects(command: str) -> bool:
     """Expansion and redirection can change the arguments delivered to a command."""
-    # Windows path separators must not become POSIX escapes before recognition.
-    if "\\" in command:
+    # These quoting/escape forms have different meanings in POSIX, cmd and PowerShell.
+    if any(char in command for char in "\\'^%‘’‚‛“”„‟"):
         return True
     quote = ""
-    for char in command:
+    for index, char in enumerate(command):
+        if char == "!" and (
+            (index > 0 and not command[index - 1].isspace())
+            or (index + 1 < len(command) and not command[index + 1].isspace())
+        ):
+            return True
         if char == quote:
             quote = ""
-        elif char in {"'", '"'} and not quote:
+        elif char == '"' and not quote:
             quote = char
-        elif quote != "'" and (char in {"$", "`"} or (not quote and char in "*?[]{}~<>")):
+        elif char in {"$", "`"} or (not quote and char in "*?[]{}~<>"):
             return True
     return False
 
@@ -250,7 +255,12 @@ def _evaluate_shell(
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
-            decision = _worse(decision, _evaluate_shell(inner, check, depth + 1))
+            if is_shell_interpreter(tokens) and inner.startswith(("-", "+")):
+                decision = _worse(
+                    decision, _ask("Shell options after the command-string flag require approval.")
+                )
+            else:
+                decision = _worse(decision, _evaluate_shell(inner, check, depth + 1))
         elif is_shell_interpreter(tokens):
             decision = _worse(decision, _ask("This shell program requires approval."))
         elif tokens[0] in {"alias", "function"} and _GATED_COMMAND.search(segment):
