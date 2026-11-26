@@ -1096,8 +1096,8 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
 - **`reply-quote-cards`:** component coverage, run with vitest from `web/`:
   `web/src/lib/replyDraftDocument.test.ts`,
   `web/src/components/composer/engine/CodeMirrorComposerInput.test.tsx` and its
-  `.mac.test.tsx`, and `web/src/pages/ChatPage.composer.test.tsx` (`Composer
-  reply quotes in the CodeMirror editor`). Manually, with
+  `.mac.test.tsx`, and `web/src/pages/ChatPage.composer.test.tsx`
+  (`Composer reply quotes in the CodeMirror editor`). Manually, with
   `chat_composer_codemirror` on: choose **Reply** on a passage, type under the
   card, step over it with ← and →, then press Backspace at the start of the
   line under it to remove it, and ⌘Z (Ctrl+Z) to bring it back. Its X also
