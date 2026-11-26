@@ -2005,9 +2005,15 @@ def test_managed_sandbox_reaper_pages_and_compare_clear_span_workspaces(
     assert [(workspace_id, host.host_id) for workspace_id, host in remaining] == [(22, host_22)]
 
 
-@pytest.mark.parametrize("slot", ["sandbox_id", "terminating_sandbox_id"])
+@pytest.mark.parametrize(
+    ("slot", "index_name"),
+    [
+        ("sandbox_id", "ix_hosts_sandbox_scan"),
+        ("terminating_sandbox_id", "ix_hosts_terminating_sandbox_scan"),
+    ],
+)
 def test_managed_sandbox_reaper_mysql_deep_page_seeks_to_the_cursor(
-    db_uri: str, slot: str
+    db_uri: str, slot: str, index_name: str
 ) -> None:
     """On MySQL a reaper page deep in either sandbox-id slot examines O(limit) rows."""
     store = HostStore(db_uri)
@@ -2019,27 +2025,29 @@ def test_managed_sandbox_reaper_mysql_deep_page_seeks_to_the_cursor(
         else store.list_terminating_managed_sandbox_hosts_page
     )
     now = now_epoch()
+    # Six hosts share each sandbox ID, two per workspace, so the deep page starts inside
+    # an equal (sandbox ID, workspace) prefix and then crosses workspaces and sandbox IDs.
+    rows = [
+        {
+            "workspace_id": 1 + index % 6 // 2,
+            "host_id": uuid.UUID(int=index + 1).hex,
+            "user_id": "alice@example.com",
+            "name": f"managed-{index}",
+            "status": encode_host_status("offline"),
+            "created_at": now,
+            "updated_at": now,
+            "sandbox_provider": "modal",
+            slot: f"sb-{index // 6:04d}",
+        }
+        for index in range(600)
+    ]
     with store._engine.begin() as connection:
-        connection.execute(
-            insert(SqlHost),
-            [
-                {
-                    "workspace_id": 1 + index % 3,
-                    "host_id": uuid.UUID(int=index + 1).hex,
-                    "user_id": "alice@example.com",
-                    "name": f"managed-{index}",
-                    "status": encode_host_status("offline"),
-                    "created_at": now,
-                    "updated_at": now,
-                    "sandbox_provider": "modal",
-                    slot: f"sb-{index:04d}",
-                }
-                for index in range(600)
-            ],
-        )
+        connection.execute(insert(SqlHost), rows)
         connection.exec_driver_sql("ANALYZE TABLE hosts").all()
-    workspace_id, last = list_page(after=None, limit=500)[-1]
+    keys = sorted((row[slot], row["workspace_id"], row["host_id"]) for row in rows)
+    workspace_id, last = list_page(after=None, limit=499)[-1]
     cursor = (getattr(last, slot), workspace_id, last.host_id)
+    assert cursor == keys[498]
     plans: list[str] = []
 
     def explain(conn: Any, _cursor: object, statement: str, params: object, *_: object) -> None:
@@ -2052,11 +2060,10 @@ def test_managed_sandbox_reaper_mysql_deep_page_seeks_to_the_cursor(
     finally:
         event.remove(store._engine, "before_cursor_execute", explain)
 
-    assert [getattr(host, slot) for _, host in page] == [
-        f"sb-{index:04d}" for index in range(500, 550)
-    ]
+    walked = [(getattr(host, slot), workspace, host.host_id) for workspace, host in page]
+    assert walked == keys[499:549]
     assert len(plans) == 1
-    assert "Index range scan" in plans[0], plans[0]
+    assert f"Index range scan on hosts using {index_name}" in plans[0], plans[0]
     examined = [
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
