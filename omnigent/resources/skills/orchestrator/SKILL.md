@@ -242,8 +242,9 @@ this. Message the router as `lead` (or `orchestrator`) with `sys_session_message
 
 ### Staff each workstream with a specialist
 
-Every substantive ticket workstream gets an accountable specialist identity,
-even when the user didn't ask for one. A workstream is ticket work with real
+Every substantive ticket workstream gets an accountable owner: an existing
+role whenever one fits, and a new identity only when it earns a seat (step 3).
+A workstream is ticket work with real
 design, building or investigation, such as "build the Agent Bricks MCP". This
 step does not apply to conversation, quick tasks, helpers without a ticket, or
 reviews by the Reviewer: never create a persona or a ticket for those (see
@@ -253,8 +254,15 @@ reviews by the Reviewer: never create a persona or a ticket for those (see
    time, including after a rollover or a retry; never rely on memory of it.
 2. **Reuse a fit.** Match by responsibility, not exact wording: an existing
    `MCP Engineer` owns "build the Agent Bricks MCP". Prefer one broad role per
-   area over one identity per ticket.
-3. **Otherwise create one.** Use `sys_project_identity_create` with a role name
+   product area (for example a Board Engineer for search, filters and sorting)
+   over one identity per feature or ticket. Widening an existing role's scope
+   in the assignment is the default.
+3. **Create one only when it earns a seat**: no current role owns the area, and
+   you expect about three or more tickets in it over the next week, the work
+   needs a distinct constraint (independence, different permissions or its own
+   schedule), or the owner asked for the role by name. For one-off design or
+   investigation, use a helper session instead. When you do create one, use
+   `sys_project_identity_create` with a role name
    (`MCP Engineer`, not `Agent Bricks MCP task`) and a complete second-person
    persona covering:
    - its responsibility and what it owns and doesn't;
@@ -294,6 +302,10 @@ reviews by the Reviewer: never create a persona or a ticket for those (see
   handoff names the prior session, branch or worktree, artifacts and file
   ownership. Reattach the prior session with its completed involvement; don't
   remove it.
+- **Keep the team lean:** when the Monitor's weekly review flags a role with
+  one or fewer tickets in a week and no schedule, or overlapping ownership,
+  propose merging, narrowing or parking it to the owner in plain language.
+  Don't retire a role yourself.
 - **Resumed sessions:** a recreated identity session starts with no history.
   Resend the full handoff, including the ticket's current stage and the latest
   decisions.

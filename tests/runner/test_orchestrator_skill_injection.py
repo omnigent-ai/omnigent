@@ -137,7 +137,11 @@ def test_orchestrator_skill_staffs_workstreams_with_reused_specialist_identities
     start = skill.index("### Staff each workstream with a specialist")
     section = skill[start : skill.index("\n## ", start)]
     for required in (
-        "even when the user didn't ask for one",
+        "only when it earns a seat",
+        "three or more tickets",
+        "use a helper session instead",
+        "Keep the team lean",
+        "Don't retire a role yourself",
         "never create a persona or a ticket",
         "`sys_project_identity_list`",
         "including after a rollover or a retry",
