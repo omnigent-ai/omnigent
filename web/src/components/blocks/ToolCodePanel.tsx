@@ -11,6 +11,7 @@ import {
 } from "@/components/ai-elements/code-block";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { toggleCodeBlockWordWrap, useCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { cn } from "@/lib/utils";
 
 /** Diff colors for added and removed line counts, as in the changed-files diffstat. */
@@ -49,8 +50,8 @@ export function CodePanel({
 }) {
   // Soft-wrap long lines by default so the panel never needs horizontal
   // scrolling to read; the toggle restores the scrolling view for when
-  // column alignment matters (same affordance as chat code blocks).
-  const [wrap, setWrap] = useState(true);
+  // column alignment matters (shared with chat code blocks).
+  const wrap = useCodeBlockWordWrap();
   return (
     <CodeBlock code={text} language={language} wrap={wrap}>
       <CodeBlockHeader>
@@ -58,7 +59,7 @@ export function CodePanel({
           {title !== undefined && <span className="truncate font-medium">{title}</span>}
         </CodeBlockTitle>
         <CodeBlockActions>
-          <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
+          <WrapTextButton onToggle={toggleCodeBlockWordWrap} wrap={wrap} />
           <CopyTextButton label={copyLabel} text={copyText} />
         </CodeBlockActions>
       </CodeBlockHeader>
@@ -224,7 +225,6 @@ export function OutputSection({
   language?: CodeLanguage;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
-  useEffect(() => setIsExpanded(false), [output]);
 
   const collapsedPreview = useMemo(() => getOutputPreview(output), [output]);
   const preview = useMemo(() => getOutputPreview(output, isExpanded), [output, isExpanded]);

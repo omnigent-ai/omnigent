@@ -49,6 +49,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.mock_llm import advertised_tool_names
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _bind_session_runner,
@@ -165,21 +166,7 @@ def _advertised_tool_names(mock_url: str, model: str) -> set[str]:
     """
     resp = httpx.get(f"{mock_url}/mock/requests", params={"key": model}, timeout=10.0)
     resp.raise_for_status()
-    names: set[str] = set()
-    for req in resp.json().get("requests", []):
-        if not isinstance(req, dict):
-            continue
-        for tool in req.get("tools") or []:
-            if not isinstance(tool, dict):
-                continue
-            # openai-agents Responses format: {"type": "function", "name": ...}
-            # or a nested {"function": {"name": ...}} chat-completions shape.
-            name = tool.get("name")
-            if name is None and isinstance(tool.get("function"), dict):
-                name = tool["function"].get("name")
-            if isinstance(name, str):
-                names.add(name)
-    return names
+    return advertised_tool_names(resp.json().get("requests", []))
 
 
 def _wait_for_advertised_tools(mock_url: str, model: str, *, timeout: float = 60.0) -> set[str]:

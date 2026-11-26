@@ -5,8 +5,9 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
@@ -36,6 +37,11 @@ export interface Host {
   /** Whether this connected host supports the interactive login/logout routes. */
   harness_login_supported?: boolean;
   /**
+   * Whether this host's runners accept session messages over 8,000 characters.
+   * False when the server can't confirm it; absent from older servers.
+   */
+  long_session_messages_supported?: boolean;
+  /**
    * Whether each harness family's launch on this host resolves an
    * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
    * "codex": false}`. Smart Routing's apply layer only works on gateway-backed
@@ -64,23 +70,47 @@ interface HostsResponse {
   hosts: Host[];
 }
 
-export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
-  const res = await authenticatedFetch("/v1/hosts");
+export async function fetchHosts(
+  includeSandbox: boolean,
+  sourceHostId?: string | null,
+  signal?: AbortSignal,
+): Promise<Host[]> {
+  const res = await authenticatedFetch("/v1/hosts", signal ? { signal } : undefined);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
-  // Hide server-managed sandbox hosts from every host picker: they
-  // are launch targets the server creates on demand (and relaunches
-  // at will), not user-connectable machines, so offering them as
-  // manual targets is misleading. Hosts from older servers lack the
-  // field and are kept. `includeSandbox` opts a caller (the chat-header
-  // HostBadge) back into seeing them so it can label sandbox sessions.
-  if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  return includeSandbox ? body.hosts : withoutSandboxHosts(body.hosts, sourceHostId);
+}
+
+// Hide server-managed sandbox hosts from every host picker: they
+// are launch targets the server creates on demand (and relaunches
+// at will), not user-connectable machines, so offering them as
+// manual targets is misleading. Hosts from older servers lack the
+// field and are kept. `includeSandbox` opts a caller (the chat-header
+// HostBadge) back into seeing them so it can label sandbox sessions.
+export function withoutSandboxHosts(hosts: Host[], sourceHostId?: string | null): Host[] {
+  return hosts.filter((h) => !h.sandbox_provider || h.host_id === sourceHostId);
+}
+
+/** The one cache entry every `useHosts` consumer reads: the unfiltered host list. */
+const HOSTS_QUERY_KEY = ["hosts", { includeSandbox: true }] as const;
+
+/**
+ * Fetch the host list now and store it where every `useHosts` consumer reads it,
+ * so a host the caller just found shows in the pickers without another poll.
+ * Unfiltered; pass it through `withoutSandboxHosts` for picker semantics.
+ */
+export function fetchHostsNow(queryClient: QueryClient): Promise<Host[]> {
+  return queryClient.fetchQuery({
+    queryKey: HOSTS_QUERY_KEY,
+    queryFn: () => fetchHosts(true),
+    staleTime: 0,
+  });
 }
 
 interface UseHostsOptions {
   enabled?: boolean;
   includeSandbox?: boolean;
+  sourceHostId?: string | null;
   /** Refetch on every window refocus (paired with `staleTime: 0`) so returning
    *  to the tab is a guaranteed readiness recovery. Only the setup flow needs
    *  this; other consumers keep the 30 s stale window to avoid an app-wide bump
@@ -92,12 +122,17 @@ export function useHosts(options: UseHostsOptions = {}) {
   const enabled = options.enabled ?? true;
   const includeSandbox = options.includeSandbox ?? false;
   const refetchOnFocus = options.refetchOnFocus ?? false;
+  const sourceHostId = options.sourceHostId;
+  const select = useCallback(
+    (hosts: Host[]) => withoutSandboxHosts(hosts, sourceHostId),
+    [sourceHostId],
+  );
   return useQuery({
-    // Distinct cache key per filtering mode so the picker's filtered
-    // list and the header's unfiltered list don't overwrite each other.
-    // A bare ["hosts"] invalidation still prefix-matches both.
-    queryKey: ["hosts", { includeSandbox }],
-    queryFn: () => fetchHosts(includeSandbox),
+    // Every consumer shares the one unfiltered list, so a page mixing pickers
+    // and badges polls /v1/hosts once; pickers filter it in `select`.
+    queryKey: HOSTS_QUERY_KEY,
+    queryFn: () => fetchHosts(true),
+    select: includeSandbox ? undefined : select,
     enabled,
     // Readiness is pushed live via WS (hosts_changed → invalidate in
     // SessionUpdatesProvider), so the badge normally clears within seconds of
@@ -151,7 +186,8 @@ export function useHostModelOptions(
 ) {
   const queryClient = useQueryClient();
   const canRefresh = enabled && hostId !== null && poll;
-  const pollerKey = JSON.stringify([hostId, harness]);
+  const server = getOmnigentServerIdentity();
+  const pollerKey = JSON.stringify([hostId, harness, server]);
   // Only committed selections participate; suspended renders leave retries alone.
   useLayoutEffect(() => {
     if (!canRefresh) return;
@@ -169,7 +205,7 @@ export function useHostModelOptions(
     };
   }, [queryClient, pollerKey, canRefresh]);
   const query = useQuery({
-    queryKey: ["host-model-options", hostId, harness],
+    queryKey: ["host-model-options", hostId, harness, server],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can

@@ -1,5 +1,6 @@
 // Run after building web: node --test --test-concurrency=1 e2e/desktop_design_prompt.e2e.js
 // OMNIGENT_PYTHON selects the backend; OMNIGENT_DESKTOP_COMPOSITED_VIDEO=1 films both cases.
+// Design mode's cases run as an older shell (no Annotate/Draw); Annotate's, as this one.
 
 "use strict";
 
@@ -98,6 +99,62 @@ async function assertModalIntact(page, kind) {
   assert.deepEqual(state, { open: true, period: "W41", submits: 0 });
 }
 
+/** Count the chat messages the SPA posts to the session, into `messages`. */
+function recordMessages(window, backend, messages) {
+  window.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url() === `${backend.serverUrl}/v1/sessions/${backend.sessionId}/events`
+    ) {
+      const body = request.postDataJSON();
+      if (body?.type === "message") messages.push(body);
+    }
+  });
+}
+
+/** Open the session, its right panel, and a Browser tab in it. */
+async function openBrowserTab(window, backend) {
+  await window.goto(`${backend.serverUrl}/c/${backend.sessionId}`);
+  await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
+  const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
+  if (await expand.isVisible()) await expand.click();
+  const sidebar = window.getByRole("button", { name: "Close sidebar", exact: true });
+  if (await sidebar.isVisible()) await sidebar.click();
+  await window.getByRole("button", { name: "Open new", exact: true }).click();
+  await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
+}
+
+/** Load `url` in the Browser tab; its embedded page. */
+async function visit(electronApp, window, url) {
+  const address = window.getByRole("textbox", { name: "Address bar", exact: true });
+  await address.click();
+  await window.keyboard.press("ControlOrMeta+A");
+  await window.keyboard.type(url);
+  await window.keyboard.press("Enter");
+  return eventually(
+    () =>
+      electronApp
+        .context()
+        .pages()
+        .find((candidate) => candidate.url() === url),
+    "embedded fixture WebContentsView",
+  );
+}
+
+/** Count the page's own form submissions, which no design request may cause. */
+async function countSubmits(page) {
+  await page.evaluate(() => {
+    window.designNativeSubmits = 0;
+    document.addEventListener(
+      "submit",
+      () => {
+        window.designNativeSubmits += 1;
+      },
+      true,
+    );
+  });
+}
+
 async function editPeriod(page) {
   const period = page.locator("#scenario-period");
   await period.click();
@@ -110,7 +167,7 @@ async function editPeriod(page) {
 }
 
 describe(
-  "desktop in-page floating design editor",
+  "desktop in-page floating design editor (an older shell's Design mode)",
   {
     concurrency: 1,
     skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`,
@@ -133,7 +190,9 @@ describe(
         fixtures.native = await startFormFixture();
         fixtures.radix = await startRadixFormFixture();
         backend = await startDesignBackend(tmpDir);
-        ({ electronApp, window } = await launchDesignDesktop(tmpDir, recordDir, backend.serverUrl));
+        ({ electronApp, window } = await launchDesignDesktop(tmpDir, recordDir, backend.serverUrl, {
+          OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE: "1",
+        }));
         nativeWindow = await electronApp.browserWindow(window);
         windowIds = await nativeWindow.evaluate((win) => {
           win.setSize(1400, 900);
@@ -149,23 +208,8 @@ describe(
           () => nativeWindow.evaluate((win) => win.isFocused()),
           "foreground test window",
         );
-        window.on("request", (request) => {
-          if (
-            request.method() === "POST" &&
-            request.url() === `${backend.serverUrl}/v1/sessions/${backend.sessionId}/events`
-          ) {
-            const body = request.postDataJSON();
-            if (body?.type === "message") messages.push(body);
-          }
-        });
-        await window.goto(`${backend.serverUrl}/c/${backend.sessionId}`);
-        await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
-        const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
-        if (await expand.isVisible()) await expand.click();
-        const sidebar = window.getByRole("button", { name: "Close sidebar", exact: true });
-        if (await sidebar.isVisible()) await sidebar.click();
-        await window.getByRole("button", { name: "Open new", exact: true }).click();
-        await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
+        recordMessages(window, backend, messages);
+        await openBrowserTab(window, backend);
         if (process.env.OMNIGENT_DESKTOP_COMPOSITED_VIDEO === "1") {
           const resize = window.getByRole("separator", { name: "Resize panel", exact: true });
           for (let step = 0; step < 10; step += 1) {
@@ -197,33 +241,12 @@ describe(
           const fixture = fixtures[kind];
           const exitDesign = window.getByRole("button", { name: "Exit design mode", exact: true });
           if (await exitDesign.isVisible()) await exitDesign.click();
-          const address = window.getByRole("textbox", { name: "Address bar", exact: true });
-          await address.click();
-          await window.keyboard.press("ControlOrMeta+A");
-          await window.keyboard.type(fixture.url);
-          await window.keyboard.press("Enter");
-          const page = await eventually(
-            () =>
-              electronApp
-                .context()
-                .pages()
-                .find((candidate) => candidate.url() === fixture.url),
-            "embedded fixture WebContentsView",
-          );
+          const page = await visit(electronApp, window, fixture.url);
           const period = page.locator("#scenario-period");
           const popup = page.locator("#__omni-popup");
           const input = page.locator("#__omni-popup-input");
           await period.waitFor();
-          await page.evaluate(() => {
-            window.designNativeSubmits = 0;
-            document.addEventListener(
-              "submit",
-              () => {
-                window.designNativeSubmits += 1;
-              },
-              true,
-            );
-          });
+          await countSubmits(page);
           const viewId = await electronApp.evaluate(
             ({ BrowserWindow }, { windowId, url }) =>
               BrowserWindow.fromId(windowId).contentView.children.find(
@@ -474,6 +497,111 @@ describe(
         await switcher.waitFor();
         await page.keyboard.up("Control");
         await window.waitForURL(`${backend.serverUrl}/c/${backend.otherSessionId}`);
+      },
+    );
+  },
+);
+
+describe(
+  "desktop Annotate over a page's modal (this shell)",
+  {
+    concurrency: 1,
+    skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`,
+  },
+  () => {
+    let backend;
+    let electronApp;
+    let window;
+    let fixture;
+    let recordDir;
+    const messages = [];
+
+    before(
+      async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-design-annotate-"));
+        recordDir = process.env.OMNIGENT_DESKTOP_RECORD_DIR || path.join(tmpDir, "recordings");
+        fs.mkdirSync(recordDir, { recursive: true });
+        fixture = await startFormFixture();
+        backend = await startDesignBackend(tmpDir);
+        ({ electronApp, window } = await launchDesignDesktop(tmpDir, recordDir, backend.serverUrl));
+        const nativeWindow = await electronApp.browserWindow(window);
+        await nativeWindow.evaluate((win) => {
+          win.setSize(1400, 900);
+          win.show();
+          win.focus();
+        });
+        recordMessages(window, backend, messages);
+        await openBrowserTab(window, backend);
+      },
+      { timeout: 180_000 },
+    );
+
+    after(async () => {
+      try {
+        await electronApp?.close();
+      } finally {
+        await Promise.all([fixture?.close(), backend?.close()]);
+        if (recordDir) saveRecording(recordDir, "design-annotate-renderer");
+      }
+    });
+
+    it(
+      "picks a modal's field in Annotate's overlay, and sends the request to chat",
+      { timeout: 180_000 },
+      async () => {
+        const page = await visit(electronApp, window, fixture.url);
+        const period = page.locator("#scenario-period");
+        await period.waitFor();
+        await countSubmits(page);
+        await assertModalIntact(page, "native");
+        // This shell offers Annotate, not the page-rendered Design mode.
+        const designMode = window.getByRole("button", { name: "Enter design mode", exact: true });
+        assert.equal(await designMode.isVisible(), false);
+        const beforeMessages = messages.length;
+        await window.getByRole("button", { name: "Annotate an element", exact: true }).click();
+        // Annotate draws in an overlay of its own over the page, not in the page.
+        const overlay = await eventually(async () => {
+          for (const candidate of electronApp.context().pages()) {
+            // oxlint-disable-next-line no-await-in-loop -- Look through the pages in turn.
+            if ((await candidate.getByTestId("annotate-layer").count()) > 0) return candidate;
+          }
+          return null;
+        }, "Annotate's overlay");
+        assert.equal(await page.locator("#__omni-design-layer").count(), 0);
+        const box = await period.boundingBox();
+        assert.ok(box, "the modal's field is on screen");
+        await overlay.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+        const field = overlay.getByLabel("What should change?", { exact: true });
+        await field.waitFor();
+        const instruction = "Use a week picker for Period.";
+        await field.pressSequentially(instruction);
+        assert.equal(await field.inputValue(), instruction);
+        assert.equal(messages.length, beforeMessages, "typing must not post chat");
+        await assertModalIntact(page, "native");
+        const [response] = await Promise.all([
+          window.waitForResponse(
+            (result) =>
+              result.request().method() === "POST" &&
+              result.url() === `${backend.serverUrl}/v1/sessions/${backend.sessionId}/events` &&
+              result.request().postDataJSON()?.type === "message",
+            { timeout: 45_000 },
+          ),
+          field.press("Enter"),
+        ]);
+        assert.equal(response.status(), 202);
+        assert.equal(messages.length, beforeMessages + 1, "exactly one chat POST per request");
+        const sent = JSON.stringify(messages[beforeMessages]);
+        assert.ok(sent.includes(instruction));
+        assert.ok(sent.includes("#scenario-period"));
+        assert.match(sent, /Design Mode/);
+        assert.match(sent, /input_image/, "the element's screenshot goes with it");
+        await eventually(
+          async () => (await window.getByText(MOCK_REPLY, { exact: true }).count()) > 0,
+          "mock agent reply in the real chat",
+          45_000,
+        );
+        // The page's modal, its field and its form are as they were.
+        await assertModalIntact(page, "native");
       },
     );
   },

@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type * as WorkspaceChangedFiles from "./useWorkspaceChangedFiles";
 import {
   usePullRequestChangedFiles,
+  usePullRequestDiff,
   usePullRequestInfo,
   useUpdateSessionPr,
 } from "./usePullRequests";
@@ -116,6 +117,42 @@ it("preserves changed-file incompleteness from the host response", async () => {
   expect(result.current.data).toEqual({ ...payload, available: true });
 });
 
+it("pins the changed-file list to the same revision as the diff", async () => {
+  const url = "https://github.com/example/one/pull/42";
+  const revision = `${"b".repeat(40)}:${"a".repeat(40)}`;
+  const fetchMock = vi.fn(
+    async () => new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(
+    () => ({
+      changes: usePullRequestChangedFiles("conv", true, url, revision),
+      diff: usePullRequestDiff("conv", true, url, revision),
+    }),
+    {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    },
+  );
+
+  await waitFor(() =>
+    expect(result.current.changes.isSuccess && result.current.diff.isSuccess).toBe(true),
+  );
+  const queries = fetchMock.mock.calls.map((call: unknown[]) => {
+    const request = new URL(String(call[0]), "http://localhost");
+    return [request.pathname.split("/").pop(), Object.fromEntries(request.searchParams)];
+  });
+  const pinned = { pr_url: url, base_sha: "b".repeat(40), head_sha: "a".repeat(40) };
+  expect(queries).toEqual(
+    expect.arrayContaining([
+      ["changes", pinned],
+      ["diff", pinned],
+    ]),
+  );
+});
+
 it("replaces the default selection and the removed PR's cached metadata", async () => {
   const url = "https://github.com/example/one/pull/42";
   const empty = { object: "session.github.info", tracking_available: true, prs: [] };
@@ -134,6 +171,32 @@ it("replaces the default selection and the removed PR's cached metadata", async 
   await act(() => result.current.mutateAsync({ url, action: "remove" }));
   expect(client.getQueryData(["github-info", "conv"])).toMatchObject(empty);
   expect(client.getQueryData(["github-info", "conv", url])).toMatchObject(empty);
+});
+
+it("keeps the workspace's repo when an attach reply describes only the PR", async () => {
+  const url = "https://github.com/example/other/pull/7";
+  const workspaceRepo = { name_with_owner: "example/one", host: "github.com" };
+  const attached = { object: "session.github.info", selected_pr_url: url, prs: [{ url }] };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(new Response(JSON.stringify(attached), { status: 200 })),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["github-info", "conv"], {
+    object: "session.github.info",
+    prs: [],
+    workspace_repo: workspaceRepo,
+  });
+  const { result } = renderHook(() => useUpdateSessionPr("conv"), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  await act(() => result.current.mutateAsync({ url, action: "attach" }));
+  expect(client.getQueryData(["github-info", "conv"])).toMatchObject({
+    ...attached,
+    workspace_repo: workspaceRepo,
+  });
 });
 
 it("keeps a link to its own session when the panel switches sessions", async () => {

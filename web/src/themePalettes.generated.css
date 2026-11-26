@@ -10,34 +10,35 @@
   --popover: #ffffff;
   --popover-foreground: #11171c;
   --primary: #df3c85;
-  --link: #1967b5;
+  --link: #c42f70;
   --primary-foreground: #ffffff;
   --selection-background: rgba(223, 60, 133, 0.1);
   --selection-foreground: #651249;
+  --code-selection: rgba(223, 60, 133, 0.2);
   --secondary: #eceef1;
   --secondary-foreground: #27272a;
   --muted: #0000000f;
   --muted-foreground: #71717a;
   --code-bg: #0000000f;
-  --accent: #d7edfe;
-  --accent-foreground: #04355d;
+  --accent: #f2f1f2;
+  --accent-foreground: #27272a;
   --border: #e4e4e7;
   --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
   --input: #e4e4e7;
   --ring: #11171c;
   --brand-accent: #df3c85;
-  --sidebar: #fdfafa;
+  --sidebar: #f9f9f9;
   --sidebar-foreground: #27272a;
-  --sidebar-primary: #2272b4;
+  --sidebar-primary: var(--link);
   --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #d7edfe;
-  --sidebar-accent-foreground: #04355d;
+  --sidebar-accent: #f2f1f2;
+  --sidebar-accent-foreground: #27272a;
   --sidebar-border: #e4e4e7;
-  --sidebar-ring: #2272b4;
+  --sidebar-ring: var(--ring);
   --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
   --sidebar-active-foreground: var(--primary);
-  --sidebar-background: linear-gradient(90deg, #fffefe, #fcf6fa);
+  --sidebar-background: var(--sidebar);
   --shell-background: var(--background);
 }
 
@@ -51,17 +52,18 @@
   --popover: rgba(26, 33, 41, 0.8);
   --popover-foreground: #f5f5f4;
   --primary: #df3c85;
-  --link: #72b7f5;
+  --link: #e65a9c;
   --primary-foreground: #11171c;
   --selection-background: rgba(223, 60, 133, 0.15);
   --selection-foreground: #f9a8d4;
+  --code-selection: rgba(223, 60, 133, 0.25);
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
   --muted: rgb(255 255 255 / 12%);
   --muted-foreground: rgb(245 245 244 / 56%);
   --code-bg: oklch(0.38 0.005 240);
-  --accent: #04355d;
-  --accent-foreground: #4299e0;
+  --accent: #28262e;
+  --accent-foreground: #f5f5f4;
   --border: oklch(0.28 0.005 240);
   --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
@@ -70,7 +72,7 @@
   --brand-accent: #df3c85;
   --sidebar: #0e0b19;
   --sidebar-foreground: #f5f5f4;
-  --sidebar-primary: oklch(0.64 0.22 254);
+  --sidebar-primary: var(--link);
   --sidebar-primary-foreground: oklch(0.12 0.004 240);
   --sidebar-accent: oklch(0.245 0.005 240);
   --sidebar-accent-foreground: oklch(0.965 0.003 240);
@@ -98,6 +100,7 @@
   --primary-foreground: #ffffff;
   --selection-background: rgba(124, 58, 237, 0.15);
   --selection-foreground: #1e1a2b;
+  --code-selection: rgba(124, 58, 237, 0.15);
   --secondary: #efeaf9;
   --secondary-foreground: #1e1a2b;
   --muted: #efeaf9;
@@ -139,6 +142,7 @@
   --primary-foreground: #282a36;
   --selection-background: rgba(189, 147, 249, 0.33);
   --selection-foreground: #f8f8f2;
+  --code-selection: rgba(189, 147, 249, 0.26);
   --secondary: #343746;
   --secondary-foreground: #f8f8f2;
   --muted: #3b3d4d;
@@ -180,6 +184,7 @@
   --primary-foreground: #ffffff;
   --selection-background: rgba(9, 105, 218, 0.15);
   --selection-foreground: #1f2328;
+  --code-selection: rgba(9, 105, 218, 0.15);
   --secondary: #eaeef2;
   --secondary-foreground: #1f2328;
   --muted: #eaeef2;
@@ -221,6 +226,7 @@
   --primary-foreground: #0d1117;
   --selection-background: rgba(88, 166, 255, 0.39);
   --selection-foreground: #e6edf3;
+  --code-selection: rgba(88, 166, 255, 0.24);
   --secondary: #21262d;
   --secondary-foreground: #e6edf3;
   --muted: #21262d;
@@ -262,6 +268,7 @@
   --primary-foreground: #ffffff;
   --selection-background: rgba(136, 57, 239, 0.15);
   --selection-foreground: #4c4f69;
+  --code-selection: rgba(136, 57, 239, 0.15);
   --secondary: #e6e9ef;
   --secondary-foreground: #4c4f69;
   --muted: #e6e9ef;
@@ -303,6 +310,7 @@
   --primary-foreground: #1e1e2e;
   --selection-background: rgba(203, 166, 247, 0.26);
   --selection-foreground: #f5e0dc;
+  --code-selection: rgba(203, 166, 247, 0.16);
   --secondary: #313244;
   --secondary-foreground: #cdd6f4;
   --muted: #313244;
@@ -344,6 +352,7 @@
   --primary-foreground: #ffffff;
   --selection-background: rgba(214, 93, 14, 0.18);
   --selection-foreground: #3c3836;
+  --code-selection: rgba(214, 93, 14, 0.18);
   --secondary: #ebdbb2;
   --secondary-foreground: #3c3836;
   --muted: #ebdbb2;
@@ -385,6 +394,7 @@
   --primary-foreground: #282828;
   --selection-background: rgba(254, 128, 25, 0.34);
   --selection-foreground: #ebdbb2;
+  --code-selection: rgba(254, 128, 25, 0.24);
   --secondary: #3c3836;
   --secondary-foreground: #ebdbb2;
   --muted: #3c3836;
@@ -426,6 +436,7 @@
   --primary-foreground: #fdf6e3;
   --selection-background: rgba(38, 139, 210, 0.15);
   --selection-foreground: #073642;
+  --code-selection: rgba(38, 139, 210, 0.16);
   --secondary: #eee8d5;
   --secondary-foreground: #657b83;
   --muted: #d6d4c6;
@@ -467,6 +478,7 @@
   --primary-foreground: #fdf6e3;
   --selection-background: rgba(38, 139, 210, 0.42);
   --selection-foreground: #eee8d5;
+  --code-selection: rgba(38, 139, 210, 0.26);
   --secondary: #073642;
   --secondary-foreground: #839496;
   --muted: #1d474f;
@@ -508,6 +520,7 @@
   --primary-foreground: #eceff4;
   --selection-background: rgba(94, 129, 172, 0.25);
   --selection-foreground: #2e3440;
+  --code-selection: rgba(94, 129, 172, 0.25);
   --secondary: #d8dee9;
   --secondary-foreground: #2e3440;
   --muted: #d8dee9;
@@ -549,6 +562,7 @@
   --primary-foreground: #2e3440;
   --selection-background: rgba(136, 192, 208, 0.25);
   --selection-foreground: #eceff4;
+  --code-selection: rgba(136, 192, 208, 0.19);
   --secondary: #3b4252;
   --secondary-foreground: #eceff4;
   --muted: #434c5e;
@@ -590,6 +604,7 @@
   --primary-foreground: var(--custom-light-primary-foreground);
   --selection-background: var(--custom-light-selection-background);
   --selection-foreground: var(--custom-light-selection-foreground);
+  --code-selection: var(--custom-light-code-selection);
   --secondary: var(--custom-light-secondary);
   --secondary-foreground: var(--custom-light-secondary-foreground);
   --muted: var(--custom-light-muted);
@@ -631,6 +646,7 @@
   --primary-foreground: var(--custom-dark-primary-foreground);
   --selection-background: var(--custom-dark-selection-background);
   --selection-foreground: var(--custom-dark-selection-foreground);
+  --code-selection: var(--custom-dark-code-selection);
   --secondary: var(--custom-dark-secondary);
   --secondary-foreground: var(--custom-dark-secondary-foreground);
   --muted: var(--custom-dark-muted);

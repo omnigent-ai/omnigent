@@ -254,9 +254,10 @@ def create_thread(
             pullRequest {{ reviewThreads(last: 25) {{ nodes {{ {fields} }} }} }}
           }} }}
         }}"""
-        host, token = github._host_args(root, reference), github._pr_token(root, reference)
-        if github._gh_timed_out.get():
-            raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+        host = github._host_args(root, reference)
+        token = github._write_token(
+            root, reference, timed_out=github.COMMENT_AUTHENTICATION_TIMED_OUT
+        )
         _, output, _ = github._pr_json_write(
             root,
             host=host,

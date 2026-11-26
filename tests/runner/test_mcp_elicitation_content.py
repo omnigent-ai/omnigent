@@ -137,6 +137,7 @@ async def test_a_timeout_is_a_decline_with_no_content() -> None:
 
     assert verdict.approved is False
     assert verdict.content is None
+    assert verdict.timed_out is True
 
 
 async def test_multi_field_and_free_form_answers_survive() -> None:

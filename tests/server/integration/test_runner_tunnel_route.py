@@ -47,6 +47,7 @@ from omnigent.server.disconnect_evidence import DisconnectEvidence
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
+from tests.server.helpers import wait_for_tunnel_registration
 
 pytestmark = pytest.mark.asyncio
 
@@ -230,18 +231,7 @@ async def _send_hello(
         {"type": "websocket.receive", "text": encode_frame(hello)},
     )
 
-    await asyncio.wait_for(_wait_until_registered(registry, runner_id), timeout=budget(1.0))
-
-
-async def _wait_until_registered(registry: TunnelRegistry, runner_id: str) -> None:
-    """Wait for runner registration.
-
-    :param registry: Registry shared with the tunnel router.
-    :param runner_id: Runner id expected to register.
-    :returns: None.
-    """
-    while registry.get(runner_id) is None:
-        await asyncio.sleep(0.01)
+    await wait_for_tunnel_registration(communicator, registry, runner_id)
 
 
 async def _route_requests_to_runner(
@@ -2429,10 +2419,17 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
 async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    from omnigent.server import managed_host_keepalive
     from omnigent.server.routes import runner_tunnel
 
     monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 1000)
+    reports: list[tuple[str, bool | None]] = []
+    monkeypatch.setattr(
+        managed_host_keepalive,
+        "record_pong",
+        lambda runner_id, keep_warm: reports.append((runner_id, keep_warm)),
+    )
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()
     communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
@@ -2441,7 +2438,10 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
         assert isinstance(ping, PingFrame)
         await communicator.send_input(
-            {"type": "websocket.receive", "text": encode_frame(PongFrame(ts=ping.ts))}
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(PongFrame(ts=ping.ts, keep_warm=False)),
+            }
         )
         session = route_app.registry.get(_RUNNER_ID)
         assert session is not None
@@ -2454,6 +2454,8 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         communicator.stop(exceptions=False)
         await asyncio.gather(communicator.future, return_exceptions=True)
 
+    # The pong's keep-warm report reaches the managed-sandbox keepalive gate.
+    assert reports == [(_RUNNER_ID, False)]
     row = _tunnel_end_events(caplog)[0]
     assert row["connection_id"] == "conn-heartbeat"
     assert row["app_ping_rtt_s"] >= 0
@@ -2461,6 +2463,29 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
     assert row["last_app_pong_received_age_s"] >= 0
     assert row["outbound_queue_high_water"] >= 1
     assert row["send_errors"] == 0
+
+
+async def test_first_app_ping_is_sent_at_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With managed sandboxes, the first pong carries the runner's first
+    keep-warm report, so it must not wait a whole ping interval; later pings keep
+    the normal interval."""
+    from omnigent.server import managed_host_keepalive
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 60.0)
+    monkeypatch.setattr(managed_host_keepalive, "is_enabled", lambda: True)
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-first-ping")
+        ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
+        assert isinstance(ping, PingFrame)
+        assert await communicator.receive_nothing(timeout=0.1), "the next ping waits an interval"
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(communicator.future, timeout=budget(1))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
 
 
 async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(

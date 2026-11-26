@@ -19,6 +19,7 @@ import uvicorn
 
 from omnigent.inner.claude_gateway_shim import (
     ClaudeGatewayShim,
+    gateway_body_transform,
     restore_thinking_display,
 )
 
@@ -114,6 +115,29 @@ def test_restore_passes_through_unparseable_bodies(body: bytes) -> None:
 
 
 # ── shim integration tests (real local upstream) ──────────
+
+
+@pytest.mark.parametrize(
+    "method,host,port,path,patched",
+    [
+        ("POST", "gateway.example", 8443, "/anthropic/v1/messages", True),
+        ("POST", "gateway.example", 8443, "/anthropic/v1/messages?beta=true", True),
+        ("GET", "gateway.example", 8443, "/anthropic/v1/messages", False),
+        ("POST", "other.example", 8443, "/anthropic/v1/messages", False),
+        ("POST", "gateway.example", 443, "/anthropic/v1/messages", False),
+        ("POST", "gateway.example", 8443, "/v1/messages", False),
+    ],
+)
+def test_egress_gateway_patch_is_scoped_to_the_model_endpoint(
+    method: str, host: str, port: int, path: str, patched: bool
+) -> None:
+    body = _body("databricks-claude-opus-4-8", {"type": "adaptive"})
+    transform = gateway_body_transform("https://gateway.example:8443/anthropic/")
+    result = transform(method, host, port, path, body)
+    if patched:
+        assert json.loads(result)["thinking"]["display"] == "summarized"
+    else:
+        assert result == body
 
 
 @dataclass
@@ -289,6 +313,60 @@ async def test_shim_forwards_non_opus_and_non_messages_traffic_verbatim(upstream
         assert upstream.requests[1].method == "GET"
         assert upstream.requests[1].path == "/v1/models"
         assert other.json() == {"upstream": "ok"}
+    finally:
+        await shim.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_url", "surfaces"),
+    [
+        (
+            "https://ws.cloud.databricks.com/ai-gateway/anthropic",
+            "omnigent-desktop, ug, inner",
+        ),
+        ("https://ws.cloud.databricks.com/serving-endpoints/anthropic", "ug, inner"),
+    ],
+    ids=["gateway", "serving-endpoint"],
+)
+async def test_shim_restores_gateway_attribution_after_cli_settings(
+    upstream_url: str, surfaces: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
+    requests: list[httpx.Request] = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, stream=httpx.ByteStream(b"recorded"))
+
+    shim = ClaudeGatewayShim(upstream_base_url=upstream_url)
+    await shim.start()
+    assert shim._client is not None
+    await shim._client.aclose()
+    shim._client = httpx.AsyncClient(transport=httpx.MockTransport(record))
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{shim.base_url}/v1/messages",
+                json={"model": "test", "messages": []},
+                headers=[
+                    ("Authorization", "Bearer synthetic-key"),
+                    ("anthropic-beta", "one"),
+                    ("anthropic-beta", "two"),
+                    ("databricks-custom-coding-agent", "stale-agent"),
+                    ("databricks-custom-client-surfaces", "ug, inner"),
+                ],
+            )
+        assert response.status_code == 200
+        assert len(requests) == 1
+        request = requests[0]
+        assert str(request.url) == upstream_url + "/v1/messages"
+        assert request.headers["Databricks-Custom-Client-Surfaces"] == surfaces
+        assert request.headers["Databricks-Custom-Coding-Agent"] == (
+            "claude-code" if surfaces.startswith("omnigent") else "stale-agent"
+        )
+        assert request.headers["Authorization"] == "Bearer synthetic-key"
+        assert request.headers.get_list("anthropic-beta") == ["one", "two"]
     finally:
         await shim.aclose()
 

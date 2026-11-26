@@ -29,6 +29,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import postcss from "postcss";
 import { defineConfig, transformWithOxc, type Plugin } from "vite";
+import { workerBuildOptions } from "./vite.workerExports";
 
 const SCOPE = ".omnigent-app";
 
@@ -52,7 +53,8 @@ function splitTopLevel(selectorList: string): string[] {
 }
 
 function prefixSelector(selector: string): string {
-  const s = selector.trim();
+  // Tailwind's dark variants must not inherit a dark ancestor from the host.
+  const s = selector.trim().replaceAll(":is(.dark *)", `:is(${SCOPE} .dark *)`);
   if (s === "" || s.startsWith(SCOPE)) return s;
   // Root-level selectors collapse onto the scope element itself.
   const rootMatch = s.match(/^(?::root|html|body)\b(.*)$/);
@@ -316,6 +318,8 @@ export default defineConfig({
     forceMonacoBrowserPlatform(),
     inlineWorkerUrlForHost(),
   ],
+  // Workers have no DOM, so they take a package's worker entry over its browser one.
+  worker: workerBuildOptions,
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

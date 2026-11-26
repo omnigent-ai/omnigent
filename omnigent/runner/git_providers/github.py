@@ -8,13 +8,16 @@ The observer steps live in :mod:`omnigent.runner.git_providers.github_observer`.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Any
+import functools
+import inspect
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, TypeVar
 
 from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    PullRequestStatus,
     ReviewerRef,
     ShellPrOp,
     ShellSegment,
@@ -38,6 +41,8 @@ _CAPABILITIES = ProviderCapabilities(
     review_thread_creation=True,
     details_editing=True,
     attachment_uploads=True,
+    commit_history=True,
+    merge_as_account=True,
 )
 
 
@@ -65,8 +70,44 @@ def _with_provider_fields(info: dict[str, Any]) -> dict[str, Any]:
     return info
 
 
+_Facet = TypeVar("_Facet", bound=type)
+
+
+def _for_reference_host(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run *method* with its ``reference``'s host as the target of its ``gh`` calls."""
+    parameters = list(inspect.signature(method).parameters)
+    position = parameters.index("reference")
+
+    @functools.wraps(method)
+    def step(*args: Any, **kwargs: Any) -> Any:
+        from omnigent.runner import github_resource
+
+        reference = kwargs["reference"] if "reference" in kwargs else args[position]
+        host = reference.host if isinstance(reference, PullRequestRef) else None
+        with github_resource.gh_target_host_scope(host):
+            return method(*args, **kwargs)
+
+    return step
+
+
+def _scoped_to_reference_hosts(facet: _Facet) -> _Facet:
+    """Wrap each public step that takes a ``reference`` with :func:`_for_reference_host`."""
+    for name, value in list(vars(facet).items()):
+        if (
+            not name.startswith("_")
+            and inspect.isfunction(value)
+            and "reference" in inspect.signature(value).parameters
+        ):
+            setattr(facet, name, _for_reference_host(value))
+    return facet
+
+
+@_scoped_to_reference_hosts
 class GitHubPullRequests:
-    """GitHub's pull request steps for the session panel."""
+    """GitHub's pull request steps for the session panel.
+
+    A step that takes a ``reference`` runs its ``gh`` calls for the reference's host.
+    """
 
     capabilities = _CAPABILITIES
 
@@ -88,13 +129,23 @@ class GitHubPullRequests:
 
         return github_resource._gh_installed()
 
-    def review_diff(
+    def pinned_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
         """Fetch a patch whose revisions match the displayed review conversations."""
         from omnigent.runner import github_resource
 
         return github_resource._pr_patch_at_revision(
+            root, reference, head_sha=head_sha, base_sha=base_sha
+        )
+
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """List changed files whose revisions match the displayed patch."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_changed_files_at_revision(
             root, reference, head_sha=head_sha, base_sha=base_sha
         )
 
@@ -141,6 +192,14 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._pr_title_before(root, reference, deadline)
+
+    def pr_status(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[PullRequestStatus | None, bool]:
+        """Look up one PR's title, state and draft flag before ``deadline``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_status_before(root, reference, deadline)
 
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         """Raise unless ``gh`` on the host can read the PR."""
@@ -190,6 +249,28 @@ class GitHubPullRequests:
             base_sha=base_sha,
         )
 
+    def commits(self, root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str, Any]:
+        """List the PR's commits at ``head_sha``, oldest first."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_commits(root, reference, head_sha=head_sha)
+
+    def commit_diff(
+        self, root: str, reference: PullRequestRef, *, commit_sha: str
+    ) -> dict[str, Any]:
+        """Return one commit's patch from GitHub's commit diff media type."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_commit_patch(root, reference, commit_sha=commit_sha)
+
+    def compare_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
+    ) -> dict[str, Any]:
+        """Read the PR's changes after one of its commits."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_compare(root, reference, head_sha=head_sha, from_sha=from_sha)
+
     def set_preference(
         self,
         root: str,
@@ -236,6 +317,26 @@ class GitHubPullRequests:
 
         return github_resource._merge_pr(
             root, reference, merge_method=merge_method, expected_head=expected_head
+        )
+
+    def merge_as(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        merge_method: str,
+        expected_head: str,
+        account: str,
+    ) -> dict[str, Any]:
+        """Merge with ``gh pr merge --match-head-commit`` as ``account``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._merge_pr(
+            root,
+            reference,
+            merge_method=merge_method,
+            expected_head=expected_head,
+            account=account,
         )
 
     def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:

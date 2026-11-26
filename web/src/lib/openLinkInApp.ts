@@ -7,7 +7,9 @@ import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
-import { isNativeShell, supportsBrowser } from "./nativeBridge";
+import { isNativeShell, supportsBrowser, type BrowserHostOptions } from "./nativeBridge";
+import { fetchSessionHostId } from "./fetchSessionHostId";
+import { previewHostOptions, withPreviewHostRetry } from "./previewHostOptions";
 import { randomUUID } from "./randomUUID";
 import { readSessionWorkspaceState } from "./sessionWorkspaceState";
 
@@ -15,7 +17,7 @@ type OpenOrNavigate = (
   conversationId: string,
   url: string,
   bounds: undefined,
-  opts: { agent: boolean },
+  opts: BrowserHostOptions & { agent: boolean },
 ) => Promise<{ ok: boolean; error?: string }>;
 
 interface BrowserBridge {
@@ -65,10 +67,18 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     }
     const tabId = randomUUID();
     newViewId = browserViewId(conversationId, tabId);
-    // Chat and workspace-file links are agent- or repo-authored and the agent can
-    // read the view, so they get the agent's navigation policy (no loopback/private
-    // hosts, even via redirect).
-    const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, { agent: true });
+    const hostId = await fetchSessionHostId(conversationId);
+    const options = await previewHostOptions(hostId, url);
+    // Chat and file content can come from an agent, so their links use the
+    // agent policy even when a user clicks them.
+    const viewId = newViewId;
+    const result = await withPreviewHostRetry(conversationId, hostId, (retryOptions) =>
+      bridge.browserOpenOrNavigate(viewId, url, undefined, {
+        agent: true,
+        ...options,
+        ...retryOptions,
+      }),
+    );
     if (result?.ok) {
       newViewId = undefined;
       for (const listener of listeners) listener(conversationId, tabId);
@@ -107,6 +117,11 @@ export function parseHttpUrl(href: string): URL | null {
   return url.protocol === "http:" || url.protocol === "https:" ? url : null;
 }
 
+/** Open `href` where links open: the in-app browser when the user opted in, else a new window. */
+export function openLink(conversationId: string | undefined, href: string): void {
+  if (!maybeOpenLinkInApp(conversationId, href)) window.open(href, "_blank", "noopener,noreferrer");
+}
+
 /**
  * Open an http(s) `href` in a matching or new in-app browser tab when the user
  * opted in. Returns true when routed (the caller cancels the default click).
@@ -138,7 +153,11 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * window.open regardless, so it would navigate twice.
  */
 export function followLinkWithPopupFallback(
-  event: MouseEvent,
+  // React's or the DOM's: a menu row passes the native click, so the menu still sees it unhandled.
+  event: Pick<
+    MouseEvent,
+    "defaultPrevented" | "button" | "shiftKey" | "altKey" | "metaKey" | "ctrlKey" | "preventDefault"
+  >,
   href: string,
   conversationId: string | undefined,
 ): void {

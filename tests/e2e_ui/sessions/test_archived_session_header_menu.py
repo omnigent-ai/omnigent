@@ -16,29 +16,11 @@ works, and the reopened archived session's menu must flip to Unarchive.
 from __future__ import annotations
 
 import re
-import time
 
-import httpx
 from playwright.sync_api import Page, expect
 
-
-def _wait_archived(base_url: str, session_id: str) -> None:
-    """Poll the store until the archive PATCH commits server-side.
-
-    The row leaves the UI optimistically, so without this the re-navigation
-    below could race the PATCH and legitimately render a non-archived
-    session — a flake, not the bug under test.
-    """
-    deadline = time.monotonic() + 15.0
-    archived = None
-    while time.monotonic() < deadline:
-        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-        if snapshot.status_code == 200:
-            archived = snapshot.json()["archived"]
-            if archived is True:
-                return
-        time.sleep(0.25)
-    raise AssertionError(f"session never reported archived=true, got {archived}")
+from tests._helpers.polling import poll_until
+from tests.e2e_ui.sessions._sidebar_helpers import session_archived
 
 
 def test_archived_session_header_menu_offers_unarchive(
@@ -67,7 +49,8 @@ def test_archived_session_header_menu_offers_unarchive(
     # Archiving the active session redirects home; the archive commits in
     # the background.
     page.wait_for_url(f"{base_url}/", timeout=10_000)
-    _wait_archived(base_url, session_id)
+    # The row leaves the UI optimistically; wait for the PATCH so reopening can't race it.
+    poll_until(lambda: session_archived(base_url, session_id), timeout_s=15.0)
 
     # 2. Reopen the archived session at its URL, as a user does from browser
     # history, a link, or search (its sidebar row is gone).

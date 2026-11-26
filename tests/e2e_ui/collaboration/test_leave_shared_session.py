@@ -41,6 +41,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
     MultiUserServer,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter
 
 # Read access is the minimum a grantee can hold, and leaving must work from it
 # — the route gates on read, not manage. Mirrors LEVEL_READ in
@@ -48,7 +49,6 @@ from tests.e2e_ui.collaboration._multi_user_server import (
 _LEVEL_READ = 1
 
 _FILTER = '[data-testid="session-filter"]'
-_FILTER_SHARED = '[data-testid="session-filter-shared"]'
 
 
 @pytest.fixture(scope="module")
@@ -123,11 +123,10 @@ def test_shared_viewer_leaves_session_and_row_disappears(
         page.goto(f"{server.public_url}/c/{sid}")
 
         # The shared session is hidden under the default "My sessions" filter
-        # (it isn't the viewer's own); it shows under the "Shared sessions"
+        # (it isn't the viewer's own); it shows under the "Shared with me"
         # filter, where the viewer leaves it from.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        page.locator(_FILTER).click()
-        page.locator(_FILTER_SHARED).click()
+        choose_session_filter(page, "shared")
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
         _open_row_menu(page, sid)

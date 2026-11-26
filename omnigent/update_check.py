@@ -1410,7 +1410,7 @@ class _UpgradeSuggestion:
     """A suggested upgrade command for the user's install shape.
 
     :param command: The shell command (or prose) we display in the
-        nag panel, e.g. ``"uv tool upgrade omnigent"`` or
+        nag panel, e.g. ``"uv tool upgrade --reinstall --link-mode copy omnigent"`` or
         ``"reinstall omnigent from your original source"``.
         Always populated.
     :param runnable: ``True`` when ``command`` is a real shell
@@ -1545,7 +1545,8 @@ def _build_upgrade_suggestion(
         if installer == "uv":
             return _UpgradeSuggestion(
                 command=(
-                    f"uv tool install --reinstall{_uv_python_pin()} {vcs_url_with_extras}{pre}"
+                    f"uv tool install --reinstall --link-mode copy{_uv_python_pin()} "
+                    f"{vcs_url_with_extras}{pre}"
                 ),
                 runnable=True,
             )
@@ -1589,10 +1590,17 @@ def _build_upgrade_suggestion(
             # version), not extras. Reinstall with the full PEP 508 spec
             # to preserve the extras the user originally requested.
             return _UpgradeSuggestion(
-                command=f"uv tool install --reinstall{_uv_python_pin()} {registry_spec}{pre}",
+                command=(
+                    f"uv tool install --reinstall --link-mode copy{_uv_python_pin()} "
+                    f"{registry_spec}{pre}"
+                ),
                 runnable=True,
             )
-        return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)
+        # Existing uv tools can retain cache hard links across a plain upgrade.
+        return _UpgradeSuggestion(
+            command=f"uv tool upgrade --reinstall --link-mode copy {_DIST_NAME}{pre}",
+            runnable=True,
+        )
     if installer == "pipx":
         if target_version or extras:
             # ``pipx upgrade`` does not accept extras / version specs.
@@ -1718,7 +1726,7 @@ def _run_upgrade_command(command: str, console: Console) -> int:
     ``shell=True``; the command is tokenized with ``shlex.split``.
 
     :param command: Shell-style command line, e.g.
-        ``"uv tool upgrade omnigent"``.
+        ``"uv tool upgrade --reinstall --link-mode copy omnigent"``.
     :param console: Rich console (stderr) used for the surrounding
         "Running:" / failure status lines, kept consistent with the
         panel above.
@@ -1731,7 +1739,9 @@ def _run_upgrade_command(command: str, console: Console) -> int:
 
     console.print(f"[yellow]Running:[/yellow] {command}")
     try:
-        result = subprocess.run(shlex.split(command), check=False)
+        argv = shlex.split(command)
+        env = {**os.environ, "UV_LINK_MODE": "copy"} if argv[:2] == ["uv", "tool"] else None
+        result = subprocess.run(argv, check=False, env=env)
     except (OSError, ValueError) as exc:
         # OSError: binary not on PATH. ValueError: shlex.split
         # rejected the command (extremely unlikely for our
@@ -1746,7 +1756,7 @@ def upgrade_command_for_installed() -> _UpgradeSuggestion | None:
 
     Convenience wrapper used by ``omni upgrade``: reads the installed
     distribution's metadata and maps it to the installer-appropriate
-    upgrade command (``uv tool upgrade omnigent``, ``pip install -U
+    upgrade command (``uv tool upgrade --reinstall --link-mode copy omnigent``, ``pip install -U
     omnigent``, etc.).
 
     :returns: A :class:`_UpgradeSuggestion`, or ``None`` when the

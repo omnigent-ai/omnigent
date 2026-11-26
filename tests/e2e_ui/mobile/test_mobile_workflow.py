@@ -32,7 +32,7 @@ from playwright.sync_api import Page, ViewportSize, expect
 from tests.e2e_ui.conftest import configure_mock_llm
 
 # iPhone-12-class portrait viewport — comfortably below the Tailwind
-# ``md`` breakpoint (768px) so every ``md:`` rule resolves to its
+# ``md`` breakpoint (1181px) so every ``md:`` rule resolves to its
 # mobile branch.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 
@@ -161,7 +161,8 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     agents, and is not claude-native — so the menu must list Files and
     Changes (the two files surfaces — folder tree and changed-files list)
     and Agents (unconditional — the panel lists at least the main
-    agent, badge "1"), and must NOT list Shells or Tasks. The session's
+    agent, badge "1") and Tasks when the server supports journals. It must
+    not list Shells. The session's
     only terminal is the auto-created embedded Omnigent REPL, which is
     plumbing for the Chat/Terminal pill, not inventory — listing it
     read as a phantom "main" terminal on agents that don't run a TUI,
@@ -184,8 +185,13 @@ def test_mobile_kebab_lists_file_surfaces_and_omits_absent_ones(
     # the inventory (reachable via the Chat/Terminal pill instead). An
     # entry here means the REPL leaked back into the kebab gating.
     expect(page.get_by_role("menuitem", name="Shells")).to_have_count(0)
-    # No todos on a plain hello_world session.
-    expect(page.get_by_role("menuitem", name="Tasks")).to_have_count(0)
+    info = httpx.get(f"{base_url}/v1/info", timeout=10.0)
+    info.raise_for_status()
+    tasks = page.get_by_role("menuitem", name="Tasks", exact=True)
+    if info.json().get("session_journal") is True:
+        expect(tasks).to_be_visible()
+    else:
+        expect(tasks).to_have_count(0)
 
 
 def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import sys
@@ -179,19 +180,86 @@ def _process_peak_rss_kb() -> int | None:
 
 _TEST_RSS_RECORDS: list[tuple[str, int]] = []
 
+# Keep diagnostics independent of process-wide clock and file mocks in tests.
+_PROGRESS_CLOCK = time.time
+_PROGRESS_OPEN = open
 
-def _write_progress_event(event: str, nodeid: str, rss_kb: int | None = None) -> None:
+
+def _progress_worker_id(worker: str) -> str:
+    """Keep worker metadata to xdist's bounded local-worker identifiers."""
+    if worker == "main":
+        return worker
+    if (
+        worker.startswith("gw")
+        and 2 < len(worker) <= 32
+        and worker[2:].isascii()
+        and worker[2:].isdigit()
+    ):
+        return worker
+    return "unknown"
+
+
+def _write_progress_event(
+    event: str,
+    nodeid: str,
+    rss_kb: int | None = None,
+    *,
+    phase: str | None = None,
+    error_present: bool | None = None,
+) -> None:
     """Append ``<timestamp>\\t<event>\\t<nodeid>[\\t<rss_kb>]\\n`` and fsync."""
     if _PROGRESS_LOG_PATH is None:
         return
-    line = f"{time.time():.3f}\t{event}\t{nodeid}"
+    line = f"{_PROGRESS_CLOCK():.3f}\t{event}\t{nodeid}"
     if rss_kb is not None:
         line += f"\t{rss_kb}"
+    if phase is not None:
+        worker = _progress_worker_id(os.environ.get("PYTEST_XDIST_WORKER", "main"))
+        line += f"\tphase={phase}\tworker={worker}\tpid={os.getpid()}"
+    if error_present is not None:
+        line += f"\terror_present={int(error_present)}"
     line += "\n"
-    with open(_PROGRESS_LOG_PATH, "a") as f:
+    with _PROGRESS_OPEN(_PROGRESS_LOG_PATH, "a") as f:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
+
+
+@contextlib.contextmanager
+def _record_test_phase(nodeid: str, phase: str) -> Generator[None, None, None]:
+    with contextlib.suppress(OSError):
+        _write_progress_event("PHASE_START", nodeid, phase=phase)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            _write_progress_event("PHASE_END", nodeid, phase=phase)
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True, specname="pytest_runtest_setup")
+def pytest_runtest_setup_progress(item) -> Generator[None, None, None]:
+    with _record_test_phase(item.nodeid, "setup"):
+        yield
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_call(item) -> Generator[None, None, None]:
+    with _record_test_phase(item.nodeid, "call"):
+        yield
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item) -> Generator[None, None, None]:
+    with _record_test_phase(item.nodeid, "teardown"):
+        yield
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error: object | None) -> None:
+    # This callback has no OS exit status; never render its error object.
+    worker = _progress_worker_id(node.gateway.id)
+    with contextlib.suppress(OSError):
+        _write_progress_event("WORKER_DOWN", worker, error_present=error is not None)
 
 
 def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
@@ -325,14 +393,14 @@ def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep a runner stall from tripping the RRULE search's elapsed-time limit.
+    """Keep a slow runner from tripping the RRULE search's CPU-time limit.
 
     Searches then end only on the deterministic work budget. Tests of the time
     limit patch this clock themselves, which overrides the frozen one.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", lambda: 0.0)
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", lambda: 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -354,6 +422,28 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     module = sys.modules.get("omnigent.server.smart_routing")
     if module is not None:
         module._runner_catalog_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_databricks_auth_memory() -> None:
+    """
+    Start every test without shared Databricks token sources or remembered profiles.
+
+    Both are meant to outlive a single client: the token sources are
+    process-global and keyed by server URL, which tests reuse, and the
+    remembered profiles live in the shared test data dir. Either would let one
+    test's resolution answer another's. The reset runs before the test, not
+    at teardown, where a test's ``Path.unlink`` patch can still be active.
+
+    :returns: None.
+    """
+    chat = sys.modules.get("omnigent.chat")
+    if chat is not None:
+        chat._databricks_auth_cache.clear()
+    executor = sys.modules.get("omnigent.inner.databricks_executor")
+    if executor is not None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(_TEST_OMNIGENT_DATA_DIR / executor._REMEMBERED_PROFILES_FILE)
 
 
 @pytest.fixture(autouse=True)
@@ -467,6 +557,8 @@ def _isolate_claude_managed_settings(
     would otherwise add a phantom Claude credential to every detection assertion.
     ``claude_native`` resolves this same tuple at call time, so neutralizing it
     here covers its Smart-Routing gateway check and managed model overrides too.
+    MDM plist discovery is isolated as well, so containment tests never inspect
+    the host's real managed credentials.
 
     ``autouse=True`` because the alternative leaves us one missed test away from
     host-dependent failures that reproduce only on configured machines. Tests
@@ -481,6 +573,38 @@ def _isolate_claude_managed_settings(
     if "claude_managed_settings" in request.fixturenames:
         return
     monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    monkeypatch.setattr(
+        "omnigent.inner.claude_model_access._claude_managed_preferences_paths", lambda: ()
+    )
+
+
+@pytest.fixture()
+def pi_host_mcp_servers() -> None:
+    """Opt back in to adding the host's MCP inventory to managed Pi agent dirs.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pi_host_mcp_servers(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the machine's Claude, Codex, and Cursor MCP servers out of managed Pi dirs.
+
+    Every managed Pi launch reads the host MCP inventory from the real ``$HOME``,
+    so without this a developer's configured servers would change which
+    ``mcp.json`` a test sees. Tests of that behavior request
+    :func:`pi_host_mcp_servers` and point the inventory at a temporary home.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the reader at teardown.
+    :returns: None.
+    """
+    if "pi_host_mcp_servers" in request.fixturenames:
+        return
+    monkeypatch.setattr("omnigent.inner.pi_mcp._host_mcp_servers", list)
 
 
 @pytest.fixture()

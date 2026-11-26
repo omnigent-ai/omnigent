@@ -114,6 +114,8 @@ def _pr_data() -> dict[str, object]:
         "headRefName": "reviewer-status",
         "headRefOid": "head-sha",
         "baseRefOid": "base-sha",
+        "headRepository": {"id": "R_1", "name": "widgets"},
+        "headRepositoryOwner": {"id": "U_1", "login": "acme"},
         "statusCheckRollup": [],
         "body": "description",
         "comments": [],
@@ -143,7 +145,7 @@ def _assert_reviewer_fields(argv: list[str]) -> None:
     assert "labels" in fields
 
 
-def test_workspace_info_shapes_reviewers_with_one_gh_request() -> None:
+def test_workspace_info_shapes_reviewers_with_conversation_read() -> None:
     data = _pr_data()
     gh_calls: list[list[str]] = []
 
@@ -166,12 +168,13 @@ def test_workspace_info_shapes_reviewers_with_one_gh_request() -> None:
         {"login": "platform", "kind": "team", "state": "PENDING"},
     ]
     assert payload["pr"]["labels"] == _PR_LABELS
-    assert len(gh_calls) == 1
+    assert len(gh_calls) == 2
     _assert_reviewer_fields(gh_calls[0])
+    assert gh_calls[1][:4] == ["api", "--hostname", "github.com", "graphql"]
     list_accounts.assert_not_called()
 
 
-def test_reference_info_shapes_reviewers_with_one_gh_request() -> None:
+def test_reference_info_shapes_reviewers_with_conversation_read() -> None:
     data = _pr_data()
     gh_calls: list[list[str]] = []
     reference = PullRequestRef(
@@ -204,8 +207,9 @@ def test_reference_info_shapes_reviewers_with_one_gh_request() -> None:
         {"login": "platform", "kind": "team", "state": "PENDING"},
     ]
     assert payload["pr"]["labels"] == _PR_LABELS
-    assert len(gh_calls) == 1
+    assert len(gh_calls) == 2
     _assert_reviewer_fields(gh_calls[0])
+    assert gh_calls[1][:4] == ["api", "--hostname", "github.com", "graphql"]
     fields = gh_calls[0][gh_calls[0].index("--json") + 1].split(",")
     assert {"headRefOid", "baseRefOid"}.issubset(fields)
     pr_token.assert_called_once_with("/workspace", reference)
@@ -239,6 +243,8 @@ def test_reviewer_field_failure_preserves_pr(lookup: str, error: str) -> None:
     )
 
     def run_gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+        if argv[0] == "api":
+            return 1, "", "timeline unavailable"
         fields = argv[-1].split(",")
         if "latestReviews" in fields or "reviewRequests" in fields:
             return 1, "", error
@@ -273,7 +279,8 @@ def test_reviewer_field_failure_preserves_pr(lookup: str, error: str) -> None:
         "runs": [{"name": "unit", "bucket": "passing", "url": "https://example.com/check"}],
     }
     assert "reviewers" not in payload["pr"]
-    first_call, fallback_call = gh_mock.call_args_list
+    first_call, fallback_call, timeline_call = gh_mock.call_args_list
+    assert timeline_call.args[0][:4] == ["api", "--hostname", "github.com", "graphql"]
     _assert_reviewer_fields(first_call.args[0])
     assert fallback_call.args[0][:-1] == first_call.args[0][:-1]
     assert (
@@ -299,6 +306,8 @@ def test_checks_field_failure_preserves_reviewers() -> None:
     )
 
     def run_gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+        if argv[0] == "api":
+            return 1, "", "timeline unavailable"
         fields = argv[-1].split(",")
         if "statusCheckRollup" in fields:
             return 1, "", error
@@ -312,8 +321,8 @@ def test_checks_field_failure_preserves_reviewers() -> None:
         for field, value in data.items()
         if field in github_resource._PR_VIEW_FIELDS.split(",") and field != "statusCheckRollup"
     }
-    assert gh_mock.call_count == 2
-    _assert_reviewer_fields(gh_mock.call_args.args[0])
+    assert gh_mock.call_count == 3
+    _assert_reviewer_fields(gh_mock.call_args_list[1].args[0])
 
 
 def test_title_only_failure_does_not_retry() -> None:
@@ -373,11 +382,12 @@ def test_commit_resolved_pr_preserves_data_without_reviewer_fields() -> None:
                 (1, "", "no pull requests found for branch"),
                 (1, "", 'Unknown JSON field: "latestReviews"'),
                 (0, json.dumps(data), ""),
+                (1, "", "timeline unavailable"),
             ],
         ) as run_gh,
     ):
         assert github_resource._pr_view_json("/workspace", github_resource._PR_VIEW_FIELDS) == data
-    assert run_gh.call_args.args[0][:5] == ["pr", "view", "17", "-R", "acme/widgets"]
+    assert run_gh.call_args_list[-2].args[0][:5] == ["pr", "view", "17", "-R", "acme/widgets"]
 
 
 @pytest.mark.parametrize(
@@ -400,7 +410,11 @@ def test_checks_and_reviewer_failures_preserve_pr(errors: list[str]) -> None:
         patch.object(
             github_resource,
             "_gh",
-            side_effect=[*((1, "", error) for error in errors), (0, json.dumps(data), "")],
+            side_effect=[
+                *((1, "", error) for error in errors),
+                (0, json.dumps(data), ""),
+                (1, "", "timeline unavailable"),
+            ],
         ) as run_gh,
     ):
         payload = github_resource._reference_info("/workspace", reference)
@@ -409,9 +423,9 @@ def test_checks_and_reviewer_failures_preserve_pr(errors: list[str]) -> None:
     assert payload["pr"]["title"] == data["title"]
     assert payload["pr"]["checks_supported"] is False
     assert "reviewers" not in payload["pr"]
-    assert run_gh.call_count == len(errors) + 1
+    assert run_gh.call_count == len(errors) + 2
     for call in run_gh.call_args_list:
         assert call.kwargs == {"cwd": "/workspace", "token": "selected-token"}
     assert {"headRefOid", "baseRefOid", "body", "comments"}.issubset(
-        run_gh.call_args.args[0][-1].split(",")
+        run_gh.call_args_list[-2].args[0][-1].split(",")
     )

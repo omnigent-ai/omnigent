@@ -14,9 +14,9 @@
 //  12. Comments are marked seen (inbox-clearing registry) only while the
 //      comments panel is open — never from merely opening the file.
 
-import { useMemo } from "react";
+import { type ComponentProps, useMemo } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, type UseQueryResult } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -53,7 +53,7 @@ vi.mock("./CodeViewer", () => ({
     wrapLines?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => {
-    codeViewerRenders({ path, position });
+    codeViewerRenders({ path, position, viewMode });
     return (
       <div
         data-testid="code-viewer"
@@ -81,6 +81,8 @@ vi.mock("./CommentsPanel", () => ({
     comments,
     addressedComments,
     activeSelection,
+    addressCount,
+    addressFileCount,
   }: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     onClickComment?: (comment: any) => void;
@@ -90,8 +92,15 @@ vi.mock("./CommentsPanel", () => ({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     addressedComments?: any[];
     activeSelection?: { comment_id?: string } | null;
+    addressCount?: number;
+    addressFileCount?: number;
   }) => (
-    <div data-testid="comments-panel" data-active-comment-id={activeSelection?.comment_id ?? ""}>
+    <div
+      data-testid="comments-panel"
+      data-active-comment-id={activeSelection?.comment_id ?? ""}
+      data-address-count={addressCount}
+      data-address-file-count={addressFileCount}
+    >
       {[...(comments ?? []), ...(addressedComments ?? [])].map((c: { id: string }) => (
         <button
           key={c.id}
@@ -110,18 +119,27 @@ vi.mock("./MonacoDiffViewer", () => ({
   // Surface the toggle-driven props as data attributes so tests can assert the
   // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
   MonacoDiffViewer: ({
+    before,
+    after,
     position,
     wrapLines,
     hideWhitespace,
     searchOpen,
+    commentable,
   }: {
+    before?: string;
+    after?: string;
     position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
+    commentable?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
+      data-before={before}
+      data-after={after}
+      data-commentable={String(commentable ?? true)}
       data-line={position?.line}
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
@@ -194,17 +212,32 @@ vi.mock("@/store/chatStore", () => ({
 import { useComments } from "@/hooks/useComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
-import { useFileDiff } from "@/hooks/useFileDiff";
+import { type FileDiffResponse, useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
-import { MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
-import { DEFAULT_FILE_VIEW_PREFERENCES, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import {
+  DEFAULT_FILE_VIEW_PREFERENCES,
+  readFileViewPreferences,
+  writeFileViewPreferences,
+} from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
+import {
+  PushUnresolved,
+  RepositoryContextProblem,
+  type ResolveRepositoryContextResponse,
+} from "@/lib/workspaceSidebarApi";
+import {
+  DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+  setWorkspaceSidebarSourceForTests,
+} from "@/lib/workspaceSidebarSource";
+import { repositoryContextKey } from "@/hooks/useRepositoryContext";
 
 const useCommentsMock = vi.mocked(useComments);
 const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
@@ -239,8 +272,11 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  registerLeaveGuard?: ComponentProps<typeof FileViewer>["registerLeaveGuard"];
   syncUrl?: boolean;
   frameless?: boolean;
+  besideSidebar?: boolean;
+  toolbarLeading?: React.ReactNode;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
   open?: boolean;
@@ -254,10 +290,21 @@ interface RenderProps {
   initialSearch?: string;
   /** Spy for the close affordance; defaults to a throwaway mock. */
   onClose?: () => void;
+  onCloseTab?: () => void;
+  onExitFullScreen?: () => void;
   /** Sort order for the prev/next navigation; defaults to the component default. */
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  /** Esc closes through `onClose` too, as a workspace file tab or the narrow-screen overlay does. */
+  escapeCloses?: boolean;
+  onShare?: () => void;
+  shareDisabledReason?: string;
+  linkedCommentId?: string;
+  comparisonDiff?: ComponentProps<typeof FileViewer>["comparisonDiff"];
+  onShowChanges?: () => void;
+  /** The client the tree reads through, so a test can wait for a query to settle. */
+  queryClient?: QueryClient;
 }
 
 /**
@@ -271,6 +318,8 @@ interface RenderProps {
 function viewerTree({
   syncUrl,
   frameless,
+  besideSidebar,
+  toolbarLeading,
   mobileOverlay,
   position,
   open = false,
@@ -279,11 +328,20 @@ function viewerTree({
   path = "file1.py",
   initialSearch = "",
   onClose = vi.fn(),
+  onCloseTab,
+  onExitFullScreen,
   sort,
   onNavigateTo,
+  escapeCloses = false,
+  onShare,
+  shareDisabledReason,
+  registerLeaveGuard,
+  linkedCommentId,
+  comparisonDiff,
+  onShowChanges,
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[url]}>
@@ -291,6 +349,8 @@ function viewerTree({
         <FileViewer
           syncUrl={syncUrl}
           frameless={frameless}
+          besideSidebar={besideSidebar}
+          toolbarLeading={toolbarLeading}
           mobileOverlay={mobileOverlay}
           position={position}
           open={open}
@@ -299,8 +359,16 @@ function viewerTree({
           conversationId="conv_1"
           path={path}
           onClose={onClose}
+          onCloseTab={onCloseTab ?? (escapeCloses ? onClose : undefined)}
+          onExitFullScreen={onExitFullScreen}
           sort={sort}
           onNavigateTo={onNavigateTo}
+          onShare={onShare}
+          shareDisabledReason={shareDisabledReason}
+          registerLeaveGuard={registerLeaveGuard}
+          linkedCommentId={linkedCommentId}
+          comparisonDiff={comparisonDiff}
+          onShowChanges={onShowChanges}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -426,6 +494,59 @@ function clearIOSViewport(): void {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+describe("FileViewer render failures", () => {
+  it.each(["retry", "source", "another file"])(
+    "contains a preview crash and recovers through %s",
+    (recovery) => {
+      const error = new Error("File preview failed");
+      const suppressExpectedError = (event: ErrorEvent) => {
+        if (event.error === error) event.preventDefault();
+      };
+      window.addEventListener("error", suppressExpectedError);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      let broken = false;
+      codeViewerRenders.mockImplementation(({ path, viewMode }) => {
+        if (broken && path === "results.csv" && viewMode === "preview") throw error;
+      });
+      const tree = (path = "results.csv") => (
+        <>
+          <textarea aria-label="Chat draft" />
+          {viewerTree({ open: true, path })}
+        </>
+      );
+      try {
+        const view = render(tree());
+        const draft = screen.getByRole("textbox", { name: "Chat draft" });
+        fireEvent.change(draft, { target: { value: "Unsent message" } });
+        broken = true;
+        view.rerender(tree());
+
+        expect(screen.getByRole("alert")).toHaveTextContent("Unable to display this file.");
+        expect(screen.getByRole("textbox", { name: "Chat draft" })).toBe(draft);
+        expect(draft).toHaveValue("Unsent message");
+        expect(screen.getByRole("button", { name: "View source" })).toBeInTheDocument();
+
+        if (recovery === "retry") {
+          broken = false;
+          fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+        } else if (recovery === "source") {
+          fireEvent.click(screen.getByRole("button", { name: "View source" }));
+          expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+        } else {
+          view.rerender(tree("other.csv"));
+        }
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+        expect(draft).toHaveValue("Unsent message");
+      } finally {
+        codeViewerRenders.mockReset();
+        window.removeEventListener("error", suppressExpectedError);
+      }
+    },
+  );
+});
+
 // The mobile viewer is a `fixed inset-0` overlay that the iOS shell-lock (which
 // only resizes flow content inside .app-shell) can't lift above the soft
 // keyboard. It pads its own bottom by the keyboard inset so the comments panel
@@ -446,6 +567,33 @@ describe("FileViewer mobile keyboard inset", () => {
       expect(screen.getByTestId("file-viewer")).toHaveStyle({ paddingBottom: "300px" });
     },
   );
+
+  it("keeps the frameless layout, with no sidebar cell, when it isn't beside a sidebar", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open: true, frameless: true });
+    const root = screen.getByTestId("file-viewer");
+    expect(root).toHaveClass("flex", "flex-col", "bg-card");
+    expect(root.firstElementChild).toHaveClass("border-b", "px-4", "py-3");
+    expect(root.querySelector(".col-start-2")).toBeNull();
+  });
+
+  it("beside a sidebar, spans the toolbar over the page with its leading control first", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({
+      open: true,
+      frameless: true,
+      besideSidebar: true,
+      toolbarLeading: <button type="button">Show tree</button>,
+    });
+    const root = screen.getByTestId("file-viewer");
+    expect(root).toHaveClass("grid-cols-subgrid", "bg-background");
+    const toolbar = root.firstElementChild as HTMLElement;
+    expect(toolbar).toHaveClass("col-span-full", "row-start-1");
+    const leading = within(toolbar).getByRole("button", { name: "Show tree" });
+    expect(toolbar.querySelector("button")).toBe(leading);
+    // The banner and content sit in the cell beside the sidebar.
+    expect(root.children[1]).toHaveClass("col-start-2", "row-start-2");
+  });
 
   it("does not pad the desktop rail for the iOS keyboard", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
@@ -603,6 +751,36 @@ describe("FileViewer prev/next navigation order", () => {
     { path: "b.py", bytes: 1, modified_at: 300, name: "b.py", status: "modified" as const },
     { path: "c.py", bytes: 1, modified_at: 200, name: "c.py", status: "modified" as const },
   ];
+
+  it("navigates in repository order, sorts within each repo, and puts other files last", async () => {
+    const files = [
+      { ...changedFiles[0], path: "web/a.py", repository_root: "web" },
+      { ...changedFiles[1], path: "api/b.py", repository_root: "api" },
+      { ...changedFiles[0], path: "api/a.py", repository_root: "api" },
+      changedFiles[2],
+    ];
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () =>
+        ({ data: { available: true, data: files } }) as ReturnType<typeof useWorkspaceChangedFiles>,
+      async () => {
+        useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+        const onNavigateTo = vi.fn();
+        renderViewer({ open: true, path: "api/a.py", sort: "recent", onNavigateTo });
+        const prev = screen.getByRole("button", { name: "Previous file" });
+        expect(prev.parentElement?.querySelector("span.tabular-nums")?.textContent).toBe("2/4");
+        fireEvent.click(prev);
+        expect(onNavigateTo).toHaveBeenLastCalledWith("api/b.py");
+        fireEvent.click(screen.getByRole("button", { name: "Next file" }));
+        expect(onNavigateTo).toHaveBeenLastCalledWith("web/a.py");
+        expect(files.map((file) => file.path)).toEqual([
+          "web/a.py",
+          "api/b.py",
+          "api/a.py",
+          "c.py",
+        ]);
+      },
+    );
+  });
 
   // alpha: [a, b, c] → b is 2nd → "2/3". recent: [b, c, a] → b is 1st → "1/3".
   it.each([
@@ -767,6 +945,119 @@ describe("FileViewer URL sync — diff param", () => {
     );
   });
 
+  describe("under the session's chosen comparison", () => {
+    const comparisonQuery = (before: string, after: string) =>
+      ({ data: { before, after } }) as unknown as UseQueryResult<FileDiffResponse>;
+
+    it.each([
+      ["without a comparison", undefined],
+      ["under the last commit", { base: "head" as const }],
+    ])("reads the last commit's diff exactly as before %s", async (_name, comparisonDiff) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      vi.mocked(useFileDiff).mockClear();
+      renderViewer({ open: true, initialSearch: "diff=1", comparisonDiff });
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(vi.mocked(useFileDiff).mock.calls.every(([, path]) => path === "file1.py")).toBe(true);
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", "file1.py", { requested: true });
+    });
+
+    it("shows the comparison's diff for a file only it lists, and reads no last-commit diff", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({
+        open: true,
+        path: "only-in-comparison.py",
+        initialSearch: "diff=1",
+        comparisonDiff: {
+          base: "comparison",
+          changed: true,
+          deleted: false,
+          headIsWorkingCopy: true,
+          query: comparisonQuery("base", "work"),
+        },
+      });
+      const viewer = await screen.findByTestId("diff-viewer");
+      // Monaco gets the comparison's own text, not the last commit's.
+      expect(viewer).toHaveAttribute("data-before", "base");
+      expect(viewer).toHaveAttribute("data-after", "work");
+      expect(useFileDiff).toHaveBeenLastCalledWith("conv_1", null, { requested: true });
+    });
+
+    it("keeps a file a committed head deleted, but the workspace still has, readable and editable", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      vi.stubGlobal("omnigentDesktop", {
+        kind: "electron",
+        getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "this-mac" }),
+      });
+      const context = localDesktopContext();
+      render(
+        <FileViewerContext.Provider value={context}>
+          {viewerTree({
+            open: true,
+            path: "notes.md",
+            comparisonDiff: {
+              base: "comparison",
+              changed: true,
+              deleted: true,
+              headIsWorkingCopy: false,
+              query: comparisonQuery("# Notes", ""),
+            },
+          })}
+        </FileViewerContext.Provider>,
+      );
+
+      // The current file is read and opens in its editor, with its workspace actions.
+      expect(useFileContent).toHaveBeenLastCalledWith("conv_1", "notes.md", { visible: true });
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+      expect(screen.getByRole("textbox", { name: "Draft text" })).toBeInTheDocument();
+      expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeInTheDocument();
+
+      // The comparison's deletion is a diff to show and leave, not a file that's gone.
+      fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+      const viewer = await screen.findByTestId("diff-viewer");
+      expect(viewer).toHaveAttribute("data-before", "# Notes");
+      expect(viewer).toHaveAttribute("data-after", "");
+      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+    });
+
+    it("keeps comments off a committed snapshot's after side, and on for the working copy", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      const snapshot = (headIsWorkingCopy: boolean) => ({
+        base: "comparison" as const,
+        changed: true,
+        deleted: false,
+        headIsWorkingCopy,
+        query: comparisonQuery("v1", "v2 on another branch"),
+      });
+      const { unmount } = renderViewer({
+        open: true,
+        initialSearch: "diff=1",
+        comparisonDiff: snapshot(false),
+      });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-commentable", "false");
+      unmount();
+      renderViewer({ open: true, initialSearch: "diff=1", comparisonDiff: snapshot(true) });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-commentable", "true");
+    });
+
+    it("offers no diff for a file the comparison doesn't list, even one the last commit changed", async () => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({
+        open: true,
+        initialSearch: "diff=1",
+        comparisonDiff: {
+          base: "comparison",
+          changed: false,
+          deleted: false,
+          headIsWorkingCopy: true,
+          query: comparisonQuery("", ""),
+        },
+      });
+      expect(await screen.findByTestId("code-viewer")).toBeInTheDocument();
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    });
+  });
+
   it("does not prepare a linked diff when changed-file discovery has already failed", async () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     await vi.mocked(useWorkspaceChangedFiles).withImplementation(
@@ -808,6 +1099,25 @@ describe("FileViewer URL sync — diff param", () => {
     expect(screen.getByTestId("url-params").textContent).toContain("diff=1");
   });
 
+  it("sends Show changes to the page's Changes review, and Open file leaves a diff", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onShowChanges = vi.fn();
+    renderViewer({ open: true, path: "file1.py", onShowChanges });
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show changes" }));
+    expect(onShowChanges).toHaveBeenCalledTimes(1);
+    // The review shows the diff, so the file stays in its own view.
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    cleanup();
+
+    // A file that opens in a diff, as from a ?diff=1 link, leaves it with Open file.
+    renderViewer({ open: true, path: "file1.py", onShowChanges, initialSearch: "diff=1" });
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open file" }));
+    expect(await screen.findByTestId("code-viewer")).toBeInTheDocument();
+    expect(onShowChanges).toHaveBeenCalledTimes(1);
+  });
+
   it("removes ?diff from the URL when diff is toggled off", async () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
@@ -836,6 +1146,31 @@ describe("FileViewer URL sync — diff param", () => {
       expect(screen.getByText("Loading diff…")).toBeInTheDocument();
     } finally {
       // Restore the default (payload present) so later tests render the diff.
+      vi.mocked(useFileDiff).mockReturnValue({
+        data: { before: "old", after: "new" },
+      } as ReturnType<typeof useFileDiff>);
+    }
+  });
+
+  it.each([
+    { baseline_state: "unknown", after: "current" },
+    { baseline_state: "unknown", after: null },
+    { baseline_state: undefined, after: "new file" },
+  ] as const)("handles a missing original with $baseline_state and $after", async (payload) => {
+    vi.mocked(useFileDiff).mockReturnValue({
+      data: { before: null, ...payload },
+    } as ReturnType<typeof useFileDiff>);
+    try {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
+      if (payload.baseline_state === "unknown") {
+        expect(screen.getByText("Original content unavailable")).toBeInTheDocument();
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      } else {
+        expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+        expect(screen.queryByText("Original content unavailable")).toBeNull();
+      }
+    } finally {
       vi.mocked(useFileDiff).mockReturnValue({
         data: { before: "old", after: "new" },
       } as ReturnType<typeof useFileDiff>);
@@ -879,6 +1214,23 @@ describe("FileViewer URL sync — comment param", () => {
     // Failure: linkedCommentAppliedRef logic did not run, or commentsQuery.data
     // was not available when the effect fired.
     expect(screen.getByTestId("comments-panel")).toBeInTheDocument();
+  });
+
+  it("opens the comments panel for a linked comment it's given, with no ?comment= in the URL", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1"), makeComment("c2")]));
+    // A saved Show diff doesn't hide the file the comment is on, and stays saved.
+    writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, diffActive: true });
+
+    renderViewer({ open: true, path: "file1.py", linkedCommentId: "c2" });
+    await act(async () => {});
+
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c2");
+    expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    expect(readFileViewPreferences().diffActive).toBe(true);
+    expect(screen.getByTestId("url-params").textContent).not.toContain("diff=1");
+    fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
   });
 
   it("applies the linked comment only once per component lifecycle", () => {
@@ -1008,6 +1360,122 @@ describe("FileViewer addressed selection", () => {
   });
 });
 
+describe("FileViewer Address All", () => {
+  const otherDraft = { ...makeComment("c2"), path: "other.py" };
+  const otherSent = { ...makeComment("c3", "addressed"), path: "other.py" };
+  const sentHere = makeComment("c4", "addressed");
+  const localReview: Comment = {
+    ...makeComment("pr-comment"),
+    path: "review.py",
+    anchor_metadata: {
+      pr_url: "https://github.com/acme/app/pull/1",
+      side: "RIGHT",
+      line: 1,
+      start_line: null,
+      head_sha: "head",
+      base_sha: "base",
+    },
+  };
+
+  it.each([
+    ["the open file and others", [makeComment("c1"), sentHere], ["c1", "c2"], 2],
+    ["only other files", [sentHere], ["c2"], 1],
+  ])("sends drafts from %s in one message", (_label, fileComments, expectedIds, fileCount) => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    // The session-wide list may lag behind this file's list: c4 is still a draft there,
+    // the new draft c1 is missing, and the deleted draft c5 remains.
+    const staleSessionComments = [
+      ...fileComments.filter((c) => c.id !== "c1").map((c) => ({ ...c, status: "draft" as const })),
+      makeComment("c5"),
+      otherDraft,
+      otherSent,
+      localReview,
+    ];
+    useCommentsMock.mockImplementation((_sessionId, path) =>
+      makeCommentsQuery(path ? fileComments : staleSessionComments),
+    );
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: expectedIds });
+    const panel = screen.getByTestId("comments-panel");
+    expect(panel).toHaveAttribute("data-address-count", String(expectedIds.length));
+    expect(panel).toHaveAttribute("data-address-file-count", String(fileCount));
+  });
+
+  it("does not send or count local review comments on any path", () => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    const localHere = { ...localReview, id: "pr-here", path: "file1.py" };
+    useCommentsMock.mockImplementation((_sessionId, path) =>
+      makeCommentsQuery(path ? [localHere] : [localHere, localReview]),
+    );
+
+    renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).not.toHaveBeenCalled();
+    const panel = screen.getByTestId("comments-panel");
+    expect(panel).toHaveAttribute("data-address-count", "0");
+    expect(panel).toHaveAttribute("data-address-file-count", "0");
+  });
+
+  it.each([
+    ["session", "loading", { data: undefined, isPending: true }],
+    ["session", "failed", { data: undefined, isError: true }],
+    ["file", "loading", { data: undefined, isPending: true }],
+    ["file", "failed", { data: undefined, isError: true }],
+  ] as const)("sends nothing until the %s list loads (%s)", (unavailableList, _state, query) => {
+    const mutate = vi.fn();
+    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    const unavailableQuery = query as unknown as ReturnType<typeof useComments>;
+    let loaded = false;
+    useCommentsMock.mockImplementation((_sessionId, path) => {
+      if (!loaded && (path ? "file" : "session") === unavailableList) return unavailableQuery;
+      return makeCommentsQuery(path ? [makeComment("c1")] : [makeComment("c1"), otherDraft]);
+    });
+
+    const { rerender } = renderViewer({ open: true, path: "file1.py" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-address-count", "0");
+
+    loaded = true;
+    rerender(viewerTree({ open: true, path: "file1.py" }));
+    fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1", "c2"] });
+  });
+
+  it.each(["session", "file"] as const)(
+    "keeps sending cached drafts when the %s list's refresh fails",
+    (failedList) => {
+      const mutate = vi.fn();
+      useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+      useCommentsMock.mockImplementation((_sessionId, path) => {
+        const data = path ? [makeComment("c1")] : [makeComment("c1"), otherDraft];
+        const isError = (path ? "file" : "session") === failedList;
+        return { data, isError } as unknown as ReturnType<typeof useComments>;
+      });
+
+      renderViewer({ open: true, path: "file1.py" });
+      fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+      fireEvent.click(screen.getByRole("button", { name: "address all comments" }));
+
+      expect(mutate).toHaveBeenCalledWith({ comment_ids: ["c1", "c2"] });
+      expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-address-count", "2");
+    },
+  );
+});
+
 describe("FileViewer copy-link button", () => {
   it("renders a Copy link button in the viewer header toolbar", () => {
     // The button must always be present when the viewer is open so users can
@@ -1111,6 +1579,72 @@ describe("FileViewer clickable file path", () => {
 
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Failed to copy file path"));
     expect(toast.success).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileViewer file sharing", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  it("opens file sharing from the toolbar while preserving copy link", async () => {
+    const onShare = vi.fn();
+    renderViewer({ open: true, onShare });
+
+    const button = screen.getByRole("button", { name: "Share file" });
+    act(() => button.focus());
+    const tooltip = await screen.findByRole("tooltip");
+    expect(button).toHaveAttribute("aria-describedby", tooltip.id);
+    expect(tooltip).toHaveTextContent("Share file");
+    fireEvent.click(button);
+
+    expect(onShare).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Copy link to file" })).toBeInTheDocument();
+  });
+
+  it("omits sharing when no share action is available", () => {
+    renderViewer({ open: true });
+
+    expect(screen.queryByRole("button", { name: "Share file" })).toBeNull();
+  });
+
+  it("disables sharing and explains the server restriction", async () => {
+    const onShare = vi.fn();
+    const reason = "Sharing has been disabled for this Omnigent server.";
+    renderViewer({ open: true, onShare, shareDisabledReason: reason });
+
+    const button = screen.getByRole("button", { name: `Share file disabled: ${reason}` });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(onShare).not.toHaveBeenCalled();
+    fireEvent.pointerMove(button.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+  });
+
+  it("opens sharing from the narrow toolbar overflow", () => {
+    installCollapsedToolbar();
+    const onShare = vi.fn();
+    renderViewer({ open: true, onShare });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Share file" }));
+
+    expect(onShare).toHaveBeenCalledOnce();
+  });
+
+  it("keeps sharing disabled in the narrow toolbar overflow", async () => {
+    installCollapsedToolbar();
+    const onShare = vi.fn();
+    const reason = "Sharing is unavailable from a local server.";
+    renderViewer({ open: true, onShare, shareDisabledReason: reason });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions" }), { button: 0 });
+    const item = screen.getByRole("menuitem", { name: `Share file disabled: ${reason}` });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(item);
+    expect(onShare).not.toHaveBeenCalled();
+    fireEvent.pointerMove(item.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
   });
 });
 
@@ -1379,7 +1913,120 @@ describe("classifyAndRemapComments", () => {
 // the tabbed Files rail (frameless), where tabs own open/close, so the back
 // button is hidden there.
 
+describe("FileViewer Escape ownership", () => {
+  it("marks itself as owning Escape while Escape would close its tab", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(
+      <>
+        {viewerTree({ open: true, escapeCloses: true, syncUrl: false })}
+        <button type="button">Chat</button>
+      </>,
+    );
+    const viewer = screen.getByTestId("file-viewer");
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // Working in the chat leaves Escape to the chat.
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Chat" }));
+    expect(viewer).not.toHaveAttribute("data-escape-owner");
+    fireEvent.mouseDown(viewer);
+    expect(viewer).toHaveAttribute("data-escape-owner");
+
+    // With Find open, Escape closes Find first, so the viewer still owns it.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    // The menu took focus; the app's Find bar takes it back into the viewer.
+    fireEvent.mouseDown(viewer);
+    expect(viewer).toHaveAttribute("data-escape-owner");
+  });
+
+  it("leaves Escape to an open Find bar over a pending question", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onClose = vi.fn();
+    const onReject = vi.fn();
+    render(
+      <>
+        {viewerTree({ open: true, escapeCloses: true, syncUrl: false, onClose })}
+        <AskUserQuestionForm
+          elicitationId="elic_find"
+          questions={[
+            { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+          ]}
+          onSubmit={vi.fn()}
+          onReject={onReject}
+          keyboardActive
+        />
+      </>,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    // Focus leaves the search box for the file's text, still inside the viewer.
+    const viewer = screen.getByTestId("file-viewer");
+    fireEvent.mouseDown(screen.getByTestId("code-viewer"));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(viewer).toHaveAttribute("data-escape-owner");
+    expect(onReject).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "leaves Escape to a question typed into after the viewer (syncUrl=%s)",
+    (syncUrl) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      const onClose = vi.fn();
+      const onReject = vi.fn();
+      render(
+        <>
+          {viewerTree({ open: true, escapeCloses: true, syncUrl, onClose })}
+          <AskUserQuestionForm
+            elicitationId="elic_viewer"
+            questions={[
+              { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+            ]}
+            onSubmit={vi.fn()}
+            onReject={onReject}
+            keyboardActive
+          />
+        </>,
+      );
+      const custom = screen.getByTestId("ask-user-question-custom-input");
+      fireEvent.focusIn(custom);
+      custom.focus();
+      fireEvent.keyDown(custom, { key: "Escape" });
+      expect(onReject).toHaveBeenCalledOnce();
+      expect(onClose).not.toHaveBeenCalled();
+    },
+  );
+
+  it("doesn't own Escape when Escape doesn't close it", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(viewerTree({ open: true }));
+    expect(screen.getByTestId("file-viewer")).not.toHaveAttribute("data-escape-owner");
+  });
+});
+
 describe("FileViewer header close affordance", () => {
+  it("lists Esc on Close only while Esc would close the viewer", async () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(viewerTree({ open: true, mobileOverlay: true, escapeCloses: true }));
+    const closeKeys = async () => {
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Close file viewer" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      const keys = Array.from(tooltip.querySelectorAll("kbd"), (key) => key.textContent);
+      fireEvent.pointerLeave(screen.getByRole("button", { name: "Close file viewer" }));
+      return keys;
+    };
+    expect(await closeKeys()).toEqual(["Esc"]);
+
+    // Find keeps Esc for closing itself.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Find in file" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+    expect(await closeKeys()).toEqual([]);
+  });
+
   it.each([false, true])("invokes onClose for a mobile overlay (frameless=%s)", (frameless) => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     const onClose = vi.fn();
@@ -1546,12 +2193,67 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
   });
 
-  it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
-    renderViewer({ open: true, path: "page.html" });
-    expect(viewModeOf()).toBe("preview");
-    // In preview, the single toggle switches to source (existing behavior).
-    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+  it.each(["page.html", "results.csv", "export.tsv"])(
+    "opens %s in preview and guards unsaved source edits when toggling back",
+    (path) => {
+      renderViewer({ open: true, path });
+      expect(viewModeOf()).toBe("preview");
+      // In preview, the single toggle switches to source (existing behavior).
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(viewModeOf()).toBe("source");
+      expect(screen.queryByText("Unsaved changes")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
+
+  it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
+    renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("switches a CSV opened on its table to source when a comment is picked", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    renderViewer({ open: true, path: "results.csv" });
+    expect(viewModeOf()).toBe("preview");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+    // The toggle still returns to the table.
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("ends a picked comment's pull toward source when another file opens", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const view = renderViewer({ open: true, path: "results.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+
+    view.rerender(viewerTree({ open: true, path: "other.csv" }));
+    view.rerender(viewerTree({ open: true, path: "results.csv" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("keeps a Markdown comment link's pull toward its editor across a visit elsewhere", () => {
+    // Only a data table's pull ends on leaving; Markdown keeps its deep-link bias.
+    const view = renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+    expect(viewModeOf()).toBe("editor");
+    view.rerender(viewerTree({ open: true, path: "other.py", initialSearch: "comment=c1" }));
+    view.rerender(viewerTree({ open: true, path: "notes.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("editor");
   });
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
@@ -1568,6 +2270,61 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     // Confirming the discard performs the deferred switch.
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(viewModeOf()).toBe("source");
+  });
+
+  it("asks its host's leave question while the markdown editor has unsaved edits", async () => {
+    let guard: (() => Promise<"leave" | "cancel">) | undefined;
+    const unregister = vi.fn();
+    const registerLeaveGuard = vi.fn((next: () => Promise<"leave" | "cancel">) => {
+      guard = next;
+      return unregister;
+    });
+    renderViewer({ open: true, path: "notes.md", registerLeaveGuard });
+    selectMode("Edit");
+    expect(registerLeaveGuard).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    expect(registerLeaveGuard).toHaveBeenCalledTimes(1);
+
+    let answer!: Promise<"leave" | "cancel">;
+    act(() => {
+      answer = guard!();
+    });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    await expect(answer).resolves.toBe("cancel");
+    act(() => {
+      answer = guard!();
+    });
+    expect(unregister).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await expect(answer).resolves.toBe("leave");
+    // With the edits gone there's nothing to ask about.
+    expect(unregister).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers a waiting leave question when another replaces it or the viewer goes away", async () => {
+    let guard: (() => Promise<"leave" | "cancel">) | undefined;
+    const registerLeaveGuard = vi.fn((next: () => Promise<"leave" | "cancel">) => {
+      guard = next;
+      return () => undefined;
+    });
+    const view = renderViewer({ open: true, path: "notes.md", registerLeaveGuard });
+    selectMode("Edit");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+
+    let first!: Promise<"leave" | "cancel">;
+    let second!: Promise<"leave" | "cancel">;
+    act(() => {
+      first = guard!();
+    });
+    act(() => {
+      second = guard!();
+    });
+    await expect(first).resolves.toBe("cancel");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+
+    view.unmount();
+    await expect(second).resolves.toBe("cancel");
   });
 
   it("switches out of a clean markdown editor immediately, with no discard dialog", () => {
@@ -1738,6 +2495,126 @@ describe("FileViewer view-settings menu", () => {
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
   });
 
+  describe("Open in GitHub", () => {
+    const pushed = "c".repeat(40);
+    const pushTarget = {
+      remoteName: "origin",
+      branch: "feature",
+      host: "github.com",
+      owner: "acme",
+      repo: "app",
+      trackingSha: pushed,
+    };
+    const repositoryContext = (
+      overrides: Partial<ResolveRepositoryContextResponse> = {},
+    ): ResolveRepositoryContextResponse => ({
+      problem: RepositoryContextProblem.UNSPECIFIED,
+      branch: "feature",
+      headSha: pushed,
+      push: pushTarget,
+      pushUnresolved: PushUnresolved.UNSPECIFIED,
+      upstreamRef: "refs/remotes/origin/feature",
+      remotes: [{ name: "origin", host: "github.com", owner: "acme", repo: "app" }],
+      unsupportedRemoteCount: 0,
+      truncatedRemotes: false,
+      workspacePrefix: "web/",
+      ...overrides,
+    });
+    const answering = (response: ResolveRepositoryContextResponse) => {
+      const resolve = vi.fn(() => Promise.resolve(response));
+      setWorkspaceSidebarSourceForTests({
+        ...DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+        resolveRepositoryContext: resolve,
+      });
+      return resolve;
+    };
+
+    afterEach(() => setWorkspaceSidebarSourceForTests(null));
+
+    it("links the file at its pushed commit, below the workspace's place in the repository", async () => {
+      answering(repositoryContext());
+      const fileUrl = `https://github.com/acme/app/blob/${pushed}/web/file1.py`;
+      // An embedding pane that withholds popups: the row must still navigate.
+      vi.spyOn(window, "open").mockReturnValue(null);
+      const followed: HTMLAnchorElement[] = [];
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+        this: HTMLAnchorElement,
+      ) {
+        followed.push(this);
+      });
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      const item = await screen.findByRole("menuitem", { name: "Open in GitHub" });
+      expect(item).toHaveAttribute("href", fileUrl);
+      fireEvent.click(item);
+      expect(followed.map((link) => [link.href, link.target])).toEqual([[fileUrl, "_self"]]);
+    });
+
+    it("shows the item disabled, with why, while the branch isn't pushed", async () => {
+      answering(repositoryContext({ push: { ...pushTarget, trackingSha: "" } }));
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      const item = await screen.findByRole("menuitem", { name: "Open in GitHub" });
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      expect(item).toHaveAccessibleDescription("Push this branch to open the file in GitHub.");
+      expect(item).not.toHaveAttribute("href");
+    });
+
+    it("reads the context again when the menu reopens, so a push made meanwhile links", async () => {
+      let current = repositoryContext({ push: { ...pushTarget, trackingSha: "" } });
+      const resolve = vi.fn(() => Promise.resolve(current));
+      setWorkspaceSidebarSourceForTests({
+        ...DEFAULT_WORKSPACE_SIDEBAR_SOURCE,
+        resolveRepositoryContext: resolve,
+      });
+      render(viewerTree({ open: true }));
+      openSettingsMenu();
+      expect(await screen.findByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+      // The agent pushes while the viewer stays mounted and the page keeps focus.
+      current = repositoryContext();
+      const reads = resolve.mock.calls.length;
+      openSettingsMenu();
+      expect(resolve.mock.calls.length).toBeGreaterThan(reads);
+      await waitFor(() =>
+        expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+          "href",
+          `https://github.com/acme/app/blob/${pushed}/web/file1.py`,
+        ),
+      );
+    });
+
+    it("leaves the item out of a workspace that isn't a repository", async () => {
+      answering(
+        repositoryContext({
+          problem: RepositoryContextProblem.NOT_A_REPOSITORY,
+          push: undefined,
+          remotes: [],
+          workspacePrefix: undefined,
+        }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(viewerTree({ open: true, queryClient }));
+      await waitFor(() =>
+        expect(queryClient.getQueryState(repositoryContextKey("conv_1"))?.status).toBe("success"),
+      );
+      // Let the viewer render the settled answer before checking what it left out.
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 0);
+          }),
+      );
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: /Open in GitHub/ })).toBeNull();
+    });
+  });
+
   it("toggling Wrap lines in a code file flips the code viewer's wrapLines prop", () => {
     render(viewerTree({ open: true }));
     expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-wrap-lines", "false");
@@ -1770,24 +2647,35 @@ describe("FileViewer view-settings menu", () => {
     },
   );
 
-  it("offers Wrap lines for a deleted file only in the diff view", async () => {
+  it("shows deleted files in diff without changing the global preference or fetching missing content", async () => {
     const changed = vi.mocked(useWorkspaceChangedFiles);
     const original = changed.getMockImplementation();
     const entry = { path: "file1.py", name: "file1.py", bytes: 0, modified_at: null };
     changed.mockReturnValue({
-      data: { available: true, data: [{ ...entry, status: "deleted" }] },
+      data: {
+        available: true,
+        data: [
+          { ...entry, status: "modified" },
+          { ...entry, path: "deleted.py", name: "deleted.py", status: "deleted" },
+        ],
+      },
     } as ReturnType<typeof useWorkspaceChangedFiles>);
     try {
-      const first = render(viewerTree({ open: true }));
+      const { rerender } = render(viewerTree({ open: true }));
+      expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+      rerender(viewerTree({ open: true, path: "deleted.py" }));
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(useFileContent).toHaveBeenLastCalledWith("conv_1", null, { visible: true });
+      expect(screen.queryByRole("button", { name: /Exit diff view|Show diff/ })).toBeNull();
+      expect(readFileViewPreferences().diffActive).toBe(false);
       openSettingsMenu();
       expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
-      expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
-      first.unmount();
-
-      render(viewerTree({ open: true, initialSearch: "diff=1" }));
-      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
-      openSettingsMenu();
       expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+      rerender(viewerTree({ open: true }));
+      expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      expect(readFileViewPreferences().diffActive).toBe(false);
     } finally {
       changed.mockImplementation(original!);
     }
@@ -1810,6 +2698,30 @@ describe("FileViewer view-settings menu", () => {
     openSettingsMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: /^Show in / }));
     expect(revealFile).toHaveBeenCalledWith("this-mac", "/repo/file1.py");
+  });
+
+  it("opens the selected file directly beside Copy link", async () => {
+    const openEditor = vi.fn();
+    vi.stubGlobal("open", openEditor);
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "this-mac" }),
+    });
+    const context = localDesktopContext();
+    render(
+      <FileViewerContext.Provider value={context}>
+        {viewerTree({ open: true })}
+      </FileViewerContext.Provider>,
+    );
+    const openIn = await screen.findByRole("button", { name: "Open in VS Code" });
+    const copy = screen.getByRole("button", { name: "Copy link to file" });
+    expect(copy.compareDocumentPosition(openIn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(openIn);
+    expect(openEditor).toHaveBeenCalledWith(
+      "vscode://file/repo/file1.py",
+      "_blank",
+      "noopener,noreferrer",
+    );
   });
 
   it("adds the wrap-lines and whitespace toggles in diff view", async () => {
@@ -2217,6 +3129,76 @@ describe("FileViewer Escape closes the active tab", () => {
   });
 });
 
+describe("FileViewer Escape exits full screen", () => {
+  it("exits full screen and keeps the tab open", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    render(viewerTree({ open: true, frameless: true, onCloseTab, onExitFullScreen }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(onCloseTab).not.toHaveBeenCalled();
+  });
+
+  it("keeps unsaved edits without a prompt, and a later Escape still guards them", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    const props = { open: true, frameless: true, path: "file1.md", onCloseTab };
+    const { rerender } = render(viewerTree({ ...props, onExitFullScreen }));
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+
+    rerender(viewerTree(props));
+    expect(draft).toHaveValue("Unsaved draft");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(onCloseTab).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Escape after a click outside the viewer, since full screen hides the chat", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({
+          open: true,
+          frameless: true,
+          syncUrl: false,
+          onCloseTab: vi.fn(),
+          onExitFullScreen,
+        })}
+        <button type="button">Exit full screen</button>
+      </>,
+    );
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Exit full screen" }));
+    // Page-wide Escape handlers, such as declining an approval, yield to the viewer.
+    expect(screen.getByTestId("file-viewer")).toHaveAttribute("data-escape-owner");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores Escape while focus is in a text field", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({ open: true, frameless: true, onCloseTab: vi.fn(), onExitFullScreen })}
+        <input aria-label="Notes" />
+      </>,
+    );
+    const input = screen.getByRole("textbox", { name: "Notes" });
+    input.focus();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onExitFullScreen).not.toHaveBeenCalled();
+  });
+});
+
 describe("FileViewer video files", () => {
   it("skips capped content and diff reads and suppresses diff controls", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
@@ -2292,6 +3274,32 @@ describe("FileViewer 3D model files", () => {
     expect(viewModeOf()).toBe("source");
   });
 
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens %s on its table, with no source toggle, even from a line link",
+    (path) => {
+      renderViewer({ open: true, path, position: { line: 3 } });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "View preview" })).toBeNull();
+    },
+  );
+
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens a changed %s on its table even when the link asks for the diff",
+    (path) => {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      renderViewer({ open: true, path, initialSearch: "diff=1" });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    },
+  );
+
   it("suppresses the diff toggle for a model file even when it is a changed file", () => {
     // Report the model as a changed file — an ordinary changed file would get a
     // "Show diff" button; a model must not.
@@ -2358,7 +3366,7 @@ describe("file position navigation", () => {
     rerender(viewerTree({ open: true, path: "file2.md" }));
     expect(codeViewerRenders).toHaveBeenCalled();
     for (const [props] of codeViewerRenders.mock.calls) {
-      expect(props).toEqual({ path: "file2.md", position: undefined });
+      expect(props).toMatchObject({ path: "file2.md", position: undefined });
     }
   });
 
@@ -2474,6 +3482,50 @@ describe("file position navigation", () => {
     expect(unregister).toHaveBeenCalled();
   });
 
+  it("asks before a closing tab or a session exit drops unsaved edits", () => {
+    let guard: FileNavigationGuard | undefined;
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return () => {};
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "file1.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    render(<GuardedViewer />);
+    const close = vi.fn();
+    // A clean editor lets the tab close straight away.
+    act(() => guard!(null, undefined, close));
+    expect(close).toHaveBeenCalledTimes(1);
+
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    act(() => guard!(null, undefined, close));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(draft).toHaveValue("Unsaved draft");
+
+    act(() => guard!(null, undefined, close));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(close).toHaveBeenCalledTimes(2);
+  });
+
   it.each([false, true])(
     "keeps unsaved Markdown edits when a line navigation is cancelled (diff preference=%s)",
     (diffActive) => {
@@ -2513,30 +3565,116 @@ describe("large Markdown file routing", () => {
   });
   afterEach(() => setContent(""));
 
-  it.each(["editor", "preview", "source"] as const)(
-    "overrides %s without changing the preference",
-    (mode) => {
-      writeFileViewPreferences({
-        diffActive: false,
-        diffLayout: "unified",
-        previewableViewMode: mode,
-        hideWhitespace: false,
-        wrapLines: false,
-      });
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+  const seedPreference = (mode: "editor" | "preview" | "source") =>
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: mode,
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+  const selectMode = (mode: "Preview" | "Edit") => {
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: mode }));
+  };
+
+  it.each([
+    { preference: "editor", opensIn: "preview" },
+    { preference: "preview", opensIn: "preview" },
+    { preference: "source", opensIn: "source" },
+  ] as const)(
+    "opens in $opensIn for a $preference preference without changing it",
+    ({ preference, opensIn }) => {
+      seedPreference(preference);
       setContent(large);
       const view = render(viewerTree({ open: true, path: "large.md" }));
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+      expect(viewModeOf()).toBe(opensIn);
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "true");
-      expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
-      vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
-      fireEvent.keyDown(window, { key: "f", ctrlKey: true });
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
       setContent("# Small");
       view.rerender(viewerTree({ open: true, path: "small.md" }));
-      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", mode);
+      expect(viewModeOf()).toBe(preference);
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "false");
     },
   );
+
+  it("offers only Preview and an Edit that opens source", () => {
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Source" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.mouseDown(screen.getByTestId("code-viewer"));
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
+    fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+  });
+
+  it("keeps Edit for this visit only, then reopens in Preview", () => {
+    seedPreference("editor");
+    setContent(large);
+    const view = render(viewerTree({ open: true, path: "large.md" }));
+    selectMode("Edit");
+    expect(viewModeOf()).toBe("source");
+    setContent("# Small");
+    view.rerender(viewerTree({ open: true, path: "small.md" }));
+    expect(viewModeOf()).toBe("editor");
+    setContent(large);
+    view.rerender(viewerTree({ open: true, path: "large.md" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("guards unsaved source edits when returning to Preview", () => {
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md" }));
+    selectMode("Edit");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    selectMode("Preview");
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it.each([
+    { name: "beyond the preview limit", content: "a".repeat(MAX_PREVIEW_MARKDOWN_BYTES + 1) },
+    { name: "truncated", content: large, truncated: true },
+  ])("opens $name Markdown straight in source with no mode picker", (c) => {
+    seedPreference("preview");
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: c.content, encoding: "utf-8", truncated: c.truncated },
+    } as ReturnType<typeof useFileContent>);
+    render(viewerTree({ open: true, path: "huge.md" }));
+    expect(viewModeOf()).toBe("source");
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "true");
+    expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps a citation's source editor when the citation clears, guarding unsaved edits", () => {
+    seedPreference("editor");
+    setContent(large);
+    const view = render(viewerTree({ open: true, path: "large.md", position: { line: 1 } }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    view.rerender(viewerTree({ open: true, path: "large.md" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("opens a comment deep link in source, where its anchor is shown", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    setContent(large);
+    render(viewerTree({ open: true, path: "large.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("source");
+  });
 
   it.each([
     { size: "large", content: large, monaco: true },

@@ -5,7 +5,7 @@ HTTP-path tests in ``test_app_sessions_native_events_lifecycle.py`` /
 ``test_app_sessions_native_supervision.py`` (which POST to ``/events`` and patch
 the bridge-module control functions). The focus here is the registry dispatch
 and the descriptor-collapsed uniform handlers: which harnesses route where, the
-opencode interrupt (native ``/abort``) dispatch, the antigravity no-handler
+opencode interrupt (native ``/interrupt``) dispatch, the antigravity no-handler
 fall-through contract, and the 503 mapping.
 """
 
@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -74,6 +75,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_cancellation: bool = False,
     ) -> _FakeAck:
         if only_if_work_id is not None and only_if_work_id != captured["current_work_id"]:
             # A newer dispatch replaced the entry: drop the delayed op untouched.
@@ -86,6 +88,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
                 "status": status,
                 "output": output,
                 "only_if_work_id": only_if_work_id,
+                "confirmed_cancellation": confirmed_cancellation,
             }
         )
         return _FakeAck()
@@ -155,15 +158,15 @@ _OPENCODE_STATE = SimpleNamespace(
 
 
 class _FakeOpenCodeClient:
-    """Records the native abort, raising *error* when one is given."""
+    """Records the native interrupt, raising *error* when one is given."""
 
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
-        self.abort_calls: list[str] = []
+        self.interrupt_calls: list[str] = []
         self.closed = False
 
-    async def abort(self, session_id: str) -> bool:
-        self.abort_calls.append(session_id)
+    async def interrupt(self, session_id: str) -> bool:
+        self.interrupt_calls.append(session_id)
         if self.error is not None:
             raise self.error
         return True
@@ -188,8 +191,11 @@ def _patch_opencode_bridge(
 
 
 @pytest.mark.asyncio
-async def test_opencode_interrupt_aborts_native_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Interrupt aborts the turn on OpenCode's own server and records it for the dispatch.
+@pytest.mark.parametrize("method", ["interrupt", "stop"])
+async def test_opencode_interrupt_stops_native_turn(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """Interrupt and stop end the turn on OpenCode's own server and record it for the dispatch.
 
     The pending record lets a bare idle or the grace timer settle the dispatch as
     cancelled; the handler itself wakes nothing.
@@ -199,10 +205,10 @@ async def test_opencode_interrupt_aborts_native_turn(monkeypatch: pytest.MonkeyP
     runner, captured = _make_runner()
     captured["current_work_id"] = "work_oc"
 
-    resp = await runner.interrupt("opencode-native", "conv_oc")
+    resp = await getattr(runner, method)("opencode-native", "conv_oc")
 
     assert isinstance(resp, Response) and resp.status_code == 204
-    assert client.abort_calls == ["ses_oc"] and client.closed
+    assert client.interrupt_calls == ["ses_oc"] and client.closed
     assert routed == {
         "base_url": "http://127.0.0.1:9999/",
         "auth_secret": "secret",
@@ -210,7 +216,6 @@ async def test_opencode_interrupt_aborts_native_turn(monkeypatch: pytest.MonkeyP
     }
     assert captured["wakes"] == []
     assert runner.take_pending_interrupt("conv_oc") == (True, "work_oc")
-    assert await runner.stop("opencode-native", "conv_oc") is None
 
 
 @pytest.mark.asyncio
@@ -228,7 +233,7 @@ async def test_opencode_interrupt_fallbacks(
     error: Exception | None,
     expected_status: int | None,
 ) -> None:
-    """Missing bridge state falls through; a failed abort is a 503."""
+    """Missing bridge state falls through; a failed interrupt is a 503."""
     client = _FakeOpenCodeClient(error)
     _patch_opencode_bridge(monkeypatch, state=state, client=client)
     runner, captured = _make_runner()
@@ -525,6 +530,7 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
     assert captured["wakes"] == [("conv_c", "cancelled", None)]
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
@@ -572,11 +578,74 @@ async def test_codex_and_pi_stop_route_to_interrupt(
 
 
 @pytest.mark.asyncio
-async def test_codex_interrupt_noop_when_no_bridge_state() -> None:
-    """codex interrupt returns 204 when there is no live bridge state."""
+async def test_codex_interrupt_defers_to_the_runner_turn_before_codex_has_a_thread() -> None:
+    """
+    Before Codex has a thread, interrupt hands Stop back to the runner's turn.
+
+    A message held while Codex starts lives in the runner's in-process turn, so
+    ``None`` lets the caller cancel that turn instead of answering 204 for nothing.
+    """
     runner, _ = _make_runner()  # default codex_bridge_state returns None
-    resp = await runner.interrupt("codex-native", "conv_cx")
-    assert isinstance(resp, Response) and resp.status_code == 204
+    assert await runner.interrupt("codex-native", "conv_cx") is None
+
+
+@pytest.mark.parametrize("mcp_starting", [False, True], ids=["idle-thread", "mcp-unreachable"])
+@pytest.mark.asyncio
+async def test_codex_interrupt_defers_to_the_runner_turn_while_codex_runs_no_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mcp_starting: bool,
+) -> None:
+    """
+    With a thread but no Codex turn, interrupt hands Stop back to the runner's turn.
+
+    A message not yet submitted is the runner's to cancel. A pending MCP startup
+    is still cancelled locally first, and an app-server that cannot be reached yet
+    does not turn the Stop into a failure. No parent wake is deferred: no Codex turn
+    was interrupted for one to wait on.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    state = codex_native_bridge.CodexNativeBridgeState(
+        session_id="conv_cx",
+        socket_path="ws://127.0.0.1:43215",
+        thread_id="thread_cx",
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id=None,
+    )
+    codex_native_bridge.write_bridge_state(tmp_path, state)
+    if mcp_starting:
+        codex_native_bridge.update_mcp_server_startup(tmp_path, "storage-console", "starting")
+    connects: list[str] = []
+
+    class _UnreachableAppServer:
+        async def connect(self) -> None:
+            connects.append("connect")
+            raise ConnectionRefusedError(111, "Connect call failed")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_a, **_kw: _UnreachableAppServer()
+    )
+
+    async def _bridge_state(conv_id: str, *, action: str, **_kw: Any) -> tuple[Any, Path]:
+        return state, tmp_path
+
+    runner, _ = _make_runner(
+        codex_bridge_state_for_session=_bridge_state,
+        server_client=SimpleNamespace(post=AsyncMock()),
+    )
+
+    assert await runner.interrupt("codex-native", "conv_cx") is None
+    assert runner._pending_interrupts == {}
+    assert connects == (["connect"] if mcp_starting else [])
+    if mcp_starting:
+        assert codex_native_bridge.read_mcp_startup(tmp_path) == {
+            "storage-console": {"status": "cancelled", "error": None}
+        }
 
 
 @pytest.mark.asyncio
@@ -604,6 +673,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert captured["wakes"] == [("conv_cn", "cancelled", None)]
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio

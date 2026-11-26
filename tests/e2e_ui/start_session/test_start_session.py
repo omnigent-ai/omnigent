@@ -1121,6 +1121,9 @@ async def _drive_landing_clears_after_navigating_away(
             await landing_input.fill(message)
             await page.get_by_test_id("new-chat-landing-submit").click()
             await poll_until_async(lambda: len(create_bodies) == 1)
+            # The router can defer the temporary chat; leaving before it renders would keep
+            # the submitted landing mounted, text and all, rather than test a remount.
+            await expect(landing_input).to_have_count(0, timeout=30_000)
 
             # Detour through another session and come straight back, all
             # while the create is still bootstrapping.
@@ -1421,11 +1424,12 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 );"""
             )
 
-            # ChatPage and Sidebar warm the shared host-query cache while the
-            # stub exposes only the Mac. No landing draft exists on this path.
+            # ChatPage and Sidebar warm the shared host-query cache (one
+            # request) while the stub exposes only the Mac. No landing draft
+            # exists on this path.
             await page.goto(f"{base_url}/c/{session_id}")
             await page.get_by_test_id("new-chat-button").wait_for(state="visible", timeout=30_000)
-            await poll_until_async(lambda: route_state["requests"] >= 2)
+            await poll_until_async(lambda: route_state["requests"] >= 1)
 
             # NewChat mounts with cached Mac-only data and completes another
             # Mac-only request. Neither snapshot may silently replace the saved
@@ -1436,9 +1440,7 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 await page.get_by_test_id("new-chat-button").click()
             await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(chip).to_have_attribute(
-                "aria-label", re.compile("No host selected, Offline")
-            )
+            await expect(chip).to_have_attribute("aria-label", "Host: No host selected")
 
             # A later host refresh reports the continuously preferred VM again.
             # The empty slot lets that saved choice heal automatically.
@@ -1545,12 +1547,8 @@ async def _drive_managed_repository_workspace_bar(
                 "aria-label", f"Sandbox repositories: {repo_name}"
             )
             repository_label = repository.locator("[data-workspace-collapse-label]")
-            if viewport_width == 390:
-                await expect(controls).to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_hidden()
-            else:
-                await expect(controls).not_to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_visible()
+            await expect(controls).not_to_have_attribute("data-labels", "collapsed")
+            await expect(repository_label).to_be_visible()
 
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
@@ -2086,7 +2084,7 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """A safer approval preset clears bypass and reaches the create call.
 
-    Selecting "Full access" in the composer's permissions dropdown must clear
+    Selecting "Full Access" in the composer's permissions dropdown must clear
     a previous bypass choice and reach
     ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
@@ -2220,7 +2218,14 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             approval = page.get_by_test_id("new-chat-landing-permission-chip")
             await expect(approval).to_be_visible()
             await approval.click()
-            for label in ("Default", "Full access", "Read only", "Bypass approvals & sandbox"):
+            for label in (
+                "Default",
+                "Ask for approval",
+                "Approve for me",
+                "Full Access",
+                "Read Only",
+                "Bypass approvals & sandbox",
+            ):
                 await expect(
                     page.get_by_role("menuitemradio", name=label, exact=True)
                 ).to_be_visible()
@@ -2230,8 +2235,8 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
                 page.get_by_test_id("new-chat-landing-permission-menu")
             ).not_to_be_visible()
             await approval.click()
-            await page.get_by_role("menuitemradio", name="Full access", exact=True).click()
-            await expect(approval).to_contain_text("Full access")
+            await page.get_by_role("menuitemradio", name="Full Access", exact=True).click()
+            await expect(approval).to_contain_text("Full Access")
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()

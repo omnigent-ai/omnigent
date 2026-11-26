@@ -3,7 +3,7 @@
 In the iOS app the native server-switcher pill used to float top-center over
 the WebView, directly inside the chat header band, where it crowded the
 floating header controls (sidebar toggle, overflow kebab) and overlapped the
-Plan tracker's title row on a notched iPhone. The fix moves server selection
+task preview's row on a notched iPhone. The fix moves server selection
 into the navigation drawer (the same in-sidebar picker the desktop shell
 uses) and stops requesting the floating pill over the chat surface on shells
 that host that picker.
@@ -106,8 +106,8 @@ window.omnigentNative = {{
 """
 
 # A plan for the session, published through the events route (the same path
-# the harness forwarders post to) so the Plan tracker renders without a live
-# agent turn — the pattern from chat/test_plan_tracker.py.
+# the harness forwarders post to) so the task preview renders without a live
+# agent turn — the pattern from chat/test_tasks_preview.py.
 _PLAN = [
     {"content": "Read the code", "status": "completed", "activeForm": "Reading the code"},
     {"content": "Write the tracker", "status": "in_progress", "activeForm": "Writing the tracker"},
@@ -228,7 +228,7 @@ def test_ios_server_switcher_stays_out_of_chat_header(
 
     _open_ios_session(page, base_url, session_id)
 
-    tracker = page.locator('[data-testid="plan-tracker"]')
+    tracker = page.locator('[data-testid="tasks-preview"]')
     expect(tracker).to_be_visible(timeout=15_000)
     header = page.locator(".chat-header")
     expect(header).to_be_visible()
@@ -254,7 +254,7 @@ def test_ios_server_switcher_stays_out_of_chat_header(
     inner_width = float(page.evaluate("() => window.innerWidth"))
     pill = _switcher_band(inner_width)
     header_box = header.bounding_box()
-    plan_box = tracker.locator("summary").bounding_box()
+    plan_box = tracker.bounding_box()
     assert header_box is not None and plan_box is not None
 
     violations: list[str] = []

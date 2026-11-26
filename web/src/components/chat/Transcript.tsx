@@ -10,11 +10,13 @@ import {
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
+import { TaskMarkersProvider } from "@/components/blocks/TaskActivityMessage";
+import { readTaskActivity, taskMarkerId } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { isSystemUserContent } from "@/lib/systemMessage";
-import { isTerminalCommandInput } from "@/lib/blocks";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { isTerminalCommandInput, isTextBlock } from "@/lib/blocks";
 import {
   type Bubble,
   type BubbleCache,
@@ -22,19 +24,17 @@ import {
   createBubbleCache,
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
-import { useChatStore } from "@/store/chatStore";
+import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
-import { DbcertBanner } from "@/components/DbcertBanner";
-import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
-import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
+import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
-import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
+import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 import {
   RunnerStartingIndicator,
   McpStartupIndicator,
@@ -48,26 +48,28 @@ import {
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  WorkingIndicator,
+  WorkingIndicatorRow,
   bubbleKey,
-  buildPendingBubbles,
   collectPendingElicitations,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
-  mergePendingBubbles,
+  keyboardActiveQuestionId,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
+  userMessageOrigin,
+  withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
+import { TranscriptPaletteCommands } from "@/components/chat/TranscriptPaletteCommands";
+import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
-  hostId: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -88,6 +90,52 @@ export interface TranscriptProps {
   sandboxLaunching: boolean;
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
+}
+
+function isHiddenSubagentWakeBubble(bubble: Bubble): boolean {
+  if (bubble.kind !== "user") return false;
+  const first = bubble.content[0];
+  if (!first || !isTextBlock(first) || !first.text.startsWith("[System: sub-agent ")) return false;
+  if (!bubble.content.every(isTextBlock)) return false;
+  const parsed = parseSystemMessage(extractUserText(bubble.content));
+  return parsed?.kind === "subagent_wake" && parsed.body === "";
+}
+
+/** Whether *bubble* holds the task marker *markerId*, as a notice of its own or beside its work. */
+function bubbleHasMarker(bubble: Bubble, markerId: string): boolean {
+  const matches = (data: Record<string, unknown>) => {
+    const activity = readTaskActivity(data);
+    return activity !== null && taskMarkerId(activity) === markerId;
+  };
+  if (bubble.kind === "subagent_activity") return matches(bubble.data);
+  if (bubble.kind !== "assistant") return false;
+  return bubble.items.some((item) => item.kind === "subagent_activity" && matches(item.data));
+}
+
+function isSessionMessageBubble(bubble: Bubble): boolean {
+  return bubble.kind === "user" && userMessageOrigin(bubble.content) !== null;
+}
+
+/**
+ * Keep model-facing sub-agent wake messages out of the visible row geometry.
+ *
+ * :param hideSessionMessages: Also drop messages other sessions sent, when the
+ *     reader chose to hide them.
+ */
+export function visibleTranscriptBubbles(bubbles: Bubble[], hideSessionMessages = false): Bubble[] {
+  let visible: Bubble[] | null = null;
+  for (let index = 0; index < bubbles.length; index += 1) {
+    const bubble = bubbles[index]!;
+    if (
+      isHiddenSubagentWakeBubble(bubble) ||
+      (hideSessionMessages && isSessionMessageBubble(bubble))
+    ) {
+      visible ??= bubbles.slice(0, index);
+    } else {
+      visible?.push(bubble);
+    }
+  }
+  return visible ?? bubbles;
 }
 
 export function isNativeFindShortcut(
@@ -113,7 +161,6 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
-  hostId,
   setConversationEl,
   containerEl,
   scroller,
@@ -129,18 +176,34 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedUploads = useChatStore((s) => s.failedUploads);
+  const failedInputs = useChatStore((s) => s.failedInputs);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const sandboxFailed = useChatStore((s) => s.sandboxStatus?.stage === "failed");
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
-  const hasTasks = useChatStore((s) => s.todos.length > 0);
   const conversationId = useChatStore((s) => s.conversationId);
+  const tasks = useSessionTasks(conversationId ?? undefined, true);
+  const hasTasks = hasTaskPreview(tasks);
+  // Task markers link to the tasks in the Tasks tab now; keyed by their IDs so
+  // the markers re-render only when that list changes.
+  const taskIdsKey = tasks.progress.map((item) => item.step.id).join("\n");
+  const taskMarkers = useMemo(
+    () =>
+      conversationId
+        ? { conversationId, taskIds: new Set(taskIdsKey ? taskIdsKey.split("\n") : []) }
+        : null,
+    [conversationId, taskIdsKey],
+  );
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
   // finalized prefix by reference. Pending user messages (POSTed but not yet
   // acked) render as trailing user bubbles so the input is visible immediately.
+  // Undelivered startup messages replace their pending bubbles, above the
+  // failure notice that explains them.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
@@ -155,24 +218,37 @@ function TranscriptImpl({
       ),
       subagentRoutingOverride,
     );
-    if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
+    return withUncommittedUserBubbles(
       committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+      pendingUserMessages,
+      failedInputs,
+      getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
+    failedInputs,
     subagentRoutingOverride,
     sessionStatus,
   ]);
 
   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const keyboardActiveElicitationId = useMemo(
+    () => keyboardActiveQuestionId(pendingElicitations),
+    [pendingElicitations],
+  );
+  const hideSessionMessages = usePeerSessionMessageDisplay() === "hide";
   const streamBubbles = useMemo(
-    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
-    [bubbles, pendingElicitations.length],
+    () =>
+      visibleTranscriptBubbles(
+        pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles),
+        hideSessionMessages,
+      ),
+    [bubbles, pendingElicitations.length, hideSessionMessages],
   );
   const committedUserIds = useMemo(() => {
     const ids = new Set<string>();
@@ -195,6 +271,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blockCount: blocks.length,
       committedUserIds,
       hasCommittedAnchor:
@@ -210,6 +287,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blocks,
       committedUserIds,
       hasTasks,
@@ -262,17 +340,21 @@ function TranscriptImpl({
 
   // Single nav instance shared by hotkey + buttons. System-message bubbles are
   // excluded — the hotkey is for navigating real user turns, not markers.
-  const userMessageIds = useMemo(
-    () =>
-      display.bubbles
-        .filter(
-          (b): b is Extract<Bubble, { kind: "user" }> => b.kind === "user" && !isSystemBubble(b),
-        )
-        .map((b) => b.itemId),
-    [display.bubbles],
+  // Hidden messages from other sessions aren't turns the reader can reach either.
+  const isUserTurnBubble = useCallback(
+    (b: Bubble): b is Extract<Bubble, { kind: "user" }> =>
+      b.kind === "user" &&
+      !isSystemBubble(b) &&
+      !(hideSessionMessages && isSessionMessageBubble(b)),
+    [hideSessionMessages],
   );
-  const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
+  const userMessageIds = useMemo(
+    () => display.bubbles.filter(isUserTurnBubble).map((b) => b.itemId),
+    [display.bubbles, isUserTurnBubble],
+  );
+  const nav = useUserMessageNav(userMessageIds, ensureItemVisible, scroller?.el);
   useMessageDeepLink(conversationId ?? null, {
+    root: scroller?.el,
     ensureMessageVisible: ensureItemVisible,
     ready: display.conversationId === conversationId && !!scroller?.el && !!scrollToItemRef.current,
     rangeNonce: spacerMeasureNonce,
@@ -284,11 +366,11 @@ function TranscriptImpl({
     const out: Turn[] = [];
     for (let i = 0; i < display.bubbles.length; i++) {
       const b = display.bubbles[i];
-      if (b.kind !== "user" || isSystemBubble(b)) continue;
+      if (!isUserTurnBubble(b)) continue;
       let preview = "";
       for (let j = i + 1; j < display.bubbles.length; j++) {
         const next = display.bubbles[j];
-        if (next.kind === "user" && !isSystemBubble(next)) break;
+        if (isUserTurnBubble(next)) break;
         if (next.kind === "assistant") {
           const textItem = next.items.find((it) => it.kind === "text" && it.text.trim());
           if (textItem && textItem.kind === "text") {
@@ -304,7 +386,7 @@ function TranscriptImpl({
       });
     }
     return out;
-  }, [display.bubbles]);
+  }, [display.bubbles, isUserTurnBubble]);
 
   const lastAssistantIndex = useMemo(
     () => liveCandidateAssistantIndex(display.streamBubbles),
@@ -325,26 +407,31 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
-  const arcaWarning = useArcaShutdownBanner();
-  const showArcaBanner = arcaWarning.showForHost(hostId);
-  const hasPinnedBanner = display.hasTasks || showArcaBanner;
+  const showWorkingIndicator =
+    !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  const hasPinnedBanner = display.hasTasks;
   return (
-    <>
-      {/* Task tracker pinned above the thread. Sibling of the viewport (not an
+    <TaskMarkersProvider value={taskMarkers}>
+      {/* Task preview pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
-      <ChatPlanAccordion className="mt-14 md:mt-12" />
-      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
+      {conversationId && (
+        <ChatTasksPreview
+          conversationId={conversationId}
+          tasks={tasks}
+          className="mt-14 md:mt-12"
+        />
+      )}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
-        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
           className={cn(
-            hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            !isMobileViewport &&
+              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
             "flex-1",
           )}
         >
@@ -353,20 +440,20 @@ function TranscriptImpl({
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
               hasPinnedBanner ? "pt-4" : "pt-20",
-              showArcaBanner && "chat-content-under-arca-banner",
+              // In a chat pane, the panes view and the pane's strip already clear the header.
+              "in-data-chat-pane-body-host:pt-4",
               CHAT_COLUMN_WIDTH,
             )}
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <KeepBottomOnViewportResize />
-            <ConversationScrollRefBridge onScroller={setScroller} />
+            <KeepBottomOnResize />
             <HistoryAutoLoader
               scrollElement={scroller?.el ?? null}
               rowCount={display.streamBubbles.length}
             />
             {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
-              sandboxLaunching ? (
+              sandboxLaunching || sandboxFailed ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (
                 <ConversationEmptyState>
@@ -407,15 +494,22 @@ function TranscriptImpl({
                     from="assistant"
                     className="max-w-full"
                     data-testid="bottom-elicitation"
+                    data-message-id={item.elicitationId}
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard
+                        item={item}
+                        keyboardActive={item.elicitationId === display.keyboardActiveElicitationId}
+                      />
                     </MessageContent>
                   </Message>
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
-                {/* Managed-sandbox stage cue; only when Working is absent. */}
+                <WorkingIndicatorRow
+                  key={display.conversationId ?? "landing"}
+                  show={showWorkingIndicator}
+                />
+                {/* Managed-sandbox launch status; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
                 round settles (failures stay in host logs, not the chat). */}
@@ -435,7 +529,19 @@ function TranscriptImpl({
               remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
-          <ConversationScrollButton />
+          {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
+          <ConversationScrollRefBridge onScroller={setScroller} />
+          <TranscriptPaletteCommands
+            conversationId={display.conversationId}
+            bubbles={display.streamBubbles}
+          />
+          <ConversationScrollButton
+            className={
+              isMobileViewport
+                ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
+                : undefined
+            }
+          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
@@ -446,10 +552,9 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+        {/* Too-many-tabs and sandbox-launch warnings, siblings of Conversation. */}
         <FloatingBannerStack>
           <StreamBudgetBanner />
-          <DbcertBanner conversationId={conversationId} hostId={hostId} />
           <SandboxActionBanner />
         </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
@@ -463,7 +568,7 @@ function TranscriptImpl({
           />
         )}
       </div>
-    </>
+    </TaskMarkersProvider>
   );
 }
 
@@ -572,6 +677,43 @@ function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
 }
 
+/**
+ * Re-apply `pin` every frame while row heights settle, for the restore budget or until
+ * the reader scrolls, taps, or types. Returns a function that stops it early.
+ */
+export function pinUntilSettled(
+  scrollEl: HTMLElement,
+  pin: () => void,
+  isCurrent: () => boolean,
+  onFinish: () => void,
+): () => void {
+  const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
+  let frame = 0;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    cancelAnimationFrame(frame);
+    for (const type of RESTORE_CANCEL_EVENTS) scrollEl.removeEventListener(type, finish);
+    onFinish();
+  };
+  const tick = () => {
+    if (done || !isCurrent()) return;
+    if (performance.now() >= deadline) {
+      finish();
+      return;
+    }
+    pin();
+    frame = requestAnimationFrame(tick);
+  };
+  for (const type of RESTORE_CANCEL_EVENTS) {
+    scrollEl.addEventListener(type, finish, { passive: true });
+  }
+  pin();
+  frame = requestAnimationFrame(tick);
+  return finish;
+}
+
 export function VirtualBubbleList({
   bubbles,
   scrollEl,
@@ -602,7 +744,32 @@ export function VirtualBubbleList({
   };
   const ctxRef = useRef(ctx);
   ctxRef.current = ctx;
+  // A commit can transiently shorten the transcript and clamp a following reader to that height.
+  // Re-pin only a reader the commit moved up from the end (the library pins 1px short of it);
+  // a user scroll lands in its own task.
+  const followingScrollTopRef = useRef<number | null>(null);
+  followingScrollTopRef.current =
+    scrollEl &&
+    ctx.state.isAtBottom &&
+    !ctx.state.escapedFromLock &&
+    scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 2
+      ? scrollEl.scrollTop
+      : null;
+  useLayoutEffect(() => {
+    const recorded = followingScrollTopRef.current;
+    const { isAtBottom, escapedFromLock } = ctxRef.current.state;
+    if (!scrollEl || recorded === null || !isAtBottom || escapedFromLock) return;
+    if (scrollEl.scrollTop >= recorded) return;
+    const bottom = scrollEl.scrollHeight - scrollEl.clientHeight;
+    if (bottom - scrollEl.scrollTop > 1) ctxRef.current.state.scrollTop = bottom;
+  });
   const storeConvId = useChatStore((s) => s.conversationId);
+  // A queued follow-up is sent as soon as the turn ends, so the reply's actions would
+  // only show for a frame.
+  const followUpQueued = useChatStore(
+    (s) => sendableQueuedHead(s.queuedMessages, conversationId) !== null,
+  );
+  const actionsPersist = sessionIdle && !followUpQueued;
   const restoringRef = useRef<string | null>(null);
   const latestSnapshotRef = useRef<{
     conversationId: string;
@@ -764,6 +931,25 @@ export function VirtualBubbleList({
     },
   });
 
+  // A row mounted mid-scroll is only measured by its ResizeObserver, after the layout
+  // has recorded its shift. Measuring it right after the commit corrects the scroll first.
+  const measureRow = useCallback(
+    (node: HTMLDivElement | null) => {
+      virtualizer.measureElement(node);
+      if (node === null) return;
+      queueMicrotask(() => {
+        const key = node.dataset.bubbleKey;
+        if (!node.isConnected || key === undefined || virtualizer.itemSizeCache.has(key)) return;
+        // The cached offset lags scroll writes until the next scroll event, and the
+        // correction below writes an absolute position built from it.
+        const scroller = virtualizer.scrollElement;
+        if (scroller) virtualizer.scrollOffset = scroller.scrollTop;
+        virtualizer.resizeItem(Number(node.dataset.index), node.getBoundingClientRect().height);
+      });
+    },
+    [virtualizer],
+  );
+
   // An assistant bubble is keyed by its first item, so a history page that
   // continues the top turn renames it. Keep rendering it under the key its row
   // already has: React keeps the node (a remount replays the action row's hover
@@ -820,6 +1006,11 @@ export function VirtualBubbleList({
   bubblesRef.current = bubbles;
   const virtualizerRef = useRef(virtualizer);
   virtualizerRef.current = virtualizer;
+  // Where a row's top sits, by key, as the virtualizer currently measures it.
+  const anchorStart = useCallback((key: string): number | undefined => {
+    const index = bubblesRef.current.findIndex((bubble) => bubbleKey(bubble) === key);
+    return index < 0 ? undefined : virtualizerRef.current.getOffsetForIndex(index, "start")?.[0];
+  }, []);
 
   // Persist the item crossing the viewport top, not only a raw scrollTop.
   // Virtual row estimates can change while a conversation is hidden; the key
@@ -872,9 +1063,6 @@ export function VirtualBubbleList({
       done = true;
       if (restoringRef.current === conversationId) restoringRef.current = null;
       cancelAnimationFrame(frame);
-      for (const type of RESTORE_CANCEL_EVENTS) {
-        scrollEl.removeEventListener(type, finish);
-      }
     };
 
     if (!saved || saved.atBottom) {
@@ -898,38 +1086,25 @@ export function VirtualBubbleList({
     }
 
     c.stopScroll();
-    const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
-    const pinAnchor = () => {
-      scrollEl.scrollTop = resolveTranscriptViewOffset(saved, (key) => {
-        const index = bubblesRef.current.findIndex((bubble) => bubbleKey(bubble) === key);
-        return index < 0
-          ? undefined
-          : virtualizerRef.current.getOffsetForIndex(index, "start")?.[0];
-      });
-    };
-    const tick = () => {
-      if (done || restoringRef.current !== conversationId) return;
-      if (performance.now() >= deadline) {
-        finish();
-        return;
-      }
-      pinAnchor();
-      frame = requestAnimationFrame(tick);
-    };
-    for (const type of RESTORE_CANCEL_EVENTS) {
-      scrollEl.addEventListener(type, finish, { passive: true });
-    }
-    pinAnchor();
-    frame = requestAnimationFrame(tick);
-    return finish;
-  }, [conversationId, scrollEl, messageId]);
+    return pinUntilSettled(
+      scrollEl,
+      () => {
+        scrollEl.scrollTop = resolveTranscriptViewOffset(saved, anchorStart);
+      },
+      () => restoringRef.current === conversationId,
+      finish,
+    );
+  }, [conversationId, scrollEl, messageId, anchorStart]);
 
   const scrollToItem = useCallback((itemId: string): boolean => {
-    const index = bubblesRef.current.findIndex(
+    let index = bubblesRef.current.findIndex(
       (b) =>
         (b.kind === "user" && b.itemId === itemId) ||
         (b.kind === "assistant" && b.responseId === itemId),
     );
+    // A task marker, alone or in the work beside it. One of the agent's own
+    // tasks can mark the same start twice, so the newest wins.
+    if (index < 0) index = bubblesRef.current.findLastIndex((b) => bubbleHasMarker(b, itemId));
     if (index < 0) return false;
     const c = ctxRef.current;
     c.stopScroll();
@@ -1046,18 +1221,21 @@ export function VirtualBubbleList({
   }, [onGeometryChange, scrollToItem, activeTurnId, rangeNonce]);
 
   if (disableVirtualization) {
+    // Same wrapper and keyed rows as the virtualized list, so mounted rows keep
+    // their DOM nodes and the reader's selection survives into native find.
     return (
-      <div className="flex w-full flex-col gap-4">
+      <div className="flex w-full flex-col" style={{ rowGap: ROW_GAP_PX }}>
         {bubbles.map((bubble, index) => (
-          <BubbleView
-            key={rowKey(bubble)}
-            bubble={bubble}
-            isLastAssistant={index === lastAssistantIndex}
-            showsWorking={showsWorking && index === lastAssistantIndex}
-            actionsPersistent={
-              index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
-            }
-          />
+          <div key={rowKey(bubble)} className="relative">
+            <BubbleView
+              bubble={bubble}
+              isLastAssistant={index === lastAssistantIndex}
+              showsWorking={showsWorking && index === lastAssistantIndex}
+              actionsPersistent={
+                index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
+              }
+            />
+          </div>
         ))}
       </div>
     );
@@ -1086,7 +1264,7 @@ export function VirtualBubbleList({
             key={rowKey(bubble)}
             data-index={item.index}
             data-bubble-key={rowKey(bubble)}
-            ref={virtualizer.measureElement}
+            ref={measureRow}
             className="relative"
           >
             <BubbleView
@@ -1094,7 +1272,7 @@ export function VirtualBubbleList({
               isLastAssistant={item.index === lastAssistantIndex}
               showsWorking={showsWorking && item.index === lastAssistantIndex}
               actionsPersistent={
-                item.index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
+                item.index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
               }
             />
           </div>

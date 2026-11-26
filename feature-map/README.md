@@ -113,11 +113,30 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
-- [Pull request conversations](./pull-request-conversations.md) covers inline
-  GitHub threads and replies through Workspace, composer, mobile and Canvas.
+- [Automation failure visibility](./automation-failures.md) covers failed-run card
+  warnings, Inbox surfacing, session deduplication and browser-local dismissal.
 
-- [Session orchestration](./session-orchestration.md) covers private-owner
-  messaging, top-level worker creation, polling results and sharing restrictions.
+- [Automation sharing](./automation-sharing.md) covers the owner's Share action on
+  the detail page and row menus, the read-only share dialog, the warning on a
+  session an automation manages, and what the people it is shared with see: the
+  Shared with me tab, the read-only automation page and the sidebar folder.
+
+- [Automation templates](./automation-templates.md) covers the gallery tabs,
+  suggestions on Your automations, and direct template setup.
+
+- [Automations introduction](./automations-introduction.md) covers the first-visit
+  walkthrough, capability-dependent content, and browser-local dismissal.
+
+- [Pull request conversations](./pull-request-conversations.md) covers inline
+  GitHub threads and replies through Workspace, composer, mobile and Canvas, and
+  PR reference links in chat messages.
+
+- [Pull request review navigation](./pull-request-review-navigation.md) covers the
+  Changes tab's path filter, find in the fetched patch, copy and open actions, and
+  browser-local viewed marks with progress and hide-viewed.
+
+- [Session orchestration](./session-orchestration.md) covers owner-controlled
+  messaging, sibling worker creation, polling results and sharing restrictions.
 
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
@@ -139,7 +158,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   one-shot host launch, existing-session boundaries, and failure diagnostics.
 
 - [Composer](./composer.md) covers the session and new-session composers,
-  the model/effort pill, the configuration gear, and slash commands.
+  the model/effort pill, the configuration gear, slash commands, and the
+  native `!` shell mode.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
@@ -156,11 +176,16 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Data-file table preview](./data-table-preview.md) covers CSV, TSV, Excel and
+  Parquet files opening as a sortable, filterable table, its row bounds, and encodings.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
   desktop and mobile profile selection, and the boundary between browser
   request proof and live resource/network enforcement.
+- [Floating New Agent panel](./floating-new-agent.md) covers the macOS desktop
+  app's ⇧⌘Space panel: opening it from any app, hiding it with its draft, launching
+  on This Mac or a new sandbox, and its release flag.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -194,15 +219,18 @@ map an area, remove it here in the same change.
   discovery and idle-runner performance are mapped in Native harnesses)
 - Files and the workspace browser: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
 - Comments: `tests/e2e_ui/comments/`
-- Sharing and session permissions: `tests/e2e_ui/collaboration/`
+- Sharing and session permissions: `tests/e2e_ui/collaboration/` (only automation
+  sharing and its managed-session warning are mapped)
 - GitHub integration: `tests/e2e_ui/github/`
 - Scheduled tasks: `tests/e2e_ui/scheduled/`
+- Saved workflows and cloning: `tests/e2e_ui/workflows/`
 - In-app browser: `tests/e2e_ui/browser/` (session cookie sharing is covered in
   Sessions; other browser behavior remains unmapped)
 - Desktop app: `tests/e2e_ui/desktop/`
 - Web sign-in: `tests/e2e_ui/auth/`
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
+- Settings search and Appearance settings: `tests/e2e_ui/appearance/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,
   Claude and Codex shell-command settlement, refused-delivery persistence, and
   tool-run folding are mapped)
@@ -241,7 +269,19 @@ header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
 budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
-and smart routing.
+and smart routing. Smart routing's per-worker model lists, which `sys_list_models`
+also returns, are covered by component tests: `tests/test_model_catalog.py` for
+the worker rows and `tests/host/test_connect.py` for the host's
+`GET /v1/hosts/{id}/harnesses/claude-sdk/model-options` answer. A Claude Code or
+Codex SDK worker on a CLI login lists the host's cached native probe of that
+login; behind a gateway, `apiKeyHelper` or cloud transport, with Codex logged
+out, or when the child launches a different CLI or arguments than the host
+probed, it lists nothing. To check one by hand, give an `openai-agents` brain on
+the mock model a `codex` SDK worker as an agent tool, launch it on a host with a
+Codex subscription, script it to call `sys_list_models`, and open the List models
+result; the host's boot probe writes the catalog, and Codex lists models without
+a login. A host passes `HARNESS_CODEX_*` to its runners only when
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` names them.
 
 ## Keeping the map current
 

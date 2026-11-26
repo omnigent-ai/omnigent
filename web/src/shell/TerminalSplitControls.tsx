@@ -1,6 +1,6 @@
 // Header split/close controls for the main terminal view (flag-gated, desktop owners).
 
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { Columns2Icon, Rows2Icon, XIcon } from "lucide-react";
 import { SPLIT_TERMINAL_KEYS } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
@@ -36,6 +36,7 @@ import {
   type TerminalSplitAxis,
 } from "@/lib/terminalSplitLayout";
 import { CloseShellDialog } from "./CloseShellDialog";
+import { useShellCloseRequest } from "./shellCloseCheck";
 import { resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { updateTerminalSplit, useTerminalSplitPanes } from "./terminalSplitPanesStore";
@@ -56,7 +57,13 @@ export function TerminalSplitControls({
   const deleteTerminal = useDeleteTerminal(conversationId);
   const split = useTerminalSplitPanes(conversationId);
   // The shell a pending close targets, fixed when the dialog opens.
-  const [closeTarget, setCloseTarget] = useState<TerminalInfo | null>(null);
+  const closeShell = useShellCloseRequest<TerminalInfo>(
+    conversationId,
+    "split_controls_close",
+    // MainTerminalView prunes the pane once the terminal leaves the list.
+    (terminal) => deleteTerminal.mutate(terminal.id),
+  );
+  const closeTarget = closeShell.pending?.item ?? null;
   const agentTerminal = findAgentTerminal(terminals);
   const declaredShells = agent?.terminals ?? [];
   if (
@@ -85,7 +92,7 @@ export function TerminalSplitControls({
     split && !focusedShell && !isAgentTerminalKey(split.focusedKey) ? split.focusedKey : null;
   const closePane = () => {
     if (focusedShell) {
-      setCloseTarget(focusedShell);
+      closeShell.request(focusedShell, [focusedShell.id]);
       return;
     }
     updateTerminalSplit(conversationId, (current) => {
@@ -97,8 +104,8 @@ export function TerminalSplitControls({
 
   const splitWith = (shell: string, axis: TerminalSplitAxis) => {
     writePreferredShell(shell);
-    create.mutate(shell, {
-      onSuccess: (info) => {
+    create.launch(shell, {
+      onOpen: (info) => {
         const newKey = terminalTabKey(info);
         updateTerminalSplit(conversationId, (current) => {
           const layout = current?.layout ?? agentKey;
@@ -107,7 +114,19 @@ export function TerminalSplitControls({
           return { layout: splitTerminalLayout(layout, target, newKey, axis), focusedKey: newKey };
         });
       },
-      onError: (error) => showToast(`Couldn't open a shell: ${error.message}`),
+      onError: (error, opened) => {
+        if (opened) {
+          const openedKey = terminalTabKey(opened);
+          updateTerminalSplit(conversationId, (current) => {
+            const layout = current && removeTerminalLayoutKey(current.layout, openedKey);
+            if (!layout || typeof layout === "string") return undefined;
+            const keys = terminalLayoutKeys(layout);
+            const focusedKey = keys.includes(current.focusedKey) ? current.focusedKey : keys[0];
+            return { layout, focusedKey };
+          });
+        }
+        showToast(`Couldn't open a shell: ${error.message}`);
+      },
     });
   };
 
@@ -147,12 +166,9 @@ export function TerminalSplitControls({
       <CloseShellDialog
         open={closeTarget !== null}
         shellLabel={closeTarget && terminalDisplayLabel(closeTarget)}
-        onCancel={() => setCloseTarget(null)}
-        onConfirm={() => {
-          // MainTerminalView prunes the pane once the terminal leaves the list.
-          if (closeTarget) deleteTerminal.mutate(closeTarget.id);
-          setCloseTarget(null);
-        }}
+        busy={closeShell.pending?.busy}
+        onCancel={closeShell.cancel}
+        onConfirm={closeShell.confirm}
       />
     </div>
   );

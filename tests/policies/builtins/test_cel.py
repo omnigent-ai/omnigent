@@ -12,7 +12,12 @@ pytest.importorskip("celpy", reason="cel-python not installed")
 
 import celpy
 
-from omnigent.policies.builtins.cel import _PROGRAM_CACHE_SIZE, _compile, cel_policy
+from omnigent.policies.builtins.cel import (
+    _PROGRAM_CACHE_SIZE,
+    _compile,
+    _warn_non_decision,
+    cel_policy,
+)
 from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext
 from omnigent.spec.types import (
@@ -217,16 +222,64 @@ def test_state_updates_must_be_a_list() -> None:
 # ── Abstain (non-map returns) ───────────────────────────────────
 
 
-def test_non_map_return_abstains() -> None:
-    """Non-map return (e.g. bool, string) abstains."""
-    evaluate = cel_policy(expression="true")
-    assert evaluate({"type": "request"}) is None
+@pytest.mark.parametrize(
+    ("expression", "expected_fragment"),
+    [
+        ('event.type == "tool_call"', "BoolType instead of a map"),
+        ('"DENY"', "StringType instead of a map"),
+        ('{"result": "BLOCK"}', "StringType result other than DENY, ASK or ALLOW"),
+    ],
+)
+def test_non_decision_return_abstains_with_one_warning(
+    expression: str, expected_fragment: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Non-decision returns abstain and warn once, though engines rebuild per event."""
+    _warn_non_decision.cache_clear()
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        for _ in range(2):
+            evaluate = cel_policy(expression=expression)
+            assert evaluate({"type": "tool_call", "data": {"name": "sys_os_shell"}}) is None
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1
+    assert expected_fragment in warnings[0]
+    assert expression in warnings[0]
 
 
-def test_map_without_result_key_abstains() -> None:
-    """Map missing the result key abstains."""
-    evaluate = cel_policy(expression='{"reason": "no verdict"}')
-    assert evaluate({"type": "request"}) is None
+def test_non_decision_warning_omits_event_content(caplog: pytest.LogCaptureFixture) -> None:
+    """A result echoed from the event is reported by type, never by value."""
+    _warn_non_decision.cache_clear()
+    evaluate = cel_policy(expression="event.data")
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        assert evaluate({"type": "tool_call", "data": {"result": "synthetic_secret"}}) is None
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1
+    assert "synthetic_secret" not in warnings[0].lower()
+
+
+def test_mixed_outcome_expression_still_decides_after_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A warning for one event does not stop later events from getting a verdict."""
+    _warn_non_decision.cache_clear()
+    evaluate = cel_policy(expression='event.type == "tool_call" ? {"result": "DENY"} : false')
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        assert evaluate({"type": "request", "data": "hi"}) is None
+        assert evaluate({"type": "tool_call", "data": {"name": "x"}})["result"] == "DENY"
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1
+    assert "abstained" in warnings[0]
+
+
+@pytest.mark.parametrize("expression", ["null", '{"reason": "no verdict"}'])
+def test_documented_abstain_returns_do_not_warn(
+    expression: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``null`` and a map without ``result`` are deliberate abstains."""
+    _warn_non_decision.cache_clear()
+    evaluate = cel_policy(expression=expression)
+    with caplog.at_level("WARNING", logger="omnigent.policies.builtins.cel"):
+        assert evaluate({"type": "request"}) is None
+    assert caplog.records == []
 
 
 # ── CEL features ────────────────────────────────────────────────
@@ -301,6 +354,86 @@ def test_eval_error_returns_none() -> None:
         expression='event.nonexistent == "x" ? {"result": "DENY"} : {"result": "ALLOW"}'
     )
     assert evaluate({"type": "request", "data": "hello"}) is None
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        " || ".join(["event.missing_field"] * 64),
+        " && ".join(["event.missing_field"] * 64),
+        "event.data.records.exists(record, record.missing_field)",
+        "event.data.records.all(record, record.missing_field)",
+    ],
+    ids=["or", "and", "exists", "all"],
+)
+def test_logical_error_chains_have_bounded_representations(
+    expression: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested logical failures must not recursively embed earlier error text."""
+    error_repr = celpy.CELEvalError.__repr__
+
+    def checked_repr(error: celpy.CELEvalError) -> str:
+        text = error_repr(error)
+        assert len(text) < 1024, "CEL error representation grew beyond a bounded diagnostic"
+        return text
+
+    # Fail before allocating a large string if recursive rendering regresses.
+    monkeypatch.setattr(celpy.CELEvalError, "__repr__", checked_repr)
+    evaluate = cel_policy(expression=expression)
+
+    assert evaluate({"type": "tool_call", "data": {"records": [{} for _ in range(64)]}}) is None
+
+
+@pytest.mark.parametrize("operator", ["||", "&&"])
+@pytest.mark.parametrize(
+    ("left", "right", "disjunction", "conjunction"),
+    [
+        ("true", "true", True, True),
+        ("true", "false", True, False),
+        ("false", "true", True, False),
+        ("false", "false", False, False),
+        ("true", "event.missing_field", True, None),
+        ("event.missing_field", "true", True, None),
+        ("false", "event.missing_field", None, False),
+        ("event.missing_field", "false", None, False),
+        ("event.missing_field", "event.missing_field", None, None),
+        ("1", "2", None, None),
+        ('"text"', "null", None, None),
+    ],
+)
+def test_logical_operators_preserve_boolean_and_error_semantics(
+    operator: str,
+    left: str,
+    right: str,
+    disjunction: bool | None,
+    conjunction: bool | None,
+) -> None:
+    """Decisive booleans suppress errors on either side; other errors abstain."""
+    evaluate = cel_policy(
+        expression=f'({left} {operator} {right}) ? {{"result": "DENY"}} : {{"result": "ALLOW"}}'
+    )
+    result = evaluate({"type": "tool_call"})
+    expected = disjunction if operator == "||" else conjunction
+
+    if expected is None:
+        assert result is None
+    elif expected:
+        assert result == {"result": "DENY", "reason": "Denied by policy."}
+    else:
+        assert result == {"result": "ALLOW"}
+
+
+def test_cel_error_repr_does_not_render_arguments() -> None:
+    """Error arguments can contain large values and nested exceptions."""
+
+    class Unrenderable:
+        def __repr__(self) -> str:
+            pytest.fail("CEL error representation rendered its arguments")
+
+    error = celpy.CELEvalError(Unrenderable())
+    error.line, error.column = 3, 7
+
+    assert repr(error) == "CELEvalError(line=3, column=7)"
 
 
 def test_invalid_syntax_raises() -> None:
