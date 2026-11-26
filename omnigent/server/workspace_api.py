@@ -54,7 +54,7 @@ from omnigent.server.pull_request_viewers import (
 from omnigent.server.read_only_code_hosts import (
     READ_ONLY_CODE_HOST_MESSAGE,
     READ_ONLY_CODE_HOST_REASON,
-    is_read_only_pull_request,
+    refuses_change,
 )
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -89,9 +89,9 @@ _REVIEW_WRITES = frozenset(
         "RemoveReaction",
     }
 )
-# The refusal reasons a client may read; any other reason a host sends is dropped.
 # Changes that stay on the session's host, such as which account it uses.
 _HOST_ONLY_CHANGES = frozenset({"SetPullRequestAccount"})
+# The refusal reasons a client may read; any other reason a host sends is dropped.
 PULL_REQUEST_FAILURE_REASONS = frozenset(
     {"comment_changed", "pull_request_changed", "invalid_input", READ_ONLY_CODE_HOST_REASON}
 )
@@ -217,7 +217,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
         # The PR the call names, else the server's first, which the host would change.
         target = getattr(request, "pr_url", "") or (vouch.default_pr_url if vouch else None)
         writes = changes and method.name not in _HOST_ONLY_CHANGES
-        if writes and is_read_only_pull_request(target, route.read_only_code_hosts):
+        if writes and refuses_change(target, route.read_only_code_hosts):
             raise ConnectError(
                 Code.FAILED_PRECONDITION,
                 READ_ONLY_CODE_HOST_MESSAGE,

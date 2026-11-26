@@ -889,16 +889,17 @@ def branding_config() -> dict[str, Any]:
     return load_branding_snapshot().config()
 
 
-def read_only_code_hosts() -> tuple[str, ...]:
+def read_only_code_hosts(config: Mapping[str, Any]) -> tuple[str, ...]:
     """Host patterns whose pull requests this server serves read-only.
 
-    Config key ``read_only_code_hosts``, a list of host names where ``*`` matches any run
-    of characters, e.g. ``["*.code.example.com"]``. Their pull requests can be read, but
-    they offer no write capabilities and the server refuses their writes.
+    :param config: Loaded server config with the optional ``read_only_code_hosts`` key, a
+        list of host names where ``*`` matches any run of characters, such as
+        ``["*.code.example.com"]``. Their pull requests can be read, but they offer no write
+        capabilities and the server refuses their writes.
     """
     from omnigent.server.read_only_code_hosts import parse_patterns
 
-    raw = load_server_config().get("read_only_code_hosts")
-    if raw is not None and not isinstance(raw, list):
+    raw = config.get("read_only_code_hosts")
+    if "read_only_code_hosts" in config and not isinstance(raw, list):
         logger.warning("server config read_only_code_hosts=%r is not a list, ignoring", raw)
     return parse_patterns(raw)

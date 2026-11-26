@@ -39,8 +39,8 @@ from omnigent.host.workspace_pull_request_input import (
     MAX_PULL_REQUEST_URL_CHARACTERS,
 )
 from omnigent.runner import pr_resource
-from omnigent.server import server_config, workspace_access, workspace_api
 from omnigent.server import session_pull_requests as server_prs
+from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.server.pull_request_viewers import PullRequestViewer
 from omnigent.server.read_only_code_hosts import READ_ONLY_CODE_HOST_MESSAGE
@@ -117,9 +117,17 @@ def provider_reads(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
     return reached
 
 
-def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: _Store | None) -> Any:
+def _client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store: _Store | None,
+    *,
+    read_only_code_hosts: tuple[str, ...] = (),
+) -> Any:
     monkeypatch.setattr(server_prs, "open_store", lambda _conversations: store)
-    app = service_tests._server_app(tmp_path, monkeypatch)
+    app = service_tests._server_app(
+        tmp_path, monkeypatch, read_only_code_hosts=read_only_code_hosts
+    )
     return service_tests._connect(app, service_tests._SERVER_BASE, ProtocolType.CONNECT)
 
 
@@ -640,6 +648,8 @@ def _tunnel(
     *,
     refuse_send: bool = False,
     viewer: PullRequestViewer = PullRequestViewer.VIEWER,
+    vouch: Callable[[str], Any] = _no_vouch,
+    read_only_code_hosts: tuple[str, ...] = (),
 ) -> _Tunnel:
     registry = HostRegistry()
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
@@ -658,7 +668,11 @@ def _tunnel(
         workspace_api.HostTarget(registry, host, str(tmp_path)),
         content_search=False,
         pull_requests=workspace_api.PullRequestRoute(
-            _SESSION, vouch=_no_vouch, overview=_as_reported, viewer=viewer
+            _SESSION,
+            vouch=vouch,
+            overview=_as_reported,
+            viewer=viewer,
+            read_only_code_hosts=read_only_code_hosts,
         ),
     )
     return _Tunnel(registry, host, service, sent)
@@ -1408,26 +1422,67 @@ async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
 # Every change to the pull request on its code host, with a valid request for it.
 _CODE_HOST_CHANGES = sorted(_PULL_REQUEST_WRITES - {"SetPullRequestAccount"})
 _CHANGE_REQUESTS = {**host_tests._OWNER_CALLS, **host_tests._REVIEW_CALLS}
+_READ_ONLY_GITHUB = ("github.com",)
 
 
-@pytest.fixture
-def read_only_github(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The server serves pull requests on ``github.com`` read-only."""
-    monkeypatch.setattr(server_config, "read_only_code_hosts", lambda: ("github.com",))
+async def _tracked(_pr_url: str) -> PullRequestVouch:
+    """The vouch once the server stores the session's PRs: their first is the default."""
+    return PullRequestVouch(server_tracked=True, default_pr_url=_PR)
 
 
-@pytest.mark.usefixtures("read_only_github")
+async def _refused_before_the_host(tunnel: _Tunnel, method: str, request: Any) -> ConnectError:
+    """The read-only refusal a change gets, checking that no frame went to the host."""
+    with pytest.raises(ConnectError) as refused:
+        # A change that isn't refused waits for the host; this one has no answer.
+        await asyncio.wait_for(tunnel.call(method, request), timeout=5)
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
+    assert _failure_reasons(refused.value) == ["read_only_code_host"]
+    assert tunnel.sent == []
+    return refused.value
+
+
 @pytest.mark.parametrize("method", _CODE_HOST_CHANGES)
 async def test_a_change_to_a_pr_on_a_read_only_host_is_refused_before_the_host(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    host_calls: list[HostWorkspaceCallFrame],
-    method: str,
+    tmp_path: Path, method: str
 ) -> None:
-    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    tunnel = _tunnel(tmp_path, vouch=_tracked, read_only_code_hosts=_READ_ONLY_GITHUB)
+
+    await _refused_before_the_host(tunnel, method, _CHANGE_REQUESTS[method][0])
+
+
+@pytest.mark.parametrize(
+    "request_message",
+    [
+        pb.CreateCommentRequest(body="Looks good"),
+        pb.CreateCommentRequest(pr_url="\u00a0" + _PR, body="Looks good"),
+        pb.CreateCommentRequest(
+            pr_url="https://example.visualstudio.com/project/_git/repo/pullrequest/7",
+            body="Looks good",
+        ),
+    ],
+    ids=["no-pr", "padded-url", "legacy-alias"],
+)
+async def test_a_change_the_server_cant_place_off_a_read_only_host_is_refused(
+    tmp_path: Path, request_message: Any
+) -> None:
+    """Before the server stores the session's PRs, the host picks or normalizes the PR."""
+    hosts = (*_READ_ONLY_GITHUB, "dev.azure.com")
+    tunnel = _tunnel(tmp_path, vouch=_no_vouch, read_only_code_hosts=hosts)
+
+    await _refused_before_the_host(tunnel, "CreateComment", request_message)
+
+
+async def test_a_change_naming_no_pr_is_refused_when_the_first_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    """Through the route, so the server's configured hosts reach the workspace API."""
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=_READ_ONLY_GITHUB
+    )
 
     with pytest.raises(ConnectError) as refused:
-        await getattr(client, WORKSPACE_METHODS[method].python_name)(_CHANGE_REQUESTS[method][0])
+        await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
 
     assert refused.value.code == Code.FAILED_PRECONDITION
     assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
@@ -1435,20 +1490,6 @@ async def test_a_change_to_a_pr_on_a_read_only_host_is_refused_before_the_host(
     assert host_calls == []
 
 
-@pytest.mark.usefixtures("read_only_github")
-async def test_a_change_naming_no_pr_is_refused_when_the_first_is_read_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
-) -> None:
-    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
-
-    with pytest.raises(ConnectError) as refused:
-        await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
-
-    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
-    assert host_calls == []
-
-
-@pytest.mark.usefixtures("read_only_github")
 @pytest.mark.parametrize("method", ["SetPullRequestAccount", "GetMergeOptions"])
 async def test_reads_and_the_account_choice_on_a_read_only_host_reach_the_host(
     tmp_path: Path,
@@ -1457,7 +1498,9 @@ async def test_reads_and_the_account_choice_on_a_read_only_host_reach_the_host(
     owner_calls: list[tuple[str, str, dict[str, Any]]],
     method: str,
 ) -> None:
-    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    client = _client(
+        tmp_path, monkeypatch, _Store(_linked(_PR)), read_only_code_hosts=_READ_ONLY_GITHUB
+    )
 
     await getattr(client, WORKSPACE_METHODS[method].python_name)(_CHANGE_REQUESTS[method][0])
 

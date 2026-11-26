@@ -19,7 +19,6 @@ from fastapi.routing import APIRoute
 
 from omnigent.errors import OmnigentError
 from omnigent.runtime import set_runner_router
-from omnigent.server import server_config
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -230,7 +229,7 @@ def _conversations(db_uri: str) -> SqlAlchemyConversationStore:
     return conversations
 
 
-def _app(db_uri: str, *, auth: bool = True) -> FastAPI:
+def _app(db_uri: str, *, auth: bool = True, read_only_code_hosts: tuple[str, ...] = ()) -> FastAPI:
     application = FastAPI()
 
     @application.exception_handler(OmnigentError)
@@ -246,6 +245,7 @@ def _app(db_uri: str, *, auth: bool = True) -> FastAPI:
             _conversations(db_uri),
             object(),  # type: ignore[arg-type]  # No agents are loaded on these routes.
             host_registry=_ConnectedHosts(),  # type: ignore[arg-type]
+            read_only_code_hosts=read_only_code_hosts,
             **(
                 {
                     "auth_provider": UnifiedAuthProvider(source="header", local_single_user=False),
@@ -510,6 +510,7 @@ async def test_the_owner_sees_the_host_s_info_unchanged(
     assert info["auth"]["accounts"] == _ACCOUNTS
     assert info["capabilities"] == _HOST_INFO["capabilities"]
     assert "owner_only_changes" not in info
+    assert "read_only" not in info
 
 
 @pytest.mark.asyncio
@@ -680,13 +681,10 @@ _CODE_HOST_WRITES = [
 
 
 @pytest.fixture
-async def read_only_client(
-    db_uri: str, host: _RecordingHost, monkeypatch: pytest.MonkeyPatch
-) -> AsyncIterator[httpx.AsyncClient]:
+async def read_only_client(db_uri: str, host: _RecordingHost) -> AsyncIterator[httpx.AsyncClient]:
     """A server that serves pull requests on ``github.com`` read-only."""
     del host
-    monkeypatch.setattr(server_config, "read_only_code_hosts", lambda: ("github.com",))
-    transport = httpx.ASGITransport(app=_app(db_uri))
+    transport = httpx.ASGITransport(app=_app(db_uri, read_only_code_hosts=("github.com",)))
     async with httpx.AsyncClient(transport=transport, base_url="http://server") as session:
         yield session
 
@@ -741,10 +739,36 @@ async def test_a_read_only_host_s_info_is_marked_and_offers_no_changes(
     assert info["pr"]["number"] == 42
 
 
-@pytest.mark.asyncio
-async def test_without_read_only_hosts_the_owner_s_info_is_unmarked(
-    client: httpx.AsyncClient,
-) -> None:
-    response = await _call(client, "GET", "/resources/github", {}, caller=_OWNER)
+@pytest.fixture
+async def unsynced_read_only_client(
+    db_uri: str, host: _RecordingHost, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[httpx.AsyncClient]:
+    """A read-only ``github.com`` server that hasn't imported the session's PRs yet."""
+    del host
+    monkeypatch.setattr(routes_resources.server_prs, "vouch", lambda _stored, _pr_url: {})
+    transport = httpx.ASGITransport(app=_app(db_uri, read_only_code_hosts=("github.com",)))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as session:
+        yield session
 
-    assert "read_only" not in response.json()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Every route needs a ``pr_url`` string; an empty one names no pull request.
+        {"pr_url": "", "merge_method": "squash"},
+        {"pr_url": "\u00a0" + _PR, "merge_method": "squash"},
+    ],
+    ids=["empty-pr-url", "padded-url"],
+)
+async def test_a_change_the_server_cant_place_off_a_read_only_host_is_refused(
+    unsynced_read_only_client: httpx.AsyncClient, host: _RecordingHost, body: dict[str, Any]
+) -> None:
+    """Without the stored PRs, the host would pick or normalize the PR the change goes to."""
+    response = await _call(
+        unsynced_read_only_client, "POST", "/resources/github/merge", {"json": body}, caller=_OWNER
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["message"] == READ_ONLY_CODE_HOST_MESSAGE
+    assert host.writes == []

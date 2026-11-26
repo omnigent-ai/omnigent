@@ -125,6 +125,7 @@ def _server_app(
     side_chat: bool = False,
     remote_host: bool = False,
     content_search: bool = False,
+    read_only_code_hosts: tuple[str, ...] = (),
 ) -> FastAPI:
     """The sessions API, with the session's host answering over an in-memory tunnel.
 
@@ -206,6 +207,7 @@ def _server_app(
         store,  # type: ignore[arg-type]
         _StubAgentStore(),  # type: ignore[arg-type]
         host_registry=registry,
+        read_only_code_hosts=read_only_code_hosts,
     )
     app.include_router(router, prefix="/v1")
     return app

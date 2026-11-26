@@ -77,6 +77,7 @@ from omnigent.server.read_only_code_hosts import (
     is_read_only_pull_request,
     mark_read_only,
     parse_patterns,
+    refuses_change,
     selected_pull_request,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -296,18 +297,14 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
-    read_only_code_hosts: Sequence[str] | None = None,
+    read_only_code_hosts: Sequence[str] = (),
 ) -> None:
     """Register the resources routes on router.
 
-    :param read_only_code_hosts: Host patterns whose pull requests are served read-only;
-        ``None`` reads the server config's ``read_only_code_hosts``.
+    :param read_only_code_hosts: Host patterns whose pull requests are served read-only,
+        from the server config's ``read_only_code_hosts``.
     """
     pull_request_store = server_prs.open_store(conversation_store)
-    if read_only_code_hosts is None:
-        from omnigent.server.server_config import read_only_code_hosts as configured
-
-        read_only_code_hosts = configured()
     read_only_patterns = parse_patterns(list(read_only_code_hosts))
 
     def _refuse_read_only_write(params: dict[str, Any]) -> None:
@@ -316,7 +313,7 @@ def register_resources_routes(
         :param params: The write's parameters: the PR it names, else the server's first.
         """
         target = params.get("pr_url") or params.get("default_pr_url")
-        if is_read_only_pull_request(target, read_only_patterns):
+        if refuses_change(target, read_only_patterns):
             raise OmnigentError(READ_ONLY_CODE_HOST_MESSAGE, code=ErrorCode.FORBIDDEN)
 
     def _marked_read_only(info: dict[str, Any]) -> dict[str, Any]:

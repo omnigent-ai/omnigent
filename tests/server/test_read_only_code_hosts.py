@@ -12,6 +12,7 @@ from omnigent.server.read_only_code_hosts import (
     is_read_only_pull_request,
     mark_read_only,
     parse_patterns,
+    refuses_change,
     selected_pull_request,
 )
 
@@ -29,10 +30,28 @@ def _pr(host: str) -> str:
         _pr("A.B.Code.Example.COM"),
         _pr("git.example.org"),
         _pr("git.example.org:8443"),
+        # Forms the session's host normalizes to a matching host before it writes.
+        "\u00a0" + _pr("git.example.org"),
+        " " + _pr("git.example.org") + "\n",
     ],
 )
 def test_a_pull_request_on_a_matching_host_is_read_only(pr_url: str) -> None:
     assert is_read_only_pull_request(pr_url, PATTERNS)
+
+
+def test_a_legacy_alias_is_matched_by_the_host_it_resolves_to() -> None:
+    legacy = "https://example.visualstudio.com/project/_git/repo/pullrequest/7"
+
+    assert is_read_only_pull_request(legacy, ("dev.azure.com",))
+    assert is_read_only_pull_request(legacy, ("*.visualstudio.com",))
+
+
+@pytest.mark.parametrize("pr_url", ["https://[not-a-host/pull/7", "not a url", "https:///pull/7"])
+def test_a_pull_request_whose_host_cant_be_told_is_read_only_while_any_host_is(
+    pr_url: str,
+) -> None:
+    assert is_read_only_pull_request(pr_url, PATTERNS)
+    assert not is_read_only_pull_request(pr_url, ())
 
 
 @pytest.mark.parametrize(
@@ -41,7 +60,6 @@ def test_a_pull_request_on_a_matching_host_is_read_only(pr_url: str) -> None:
         _pr("code.example.com"),
         _pr("github.com"),
         _pr("git.example.org.example.net"),
-        "https://[not-a-host/pull/7",
         "",
         None,
         7,
@@ -62,6 +80,23 @@ def test_other_pull_requests_are_writable(pr_url: object) -> None:
 )
 def test_only_a_star_is_a_wildcard(pattern: str, host: str, matches: bool) -> None:
     assert is_read_only_pull_request(_pr(host), (pattern,)) is matches
+
+
+@pytest.mark.parametrize(
+    ("target", "patterns", "refused"),
+    [
+        (None, PATTERNS, True),
+        ("", PATTERNS, True),
+        (None, (), False),
+        (_pr("git.example.org"), PATTERNS, True),
+        (_pr("github.com"), PATTERNS, False),
+    ],
+    ids=["no-target", "empty-target", "no-patterns", "read-only", "writable"],
+)
+def test_a_change_with_no_target_is_refused_only_while_a_host_is_read_only(
+    target: object, patterns: tuple[str, ...], refused: bool
+) -> None:
+    assert refuses_change(target, patterns) is refused
 
 
 def test_no_patterns_leave_every_pull_request_writable() -> None:
@@ -113,21 +148,24 @@ def test_an_overview_is_about_its_selected_pull_request(info: dict, expected: ob
     assert selected_pull_request(info) == expected
 
 
-def test_the_config_lists_its_read_only_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_config_lists_its_read_only_hosts() -> None:
     config = {"read_only_code_hosts": ["*.Code.Example.com", "git.example.org"]}
-    monkeypatch.setattr(server_config, "load_server_config", lambda: config)
 
-    assert server_config.read_only_code_hosts() == PATTERNS
+    assert server_config.read_only_code_hosts(config) == PATTERNS
 
 
+@pytest.mark.parametrize("value", ["git.example.org", None], ids=["string", "null"])
 def test_a_config_value_that_isnt_a_list_is_ignored_with_a_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture, value: object
 ) -> None:
-    monkeypatch.setattr(
-        server_config, "load_server_config", lambda: {"read_only_code_hosts": "git.example.org"}
-    )
-
     with caplog.at_level(logging.WARNING, logger=server_config.logger.name):
-        assert server_config.read_only_code_hosts() == ()
+        assert server_config.read_only_code_hosts({"read_only_code_hosts": value}) == ()
 
     assert "read_only_code_hosts" in caplog.text
+
+
+def test_no_read_only_hosts_configured_is_quiet(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger=server_config.logger.name):
+        assert server_config.read_only_code_hosts({}) == ()
+
+    assert caplog.text == ""

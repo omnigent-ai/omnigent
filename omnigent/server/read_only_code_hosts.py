@@ -4,9 +4,9 @@ A server can list host patterns, such as ``"*.code.example.com"``, whose pull re
 it serves for reading only: their overviews offer no write capabilities, and the server
 refuses their writes before they reach the session's host. A pattern is a host name,
 matched case-insensitively, where ``*`` stands for any run of characters and every other
-character, ``?`` and ``[`` included, stands for itself. The server reads its list when it
-starts, so a change takes a restart. Only the server's routes are limited: an agent in the
-session that runs ``gh`` itself isn't.
+character, ``?`` and ``[`` included, stands for itself. The server reads its config's
+list when it starts, so a change takes a restart. Only the server's routes are limited:
+an agent in the session that runs ``gh`` itself isn't.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlsplit
 
+from omnigent.git_providers import EnvInstances, resolve_pr_url
 from omnigent.server.pull_request_viewers import OWNER_CAPABILITIES
 
 READ_ONLY_CODE_HOST_MESSAGE = "Changes to pull requests on this code host are turned off."
@@ -35,14 +36,49 @@ def parse_patterns(value: object) -> tuple[str, ...]:
 
 
 def is_read_only_pull_request(pr_url: object, patterns: Iterable[str]) -> bool:
-    """Whether ``pr_url`` is a pull request on a host matching one of ``patterns``."""
-    if not isinstance(pr_url, str) or not pr_url:
+    """Whether ``pr_url`` is a pull request on a host matching one of ``patterns``.
+
+    Checks the host as written and the host the session's host resolves it to, such as
+    ``dev.azure.com`` for a legacy ``*.visualstudio.com`` URL. While any pattern is set, a
+    URL whose host can't be told is read-only too.
+    """
+    patterns = tuple(patterns)
+    if not patterns or not isinstance(pr_url, str) or not pr_url:
         return False
+    hosts = _pull_request_hosts(pr_url)
+    if not hosts:
+        return True
+    return any(_matches(host, pattern) for host in hosts for pattern in patterns)
+
+
+def refuses_change(target: object, patterns: Iterable[str]) -> bool:
+    """Whether a change to ``target``, the PR it names or the server's first, is refused.
+
+    While any pattern is set, a change with no target is refused: the session's host would
+    pick the pull request itself.
+    """
+    patterns = tuple(patterns)
+    if not patterns:
+        return False
+    if not isinstance(target, str) or not target:
+        return True
+    return is_read_only_pull_request(target, patterns)
+
+
+def _pull_request_hosts(pr_url: str) -> set[str]:
+    """The host ``pr_url`` names, and the one provider resolution normalizes it to."""
+    hosts: set[str] = set()
+    stripped = pr_url.strip()
     try:
-        host = urlsplit(pr_url).hostname
+        written = urlsplit(stripped).hostname
     except ValueError:
-        return False
-    return bool(host) and any(_matches(host.casefold(), pattern) for pattern in patterns)
+        written = None
+    if written:
+        hosts.add(written.casefold())
+    resolved = resolve_pr_url(stripped, EnvInstances())
+    if resolved is not None and resolved.host:
+        hosts.add(resolved.host.casefold())
+    return hosts
 
 
 def _matches(host: str, pattern: str) -> bool:
