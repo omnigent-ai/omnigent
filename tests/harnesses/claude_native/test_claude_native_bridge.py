@@ -41,6 +41,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _LOGIN_GUIDANCE,
     _TURN_END_SCAN_BYTES,
     BackgroundAgentsAfterTurnReader,
+    TurnEndReader,
     _claude_prompt_rendered,
     _escape_slash_command_text,
     _escape_unsupported_slash_command,
@@ -766,7 +767,7 @@ def _append_entries(transcript_path: Path, *entries: dict[str, Any]) -> None:
 def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
     tmp_path: Path, background_tasks: list[dict[str, str]] | None, agent_running: bool
 ) -> None:
-    """Each main-session Stop records whether it left an unfinished background agent."""
+    """Each main-session Stop records its turn end and whether it left a background agent."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
     _write_turn(transcript_path, {"type": "system", "subtype": "stop_hook_summary"})
@@ -784,6 +785,7 @@ def test_record_hook_event_marks_a_stop_that_leaves_a_background_agent(
     record_hook_event(bridge_dir, stop)
 
     assert reader.read() is agent_running
+    assert TurnEndReader(bridge_dir).read() is True
 
 
 def test_background_agent_mark_names_only_the_running_agents(tmp_path: Path) -> None:
@@ -824,22 +826,25 @@ def test_background_agent_mark_names_only_the_running_agents(tmp_path: Path) -> 
 def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
     tmp_path: Path, next_event: str
 ) -> None:
-    """Only the main session's next turn clears the mark; the agent's own hooks do not."""
+    """Only the main session's next turn clears the marks; the agent's own hooks do not."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
     _write_turn(transcript_path)
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
     reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    turn_end = TurnEndReader(bridge_dir)
     for child_event in ("UserPromptSubmit", "Stop"):
         record_hook_event(
             bridge_dir,
             {"hook_event_name": child_event, "session_id": "claude-session", "agent_id": "a1"},
         )
     assert reader.read() is True
+    assert turn_end.read() is True
 
     record_hook_event(bridge_dir, {"hook_event_name": next_event, "session_id": "claude-session"})
 
     assert reader.read() is False
+    assert turn_end.read() is False
 
 
 @pytest.mark.parametrize(
@@ -862,19 +867,22 @@ def test_record_hook_event_clears_the_background_agent_mark_on_the_next_turn(
 def test_background_agent_mark_ends_when_the_main_conversation_continues(
     tmp_path: Path, appended_entries: list[dict[str, Any]], still_held: bool
 ) -> None:
-    """A blocking Stop hook resumes the turn with no new prompt; its entries end the hold."""
+    """A blocking Stop hook resumes the turn with no new prompt; its entries end the marks."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "transcript.jsonl"
     _write_turn(transcript_path)
     record_hook_event(bridge_dir, _stop_leaving_agent_running(transcript_path))
     reader = BackgroundAgentsAfterTurnReader(bridge_dir)
+    turn_end = TurnEndReader(bridge_dir)
     assert reader.read() is True
+    assert turn_end.read() is True
 
     with transcript_path.open("a", encoding="utf-8") as transcript:
         transcript.write("not json\n")
     _append_entries(transcript_path, *appended_entries)
 
     assert reader.read() is still_held
+    assert turn_end.read() is still_held
 
 
 def test_background_agent_mark_ignores_a_stop_another_hook_already_blocked(

@@ -3474,8 +3474,11 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
                 seen.add(claude_session_id)
                 state["seen_claude_session_ids"] = sorted(seen)
             if event_name == "Stop":
-                state["background_agents_after_turn"] = _background_agent_hold(payload)
+                turn_end = _turn_end(payload)
+                state["turn_end"] = turn_end
+                state["background_agents_after_turn"] = _background_agent_hold(payload, turn_end)
             elif event_name in {"UserPromptSubmit", "StopFailure", "SessionStart"}:
+                state["turn_end"] = None
                 state["background_agents_after_turn"] = None
         else:
             _logger.debug(
@@ -3529,64 +3532,35 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     return raw
 
 
-class BackgroundAgentsAfterTurnReader:
+class _TurnContinuationScanner:
     """
-    Read whether the main session's last turn ended with a background agent running.
+    Track whether the main conversation continued past a ``Stop``'s turn end.
 
-    Claude keeps reporting itself busy for as long as such an agent runs,
-    although its prompt is free, so the session reports ``waiting`` instead.
-    Set by the main session's ``Stop`` hook and cleared by its next
-    ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``.
     A blocking ``Stop`` hook resumes the same turn with no new prompt, so a main
-    conversation entry after that turn's last reply also ends it, as does a
-    transcript cut short of that reply. Each read parses only the complete
+    conversation entry after that turn's last reply continues it, as does a
+    transcript cut short of that reply. Each check parses only the complete
     transcript lines appended since the previous one.
-
-    :param bridge_dir: Bridge directory path.
     """
 
-    def __init__(self, bridge_dir: Path) -> None:
-        self._bridge_dir = bridge_dir
-        self._hold: tuple[str, int] | None = None
+    def __init__(self) -> None:
+        self._turn_end: tuple[str, int] | None = None
         self._transcript_identity: tuple[int, int] | None = None
         self._scanned_to = 0
         self._released = False
-        self._agents: list[_JsonObject] = []
 
-    @property
-    def agents(self) -> list[_JsonObject]:
-        """Display fields of the agents the last ``Stop`` left running.
-
-        Read alongside :meth:`read`; meaningful only while it returns ``True``.
-        An entry has ``id`` / ``type`` / ``status`` / ``description`` when Claude
-        sent them, e.g. ``{"id": "a1", "type": "subagent", "description": "Audit"}``.
+    def ended(self, transcript_path: str, offset: int) -> bool:
         """
-        return list(self._agents)
+        Return whether the turn whose last reply ends at *offset* is still over.
 
-    def read(self) -> bool:
+        :param transcript_path: Main session transcript path.
+        :param offset: Byte offset just past that turn's last reply.
+        :returns: ``False`` once the conversation continues or the transcript
+            cannot be read.
         """
-        Return whether the last ``Stop`` still holds the session waiting on its agents.
-
-        :returns: ``True`` between that ``Stop`` and the next main-session turn.
-        """
-        state = _read_json_file(self._bridge_dir / _STATE_FILE)
-        raw = state.get("background_agents_after_turn") if isinstance(state, dict) else None
-        transcript_path = raw.get("transcript_path") if isinstance(raw, dict) else None
-        offset = raw.get("transcript_offset") if isinstance(raw, dict) else None
-        if not isinstance(transcript_path, str) or not isinstance(offset, int):
-            self._hold = None
-            self._agents = []
-            return False
-        if self._hold != (transcript_path, offset):
-            self._hold = (transcript_path, offset)
+        if self._turn_end != (transcript_path, offset):
+            self._turn_end = (transcript_path, offset)
             self._transcript_identity = None
             self._released = False
-            raw_agents = raw.get("agents") if isinstance(raw, dict) else None
-            self._agents = (
-                [agent for agent in raw_agents if isinstance(agent, dict)]
-                if isinstance(raw_agents, list)
-                else []
-            )
         if self._released:
             return False
         try:
@@ -3609,6 +3583,94 @@ class BackgroundAgentsAfterTurnReader:
         except OSError:
             return False
         return True
+
+
+def _turn_end_mark(raw: object) -> tuple[str, int] | None:
+    """Return a recorded turn end's ``(transcript_path, offset)``, if well formed."""
+    transcript_path = raw.get("transcript_path") if isinstance(raw, dict) else None
+    offset = raw.get("transcript_offset") if isinstance(raw, dict) else None
+    if not isinstance(transcript_path, str) or not isinstance(offset, int):
+        return None
+    return transcript_path, offset
+
+
+class TurnEndReader:
+    """
+    Read whether the main session's last ``Stop`` still ends its turn.
+
+    Claude can keep reporting itself busy after that ``Stop`` with nothing left
+    to finish. Set by the main session's ``Stop`` hook and cleared by its next
+    ``UserPromptSubmit``, ``StopFailure`` or ``SessionStart``, or by the
+    conversation continuing (see :class:`_TurnContinuationScanner`).
+
+    :param bridge_dir: Bridge directory path.
+    """
+
+    def __init__(self, bridge_dir: Path) -> None:
+        self._bridge_dir = bridge_dir
+        self._continuation = _TurnContinuationScanner()
+
+    def read(self) -> bool:
+        """
+        Return whether the last ``Stop`` still ends the session's turn.
+
+        :returns: ``True`` between that ``Stop`` and the next main-session turn.
+        """
+        state = _read_json_file(self._bridge_dir / _STATE_FILE)
+        mark = _turn_end_mark(state.get("turn_end") if isinstance(state, dict) else None)
+        return mark is not None and self._continuation.ended(*mark)
+
+
+class BackgroundAgentsAfterTurnReader:
+    """
+    Read whether the main session's last turn ended with a background agent running.
+
+    Claude keeps reporting itself busy for as long as such an agent runs,
+    although its prompt is free, so the session reports ``waiting`` instead.
+    Set by the main session's ``Stop`` hook and cleared like
+    :class:`TurnEndReader`'s turn end.
+
+    :param bridge_dir: Bridge directory path.
+    """
+
+    def __init__(self, bridge_dir: Path) -> None:
+        self._bridge_dir = bridge_dir
+        self._hold: tuple[str, int] | None = None
+        self._continuation = _TurnContinuationScanner()
+        self._agents: list[_JsonObject] = []
+
+    @property
+    def agents(self) -> list[_JsonObject]:
+        """Display fields of the agents the last ``Stop`` left running.
+
+        Read alongside :meth:`read`; meaningful only while it returns ``True``.
+        An entry has ``id`` / ``type`` / ``status`` / ``description`` when Claude
+        sent them, e.g. ``{"id": "a1", "type": "subagent", "description": "Audit"}``.
+        """
+        return list(self._agents)
+
+    def read(self) -> bool:
+        """
+        Return whether the last ``Stop`` still holds the session waiting on its agents.
+
+        :returns: ``True`` between that ``Stop`` and the next main-session turn.
+        """
+        state = _read_json_file(self._bridge_dir / _STATE_FILE)
+        raw = state.get("background_agents_after_turn") if isinstance(state, dict) else None
+        mark = _turn_end_mark(raw)
+        if mark is None:
+            self._hold = None
+            self._agents = []
+            return False
+        if self._hold != mark:
+            self._hold = mark
+            raw_agents = raw.get("agents") if isinstance(raw, dict) else None
+            self._agents = (
+                [agent for agent in raw_agents if isinstance(agent, dict)]
+                if isinstance(raw_agents, list)
+                else []
+            )
+        return self._continuation.ended(*mark)
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -4529,15 +4591,27 @@ def _is_background_shell(raw: object) -> bool:
     return raw.get("type") not in _BACKGROUND_AGENT_TASK_TYPES
 
 
-def _background_agent_hold(payload: _JsonObject) -> _JsonObject | None:
-    """Where the turn's last reply ends at a ``Stop`` that left an agent running, if one did.
+def _turn_end(payload: _JsonObject) -> _JsonObject | None:
+    """Where a ``Stop``'s turn ends: just past the transcript's last main reply."""
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(transcript_path, str):
+        return None
+    offset = _offset_after_last_main_reply(transcript_path)
+    if offset is None:
+        return None
+    return {"transcript_path": transcript_path, "transcript_offset": offset}
+
+
+def _background_agent_hold(
+    payload: _JsonObject, turn_end: _JsonObject | None
+) -> _JsonObject | None:
+    """The turn's end at a ``Stop`` that left an agent running, if one did.
 
     The hold also keeps the running agents' display fields, so the session can
     say what it is still waiting on.
     """
     raw_tasks = payload.get("background_tasks")
-    transcript_path = payload.get("transcript_path")
-    if not isinstance(raw_tasks, list) or not isinstance(transcript_path, str):
+    if turn_end is None or not isinstance(raw_tasks, list):
         return None
     running = [
         task
@@ -4548,15 +4622,12 @@ def _background_agent_hold(payload: _JsonObject) -> _JsonObject | None:
     ]
     if not running:
         return None
-    offset = _offset_after_last_main_reply(transcript_path)
-    if offset is None:
-        return None
     agents = [
         detail
         for task in running[:_BACKGROUND_TASK_FORWARD_LIMIT]
         if (detail := _normalize_background_task(task)) is not None
     ]
-    return {"transcript_path": transcript_path, "transcript_offset": offset, "agents": agents}
+    return {**turn_end, "agents": agents}
 
 
 def _offset_after_last_main_reply(transcript_path: str) -> int | None:

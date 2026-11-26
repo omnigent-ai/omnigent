@@ -54,6 +54,7 @@ class ClaudeProgramStatusPoller:
         on_failure: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         background_agents_after_turn: Callable[[], bool] | None = None,
+        turn_ended: Callable[[], bool] | None = None,
     ) -> None:
         self._reader = reader
         self._fallback = fallback
@@ -62,6 +63,9 @@ class ClaudeProgramStatusPoller:
         # Claude reports working for a background agent that outlives its turn.
         self._background_agents_after_turn = background_agents_after_turn
         self._holding_background_agents = False
+        # Claude can also report working after a Stop that left nothing running.
+        self._turn_ended = turn_ended
+        self._settled_after_turn = False
         self._omnigent_session_id = omnigent_session_id
         self._terminal_instance_id = terminal_instance_id
         self._terminal_launch_id = terminal_launch_id
@@ -150,22 +154,30 @@ class ClaudeProgramStatusPoller:
         self._error_observed = is_error
         if report is not None:
             self._using_osc = True
+            working = report.state == "working"
             holding = (
-                report.state == "working"
+                working
                 and self._background_agents_after_turn is not None
                 and self._background_agents_after_turn()
             )
-            changed = report != self._last or holding != self._holding_background_agents
+            settled = (
+                not holding and working and self._turn_ended is not None and self._turn_ended()
+            )
+            changed = report != self._last or (holding, settled) != (
+                self._holding_background_agents,
+                self._settled_after_turn,
+            )
             if changed:
                 self._observation_version += 1
             if changed or requested:
                 self._last = report
                 self._holding_background_agents = holding
+                self._settled_after_turn = settled
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
                 if not is_error:
-                    working = report.state in _RUNNING_STATES
-                    status = "waiting" if holding else "running" if working else "idle"
+                    running = report.state in _RUNNING_STATES and not settled
+                    status = "waiting" if holding else "running" if running else "idle"
                     publish = self._on_status if changed else self._on_replay
                     publish(status, blocked_reason(report))
             self._fail_if_hook_overdue(report)
@@ -179,6 +191,7 @@ class ClaudeProgramStatusPoller:
                 self._fallback.resync()
             self._using_osc = False
             self._holding_background_agents = False
+            self._settled_after_turn = False
             self._last = None
             self._fail_if_hook_overdue(None)
             self._fallback.tick()

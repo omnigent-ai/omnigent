@@ -2321,6 +2321,7 @@ class SessionResourceRegistry:
         """
         from omnigent.harnesses.claude_native.bridge import (
             BackgroundAgentsAfterTurnReader,
+            TurnEndReader,
             bridge_dir_for_conversation_id,
             read_claude_session_id,
         )
@@ -2328,6 +2329,7 @@ class SessionResourceRegistry:
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
         background_agents = BackgroundAgentsAfterTurnReader(bridge_dir)
+        turn_end = TurnEndReader(bridge_dir)
         with self._lock:
             self._background_agent_readers[session_id] = background_agents
 
@@ -2347,6 +2349,12 @@ class SessionResourceRegistry:
             except Exception:  # noqa: BLE001 - an unreadable mark reports Claude's status as is.
                 return False
 
+        def _turn_ended() -> bool:
+            try:
+                return turn_end.read()
+            except Exception:  # noqa: BLE001 - an unreadable mark reports Claude's status as is.
+                return False
+
         reader = getattr(instance, "program_status", None)
         fallback = SessionStatusPoller(
             on_status=on_status,
@@ -2358,6 +2366,7 @@ class SessionResourceRegistry:
             omnigent_session_id=session_id,
             on_background=on_background,
             background_agents_after_turn=_background_agents_after_turn,
+            turn_ended=_turn_ended,
         )
         if reader is not None:
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
@@ -2374,6 +2383,7 @@ class SessionResourceRegistry:
                 turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
                 on_failure=on_failure,
                 background_agents_after_turn=_background_agents_after_turn,
+                turn_ended=_turn_ended,
             )
         return fallback
 
