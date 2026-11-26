@@ -6,11 +6,15 @@ from datetime import UTC, datetime
 import pytest
 
 from omnigent.entities import ScheduledTask
-from omnigent.server.scheduled.rrule import RRuleSearchError
+from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError
 from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
+    sandbox_host_id,
+    timer_interval,
+    timer_rule,
 )
 
 
@@ -39,6 +43,35 @@ def test_sandbox_identity_is_stable_per_tenant_task_and_trigger(task) -> None:
     assert host != occurrence_host_id(task, "manual:100")
     pinned = replace(task, execution_target="connected_host", host_id=uuid.uuid4().hex)
     assert occurrence_host_id(pinned, "schedule:100") == pinned.host_id
+
+
+@pytest.mark.parametrize(
+    "task_id,occurrence_host,continued_host",
+    [
+        # Values from before non-UUID IDs, so running sandboxes keep their host IDs.
+        (
+            "6f1c0a3e9b2d4c5e8f7a1b2c3d4e5f60",
+            "e140df56908451ec8c9e48a16e1a9784",
+            "f3570dd74571508eb915bedac22a76e1",
+        ),
+        # An ID a deployment allocates in another form.
+        (
+            "4611686018427387904",
+            "1a9741b70fec58859e0afd6205d2721e",
+            "e2a4b899204a553e8046228f5fce6286",
+        ),
+    ],
+    ids=["uuid", "decimal"],
+)
+def test_sandbox_identity_is_pinned_for_any_task_id_form(
+    task_id: str, occurrence_host: str, continued_host: str
+) -> None:
+    assert sandbox_host_id(task_id, 1, "schedule:100") == occurrence_host
+    assert continued_sandbox_host_id(task_id, 1) == continued_host
+    # Another ID of the same form gets other hosts.
+    other = task_id[:-1] + ("2" if task_id.endswith("1") else "1")
+    assert sandbox_host_id(other, 1, "schedule:100") != occurrence_host
+    assert continued_sandbox_host_id(other, 1) != continued_host
 
 
 @pytest.mark.parametrize("source", ["Jira", "Slack", "GitHub", "Linear", "PagerDuty"])
@@ -143,3 +176,72 @@ def test_inactive_or_invalid_schedule_has_no_next_occurrence(task, changes) -> N
     from dataclasses import replace
 
     assert next_scheduled_time(replace(task, **changes), task.created_at) is None
+
+
+# A timer anchored here with a 120-second interval first fires at _ANCHOR + 120.
+_ANCHOR = 1_800_000_000
+
+
+@pytest.mark.parametrize(
+    "repeat,after,expected",
+    [
+        (True, _ANCHOR, _ANCHOR + 120),
+        # Saved a moment late: the first firing is still the next one, not skipped.
+        (True, _ANCHOR + 119, _ANCHOR + 120),
+        # Strictly after: claiming the firing due now moves to the next tick.
+        (True, _ANCHOR + 120, _ANCHOR + 240),
+        # Back from a long outage: missed ticks are skipped, the phase is kept.
+        (True, _ANCHOR + 1000, _ANCHOR + 1080),
+        (False, _ANCHOR + 119, _ANCHOR + 120),
+        # A one-shot timer has no firing after its only one.
+        (False, _ANCHOR + 120, None),
+        (False, _ANCHOR + 5000, None),
+    ],
+    ids=[
+        "repeat-first",
+        "repeat-just-before",
+        "repeat-at-firing",
+        "repeat-after-outage",
+        "once-just-before",
+        "once-at-firing",
+        "once-long-after",
+    ],
+)
+def test_timer_firings_fall_on_whole_intervals_from_the_anchor(
+    task, repeat: bool, after: int, expected: int | None
+) -> None:
+    from dataclasses import replace
+
+    timer = replace(
+        task,
+        kind="timer",
+        rrule=timer_rule(120, repeat=repeat),
+        created_at=_ANCHOR,
+        session_mode="continue",
+    )
+    assert next_scheduled_time(timer, after) == expected
+
+
+def test_timer_rules_round_trip_their_interval() -> None:
+    assert timer_rule(120, repeat=True) == "FREQ=SECONDLY;INTERVAL=120"
+    assert timer_rule(1, repeat=False) == "FREQ=SECONDLY;INTERVAL=1;COUNT=1"
+    assert timer_interval(timer_rule(1_000_000, repeat=True)) == 1_000_000
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=DAILY",
+        "FREQ=SECONDLY;INTERVAL=0",
+        "FREQ=SECONDLY;INTERVAL=1000001",
+        "FREQ=SECONDLY;INTERVAL=5;COUNT=2",
+        "FREQ=SECONDLY;INTERVAL=05",
+    ],
+)
+def test_a_rule_a_timer_never_saves_is_invalid(task, rule: str) -> None:
+    from dataclasses import replace
+
+    with pytest.raises(RRuleValidationError):
+        timer_interval(rule)
+    # The scheduler finds no firing for it instead of failing the poll.
+    assert next_scheduled_time(replace(task, kind="timer", rrule=rule), _ANCHOR) is None

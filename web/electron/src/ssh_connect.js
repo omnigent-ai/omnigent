@@ -552,6 +552,10 @@ function createSshSession(options) {
     cancelLocal: (port) => control("cancel", ["-L", `localhost:${port}:127.0.0.1:${port}`]),
     holdRemote: (port) => control("forward", ["-R", `${port}:${HELD_PORT_TARGET}`]),
     releaseRemote: (port) => control("cancel", ["-R", `${port}:${HELD_PORT_TARGET}`]),
+    forwardSocket: (localPath, remotePath) =>
+      control("forward", ["-L", `${localPath}:${remotePath}`]),
+    cancelSocket: (localPath, remotePath) =>
+      control("cancel", ["-L", `${localPath}:${remotePath}`]),
 
     /** End the shared connection, killing it if it doesn't exit in time. */
     async close() {
@@ -894,6 +898,7 @@ function startSshConnect(serverUrl, destination, deps) {
 }
 
 module.exports = {
+  REMOTE_PATH,
   SIGN_IN_FIRST_PORT,
   SIGN_IN_LAST_PORT,
   SshConnectError,

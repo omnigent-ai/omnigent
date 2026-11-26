@@ -2,8 +2,9 @@
 //
 // Mock identity and sharing hooks to cover admin gating and disabled controls.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 import { SharingPage } from "./SharingPage";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as identity from "@/lib/identity";
@@ -26,10 +27,20 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
   }),
 }));
 
-vi.mock("@/lib/identity", () => ({
+const identityUpdates = vi.hoisted(() => new Set<() => void>());
+
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof identity>()),
   resolveIdentity: vi.fn(),
   getCurrentIsAdmin: vi.fn(),
+  getCurrentUserId: vi.fn(),
+  subscribeIdentity: (listener: () => void) => {
+    identityUpdates.add(listener);
+    return () => identityUpdates.delete(listener);
+  },
 }));
+
+beforeEach(() => identityUpdates.clear());
 vi.mock("@/hooks/useSharing", () => ({
   useSharing: vi.fn(),
   useSetSharing: vi.fn(),
@@ -66,16 +77,18 @@ function state(overrides: Partial<SharingState> = {}): SharingState {
 
 /** Scope options within the automatic-sharing fieldset. */
 function radiosIn(group: string): HTMLInputElement[] {
-  return within(screen.getByRole("group", { name: group })).getAllByRole(
+  return within(screen.getByRole("radiogroup", { name: group })).getAllByRole(
     "radio",
   ) as HTMLInputElement[];
 }
 
 function renderPage() {
   return render(
-    <TooltipProvider>
-      <SharingPage />
-    </TooltipProvider>,
+    <MemoryRouter>
+      <TooltipProvider>
+        <SharingPage />
+      </TooltipProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -203,9 +216,11 @@ describe("SharingPage", () => {
 
     setSharingState(state({ sharing_mode: "restricted_read_only" }));
     view.rerender(
-      <TooltipProvider>
-        <SharingPage />
-      </TooltipProvider>,
+      <MemoryRouter>
+        <TooltipProvider>
+          <SharingPage />
+        </TooltipProvider>
+      </MemoryRouter>,
     );
     expect(trigger).toHaveTextContent(/^Read only \(restricted\)$/);
     expect(trigger).toHaveAccessibleDescription(
@@ -268,6 +283,30 @@ describe("SharingPage", () => {
     fireEvent.click(trigger);
     expect(screen.queryByRole("option")).not.toBeInTheDocument();
     expect(setModeMutate).not.toHaveBeenCalled();
+  });
+
+  it("shows sharing controls when identity recovers while the page stays open", async () => {
+    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    setSharingState(state());
+    const view = renderPage();
+    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+    expect(
+      screen.queryByRole("combobox", { name: "Session sharing mode" }),
+    ).not.toBeInTheDocument();
+
+    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
+
+    expect(
+      await screen.findByRole("combobox", { name: "Session sharing mode" }),
+    ).toBeInTheDocument();
+    view.unmount();
+    expect(identityUpdates.size).toBe(0);
   });
 
   it("shows a no-permission message to a non-admin", async () => {
@@ -336,6 +375,9 @@ describe("SharingPage", () => {
       expect(radios.find((r) => r.value === "sandbox")!.checked).toBe(true);
       expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
       expect(screen.getByText(/Local sessions start private/)).toBeInTheDocument();
+      expect(screen.getByRole("switch", { name: TOGGLE })).toHaveAccessibleDescription(
+        /New sessions allow public read access/,
+      );
     });
 
     it("hides scope while off and enables managed hosts only by default", async () => {
@@ -436,9 +478,11 @@ describe("SharingPage", () => {
 
       setSharingState(state({ public_sharing_enabled: true, default_public_sessions: "all" }));
       view.rerender(
-        <TooltipProvider>
-          <SharingPage />
-        </TooltipProvider>,
+        <MemoryRouter>
+          <TooltipProvider>
+            <SharingPage />
+          </TooltipProvider>
+        </MemoryRouter>,
       );
 
       const radios = radiosIn(GROUP);
@@ -583,5 +627,52 @@ describe("SharingPage", () => {
       );
       expect(enabledArgs().every((enabled) => enabled === false)).toBe(true);
     });
+  });
+});
+
+describe("SharingPage Settings rows", () => {
+  it("renders each row from its Settings catalog entry", async () => {
+    setSharingState(state({ sharing_mode: "on", default_public_sessions: "sandbox" }));
+    renderPage();
+    await screen.findByRole("combobox", { name: "Session sharing mode" });
+    for (const id of [
+      "sharing-mode",
+      "public-access",
+      "public-max-permission",
+      "default-public-sessions",
+      "peer-session-messaging",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="default-public-sessions:scope"]'),
+    ).not.toBeNull();
+    expect(screen.getByRole("switch", { name: "Public access" })).toHaveAttribute(
+      "data-settings-control",
+      "public-access:",
+    );
+  });
+
+  it("names the reason a row is greyed out as that row's blocked part", async () => {
+    setSharingState(state({ sharing_mode: "off" }));
+    renderPage();
+    await screen.findByRole("switch", { name: "Public access" });
+    expect(
+      document.querySelector('[data-settings-control="public-access:blocked"]'),
+    ).toHaveAttribute("tabindex", "0");
+    expect(
+      document.querySelector('[data-settings-control="default-public-sessions:blockedBySharing"]'),
+    ).not.toBeNull();
+  });
+
+  it("names public access as the reason the default-sharing row is greyed out", async () => {
+    setSharingState(state({ sharing_mode: "on", public_sharing_enabled: false }));
+    renderPage();
+    await screen.findByRole("switch", { name: "Public access" });
+    expect(
+      document.querySelector(
+        '[data-settings-control="default-public-sessions:blockedByPublicAccess"]',
+      ),
+    ).toHaveAttribute("tabindex", "0");
   });
 });

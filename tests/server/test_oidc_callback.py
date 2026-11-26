@@ -68,6 +68,7 @@ def _oidc_config(
     skip_email_verification: bool = False,
     email_claim: str = "email",
     require_reauth: bool = True,
+    reauth_prompt: bool = True,
 ) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
@@ -80,6 +81,8 @@ def _oidc_config(
         ``OMNIGENT_OIDC_EMAIL_CLAIM`` would set it.
     :param require_reauth: Verify ``auth_time`` on forced re-authentication,
         as ``OMNIGENT_OIDC_REQUIRE_REAUTH`` would set it.
+    :param reauth_prompt: Send ``prompt=login`` and ``max_age`` on forced
+        re-authentication, as ``OMNIGENT_OIDC_REAUTH_PROMPT`` would set it.
     """
     return OIDCConfig(
         issuer=_ISSUER,
@@ -100,6 +103,7 @@ def _oidc_config(
         skip_email_verification=skip_email_verification,
         email_claim=email_claim,
         require_reauth=require_reauth,
+        reauth_prompt=reauth_prompt,
     )
 
 
@@ -694,9 +698,21 @@ def test_non_reauth_callback_ignores_auth_time(
 # ── CLI login tickets + login-issued refresh grants ───────────────
 
 
+@pytest.mark.parametrize(
+    ("callback_client", "reauth_request"),
+    [
+        pytest.param({}, {"prompt": ["login"], "max_age": ["300"]}, id="auth-time-verified"),
+        # IdPs such as GitLab drop the authorization request when asked to re-authenticate.
+        pytest.param(
+            {"require_reauth": False, "reauth_prompt": False}, {}, id="reauth-prompt-opt-out"
+        ),
+    ],
+    indirect=["callback_client"],
+)
 @pytest.mark.parametrize("reauth", ["1", "0", None])
 def test_cli_ticket_generic_oidc_reauth_round_trip(
     callback_client: tuple[TestClient, _IdpKeys],
+    reauth_request: dict[str, list[str]],
     reauth: str | None,
 ) -> None:
     client, keys = callback_client
@@ -709,15 +725,18 @@ def test_cli_ticket_generic_oidc_reauth_round_trip(
         login_url = login_url.copy_set_param("reauth", reauth)
     login = client.get(str(login_url), follow_redirects=False)
     authorization = parse_qs(urlsplit(login.headers["location"]).query)
-    assert authorization["prompt"] == ["login"]
-    assert authorization["max_age"] == ["300"]
+    sent_reauth_request = {
+        name: authorization[name] for name in ("prompt", "max_age") if name in authorization
+    }
+    assert sent_reauth_request == reauth_request
     state = jwt.decode(
         client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
     )
     assert state["ticket"] == created["ticket"]
-    client.app.state.pending_id_token[0] = keys.sign_id_token(
-        {"email": "alice@example.com", "email_verified": True, "auth_time": state["reauth_at"]}
-    )
+    claims: dict[str, object] = {"email": "alice@example.com", "email_verified": True}
+    if reauth_request:
+        claims["auth_time"] = state["reauth_at"]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(claims)
     callback = client.get(
         "/auth/callback",
         params={"code": "auth-code", "state": authorization["state"][0]},

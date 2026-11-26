@@ -14,6 +14,7 @@ import functools
 import importlib.resources
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -98,8 +99,10 @@ from omnigent.harnesses.claude_native.bridge import (
     augment_claude_args,
     bridge_dir_for_bridge_id,
     claude_terminal_relay_env,
+    clear_resume_cost_baseline,
     prepare_bridge_dir,
     read_active_session_id,
+    record_resume_cost_baseline,
     resolve_launch_effort_level,
     url_component,
     validate_claude_hook_interpreter_compatibility,
@@ -323,6 +326,8 @@ def _managed_settings_paths() -> tuple[Path, ...]:
 
 
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# Transcript record Claude Code restores a resumed session's running cost from.
+_CLAUDE_COST_STATE_RECORD_TYPE = "cost-state"
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
 _RESUME_ACTION_LEAVE = "leave"
@@ -756,6 +761,8 @@ def claude_config_with_launch_model_pinned(
         env set.
     """
     from omnigent.models.claude_model_vocabulary import (
+        LONG_CONTEXT_MARKER,
+        alias_pins,
         claude_model_command_arg,
         normalized_model_id,
     )
@@ -770,10 +777,27 @@ def claude_config_with_launch_model_pinned(
     model = launch_model.strip()
     if model in _UCODE_CLAUDE_TIER_TO_ENV or model == _UCODE_CLAUDE_CUSTOM_TIER:
         return claude_config
-    if claude_model_command_arg(model, claude_config.env) is not None:
-        # Already speakable: an alias pinned to exactly this id, or the
-        # custom slot already holding it.
+    custom_slot = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV, "").strip()
+    speakable = claude_model_command_arg(model, claude_config.env)
+    resolved_speakable = (
+        alias_pins(claude_config.env).get(speakable, speakable) if speakable is not None else None
+    )
+    wants_marker = model.lower().endswith(LONG_CONTEXT_MARKER)
+    if (
+        speakable is not None
+        and speakable != custom_slot
+        and resolved_speakable is not None
+        and resolved_speakable.lower().endswith(LONG_CONTEXT_MARKER) == wants_marker
+    ):
+        # A family alias preserves the window only when its configured pin
+        # carries the same marker.
         return claude_config
+    if custom_slot == model:
+        # The slot already holds this id byte-for-byte, marker included.
+        return claude_config
+    # Otherwise (re)write the slot to the launch model. A slot that matches only
+    # once ``[1m]`` is stripped would make ``/model`` re-select the bare id and
+    # fall back to 200K, so the slot must carry the marked spelling verbatim.
     normalized = normalized_model_id(model)
     tier = next(
         (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),
@@ -1054,8 +1078,12 @@ def _claude_model_probe_launch(
     if not claude_code_managed_mcp_present():
         args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
     args.extend(["--no-session-persistence", *extra_args])
+    # The user's SessionStart hooks would otherwise run for this headless call
+    # and push it past the probe timeout.
+    probe_settings: dict[str, object] = {"disableAllHooks": True}
     if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+        probe_settings["apiKeyHelper"] = claude_config.api_key_helper
+    args.extend(("--settings", json.dumps(probe_settings)))
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
@@ -2644,8 +2672,9 @@ def _copy_transcript_with_cwd(
         The ``uuid`` / ``parentUuid`` chain is preserved verbatim in
         either case. A clone also sheds the source's live background
         sub-agent launch handles (see
-        :func:`_detach_cloned_background_launch`); the move keeps them,
-        since that session's own process really did exit.
+        :func:`_detach_cloned_background_launch`) and its ``cost-state``
+        records, so the fork counts its own spend from zero; the move keeps
+        both, since it is still the same session.
     :returns: None.
     :raises click.ClickException: If a transcript line is malformed.
     """
@@ -2663,6 +2692,11 @@ def _copy_transcript_with_cwd(
                     f"line {line_number} is not valid JSON."
                 ) from exc
             if isinstance(payload, dict):
+                if (
+                    new_session_id is not None
+                    and payload.get("type") == _CLAUDE_COST_STATE_RECORD_TYPE
+                ):
+                    continue
                 if isinstance(payload.get("cwd"), str):
                     payload["cwd"] = current_text
                 if new_session_id is not None:
@@ -2806,6 +2840,28 @@ def _carries_any_payload(text: str, payloads: list[str]) -> bool:
     return any(item in compact or item.rstrip("=") in compact for item in payloads)
 
 
+def _blank_read_file_payload(value: object, payloads: list[str]) -> object:
+    """
+    Blank a duplicated payload in Claude Code's own Read metadata.
+
+    Image and PDF Read results store ``{"type": ..., "file": {"base64": ...}}``;
+    current Claude Code writes ``base64`` empty, the shape its renderer expects.
+
+    :param value: A record's ``toolUseResult`` object.
+    :param payloads: Base64 payloads present in the structured content.
+    :returns: *value* with ``file.base64`` emptied, or *value* unchanged.
+    """
+    if not isinstance(value, dict):
+        return value
+    file_meta = value.get("file")
+    if not isinstance(file_meta, dict):
+        return value
+    data = file_meta.get("base64")
+    if not isinstance(data, str) or not _carries_any_payload(data, payloads):
+        return value
+    return {**value, "file": {**file_meta, "base64": ""}}
+
+
 def _repair_cloned_tool_use_result(
     payload: _JsonObject,
     blocks: list[_JsonObject],
@@ -2818,7 +2874,8 @@ def _repair_cloned_tool_use_result(
     structured content. Matching is spelling-insensitive: the content blocks hold
     canonical base64 while the metadata may hold the producer's wrapped or
     unpadded original, so an exact substring test would miss the duplicate it is
-    meant to find. A redacted passthrough is preferred; when the payload survives
+    meant to find. A redacted passthrough is preferred, keeping Claude Code's Read
+    metadata shape via :func:`_blank_read_file_payload`; when the payload survives
     that (a JSON string literal wrapping mixed text-plus-image, which structured
     redaction cannot reach), the canonical redacted block list replaces it.
 
@@ -2839,7 +2896,7 @@ def _repair_cloned_tool_use_result(
     if isinstance(tool_use_result, str):
         candidate: object = _json_safe_tool_use_result(tool_use_result)
     else:
-        candidate = _redact_binary_blocks(tool_use_result)
+        candidate = _redact_binary_blocks(_blank_read_file_payload(tool_use_result, payloads))
     candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
     if _carries_any_payload(candidate_text, payloads):
         candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))
@@ -5157,7 +5214,7 @@ def _run_with_remote_server(
     # long-lived transcript-forwarder client survives the ~1h Databricks
     # OAuth token TTL.
     startup_profiler.mark("remote auth resolving")
-    forwarder_auth = _server_auth(server_url=base_url, session_id=None)
+    forwarder_auth = _server_auth(server_url=base_url)
     startup_profiler.mark("remote auth resolved")
     prepared: PreparedClaudeTerminal | None = None
     # Bound before the attach call so the ``finally`` can read it even
@@ -5643,6 +5700,7 @@ async def _resolve_cold_resume_args(
         workspace=Path.cwd().resolve(),
         bridge_dir=bridge_dir_for_bridge_id(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
         resume_copy=resume_session_id != external_session_id,
+        resume_cost_usd=_claude_resume_cost_from_snapshot(payload),
     )
     if transcript is None:
         # No resumable records: ``claude --resume`` against an empty (or
@@ -5716,6 +5774,56 @@ def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> s
     return copy_session_id
 
 
+def _claude_resume_cost_from_snapshot(snapshot: object) -> float | None:
+    """
+    Read a session's own recorded cost from its ``GET /v1/sessions`` snapshot.
+
+    :param snapshot: Parsed session response, e.g.
+        ``{"native_usage_baseline": {"cumulative_cost_usd": 1.25}}``.
+    :returns: The positive own-session cost in USD, or ``None`` when the
+        server reports none (an older server, or nothing spent yet).
+    """
+    baseline = snapshot.get("native_usage_baseline") if isinstance(snapshot, dict) else None
+    cost = baseline.get("cumulative_cost_usd") if isinstance(baseline, dict) else None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    try:
+        value = float(cost)
+    except OverflowError:  # an integer too large for a float
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _claude_cost_state_record(external_session_id: str, cost_usd: float) -> _JsonObject:
+    """
+    Build the record Claude Code restores its running session cost from.
+
+    Claude appends a ``cost-state`` record when it exits and reads the last one
+    back on ``--resume``. It skips a partial record, so every field it writes is
+    present; durations and per-model usage start empty because only the total
+    is stored.
+
+    :param external_session_id: Claude session id the record belongs to, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param cost_usd: Session cost to resume from, e.g. ``1.25``.
+    :returns: The JSONL record.
+    """
+    return {
+        "type": _CLAUDE_COST_STATE_RECORD_TYPE,
+        "sessionId": external_session_id,
+        "totalCostUSD": cost_usd,
+        "totalAPIDuration": 0,
+        "totalAPIDurationWithoutRetries": 0,
+        "totalToolDuration": 0,
+        "totalLinesAdded": 0,
+        "totalLinesRemoved": 0,
+        "totalDuration": 0,
+        "startTime": int(datetime.now(UTC).timestamp() * 1000),
+        "hasUnknownModelCost": False,
+        "modelUsage": {},
+    }
+
+
 async def _ensure_local_claude_resume_transcript(
     client: httpx.AsyncClient,
     *,
@@ -5724,6 +5832,7 @@ async def _ensure_local_claude_resume_transcript(
     workspace: Path,
     bridge_dir: Path | None = None,
     resume_copy: bool = False,
+    resume_cost_usd: float | None = None,
 ) -> Path | None:
     """
     Refresh Claude Code's local JSONL transcript for cold resume.
@@ -5751,6 +5860,11 @@ async def _ensure_local_claude_resume_transcript(
     :param bridge_dir: Launch bridge path identifying the attachment cache.
         Defaults to the legacy session-id bridge when omitted.
     :param resume_copy: Mark a temporary native copy so local import excludes it.
+    :param resume_cost_usd: The session's own recorded cost, e.g. ``1.25``.
+        The rebuilt transcript carries it so the resumed Claude keeps counting
+        from it instead of from zero, and the bridge dir records it so the
+        forwarder can tell whether Claude did. ``None`` when there is no cost
+        to restore, such as for a fork, which starts its own.
     :returns: Path to the local transcript that was written; ``None`` if
         *external_session_id* is not a safe transcript stem, or if the AP
         history yields no resumable records (an empty transcript would make
@@ -5763,6 +5877,14 @@ async def _ensure_local_claude_resume_transcript(
         return None
     from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
 
+    resolved_bridge_dir = bridge_dir or bridge_dir_for_conversation_id(session_id)
+    # A seeded cost applies only to the launch that seeded it.
+    try:
+        clear_resume_cost_baseline(resolved_bridge_dir)
+    except OSError:
+        _logger.warning(
+            "Could not clear the previous cold-resume cost for %r", session_id, exc_info=True
+        )
     current = workspace
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
@@ -5800,13 +5922,15 @@ async def _ensure_local_claude_resume_transcript(
         session_id=session_id,
         external_session_id=external_session_id,
         cwd=current,
-        bridge_dir=bridge_dir or bridge_dir_for_conversation_id(session_id),
+        bridge_dir=resolved_bridge_dir,
     )
     # Empty transcript → ``claude --resume`` exits fatally ("No conversation
     # found"), killing the terminal-as-agent. Return None so the caller
     # launches fresh instead of resuming nothing.
     if not records:
         return None
+    if resume_cost_usd is not None:
+        records.append(_claude_cost_state_record(external_session_id, resume_cost_usd))
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
     try:
@@ -5824,6 +5948,18 @@ async def _ensure_local_claude_resume_transcript(
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
+    if resume_cost_usd is not None:
+        try:
+            record_resume_cost_baseline(
+                resolved_bridge_dir,
+                claude_session_id=external_session_id,
+                cost_usd=resume_cost_usd,
+            )
+        except (OSError, RuntimeError):
+            # The transcript still restores the cost; only the forwarder's check is lost.
+            _logger.warning(
+                "Could not record the cold-resume cost for %r", session_id, exc_info=True
+            )
     return target
 
 
@@ -7227,6 +7363,7 @@ def _websocket_connect(
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
     from omnigent.session_host import session_routing_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
     from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
@@ -7238,6 +7375,8 @@ def _websocket_connect(
         **session_routing_headers(attach_url),
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
     }
+    # websockets adds its own User-Agent on top of the handshake headers; send only ours.
+    user_agent = pop_client_user_agent(handshake_headers)
     # A remote (https) workspace yields a wss:// attach URL; build a verifying
     # SSL context from a real CA bundle so verification works on interpreters
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
@@ -7251,6 +7390,7 @@ def _websocket_connect(
                 additional_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                user_agent_header=user_agent,
             ),
         )
     except TypeError:
@@ -7261,6 +7401,7 @@ def _websocket_connect(
                 extra_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                user_agent_header=user_agent,
             ),
         )
 

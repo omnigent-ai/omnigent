@@ -20,6 +20,7 @@ export function PullRequestFileActions({
   openLabel,
   openUrl,
   openUnavailableReason,
+  earlierComments,
 }: {
   /** The repo-relative current path. */
   path: string;
@@ -29,6 +30,7 @@ export function PullRequestFileActions({
   /** Null when the file can't be opened at the revision it shows. */
   openUrl: string | null;
   openUnavailableReason: string;
+  earlierComments?: { shown: boolean; onToggle: () => void };
 }) {
   const mobile = useIsMobileViewport();
   const copy = (value: string, label: string) => {
@@ -60,6 +62,11 @@ export function PullRequestFileActions({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          {earlierComments && (
+            <DropdownMenuItem onSelect={earlierComments.onToggle}>
+              {earlierComments.shown ? "Hide earlier comments" : "Show earlier comments"}
+            </DropdownMenuItem>
+          )}
           {mobile && (
             <DropdownMenuItem onSelect={() => copy(path, "path")}>Copy path</DropdownMenuItem>
           )}

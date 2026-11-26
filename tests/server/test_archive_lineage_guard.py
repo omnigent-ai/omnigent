@@ -41,11 +41,11 @@ def _check(conversations, target: str, source: str | None = None) -> None:
     require_archive_outside_source_lineage(SimpleNamespace(headers=headers), target, conversations)
 
 
-def test_refuses_the_caller_and_its_deepest_checkable_ancestor():
+def test_allows_the_caller_and_refuses_its_deepest_checkable_ancestor():
     conversations = _Conversations(_MAX_ARCHIVE_LINEAGE_DEPTH)
-    for target in (_session_id(0), _session_id(_MAX_ARCHIVE_LINEAGE_DEPTH - 1)):
-        with pytest.raises(OmnigentError, match="a session it runs under"):
-            _check(conversations, target)
+    _check(conversations, _session_id(0))
+    with pytest.raises(OmnigentError, match="a session it runs under"):
+        _check(conversations, _session_id(_MAX_ARCHIVE_LINEAGE_DEPTH - 1))
 
 
 def test_allows_an_unrelated_session_once_the_walk_reaches_the_root():

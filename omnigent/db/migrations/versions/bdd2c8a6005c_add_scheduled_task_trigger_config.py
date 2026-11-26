@@ -1,40 +1,18 @@
-"""add the event-trigger schema for scheduled tasks
+"""Add provider-neutral event-trigger configuration and occurrence receipts.
 
 Revision ID: bdd2c8a6005c
-Revises: a7d4c2e9f610
-Create Date: 2026-11-11 00:00:00.000000
+Revises: 47d3e8fc3e25
+Create Date: 2026-11-26 00:00:00.000000
 
-The shared schema for event-triggered automations, so each trigger provider
-adds a ``provider`` value and its JSON shapes, not columns:
+The additive columns require no backfill and have no application writer yet.
+Keep event triggers off while any running server still requires recurrence rules.
+Restarting an older binary rejects this unknown schema revision: stop writers,
+remove ruleless event tasks, downgrade the schema, then restart the old binary.
 
-* ``scheduled_tasks.trigger_config``: nullable JSON naming the provider and its
-  condition. A task with one runs on events instead of a schedule.
-* ``scheduled_tasks.rrule`` becomes nullable, since an event-triggered task has
-  no recurrence rule.
-* ``scheduled_tasks.pending_event_run_id``: the event run that a task continuing
-  one session adds new events to while it waits for a claim, or NULL.
-* ``scheduled_tasks.trigger_provider``: the provider named in ``trigger_config``,
-  or NULL for a scheduled task. It is the scalar that SQL filters on, through
-  ``ix_scheduled_tasks_trigger`` on ``(state, trigger_provider, next_run_at,
-  workspace_id, id)``: an equality seek finds a workspace's active tasks for one
-  provider, and the search for scheduled tasks without a next run time skips
-  event-triggered ones.
-* ``scheduled_task_runs.event``: nullable JSON describing the event(s) a run was
-  recorded for.
-* ``scheduled_task_event_receipts``: one row per event occurrence a task
-  accepted, unique per task, so an occurrence that joined another occurrence's
-  run is still recognized when it is delivered again.
-
-The JSON columns are read and written whole and never filtered in SQL, so they
-are stored compressed, at most 16,383 bytes each (``VARBINARY(16383)`` on MySQL).
-
-Additive, with no backfill: existing tasks keep their rule. Deploy it before the
-application change that writes these columns. A server that predates that change
-reads a task with no ``rrule`` as an invalid schedule and pauses it, so event
-triggers stay off until no such server runs against the database.
-
-Downgrade refuses while any task has no ``rrule``; delete the event-triggered
-automations first.
+SQLite rebuilds scheduled_tasks to relax nullability, requiring temporary disk
+space and a write lock during the copy. Schedule upgrades accordingly.
+Downgrade requires all event writers to stay stopped while the guard checks
+bounded transactions and the schema is restored.
 """
 
 from __future__ import annotations
@@ -49,7 +27,7 @@ from omnigent.db.compression import CompressedText
 from omnigent.db.db_models import Uuid16
 
 revision: str = "bdd2c8a6005c"
-down_revision: str | None = "a7d4c2e9f610"
+down_revision: str | None = "47d3e8fc3e25"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -69,7 +47,7 @@ def upgrade() -> None:
         batch_op.add_column(
             sa.Column(
                 "trigger_config",
-                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES, mysql_varbinary=True),
+                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES, bounded_binary=True),
                 nullable=True,
             )
         )
@@ -90,7 +68,7 @@ def upgrade() -> None:
         batch_op.add_column(
             sa.Column(
                 "event",
-                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES, mysql_varbinary=True),
+                CompressedText(max_stored_bytes=_JSON_MAX_STORED_BYTES, bounded_binary=True),
                 nullable=True,
             )
         )
@@ -169,6 +147,12 @@ def _refuse_while_a_task_has_no_rule() -> None:
         if len(rows) < _GUARD_BATCH:
             return
         after = (rows[-1].workspace_id, rows[-1].id)
+        if bind.dialect.name == "cockroachdb":
+            bind.commit()
+            bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        else:
+            with op.get_context().autocommit_block():
+                pass
 
 
 def _guard_page(

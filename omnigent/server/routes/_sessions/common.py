@@ -31,7 +31,7 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
 )
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import WrongReplicaError
 from omnigent.harness_capabilities import ForkHistory
 from omnigent.harness_plugins import (
     ANTIGRAVITY_NATIVE_CODING_AGENT,
@@ -440,6 +440,16 @@ _HOST_RECONNECT_GRACE_S = 30.0
 
 
 _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S = 30.0
+
+
+# A host that confirmed the spawn has a runner process that may still be
+# booting (slow imports on a busy machine), so it earns a longer connect wait.
+_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
+
+
+# A launch stops following runners that messages relaunch after this long, so a
+# host that keeps failing to start one still settles the launch and its rollback.
+_MANAGED_RUNNER_REPLACEMENT_WAIT_S = 15 * 60.0
 
 
 _HOST_RUNNER_STATUS_TIMEOUT_S = 3.0
@@ -1086,10 +1096,7 @@ def host_interactive_shells_for_request(
         and runner_router is not None
         and runner_router.host_is_on_another_replica(host_id)
     ):
-        raise OmnigentError(
-            "host shell inventory is on another replica",
-            code=ErrorCode.WRONG_REPLICA,
-        )
+        raise WrongReplicaError("host shell inventory is on another replica", host_id=host_id)
     return normalize_interactive_shells(host_registry.interactive_shells(host_id))
 
 
@@ -1117,6 +1124,7 @@ __all__ = [
     "CLIENT_SESSION_EVENT_TYPES",
     "COST_CONTROL_OVERRIDE_VALUES",
     "SUBAGENT_ROUTING_OVERRIDE_VALUES",
+    "_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR",
     "_ALLOWED_EVENT_TYPES",
     "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_ANTIGRAVITY_NATIVE_HARNESS",
@@ -1234,6 +1242,7 @@ __all__ = [
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
     "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
+    "_MANAGED_RUNNER_REPLACEMENT_WAIT_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
     "_MCP_ELICITATION_TYPE",

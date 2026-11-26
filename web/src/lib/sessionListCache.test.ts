@@ -1,17 +1,23 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { Session } from "@/lib/types";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
+  clearRecentlyCreated,
   collectConversationIds,
+  conversationRowFromSession,
   filtersFromConversationQueryKey,
+  insertCreatedRowIntoCaches,
   parseProjectSessionsQueryKey,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
   overlayArchivedIntoCaches,
+  settleUpdatedAtIntoCaches,
   overlayTitleIntoCaches,
+  recentlyCreatedSessions,
   removeIdsFromPages,
   settleOpenSessionRow,
 } from "./sessionListCache";
@@ -325,19 +331,74 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
     expect(needsRefetch).toBe(true);
   });
 
-  it("flags a refetch when a row is relabeled INTO a project so filtered variants reconcile", () => {
+  it("reports a row relabeled INTO a project so the filtered variants can reconcile", () => {
     // The row lives in the unfiltered archived variant; a session moved into
     // "Alpha" isn't in the Alpha-filtered cache yet, so only a server reconcile
-    // can place it. The label change here must trigger the prefix-wide refetch.
+    // can place it. The unfiltered list itself still holds it correctly.
     const before = data([conv("a", { archived: true, labels: {} })]);
     const items = new Map<string, SessionListWireItem>([
       ["a", { id: "a", archived: true, labels: { omni_project: "Alpha" } }],
     ]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, unfiltered);
+    const { data: after, needsRefetch, changes } = mergeItemsIntoPages(before, items, unfiltered);
 
     expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
-    expect(needsRefetch).toBe(true);
+    expect(needsRefetch).toBe(false);
+    expect(changes.get("a")?.fields).toEqual(new Set(["project"]));
+    expect(changes.get("a")?.row.labels).toEqual({ omni_project: "Alpha" });
+  });
+
+  it("patches labels no list filters on without a refetch or a membership change", () => {
+    // A failing session gains, then loses, a server-written error label on
+    // every turn; no list's membership or order reads it.
+    const before = data([conv("a", { labels: { omni_project: "Alpha" } })]);
+    const items = new Map<string, SessionListWireItem>([
+      [
+        "a",
+        {
+          id: "a",
+          labels: { omni_project: "Alpha", "omnigent.last_task_error_code": "rate_limited" },
+        },
+      ],
+    ]);
+
+    const { data: after, needsRefetch, changes } = mergeItemsIntoPages(before, items, unfiltered);
+
+    expect(after!.pages[0].data[0].labels["omnigent.last_task_error_code"]).toBe("rate_limited");
+    expect(needsRefetch).toBe(false);
+    expect(changes.size).toBe(0);
+  });
+
+  it("names each membership field a patch moves", () => {
+    const before = data([conv("a", { labels: {} })]);
+    const fieldsFor = (wire: Omit<SessionListWireItem, "id">) =>
+      mergeItemsIntoPages(before, new Map([["a", { id: "a", ...wire }]]), unfiltered).changes.get(
+        "a",
+      )?.fields;
+
+    expect(fieldsFor({ archived: true })).toEqual(new Set(["archived"]));
+    expect(fieldsFor({ title: "renamed" })).toEqual(new Set(["title"]));
+    expect(fieldsFor({ project_id: "proj_1" })).toEqual(new Set(["project"]));
+    // A pin label no cached list filters on names no membership field.
+    expect(fieldsFor({ labels: { "omnigent.pinned": "1" } })).toBeUndefined();
+    expect(fieldsFor({ labels: { "omnigent.archived_at": "1" } })).toEqual(new Set(["archived"]));
+    expect(fieldsFor({ labels: { "omnigent.side_chat": "1" } })).toEqual(new Set(["hidden"]));
+  });
+
+  it("refetches a list a row turned into a side chat in, since the server drops it", () => {
+    const before = data([conv("a", { labels: {} })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", labels: { "omnigent.side_chat": "1" } }],
+    ]);
+
+    expect(mergeItemsIntoPages(before, items, unfiltered).needsRefetch).toBe(true);
+  });
+
+  it("doesn't refetch an unsearched list for a title change", () => {
+    const before = data([conv("a", { title: "old" })]);
+    const items = new Map<string, SessionListWireItem>([["a", { id: "a", title: "new" }]]);
+
+    expect(mergeItemsIntoPages(before, items, unfiltered).needsRefetch).toBe(false);
   });
 
   it("keeps a row whose project still matches when a non-label field changes", () => {
@@ -550,6 +611,26 @@ describe("overlayArchivedIntoCaches", () => {
   });
 });
 
+describe("settleUpdatedAtIntoCaches", () => {
+  it("writes the confirmed updated_at over an older one and keeps a newer one", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(["conversations", "", true], data([conv("a", { updated_at: 5 })]));
+    qc.setQueryData(["conversations", "", false], data([conv("a", { updated_at: 30 })]));
+    qc.setQueryData(
+      ["project-sessions", "proj", "updated_at", true],
+      data([conv("a", { archived: true, updated_at: 5 })]),
+    );
+
+    settleUpdatedAtIntoCaches(qc, "a", 20);
+
+    const updatedAt = (key: unknown[]) =>
+      qc.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].updated_at;
+    expect(updatedAt(["conversations", "", true])).toBe(20);
+    expect(updatedAt(["conversations", "", false])).toBe(30);
+    expect(updatedAt(["project-sessions", "proj", "updated_at", true])).toBe(20);
+  });
+});
+
 describe("insertNewRowsIntoPages", () => {
   const candidate = (id: string, extra: Partial<Conversation> = {}) =>
     new Map<string, SessionListWireItem>([[id, { id, updated_at: 100, ...extra }]]);
@@ -615,6 +696,39 @@ describe("insertNewRowsIntoPages", () => {
     );
     expect(inserted).toHaveLength(0);
   });
+
+  it("infers ownership from the row when no viewer id is known", () => {
+    const before = data([conv("a")]);
+    const owned = candidate("new", { owner: "alice" });
+    const mine = insertNewRowsIntoPages(before, owned, { ...DEFAULT_FILTERS, visibility: "mine" });
+    expect(mine.inserted.map((c) => c.id)).toEqual(["new"]);
+    const shared = insertNewRowsIntoPages(before, owned, {
+      ...DEFAULT_FILTERS,
+      visibility: "shared",
+    });
+    expect(shared.inserted).toHaveLength(0);
+  });
+
+  it("treats an ownerless row with a shared grant as shared, not mine", () => {
+    const before = data([conv("a")]);
+    const granted = candidate("new", { permission_level: 1 });
+    const shared = insertNewRowsIntoPages(
+      before,
+      granted,
+      { ...DEFAULT_FILTERS, visibility: "shared" },
+      undefined,
+      "alice",
+    );
+    expect(shared.inserted.map((c) => c.id)).toEqual(["new"]);
+    const mine = insertNewRowsIntoPages(
+      before,
+      granted,
+      { ...DEFAULT_FILTERS, visibility: "mine" },
+      undefined,
+      "alice",
+    );
+    expect(mine.inserted).toHaveLength(0);
+  });
 });
 
 describe("settleOpenSessionRow", () => {
@@ -640,5 +754,102 @@ describe("settleOpenSessionRow", () => {
     expect(client.getQueryData(key)).toEqual(
       conv("a", { owner: "teammate", archived: true, title: "Renamed", updated_at: 5 }),
     );
+  });
+});
+
+function session(overrides: Partial<Session> = {}): Session {
+  return {
+    id: "conv_fork",
+    agentId: "ag_1",
+    agentName: "hello",
+    status: "idle",
+    createdAt: 100,
+    title: "Fork of My session",
+    items: [],
+    permissionLevel: 4,
+    parentSessionId: null,
+    subAgentName: null,
+    kind: "default",
+    ...overrides,
+  };
+}
+
+describe("conversationRowFromSession", () => {
+  it("maps a session snapshot onto the sidebar row shape", () => {
+    const row = conversationRowFromSession(
+      session({
+        updatedAt: 150,
+        labels: { k: "v" },
+        hostId: "host_1",
+        workspace: "/repo",
+        gitBranch: "feat",
+        projectId: "proj_1",
+        harness: "codex",
+        family: { id: "fam_1", representative_id: "conv_src", pinned: false },
+      }),
+    );
+    expect(row).toMatchObject({
+      id: "conv_fork",
+      object: "conversation",
+      title: "Fork of My session",
+      created_at: 100,
+      updated_at: 150,
+      labels: { k: "v" },
+      permission_level: 4,
+      agent_id: "ag_1",
+      agent_name: "hello",
+      host_id: "host_1",
+      workspace: "/repo",
+      git_branch: "feat",
+      parent_session_id: null,
+      project_id: "proj_1",
+      harness: "codex",
+      family: { id: "fam_1", representative_id: "conv_src", pinned: false },
+    });
+    // A snapshot names no owner, so the row reads as the viewer's own.
+    expect(row.owner).toBeUndefined();
+  });
+
+  it("falls back to created_at when the snapshot carries no updated_at", () => {
+    const row = conversationRowFromSession(session());
+    expect(row.updated_at).toBe(100);
+    expect(row.labels).toEqual({});
+    expect(row.project_id).toBeNull();
+  });
+});
+
+describe("insertCreatedRowIntoCaches", () => {
+  afterEach(() => clearRecentlyCreated());
+
+  const ids = (qc: QueryClient, key: unknown[]) =>
+    qc.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data.map((c) => c.id);
+
+  it("prepends the row to the unfiltered lists and arms the keep-alive", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(["conversations", "", false], data([conv("old")]));
+    qc.setQueryData(["conversations", "", false, null, "mine"], data([conv("old")]));
+    // A search list and the archived tab can't place a brand-new row.
+    qc.setQueryData(["conversations", "old", false], data([conv("old")]));
+    qc.setQueryData(
+      ["conversations", "", true, null, "archived"],
+      data([conv("gone", { archived: true })]),
+    );
+    // Nor can another project's list or the shared tab hold a fork the viewer owns.
+    qc.setQueryData(["conversations", "", true, "Alpha"], data([conv("old")]));
+    qc.setQueryData(["conversations", "", false, null, "shared"], data([conv("theirs")]));
+
+    const row = conv("fork", { title: "Fork of old", labels: { omni_project: "Beta" } });
+    insertCreatedRowIntoCaches(qc, row);
+
+    expect(ids(qc, ["conversations", "", false])).toEqual(["fork", "old"]);
+    expect(ids(qc, ["conversations", "", false, null, "mine"])).toEqual(["fork", "old"]);
+    expect(ids(qc, ["conversations", "old", false])).toEqual(["old"]);
+    expect(ids(qc, ["conversations", "", true, null, "archived"])).toEqual(["gone"]);
+    expect(ids(qc, ["conversations", "", true, "Alpha"])).toEqual(["old"]);
+    expect(ids(qc, ["conversations", "", false, null, "shared"])).toEqual(["theirs"]);
+    expect(recentlyCreatedSessions.get("fork")).toEqual(row);
+
+    insertCreatedRowIntoCaches(qc, row);
+    expect(ids(qc, ["conversations", "", false])).toEqual(["fork", "old"]);
   });
 });

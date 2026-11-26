@@ -6,6 +6,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 
 interface SettingsLabelProps {
   label: string;
+  /** A short tag after the label, such as what kind of setting this is. */
+  labelBadge?: ReactNode;
   description: ReactNode;
   tooltipDescription?: ReactNode;
   labelId?: string;
@@ -20,6 +22,7 @@ interface SettingsLabelProps {
 /** Keeps setting help inline on mobile while preserving desktop descriptions. */
 export function SettingsLabel({
   label,
+  labelBadge,
   description,
   tooltipDescription,
   labelId,
@@ -38,6 +41,7 @@ export function SettingsLabel({
         <span id={labelId} className={cn("text-ui font-normal md:font-medium", labelClassName)}>
           {label}
         </span>
+        {labelBadge}
         <TooltipProvider delayDuration={0}>
           <Tooltip open={tooltipOpen} onOpenChange={setTooltipOpen}>
             <TooltipTrigger asChild>

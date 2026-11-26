@@ -14,6 +14,11 @@ from omnigent.harnesses.codex_native.app_server import (
     build_codex_native_server,
 )
 
+# Bound at import, before the package conftest stubs it for every test.
+from omnigent.harnesses.codex_native.app_server import (
+    _codex_catalog_models as _installed_codex_catalog_models,
+)
+
 
 @pytest.fixture
 def _databricks_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
@@ -131,9 +136,11 @@ async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
     ("live_listing", "cached_listing", "expected"),
     [
         pytest.param(
-            ("system.ai.gpt-6-1-sol",),
+            ("system.ai.gpt-5-6-sol", "system.ai.gpt-6-1-sol", "system.ai.glm-5-2"),
             ["system.ai.gpt-5-6-sol"],
-            DatabricksCodexModelListing(("system.ai.gpt-6-1-sol",)),
+            DatabricksCodexModelListing(
+                ("system.ai.gpt-6-1-sol", "system.ai.gpt-5-6-sol", "system.ai.glm-5-2")
+            ),
             id="live",
         ),
         pytest.param(
@@ -141,8 +148,10 @@ async def test_codex_launch_models_lists_a_profile_launch_from_its_workspace(
         ),
         pytest.param(
             OSError("listing failed"),
-            ["system.ai.gpt-6-1-sol"],
-            DatabricksCodexModelListing(("system.ai.gpt-6-1-sol",), cached=True),
+            ["system.ai.gpt-5-6-sol", "system.ai.gpt-6-1-sol"],
+            DatabricksCodexModelListing(
+                ("system.ai.gpt-6-1-sol", "system.ai.gpt-5-6-sol"), cached=True
+            ),
             id="cache",
         ),
         pytest.param(
@@ -170,6 +179,15 @@ def test_databricks_profile_codex_models_reads_live_then_cached_listing(
     monkeypatch.setattr(
         app_server, "_databricks_gateway_host", Mock(return_value="https://h.example.com/")
     )
+    # Either listing comes back in the installed Codex's catalog order.
+    monkeypatch.setattr(
+        app_server,
+        "_codex_catalog_models",
+        lambda: [
+            {"slug": "gpt-6.1-sol", "priority": 1, "visibility": "list"},
+            {"slug": "gpt-5.6-sol", "priority": 5, "visibility": "list"},
+        ],
+    )
     monkeypatch.setattr(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
         Mock(return_value=SimpleNamespace(token="tok")),
@@ -193,6 +211,36 @@ def test_databricks_profile_codex_models_reads_live_then_cached_listing(
         read_cached_state.assert_called_once_with("https://h.example.com")
     else:
         read_cached_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("codex_path", "catalog", "expected"),
+    [
+        pytest.param(None, None, [], id="no-codex"),
+        pytest.param("/bin/codex", None, [], id="unreadable"),
+        pytest.param(
+            "/bin/codex",
+            {"models": [{"slug": "gpt-6.1-sol"}]},
+            [{"slug": "gpt-6.1-sol"}],
+            id="read",
+        ),
+    ],
+)
+def test_codex_catalog_models_reads_the_installed_codex(
+    monkeypatch: pytest.MonkeyPatch,
+    codex_path: str | None,
+    catalog: dict[str, object] | None,
+    expected: list[object],
+) -> None:
+    """The ordering source is the installed Codex's own catalog, empty when unreadable."""
+    from omnigent.harnesses.codex_native import app_server
+
+    read_catalog = Mock(return_value=catalog)
+    monkeypatch.setattr(app_server, "_find_codex_cli", lambda: codex_path)
+    monkeypatch.setattr(app_server, "read_codex_model_catalog", read_catalog)
+
+    assert _installed_codex_catalog_models() == expected
+    assert read_catalog.called is (codex_path is not None)
 
 
 @pytest.mark.parametrize(

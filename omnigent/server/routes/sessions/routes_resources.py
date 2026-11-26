@@ -29,7 +29,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.types import Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.debug_logging import StageTimings, debug_event
 from omnigent.entities import (
@@ -37,12 +37,14 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.host.frames import PullRequestVouch
+from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_session
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
@@ -60,10 +62,21 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
+from omnigent.server.pull_request_viewers import (
+    OWNER_ONLY_CHANGES_MESSAGE,
+    PullRequestViewer,
+    info_for_viewer,
+    review_comments_for_viewer,
+    review_read_params,
+    review_threads_for_viewer,
+)
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
@@ -73,7 +86,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
-from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -109,16 +122,19 @@ from omnigent.server.schemas import (
     CopiedFile,
     CopyFilesRequest,
     CopyFilesResponse,
+    ErrorResponse,
     SessionPullRequestList,
     SessionRepositoryBranchList,
     SessionResourceObject,
     SessionResourcePaginatedList,
+    TerminalShellState,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_pull_request_store import SessionPullRequestLimitError
+from omnigent.terminals.shell_inspection import ShellInspection
 
 if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
@@ -174,7 +190,7 @@ class _RunnerStreamResponse(StreamingResponse):
     """
 
     def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+        super().__init__(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers)
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -188,11 +204,19 @@ class _RunnerStreamResponse(StreamingResponse):
 # budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
 # reported as failed.
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
+# A terminal resource id as the runner builds it, checked before it goes into a runner path.
+_TERMINAL_RESOURCE_ID_RE = re.compile(r"terminal_[A-Za-z0-9_.-]{1,200}")
+# The shell route's answer when the session's runner is offline or unreachable.
+_SHELL_RUNNER_OFFLINE = "This session's runner isn't available right now."
+# The whole runner call, since a tunneled runner's transport doesn't enforce httpx's timeout.
+_SHELL_PROXY_TIMEOUT_S = 1.0
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
 # the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
 _MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
+# Room in a workspace API upload's body for its URL, name and protobuf framing.
+_UPLOAD_FIELDS_MARGIN_BYTES = 64 * 1024
 
 # Automatic previews can require this acknowledgement when talking to older servers.
 _WORKSPACE_FILE_SCOPE_HEADERS = {
@@ -243,11 +267,12 @@ def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachme
     )
     if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
         return (
-            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+            f"{detail}, or use a supported native coding agent for archives, "
+            "Office documents, databases, and MP4 videos."
         )
     if policy.extensions:
         extensions = ", ".join(sorted(policy.extensions))
-        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+        return f"{detail}, or use a supported native coding agent for {extensions} files."
     return f"{detail}."
 
 
@@ -300,6 +325,7 @@ def register_resources_routes(
                 session_id=conv.id,
                 conv=conv,
                 app_state=request.app.state,
+                request=request,
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
@@ -468,7 +494,7 @@ def register_resources_routes(
         file is. There is no host fallback: the host tunnel's filesystem
         op answers in a single message, so it cannot stream a file.
 
-        :param request: The incoming request, for the gzip opt-out.
+        :param request: The incoming request, including any media byte range.
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param runner_path: Runner-relative URL carrying ``download=true``.
@@ -494,6 +520,7 @@ def register_resources_routes(
                 session_id=session_id,
                 conv=conversation,
                 app_state=request.app.state,
+                request=request,
                 conversation_store=conversation_store,
                 runner_router=runner_router or get_server_runner_router(),
                 raise_host_refusal=True,
@@ -509,7 +536,16 @@ def register_resources_routes(
             )
         try:
             resp = await runner_client.send(
-                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                runner_client.build_request(
+                    "GET",
+                    runner_path,
+                    headers={
+                        name: request.headers[name]
+                        for name in ("range", "if-range")
+                        if name in request.headers
+                    },
+                    timeout=_download_timeout,
+                ),
                 stream=True,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
@@ -517,7 +553,9 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
-        if resp.status_code == 200 and "content-disposition" in resp.headers:
+        if (resp.status_code in (200, 206) and "content-disposition" in resp.headers) or (
+            resp.status_code == 416 and "content-range" in resp.headers
+        ):
             skip_gzip(request)
             forwarded = {
                 name: resp.headers[name]
@@ -526,6 +564,8 @@ def register_resources_routes(
                     "content-length",
                     "content-encoding",
                     "content-disposition",
+                    "accept-ranges",
+                    "content-range",
                     "cache-control",
                     "x-content-type-options",
                 )
@@ -562,6 +602,8 @@ def register_resources_routes(
         params: dict[str, str] | None = None,
         timeout: float = 10.0,
         unsupported_endpoint_message: str | None = None,
+        *,
+        for_control: bool = False,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -572,6 +614,7 @@ def register_resources_routes(
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :param timeout: Seconds to wait for the runner response.
         :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
+        :param for_control: Read registry metadata without admitting execution.
         :returns: Parsed JSON response body.
         :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
             typed ``not_found`` (404) or
@@ -579,10 +622,14 @@ def register_resources_routes(
         :raises HTTPException: The runner's 400 with its detail when it rejects the request;
             502 on any other runner failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        if for_control:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation, for_control=True
+            )
+        else:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -627,11 +674,11 @@ def register_resources_routes(
                 and isinstance(response_payload.get("detail"), str)
             ):
                 raise HTTPException(status_code=400, detail=response_payload["detail"])
+            msg = "runner resource endpoint failed"
             if isinstance(response_payload, dict):
-                error = response_payload.get("error", {})
-                msg = error.get("message") or "runner resource endpoint failed"
-            else:
-                msg = "runner resource endpoint failed"
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    msg = error["message"] or msg
             raise HTTPException(status_code=502, detail=msg)
         if not isinstance(response_payload, dict):
             raise HTTPException(
@@ -716,8 +763,34 @@ def register_resources_routes(
             raise runner_offline
         return payload
 
+    async def _session_host(
+        conv: Conversation, request: Request
+    ) -> tuple[str | None, HostConnection | None, str | None]:
+        """Return the host a session runs on, its tunnel here, and the session's workspace.
+
+        Side chats and sub-agents run on the host of the session that owns them,
+        but keep their own workspace; like the runner, fall back to the owner's
+        workspace only when the session has none. The tunnel is ``None`` when the
+        host isn't connected here; a host live on another replica raises
+        :class:`WrongReplicaError`, so the client re-addresses.
+
+        :param conv: The authorized session.
+        :param request: The incoming request, for the app's host store.
+        :returns: ``(host id, local host connection or None, workspace)``.
+        """
+        owner = await asyncio.to_thread(routing_host_session, conv, conversation_store) or conv
+        host_id = owner.host_id
+        host = host_registry.get(host_id) if host_registry is not None and host_id else None
+        host_store = getattr(request.app.state, "host_store", None)
+        if host is None and host_id and host_store is not None:
+            record = await asyncio.to_thread(host_store.get_host, host_id)
+            absent = host_absent_error(record) if record is not None else None
+            if isinstance(absent, WrongReplicaError):
+                raise absent
+        return host_id, host, conv.workspace or owner.workspace
+
     async def _environment_reach_for_session(
-        conversation: Conversation,
+        conversation: Conversation, workspace: str | None = None
     ) -> tuple[list[Any], bool, str] | None:
         """Compute a session's browse reach without consulting the runner.
 
@@ -728,12 +801,15 @@ def register_resources_routes(
         the decision has to be made here.
 
         :param conversation: Conversation loaded during authorization.
+        :param workspace: The workspace to resolve against, when it isn't the
+            conversation's own (a sub-agent inheriting its runner's).
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
         from omnigent.inner.sandbox import declared_filesystem_reach
 
-        if not conversation.workspace:
+        workspace = workspace or conversation.workspace
+        if not workspace:
             return None
         spec = await asyncio.to_thread(
             _load_agent_spec_for_session,
@@ -743,13 +819,8 @@ def register_resources_routes(
         spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
         if spec_os_env is None:
             return None
-        root = Path(conversation.workspace)
-        roots, unconfined = declared_filesystem_reach(root, spec_os_env)
-        return (
-            roots,
-            unconfined,
-            conversation.workspace,
-        )
+        roots, unconfined = declared_filesystem_reach(Path(workspace), spec_os_env)
+        return roots, unconfined, workspace
 
     def _runner_environment_segment(environment_id: str) -> str:
         """Preserve an environment identifier as one runner URL segment."""
@@ -1085,7 +1156,8 @@ def register_resources_routes(
         :param op: Host-side write op — ``"github_set_preference"``,
             ``"github_prs_update"``, ``"github_labels_update"``,
             ``"github_reviewers_update"``, ``"github_details_update"``,
-            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``, or
+            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``,
+            ``"github_merge_as"``, or
             ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
         :param timeout: Seconds to wait for the host; the tunnel's default when ``None``.
@@ -1127,6 +1199,48 @@ def register_resources_routes(
             if exc.status == 400:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
             raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _caller_is_session_owner(conv: Conversation, request: Request) -> bool:
+        """Whether the caller holds the owner grant on the session's root; admins don't count."""
+        return await asyncio.to_thread(
+            _is_session_owner,
+            _get_user_id(request, auth_provider),
+            conv,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+
+    async def _require_pull_request_owner(conv: Conversation, request: Request) -> None:
+        """Refuse a change to the session's pull requests to anyone but its owner.
+
+        Called right after the route's own access check, before anything is stored or sent:
+        every change runs as the host's code-host account, which is the owner's.
+        """
+        if not await _caller_is_session_owner(conv, request):
+            raise OmnigentError(OWNER_ONLY_CHANGES_MESSAGE, code=ErrorCode.FORBIDDEN)
+
+    async def _pull_request_viewer(conv: Conversation, request: Request) -> PullRequestViewer:
+        """Who reads the session's pull request info; the least trusted when unsure."""
+        try:
+            if await _caller_is_session_owner(conv, request):
+                return PullRequestViewer.OWNER
+            if permission_store is not None and await asyncio.to_thread(
+                check_session_access,
+                _get_user_id(request, auth_provider),
+                conv.id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+                conv,
+            ):
+                return PullRequestViewer.EDITOR
+        except Exception:
+            _logger.warning(
+                "Could not decide who reads a session's pull requests",
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+        return PullRequestViewer.VIEWER
 
     async def _post_pr_edit(
         session_id: str,
@@ -1214,6 +1328,8 @@ def register_resources_routes(
         session_id: str,
         path: str,
         conversation: Conversation,
+        *,
+        for_control: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a DELETE request to the runner and return status + JSON.
 
@@ -1223,10 +1339,14 @@ def register_resources_routes(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: On transport failure or an unreadable runner reply.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        if for_control:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation, for_control=True
+            )
+        else:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -1457,6 +1577,7 @@ def register_resources_routes(
             path,
             conv,
             params=forwarded or None,
+            for_control=True,
         )
         await _annotate_direct_attach(page, session_id, request)
         return page
@@ -1517,7 +1638,7 @@ def register_resources_routes(
         resolver = get_runner_direct_attach_resolver()
         if resolver is None:
             return
-        endpoint = resolver(session_id)
+        endpoint = await asyncio.to_thread(resolver, session_id)
         if endpoint is None:
             return
         if not await _caller_owns_session(session_id, request):
@@ -1628,6 +1749,7 @@ def register_resources_routes(
             session_id=session_id,
             conv=conv,
             app_state=request.app.state,
+            request=request,
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
         )
@@ -1635,7 +1757,7 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
-            await asyncio.to_thread(router.require_mcp_registry_support, conv)
+            await asyncio.to_thread(router.require_runtime_support, conv)
         status, payload = await _proxy_post_to_runner(
             session_id,
             path,
@@ -1690,7 +1812,80 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
-        return await _proxy_get_to_runner(session_id, path, conv)
+        return await _proxy_get_to_runner(session_id, path, conv, for_control=True)
+
+    @router.get(
+        "/sessions/{session_id}/resources/terminals/{terminal_id}/shell",
+        response_model=TerminalShellState,
+        responses={
+            403: {"model": ErrorResponse, "description": "The caller can't close this terminal"},
+            404: {
+                "model": ErrorResponse,
+                "description": "No such running terminal in a session the caller can see",
+            },
+            502: {"description": "The runner failed to inspect the terminal"},
+            503: {
+                "model": ErrorResponse,
+                "description": "The runner is offline, or too old to inspect terminals",
+            },
+        },
+    )
+    async def get_session_terminal_shell(
+        request: Request,
+        session_id: str,
+        terminal_id: str,
+    ) -> dict[str, Any]:
+        """
+        Whether a terminal runs anything besides its login shell, so closing it can skip asking.
+
+        Only a caller who may close the terminal may ask: edit access, as deleting it needs.
+        Every miss answers one fixed 404, and runner failures become fixed messages: the
+        runner's text never reaches the caller, and its answer is rebuilt field by field. A
+        runner tunnel on another replica keeps its routing error, so the client can resend.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Terminal resource id, e.g. ``"terminal_bash_s1"``.
+        :returns: ``{"state", "foreground", "background_jobs"}``.
+        """
+        not_found = OmnigentError("Terminal not found", code=ErrorCode.NOT_FOUND)
+        if _TERMINAL_RESOURCE_ID_RE.fullmatch(terminal_id) is None:
+            raise not_found
+        try:
+            conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise not_found from None
+            raise
+        path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell"
+        older_runner = "This session's runner can't inspect terminals."
+        try:
+            async with asyncio.timeout(_SHELL_PROXY_TIMEOUT_S):
+                payload = await _proxy_get_to_runner(
+                    session_id,
+                    path,
+                    conv,
+                    timeout=_SHELL_PROXY_TIMEOUT_S,
+                    unsupported_endpoint_message=older_runner,
+                    for_control=True,
+                )
+        except TimeoutError:
+            # A runner that stops answering fails the same way as one that answers badly.
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        except WrongReplicaError:
+            # Its host id tells the client where to resend; it carries no runner text.
+            raise
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise not_found from None
+            if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                # An older runner and an offline one both ask before closing, but read apart.
+                message = older_runner if exc.message == older_runner else _SHELL_RUNNER_OFFLINE
+                raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE) from None
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        except HTTPException:
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        return ShellInspection.from_untrusted(payload).to_dict()
 
     @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
     async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:
@@ -1851,6 +2046,7 @@ def register_resources_routes(
             session_id,
             path,
             conv,
+            for_control=True,
         )
         if status == 404:
             error = payload.get("error", {})
@@ -2528,6 +2724,7 @@ def register_resources_routes(
                     session_id=session_id,
                     conv=conv,
                     app_state=request.app.state,
+                    request=request,
                     conversation_store=conversation_store,
                     runner_router=runner_router or get_server_runner_router(),
                     raise_host_refusal=True,
@@ -2719,6 +2916,163 @@ def register_resources_routes(
                 "Session runner does not support content search; update the host and restart the session"
             ),
         )
+
+    @router.post(
+        "/sessions/{session_id}/workspace/direct-access",
+        response_model=None,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def create_workspace_direct_access(request: Request, session_id: str) -> dict[str, Any]:
+        """Give the session owner a short-lived token for its host's workspace socket.
+
+        The owner's desktop app, on the same machine as the host, uses it to call
+        the workspace API without a server round trip. Unconfined sessions only:
+        the host reads the workspace itself and applies no sandbox's hidden paths.
+        Any refusal leaves the client on the server route.
+        """
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_DIRECT_ACCESS):
+            raise HTTPException(status_code=404, detail="Workspace direct access is disabled")
+        conv, is_owner = await _authorize_browse_read_with_owner(session_id, request)
+        if not is_owner:
+            raise HTTPException(
+                status_code=403, detail="Only the session owner can read its workspace directly"
+            )
+        host_id, host, workspace = await _session_host(conv, request)
+        if host_id is None or host is None:
+            raise HTTPException(status_code=404, detail="The session's host is not connected")
+        socket_path = host.hello.workspace_socket
+        key = host.hello.workspace_token_key
+        if not socket_path or not key:
+            raise HTTPException(
+                status_code=404, detail="The session's host offers no direct access"
+            )
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace)
+        if reach is None or not reach[1]:
+            raise HTTPException(
+                status_code=404, detail="Direct access serves unconfined sessions only"
+            )
+        token, expires_at = mint_token(
+            key, host_id=host_id, session_id=session_id, workspace=reach[2]
+        )
+        return {
+            "host_id": host_id,
+            "socket_path": socket_path,
+            "token": token,
+            "expires_at": expires_at,
+        }
+
+    @router.post("/sessions/{session_id}/workspace/{service}/{method}", response_model=None)
+    async def call_workspace_api(
+        request: Request, session_id: str, service: str, method: str
+    ) -> Response:
+        """Serve the workspace API to any client, answered by the session's host.
+
+        Each method has its gate (:mod:`omnigent.server.workspace_access`): the file
+        methods the file routes' read gate, the pull request reads their REST routes'
+        gates, the pull request changes the session owner's, and an unknown method a
+        404. A change from an untrusted ``Origin`` is refused before any other work.
+        The API never takes absolute paths.
+        Side chats and sub-agents use the host and workspace of the session that
+        owns them. Unconfined sessions only, because the host applies no sandbox's
+        hidden paths. A host on another replica gets the REST wrong-replica error,
+        so the client's fetch re-addresses it; other refusals are Connect errors.
+        """
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_API_SERVER_ACCESS):
+            raise HTTPException(status_code=404, detail="The workspace API is disabled")
+        try:
+            from connectrpc.code import Code
+        except ImportError:
+            raise HTTPException(
+                status_code=501, detail="The workspace API needs `omnigent[workspace-api]`"
+            ) from None
+        from connectrpc.errors import ConnectError
+        from connectrpc.server import DEFAULT_READ_MAX_BYTES
+
+        from omnigent.api.workspace.v1alpha1.workspace_connect import (
+            WorkspaceServiceASGIApplication,
+        )
+        from omnigent.host.frames import CAP_WORKSPACE_API
+        from omnigent.host.workspace_methods import WORKSPACE_METHODS
+        from omnigent.host.workspace_pull_request_input import MAX_ATTACHMENT_BYTES
+        from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
+        from omnigent.server.workspace_api import (
+            VIEWER_SHAPED_METHODS,
+            ConnectCallResponse,
+            HostTarget,
+            HostWorkspaceService,
+            PullRequestRoute,
+        )
+
+        gate = gate_for(method)
+        if gate is None:
+            raise HTTPException(status_code=404, detail="Unknown workspace method")
+        # As on REST's multipart route: a page on another site never makes a change.
+        described = WORKSPACE_METHODS[method]
+        if described.pull_request and not described.no_side_effects:
+            require_trusted_origin(request)
+        if gate is WorkspaceGate.BROWSE:
+            conv = await _authorize_browse_read(session_id, request)
+        else:
+            conv = await _validate_session(session_id, request, LEVEL_READ)
+        # The owner grant itself, with no admin pass: only the owner acts as the host's account.
+        # Only an owner-gated method and GetCapabilities, which lists them, need it.
+        if gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities":
+            session_owner = await _caller_is_session_owner(conv, request)
+        elif method in VIEWER_SHAPED_METHODS:
+            # The thread reads show the host account's rights to the owner alone; as on REST,
+            # a failed lookup reads them as anyone else would rather than failing the read.
+            viewer = await _pull_request_viewer(conv, request)
+            session_owner = viewer is PullRequestViewer.OWNER
+        else:
+            session_owner = False
+        if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
+            raise OmnigentError(
+                "Only the session's owner can use this through the workspace API",
+                code=ErrorCode.FORBIDDEN,
+            )
+        _host_id, host, workspace = await _session_host(conv, request)
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace) if host is not None else None
+        target: HostTarget | ConnectError
+        if host is None or host_registry is None:
+            target = ConnectError(Code.UNAVAILABLE, "The session's host is not connected")
+        elif CAP_WORKSPACE_API not in host.hello.capabilities:
+            target = ConnectError(Code.UNIMPLEMENTED, "The session's host needs an update")
+        elif reach is None or not reach[1]:
+            target = ConnectError(
+                Code.FAILED_PRECONDITION, "The workspace API serves unconfined sessions only"
+            )
+        else:
+            target = HostTarget(host_registry, host, reach[2])
+        forwarder = HostWorkspaceService(
+            target,
+            content_search=flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH),
+            pull_requests=PullRequestRoute(
+                session_id,
+                vouch=lambda pr_url: _workspace_pull_request_vouch(session_id, pr_url),
+                overview=lambda payload, sent_at: _with_server_pull_requests(
+                    session_id, payload, sent_at
+                ),
+                viewer=PullRequestViewer.OWNER if session_owner else PullRequestViewer.VIEWER,
+            ),
+            # Only GetCapabilities lists methods, and it needs the browse gate.
+            callable_methods=callable_methods(
+                browse=gate is WorkspaceGate.BROWSE, session_owner=session_owner
+            ),
+        )
+        # An upload may be as large as an attachment, but only once the owner gate has passed;
+        # every other call, and anyone else's, keeps connectrpc's default read limit.
+        read_max_bytes = (
+            MAX_ATTACHMENT_BYTES + _UPLOAD_FIELDS_MARGIN_BYTES
+            if method == "UploadAttachment" and session_owner
+            else DEFAULT_READ_MAX_BYTES
+        )
+        app = WorkspaceServiceASGIApplication(forwarder, read_max_bytes=read_max_bytes)
+        # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
+        return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",
@@ -3003,6 +3357,45 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/compare-diff",
+        # Internal (UI "Changes since" view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_compare_diff(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> Any:
+        """
+        Return the selected PR's changes after one of its commits, up to its head.
+
+        Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param head_sha: The PR head the panel shows, a full commit id.
+        :param from_sha: One of the PR's commits, a full commit id.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha is not None:
+            params["head_sha"] = head_sha
+        if from_sha is not None:
+            params["from_sha"] = from_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_compare_diff",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/compare-diff",
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
         # Internal (UI GitHub diff view) — hidden from the public API reference.
         include_in_schema=False,
@@ -3146,7 +3539,7 @@ def register_resources_routes(
                 f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **scope_params}),
             )
-            if scope == "workspace" and download_response.status_code == 200:
+            if scope == "workspace" and download_response.status_code in (200, 206):
                 download_response.headers.update(_WORKSPACE_FILE_SCOPE_HEADERS)
             return download_response
         path = (
@@ -3352,6 +3745,30 @@ def register_resources_routes(
         except server_prs.NotAssociatedError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    async def _workspace_pull_request_vouch(
+        session_id: str, pr_url: str
+    ) -> PullRequestVouch | None:
+        """The server's vouch for a workspace API pull request read, as REST gives it.
+
+        :returns: ``None`` until the server stores the session's PRs, so the host's own
+            record decides.
+        :raises ConnectError: FAILED_PRECONDITION for a PR the session doesn't link.
+        """
+        from connectrpc.code import Code
+        from connectrpc.errors import ConnectError
+
+        try:
+            params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        except HTTPException as exc:
+            raise ConnectError(Code.FAILED_PRECONDITION, str(exc.detail)) from exc
+        if params.get("server_tracked") is not True:
+            return None
+        default_pr_url = params.get("default_pr_url")
+        return PullRequestVouch(
+            server_tracked=True,
+            default_pr_url=default_pr_url if isinstance(default_pr_url, str) else None,
+        )
+
     async def _with_server_pull_requests(
         session_id: str, info: dict[str, Any], requested_at: float
     ) -> dict[str, Any]:
@@ -3422,9 +3839,21 @@ def register_resources_routes(
         session_id: str,
         conv: Conversation,
         pr_url: str | None = None,
+        *,
+        allow_cached: bool = False,
     ) -> dict[str, Any]:
-        """Read PR context through the runner or host and store what it reports."""
-        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        """Read PR context through the runner or host and store what it reports.
+
+        :param allow_cached: The client polls again soon, so the runner may answer
+            from its previous read.
+        """
+        params = await _github_params(
+            session_id,
+            {
+                **({"pr_url": pr_url} if pr_url else {}),
+                **({"allow_cached": True} if allow_cached else {}),
+            },
+        )
         requested_at = time.time()
         info = await _fs_get_with_host_fallback(
             session_id,
@@ -3434,6 +3863,10 @@ def register_resources_routes(
             runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github",
         )
+        # A runner or host may answer from a read that began before this request.
+        age = info.pop("cache_age_s", 0)
+        if isinstance(age, int | float) and age > 0:
+            requested_at -= age
         return await _with_server_pull_requests(session_id, info, requested_at)
 
     async def _update_host_pull_requests(
@@ -3581,6 +4014,7 @@ def register_resources_routes(
         :returns: The first page of the session's remaining linked PRs.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         if pull_request_store is None:
             raise OmnigentError(
                 "Pull request storage is unavailable", code=ErrorCode.INTERNAL_ERROR
@@ -3675,6 +4109,7 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
+        allow_cached: bool = False,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -3685,10 +4120,14 @@ def register_resources_routes(
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
+        :param allow_cached: Set by a client that polls again soon: the answer may
+            come from the runner's previous read, at most a minute old.
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _github_info(session_id, conv, pr_url)
+        info = await _github_info(session_id, conv, pr_url, allow_cached=allow_cached)
+        # Applied here, not in _github_info: background refreshes have no caller.
+        return info_for_viewer(info, await _pull_request_viewer(conv, request))
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",
@@ -3756,6 +4195,11 @@ def register_resources_routes(
             runner_path=f"/v1/sessions/{session_id}/resources/github/commits",
         )
 
+    @router.post(
+        "/sessions/{session_id}/resources/github/prs/orchestrated",
+        response_model=None,
+        include_in_schema=False,
+    )
     @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
     async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
         """
@@ -3769,7 +4213,27 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: The refreshed ``session.github.info`` object.
         """
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+        from omnigent.server.session_orchestration import require_orchestration_source
+
+        if request.url.path.endswith("/prs/orchestrated") and not request.headers.get(
+            ORCHESTRATION_SOURCE_HEADER
+        ):
+            raise OmnigentError(
+                "PR linking requires an orchestration source", code=ErrorCode.FORBIDDEN
+            )
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            if not request.app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS):
+                raise OmnigentError("Scripted sessions are disabled", code=ErrorCode.FORBIDDEN)
+            await asyncio.to_thread(
+                require_orchestration_source,
+                request,
+                _get_user_id(request, auth_provider),
+                conversation_store,
+                permission_store,
+            )
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -3801,6 +4265,7 @@ def register_resources_routes(
         :returns: The refreshed ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         params = {"account": body.get("account"), "remote": body.get("remote")}
         if body.get("pr_url"):
@@ -3853,6 +4318,7 @@ def register_resources_routes(
         :returns: A list of ``{name, color, description}`` with ``has_more``.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         params = await _github_params(session_id, {"pr_url": pr_url})
         return await _fs_get_with_host_fallback(
             session_id,
@@ -3880,6 +4346,7 @@ def register_resources_routes(
         :returns: A ``session.github.pr_labels`` with the PR's resulting labels.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -3917,6 +4384,7 @@ def register_resources_routes(
         :returns: A ``session.github.merge_options`` with ``methods`` and ``default``.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         params = await _github_params(session_id, {"pr_url": pr_url})
         return await _fs_get_with_host_fallback(
             session_id,
@@ -3946,6 +4414,7 @@ def register_resources_routes(
         :returns: A ``session.github.pr_merge``.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -3958,6 +4427,45 @@ def register_resources_routes(
                 "pr_url": body["pr_url"],
                 "merge_method": body.get("merge_method"),
                 "expected_head": body.get("expected_head"),
+            },
+            failure_detail="Cannot merge the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/merge-as",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def merge_session_github_pr_as(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Merge the selected PR as the account the merge dialog showed.
+
+        A route apart from ``/merge``, so a server, runner, or host that can't
+        bind the account refuses the request instead of merging as the saved one.
+
+        :param request: JSON body with the ``/merge`` fields and ``account``, the
+            login the merge runs as.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        account = body.get("account")
+        if not isinstance(account, str) or not account.strip():
+            raise HTTPException(status_code=400, detail="Expected an account to merge as")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge-as",
+            host_op="github_merge_as",
+            params={
+                "pr_url": body["pr_url"],
+                "merge_method": body.get("merge_method"),
+                "expected_head": body.get("expected_head"),
+                "account": account,
             },
             failure_detail="Cannot merge the pull request",
         )
@@ -3980,6 +4488,7 @@ def register_resources_routes(
         :returns: A ``session.github.pr_merge``.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -4013,6 +4522,7 @@ def register_resources_routes(
         :returns: A list of ``{login, kind, name}`` with ``has_more``.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         params = await _github_params(session_id, {"pr_url": pr_url})
         return await _fs_get_with_host_fallback(
             session_id,
@@ -4042,6 +4552,7 @@ def register_resources_routes(
         :returns: A ``session.github.pr_reviewers`` with the PR's resulting reviewers.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -4078,7 +4589,10 @@ def register_resources_routes(
                 "base_sha": base_sha,
             },
         )
-        return await _fs_get_with_host_fallback(
+        # The host account's rights in each conversation are the owner's to see.
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        threads = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_threads",
@@ -4086,6 +4600,7 @@ def register_resources_routes(
             runner_params=params,
             runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
         )
+        return review_threads_for_viewer(threads, viewer)
 
     @router.get(
         "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
@@ -4101,7 +4616,9 @@ def register_resources_routes(
         """Load additional replies in a published PR review conversation."""
         conv = await _validate_session(session_id, request, LEVEL_READ)
         params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
-        return await _fs_get_with_host_fallback(
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        comments = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_thread_comments",
@@ -4112,6 +4629,7 @@ def register_resources_routes(
                 f"{urllib.parse.quote(thread_id, safe='')}/comments"
             ),
         )
+        return review_comments_for_viewer(comments, viewer)
 
     @router.post(
         "/sessions/{session_id}/resources/github/review-threads",
@@ -4121,6 +4639,7 @@ def register_resources_routes(
     async def create_session_review_thread(request: Request, session_id: str) -> dict[str, Any]:
         """Publish a new line conversation with the host's selected GitHub account."""
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -4150,6 +4669,7 @@ def register_resources_routes(
     ) -> dict[str, Any]:
         """Publish one reply with the host's selected GitHub account."""
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -4174,6 +4694,7 @@ def register_resources_routes(
     async def create_session_github_comment(request: Request, session_id: str) -> dict[str, Any]:
         """Post a top-level comment using the host's selected GitHub account."""
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -4205,6 +4726,7 @@ def register_resources_routes(
         :returns: A ``session.github.pr_details`` with the PR's resulting title and body.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
@@ -4248,6 +4770,7 @@ def register_resources_routes(
         :returns: A ``session.github.pr_attachment`` with the ``url`` to embed.
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        await _require_pull_request_owner(conv, request)
         content = await _read_upload_capped(file, _MAX_PR_ATTACHMENT_BYTES)
         name = file.filename or ""
         tracking = await _github_params(session_id, {"pr_url": pr_url})

@@ -17,6 +17,7 @@ import types
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import click
 import pytest
 
 import omnigent.onboarding.sandboxes.kubernetes as k8s
@@ -80,11 +81,15 @@ class _FakeCore:
         self.deleted_pods: list[str] = []
         self.read_pod_error: Exception | None = None
         self.pod_deletion_timestamp: str | None = None
+        self.pod: object | None = None
+        self.logs: dict[str, str] = {}
 
     def read_namespaced_pod(self, name, namespace, _request_timeout=None):
         self.calls.append("read_pod")
         if self.read_pod_error is not None:
             raise self.read_pod_error
+        if self.pod is not None:
+            return self.pod
         return SimpleNamespace(
             metadata=SimpleNamespace(name=name, deletion_timestamp=self.pod_deletion_timestamp)
         )
@@ -96,6 +101,20 @@ class _FakeCore:
     def delete_namespaced_pod(self, name, namespace, _request_timeout=None):
         self.calls.append("delete_pod")
         self.deleted_pods.append(name)
+
+    def read_namespaced_pod_log(
+        self,
+        name,
+        namespace,
+        container=None,
+        previous=None,
+        tail_lines=None,
+        _request_timeout=None,
+    ):
+        return self.logs.get(container, "")
+
+    def list_namespaced_event(self, namespace, field_selector=None, _request_timeout=None):
+        return SimpleNamespace(items=[])
 
 
 class _FakeCustom:
@@ -200,6 +219,45 @@ def test_agent_sandbox_inherits_multi_repo_capability() -> None:
 
 
 # ── manifest conversion ────────────────────────────────
+
+
+def test_crash_looping_init_container_fails_fast_with_its_log_tail(
+    fake_clients: tuple[_FakeCore, _FakeCustom],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """agent-sandbox inherits the start wait's fast-fail and log tail.
+
+    The backing Pod stays Pending while workspace-prep crash-loops. The wait must
+    name the init container and carry its clone error instead of polling out the
+    pod-ready budget.
+    """
+    core, _custom = fake_clients
+    monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
+    core.logs["workspace-prep"] = "fatal: could not resolve host: git.example.invalid\n"
+    crashloop = SimpleNamespace(
+        name="workspace-prep",
+        restart_count=3,
+        state=SimpleNamespace(
+            waiting=SimpleNamespace(reason="CrashLoopBackOff", message="back-off 40s"),
+            terminated=None,
+        ),
+        last_state=SimpleNamespace(terminated=SimpleNamespace(exit_code=128, reason="Error")),
+    )
+    core.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name=_SANDBOX_ID, uid="pod-uid", deletion_timestamp=None),
+        status=SimpleNamespace(
+            phase="Pending",
+            init_container_statuses=[crashloop],
+            container_statuses=[],
+            conditions=None,
+        ),
+    )
+    with pytest.raises(click.ClickException) as excinfo:
+        _launcher()._wait_for_pod_running("omnigent-sandboxes", _SANDBOX_ID)
+    message = str(excinfo.value)
+    assert "did not start within" not in message
+    assert "init container 'workspace-prep' is crash-looping" in message
+    assert "could not resolve host: git.example.invalid" in message
 
 
 def test_sandbox_manifest_carries_the_pod_template_verbatim() -> None:

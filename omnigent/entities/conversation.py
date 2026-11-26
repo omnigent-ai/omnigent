@@ -331,6 +331,8 @@ class Conversation:
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    # Store snapshot used to fence recovery against concurrently accepted input.
+    next_position: int | None = None
     background_work_running: bool | None = None
     blocked_on: str | None = None
     project_id: str | None = None
@@ -701,6 +703,13 @@ class ResourceEventData(BaseModel):
     resource: dict[str, Any] | None = None
 
 
+class TerminalCommandSubmission(BaseModel):
+    """Server-owned identity of the web submission consumed by a shell input."""
+
+    pending_id: str | None = None
+    stable_id: str | None = None
+
+
 class TerminalCommandData(BaseModel):
     """
     Data payload for a runner-side terminal command (``!cmd``) observed
@@ -725,6 +734,8 @@ class TerminalCommandData(BaseModel):
         ``None`` otherwise.
     """
 
+    # None is legacy; an empty identity explicitly consumed no web submission.
+    submission: TerminalCommandSubmission | None = None
     kind: Literal["input", "output"]
     input: str | None = None
     stdout: str | None = None

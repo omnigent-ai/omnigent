@@ -4,7 +4,12 @@ import { ZoomableImage } from "@/components/ImageLightbox";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
 import { resolveChatFilePath, useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
-import { useFileViewerConversationId, useWorkspacePaths } from "@/shell/FileViewerContext";
+import { cn } from "@/lib/utils";
+import {
+  useFileViewer,
+  useFileViewerConversationId,
+  useWorkspacePaths,
+} from "@/shell/FileViewerContext";
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const RASTER_IMAGE_TYPES_BY_EXTENSION = new Map([
@@ -18,6 +23,11 @@ const RASTER_IMAGE_TYPES_BY_EXTENSION = new Map([
 ]);
 const RASTER_IMAGE_TYPES = new Set(RASTER_IMAGE_TYPES_BY_EXTENSION.values());
 
+function rasterImageType(path: string): string | undefined {
+  const extension = path.match(/\.([^.]+)$/)?.[1].toLowerCase() ?? "";
+  return RASTER_IMAGE_TYPES_BY_EXTENSION.get(extension);
+}
+
 /** An assistant's workspace image, fetched with the displayed session's permissions. */
 export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: string }) {
   const scopedId = useContext(ConversationScopeContext);
@@ -30,10 +40,18 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   const home = usesViewerWorkspace ? viewerPaths.home : (environment.data?.home ?? null);
   const resolved = root ? resolveChatFilePath(path.replace(/^(\.\/)+/, ""), root, home) : null;
   const relativePath = resolved && !resolved.path.startsWith("/") ? resolved.path : null;
+  const openFile = useFileViewer();
+  // The viewer opens paths in its own session, so another session's image stays inert. An image
+  // outside the workspace (e.g. a worker's worktree) opens on click only; previews never read it.
+  const openInViewer =
+    openFile && conversationId && usesViewerWorkspace && resolved && rasterImageType(resolved.path)
+      ? () => openFile(resolved.path)
+      : null;
   const imageKey = `${conversationId ?? ""}\0${root ?? ""}\0${relativePath ?? ""}`;
   const [loaded, setLoaded] = useState<{
     key: string;
     url: string;
+    blob: Blob;
     signal: AbortSignal;
   } | null>(null);
   const [failedKey, setFailedKey] = useState<string | null>(null);
@@ -41,8 +59,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
 
   useEffect(() => {
     if (!conversationId || !relativePath) return;
-    const extension = relativePath.match(/\.([^.]+)$/)?.[1].toLowerCase() ?? "";
-    const extensionType = RASTER_IMAGE_TYPES_BY_EXTENSION.get(extension);
+    const extensionType = rasterImageType(relativePath);
     if (!extensionType) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
@@ -62,7 +79,7 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
         if (blob.size > MAX_IMAGE_BYTES) return;
         objectUrl = URL.createObjectURL(blob);
         setFailedKey(null);
-        setLoaded({ key: imageKey, url: objectUrl, signal: controller.signal });
+        setLoaded({ key: imageKey, url: objectUrl, blob, signal: controller.signal });
       })
       .catch(() => {
         // Missing files, denied reads and offline hosts keep the filename chip.
@@ -74,30 +91,53 @@ export function WorkspaceMarkdownImage({ path, alt }: { path: string; alt: strin
   }, [conversationId, relativePath, imageKey]);
 
   if (loaded?.key !== imageKey || loaded.signal.aborted || failedKey === imageKey) {
-    return (
-      <span
-        className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 align-middle text-sm text-muted-foreground"
-        title={path}
-        role="img"
-        aria-label={alt || filename}
-      >
+    const chipClassName =
+      "inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 align-middle text-sm text-muted-foreground";
+    const chipContent = (
+      <>
         <ImageIcon className="size-3.5 shrink-0" aria-hidden="true" />
         <span className="truncate">{filename}</span>
+      </>
+    );
+    if (openInViewer) {
+      return (
+        <button
+          type="button"
+          className={cn(
+            chipClassName,
+            "cursor-pointer transition-colors hover:bg-accent hover:text-foreground",
+          )}
+          title={path}
+          aria-label={alt && alt !== filename ? `Open ${alt} (${filename})` : `Open ${filename}`}
+          onClick={openInViewer}
+        >
+          {chipContent}
+        </button>
+      );
+    }
+    return (
+      <span className={chipClassName} title={path} role="img" aria-label={alt || filename}>
+        {chipContent}
       </span>
     );
   }
 
   return (
-    <ZoomableImage
-      src={loaded.url}
-      alt={alt || filename}
-      className="my-2 max-h-96 max-w-full rounded-md object-contain"
-      loading="lazy"
-      decoding="async"
-      onError={() => {
-        URL.revokeObjectURL(loaded.url);
-        setFailedKey(imageKey);
-      }}
-    />
+    // The margin sits outside the image so the download button hugs its corner.
+    <span className="my-2 inline-flex max-w-full">
+      <ZoomableImage
+        src={loaded.url}
+        alt={alt || filename}
+        className="max-h-96 max-w-full rounded-md object-contain"
+        downloadName={filename}
+        downloadBlob={loaded.blob}
+        loading="lazy"
+        decoding="async"
+        onError={() => {
+          URL.revokeObjectURL(loaded.url);
+          setFailedKey(imageKey);
+        }}
+      />
+    </span>
   );
 }

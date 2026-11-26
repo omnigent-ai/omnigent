@@ -1,9 +1,22 @@
+import type { FileDiff } from "@pierre/diffs/react";
+import type { Comment } from "@/hooks/useComments";
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 // Tests for PullRequestPanel — the stacked "Files changed" view. The GitHub data
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
@@ -43,17 +56,19 @@ const state = vi.hoisted(() => ({
     isFetching: boolean;
   } | null,
   // Per-file diffs the stubbed parsePatchFiles yields (name + optional
-  // rename fields), so tests can exercise renamed/pure-rename rendering.
+  // rename fields and hunk sizes), so tests can exercise renamed/pure-rename rendering.
   parsedFiles: [] as {
     name: string;
     prevName?: string;
     type?: string;
-    unifiedLineCount?: number;
+    hunks?: { unifiedLineCount: number; hunkContent: unknown[] }[];
   }[],
   // The whole-PR diff response; the panel parses its patch into per-file diffs.
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
   canEdit: true,
+  // The server's word on whether the viewer owns the session; null when it doesn't say.
+  sessionOwner: null as boolean | null,
   updateSessionPr: vi.fn(),
   realPrHooks: false,
   repoLabels: {
@@ -120,6 +135,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       isError: false,
     }),
     uploadPullRequestAttachment: vi.fn(),
+    usePullRequestReadPriority: vi.fn(),
     usePullRequestInfo: vi.fn((...args: Parameters<typeof original.usePullRequestInfo>) =>
       state.realPrHooks ? original.usePullRequestInfo(...args) : state.info,
     ),
@@ -169,7 +185,10 @@ vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
     useUnlinkSessionPr: () => state.unlink,
   };
 });
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: () => state.canEdit,
+  useIsSessionOwner: () => state.sessionOwner,
+}));
 let sandboxStarting = false;
 vi.mock("@/hooks/useSessionReconnect", () => ({ useSandboxStarting: () => sandboxStarting }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
@@ -183,11 +202,25 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
 // stubbed to yield the files configured on `state` (name + optional rename
 // metadata), matching the whole-PR patch.
 vi.mock("@pierre/diffs", () => ({
-  parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
+  parsePatchFiles: vi.fn(() => [
+    { files: state.parsedFiles.map((parsed) => ({ hunks: [], ...parsed })) },
+  ]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
-  FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
-    <div data-testid="diff" data-path={fileDiff.name} />
+  FileDiff: ({
+    fileDiff,
+    renderGutterUtility,
+    lineAnnotations,
+    renderAnnotation,
+  }: React.ComponentProps<typeof FileDiff>) => (
+    <div data-testid="diff" data-path={fileDiff.name}>
+      {renderGutterUtility?.(() => ({ lineNumber: 1, side: "additions" }))}
+      {lineAnnotations?.map((annotation) => (
+        <div key={`${annotation.side}:${annotation.lineNumber}`}>
+          {renderAnnotation?.(annotation)}
+        </div>
+      ))}
+    </div>
   ),
 }));
 // The resolved theme mode drives @pierre/diffs' themeType.
@@ -205,14 +238,17 @@ vi.mock("@/components/ai-elements/message", () => ({
 import {
   usePullRequestInfo,
   usePullRequestChangedFiles,
+  usePullRequestReadPriority,
   usePullRequestRepoLabels,
   usePullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
 
 import {
   PullRequestPanel,
+  selectPullRequestInPanel,
   derivePullRequestPanelState,
   LARGE_DIFF_THRESHOLD,
+  type PullRequestSubtab,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { viewedStorageKey } from "@/lib/pullRequestViewed";
@@ -232,6 +268,11 @@ const OTHER_PR: PullRequestAssociation = {
   relationship: "attached",
 };
 
+/** A parsed hunk stub that renders `unifiedLineCount` lines. */
+function hunk(unifiedLineCount: number) {
+  return { unifiedLineCount, hunkContent: [] };
+}
+
 function file(
   path: string,
   status: PullRequestChangedFile["status"],
@@ -249,23 +290,36 @@ function file(
   };
 }
 
-function renderPanel(mobile = false, active?: boolean) {
+function renderPanel(
+  mobile = false,
+  active?: boolean,
+  onOpenPullRequest?: (url: string, section?: PullRequestSubtab) => void,
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return {
     client,
-    ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
-      wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>
-          {mobile ? (
-            <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
-              {children}
-            </MobilePanelDrawer>
-          ) : (
-            children
-          )}
-        </QueryClientProvider>
-      ),
-    }),
+    ...render(
+      <PullRequestPanel
+        conversationId="conv_1"
+        active={active}
+        onOpenPullRequest={onOpenPullRequest}
+      />,
+      {
+        wrapper: ({ children }) => (
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+            <QueryClientProvider client={client}>
+              {mobile ? (
+                <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
+                  {children}
+                </MobilePanelDrawer>
+              ) : (
+                children
+              )}
+            </QueryClientProvider>
+          </CapabilitiesProvider>
+        ),
+      },
+    ),
   };
 }
 
@@ -395,6 +449,7 @@ beforeEach(() => {
   state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
   state.diffError = null;
   state.canEdit = true;
+  state.sessionOwner = null;
   state.repoLabels = { data: undefined, isPending: true, isError: false, error: null };
   state.updateLabels = { mutate: vi.fn(), isError: false, error: null };
 });
@@ -747,6 +802,7 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: false, prUrl: pr.url });
     }
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
 
     expect(refetchQueries).not.toHaveBeenCalled();
 
@@ -755,6 +811,8 @@ describe("PullRequestPanel", () => {
     for (const pr of state.stored.conv_1) {
       expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: "list", prUrl: pr.url });
     }
+    // List rows wait their turn; only an open details view reads ahead of them.
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     // Turning the poll back on doesn't fetch by itself.
     expect(refetchQueries).toHaveBeenCalledWith({
       queryKey: ["github-info", "conv_1"],
@@ -765,6 +823,7 @@ describe("PullRequestPanel", () => {
       poll: true,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
@@ -775,17 +834,20 @@ describe("PullRequestPanel", () => {
       poll: false,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     rerender(<PullRequestPanel conversationId="conv_1" active />);
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", url);
     await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
     expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
     expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", {
       poll: "list",
       prUrl: url,
     });
+    expect(usePullRequestReadPriority).toHaveBeenLastCalledWith("conv_1", undefined);
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
     expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
@@ -1051,13 +1113,11 @@ describe("PullRequestPanel", () => {
       expect(
         labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
-      // Reviewers and labels share one row, split by a vertical divider, above a divider.
+      // Reviewers and labels share one row, the labels column bordering the reviewers,
+      // above a divider.
       const row = reviewers.parentElement!.parentElement!;
       expect(row).toContainElement(labels);
-      expect(row.querySelector('[data-slot="separator"]')).toHaveAttribute(
-        "data-orientation",
-        "vertical",
-      );
+      expect(labels.parentElement).toHaveClass("border-l");
       expect(row.nextElementSibling).toHaveAttribute("data-slot", "separator");
     });
 
@@ -1143,6 +1203,40 @@ describe("PullRequestPanel", () => {
       fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
       expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
     });
+
+    it.each([
+      [true, true, true],
+      [false, true, false],
+      // An older host would merge as its saved account, whatever the dialog sent.
+      [true, undefined, false],
+    ])(
+      "offers the PR's accounts to merge as (switching: %s, merge as account: %s)",
+      (switching, mergeAsAccount, offered) => {
+        state.info!.data!.capabilities!.account_switching = switching;
+        state.info!.data!.capabilities!.merge_as_account = mergeAsAccount;
+        state.info!.data!.accounts = ["work", "personal"].map((login) => ({
+          login,
+          active: login === "work",
+          state: "success",
+          host: "github.com",
+        }));
+        state.info!.data!.selected_account = "work";
+        renderPanel();
+
+        // The repository resolved, so only the merge dialog asks for an account.
+        expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+        const merge = screen.getByRole("region", { name: "Merge" });
+        fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+        const picker = within(screen.getByRole("dialog")).queryByRole("combobox", {
+          name: "Merge as",
+        });
+        if (offered) {
+          expect(picker).toHaveTextContent("work (active)");
+        } else {
+          expect(picker).toBeNull();
+        }
+      },
+    );
 
     it("divides the metadata from the description", () => {
       renderPanel();
@@ -1638,6 +1732,25 @@ describe("PullRequestPanel", () => {
     // Each file shows as a leaf keyed by its basename.
     expect(screen.getAllByRole("button", { name: /app\.py/ }).length).toBeGreaterThan(0);
     expect(screen.getAllByRole("button", { name: /util\.py/ }).length).toBeGreaterThan(0);
+  });
+
+  it("truncates a long file name in the sidebar tree from its middle, keeping its start", async () => {
+    state.changes = {
+      data: { available: true, data: [file("src/DataModelHandler.scala", "modified")] },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderChanges();
+    await screen.findByRole("button", { name: "src" });
+    // The section header carries aria-expanded; the sidebar row doesn't.
+    const row = fileRowButtons(/DataModelHandler\.scala/).find(
+      (button) => !button.hasAttribute("aria-expanded"),
+    )!;
+    const start = within(row).getByText("DataModelHandler.");
+    expect(start).toHaveClass("truncate");
+    expect(start.closest('[class~="[direction:rtl]"]')).toBeNull();
+    expect(within(row).getByText("scala")).toBeInTheDocument();
   });
 
   it("collapses a folder to hide its files in the sidebar tree", async () => {
@@ -2561,8 +2674,104 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
-  it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
-    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD }];
+  it("shows someone other than the owner the PRs without the controls that change them", async () => {
+    const user = userEvent.setup();
+    const pr = state.info!.data!.pr!;
+    Object.assign(state.info!.data!, {
+      owner_only_changes: true,
+      // What the server sends a non-owner: only read capabilities stay on.
+      capabilities: {
+        account_switching: false,
+        base_remote_selection: false,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: false,
+      },
+      tracking_available: true,
+      prs: [
+        OTHER_PR,
+        {
+          url: pr.url,
+          repository: "example/repo",
+          host: "github.com",
+          number: pr.number,
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+
+    expect(
+      screen.getByText(/Only the session’s owner can change its pull requests here/),
+    ).toHaveTextContent("Open the pull request on GitHub to make changes.");
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Actions for example/repo #6000" }));
+    expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
+    await user.keyboard("{Escape}");
+  });
+
+  it("keeps a non-owner's PR changes hidden while the host is offline", async () => {
+    const user = userEvent.setup();
+    const url = "https://github.com/example/one/pull/42";
+    state.sessionOwner = false;
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [
+      { url, host: "github.com", repository: "example/one", number: 42, relationship: "created" },
+      { ...OTHER_PR },
+    ];
+    renderPanel();
+
+    await screen.findByRole("list", { name: "Pull requests" });
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Actions for example/one #42" }));
+    expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
+  });
+
+  it("offers a non-owner no unlink on a PR's details, even while another PR's load", async () => {
+    const url = state.info!.data!.pr!.url;
+    Object.assign(state.info!.data!, {
+      owner_only_changes: true,
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [
+        { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
+      ],
+    });
+    // A server that doesn't say who owns the session: only the PR info's marker decides.
+    state.sessionOwner = null;
+    const { rerender } = renderPanel();
+    expect(await screen.findByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+
+    state.info = { isLoading: true, error: null, isFetching: true };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Unlink PR" })).toBeNull();
+  });
+
+  it("offers a non-owner no link in the empty state", () => {
+    Object.assign(state.info!.data!, {
+      pr: null,
+      prs: [],
+      tracking_available: true,
+      owner_only_changes: true,
+    });
+    renderPanel();
+    expect(screen.getByText(/Pull requests created in this session appear here/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
+    expect(screen.getByText(/Only the session’s owner can change/)).toBeVisible();
+  });
+
+  it("shows the diff immediately when its hunks render the threshold's lines", async () => {
+    state.parsedFiles = [{ name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD)] }];
     state.changes = {
       data: { available: true, data: [file("hello.py", "modified")] },
       isLoading: false,
@@ -2575,9 +2784,9 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText(/Large diff/)).toBeNull();
   });
 
-  it("replaces a file's diff with a large-diff affordance when unifiedLineCount exceeds the threshold", async () => {
+  it("replaces a file's diff with a large-diff affordance when its hunks exceed the threshold", async () => {
     state.parsedFiles = [
-      { name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 },
+      { name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD), hunk(1)] },
       { name: "src/app.ts" },
     ];
     renderChanges();
@@ -2593,7 +2802,7 @@ describe("PullRequestPanel", () => {
   });
 
   it("reveals the diff after clicking Show diff", async () => {
-    state.parsedFiles = [{ name: "hello.py", unifiedLineCount: LARGE_DIFF_THRESHOLD + 1 }];
+    state.parsedFiles = [{ name: "hello.py", hunks: [hunk(LARGE_DIFF_THRESHOLD + 1)] }];
     state.changes = {
       data: { available: true, data: [file("hello.py", "modified")] },
       isLoading: false,
@@ -2745,6 +2954,46 @@ describe("derivePullRequestPanelState", () => {
 });
 
 describe("session PR selection", () => {
+  it.each([false, true])(
+    "selects a previewed PR in a mounted panel (active: %s)",
+    async (active) => {
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        prs: [
+          {
+            ...OTHER_PR,
+            url: state.info!.data!.pr!.url,
+            number: 6000,
+          },
+          OTHER_PR,
+        ],
+      });
+      const { client, rerender } = renderPanel(false, active);
+      expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+
+      act(() => selectPullRequestInPanel(client, "conv_1", OTHER_PR.url));
+
+      expect(await screen.findByRole("tab", { name: "Summary" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+      expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+        poll: active,
+        prUrl: OTHER_PR.url,
+      });
+
+      rerender(<div />);
+      selectPullRequestInPanel(client, "conv_1", state.info!.data!.pr!.url);
+      rerender(<PullRequestPanel conversationId="conv_1" active={active} />);
+      expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
+      expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+        poll: active,
+        prUrl: state.info!.data!.pr!.url,
+      });
+    },
+  );
+
   it.each([false, true])("opens a single PR directly (stored list: %s)", async (stored) => {
     const url = state.info!.data!.pr!.url;
     const association: PullRequestAssociation = {
@@ -2840,6 +3089,51 @@ describe("session PR selection", () => {
       expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     },
   );
+
+  it("offers the PR's accounts to merge as from its compact row", () => {
+    const pr = {
+      ...state.info!.data!.pr!,
+      checks: { total: 1, passing: 1, failing: 0, pending: 0, runs: [] },
+      merge_state_status: "CLEAN",
+      head_sha: "head",
+    };
+    Object.assign(state.info!.data!, {
+      pr,
+      capabilities: {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: true,
+        merge_as_account: true,
+      },
+      accounts: ["work", "personal"].map((login) => ({
+        login,
+        active: login === "work",
+        state: "success",
+        host: "github.com",
+      })),
+      selected_account: "work",
+      tracking_available: true,
+      prs: [
+        OTHER_PR,
+        {
+          url: pr.url,
+          repository: "example/repo",
+          host: "github.com",
+          number: pr.number,
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    expect(
+      within(screen.getByRole("dialog")).getByRole("combobox", { name: "Merge as" }),
+    ).toHaveTextContent("work (active)");
+  });
 
   it.each(["failing", "pending", "cancelled", "skipped", "partial", "read-only"])(
     "keeps check details and uses mergeability for %s",
@@ -3518,3 +3812,229 @@ it.each(["capabilities", "selected_pr_url"] as const)(
     expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
   },
 );
+
+it("saves a local comment as agent context and retains earlier revisions", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  const diffs = await vi.importActual<typeof DiffsModule>("@pierre/diffs");
+  state.parsedFiles = diffs.parsePatchFiles(
+    "diff --git a/hello.py b/hello.py\n--- a/hello.py\n+++ b/hello.py\n@@ -1 +1 @@\n-old\n+new\n",
+  )[0]!.files;
+  state.changes!.data!.data = [file("hello.py", "modified")];
+  state.diff = {
+    object: "session.github.pr_diff",
+    patch: "PATCH",
+    head_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+  };
+  const comments: Comment[] = [];
+  const requests: string[] = [];
+  let failMutation = false;
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    requests.push(`${init?.method ?? "GET"} ${url}`);
+    if (failMutation && (init?.method === "PATCH" || init?.method === "DELETE"))
+      return new Response(null, { status: 500, statusText: "Try again" });
+    if (url.endsWith("/comments") && init?.method === "POST") {
+      const comment = {
+        ...JSON.parse(String(init.body)),
+        id: "local-1",
+        conversation_id: "conv_1",
+        status: "draft",
+        created_by: null,
+        created_at: 0,
+        updated_at: 1,
+        anchor_content: null,
+      } as Comment;
+      comments.push(comment);
+      return new Response(JSON.stringify(comment));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "PATCH") {
+      Object.assign(comments[0]!, JSON.parse(String(init.body)));
+      return new Response(JSON.stringify(comments[0]));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "DELETE") {
+      comments.splice(0);
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify(comments));
+  });
+  onTestFinished(() => {
+    fetch.mockRestore();
+    clearLocalReviewContexts("conv_1");
+  });
+  const { client } = renderChanges();
+  const contexts = renderHook(() => usePendingLocalReviewContexts("conv_1"));
+  await userEvent.click(screen.getByRole("button", { name: "Start a new review conversation" }));
+  expect(
+    within(screen.getByRole("group", { name: "Comment destination" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["GitHub", "Agent"]);
+  expect(screen.getByRole("button", { name: "Agent" })).toHaveAttribute("aria-pressed", "true");
+  await userEvent.hover(screen.getByRole("button", { name: "Agent" }));
+  expect(await screen.findByRole("tooltip")).toHaveTextContent(
+    "Leave a comment for your agent in this session.",
+  );
+  await userEvent.unhover(screen.getByRole("button", { name: "Agent" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "New review comment" }),
+    "Handle empty input",
+  );
+  fireEvent.keyDown(screen.getByRole("textbox", { name: "New review comment" }), {
+    key: "Enter",
+    metaKey: true,
+  });
+  await screen.findByRole("region", { name: "Local review comment" });
+  expect(comments[0]?.anchor_metadata).toMatchObject({
+    side: "RIGHT",
+    line: 1,
+    head_sha: "a".repeat(40),
+  });
+  expect(requests.filter((request) => request.startsWith("POST"))).toEqual([
+    "POST /v1/sessions/conv_1/comments",
+  ]);
+  expect(contexts.result.current).toHaveLength(1);
+  expect(contexts.result.current[0]).toMatchObject({ id: "local-1", body: "Handle empty input" });
+  expect(requests.some((request) => request.includes("/comments/send"))).toBe(false);
+  const other = {
+    ...comments[0]!,
+    id: "other",
+    body: "Feedback on a different PR",
+    anchor_metadata: { ...comments[0]!.anchor_metadata!, pr_url: "https://example.com/pr/other" },
+  };
+  const addressed = { ...comments[0]!, id: "addressed", status: "addressed" as const };
+  await act(async () => {
+    client.setQueryData(["comments", "conv_1"], [...comments, other, addressed]);
+  });
+  expect(screen.queryByText("Feedback on a different PR")).not.toBeInTheDocument();
+  expect(screen.queryByText(/Add to chat/)).not.toBeInTheDocument();
+  state.diff = { ...state.diff!, head_sha: "c".repeat(40) };
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  expect(screen.queryByText(/Earlier revision/)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "More actions for hello.py" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Show earlier comments" }));
+  expect(screen.getAllByText(/Earlier revision/).length).toBeGreaterThan(0);
+  const card = within(screen.getAllByRole("region", { name: "Local review comment" })[0]!);
+  expect(
+    card.queryByRole("button", { name: /Attach to agent|Mark addressed|Reopen/ }),
+  ).not.toBeInTheDocument();
+  await userEvent.click(card.getByRole("button", { name: "Edit local comment" }));
+  await userEvent.clear(card.getByRole("textbox", { name: "Edit local comment" }));
+  await userEvent.type(
+    card.getByRole("textbox", { name: "Edit local comment" }),
+    "Validate empty input",
+  );
+  const originalAnchor = { ...comments[0]!.anchor_metadata! };
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(card.getByRole("textbox", { name: "Edit local comment" })).toHaveValue(
+    "Validate empty input",
+  );
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Handle empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(comments[0]?.body).toBe("Validate empty input"));
+  expect(contexts.result.current[0]?.body).toBe("Validate empty input");
+  expect(contexts.result.current[0]?.anchor_metadata).toEqual(originalAnchor);
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Validate empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),
+  );
+  expect(contexts.result.current).toHaveLength(0);
+});
+
+describe("a host that shows each pull request in a place of its own", () => {
+  function listPrs(prs: PullRequestAssociation[]) {
+    state.storesPrs = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: prs[0]!.url,
+      prs,
+    });
+  }
+  const FIRST: PullRequestAssociation = {
+    ...OTHER_PR,
+    url: "https://github.com/acme/app/pull/6000",
+    number: 6000,
+  };
+
+  it("hands a chosen pull request to the host and keeps showing the list", async () => {
+    const user = userEvent.setup();
+    listPrs([FIRST, OTHER_PR]);
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    await user.click(within(list).getByRole("button", { name: "acme/app #6001" }));
+    expect(onOpenPullRequest).toHaveBeenCalledWith(OTHER_PR.url);
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+  });
+
+  it("lists a session's only pull request rather than opening it in the list's place", async () => {
+    const user = userEvent.setup();
+    listPrs([FIRST]);
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    await user.click(within(list).getByRole("button", { name: "acme/app #6000" }));
+    expect(onOpenPullRequest).toHaveBeenCalledWith(FIRST.url);
+  });
+  it.each([
+    {
+      shape: "an older host that sends only the branch's pull request",
+      setUp: () => {
+        state.storesPrs = false;
+      },
+    },
+    {
+      shape: "a host whose list of linked pull requests isn't synced yet",
+      setUp: () => {
+        state.storesPrs = true;
+        state.stored.conv_1 = [];
+        state.unsynced.add("conv_1");
+        Object.assign(state.info!.data!, { tracking_available: true });
+      },
+    },
+  ])("lists the branch's pull request from $shape, and hands it over too", async ({ setUp }) => {
+    const user = userEvent.setup();
+    setUp();
+    const url = state.info!.data!.pr!.url;
+    const onOpenPullRequest = vi.fn();
+    renderPanel(false, true, onOpenPullRequest);
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    const list = screen.getByRole("list", { name: "Pull requests" });
+    await user.click(
+      within(list).getByRole("button", { name: /^example\.com\/acme\/app #6000 \(from branch\)/ }),
+    );
+    expect(onOpenPullRequest).toHaveBeenCalledWith(url);
+  });
+
+  it("titles an older host's list and keeps its Refresh", () => {
+    state.storesPrs = false;
+    renderPanel(false, true, vi.fn());
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Pull Requests" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
+  });
+
+  it("still shows the branch's pull request itself without a host to hand it to", () => {
+    state.storesPrs = false;
+    renderPanel(false, true);
+    expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+  });
+});

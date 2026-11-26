@@ -29,6 +29,7 @@ from omnigent.runtime.filesystem_registry import (
     GitFilesystemRegistry,
     GitStatusUnavailable,
     MultiRepositoryFilesystemRegistry,
+    _count_untracked_lines,
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
@@ -998,6 +999,100 @@ def test_skip_dir_pathspecs_anchored_to_workspace_subdir(tmp_path: Path) -> None
     assert ":(exclude)node_modules" not in specs
 
 
+def test_git_list_changed_files_scopes_git_reads_to_workspace_subdir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A workspace below the repo root runs ``git status`` and numstat on its own subtree.
+
+    Exclude-only pathspecs still scan the whole repository even though only
+    workspace records are returned. Failure means a status or numstat call ran
+    without the workspace pathspec.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    workspace = tmp_path / "sub" / "ws"
+    workspace.mkdir(parents=True)
+    (workspace / "tracked.py").write_text("a\n")
+    (tmp_path / "elsewhere.py").write_text("a\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    (workspace / "tracked.py").write_text("a\nb\n")
+    (workspace / "new.py").write_text("new\n")
+    (tmp_path / "elsewhere.py").write_text("a\nb\n")
+    (tmp_path / "outside_new.py").write_text("x\n")
+
+    git_reads: list[list[str]] = []
+    real_run = subprocess.run
+
+    def _record(argv, *args, **kwargs):
+        if isinstance(argv, list) and ("status" in argv or "diff" in argv):
+            git_reads.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _record)
+
+    reg = GitFilesystemRegistry(watch_path=workspace, git_root=tmp_path)
+    records = {r["path"]: r for r in reg.list_changed_files("any-conv", limit=100)}
+
+    assert set(records) == {"tracked.py", "new.py"}, (
+        f"Expected only the workspace's own changes, got {sorted(records)}."
+    )
+    assert (records["tracked.py"]["lines_added"], records["tracked.py"]["lines_removed"]) == (1, 0)
+    assert {"status", "diff"} <= {word for argv in git_reads for word in argv}, git_reads
+    unscoped = [argv for argv in git_reads if ":(literal)sub/ws" not in argv]
+    assert not unscoped, f"Expected every git read scoped to sub/ws, got {unscoped}."
+
+
+def test_workspace_pathspecs_cover_root_and_outside_workspaces(tmp_path: Path) -> None:
+    """Only a workspace strictly below the git root gets a scoping pathspec.
+
+    At the root there is nothing to narrow, and a workspace outside the repo
+    has no git-relative prefix, so both keep the unscoped status.
+    """
+    repo = tmp_path / "repo"
+    nested = repo / "sub"
+    nested.mkdir(parents=True)
+
+    assert GitFilesystemRegistry(watch_path=nested, git_root=repo)._workspace_pathspecs() == [
+        ":(literal)sub"
+    ]
+    assert GitFilesystemRegistry(watch_path=repo, git_root=repo)._workspace_pathspecs() == []
+    assert GitFilesystemRegistry(watch_path=tmp_path, git_root=repo)._workspace_pathspecs() == []
+
+
+def test_git_list_changed_files_shows_workspace_side_of_cross_boundary_renames(
+    tmp_path: Path,
+) -> None:
+    """A staged rename across the workspace boundary shows as the workspace's add or delete.
+
+    With status scoped to the workspace, git cannot pair the two sides of the
+    rename, so a file moved in is ``created`` and a file moved out is
+    ``deleted``, each with its full line count.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    workspace = tmp_path / "sub" / "ws"
+    workspace.mkdir(parents=True)
+    (workspace / "leaving.py").write_text("a\nb\n")
+    (tmp_path / "arriving.py").write_text("x\ny\nz\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, env=env
+    )
+    for src, dst in (("arriving.py", "sub/ws/arrived.py"), ("sub/ws/leaving.py", "left.py")):
+        subprocess.run(["git", "mv", src, dst], cwd=tmp_path, check=True, capture_output=True)
+
+    reg = GitFilesystemRegistry(watch_path=workspace, git_root=tmp_path)
+    records = {
+        r["path"]: (r["status"], r["lines_added"], r["lines_removed"])
+        for r in reg.list_changed_files("any-conv", limit=100)
+    }
+
+    assert records == {"arrived.py": ("created", 3, 0), "leaving.py": ("deleted", 0, 2)}, records
+
+
 def test_untracked_cache_enable_helper_sets_repo_config(tmp_path: Path) -> None:
     """The background helper enables ``core.untrackedCache`` when supported.
 
@@ -1862,19 +1957,141 @@ def test_git_line_counts_modified(tmp_path: Path) -> None:
 
 
 def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
-    """An untracked new file (absent from `git diff HEAD`) reports no counts.
+    """An untracked new file (absent from `git diff HEAD`) reports no diff counts.
 
     Counts come only from numstat; git doesn't diff untracked files, so the UI
-    omits the counter for them — matching VS Code / Cursor's source-control view.
+    omits the counter for them. Untracked text files count ``untracked_lines``.
     """
-    _init_git_with_commit(tmp_path, "committed.py", "x\n")
-    (tmp_path / "new.py").write_text("one\ntwo\nthree\n")
+    _init_git_with_commit(tmp_path, "tracked.py", "x\n")
+    (tmp_path / "tracked.py").write_text("x\ny\n")
+    (tmp_path / "new.py").write_text("one\ntwo\nthree")
+    (tmp_path / "empty.txt").write_text("")
+    (tmp_path / "blob.bin").write_bytes(b"a\0b\n")
+    os.symlink("new.py", tmp_path / "link.py")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    rec = next(r for r in reg.list_changed_files("any-conv", limit=100) if r["path"] == "new.py")
+    records = {r["path"]: r for r in reg.list_changed_files("any-conv", limit=100)}
+    assert {path: r.get("untracked_lines") for path, r in records.items()} == {
+        "tracked.py": None,
+        "new.py": 3,
+        "empty.txt": 0,
+        "blob.bin": None,
+        "link.py": None,
+    }
+    assert "untracked_lines" not in records["tracked.py"]
+    rec = records["new.py"]
     assert rec["status"] == "created"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
+
+
+def test_git_untracked_lines_never_read_through_links_or_fifos(tmp_path: Path) -> None:
+    """Symlinks swapped in after ``git status`` (even the root) and ``..`` never redirect reads."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("a\nb\n")
+    workspace = tmp_path / "workspace"
+    (workspace / "real").mkdir(parents=True)
+    (workspace / "real" / "new.txt").write_text("a\nb\n")
+    os.symlink(outside, workspace / "swapped")
+    os.mkfifo(workspace / "pipe")
+    paths = ["real/new.txt", "swapped/secret.txt", "pipe", "../outside/secret.txt"]
+    records = [{"path": path, "bytes": 4} for path in paths]
+
+    _count_untracked_lines(workspace, records, set(paths))
+    assert [r["untracked_lines"] for r in records] == [2, None, None, None]
+
+    os.symlink(outside, tmp_path / "swapped_root")
+    swapped_root = [{"path": "secret.txt", "bytes": 4}]
+    _count_untracked_lines(tmp_path / "swapped_root", swapped_root, {"secret.txt"})
+    assert swapped_root[0]["untracked_lines"] is None
+
+
+def test_git_untracked_lines_read_past_short_reads(tmp_path: Path, monkeypatch) -> None:
+    """A short read is not EOF: the count and the NUL check cover the whole file."""
+    (tmp_path / "text.txt").write_bytes(b"one\ntwo\n")
+    (tmp_path / "late_nul.txt").write_bytes(b"one\n\0two\n")
+    real_read = os.read
+    monkeypatch.setattr(os, "read", lambda fd, size: real_read(fd, min(size, 4)))
+    records = [{"path": path, "bytes": 9} for path in ("text.txt", "late_nul.txt")]
+
+    _count_untracked_lines(tmp_path, records, {"text.txt", "late_nul.txt"})
+    assert [r["untracked_lines"] for r in records] == [2, None]
+
+
+def test_git_untracked_lines_reserve_reads_before_they_start(tmp_path: Path, monkeypatch) -> None:
+    """Failed and grown reads still spend their allowance, so the budget bounds every byte read."""
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_TOTAL_BYTES", 20
+    )
+    paths = ["grown.txt", *(f"fails_{index}.txt" for index in range(4))]
+    for path in paths:
+        (tmp_path / path).write_bytes(b"1\n2\n3\n4\n")
+    # grown.txt was listed before it doubled; the others fail after their first chunk.
+    records = [{"path": path, "bytes": 4 if path == "grown.txt" else 8} for path in paths]
+    consumed = 0
+    real_read = os.read
+
+    def read_one_chunk_then_fail(fd: int, size: int) -> bytes:
+        nonlocal consumed
+        if os.lseek(fd, 0, os.SEEK_CUR):
+            raise OSError("injected I/O error")
+        chunk = real_read(fd, size)
+        consumed += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(os, "read", read_one_chunk_then_fail)
+
+    _count_untracked_lines(tmp_path, records, set(paths))
+    assert [r["untracked_lines"] for r in records] == [None] * len(paths)
+    assert consumed <= 20
+
+
+def test_multi_repo_untracked_lines_share_one_budget_newest_first(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Repositories share the listing's budget, spent on the newest file first."""
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILES", 1)
+    for age, name in enumerate(("beta", "alpha")):
+        repo = tmp_path / name
+        repo.mkdir()
+        _init_git_with_commit(repo, "same.txt", "x\n")
+        (repo / "new.txt").write_text("1\n2\n")
+        os.utime(repo / "new.txt", (1_000_000 - age, 1_000_000 - age))
+
+    registry = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
+    records = registry.list_changed_files("session", limit=100)
+    assert [(r["path"], r["untracked_lines"]) for r in records] == [
+        ("beta/new.txt", 2),
+        ("alpha/new.txt", None),
+    ]
+
+
+def test_git_untracked_lines_stop_at_the_caps(tmp_path: Path, monkeypatch) -> None:
+    """Newest files are read first; per-file, total and file-count caps yield ``None``."""
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILE_BYTES", 10)
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_TOTAL_BYTES", 15
+    )
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILES", 2)
+    _init_git_with_commit(tmp_path, "committed.py", "x\n")
+    # Newest first: over the per-file cap, read, over the remaining total
+    # budget, read, then past the file-count cap.
+    files = [("c.txt", "x" * 11), ("a.txt", "1\n2\n3\n4\n"), ("b.txt", "1\n2\n3\n4\n")]
+    files += [("d.txt", "1\n"), ("e.txt", "1\n")]
+    for age, (name, content) in enumerate(files):
+        (tmp_path / name).write_text(content)
+        os.utime(tmp_path / name, (1_000_000 - age, 1_000_000 - age))
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    records = reg.list_changed_files("any-conv", limit=100)
+    assert [(r["path"], r["untracked_lines"]) for r in records] == [
+        ("c.txt", None),
+        ("a.txt", 4),
+        ("b.txt", None),
+        ("d.txt", 1),
+        ("e.txt", None),
+    ]
 
 
 def test_git_line_counts_staged_new_file_added_only(tmp_path: Path) -> None:

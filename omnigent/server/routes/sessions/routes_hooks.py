@@ -1335,7 +1335,7 @@ def register_hooks_routes(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
-        if result.action == "decline":
+        if result.action == "decline" and codex_request.interrupts_on_decline:
             # Explicit user decline: interrupt Codex before returning the
             # deny response, same as the Claude-native path. The await
             # ensures the abort signal reaches Codex before it processes

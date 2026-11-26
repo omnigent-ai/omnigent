@@ -545,6 +545,54 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     proc.kill()
 
 
+@pytest.mark.parametrize("method", ["terminate", "kill"])
+@pytest.mark.parametrize("identity", ["reused", "gone", "cached_exit"])
+def test_signal_preserves_runner_identity(
+    monkeypatch: pytest.MonkeyPatch, method: str, identity: str
+) -> None:
+    proc = ZygoteRunnerProc(os.getpid(), ZygoteManager())
+    assert proc._process is not None
+    if identity == "reused":
+        proc._process._ident = (proc.pid, -1.0)
+    elif identity == "gone":
+        proc._process = None
+    else:
+        proc.returncode = 7
+    raw_signal = Mock()
+    monkeypatch.setattr("os.kill", raw_signal)
+
+    getattr(proc, method)()
+
+    raw_signal.assert_not_called()
+    assert proc.returncode == (7 if identity == "cached_exit" else None)
+
+
+@pytest.mark.parametrize(
+    "method, expected_signal", [("terminate", signal.SIGTERM), ("kill", signal.SIGKILL)]
+)
+@pytest.mark.parametrize("failure", [None, psutil.NoSuchProcess, psutil.AccessDenied, OSError])
+def test_signal_uses_captured_process_without_control_exchange(
+    monkeypatch: pytest.MonkeyPatch, method: str, expected_signal: int, failure: type | None
+) -> None:
+    original_process = Mock()
+    if failure is not None:
+        original_process.send_signal.side_effect = failure(123)
+    process_factory = Mock(return_value=original_process)
+    monkeypatch.setattr("psutil.Process", process_factory)
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(123, manager)
+    process_factory.side_effect = AssertionError("must not recapture a recycled PID")
+    monkeypatch.setattr(manager, "_exchange", Mock(side_effect=AssertionError("control IPC")))
+    raw_signal = Mock()
+    monkeypatch.setattr("os.kill", raw_signal)
+
+    getattr(proc, method)()
+
+    original_process.send_signal.assert_called_once_with(expected_signal)
+    raw_signal.assert_not_called()
+    assert proc.returncode is None
+
+
 def test_stop_forked_runner_does_not_wait_for_control_lock(
     manager: ZygoteManager, tmp_path: Path
 ) -> None:

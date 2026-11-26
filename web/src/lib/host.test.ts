@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { sentXhrs } from "@/test/fetchBackedXhr";
+
 import {
   getCliServerUrl,
   hostFetch,
   resolveMediaUrl,
   resolveWebSocketUrl,
   setOmnigentHostConfig,
+  withRoutingKey,
 } from "./host";
 
 afterEach(() => {
@@ -60,9 +63,78 @@ describe("hostFetch base path", () => {
     const { hostFetch: freshHostFetch, setOmnigentHostConfig: setConfig } = await import("./host");
     const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     setConfig({ fetcher });
-    await freshHostFetch("/v1/sessions");
-    expect(fetcher).toHaveBeenCalledWith("/v1/sessions", undefined);
     vi.resetModules();
+    await freshHostFetch("/v1/sessions");
+    expect(fetcher.mock.calls[0][0]).toBe("/v1/sessions");
+    // The installed fetcher marks a workspace, so the request names a replica.
+    const init = fetcher.mock.calls[0][1] as RequestInit;
+    expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toMatch(
+      /^[0-9a-f]{32}$/,
+    );
+  });
+});
+
+describe("routing key", () => {
+  // An installed fetcher marks a Databricks workspace, which turns host routing on.
+  async function routedHost() {
+    vi.resetModules();
+    const host = await import("./host");
+    host.setOmnigentHostConfig({
+      fetcher: vi.fn().mockResolvedValue(new Response(null, { status: 200 })),
+    });
+    vi.resetModules();
+    return host;
+  }
+
+  it("adds the client key to a request that carries none", async () => {
+    const routed = await routedHost();
+    const key = new Headers(routed.withRoutingKey({ method: "POST" })?.headers).get(
+      "X-Databricks-Omnigent-Slice-Key",
+    );
+    expect(key).toMatch(/^[0-9a-f]{32}$/);
+    const own = routed.withRoutingKey({ headers: { "X-Databricks-Omnigent-Slice-Key": "host_1" } });
+    expect(new Headers(own?.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe("host_1");
+    expect(routed.withRoutingKey({ method: "GET" }, { unkeyed: true })).toEqual({ method: "GET" });
+  });
+
+  it("keys a hostless request by the modal host once it resolves", async () => {
+    vi.resetModules();
+    const sessionHost = await import("./sessionHost");
+    const host = await import("./host");
+    host.setOmnigentHostConfig({
+      fetcher: vi.fn().mockResolvedValue(new Response(null, { status: 200 })),
+    });
+    sessionHost.setSessionHost("session-a", "host_modal");
+    const keyOf = (init?: RequestInit) =>
+      new Headers(host.withRoutingKey(init, { hostless: true })?.headers).get(
+        "X-Databricks-Omnigent-Slice-Key",
+      );
+    expect(keyOf()).toMatch(/^[0-9a-f]{32}$/);
+    sessionHost.resolveModalHost(["host_modal"]);
+    expect(keyOf()).toBe("host_modal");
+    expect(host.resolveWebSocketUrl("/v1/sessions/updates", { hostless: true })).toContain(
+      "omnigent_slice_key=host_modal",
+    );
+  });
+
+  it("adds the client key to a WebSocket path that carries none", async () => {
+    const { withRoutingKeyParam, resolveWebSocketUrl: routedWebSocketUrl } = await routedHost();
+    expect(routedWebSocketUrl("/v1/dictation/stream")).toMatch(
+      /\/v1\/dictation\/stream\?omnigent_slice_key=[0-9a-f]{32}$/,
+    );
+    expect(routedWebSocketUrl("/v1/x", { unkeyed: true })).not.toContain("omnigent_slice_key");
+    expect(withRoutingKeyParam("/v1/x?a=1")).toMatch(
+      /^\/v1\/x\?a=1&omnigent_slice_key=[0-9a-f]{32}$/,
+    );
+    expect(withRoutingKeyParam("/v1/x?omnigent_slice_key=host_1")).toBe(
+      "/v1/x?omnigent_slice_key=host_1",
+    );
+    expect(withRoutingKeyParam("/v1/x", { unkeyed: true })).toBe("/v1/x");
+  });
+
+  it("leaves requests unkeyed when host routing is off", () => {
+    expect(withRoutingKey(undefined)).toBeUndefined();
+    expect(resolveWebSocketUrl("/v1/x")).not.toContain("omnigent_slice_key");
   });
 });
 
@@ -140,5 +212,102 @@ describe("isHostRoutingEnabled", () => {
     vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
     const { isHostRoutingEnabled } = await import("./host");
     expect(isHostRoutingEnabled()).toBe(true);
+  });
+});
+
+describe("hostFetch upload progress", () => {
+  it("sends through XMLHttpRequest with the headers and body, answering with a Response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"id":"file_1"}', { status: 201, headers: { "X-Reply": "yes" } }),
+    );
+    const onUploadProgress = vi.fn();
+    const body = new Blob(["abc"]);
+
+    const res = await hostFetch(
+      "/v1/upload",
+      { method: "POST", body, headers: { "X-Custom": "kept" } },
+      { onUploadProgress },
+    );
+
+    const xhr = sentXhrs.at(-1)!;
+    expect(xhr.method).toBe("POST");
+    expect(xhr.requestHeaders.get("X-Custom")).toBe("kept");
+    expect(xhr.body).toBe(body);
+    expect(res.status).toBe(201);
+    expect(res.headers.get("X-Reply")).toBe("yes");
+    expect(await res.json()).toEqual({ id: "file_1" });
+    expect(onUploadProgress).toHaveBeenLastCalledWith(3, 3);
+  });
+
+  it("reports a server error as a Response rather than a rejection", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"detail":"Too big"}', { status: 413 }),
+    );
+    const res = await hostFetch(
+      "/v1/upload",
+      { method: "POST", body: "x" },
+      {
+        onUploadProgress: vi.fn(),
+      },
+    );
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ detail: "Too big" });
+  });
+
+  it("rejects as a network failure when the response status cannot form a Response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      status: 0,
+      statusText: "",
+      headers: new Headers(),
+      arrayBuffer: async () => new ArrayBuffer(0),
+    } as unknown as Response);
+
+    await expect(
+      hostFetch("/v1/upload", { method: "POST", body: "x" }, { onUploadProgress: vi.fn() }),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it("passes the request's credentials mode through to the request", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+
+    await hostFetch(
+      "/v1/upload",
+      { method: "POST", body: "x", credentials: "include" },
+      { onUploadProgress: vi.fn() },
+    );
+
+    expect(fetchSpy.mock.calls[0]![1]).toMatchObject({ credentials: "include" });
+  });
+
+  it("rejects with the signal's reason when the caller aborts", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => new Promise<Response>(() => {}));
+    const controller = new AbortController();
+    const pending = hostFetch(
+      "/v1/upload",
+      { method: "POST", body: "x", signal: controller.signal },
+      { onUploadProgress: vi.fn() },
+    );
+
+    const reason = new DOMException("Stopped", "AbortError");
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+  });
+
+  it("leaves an embedding's fetcher in charge, with no XMLHttpRequest and no progress", async () => {
+    vi.resetModules();
+    const fresh = await import("./host");
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    fresh.setOmnigentHostConfig({ fetcher });
+    const sentBefore = sentXhrs.length;
+    const onUploadProgress = vi.fn();
+
+    await fresh.hostFetch("/v1/upload", { method: "POST", body: "x" }, { onUploadProgress });
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(sentXhrs.length).toBe(sentBefore);
+    expect(onUploadProgress).not.toHaveBeenCalled();
   });
 });

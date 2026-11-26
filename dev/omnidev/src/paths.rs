@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+/// Serialize test readers and writers of process-global path and pod settings.
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Walk up from `start` looking for the checkout root.
 ///
 /// The root is the first ancestor holding a `.jj/` or `.git/` marker — the VCS
@@ -80,6 +87,11 @@ pub fn install_config_path() -> Result<PathBuf> {
 /// `~/.cache/omnidev/omnigent-check.json` — volatile update-check state.
 pub fn check_cache_path() -> Result<PathBuf> {
     Ok(cache_home()?.join("omnidev").join("omnigent-check.json"))
+}
+
+/// `~/.cache/omnidev/recent-servers.json` — servers `omnidev ui` offers in its picker.
+pub fn recent_servers_path() -> Result<PathBuf> {
+    Ok(cache_home()?.join("omnidev").join("recent-servers.json"))
 }
 
 /// FNV-1a 64-bit, rendered as 8 hex chars. No external dep needed — we only

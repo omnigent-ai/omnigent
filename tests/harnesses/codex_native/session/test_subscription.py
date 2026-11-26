@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import DEFAULT, AsyncMock
 
 import click
 import httpx
@@ -130,6 +132,7 @@ def test_codex_app_server_client_uses_codex_remote_handshake(
         "uri": "ws://localhost/rpc",
         "max_size": 128 << 20,
         "compression": None,
+        "ping_interval": None,
     }
     assert [json.loads(payload) for payload in fake_websocket.sent] == [
         {
@@ -387,6 +390,188 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
     assert fake_client.closed
 
 
+@pytest.mark.parametrize("startup", ["fresh", "active_turn", "pending_shell"])
+def test_supervise_forwarder_mirrors_live_turn_when_history_is_unsupported(
+    tmp_path: Path, startup: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A history-listing refusal must not prevent live replies or completion."""
+    _write_forwarder_bridge(
+        tmp_path, active_turn_id="turn_123" if startup == "active_turn" else None
+    )
+    if startup == "pending_shell":
+        state = read_bridge_state(tmp_path)
+        assert state is not None
+        codex_native_forwarder.write_bridge_state(
+            tmp_path, replace(state, pending_shell_command_id="shell_123")
+        )
+
+    # Codex sends item/turn notifications only after this connection subscribes.
+    class HistoryRefusingClient(_FakeCodexAppServerClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_request = asyncio.Event()
+            self.subscribed = asyncio.Event()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            self.requests.append((method, params))
+            if method != "thread/resume":
+                return {"result": {}}
+            if startup == "fresh" and not self.first_request.is_set():
+                self.first_request.set()
+                raise RuntimeError("no rollout found for thread id thread_123")
+            self.first_request.set()
+            if not params.get("excludeTurns"):
+                raise codex_native_app_server.CodexAppServerResponseError(
+                    {"code": -32601, "message": "list_turns is not supported yet"}
+                )
+            self.subscribed.set()
+            return {"result": {"thread": {"id": "thread_123", "turns": []}}}
+
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            return self.subscribed.is_set()
+
+        async def iter_events(self) -> Any:
+            await self.first_request.wait()
+            yield {
+                "method": "thread/status/changed",
+                "params": {"threadId": "thread_123", "status": {"type": "active"}},
+            }
+            await asyncio.wait_for(self.subscribed.wait(), timeout=2)
+            yield _started_event("turn_123")
+            yield {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread_123",
+                    "turnId": "turn_123",
+                    "item": _user_message_item("user_123", "hello"),
+                },
+            }
+            yield _agent_message_event("turn_123", "agent_123", "live reply")
+            yield _completed_event("turn_123", thread_id="thread_123")
+
+    fake_client = HistoryRefusingClient()
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_capture_handler(posted)),
+        )
+    )
+
+    resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+    expected = [{"threadId": "thread_123"}, {"threadId": "thread_123", "excludeTurns": True}]
+    if startup == "fresh":
+        expected.insert(0, {"threadId": "thread_123", "excludeTurns": True})
+    assert resumes == expected
+    items = [p["data"]["item_data"] for p in posted if p["type"] == "external_conversation_item"]
+    assert [item["role"] for item in items] == ["user", "assistant"]
+    assert items[1]["content"][0]["text"] == "live reply"
+    statuses = [p["data"]["status"] for p in posted if p["type"] == "external_session_status"]
+    assert statuses[-1] == "idle"
+    assert "failed" not in statuses
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id is None
+    assert "Items before this subscription cannot be replayed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "active_turn_id", "attempts"),
+    [
+        (-32601, "list_turns is not supported yet", "turn_123", 2),
+        (-32601, "list_turns is not supported yet", None, 1),
+        (-32601, "method not found", "turn_123", 1),
+        (-32600, "list_turns is not supported yet", "turn_123", 1),
+    ],
+)
+def test_subscribe_history_fallback_is_bounded_and_specific(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    code: int,
+    message: str,
+    active_turn_id: str | None,
+    attempts: int,
+) -> None:
+    """A second refusal or unrelated RPC error keeps the original failure path."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=active_turn_id)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(
+            {"code": code, "message": message}
+        )
+    )
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            await asyncio.wait_for(
+                codex_native_forwarder._subscribe_until_ready(
+                    fake_client,  # type: ignore[arg-type]
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    thread_id="thread_123",
+                ),
+                timeout=2,
+            )
+
+    asyncio.run(run())
+
+    assert len(fake_client.requests) == attempts
+    assert all(method == "thread/resume" for method, _params in fake_client.requests)
+    assert posted == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == active_turn_id
+    assert "failed to subscribe to Codex thread thread_123" in caplog.text
+
+
+@pytest.mark.parametrize("pending_shell", [False, True])
+def test_history_free_resume_preserves_unconfirmed_recovery_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, pending_shell: bool
+) -> None:
+    """An idle snapshot without turns cannot prove which saved work completed."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    if pending_shell:
+        state = replace(state, pending_shell_command_id="shell_123")
+        codex_native_forwarder.write_bridge_state(tmp_path, state)
+
+    class HistoryRefusingClient(_FakeCodexAppServerClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if not params.get("excludeTurns"):
+                raise codex_native_app_server.CodexAppServerResponseError(
+                    {"code": -32601, "message": "list_turns is not supported yet"}
+                )
+            return {
+                "result": {
+                    "active_turn_present": False,
+                    "thread": {"id": "thread_123", "status": {"type": "idle"}, "turns": []},
+                }
+            }
+
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            await codex_native_forwarder._subscribe_until_ready(
+                HistoryRefusingClient(),  # type: ignore[arg-type]
+                client,
+                **_forwarder_context(client, tmp_path),
+                thread_id="thread_123",
+            )
+
+    asyncio.run(run())
+
+    assert read_bridge_state(tmp_path) == state
+    assert posted == []
+    assert "Items before this subscription cannot be replayed" in caplog.text
+    assert "missing from resume response" not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("failure_source", "close_fails"),
     [
@@ -611,6 +796,10 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
         return None
 
     posted: list[dict[str, Any]] = []
+    posts_when_subscribed: list[int] = []
+
+    async def on_subscribed() -> None:
+        posts_when_subscribed.append(len(posted))
 
     monkeypatch.setattr(fake_client, "request", fake_request)
     monkeypatch.setattr(codex_native_forwarder, "_sleep", fake_sleep)
@@ -625,6 +814,7 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
                 thread_id="thread_123",
                 usage_coalescer=_usage_coalescer(client),
                 elicitation_tracker=_elicitation_tracker(),
+                on_subscribed=on_subscribed,
             )
 
     asyncio.run(run())
@@ -633,6 +823,8 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
         ("thread/resume", {"threadId": "thread_123"}),
     ]
+    # Once, after the retry succeeded and its replay landed.
+    assert posts_when_subscribed == [len(posted)]
     assert [payload["data"]["item_data"]["role"] for payload in posted[:2]] == [
         "user",
         "assistant",
@@ -641,6 +833,31 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
     assert posted[2]["data"] == _expected_status_data("running", "turn_123")
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id == "turn_123"
+
+
+def test_subscribe_until_ready_skips_on_subscribed_when_subscribing_fails(tmp_path: Path) -> None:
+    """A thread the forwarder cannot subscribe to never runs the success callback."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    fake_client = _FakeCodexAppServerClient(error=RuntimeError("thread not found"))
+    on_subscribed = AsyncMock()
+
+    async def run() -> None:
+        async with _recording_forwarder_client([]) as client:
+            await codex_native_forwarder._subscribe_until_ready(
+                fake_client,  # type: ignore[arg-type]
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                thread_id="thread_123",
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                on_subscribed=on_subscribed,
+            )
+
+    asyncio.run(run())
+
+    assert len(fake_client.requests) == 1
+    on_subscribed.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -1148,6 +1365,69 @@ def test_supervise_forwarder_continues_after_event_handler_failure(
 
     assert handled == ["turn_after"]
     assert "Codex forwarder event handling failed" in caplog.text
+
+
+@pytest.mark.parametrize("status_publish_fails", [False, True])
+def test_supervise_forwarder_reports_running_from_first_live_item_of_missed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status_publish_fails: bool,
+) -> None:
+    """First-item recovery is best effort and never consumes the original live item."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_1")
+    user_message = _user_message_item("item_1", "Review the change.")
+    item_params = {"threadId": "thread_123", "turnId": "turn_1", "item": user_message}
+    events = [
+        {"method": "item/started", "params": item_params},
+        {"method": "item/completed", "params": item_params},
+    ]
+    fake_client = _FakeCodexAppServerClient(events=events)
+    posted: list[dict[str, Any]] = []
+    handle_event = AsyncMock(wraps=codex_native_forwarder._handle_event)
+    monkeypatch.setattr(codex_native_forwarder, "_handle_event", handle_event)
+    status_poster = AsyncMock(
+        wraps=codex_native_forwarder._post_turn_status_edge,
+        side_effect=[RuntimeError("credential resolution failed"), DEFAULT]
+        if status_publish_fails
+        else None,
+    )
+    monkeypatch.setattr(codex_native_forwarder, "_post_turn_status_edge", status_poster)
+
+    asyncio.run(
+        codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_capture_handler(posted)),
+        )
+    )
+
+    assert [call.kwargs["event"]["method"] for call in handle_event.await_args_list] == [
+        "item/started",
+        "item/completed",
+    ]
+    for call, event in zip(handle_event.await_args_list, events, strict=True):
+        assert call.kwargs["event"] is event
+        assert call.kwargs["event"]["params"]["item"] is user_message
+    assert user_message == _user_message_item("item_1", "Review the change.")
+    assert [body["data"] for body in posted if body["type"] == "external_conversation_item"] == [
+        {
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Review the change."}],
+            },
+            "response_id": "codex_turn_1",
+            "source_id": "thread_123:turn_1:item_1",
+        }
+    ]
+    statuses = [body["data"] for body in posted if body["type"] == "external_session_status"]
+    assert status_poster.await_count == (2 if status_publish_fails else 1)
+    assert statuses == [_expected_status_data("running", "turn_1")]
 
 
 def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(

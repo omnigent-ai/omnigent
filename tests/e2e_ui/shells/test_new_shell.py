@@ -13,7 +13,8 @@ Five behaviors are covered:
 1. **"+" → Shell launches and opens a shell.** Picking Shell creates a
    ``zsh`` shell that opens as a rail tab (``zsh · u-…``): its xterm
    connects in the rail's content slot, the chat page is left undisturbed,
-   and the tab's "x" closes it (after a confirm) and kills the terminal.
+   and the tab's "x" closes the idle shell at once and kills the terminal.
+   A busy shell's "x" asks first, naming what runs in it.
 
 2. **The user can type a command into the shell.** We type ``pwd`` into
    the connected shell and assert it keeps running — the keystrokes are
@@ -57,6 +58,7 @@ import httpx
 from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.polling import poll_until
+from tests.e2e_ui._shell_states import wait_until_shells_read
 from tests.e2e_ui.conftest import _server_state, open_right_rail
 
 
@@ -86,7 +88,7 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     as a tab in the workspace rail's top strip (labeled ``zsh · u-…``) and
     its xterm renders inside the rail's content slot — the chat page is
     left undisturbed (no ``main-terminal-view`` takeover). The tab's "x"
-    closes it (after confirming) and its xterm unmounts.
+    closes the idle shell without asking, and its xterm unmounts.
     """
     base_url, session_id = terminal_session
 
@@ -112,12 +114,46 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     )
     expect(page.get_by_placeholder("Send a message…")).to_be_visible()
 
-    # The tab's x asks to confirm first (closing a tab kills the terminal);
-    # confirming unmounts the shell's xterm and the rail returns to its
-    # default view.
+    # Once the runner reads the shell idle at its prompt, its x closes it without asking;
+    # its xterm unmounts and the rail returns to its default view.
+    wait_until_shells_read(base_url, session_id, ["idle"])
     close_tab.click()
+    expect(terminal_view).to_have_count(0, timeout=30_000)
+    expect(page.get_by_role("dialog")).to_have_count(0)
+
+
+def test_closing_a_busy_shell_asks_first_naming_its_job(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A shell running a program asks before its tab closes, naming the program.
+
+    Cancelling keeps the shell; confirming kills it and unmounts its xterm.
+    """
+    base_url, session_id = terminal_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    close_tab = rail.get_by_role("button", name=re.compile(r"^Close zsh · u-"))
+    expect(close_tab).to_be_visible(timeout=60_000)
+    terminal_view = rail.get_by_test_id("terminal-view")
+    expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
+    terminal_view.last.click()
+    page.keyboard.type("sleep 300")
+    page.keyboard.press("Enter")
+
+    # Wait until the runner reads the job, so the close can't catch the prompt before it.
+    wait_until_shells_read(base_url, session_id, ["busy"])
+    dialog = page.get_by_role("dialog")
+    close_tab.click()
+    expect(dialog).to_contain_text("sleep is running in zsh · u-")
+    page.get_by_role("button", name="Cancel").click()
+    expect(terminal_view.last).to_have_attribute("data-state", "connected")
+
+    close_tab.click()
+    expect(dialog).to_contain_text("sleep is running in zsh · u-")
     page.get_by_role("button", name="Close shell").click()
-    expect(terminal_view).to_have_count(0)
+    expect(terminal_view).to_have_count(0, timeout=30_000)
 
 
 def test_new_shell_attaches_while_create_in_flight(

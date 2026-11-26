@@ -43,6 +43,25 @@ def has_closed_title_marker(title: str | None) -> bool:
     return bool(title and CLOSED_TITLE_INFIX in title)
 
 
+def closed_title(title: str, session_id: str, max_chars: int) -> str:
+    """
+    Return the stored title that frees a sub-agent's ``(parent, title)`` slot.
+
+    Appends the closed marker and the session's id, trimming the visible part
+    so the result fits *max_chars*. A title that already carries the marker
+    is returned unchanged.
+
+    :param title: Visible sub-agent title, e.g. ``"researcher:auth"``.
+    :param session_id: The closed session's id, e.g. ``"conv_abc123"``.
+    :param max_chars: Longest stored title the server accepts, e.g. ``200``.
+    :returns: e.g. ``"researcher:auth:closed:conv_abc123"``.
+    """
+    if has_closed_title_marker(title):
+        return title
+    suffix = f"{CLOSED_TITLE_INFIX}{session_id}"
+    return title[: max(max_chars - len(suffix), 0)] + suffix
+
+
 def labels_with_closed_status(
     labels: Mapping[str, str] | None,
     title: str | None,

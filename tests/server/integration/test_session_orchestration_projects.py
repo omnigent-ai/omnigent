@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -279,8 +280,9 @@ async def test_another_project_keeps_the_destination_policy(auth_client, auth_ap
     assert {session.id for session in store.list_conversations().data} == before
 
 
+@pytest.mark.parametrize("by_id", [False, True])
 async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
-    auth_client, auth_app, db_uri, monkeypatch
+    auth_client, auth_app, db_uri, monkeypatch, by_id
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
@@ -292,8 +294,19 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
         {"agent_id": other_agent, **_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER},
     )
 
+    if by_id:
+        from omnigent.server.feature_flags import Feature, FeatureFlags
+
+        auth_app.state.feature_flags = FeatureFlags(
+            auth_app.state.feature_flags.enabled_features | {Feature.SCRIPTED_SESSIONS}
+        )
     worker_id = await _start_worker(
-        auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": "Elsewhere"}
+        auth_client,
+        auth_app,
+        db_uri,
+        monkeypatch,
+        source,
+        tool_args={"project_id": named} if by_id else {"project_name": "Elsewhere"},
     )
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
@@ -632,6 +645,127 @@ async def test_organizing_tools_rename_pin_archive_and_manage_projects(
 
 
 @_ONE_ENVIRONMENT
+async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
+    auth_client, peers, db_uri, monkeypatch
+):
+    source, target, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    # One sub-agent in another tree, and one of the caller's own on its runner.
+    other_tree_child = store.create_conversation(
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=target["id"],
+        title="researcher:auth",
+    )
+    own_child = store.create_conversation(
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=source["id"],
+        title="Worker",
+    )
+    # Stopping a native side chat closes it without releasing its title.
+    closed_child = store.create_conversation(
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=target["id"],
+        title="Stopped worker",
+        labels={"omnigent.closed": "true"},
+    )
+    children = (other_tree_child, own_child, closed_child)
+    runner_id = store.get_conversation(source["id"]).runner_id
+    assert runner_id
+    assert store.set_runner_id(own_child.id, runner_id) is True
+    stopped: list[str] = []
+
+    async def record_stop(session_id: str, _runner_router) -> bool:
+        stopped.append(session_id)
+        return True
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    monkeypatch.setattr(orchestration, "_stop_session_via_runner", record_stop)
+    store.set_session_live_status(source["id"], "running")
+    for session_id in (source["id"], target["id"], *(child.id for child in children)):
+        monkeypatch.setitem(sessions_common._session_status_cache, session_id, "running")
+
+    for child in children:
+        result = await _project_tool(
+            auth_client, source, "sys_session_update", session_id=child.id, archived=True
+        )
+        assert result == {
+            "session_id": child.id,
+            "status": "updated",
+            "archived": True,
+            "closed": True,
+        }
+    await asyncio.gather(*list(orchestration._detached_stop_tasks))
+    # Only the archived sub-agents stop; their parents keep running.
+    assert sorted(stopped) == sorted(child.id for child in children)
+    assert store.get_conversation(source["id"]).live_status == "running"
+    assert store.get_conversation(target["id"]).archived is not True
+    for child in children:
+        title = child.title
+        saved = store.get_conversation(child.id)
+        assert saved.archived is True and saved.labels["omnigent.closed"] == "true"
+        assert saved.title == f"{title}:closed:{child.id}"
+        shown = (await auth_client.get(f"/v1/sessions/{child.id}")).json()
+        assert shown["title"] == title
+        # The parent can start a new sub-agent under the freed name.
+        store.create_conversation(
+            kind="sub_agent",
+            agent_id=source["agent_id"],
+            parent_conversation_id=saved.parent_conversation_id,
+            title=title,
+        )
+
+    # Snapshots hide the tombstone; archiving again must preserve the stored title.
+    repeated = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=closed_child.id, archived=True
+    )
+    await asyncio.gather(*list(orchestration._detached_stop_tasks))
+    assert repeated["closed"] is True and repeated["archived"] is True
+    assert store.get_conversation(closed_child.id).title == (
+        f"Stopped worker:closed:{closed_child.id}"
+    )
+
+    # Siblings left on the caller's runner after their parent was rebound: the
+    # host-bound one owns it, so archiving it would stop the caller; it is refused.
+    rebound = store.create_conversation(
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=target["id"],
+        title="Rebound",
+    )
+    owner = store.create_conversation(
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=rebound.id,
+        title="Owner",
+    )
+    sibling = store.create_conversation(
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=rebound.id,
+        title="Sibling",
+    )
+    assert store.set_runner_id(rebound.id, "rebound-runner") is True
+    store.set_host_id(owner.id, "c1b2c3d4e5f61234567890abcdef0123", workspace="/tmp/ws")
+    for session_id in (owner.id, sibling.id):
+        assert store.set_runner_id(session_id, runner_id) is True
+    stopped.clear()
+    refused = json.loads(
+        await execute_tool(
+            tool_name="sys_session_update",
+            arguments=json.dumps({"session_id": owner.id, "archived": True}),
+            server_client=auth_client,
+            conversation_id=sibling.id,
+        )
+    )
+    assert "owns the runner it runs on" in refused["error"], refused
+    assert store.get_conversation(owner.id).archived is not True
+    assert stopped == []
+
+
+@_ONE_ENVIRONMENT
 async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
     auth_client, peers, db_uri
 ):
@@ -668,37 +802,78 @@ async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
 
 
 @_ONE_ENVIRONMENT
-async def test_a_child_cannot_archive_its_rebound_parent(auth_client, peers, db_uri):
+@pytest.mark.parametrize("parent_case", ["rebound-root", "sub-agent", "sub-agent-undo"])
+async def test_a_child_cannot_archive_its_parent(
+    auth_client, peers, db_uri, monkeypatch, parent_case
+):
     source, _, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
+    parent = store.get_conversation(source["id"])
+    if parent_case != "rebound-root":
+        parent = store.create_conversation(
+            kind="sub_agent",
+            agent_id=source["agent_id"],
+            parent_conversation_id=source["id"],
+            title="Lead",
+            runner_id=parent.runner_id,
+        )
     child = store.create_conversation(
-        agent_id=source["agent_id"], parent_conversation_id=source["id"]
+        kind="sub_agent",
+        agent_id=source["agent_id"],
+        parent_conversation_id=parent.id,
+        title="Helper",
     )
-    # The parent moved to another runner while the child stayed on the original.
     auth_client.headers.update(_bind_runner(db_uri, child.id))
-    store.clear_runner_id(source["id"])
-    assert store.set_runner_id(source["id"], "rebound-runner")
-
-    existing_id = await _project(auth_client, "Existing")
+    if parent_case == "rebound-root":
+        # The parent moved to another runner while the child stayed on the original.
+        store.clear_runner_id(parent.id)
+        assert store.set_runner_id(parent.id, "rebound-runner")
 
     async def archive_parent(**fields) -> dict:
-        return json.loads(
-            await execute_tool(
-                tool_name="sys_session_update",
-                arguments=json.dumps({"session_id": source["id"], "archived": True, **fields}),
-                server_client=auth_client,
-                conversation_id=child.id,
-            )
+        return await _project_tool(
+            auth_client,
+            {"id": child.id},
+            "sys_session_update",
+            session_id=parent.id,
+            archived=True,
+            **fields,
         )
 
-    result = await archive_parent()
-    assert "cannot archive its own session or a session it runs under" in result["error"], result
+    async def undo_after_snapshot(response):
+        if response.request.method == "GET" and response.request.url.path == (
+            f"/v1/sessions/{parent.id}"
+        ):
+            await response.aread()
+            assert response.json()["archived"] is True
+            restored = await auth_client.patch(
+                f"/v1/sessions/{parent.id}", json={"archived": False}
+            )
+            assert restored.status_code == 200, restored.text
+
+    with monkeypatch.context() as patch:
+        if parent_case == "sub-agent-undo":
+            store.update_conversation(parent.id, archived=True)
+            # Undo after the read keeps source validation from masking the lineage guard.
+            patch.setitem(
+                auth_client.event_hooks,
+                "response",
+                [*auth_client.event_hooks["response"], undo_after_snapshot],
+            )
+        result = await archive_parent()
+    assert "cannot archive a session it runs under" in result["error"], result
+    unchanged = store.get_conversation(parent.id)
+    assert unchanged.archived is not True and unchanged.title == parent.title
+    assert unchanged.labels == parent.labels and unchanged.project_id is None
+    if parent_case != "rebound-root":
+        return
+
+    existing_id = await _project(auth_client, "Existing")
     into_existing = await archive_parent(project="Existing")
     assert "a session it runs under" in into_existing["error"], into_existing
     into_new = await archive_parent(project="Brand new")
     assert "in separate calls" in into_new["error"], into_new
-    parent = store.get_conversation(source["id"])
-    assert parent.archived is not True and parent.project_id is None
+    unchanged = store.get_conversation(parent.id)
+    assert unchanged.archived is not True and unchanged.project_id is None
     projects = (await auth_client.get("/v1/projects")).json()["data"]
     assert [project["id"] for project in projects] == [existing_id]
 
@@ -768,3 +943,69 @@ async def test_project_update_promotes_a_label_only_folder(auth_client, peers, d
     assert "Somewhere" not in {
         p["name"] for p in (await auth_client.get("/v1/projects")).json()["data"]
     }
+
+
+@_ONE_ENVIRONMENT
+@pytest.mark.parametrize(
+    ("undone", "via"),
+    [(False, "tool"), (True, "tool"), (False, "dashed-path")],
+    ids=["turn-ends", "undone", "turn-ends-dashed-path"],
+)
+async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
+    auth_client, peers, db_uri, monkeypatch, undone, via
+):
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    torn_down: list[str] = []
+
+    async def record_teardown(session_id: str, _store, _runner_router) -> list[str]:
+        torn_down.append(session_id)
+        return []
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
+    monkeypatch.setattr(sessions_module, "_best_effort_stop", record_teardown)
+    # The wait has seen the turn running twice, so it is looping rather than
+    # merely slow to start.
+    seen_running_twice = asyncio.Event()
+    running_reads = 0
+    real_status = orchestration._session_status_from_cache
+
+    def counted_status(session_id: str, *args):
+        nonlocal running_reads
+        status = real_status(session_id, *args)
+        if session_id == source["id"] and status == "running":
+            running_reads += 1
+            if running_reads >= 2:
+                seen_running_twice.set()
+        return status
+
+    monkeypatch.setattr(orchestration, "_session_status_from_cache", counted_status)
+    # The tool call happens mid-turn.
+    monkeypatch.setitem(sessions_common._session_status_cache, source["id"], "running")
+    if via == "tool":
+        result = await _project_tool(
+            auth_client, source, "sys_session_update", session_id=source["id"], archived=True
+        )
+        assert result["status"] == "updated" and result["archived"] is True, result
+    else:
+        # The path may spell the id with dashes; the wait and the pending stop
+        # still key it by the canonical id.
+        response = await auth_client.patch(
+            f"/v1/sessions/{uuid.UUID(source['id'])}",
+            headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+            json={"archived": True},
+        )
+        assert response.status_code == 200, response.text
+    assert store.get_conversation(source["id"]).archived is True
+
+    await asyncio.wait_for(seen_running_twice.wait(), 5)
+    assert torn_down == [] and source["id"] in orchestration._pending_archive_stops
+    if undone:
+        # An Undo on another replica only clears the flag; the wait ends without
+        # the turn ending.
+        store.update_conversation(source["id"], archived=False)
+    else:
+        sessions_common._session_status_cache[source["id"]] = "idle"
+    await asyncio.wait_for(asyncio.gather(*list(orchestration._detached_stop_tasks)), 5)
+    assert torn_down == ([] if undone else [source["id"]])

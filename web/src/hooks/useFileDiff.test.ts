@@ -11,7 +11,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceChangedFiles: vi.fn(),
@@ -24,7 +24,7 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceServeable,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { useFileDiff } from "./useFileDiff";
+import { fetchFileDiff, fileDiffQueryKey, useFileDiff } from "./useFileDiff";
 
 const serveableMock = vi.mocked(useWorkspaceServeable);
 const changedFilesMock = vi.mocked(useWorkspaceChangedFiles);
@@ -311,5 +311,42 @@ describe("useFileDiff — error handling", () => {
     expect(result.current.error).toMatchObject({
       message: "git status timed out after 5.0s",
     });
+  });
+});
+
+describe("fetchFileDiff", () => {
+  it("reads one file's diff, and can be cancelled", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ path: "a.ts", before: "old", after: "new" }));
+    const controller = new AbortController();
+
+    expect(await fetchFileDiff("conv_1", "src/a.ts", controller.signal)).toMatchObject({
+      after: "new",
+    });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain(
+      "/v1/sessions/conv_1/resources/environments/default/diff/src/a.ts",
+    );
+    expect((init as RequestInit | undefined)?.signal).toBe(controller.signal);
+  });
+
+  it("stamps a diff with when its request started, not when it arrived", async () => {
+    let answer: (response: Response) => void = () => {};
+    fetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    onTestFinished(() => now.mockRestore());
+    const reading = fetchFileDiff("conv_1", "a.ts");
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    now.mockReturnValue(5_000);
+    answer(mockResponse({ path: "a.ts", before: "old", after: "new" }));
+
+    expect((await reading).requestedAt).toBe(1_000);
+  });
+
+  it("keys every diff surface's cache the same way", () => {
+    expect(fileDiffQueryKey("conv_1", "a.ts")).toEqual(["file-diff", "conv_1", "a.ts"]);
   });
 });
