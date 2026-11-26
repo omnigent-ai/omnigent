@@ -8,6 +8,8 @@ import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
 import { useTabStripWidth } from "./useTabStripWidth";
+import { publishRailControlsWidth } from "./railControlsWidth";
+import { settingsPagePlace, useWorkspaceTabSettings } from "./workspaceTabSettings";
 import { tabGroup as tabGroupDefinition, tabGroupOf, tabPullRequestUrl } from "./tabGroups";
 import {
   type TabSearchClosing,
@@ -35,6 +37,7 @@ import {
   type LucideIcon,
   MaximizeIcon,
   XIcon,
+  PanelRightCloseIcon,
   MessageSquareIcon,
   MinimizeIcon,
   SearchIcon,
@@ -69,7 +72,7 @@ import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { closeBrowserView, forgetBrowserTab, useBrowserPageLabels } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { getPullRequestStatus } from "@/lib/pullRequestStatus";
-import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentSessionIdFromTab, subagentTabId } from "@/lib/subagentTabs";
 import { ApiError, getSessionSlim } from "@/lib/sessionsApi";
@@ -145,7 +148,7 @@ import { shellLabelList } from "./useTabsShellClose";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
 import { WorkspaceHistoryChevrons } from "./WorkspaceHistoryChevrons";
 import { LOCAL_CHANGES_LABEL, type PlaceIcon, placeTitle, truncateMiddle } from "./placeTitle";
-import type { TabId, WorkspacePlace } from "./workspacePlace";
+import type { TabId } from "./workspacePlace";
 import { isUnknownTab, type WorkspaceTab, type WorkspaceTabRecord } from "./workspaceTab";
 import { isOnlyEmptyNewTab, LAST_NEW_TAB_REASON, type RecentPlace } from "./workspaceTabsStore";
 import {
@@ -157,7 +160,6 @@ import {
   type WorkspaceTabsSession,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
-import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { TasksPanel } from "../TasksPanel";
@@ -341,6 +343,12 @@ function WorkspaceTabsPanelImpl({
   onHistoryGo,
 }: WorkspaceTabsPanelProps) {
   const { session, tabs, selectedTabId } = useWorkspaceTabs(conversationId);
+  // The header keeps its toggle while this sidebar is too narrow to show its own Collapse.
+  const reportControlsWidth = useCallback(
+    (controlsWidth: number) => publishRailControlsWidth(conversationId, controlsWidth),
+    [conversationId],
+  );
+  useEffect(() => () => publishRailControlsWidth(conversationId, null), [conversationId]);
   const { store } = session;
   const knownTabs = tabs.filter((tab): tab is WorkspaceTab => !isUnknownTab(tab));
   const selectedTab = knownTabs.find((tab) => tab.id === selectedTabId);
@@ -909,6 +917,16 @@ function WorkspaceTabsPanelImpl({
       tab,
       label: tab === "changes" ? LOCAL_CHANGES_LABEL : WORKSPACE_PANEL_TABS[tab].label,
     }));
+  // The Workspace settings' pinned pages and first page, as far as this session can show them.
+  const tabSettings = useWorkspaceTabSettings();
+  const openablePages = openablePanels.map((panel) => panel.tab).join(",");
+  // A tab closing makes room for a pinned page that didn't fit; an unchanged apply does nothing.
+  const tabCount = tabs.length;
+  useEffect(() => {
+    if (pending) return;
+    const pages = new Set(openablePages.split(","));
+    store.applyTabSettings(tabSettings, (page) => pages.has(page));
+  }, [store, tabSettings, openablePages, pending, tabCount]);
   const facts: WorkspaceCommandFacts = {
     openablePanels,
     browser: showBrowserTab,
@@ -1002,7 +1020,7 @@ function WorkspaceTabsPanelImpl({
     switch (command.kind) {
       case "panel":
         if (fromNewTab) {
-          store.fillNewTab(fromNewTab, pagePlace(command.tab));
+          store.fillNewTab(fromNewTab, settingsPagePlace(command.tab));
           return;
         }
         void openWorkspacePage(conversationId, command.tab).then(reportRefusal);
@@ -1371,6 +1389,7 @@ function WorkspaceTabsPanelImpl({
           <WorkspaceSidebarFrame
             stripWidth={stripWidth}
             tabListRef={tabListRef}
+            onControlsWidth={reportControlsWidth}
             leading={
               // ‹ › and the tab list sit together, without the strip's gap.
               <div className="flex shrink-0 items-center">
@@ -1545,10 +1564,18 @@ function WorkspaceTabsPanelImpl({
                       aria-keyshortcuts={shortcutAriaKeys("sidebar.right")}
                       onClick={onHide}
                       size="icon-xs"
-                      // A narrow strip leaves room to "+", as the header's toggle beside it does the same.
-                      className="flex size-6 text-muted-foreground hover:text-foreground @max-[240px]/rail:hidden"
+                      // A narrow strip leaves room to "+" while the header's toggle beside it also closes
+                      // the sidebar. Floating panes hide that toggle, so this one stays.
+                      className={cn(
+                        "flex size-6 text-muted-foreground hover:text-foreground",
+                        !floatingPanes && "@max-[240px]/rail:hidden",
+                      )}
                     >
-                      <XIcon className="size-4" />
+                      {floatingPanes ? (
+                        <PanelRightCloseIcon className="size-4" />
+                      ) : (
+                        <XIcon className="size-4" />
+                      )}
                     </Button>
                   </WorkspaceTabTooltip>
                 )}
@@ -1617,21 +1644,6 @@ function WorkspaceTabsPanelImpl({
       )}
     </>
   );
-}
-
-function pagePlace(page: DefaultWorkspaceTab): WorkspacePlace {
-  switch (page) {
-    case "files":
-      return { kind: "files" };
-    case "changes":
-      return { kind: "changes" };
-    case "github":
-      return { kind: "pulls" };
-    case "subagents":
-      return { kind: "agents" };
-    case "tasks":
-      return { kind: "tasks" };
-  }
 }
 
 function AttentionBar({

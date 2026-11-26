@@ -1,7 +1,13 @@
 // Syntax highlighting that tokenizes only what the reader can see plus a
 // buffer, so a file of any size stays highlighted without a long main-thread pass.
 
-import { StateEffect, StateField, type Extension, type Text } from "@codemirror/state";
+import {
+  type EditorState,
+  StateEffect,
+  StateField,
+  type Extension,
+  type Text,
+} from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -38,6 +44,11 @@ const highlighting = StateField.define<DecorationSet>({
   },
   provide: (field) => EditorView.decorations.from(field),
 });
+
+/** The syntax colors the viewer has so far, as token marks. */
+export function highlightingOf(state: EditorState): DecorationSet {
+  return state.field(highlighting, false) ?? Decoration.none;
+}
 
 /** Whether `doc` is large enough that only the visible slice is tokenized. */
 export function usesViewportHighlighting(doc: Text): boolean {

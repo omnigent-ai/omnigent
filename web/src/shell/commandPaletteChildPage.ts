@@ -1,15 +1,33 @@
-// The command palette's child pages: a setting's values and a command's options. They live
-// outside the palette component so work that settles late can tell whether its page still shows.
+// The command palette's child pages: a setting's values, a command's options and a session's
+// actions. They live outside the palette component so work that settles late can tell whether
+// its page still shows.
 
 import { create } from "zustand";
+
+import type { Conversation } from "@/hooks/useConversations";
+
+import type { SessionCommandId } from "./sessionCommands/commandIds";
 
 /** Where Back returns to: the parent page's query and active row. */
 export interface PaletteParentPlace {
   query: string;
   activeId: string | null;
+  /** The child page Back reopens, with its own parent, when the parent is itself a page. */
+  page?: { page: PaletteChildPage; parent: PaletteParentPlace | null };
 }
 
 export type PaletteChildPage =
+  /** The sessions to run `command` on, from a verb-first row such as "Archive a Session…". */
+  | { kind: "pick-session"; command: SessionCommandId }
+  /** A session's actions, from ⌘↵ on its row; `conversation` is that row as listed. */
+  | {
+      kind: "session-actions";
+      sessionId: string;
+      title: string;
+      conversation: Conversation;
+      /** Whether the sidebar's lists held the session as its actions opened. */
+      listed: boolean;
+    }
   /** A command's options, bound to its row and the command target then. */
   | { kind: "command-options"; itemId: string; targetKey: string; label: string }
   /**
@@ -78,7 +96,7 @@ export function openPaletteChildPage(page: PaletteChildPage): void {
 export function leavePaletteChildPage(): PaletteParentPlace | null {
   paletteIntents.revoke();
   const { parent } = paletteChildPageStore.getState();
-  paletteChildPageStore.setState({ page: null, parent: null });
+  paletteChildPageStore.setState(parent?.page ?? { page: null, parent: null });
   return parent;
 }
 

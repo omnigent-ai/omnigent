@@ -68,6 +68,9 @@ from omnigent.server.pull_request_viewers import (
     OWNER_ONLY_CHANGES_MESSAGE,
     PullRequestViewer,
     info_for_viewer,
+    review_comments_for_viewer,
+    review_read_params,
+    review_threads_for_viewer,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -119,16 +122,19 @@ from omnigent.server.schemas import (
     CopiedFile,
     CopyFilesRequest,
     CopyFilesResponse,
+    ErrorResponse,
     SessionPullRequestList,
     SessionRepositoryBranchList,
     SessionResourceObject,
     SessionResourcePaginatedList,
+    TerminalShellState,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_pull_request_store import SessionPullRequestLimitError
+from omnigent.terminals.shell_inspection import ShellInspection
 
 if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
@@ -198,11 +204,19 @@ class _RunnerStreamResponse(StreamingResponse):
 # budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
 # reported as failed.
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
+# A terminal resource id as the runner builds it, checked before it goes into a runner path.
+_TERMINAL_RESOURCE_ID_RE = re.compile(r"terminal_[A-Za-z0-9_.-]{1,200}")
+# The shell route's answer when the session's runner is offline or unreachable.
+_SHELL_RUNNER_OFFLINE = "This session's runner isn't available right now."
+# The whole runner call, since a tunneled runner's transport doesn't enforce httpx's timeout.
+_SHELL_PROXY_TIMEOUT_S = 1.0
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
 # the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
 _MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
+# Room in a workspace API upload's body for its URL, name and protobuf framing.
+_UPLOAD_FIELDS_MARGIN_BYTES = 64 * 1024
 
 # Automatic previews can require this acknowledgement when talking to older servers.
 _WORKSPACE_FILE_SCOPE_HEADERS = {
@@ -660,11 +674,11 @@ def register_resources_routes(
                 and isinstance(response_payload.get("detail"), str)
             ):
                 raise HTTPException(status_code=400, detail=response_payload["detail"])
+            msg = "runner resource endpoint failed"
             if isinstance(response_payload, dict):
-                error = response_payload.get("error", {})
-                msg = error.get("message") or "runner resource endpoint failed"
-            else:
-                msg = "runner resource endpoint failed"
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    msg = error["message"] or msg
             raise HTTPException(status_code=502, detail=msg)
         if not isinstance(response_payload, dict):
             raise HTTPException(
@@ -1800,6 +1814,79 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
         return await _proxy_get_to_runner(session_id, path, conv, for_control=True)
 
+    @router.get(
+        "/sessions/{session_id}/resources/terminals/{terminal_id}/shell",
+        response_model=TerminalShellState,
+        responses={
+            403: {"model": ErrorResponse, "description": "The caller can't close this terminal"},
+            404: {
+                "model": ErrorResponse,
+                "description": "No such running terminal in a session the caller can see",
+            },
+            502: {"description": "The runner failed to inspect the terminal"},
+            503: {
+                "model": ErrorResponse,
+                "description": "The runner is offline, or too old to inspect terminals",
+            },
+        },
+    )
+    async def get_session_terminal_shell(
+        request: Request,
+        session_id: str,
+        terminal_id: str,
+    ) -> dict[str, Any]:
+        """
+        Whether a terminal runs anything besides its login shell, so closing it can skip asking.
+
+        Only a caller who may close the terminal may ask: edit access, as deleting it needs.
+        Every miss answers one fixed 404, and runner failures become fixed messages: the
+        runner's text never reaches the caller, and its answer is rebuilt field by field. A
+        runner tunnel on another replica keeps its routing error, so the client can resend.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Terminal resource id, e.g. ``"terminal_bash_s1"``.
+        :returns: ``{"state", "foreground", "background_jobs"}``.
+        """
+        not_found = OmnigentError("Terminal not found", code=ErrorCode.NOT_FOUND)
+        if _TERMINAL_RESOURCE_ID_RE.fullmatch(terminal_id) is None:
+            raise not_found
+        try:
+            conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise not_found from None
+            raise
+        path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell"
+        older_runner = "This session's runner can't inspect terminals."
+        try:
+            async with asyncio.timeout(_SHELL_PROXY_TIMEOUT_S):
+                payload = await _proxy_get_to_runner(
+                    session_id,
+                    path,
+                    conv,
+                    timeout=_SHELL_PROXY_TIMEOUT_S,
+                    unsupported_endpoint_message=older_runner,
+                    for_control=True,
+                )
+        except TimeoutError:
+            # A runner that stops answering fails the same way as one that answers badly.
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        except WrongReplicaError:
+            # Its host id tells the client where to resend; it carries no runner text.
+            raise
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise not_found from None
+            if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                # An older runner and an offline one both ask before closing, but read apart.
+                message = older_runner if exc.message == older_runner else _SHELL_RUNNER_OFFLINE
+                raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE) from None
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        except HTTPException:
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        return ShellInspection.from_untrusted(payload).to_dict()
+
     @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
     async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:
         """
@@ -2902,14 +2989,17 @@ def register_resources_routes(
                 status_code=501, detail="The workspace API needs `omnigent[workspace-api]`"
             ) from None
         from connectrpc.errors import ConnectError
+        from connectrpc.server import DEFAULT_READ_MAX_BYTES
 
         from omnigent.api.workspace.v1alpha1.workspace_connect import (
             WorkspaceServiceASGIApplication,
         )
         from omnigent.host.frames import CAP_WORKSPACE_API
         from omnigent.host.workspace_methods import WORKSPACE_METHODS
+        from omnigent.host.workspace_pull_request_input import MAX_ATTACHMENT_BYTES
         from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
         from omnigent.server.workspace_api import (
+            VIEWER_SHAPED_METHODS,
             ConnectCallResponse,
             HostTarget,
             HostWorkspaceService,
@@ -2929,15 +3019,15 @@ def register_resources_routes(
             conv = await _validate_session(session_id, request, LEVEL_READ)
         # The owner grant itself, with no admin pass: only the owner acts as the host's account.
         # Only an owner-gated method and GetCapabilities, which lists them, need it.
-        session_owner = (
-            gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities"
-        ) and await asyncio.to_thread(
-            _is_session_owner,
-            _get_user_id(request, auth_provider),
-            conv,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-        )
+        if gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities":
+            session_owner = await _caller_is_session_owner(conv, request)
+        elif method in VIEWER_SHAPED_METHODS:
+            # The thread reads show the host account's rights to the owner alone; as on REST,
+            # a failed lookup reads them as anyone else would rather than failing the read.
+            viewer = await _pull_request_viewer(conv, request)
+            session_owner = viewer is PullRequestViewer.OWNER
+        else:
+            session_owner = False
         if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
             raise OmnigentError(
                 "Only the session's owner can use this through the workspace API",
@@ -2966,13 +3056,21 @@ def register_resources_routes(
                 overview=lambda payload, sent_at: _with_server_pull_requests(
                     session_id, payload, sent_at
                 ),
+                viewer=PullRequestViewer.OWNER if session_owner else PullRequestViewer.VIEWER,
             ),
             # Only GetCapabilities lists methods, and it needs the browse gate.
             callable_methods=callable_methods(
                 browse=gate is WorkspaceGate.BROWSE, session_owner=session_owner
             ),
         )
-        app = WorkspaceServiceASGIApplication(forwarder)
+        # An upload may be as large as an attachment, but only once the owner gate has passed;
+        # every other call, and anyone else's, keeps connectrpc's default read limit.
+        read_max_bytes = (
+            MAX_ATTACHMENT_BYTES + _UPLOAD_FIELDS_MARGIN_BYTES
+            if method == "UploadAttachment" and session_owner
+            else DEFAULT_READ_MAX_BYTES
+        )
+        app = WorkspaceServiceASGIApplication(forwarder, read_max_bytes=read_max_bytes)
         # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
         return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
@@ -4491,7 +4589,10 @@ def register_resources_routes(
                 "base_sha": base_sha,
             },
         )
-        return await _fs_get_with_host_fallback(
+        # The host account's rights in each conversation are the owner's to see.
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        threads = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_threads",
@@ -4499,6 +4600,7 @@ def register_resources_routes(
             runner_params=params,
             runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
         )
+        return review_threads_for_viewer(threads, viewer)
 
     @router.get(
         "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
@@ -4514,7 +4616,9 @@ def register_resources_routes(
         """Load additional replies in a published PR review conversation."""
         conv = await _validate_session(session_id, request, LEVEL_READ)
         params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
-        return await _fs_get_with_host_fallback(
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        comments = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_thread_comments",
@@ -4525,6 +4629,7 @@ def register_resources_routes(
                 f"{urllib.parse.quote(thread_id, safe='')}/comments"
             ),
         )
+        return review_comments_for_viewer(comments, viewer)
 
     @router.post(
         "/sessions/{session_id}/resources/github/review-threads",

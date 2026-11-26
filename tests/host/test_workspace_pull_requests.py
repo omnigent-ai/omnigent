@@ -7,6 +7,7 @@ A provider read past the scope check is a test failure unless the case allows it
 
 from __future__ import annotations
 
+import copy
 import socket
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,13 @@ from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
-from omnigent.runner import github_resource, pr_resource
+from omnigent.runner import github_resource, github_reviews, pr_resource
+from omnigent.runner.pull_request_errors import (
+    CommentChangedError,
+    PullRequestChangedError,
+    PullRequestError,
+    UnknownOutcomeError,
+)
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
 from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS, _PULL_REQUEST_READS
@@ -58,8 +65,11 @@ def _frame(
     *,
     session_id: str | None = _SESSION,
     vouch: PullRequestVouch | None = None,
+    account_rights: bool = False,
 ) -> HostWorkspaceCallFrame:
-    return HostWorkspaceCallFrame("r1", str(root), method, request, session_id, vouch)
+    return HostWorkspaceCallFrame(
+        "r1", str(root), method, request, session_id, vouch, account_rights=account_rights
+    )
 
 
 async def _answer(frame: HostWorkspaceCallFrame) -> tuple[list[bytes], str | None, str | None]:
@@ -269,6 +279,8 @@ def _pr_target(**fields: Any) -> dict[str, Any]:
     return {"session_id": _SESSION, "pr_url": _PR, **fields}
 
 
+# A PNG signature: the runner refuses an upload whose bytes are no image or video.
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
 # Each owner method: a valid request, the pr_resource function it runs, and its arguments.
 _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "ListLabels": (pb.ListLabelsRequest(pr_url=_PR), "pr_labels", _pr_target()),
@@ -357,7 +369,146 @@ _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
         "disable_pr_auto_merge",
         _pr_target(),
     ),
+    "UploadAttachment": (
+        pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png", content=_PNG),
+        "upload_pr_attachment",
+        _pr_target(name="shot.png", content=_PNG),
+    ),
 }
+
+
+_DIGEST = "c" * 64
+_ANCHOR = pb.ReviewThreadAnchor(
+    path="src/app.py", side="RIGHT", line=4, head_sha=_HEAD, base_sha=_BASE
+)
+# Each review method: a valid request, the github_reviews function it runs, and its arguments.
+_REVIEW_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "GetPendingReview": (pb.GetPendingReviewRequest(pr_url=_PR), "get_pending_review", {}),
+    "StartPendingReview": (
+        pb.StartPendingReviewRequest(pr_url=_PR, commit_oid=_HEAD),
+        "start_pending_review",
+        {"commit_oid": _HEAD},
+    ),
+    "AddPendingReviewComment": (
+        pb.AddPendingReviewCommentRequest(
+            pr_url=_PR,
+            body="Why?",
+            anchor=_ANCHOR,
+            pending_review_id="PRR_1",
+            expected_head_oid=_HEAD,
+        ),
+        "add_pending_review_comment",
+        {
+            "body": "Why?",
+            "anchor": {
+                "path": "src/app.py",
+                "side": "RIGHT",
+                "line": 4,
+                "start_line": None,
+                "head_sha": _HEAD,
+                "base_sha": _BASE,
+            },
+            "pending_review_id": "PRR_1",
+            "expected_head": _HEAD,
+        },
+    ),
+    "UpdatePendingReviewComment": (
+        pb.UpdatePendingReviewCommentRequest(
+            pr_url=_PR,
+            comment_node_id="PRRC_1",
+            body="Better",
+            expected_body_sha256=_DIGEST,
+            pending_review_id="PRR_1",
+        ),
+        "update_pending_review_comment",
+        {
+            "comment_node_id": "PRRC_1",
+            "body": "Better",
+            "expected_body_sha256": _DIGEST,
+            "pending_review_id": "PRR_1",
+        },
+    ),
+    "DeletePendingReviewComment": (
+        pb.DeletePendingReviewCommentRequest(
+            pr_url=_PR, comment_node_id="PRRC_1", pending_review_id="PRR_1"
+        ),
+        "delete_pending_review_comment",
+        {"comment_node_id": "PRRC_1", "pending_review_id": "PRR_1"},
+    ),
+    "SubmitPendingReview": (
+        pb.SubmitPendingReviewRequest(
+            pr_url=_PR, event="APPROVE", body="", commit_oid=_HEAD, pending_review_id="PRR_1"
+        ),
+        "submit_pending_review",
+        {"event": "APPROVE", "body": "", "commit_oid": _HEAD, "pending_review_id": "PRR_1"},
+    ),
+    "DiscardPendingReview": (
+        pb.DiscardPendingReviewRequest(pr_url=_PR, pending_review_id="PRR_1"),
+        "discard_pending_review",
+        {"pending_review_id": "PRR_1"},
+    ),
+    "SubmitReview": (
+        pb.SubmitReviewRequest(pr_url=_PR, event="COMMENT", body="Nit", commit_oid=_HEAD),
+        "submit_review",
+        {"event": "COMMENT", "body": "Nit", "commit_oid": _HEAD},
+    ),
+    "SubmitReviewVerdict": (
+        pb.SubmitReviewVerdictRequest(
+            pr_url=_PR, event="REQUEST_CHANGES", body="Fix", commit_oid=_HEAD
+        ),
+        "submit_review",
+        {"event": "REQUEST_CHANGES", "body": "Fix", "commit_oid": _HEAD},
+    ),
+    "SetReviewThreadResolved": (
+        pb.SetReviewThreadResolvedRequest(pr_url=_PR, thread_id="PRRT_1", resolved=True),
+        "set_thread_resolved",
+        {"thread_id": "PRRT_1", "resolved": True},
+    ),
+    "EditComment": (
+        pb.EditCommentRequest(
+            pr_url=_PR, kind="review", comment_id=5, body="Mine", expected_body_sha256=_DIGEST
+        ),
+        "edit_comment",
+        {"kind": "review", "comment_id": 5, "body": "Mine", "expected_body_sha256": _DIGEST},
+    ),
+    "DeleteComment": (
+        pb.DeleteCommentRequest(pr_url=_PR, kind="issue", comment_id=5),
+        "delete_comment",
+        {"kind": "issue", "comment_id": 5},
+    ),
+    "AddReaction": (
+        pb.AddReactionRequest(pr_url=_PR, kind="issue", comment_id=5, content="HEART"),
+        "add_reaction",
+        {"kind": "issue", "comment_id": 5, "content": "HEART"},
+    ),
+    "RemoveReaction": (
+        pb.RemoveReactionRequest(pr_url=_PR, kind="review", comment_id=5, content="HEART"),
+        "remove_reaction",
+        {"kind": "review", "comment_id": 5, "content": "HEART"},
+    ),
+}
+
+
+def record_review_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    """Each GitHub review call a method made: the function, its root, PR and arguments."""
+    calls: list[tuple[str, str, str, dict[str, Any]]] = []
+    for function in {name for _request, name, _kwargs in _REVIEW_CALLS.values()}:
+
+        def record(
+            root: str, reference: PullRequestRef, *, _function: str = function, **kwargs: Any
+        ) -> dict[str, Any]:
+            calls.append((_function, root, reference.url, kwargs))
+            return {"object": "test"}
+
+        monkeypatch.setattr(github_reviews, function, record)
+    return calls
+
+
+@pytest.fixture
+def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
+    return record_review_calls(monkeypatch)
 
 
 def record_owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
@@ -391,7 +542,8 @@ def providers(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
 
 
 def test_every_owner_method_has_a_call_case() -> None:
-    assert set(_OWNER_CALLS) == _PULL_REQUEST_OWNER_METHODS
+    assert not set(_OWNER_CALLS) & set(_REVIEW_CALLS)
+    assert set(_OWNER_CALLS) | set(_REVIEW_CALLS) == _PULL_REQUEST_OWNER_METHODS
 
 
 @pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
@@ -514,6 +666,201 @@ async def test_list_labels_refuses_a_search_it_cant_do(
 
     assert code == Code.INVALID_ARGUMENT.value
     assert message == "Label search isn't available on this host"
+    assert owner_calls == []
+
+
+_VOUCHED = PullRequestVouch(server_tracked=True)
+
+
+async def _reason(frame: HostWorkspaceCallFrame) -> tuple[str | None, str | None]:
+    """A call's end: its error code and the refusal reason the reply carries."""
+    async for reply in serve_tunnel_call(lambda ws: WorkspaceReader(Path(ws)), frame):
+        if reply.done:
+            return reply.error_code, reply.error_reason
+    raise AssertionError("the call never ended")
+
+
+@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
+async def test_a_review_method_runs_its_github_change_with_the_requests_fields(
+    tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+) -> None:
+    request, function, kwargs = _REVIEW_CALLS[method]
+    messages, code, message = await _answer(
+        _frame(tmp_path, method, request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert code is None, message
+    assert review_calls == [(function, str(tmp_path.resolve()), _PR, kwargs)]
+    payload = WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload
+    assert dict(payload) == {"object": "test"}
+
+
+async def test_a_draft_reply_goes_in_its_conversation_without_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_calls: list[tuple[str, str, str, dict[str, Any]]] = []
+
+    def reply(root: str, reference: PullRequestRef, **kwargs: Any) -> dict[str, Any]:
+        review_calls.append(("add_pending_review_reply", root, reference.url, kwargs))
+        return {"object": "test"}
+
+    monkeypatch.setattr(github_reviews, "add_pending_review_reply", reply)
+    request = pb.AddPendingReviewCommentRequest(
+        pr_url=_PR,
+        body="Agreed",
+        in_reply_to_thread_id="PRRT_1",
+        pending_review_id="PRR_1",
+        expected_head_oid=_HEAD,
+    )
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "AddPendingReviewComment", request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert code is None, message
+    assert review_calls == [
+        (
+            "add_pending_review_reply",
+            str(tmp_path.resolve()),
+            _PR,
+            {
+                "body": "Agreed",
+                "thread_id": "PRRT_1",
+                "pending_review_id": "PRR_1",
+                "expected_head": _HEAD,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
+async def test_a_review_method_refuses_a_pr_the_session_never_recorded(
+    tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+) -> None:
+    request, _function, _kwargs = _REVIEW_CALLS[method]
+    _messages, code, message = await _answer(_frame(tmp_path, method, request.SerializeToString()))
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message == "This pull request is not associated with the session"
+    assert review_calls == []
+
+
+@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
+async def test_a_review_method_naming_no_pr_changes_none_the_server_offers_by_default(
+    tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+) -> None:
+    request, _function, _kwargs = _REVIEW_CALLS[method]
+    unnamed = type(request)()
+    unnamed.CopyFrom(request)
+    unnamed.ClearField("pr_url")
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+
+    _messages, code, message = await _answer(
+        _frame(tmp_path, method, unnamed.SerializeToString(), vouch=vouch)
+    )
+
+    assert code == Code.FAILED_PRECONDITION.value
+    assert message is not None and message.startswith("Select a pull request to ")
+    assert review_calls == []
+
+
+_MALFORMED_REVIEWS = {
+    "verdict-on-comment-review": pb.SubmitReviewRequest(
+        pr_url=_PR, event="APPROVE", body="x", commit_oid=_HEAD
+    ),
+    "comment-as-verdict": pb.SubmitReviewVerdictRequest(
+        pr_url=_PR, event="COMMENT", body="x", commit_oid=_HEAD
+    ),
+    "unknown-pending-event": pb.SubmitPendingReviewRequest(
+        pr_url=_PR, event="DISMISS", commit_oid=_HEAD, pending_review_id="PRR_1"
+    ),
+    "no-pending-review": pb.DiscardPendingReviewRequest(pr_url=_PR),
+    "bad-thread-id": pb.SetReviewThreadResolvedRequest(pr_url=_PR, thread_id="../x"),
+    "bad-reply-thread": pb.AddPendingReviewCommentRequest(
+        pr_url=_PR,
+        body="x",
+        in_reply_to_thread_id="a b",
+        pending_review_id="PRR_1",
+        expected_head_oid=_HEAD,
+    ),
+    "bad-kind": pb.DeleteCommentRequest(pr_url=_PR, kind="commit", comment_id=5),
+    "no-comment-id": pb.DeleteCommentRequest(pr_url=_PR, kind="issue"),
+    "bad-reaction": pb.AddReactionRequest(pr_url=_PR, kind="issue", comment_id=5, content="MEH"),
+    "bad-digest": pb.EditCommentRequest(
+        pr_url=_PR, kind="issue", comment_id=5, body="x", expected_body_sha256="abc"
+    ),
+    "short-head": pb.StartPendingReviewRequest(pr_url=_PR, commit_oid="abc123"),
+    "empty-body": pb.EditCommentRequest(
+        pr_url=_PR, kind="issue", comment_id=5, body=" ", expected_body_sha256=_DIGEST
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_MALFORMED_REVIEWS))
+async def test_a_malformed_review_change_is_refused_as_invalid_input_before_github(
+    tmp_path: Path, case: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
+) -> None:
+    request = _MALFORMED_REVIEWS[case]
+    method = request.DESCRIPTOR.name.removesuffix("Request")
+    code, reason = await _reason(
+        _frame(tmp_path, method, request.SerializeToString(), vouch=_VOUCHED)
+    )
+
+    assert (code, reason) == (Code.INVALID_ARGUMENT.value, "invalid_input")
+    assert review_calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "code", "reason"),
+    [
+        (CommentChangedError(), Code.FAILED_PRECONDITION, "comment_changed"),
+        (PullRequestChangedError(), Code.FAILED_PRECONDITION, "pull_request_changed"),
+        (
+            PullRequestError("Only your own comments can be changed here."),
+            Code.FAILED_PRECONDITION,
+            None,
+        ),
+        (UnknownOutcomeError(), Code.UNKNOWN, None),
+    ],
+    ids=["comment-changed", "head-moved", "not-yours", "unconfirmed"],
+)
+async def test_a_review_failure_reaches_the_server_with_its_code_and_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: ValueError,
+    code: Code,
+    reason: str | None,
+) -> None:
+    def fail(_root: str, _reference: PullRequestRef, **_kwargs: Any) -> dict[str, Any]:
+        raise failure
+
+    monkeypatch.setattr(github_reviews, "edit_comment", fail)
+    request, _function, _kwargs = _REVIEW_CALLS["EditComment"]
+
+    assert await _reason(
+        _frame(tmp_path, "EditComment", request.SerializeToString(), vouch=_VOUCHED)
+    ) == (code.value, reason)
+
+
+@pytest.mark.parametrize(
+    ("fields", "refusal"),
+    [
+        ({"name": "a" * 256, "content": b"png"}, "The file's name is longer than 255 characters"),
+        ({"name": "shot.png"}, "The attachment is empty"),
+    ],
+    ids=["long-name", "empty"],
+)
+async def test_the_host_refuses_an_upload_the_server_would_have(
+    tmp_path: Path,
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+    fields: dict[str, Any],
+    refusal: str,
+) -> None:
+    request = pb.UploadAttachmentRequest(pr_url=_PR, **fields)
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "UploadAttachment", request.SerializeToString())
+    )
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
     assert owner_calls == []
 
 
@@ -669,7 +1016,7 @@ _READ_CALLS: dict[str, tuple[Any, str, tuple[Any, ...], dict[str, Any]]] = {
         ),
         "github_review_threads",
         (_SESSION, _PR, "cursor_1", _HEAD, _BASE),
-        {},
+        {"account_rights": False},
     ),
     "ListReviewThreadComments": (
         pb.ListReviewThreadCommentsRequest(
@@ -677,7 +1024,7 @@ _READ_CALLS: dict[str, tuple[Any, str, tuple[Any, ...], dict[str, Any]]] = {
         ),
         "github_review_thread_comments",
         (_SESSION, _PR, "thread_1", "cursor_2"),
-        {},
+        {"account_rights": False},
     ),
 }
 
@@ -710,3 +1057,107 @@ async def test_a_read_passes_the_requests_fields_to_its_reader_and_its_answer_ba
     assert calls == [(reader_method, args, kwargs)]
     payload = payload_dict(WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload)
     assert payload == {"object": "test", "count": 3, "items": [{"line": 4}]}
+
+
+# A review page as GitHub answers it for the host's account, which wrote and reacted.
+_ACCOUNT_COMMENT = {
+    "id": "PRRC_1",
+    "database_id": 5,
+    "author": "host-login",
+    "body": "Why this?",
+    "reactions": [{"content": "HEART", "count": 2, "viewer_reacted": True}],
+    "can_react": True,
+    "can_update": True,
+    "can_delete": True,
+    "viewer_did_author": True,
+}
+_ACCOUNT_THREADS = {
+    "data": [
+        {
+            "id": "PRRT_1",
+            "can_reply": True,
+            "can_resolve": True,
+            "can_unresolve": False,
+            "comments": {"data": [_ACCOUNT_COMMENT], "has_more": False},
+        }
+    ],
+    "has_more": False,
+}
+
+
+class _AccountFacet:
+    """A provider that answers every review read with the host account's rights."""
+
+    def review_threads(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(_ACCOUNT_THREADS)
+
+    def review_thread_comments(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(_ACCOUNT_THREADS["data"][0]["comments"])
+
+
+@pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
+@pytest.mark.parametrize("account_rights", [False, True], ids=["older-server", "owner-asks"])
+async def test_a_review_read_carries_the_accounts_rights_only_when_the_server_asks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, account_rights: bool
+) -> None:
+    """An older server shows the host's page to anyone, so it gets none of the account's."""
+    monkeypatch.setattr(pr_resource, "_review_target", lambda *_a, **_k: (_AccountFacet(), None))
+    request = (
+        pb.ListReviewThreadsRequest(pr_url=_PR)
+        if method == "ListReviewThreads"
+        else pb.ListReviewThreadCommentsRequest(pr_url=_PR, thread_id="PRRT_1", page_token="c")
+    )
+    vouch = PullRequestVouch(server_tracked=True)
+
+    messages, code, message = await _answer(
+        _frame(
+            tmp_path,
+            method,
+            request.SerializeToString(),
+            vouch=vouch,
+            account_rights=account_rights,
+        )
+    )
+
+    assert code is None, message
+    page = payload_dict(WORKSPACE_METHODS[method].response_type.FromString(messages[0]).payload)
+    if method == "ListReviewThreads":
+        [thread] = page["data"]
+        assert (thread["id"], thread["can_reply"]) == ("PRRT_1", True)
+        assert ("can_resolve" in thread, "can_unresolve" in thread) == (account_rights,) * 2
+        [comment] = thread["comments"]["data"]
+    else:
+        [comment] = page["data"]
+    assert (comment["id"], comment["database_id"], comment["author"]) == (
+        "PRRC_1",
+        5,
+        "host-login",
+    )
+    assert comment["reactions"][0]["count"] == 2
+    if account_rights:
+        assert comment == _ACCOUNT_COMMENT
+    else:
+        assert not {"can_react", "can_update", "can_delete", "viewer_did_author"} & comment.keys()
+        assert comment["reactions"] == [{"content": "HEART", "count": 2}]
+
+
+@pytest.mark.parametrize("case", ["ListReviewThreads", "ListReviewThreadComments"])
+async def test_the_servers_account_rights_reach_the_review_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    request, reader_method, args, _kwargs = _READ_CALLS[case]
+    calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def record(_self: Any, *got: Any, **got_kwargs: Any) -> dict[str, Any]:
+        calls.append((reader_method, got, got_kwargs))
+        return {"data": []}
+
+    monkeypatch.setattr(WorkspaceReader, reader_method, record)
+    vouch = PullRequestVouch(server_tracked=True, default_pr_url=_PR)
+
+    _messages, code, message = await _answer(
+        _frame(tmp_path, case, request.SerializeToString(), vouch=vouch, account_rights=True)
+    )
+
+    assert code is None, message
+    assert calls == [(reader_method, args, {"account_rights": True})]

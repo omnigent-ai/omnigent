@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { WORKSPACE_SIDEBAR_BINDINGS } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
 import type { KeyChordInput } from "./chord";
 import {
   activeShortcutChords,
+  codeMirrorKey,
   currentShortcutEnvironment,
   matchedShortcutChordIndex,
   matchesShortcut,
@@ -15,6 +15,7 @@ import {
   type ShortcutId,
   type ShortcutPageContext,
   shortcutRowKeys,
+  WORKSPACE_SIDEBAR_BINDINGS,
 } from "./registry";
 
 function press(init: Partial<KeyChordInput> & { key: string }): KeyChordInput {
@@ -185,6 +186,20 @@ describe("shortcut registry", () => {
       altGraph: true,
     });
     expect(matchesShortcut(altGraph, "session.rename", other)).toBe(false);
+  });
+
+  it("opens Search Text and Go to File off the Mac on their own keys, never on AltGr", () => {
+    const searchText = { key: "o", code: "KeyO", ctrlKey: true, altKey: true };
+    const goToFile = { key: "P", code: "KeyP", ctrlKey: true, altKey: true, shiftKey: true };
+    expect(matchesShortcut(press(searchText), "palette.text", other)).toBe(true);
+    expect(matchesShortcut(press(goToFile), "palette.files", other)).toBe(true);
+    // AltGr+O types ó on a Polish layout, and reports as Control+Alt.
+    expect(
+      matchesShortcut(press({ ...searchText, key: "ó", altGraph: true }), "palette.text", other),
+    ).toBe(false);
+    expect(matchesShortcut(press({ ...goToFile, altGraph: true }), "palette.files", other)).toBe(
+      false,
+    );
   });
 });
 
@@ -557,5 +572,15 @@ describe("Keyboard shortcuts page metadata", () => {
     // Settings keeps its own chord in a browser and shows the menu's ⌘, in the desktop app.
     expect(shortcutRowKeys("settings.open", menu, page)).toEqual(["⌘", ","]);
     expect(shortcutRowKeys("settings.open", resolved(mac), page)).toEqual(["⌘", "⌥", ","]);
+  });
+});
+
+describe("codeMirrorKey", () => {
+  it("keeps a named key's case and lowercases a character, as CodeMirror's names need", () => {
+    expect(codeMirrorKey({ mod: true, code: "Enter" })).toBe("Mod-Enter");
+    expect(codeMirrorKey({ alt: true, code: "ArrowUp" })).toBe("Alt-ArrowUp");
+    expect(codeMirrorKey({ mod: true, shift: true, code: "KeyF" })).toBe("Mod-Shift-f");
+    expect(codeMirrorKey({ mod: true, code: "Slash" })).toBe("Mod-/");
+    expect(codeMirrorKey({ ctrl: true, key: "Escape" })).toBe("Ctrl-Escape");
   });
 });

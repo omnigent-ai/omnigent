@@ -1,5 +1,6 @@
 import type * as CapabilitiesModule from "@/lib/capabilities";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseFloatingPanesModule from "./useFloatingPanes";
 
 import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { useEffect } from "react";
@@ -54,6 +55,11 @@ vi.mock("./useTerminalStatuses", () => ({
   useTerminalStatuses: () => ({ setTerminalConnectionState: vi.fn(), markTerminalActive: vi.fn() }),
 }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => false }));
+const floatingPanes = vi.hoisted(() => ({ shown: false }));
+vi.mock("./useFloatingPanes", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseFloatingPanesModule>()),
+  useFloatingPanesShown: () => floatingPanes.shown,
+}));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
 vi.mock("@/lib/capabilities", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
@@ -137,6 +143,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  floatingPanes.shown = false;
   cleanup();
   vi.restoreAllMocks();
   window.localStorage.clear();
@@ -151,6 +158,22 @@ afterEach(() => {
 });
 
 describe("SidebarTerminalPanes", () => {
+  it.each([
+    { floating: false, target: true },
+    { floating: true, target: false },
+  ])(
+    "takes a tab dragged over its split only without floating panes ($floating)",
+    async ({ floating, target }) => {
+      floatingPanes.shown = floating;
+      const id = nextSession();
+      updateTerminalGroups(id, () => [PAIR]);
+      const { container } = render(<Sidebar conversationId={id} shownKey="terminal:a" />);
+      await screen.findByTestId("terminal-a");
+      // With floating panes the main view's split takes the tab, so the sidebar's never claims it.
+      expect(container.querySelector(`[data-split-panes="${id}"]`) !== null).toBe(target);
+    },
+  );
+
   it("keeps a member whose shell didn't start in its group, saying why, though the list never has it", async () => {
     const id = nextSession();
     recordPaneStartFailure(id, "terminal:x", { terminal: "zsh", reason: "runner offline" });

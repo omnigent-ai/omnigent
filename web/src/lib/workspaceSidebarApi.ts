@@ -239,6 +239,8 @@ export interface ResolveRepositoryContextResponse {
   remotes: RepositoryRemote[];
   unsupportedRemoteCount: number;
   truncatedRemotes: boolean;
+  /** The workspace below the repository's root, such as `packages/app/`; absent from older hosts. */
+  workspacePrefix?: string;
 }
 
 // ── The API ───────────────────────────────────────────────────────────────────

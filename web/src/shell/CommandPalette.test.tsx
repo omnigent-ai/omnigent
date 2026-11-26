@@ -4,8 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { Conversation } from "@/hooks/useConversations";
 import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
+import { toast } from "sonner";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import * as host from "@/lib/host";
+import { resetUiFeatureOverridesForTests } from "@/lib/uiFeatureOverrides";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
@@ -75,7 +78,8 @@ function searchPages(...pages: (ReturnType<typeof conv> & Partial<Conversation>)
   return { data: { pages: pages.map((data) => ({ data })) } };
 }
 
-const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8 };
+// ⌘K's own search keeps archived sessions, as the server does by default.
+const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8, includeArchived: true };
 
 /** Find a session row by its full label text even when the highlighter has
     split it around a <mark> (so the text lives across several nodes). */
@@ -118,6 +122,7 @@ afterEach(() => {
   cleanup();
   // QuickPick records accepted commands under Recent; a later case starts without them.
   localStorage.clear();
+  resetUiFeatureOverridesForTests();
 });
 
 /** Every non-empty live region's text, so both palettes' status messages read the same. */
@@ -859,7 +864,11 @@ describe("CommandPalette — title and content groups", () => {
 
   it("does not search while the palette is closed or listing sessions only", () => {
     renderPalette({ open: false });
-    expect(useSessionSearch).toHaveBeenCalledWith("", "title", { enabled: false, limit: 8 });
+    expect(useSessionSearch).toHaveBeenCalledWith("", "title", {
+      enabled: false,
+      limit: 8,
+      includeArchived: true,
+    });
     cleanup();
     useSessionSearch.mockClear();
     renderPalette({ sessionsOnly: true });
@@ -867,6 +876,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenLastCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
   });
 
@@ -1124,6 +1134,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
     expect(screen.queryByText("In messages")).toBeNull();
     const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
@@ -1250,6 +1261,96 @@ describe("CommandPalette — actions", () => {
     expect(screen.getByRole("option", { name: /Go to Settings/ })).toBeTruthy();
     expect(screen.queryByRole("option", { name: /New chat/ })).toBeNull();
   });
+});
+
+describe("CommandPalette — QuickPick preview bootstrap", () => {
+  const label = "Enable feature preview: new QuickPick command palette";
+  const origin = window.location.origin;
+  const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(origin)}`;
+  const isQuickPick = "QUICK_PICK_PALETTE" in commandPaletteModule;
+
+  function searchPreview() {
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "preview" } });
+  }
+
+  const reload = vi.fn();
+  beforeEach(() => {
+    reload.mockReset();
+    vi.stubGlobal("location", { origin, reload });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.skipIf(isQuickPick)(
+    "offers the command only in search and saves the opt-in before reloading",
+    () => {
+      serverInfo.mockReturnValue({
+        session_search_scope: true,
+        features: { quick_pick_palette: false },
+      });
+      renderPalette();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+      searchPreview();
+      const command = screen.getByRole("option", { name: label });
+      let savedAtReload: string | null = null;
+      reload.mockImplementation(() => {
+        savedAtReload = localStorage.getItem(key);
+      });
+      fireEvent.click(command);
+      expect(localStorage.getItem(key)).toBe('{"quick_pick_palette":true}');
+      expect(reload).toHaveBeenCalledOnce();
+      expect(savedAtReload).toBe('{"quick_pick_palette":true}');
+    },
+  );
+
+  it.skipIf(isQuickPick)("offers the command when an override turns QuickPick off", () => {
+    localStorage.setItem(key, '{"quick_pick_palette":false}');
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: true },
+    });
+    renderPalette();
+    searchPreview();
+    expect(screen.getByRole("option", { name: label })).toBeVisible();
+  });
+
+  it.skipIf(isQuickPick)("does not reload if storage refuses the opt-in", () => {
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: false },
+    });
+    renderPalette();
+    searchPreview();
+    const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "");
+    onTestFinished(() => {
+      storage.mockRestore();
+      errorToast.mockRestore();
+    });
+    fireEvent.click(screen.getByRole("option", { name: label }));
+    expect(errorToast).toHaveBeenCalledWith("Couldn't save the feature preview on this device.");
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(isQuickPick).each(["server-on", "override-on", "unreported", "no-identity"])(
+    "does not offer the bootstrap for %s",
+    (scenario) => {
+      if (scenario === "override-on") localStorage.setItem(key, '{"quick_pick_palette":true}');
+      if (scenario === "no-identity") {
+        const identity = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+        onTestFinished(() => identity.mockRestore());
+      }
+      const features =
+        scenario === "unreported" ? {} : { quick_pick_palette: scenario === "server-on" };
+      serverInfo.mockReturnValue({ session_search_scope: true, features });
+      renderPalette();
+      searchPreview();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+    },
+  );
 });
 
 describe("CommandPalette — empty state", () => {

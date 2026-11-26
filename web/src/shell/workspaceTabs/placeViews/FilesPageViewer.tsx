@@ -21,14 +21,16 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileContent } from "@/hooks/useFileContent";
+import { useStickyScroll } from "@/lib/fileViewPreferences";
 import { fileContentText } from "@/lib/workspaceSidebarSource";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { cn } from "@/lib/utils";
 import { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
 import {
+  type SaveStatus,
   detectLang,
   isBinaryPath,
   isImageFile,
@@ -39,8 +41,12 @@ import { workspaceFolderName } from "@/shell/breadcrumbPaths";
 import { FileBreadcrumbs } from "@/shell/FileBreadcrumbs";
 import { FileViewer } from "@/shell/FileViewer";
 import { type FilePosition, useWorkspacePaths } from "@/shell/FileViewerContext";
+import { SaveStatusChip } from "@/shell/SaveStatusChip";
 
 import { WORKSPACE_SIDEBAR_LAYOUT, WORKSPACE_TOOLBAR_CLASS } from "../WorkspaceSidebarLayout";
+import { FileActionsMenu } from "./FileActionsMenu";
+
+export const SHOW_CHANGES_LABEL = "Show changes";
 
 /** Asks the user about unsaved edits before the tab moves on: leave, or keep editing. */
 export type FilesPageLeaveGuard = () => Promise<"leave" | "cancel">;
@@ -124,18 +130,48 @@ export function FilesPageViewer({
   // Another linked comment opens its thread afresh.
   const appViewer = <ComparisonFileViewer key={commentId} {...viewerProps} />;
   const text = file.data && !rich ? fileContentText(file.data) : null;
+  const [searchOpen, setSearchOpen] = useState(false);
+  // Each Find in file bumps it, so a repeat refocuses a find bar that is already open.
+  const [searchFocusNonce, setSearchFocusNonce] = useState(0);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   return (
     <div className={cn("flex min-h-0 flex-col bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)}>
       <div className={cn(WORKSPACE_TOOLBAR_CLASS, WORKSPACE_SIDEBAR_LAYOUT.toolbar)}>
         {toolbarLeading}
         {/* The app's viewer shows the breadcrumbs in its own header. */}
         <div className="flex min-w-0 flex-1">{rich ? null : breadcrumbs}</div>
+        {text !== null ? <SaveStatusChip status={saveStatus} /> : null}
         {onShowChanges && (
-          <Button type="button" variant="ghost" size="sm" onClick={onShowChanges}>
-            <FileDiffIcon aria-hidden="true" />
-            Changes
-          </Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={SHOW_CHANGES_LABEL}
+                  onClick={onShowChanges}
+                >
+                  <FileDiffIcon aria-hidden="true" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">{SHOW_CHANGES_LABEL}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         )}
+        {/* The app's viewer keeps a rich file's actions in its own header. */}
+        {text !== null ? (
+          <TooltipProvider>
+            <FileActionsMenu
+              conversationId={conversationId}
+              path={path}
+              onFind={() => {
+                setSearchOpen(true);
+                setSearchFocusNonce((nonce) => nonce + 1);
+              }}
+            />
+          </TooltipProvider>
+        ) : null}
         <Button
           type="button"
           variant="ghost"
@@ -166,6 +202,10 @@ export function FilesPageViewer({
             settled={!file.isFetching}
             position={position}
             registerLeaveGuard={registerLeaveGuard}
+            searchOpen={searchOpen}
+            searchFocusNonce={searchFocusNonce}
+            onSearchOpenChange={setSearchOpen}
+            onSaveStatusChange={setSaveStatus}
           />
         )}
       </div>
@@ -202,6 +242,10 @@ function TextFile({
   settled,
   position,
   registerLeaveGuard,
+  searchOpen,
+  searchFocusNonce,
+  onSearchOpenChange,
+  onSaveStatusChange,
 }: {
   conversationId: string;
   path: string;
@@ -210,9 +254,14 @@ function TextFile({
   settled: boolean;
   position?: FilePosition;
   registerLeaveGuard?: (guard: FilesPageLeaveGuard) => () => void;
+  /** The editor's find bar is open, as from the toolbar's Find in file. */
+  searchOpen: boolean;
+  searchFocusNonce: number;
+  onSearchOpenChange: (open: boolean) => void;
+  onSaveStatusChange: (status: SaveStatus) => void;
 }) {
-  const [searchOpen, setSearchOpen] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const stickyScroll = useStickyScroll();
   const leave = useUnsavedChangesQuestion();
   useEffect(() => {
     if (!dirty || !registerLeaveGuard) return undefined;
@@ -228,10 +277,13 @@ function TextFile({
         isSettled={settled}
         position={position}
         wrapLines={false}
+        stickyScroll={stickyScroll}
         searchOpen={searchOpen}
-        onSearchOpened={() => setSearchOpen(true)}
-        onSearchHandled={() => setSearchOpen(false)}
+        searchFocusNonce={searchFocusNonce}
+        onSearchOpened={() => onSearchOpenChange(true)}
+        onSearchHandled={() => onSearchOpenChange(false)}
         onDirtyChange={setDirty}
+        onSaveStatusChange={onSaveStatusChange}
       />
       {leave.dialog}
     </>

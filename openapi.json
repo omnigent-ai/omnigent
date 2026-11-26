@@ -14324,6 +14324,16 @@
             ],
             "title": "Stdout"
           },
+          "submission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalCommandSubmission"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "type": {
             "const": "terminal_command",
             "title": "Type",
@@ -15399,12 +15409,97 @@
             ],
             "description": "Captured stdout text. Present when `kind=\"output\"`, `None` otherwise.",
             "title": "Stdout"
+          },
+          "submission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalCommandSubmission"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "kind"
         ],
         "title": "TerminalCommandData",
+        "type": "object"
+      },
+      "TerminalCommandSubmission": {
+        "description": "Server-owned identity of the web submission consumed by a shell input.",
+        "properties": {
+          "pending_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Id"
+          },
+          "stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stable Id"
+          }
+        },
+        "title": "TerminalCommandSubmission",
+        "type": "object"
+      },
+      "TerminalShellState": {
+        "description": "Whether a session terminal runs anything besides its login shell.\n\nOnly what a close confirmation needs: never a pid, an argument or another process.",
+        "properties": {
+          "background_jobs": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When busy, how many other jobs run. Null when jobs can't be told apart, as in a sandboxed pane.",
+            "title": "Background Jobs"
+          },
+          "foreground": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When busy, the foreground job's command name, e.g. `vim`; cleaned and at most 32 characters. Null when it can't be told.",
+            "title": "Foreground"
+          },
+          "state": {
+            "description": "`idle`: only the login shell runs, with no other process; a loop of shell builtins still reads idle. `busy`: something else does. `unknown`: it couldn't be told in time, or the terminal doesn't run a shell; treat it as busy.",
+            "enum": [
+              "idle",
+              "busy",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "TerminalShellState",
         "type": "object"
       },
       "ToolOutputDeltaEvent": {
@@ -28284,6 +28379,93 @@
           }
         },
         "summary": "Get Session Terminal",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell": {
+      "get": {
+        "description": "Whether a terminal runs anything besides its login shell, so closing it can skip asking.\n\nOnly a caller who may close the terminal may ask: edit access, as deleting it needs.\nEvery miss answers one fixed 404, and runner failures become fixed messages: the\nrunner's text never reaches the caller, and its answer is rebuilt field by field. A\nrunner tunnel on another replica keeps its routing error, so the client can resend.\n\n**Returns:** `{\"state\", \"foreground\", \"background_jobs\"}`.",
+        "operationId": "get_session_terminal_shell_v1_sessions__session_id__resources_terminals__terminal_id__shell_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Terminal resource id, e.g. `\"terminal_bash_s1\"`.",
+            "in": "path",
+            "name": "terminal_id",
+            "required": true,
+            "schema": {
+              "title": "Terminal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TerminalShellState"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The caller can't close this terminal"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "No such running terminal in a session the caller can see"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "description": "The runner failed to inspect the terminal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The runner is offline, or too old to inspect terminals"
+          }
+        },
+        "summary": "Get Session Terminal Shell",
         "tags": [
           "session_resources"
         ]

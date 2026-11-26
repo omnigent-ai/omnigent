@@ -63,7 +63,7 @@ with their own terminal retain the switcher.
 - On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
   right" / "Split down" buttons in Terminal view and pick a shell type. Drag a
   divider (or focus it and use the arrow keys along its axis) to resize. "Close
-  pane" asks for confirmation, then kills the focused shell; the agent pane
+  pane" kills the focused shell at once when it's idle, and asks first otherwise; the agent pane
   cannot be closed. Panes are saved per session in this browser and show only
   for desktop owners outside grid cells. ⌘/Ctrl+Alt+Shift+\ splits right and
   ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
@@ -75,6 +75,10 @@ with their own terminal retain the switcher.
   pane's title strip has a menu with Close Pane. While a split shows, Chat keeps
   the panes on screen with the web chat as the agent's pane, and ⌘D from its
   composer splits again. With the flag off, the classic Terminal view above stays.
+- With `floating_panes` on as well (off by default), a split's panes float as cards. Drag a
+  pane by the band around its title strip's handle; a double-click elsewhere on the strip
+  maximizes it, and a strip too narrow for both zones moves and maximizes from anywhere. A
+  pane whose shell exits closes at once, and the pane beside it takes the keyboard.
 
 **User shells:**
 
@@ -93,6 +97,13 @@ with their own terminal retain the switcher.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
+- Closing a shell, from any of these places, first asks its runner what it runs. A shell
+  idle at its prompt closes without asking; a busy one asks and names its job, such as "vim is
+  running in zsh". When the runner can't answer within half a second, the server is too old to
+  serve the check, or the shell was typed into meanwhile, it asks as before. In the rail, a grid
+  cell or the split controls, closing another shell while the first is still being checked
+  joins the two: both close, or one question asks about both. The tabs sidebar keeps the first
+  shell open instead.
 - Right-click any open workspace tab, or open the rail's panel picker (⌄), and
   choose Close other tabs or Close all tabs. Shells in the batch close together
   after one confirmation ("Close N shells?"). The batch's other tabs close

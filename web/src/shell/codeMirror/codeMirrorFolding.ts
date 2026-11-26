@@ -10,17 +10,10 @@ import {
 } from "@codemirror/language";
 import type { EditorState, Extension, Line } from "@codemirror/state";
 import { type EditorView, gutter, GutterMarker, type ViewUpdate } from "@codemirror/view";
+import { indentationOf } from "@/lib/indentationScopes";
 
-function indentationOf(text: string, tabSize: number): number | null {
-  let columns = 0;
-  for (const character of text) {
-    if (character === " ") columns += 1;
-    else if (character === "\t") columns += tabSize - (columns % tabSize);
-    else return columns;
-  }
-  // Blank lines take the indentation of their surroundings.
-  return null;
-}
+/** Re-exported for the editor modules that measure indentation the way folding does. */
+export { indentationOf };
 
 /** The foldable range starting at the line at `lineStart`, or null when nothing is nested under it. */
 export function indentationFoldRange(

@@ -19,6 +19,13 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
+    ListBranchCommitsRequest,
+    ListRepositoryRefsRequest,
+    ListWorkingCopyChangesRequest,
+    ReadBaseFileRequest,
+    ResolveWorkingCopyBaseRequest,
+)
 from omnigent.host.frames import HostWorkspaceCallFrame
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
@@ -43,6 +50,16 @@ _CALLS: dict[str, dict[str, object]] = {
     "ResolveRepositoryContext": {},
 }
 _STREAMING = {"SearchText", "ReadBaseFile"}
+# The Git methods that take a repository folder, with a request naming one.
+_FOLDER_REQUESTS = {
+    "ResolveWorkingCopyBase": ResolveWorkingCopyBaseRequest,
+    "ListWorkingCopyChanges": ListWorkingCopyChangesRequest,
+    "ReadBaseFile": lambda repository: ReadBaseFileRequest(
+        commit="a" * 40, path="a.txt", object="b" * 40, repository=repository
+    ),
+    "ListRepositoryRefs": ListRepositoryRefsRequest,
+    "ListBranchCommits": ListBranchCommitsRequest,
+}
 
 
 def _workspace(root: Path, marker: str) -> Path:
@@ -218,4 +235,35 @@ async def test_tunnel_refuses_methods_outside_the_table_before_any_work(
     ]
 
     assert [(r.done, r.error_code) for r in replies] == [(True, "unimplemented")]
+    assert no_processes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", list(_FOLDER_REQUESTS))
+async def test_a_grant_for_one_workspace_cant_name_another_as_its_repository_folder(
+    socket_client: tuple[httpx.AsyncClient, str, Path, Path],
+    no_processes: list[tuple[str, ...]],
+    method: str,
+) -> None:
+    """On the socket and the tunnel, a folder outside the workspace is refused before Git."""
+    http, key, workspace_a, workspace_b = socket_client
+    outward = f"../{workspace_b.name}"
+    body = {"repository": outward}
+    if method == "ReadBaseFile":
+        body = {**_CALLS[method], **body}
+
+    socket_reply = await _post(http, method, body, {"Authorization": _bearer(key, workspace_a)})
+    frame = HostWorkspaceCallFrame(
+        request_id="r1",
+        workspace=str(workspace_a),
+        method=method,
+        request=_FOLDER_REQUESTS[method](repository=outward).SerializeToString(),
+    )
+    tunnel_replies = [
+        reply async for reply in serve_tunnel_call(lambda ws: WorkspaceReader(Path(ws)), frame)
+    ]
+
+    assert b"invalid_argument" in socket_reply.content, socket_reply.text
+    assert b"from-b" not in socket_reply.content
+    assert [(r.done, r.error_code) for r in tunnel_replies] == [(True, "invalid_argument")]
     assert no_processes == []

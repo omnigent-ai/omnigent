@@ -5,7 +5,7 @@ import { useEffect, useRef } from "react";
 
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { TAB_KEY_OWNING_DIALOG_OR_MENU } from "@/lib/hotkeys";
-import { matchesShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /** Monaco and the CodeMirror file editor both bind the fold keys. */
 const FOLDING_EDITORS = ".monaco-editor, .cm-editor";

@@ -1273,6 +1273,41 @@ async def test_workspace_api_follows_the_file_read_gate(
     assert b"unavailable" in resp.content
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("session", "passes"), [("conv_share", False), ("conv_open", True)])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+    ],
+)
+async def test_workspace_api_gates_a_repository_folder_like_the_workspace(
+    client: httpx.AsyncClient, session: str, passes: bool, method: str
+) -> None:
+    """Naming a folder inside the workspace needs the same file read gate, and no other."""
+    body = b'{"repository": ".worktrees/feature"}'
+    streaming = method == "ReadBaseFile"
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",
+        headers={
+            "X-Forwarded-Email": "viewer@example.com",
+            "Content-Type": "application/connect+json" if streaming else "application/json",
+        },
+        content=b"\x00" + len(body).to_bytes(4, "big") + body if streaming else body,
+    )
+
+    if not passes:
+        assert resp.status_code == 403, resp.text
+        return
+    assert resp.status_code == (200 if streaming else 503), resp.text
+    assert b"unavailable" in resp.content
+
+
 _PR_BROWSE_READS = [
     "ListPullRequestFiles",
     "GetPullRequestDiff",
@@ -1302,7 +1337,48 @@ _PR_OWNER_METHODS = {
         "account": "octocat",
     },
     "DisableAutoMerge": {},
+    "GetPendingReview": {},
+    "StartPendingReview": {"commitOid": "a" * 40},
+    "AddPendingReviewComment": {
+        "body": "Why?",
+        "inReplyToThreadId": "PRRT_1",
+        "pendingReviewId": "PRR_1",
+        "expectedHeadOid": "a" * 40,
+    },
+    "UpdatePendingReviewComment": {
+        "commentNodeId": "PRRC_1",
+        "body": "Better",
+        "expectedBodySha256": "c" * 64,
+        "pendingReviewId": "PRR_1",
+    },
+    "DeletePendingReviewComment": {"commentNodeId": "PRRC_1", "pendingReviewId": "PRR_1"},
+    "SubmitPendingReview": {
+        "event": "APPROVE",
+        "commitOid": "a" * 40,
+        "pendingReviewId": "PRR_1",
+    },
+    "DiscardPendingReview": {"pendingReviewId": "PRR_1"},
+    "SubmitReview": {"event": "COMMENT", "body": "Nit", "commitOid": "a" * 40},
+    "SubmitReviewVerdict": {"event": "APPROVE", "commitOid": "a" * 40},
+    "SetReviewThreadResolved": {"threadId": "PRRT_1", "resolved": True},
+    "EditComment": {
+        "kind": "issue",
+        "commentId": "5",
+        "body": "Mine",
+        "expectedBodySha256": "c" * 64,
+    },
+    "DeleteComment": {"kind": "review", "commentId": "5"},
+    "AddReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    "RemoveReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    # JSON carries the bytes base64-encoded.
+    "UploadAttachment": {"name": "shot.png", "content": "iVBORw0KGgo="},
 }
+
+
+def test_every_owner_method_has_a_gate_case() -> None:
+    from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS
+
+    assert set(_PR_OWNER_METHODS) == _PULL_REQUEST_OWNER_METHODS
 
 
 def _pull_request_call_passes(method: str, caller: str | None, session: str) -> int:

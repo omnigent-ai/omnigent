@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
 from omnigent.runner import create_runner_app, pr_resource
 from omnigent.runner import github_resource as github
+from omnigent.runner import github_review_fields as review_fields
 from omnigent.runner import github_review_threads as reviews
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.runner.helpers import NullServerClient
@@ -596,16 +598,35 @@ def review_thread() -> dict:
     }
 
 
+_ACCOUNT_THREAD_FIELDS = {"can_resolve", "can_unresolve"}
+_ACCOUNT_COMMENT_FIELDS = {"can_react", "can_update", "can_delete", "viewer_did_author"}
+
+
 @pytest.mark.parametrize("transport", ["runner", "host"])
 @pytest.mark.parametrize("paginated", [False, True])
+@pytest.mark.parametrize("account_rights", [False, True], ids=["older-server", "owner-asks"])
 async def test_review_pages_use_selected_pr_and_cursor(
     tracked: str,
     monkeypatch: pytest.MonkeyPatch,
     review_thread: dict,
     transport: str,
     paginated: bool,
+    account_rights: bool,
 ) -> None:
     calls: list[GhCall] = []
+    # GitHub's answer says the host's account wrote the comment and reacted to it.
+    [comment] = review_thread["comments"]["nodes"]
+    comment.update(
+        fullDatabaseId="41",
+        viewerDidAuthor=True,
+        viewerCanUpdate=True,
+        viewerCanDelete=True,
+        viewerCanReact=True,
+        reactionGroups=[
+            {"content": "HEART", "viewerHasReacted": True, "reactors": {"totalCount": 2}}
+        ],
+    )
+    review_thread.update(viewerCanResolve=True, viewerCanUnresolve=False)
     page = {
         "data": {
             "repository": {
@@ -635,7 +656,12 @@ async def test_review_pages_use_selected_pr_and_cursor(
     params = {"pr_url": PR_URL}
     if paginated:
         params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
-    comment_params = {"pr_url": PR_URL, "after": "cursor"}
+    comment_params: dict[str, Any] = {"pr_url": PR_URL, "after": "cursor"}
+    if account_rights:
+        # Only a server that hides these from everyone but the owner asks for them.
+        flag = "true" if transport == "runner" else True
+        params["account_rights"] = flag
+        comment_params["account_rights"] = flag
     if transport == "runner":
         app = create_runner_app(runner_workspace=Path(tracked), server_client=NullServerClient())  # type: ignore[arg-type]
         async with httpx.AsyncClient(
@@ -666,6 +692,28 @@ async def test_review_pages_use_selected_pr_and_cursor(
         "cursor" if paginated else None,
         "cursor",
     ]
+    [thread] = thread_data["data"]
+    for shown in (thread["comments"]["data"][0], comment_data["data"][0]):
+        # Public on GitHub, whoever reads: content, IDs and reaction counts.
+        assert (shown["id"], shown["database_id"], shown["author"]) == (
+            "comment-1",
+            41,
+            "reviewer",
+        )
+        assert shown["body"] == "Explain this?"
+        assert [(r["content"], r["count"]) for r in shown["reactions"]] == [("HEART", 2)]
+        assert _ACCOUNT_COMMENT_FIELDS & shown.keys() == (
+            _ACCOUNT_COMMENT_FIELDS if account_rights else set()
+        )
+        assert ("viewer_reacted" in shown["reactions"][0]) is account_rights
+    # Sent before account rights were negotiated, so it stays as it was.
+    assert thread["can_reply"] is True
+    assert _ACCOUNT_THREAD_FIELDS & thread.keys() == (
+        _ACCOUNT_THREAD_FIELDS if account_rights else set()
+    )
+    if account_rights:
+        assert thread["comments"]["data"][0]["viewer_did_author"] is True
+        assert thread["comments"]["data"][0]["reactions"][0]["viewer_reacted"] is True
 
 
 @pytest.mark.parametrize("partial_error", [False, True])
@@ -713,6 +761,48 @@ def test_first_thread_page_is_independent_of_metadata(
 
 
 @pytest.mark.parametrize(
+    ("resolved", "can_resolve", "can_unresolve"),
+    [(False, True, False), (True, False, True), (False, None, None)],
+)
+def test_threads_carry_whether_the_viewer_may_resolve_them(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: PullRequestRef,
+    review_thread: dict,
+    resolved: bool,
+    can_resolve: bool | None,
+    can_unresolve: bool | None,
+) -> None:
+    """Resolve and Unresolve are offered only from GitHub's own viewer permissions."""
+    calls: list[GhCall] = []
+    review_thread["isResolved"] = resolved
+    if can_resolve is not None:
+        review_thread["viewerCanResolve"] = can_resolve
+        review_thread["viewerCanUnresolve"] = can_unresolve
+    pr = {"reviewThreads": {"nodes": [review_thread], "pageInfo": {"hasNextPage": False}}}
+    response = {"data": {"repository": {"pullRequest": pr}}}
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [(0, json.dumps(response), "")]))
+    [thread] = reviews.read_threads("/workspace", reference)["data"]
+    [call] = calls
+    query = json.loads(call.input)["query"]
+    assert "viewerCanResolve viewerCanUnresolve" in query
+    # Each comment's number, reactions and rights, for its edit, delete and reaction controls.
+    for field in (
+        "fullDatabaseId",
+        "viewerCanReact",
+        "viewerCanUpdate",
+        "viewerCanDelete",
+        "viewerDidAuthor",
+        "reactionGroups",
+        "viewerHasReacted",
+    ):
+        assert field in query
+    assert (thread["can_resolve"], thread["can_unresolve"]) == (
+        can_resolve is True,
+        can_unresolve is True,
+    )
+
+
+@pytest.mark.parametrize(
     "response", [{"data": None}, {"errors": [{"message": "Forbidden"}]}, [], "invalid"]
 )
 def test_unavailable_threads_report_a_read_error(
@@ -741,6 +831,52 @@ def test_thread_shaping_keeps_minimized_placeholder_and_excludes_pending(
     assert [comment["id"] for comment in shaped["comments"]["data"]] == ["comment-1", "hidden"]
     assert shaped["comments"]["data"][-1]["body"] == ""
     assert shaped["comments"]["data"][-1]["minimized"] is True
+
+
+def test_thread_comments_carry_their_numeric_id_and_reactions(review_thread: dict) -> None:
+    """Edit, delete and reaction calls name a comment by its number; the page shows reactions."""
+    [comment] = review_thread["comments"]["nodes"]
+    comment.update(
+        fullDatabaseId="9007199254740991",
+        viewerCanReact=True,
+        viewerCanUpdate=True,
+        viewerCanDelete=False,
+        viewerDidAuthor=True,
+        reactionGroups=[
+            {"content": "THUMBS_UP", "viewerHasReacted": True, "reactors": {"totalCount": 2}},
+            {"content": "HEART", "viewerHasReacted": False, "reactors": {"totalCount": 1}},
+            # GitHub lists every kind; one nobody left isn't shown.
+            {"content": "ROCKET", "viewerHasReacted": False, "reactors": {"totalCount": 0}},
+            {"content": "EYES", "reactors": None},
+        ],
+    )
+    shaped = reviews._thread(review_thread)
+    assert shaped is not None
+    [read] = shaped["comments"]["data"]
+    assert read["database_id"] == 9007199254740991
+    assert read["can_react"] is True
+    assert (read["can_update"], read["can_delete"]) == (True, False)
+    assert read["viewer_did_author"] is True
+    assert read["reactions"] == [
+        {"content": "THUMBS_UP", "count": 2, "viewer_reacted": True},
+        {"content": "HEART", "count": 1, "viewer_reacted": False},
+    ]
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "abc", "-1", "0", 1.5, {"id": 1}, "9007199254740992", 2**63]
+)
+def test_a_comment_without_a_usable_number_has_none(value: object) -> None:
+    """Including one past what a double carries exactly, which a client would misread."""
+    assert review_fields.database_id(value) is None
+
+
+def test_a_comment_read_without_reaction_fields_shows_none(review_thread: dict) -> None:
+    shaped = reviews._thread(review_thread)
+    assert shaped is not None
+    [read] = shaped["comments"]["data"]
+    assert (read["reactions"], read["can_react"]) == ([], False)
+    assert (read["can_update"], read["can_delete"]) == (False, False)
 
 
 @pytest.mark.parametrize("head,expected", [("a" * 40, None), ("c" * 40, "pull request changed")])
@@ -1079,3 +1215,55 @@ def test_pinned_read_checks_revision_before_and_after_fetch(
             "base_sha": "b" * 40,
         }
     assert len(calls) == 3
+
+
+def test_a_review_page_without_the_accounts_rights_keeps_whats_public() -> None:
+    comment = {
+        "id": "C_1",
+        "reactions": [{"content": "EYES", "count": 1, "viewer_reacted": True}, "odd"],
+        "can_react": True,
+        "can_update": True,
+        "can_delete": True,
+        "viewer_did_author": True,
+    }
+    threads = {
+        "data": [
+            {
+                "id": "T_1",
+                "can_reply": True,
+                "can_resolve": True,
+                "can_unresolve": True,
+                "comments": {"data": [comment, None], "has_more": True},
+            },
+            "odd",
+            {"id": "T_2", "comments": "odd"},
+        ],
+        "warning": "Conversations are incomplete.",
+    }
+
+    shown = review_fields.threads_without_account_rights(threads)
+
+    assert shown == {
+        "data": [
+            {
+                "id": "T_1",
+                "can_reply": True,
+                "comments": {
+                    "data": [
+                        {"id": "C_1", "reactions": [{"content": "EYES", "count": 1}, "odd"]},
+                        None,
+                    ],
+                    "has_more": True,
+                },
+            },
+            "odd",
+            {"id": "T_2", "comments": "odd"},
+        ],
+        "warning": "Conversations are incomplete.",
+    }
+    # The host's own page is left as it was.
+    assert threads["data"][0]["can_resolve"] is True
+    assert review_fields.comments_without_account_rights({"data": [{"id": "C_2"}]}) == {
+        "data": [{"id": "C_2"}]
+    }
+    assert review_fields.threads_without_account_rights({"data": "odd"}) == {"data": "odd"}

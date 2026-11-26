@@ -6,7 +6,7 @@
 // "Choose shell…" lists the rest.
 
 import { isCommandListed, type CommandAvailability } from "@/store/paletteCommands";
-import type { ShortcutId } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
 import type { WorkspaceCommand, WorkspaceShellCommand } from "@/shell/workspaceCommands/model";
 import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";

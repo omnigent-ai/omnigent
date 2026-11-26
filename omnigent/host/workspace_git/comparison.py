@@ -34,11 +34,13 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
 )
 from omnigent.host.workspace_git.runner import (
     LISTING_OUTPUT_BYTES,
+    CheckedRepository,
     Deadline,
     GitError,
     GitProblem,
     GitRepository,
     check_revision,
+    checked_or_discovered,
     is_object_name,
 )
 from omnigent.host.workspace_git.working_copy import (
@@ -295,15 +297,16 @@ def _usable_refs(output: str, requested: int) -> tuple[list[str], bool]:
 
 
 async def list_repository_refs(
-    root: Path, _request: ListRepositoryRefsRequest
+    root: Path, _request: ListRepositoryRefsRequest, checked: CheckedRepository = None
 ) -> ListRepositoryRefsResponse:
     """Branch and tag short names, local branches first, and the default branch's name.
 
+    :param checked: The repository a folder check already found at ``root``, reused as is.
     :raises ConnectError: FAILED_PRECONDITION outside a repository.
     """
     deadline = Deadline(LISTING_DEADLINE_S)
     try:
-        repository = await GitRepository.discover(root, deadline)
+        repository = await checked_or_discovered(root, deadline, checked)
         if repository is None:
             raise ConnectError(Code.FAILED_PRECONDITION, "The workspace isn't in a Git repository")
         requested = MAXIMUM_REFS + 1 + _REMOTE_HEAD_ALLOWANCE
@@ -397,15 +400,17 @@ async def _log_commits(
 
 
 async def list_branch_commits(
-    root: Path, request: ListBranchCommitsRequest
+    root: Path, request: ListBranchCommitsRequest, checked: CheckedRepository = None
 ) -> ListBranchCommitsResponse:
     """The commits a head (HEAD when empty) has past its merge base with the base, newest first.
 
     A base that can't be compared answers with its reason in ``base.unavailable``.
+
+    :param checked: The repository a folder check already found at ``root``, reused as is.
     """
     deadline = Deadline(LISTING_DEADLINE_S)
     try:
-        repository = await GitRepository.discover(root, deadline)
+        repository = await checked_or_discovered(root, deadline, checked)
         if repository is None:
             raise ComparisonUnavailableError(COMPARISON_PROBLEM_NOT_A_REPOSITORY)
         comparison = await resolve_revisions(
