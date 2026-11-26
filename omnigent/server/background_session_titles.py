@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
@@ -162,8 +163,14 @@ def _is_user_input(item: ConversationItem) -> bool:
     )
 
 
-def _first_turn_reply(conversation_store: ConversationStore, session_id: str) -> _FirstTurnReply:
-    """Read the last assistant text between the session's first and second user inputs."""
+def _first_turn_reply(
+    conversation_store: ConversationStore, session_id: str
+) -> _FirstTurnReply | None:
+    """Read the last assistant text between the session's first and second user inputs.
+
+    :returns: ``None`` when the first turn is too long to scan, since a partial
+        scan could end on a progress message instead of the reply.
+    """
     # Imported lazily: the sessions helpers import this module.
     from omnigent.server.routes._sessions.helpers import _message_text
 
@@ -187,9 +194,9 @@ def _first_turn_reply(conversation_store: ConversationStore, session_id: str) ->
                 if text and text.strip():
                     reply = text
         if not page.has_more or page.last_id is None:
-            break
+            return _FirstTurnReply(text=reply, superseded=False)
         after = page.last_id
-    return _FirstTurnReply(text=reply, superseded=False)
+    return None
 
 
 def _session_is_running(session_id: str) -> bool:
@@ -208,7 +215,12 @@ class _PendingTitleRefinement:
     initial_title: asyncio.Task[str | None]
     #: The scheduling request's context, so the store reads the session's workspace.
     context: contextvars.Context
+    workspace_id: int
     turn_end_checks: int = 0
+
+    @property
+    def key(self) -> tuple[int, str]:
+        return (self.workspace_id, self.request.session_id)
 
 
 def _with_language_rule(instructions: str) -> str:
@@ -320,7 +332,9 @@ class BackgroundSessionTitleCoordinator:
         self._pending: set[asyncio.Task[Any]] = set()
         self._scheduled_session_ids: set[str] = set()
         self._scheduled_task_summary_ids: set[str] = set()
-        self._pending_refinements: dict[str, _PendingTitleRefinement] = {}
+        self._pending_refinements: dict[tuple[int, str], _PendingTitleRefinement] = {}
+        #: Set by each idle edge that arrives while a refinement is settling.
+        self._settling_idle_edges: dict[tuple[int, str], asyncio.Event] = {}
         self._closed = False
 
     async def format_agent_title(self, request: BackgroundTitleRequest) -> str | None:
@@ -428,12 +442,14 @@ class BackgroundSessionTitleCoordinator:
             self._scheduled_session_ids.discard(session_id)
 
         task.add_done_callback(_discard)
-        if session_id not in self._pending_refinements:
+        workspace_id = current_workspace_id()
+        if (workspace_id, session_id) not in self._pending_refinements:
             self._register_refinement(
                 _PendingTitleRefinement(
                     request=request,
                     initial_title=task,
                     context=contextvars.copy_context(),
+                    workspace_id=workspace_id,
                 )
             )
 
@@ -443,15 +459,22 @@ class BackgroundSessionTitleCoordinator:
         Does nothing for sessions without a pending refinement, so later turns,
         child sessions, and sessions titled by a user or automation are untouched.
         """
-        refinement = self._pending_refinements.pop(session_id, None)
+        key = (current_workspace_id(), session_id)
+        settling_idle_edge = self._settling_idle_edges.get(key)
+        if settling_idle_edge is not None:
+            settling_idle_edge.set()
+            return
+        refinement = self._pending_refinements.pop(key, None)
         if refinement is None or self._closed:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        idle_edge = asyncio.Event()
+        self._settling_idle_edges[key] = idle_edge
         task = loop.create_task(
-            self._refine(refinement),
+            self._refine(refinement, idle_edge),
             name=f"background-session-title-refinement-{session_id}",
             context=refinement.context,
         )
@@ -461,22 +484,51 @@ class BackgroundSessionTitleCoordinator:
     def _register_refinement(self, refinement: _PendingTitleRefinement) -> None:
         if self._closed:
             return
-        self._pending_refinements[refinement.request.session_id] = refinement
+        self._pending_refinements[refinement.key] = refinement
         while len(self._pending_refinements) > _MAX_PENDING_REFINEMENTS:
             del self._pending_refinements[next(iter(self._pending_refinements))]
 
-    async def _refine(self, refinement: _PendingTitleRefinement) -> None:
+    async def _wait_for_settled_turn(
+        self, refinement: _PendingTitleRefinement, idle_edge: asyncio.Event
+    ) -> str | None:
+        """Wait for the first-message title, then for idle edges to stop for the settle delay.
+
+        :returns: The title the refinement may replace, or ``None`` when a rename took it.
+        """
+        try:
+            owned_title = await asyncio.shield(refinement.initial_title)
+            if owned_title is None:
+                return None
+            while True:
+                idle_edge.clear()
+                try:
+                    await asyncio.wait_for(idle_edge.wait(), timeout=self._turn_settle_seconds)
+                except TimeoutError:
+                    return owned_title
+        finally:
+            if self._settling_idle_edges.get(refinement.key) is idle_edge:
+                del self._settling_idle_edges[refinement.key]
+
+    async def _refine(self, refinement: _PendingTitleRefinement, idle_edge: asyncio.Event) -> None:
         """Retitle from the first message and reply if the generated title is still current."""
         session_id = refinement.request.session_id
         started = time.perf_counter()
         try:
-            owned_title = await asyncio.shield(refinement.initial_title)
+            owned_title = await self._wait_for_settled_turn(refinement, idle_edge)
             if owned_title is None:
                 return
-            await asyncio.sleep(self._turn_settle_seconds)
             first_turn = await asyncio.to_thread(
                 _first_turn_reply, self._conversation_store, session_id
             )
+            if first_turn is None:
+                _logger.info(
+                    "background session title refinement skipped session=%s "
+                    "reason=first_turn_too_long elapsed_ms=%.1f",
+                    session_id,
+                    (time.perf_counter() - started) * 1000,
+                    extra={"session_id": session_id},
+                )
+                return
             reply = first_turn.text
             if not first_turn.superseded and _session_is_running(session_id):
                 # An idle lull mid-turn: the first reply may still change.
@@ -490,17 +542,17 @@ class BackgroundSessionTitleCoordinator:
                         replace(refinement, turn_end_checks=refinement.turn_end_checks + 1)
                     )
                 return
-            # Skip the inference when a rename already won; the guarded rename covers races.
-            conversation = await asyncio.to_thread(
-                self._conversation_store.get_conversation, session_id
-            )
-            if conversation is None or conversation.title != owned_title:
-                return
             request = replace(
                 refinement.request,
                 prompt=refined_title_prompt(refinement.request.prompt, reply),
             )
             async with self._generation_slots:
+                # Skip the inference when a rename already won; the guarded rename covers races.
+                conversation = await asyncio.to_thread(
+                    self._conversation_store.get_conversation, session_id
+                )
+                if conversation is None or conversation.title != owned_title:
+                    return
                 request = await self._with_session_instructions(request)
                 title = await self._generate_title(request)
             if title is None or title == owned_title:
@@ -589,6 +641,7 @@ class BackgroundSessionTitleCoordinator:
         """Cancel and drain pending title jobs during server shutdown."""
         self._closed = True
         self._pending_refinements.clear()
+        self._settling_idle_edges.clear()
         pending = tuple(self._pending)
         for task in pending:
             task.cancel()

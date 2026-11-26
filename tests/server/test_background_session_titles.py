@@ -6,6 +6,7 @@ import uuid
 
 import pytest
 
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_MAX_PROMPT_CHARS,
@@ -13,6 +14,7 @@ from omnigent.runner.background_titles.service import (
     FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
     LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS,
 )
+from omnigent.server import background_session_titles
 from omnigent.server.background_session_titles import (
     BACKGROUND_SESSION_TITLES_HEADER,
     BACKGROUND_TITLE_MAX_CHARS,
@@ -666,6 +668,11 @@ async def test_refinement_runs_once_per_session(db_uri: str) -> None:
     )
     _append_message(store, session_id, "assistant", "The issue is a flaky upload retry.")
 
+    # A turn end for the same session id in another workspace leaves this one pending.
+    with workspace_scope(current_workspace_id() + 1):
+        coordinator.turn_ended(session_id)
+    await coordinator.wait_for_idle()
+    assert generator.prompts == [_FIRST_MESSAGE]
     for _ in range(2):
         coordinator.turn_ended(session_id)
         await coordinator.wait_for_idle()
@@ -710,6 +717,53 @@ async def test_refinement_waits_for_a_settled_first_reply(
 
     assert generator.prompts[-1].endswith("Agent reply:\nThe issue is a flaky upload retry.")
     assert store.get_conversation(session_id).title == "Fix flaky upload retries"
+
+
+async def test_refinement_settles_after_the_latest_idle_edge(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _first_turn_session(store)
+    generator = _TitlesByPrompt()
+    coordinator = BackgroundSessionTitleCoordinator(store, generator, turn_settle_seconds=1.0)
+    coordinator.schedule(
+        session_id=session_id, prompt=_FIRST_MESSAGE, expected_seed_title=_SEED_TITLE
+    )
+    await coordinator.wait_for_idle()
+
+    _append_message(store, session_id, "assistant", "Opening the issue now.")
+    coordinator.turn_ended(session_id)  # a mid-turn lull
+    await asyncio.sleep(0.8)
+    coordinator.turn_ended(session_id)  # the turn's real end restarts the settle delay
+    # Past the lull's settle deadline, before the real end's.
+    # custom-lint: disable-next=sleep-then-assert -- the window straddles both settle deadlines
+    await asyncio.sleep(0.3)
+    _append_message(store, session_id, "assistant", "The issue is a flaky upload retry.")
+    await coordinator.wait_for_idle()
+
+    assert generator.prompts[-1].endswith("Agent reply:\nThe issue is a flaky upload retry.")
+    assert store.get_conversation(session_id).title == "Fix flaky upload retries"
+
+
+async def test_refinement_is_dropped_when_the_first_turn_is_too_long_to_scan(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(background_session_titles, "_FIRST_TURN_SCAN_PAGES", 1)
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _first_turn_session(store)
+    generator = _TitlesByPrompt()
+    coordinator = BackgroundSessionTitleCoordinator(store, generator, turn_settle_seconds=0)
+    coordinator.schedule(
+        session_id=session_id, prompt=_FIRST_MESSAGE, expected_seed_title=_SEED_TITLE
+    )
+    # The one-page scan ends on a progress message; the reply lies beyond it.
+    for _ in range(100):
+        _append_message(store, session_id, "assistant", "Opening the issue now.")
+    _append_message(store, session_id, "assistant", "The issue is a flaky upload retry.")
+
+    coordinator.turn_ended(session_id)
+    await coordinator.wait_for_idle()
+
+    assert generator.prompts == [_FIRST_MESSAGE]
+    assert store.get_conversation(session_id).title == "Review linked issue"
 
 
 async def test_refinement_is_dropped_when_the_first_turn_left_no_reply(db_uri: str) -> None:
