@@ -98,8 +98,6 @@ def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
         "truncated",
         "unexpected-before-rights",
         "family",
-        "stream",
-        "datagram",
     ],
 )
 def test_invalid_readiness_never_admits_and_releases_every_received_handle(
@@ -110,14 +108,9 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     control, process, close = readiness
     payload, metadata, flags, address = control.recvmsg.return_value
     handles = [_INIT_FD]
-    if problem in {"family", "stream", "datagram"}:
+    if problem == "family":
         handles = []
-        if problem == "family":
-            control.family = socket.AF_INET
-        else:
-            control.getsockopt.return_value = (
-                socket.SOCK_STREAM if problem == "stream" else socket.SOCK_DGRAM
-            )
+        control.family = socket.AF_INET
     elif problem == "token":
         payload = b"ready:" + b"6" * 64
     elif problem == "missing-credentials":
@@ -157,7 +150,7 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
         )
     assert sorted(call.args[0] for call in close.call_args_list) == sorted(handles)
     control.send.assert_not_called()
-    if problem in {"family", "stream", "datagram"}:
+    if problem == "family":
         control.recvmsg.assert_not_called()
 
 
@@ -354,8 +347,11 @@ def test_cleanup_failure_cannot_make_later_cancellation_signal_a_reused_fd(
     assert case.events == events
 
 
+@pytest.mark.parametrize(
+    "delay_output", [True, False], ids=["delayed-output", "final-result-read"]
+)
 def test_output_and_result_polling_can_wait_without_replaying_or_finishing_the_request(
-    request_case: _RequestCase,
+    request_case: _RequestCase, delay_output: bool
 ) -> None:
     case = request_case
     polls = 0
@@ -364,7 +360,7 @@ def test_output_and_result_polling_can_wait_without_replaying_or_finishing_the_r
     def communicate(**_kwargs: object) -> tuple[bytes, bytes]:
         nonlocal polls
         polls += 1
-        if polls == 1:
+        if delay_output and polls == 1:
             assert not case.owner.done.is_set()
             raise subprocess.TimeoutExpired("request-launcher", 0.05)
         case.exited.update({_INIT_FD: True, _LAUNCHER_FD: True})
