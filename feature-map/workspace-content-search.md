@@ -36,15 +36,14 @@ Filename search remains in Files.
   Windows/Linux, except in a terminal) from anywhere in the app.
 - Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop
   browser (not a touch client), the sidebar shows tabs instead of the Workspace
-  panel, in the Workspace drawer when the window is narrower than 1181px. Choose
-  **New tab → Search text** to search in a tab of its own, and move between tabs
-  from the strip or tab search. The Workspace panel's **Cmd+Shift+F** isn't
-  bound while the tabs show.
-  **Ctrl+Cmd+O** on macOS (**Ctrl+Alt+O** on Windows/Linux), or ⌘K's
-  **Search Text in Workspace…**, opens Go to File on its **Text** tab instead:
-  it lists matching lines under their files with a preview, and Enter opens the
-  file at the line. **Open in Search** (Cmd/Ctrl+Enter) hands the search and its
-  results to the tabs sidebar's Search page, ready to type into.
+  panel, in the Workspace drawer when the window is narrower than 1181px.
+  **New tab → Search text**, **Ctrl+Cmd+O** on macOS (**Ctrl+Alt+O** on
+  Windows/Linux) and ⌘K's **Search Text in Workspace…** all open Go to File on
+  its **Text** tab: it lists matching lines under their files with a preview,
+  and Enter opens the file at the line. **Open in Search** (Cmd/Ctrl+Enter)
+  hands the search and its results to the Search page, a tab of its own in the
+  strip, ready to type into; move between tabs from the strip or tab search. The
+  Workspace panel's **Cmd+Shift+F** isn't bound while the tabs show.
 - File viewer menu: in the tabs sidebar's file viewer, select text and
   right-click it (or press **Shift+F10** or the Menu key), then choose **Search
   Text in Workspace…** to search for the selection's first non-blank line. The
