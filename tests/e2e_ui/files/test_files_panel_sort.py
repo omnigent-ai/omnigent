@@ -82,12 +82,16 @@ def test_all_view_sort_reorders_files(
     for name in _ALL_FILES:
         expect(_row(rail, name)).to_be_visible(timeout=15_000)
 
-    # Sort by Filename → alphabetical: aaa.txt above zzz.txt.
-    _select_sort(page, rail, "Filename")
-    expect(_row(rail, _SMALL)).to_be_visible()
+    # The default is alphabetical, though zzz.txt was written last.
+    expect(rail.get_by_role("button", name=re.compile(r"^Sort: Filename"))).to_be_visible()
     assert _row_y(rail, _SMALL) < _row_y(rail, _BIG)
 
     # Sort by Size → largest first: zzz.txt (biggest) now above aaa.txt.
     _select_sort(page, rail, "Size")
     expect(_row(rail, _BIG)).to_be_visible()
     assert _row_y(rail, _BIG) < _row_y(rail, _SMALL)
+
+    # Back to Filename → alphabetical again: aaa.txt above zzz.txt.
+    _select_sort(page, rail, "Filename")
+    expect(_row(rail, _SMALL)).to_be_visible()
+    assert _row_y(rail, _SMALL) < _row_y(rail, _BIG)

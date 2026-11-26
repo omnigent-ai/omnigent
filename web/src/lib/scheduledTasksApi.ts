@@ -9,7 +9,9 @@
 // omit both and the server resolves the owner's connected host + its home dir
 // at fire time. Sandbox tasks instead accept a repository URL as workspace.
 
+import type { GitProviderDisplay } from "./gitProviders";
 import { authenticatedFetch } from "./identity";
+import { resolvedLocalTimezone } from "./timezones";
 import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
@@ -45,8 +47,11 @@ export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
-  /** RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`. */
-  rrule: string;
+  /**
+   * RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`.
+   * Null for a trigger automation when the server decides when it polls (automations v2).
+   */
+  rrule: string | null;
   /** Owning user, or `null` in single-user / auth-disabled deployments. */
   ownerUserId: string | null;
   agentId: string;
@@ -86,6 +91,13 @@ export interface ScheduledTask {
    * with this session's history. `null`/absent for ordinary automations.
    */
   sourceSessionId?: string | null;
+  /**
+   * The saved workflow every run starts as a run of, whose run message `prompt` holds.
+   * `null` for other automations, and from servers that don't store it.
+   */
+  workflowId?: string | null;
+  /** The specifics each run of `workflowId` carries; `null` without a workflow. */
+  workflowDetails?: string | null;
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
@@ -108,6 +120,11 @@ export interface ScheduledTask {
   viewerRole?: ScheduledTaskViewerRole;
   /** The owner's display name, sent to a viewer; `null` for the owner. */
   ownerDisplayName?: string | null;
+  /**
+   * `false` when the server can't keep grants for this automation, e.g. a legacy
+   * one. Absent counts as shareable.
+   */
+  shareable?: boolean;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -169,7 +186,15 @@ export interface CreateScheduledTaskInput {
   /** Diagnostic creation attribution, sent as headers for older-server compatibility. */
   templateId?: AutomationTemplateId;
   name: string;
-  prompt: string;
+  /** Required unless `workflowId` names the saved workflow to run. */
+  prompt?: string;
+  /**
+   * A saved workflow every run starts as a run of, on a server that advertises
+   * `scheduled_task_workflow_id`; the server writes the prompt that runs it. `null` names none.
+   */
+  workflowId?: string | null;
+  /** This run's specifics for `workflowId`. */
+  workflowDetails?: string;
   rrule: string;
   agentId: string;
   timezone?: string;
@@ -243,6 +268,10 @@ export interface UpdateScheduledTaskInput {
    */
   executionTarget?: ScheduledTaskExecutionTarget;
   state?: ScheduledTaskState;
+  /** Run this saved workflow from now on; `null` stops running one and needs a `prompt`. */
+  workflowId?: string | null;
+  /** New specifics for each run of the task's saved workflow; `null` clears them. */
+  workflowDetails?: string | null;
   /** File future fired sessions into this existing project; `null` unfiles them. */
   projectId?: string | null;
 }
@@ -252,7 +281,7 @@ interface ScheduledTaskWire {
   id: string;
   name: string;
   prompt: string;
-  rrule: string;
+  rrule: string | null;
   owner_user_id: string | null;
   agent_id: string;
   timezone: string;
@@ -272,6 +301,9 @@ interface ScheduledTaskWire {
   // Absent on servers that predate task projects.
   project_id?: string | null;
   source_session_id?: string | null;
+  // Absent on servers that don't store the saved workflow a task runs.
+  workflow_id?: string | null;
+  workflow_details?: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
@@ -280,6 +312,8 @@ interface ScheduledTaskWire {
   // Absent on servers that predate sharing automations.
   viewer_role?: ScheduledTaskViewerRole;
   owner_display_name?: string | null;
+  // Absent on servers that predate it.
+  shareable?: boolean;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -365,6 +399,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     executionTarget: wire.execution_target,
     projectId: wire.project_id ?? null,
     sourceSessionId: wire.source_session_id ?? null,
+    workflowId: wire.workflow_id ?? null,
+    workflowDetails: wire.workflow_details ?? null,
     state: wire.state,
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
@@ -372,6 +408,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     nextRunAt: wire.next_run_at,
     viewerRole: wire.viewer_role ?? "owner",
     ownerDisplayName: wire.owner_display_name ?? null,
+    shareable: wire.shareable ?? true,
   };
 }
 
@@ -500,6 +537,65 @@ export async function listScheduledTaskRunSteps(
   }));
 }
 
+/** One PR a run created or worked on, as the server stores it. */
+export interface ScheduledTaskRunPullRequest {
+  url: string;
+  /** Git provider id, e.g. "github". */
+  provider: string;
+  provider_display?: GitProviderDisplay | null;
+  /** Base repository, e.g. "owner/repo". */
+  repository: string;
+  number: number;
+  title?: string | null;
+  relationship: "created" | "worked_on" | "attached" | "inferred";
+  /** "OPEN" | "MERGED" | "CLOSED" as the host last fetched it; null until it did. */
+  state?: string | null;
+  is_draft?: boolean;
+  /** Epoch seconds of that fetch, or null. */
+  state_checked_at?: number | null;
+}
+
+/** The PRs one run created or worked on, with the state each host last fetched. */
+export interface ScheduledTaskRunPullRequests {
+  runId: string;
+  pullRequests: ScheduledTaskRunPullRequest[];
+}
+
+/** One page of runs' PRs. */
+export interface ScheduledTaskRunPullRequestsPage {
+  runs: ScheduledTaskRunPullRequests[];
+  /** The server started refreshing a session on the page, so a later read may show more. */
+  refreshPending: boolean;
+}
+
+/**
+ * The PRs of one page of a task's runs, most recent first, paged like
+ * {@link listScheduledTaskRuns}. Runs without PRs are left out.
+ *
+ * @param after - The ID of the run before the page, e.g. the previous page's last.
+ */
+export async function listScheduledTaskRunPullRequests(
+  id: string,
+  { limit, after }: { limit: number; after?: string },
+): Promise<ScheduledTaskRunPullRequestsPage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/run-pull-requests?${params}`,
+  );
+  const body = await readJsonOrThrow<{
+    runs?: { run_id: string; pull_requests?: ScheduledTaskRunPullRequest[] }[];
+    refresh_pending?: boolean;
+  }>(res);
+  return {
+    runs: (body.runs ?? []).map((run) => ({
+      runId: run.run_id,
+      pullRequests: run.pull_requests ?? [],
+    })),
+    refreshPending: body.refresh_pending === true,
+  };
+}
+
 /**
  * Create a scheduled task. Only the fields the user actually set are sent, so
  * the server applies its own defaults (`timezone` → UTC) and the optional
@@ -509,10 +605,12 @@ export async function listScheduledTaskRunSteps(
 export async function createScheduledTask(input: CreateScheduledTaskInput): Promise<ScheduledTask> {
   const body: Record<string, unknown> = {
     name: input.name,
-    prompt: input.prompt,
     rrule: input.rrule,
     agent_id: input.agentId,
   };
+  if (input.prompt !== undefined) body.prompt = input.prompt;
+  if (input.workflowId) body.workflow_id = input.workflowId;
+  if (input.workflowDetails) body.workflow_details = input.workflowDetails;
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
@@ -550,6 +648,25 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
 }
 
 /**
+ * Record the browser's IANA zone as the caller's default for tasks created
+ * with an explicit default-zone request. Skipped when the zone is unknown, so a
+ * UTC fallback never replaces another device's zone. Failures are ignored.
+ */
+export async function reportLocalTimezone(): Promise<void> {
+  const timezone = resolvedLocalTimezone();
+  if (timezone === null) return;
+  try {
+    await authenticatedFetch("/v1/scheduled-tasks/default-timezone", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ timezone }),
+    });
+  } catch {
+    // The next app load retries.
+  }
+}
+
+/**
  * Update mutable fields of a task (pause/reactivate/rename/reschedule). Only
  * the keys present in `input` are sent, matching the server's
  * `exclude_unset` semantics.
@@ -576,6 +693,8 @@ export async function updateScheduledTask(
   if (input.hostId !== undefined) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.state !== undefined) body.state = input.state;
+  if (input.workflowId !== undefined) body.workflow_id = input.workflowId;
+  if (input.workflowDetails !== undefined) body.workflow_details = input.workflowDetails;
   if (input.projectId !== undefined) body.project_id = input.projectId;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -583,6 +702,43 @@ export async function updateScheduledTask(
     body: JSON.stringify(body),
   });
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+/**
+ * Create a copy of an automation, under a new ID, with its settings and schedule but
+ * none of its runs. The copy is paused when the original is; otherwise both run.
+ */
+export async function cloneScheduledTask(
+  task: Pick<ScheduledTask, "id" | "hostId">,
+): Promise<ScheduledTask> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(task.id)}/clone`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-omnigent-automation-source": "ui",
+      // A copied source session takes its browser tools mode from this request.
+      ...browserAgentToolsRequestHeaders(),
+    },
+    // The create checks the original's host over its tunnel, so the request
+    // routes to that host's replica by this host_id.
+    body: JSON.stringify(task.hostId ? { host_id: task.hostId } : {}),
+  });
+  return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+/** The toast after a clone: what the copy is, and what's left to do. */
+export function cloneCreatedMessage(clone: Pick<ScheduledTask, "state" | "nextRunAt">): string {
+  if (clone.state === "paused") return "Automation cloned. The copy is paused like the original.";
+  // An active copy is always armed, so no next run means a finite schedule ran out.
+  if (clone.nextRunAt === null) return "Automation cloned. Its schedule has no runs left.";
+  return "Automation cloned. Pause or delete the original so they don't both run.";
+}
+
+/** The toast when a clone fails, with the server's reason when it gave one. */
+export function cloneFailedMessage(err: unknown): string {
+  return err instanceof ScheduledTaskApiError && err.status < 500
+    ? `Couldn't clone the automation: ${err.message}`
+    : "Couldn't clone the automation";
 }
 
 /** Delete a task so it no longer fires. */

@@ -4,14 +4,18 @@ Routes, under ``/v1``, each scoped to the caller:
 
 * ``GET /workflows`` lists the caller's workflows by name, one page at a time.
 * ``POST /workflows`` saves one.
+* ``GET /workflows/shared`` lists the workflows other people shared with the caller.
 * ``GET /workflows/{workflow_id}`` returns one, with its steps.
 * ``PATCH /workflows/{workflow_id}`` changes its metadata, steps or planning session.
 * ``DELETE /workflows/{workflow_id}`` deletes it.
 * ``GET /workflows/{workflow_id}/runs`` lists the sessions that ran it, newest
   first, with where each run's steps stand.
+* ``/workflows/{workflow_id}/permissions`` shares it (see ``workflow_permissions``).
 
-Another user's workflow answers 404. A write from an agent tool whose session
-is shared with edit access is refused, as project writes are.
+Another user's workflow answers 404, unless it is shared with the caller: then
+they can read it and its runs in sessions they can read, and run it. Every
+change stays with its owner. A write from an agent tool whose session is shared
+with edit access is refused, as project writes are.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from starlette.datastructures import State
 
 from omnigent.entities import Conversation
 from omnigent.entities.session_journal import JournalEntry
@@ -33,15 +38,33 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
+from omnigent.server.proactive_agent import is_proactive_task
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+from omnigent.server.routes._sessions.helpers import (
+    _session_sandbox_status_cache,
+    _session_status_from_cache,
+)
+from omnigent.server.routes.scheduled_task_permissions import (
+    display_names_or_ids,
+    request_from_agent,
+    scheduled_task_viewer_role,
+)
+from omnigent.server.routes.workflow_permissions import (
+    WorkflowViewerRole,
+    readable_workflow,
+    register_workflow_permissions_routes,
+    stores_workflow_grants,
+    workflow_shareable,
+)
 from omnigent.server.schemas import (
     CreateWorkflowRequest,
+    SharedWorkflowList,
     UpdateWorkflowRequest,
     WorkflowDeleted,
     WorkflowList,
     WorkflowObject,
     WorkflowRun,
+    WorkflowRunAutomation,
     WorkflowRunList,
     WorkflowRunProgress,
     WorkflowRunStarter,
@@ -53,14 +76,17 @@ from omnigent.server.session_orchestration import (
     require_named_source_private,
     require_owned_session,
 )
+from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.server.workflow_telemetry import log_workflow_saved
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     MAX_SESSION_FAMILY_MEMBERS,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
 )
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import MAX_SHARED_WORKFLOWS_PAGE_SIZE, PermissionStore
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.stores.workflow_store import (
     WORKFLOW_PAGE_MAX,
@@ -105,7 +131,19 @@ def open_store(conversation_store: object) -> WorkflowStore | None:
         return store
 
 
-def _summary(workflow: Workflow) -> WorkflowSummary:
+def _summary(
+    workflow: Workflow,
+    *,
+    shareable: bool,
+    viewer_role: WorkflowViewerRole = "owner",
+    owner_display_name: str | None = None,
+) -> WorkflowSummary:
+    """Serialize a workflow for a list.
+
+    :param shareable: From :func:`workflow_shareable`.
+    :param viewer_role: ``"viewer"`` for someone it is shared with.
+    :param owner_display_name: The owner's name, for a viewer.
+    """
     return WorkflowSummary(
         id=workflow.id,
         name=workflow.name,
@@ -113,12 +151,27 @@ def _summary(workflow: Workflow) -> WorkflowSummary:
         created_at=workflow.created_at,
         updated_at=workflow.updated_at,
         is_draft=not workflow.steps,
+        viewer_role=viewer_role,
+        owner_display_name=owner_display_name,
+        shareable=shareable,
     )
 
 
-def _object(workflow: Workflow) -> WorkflowObject:
+def _object(
+    workflow: Workflow,
+    *,
+    shareable: bool,
+    viewer_role: WorkflowViewerRole = "owner",
+    owner_display_name: str | None = None,
+) -> WorkflowObject:
+    """Serialize a workflow with its steps; the parameters are :func:`_summary`'s."""
     return WorkflowObject(
-        **_summary(workflow).model_dump(),
+        **_summary(
+            workflow,
+            shareable=shareable,
+            viewer_role=viewer_role,
+            owner_display_name=owner_display_name,
+        ).model_dump(),
         steps=[WorkflowStep(**step) for step in workflow.steps],
         planning_session_id=workflow.planning_session_id,
         description_source=workflow.description_source,
@@ -182,14 +235,37 @@ def _started_during(
 
 def _run_active(run: WorkflowRun) -> bool:
     """Whether a run is working or waiting for input, as its row shows it."""
-    working = run.is_current and (run.session_status == "running" or run.background_work_running)
+    working = run.is_current and (
+        run.session_status == "running" or run.background_work_running or run.sandbox_launching
+    )
     return working or run.progress.needs_input > 0
+
+
+def _sandbox_launching(session: Conversation) -> bool:
+    """Whether the session's sandbox launch is under way: neither up nor failed.
+
+    The launching replica caches the launch's stage. Any other replica reads the
+    startup label, which the launch keeps on the session until its first messages
+    are delivered and which records a failure.
+    """
+    launch = _session_sandbox_status_cache.get(session.id)
+    if launch is not None:
+        return launch.stage != "failed"
+    return session.labels.get(STARTUP_LABEL) == "pending"
+
+
+def workflows_enabled(app_state: State | None) -> bool:
+    """Whether the server whose ``app.state`` this is enables workflows.
+
+    :param app_state: The server's ``app.state``; ``None`` reads the default flags.
+    """
+    flags = getattr(app_state, "feature_flags", FeatureFlags())
+    return flags.enabled(Feature.WORKFLOWS)
 
 
 def require_workflows(request: Request) -> None:
     """Reject workflow and journal requests unless the server enables workflows."""
-    flags = getattr(request.app.state, "feature_flags", FeatureFlags())
-    if not flags.enabled(Feature.WORKFLOWS):
+    if not workflows_enabled(request.app.state):
         raise OmnigentError("Workflows are disabled on this server", code=ErrorCode.NOT_FOUND)
 
 
@@ -198,6 +274,7 @@ def create_workflows_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
 ) -> APIRouter:
     """Build the workflows router, mounted under ``/v1``.
 
@@ -206,7 +283,10 @@ def create_workflows_router(
         It also resolves the calling session an agent tool names.
     :param auth_provider: Identifies the caller; ``None`` in single-user mode.
     :param permission_store: Checks whether that calling session is shared
-        with edit access; ``None`` disables the check.
+        with edit access, and keeps who each workflow is shared with; ``None``
+        disables the check and sharing.
+    :param scheduled_task_store: Names the automation whose scheduled run started
+        each listed run; ``None`` names none.
     """
     router = APIRouter(dependencies=[Depends(require_workflows)])
 
@@ -217,6 +297,39 @@ def create_workflows_router(
                 "Workflows are not available on this server", code=ErrorCode.NOT_FOUND
             )
         return store
+
+    def _shareable(workflow_id: str) -> bool:
+        return workflow_shareable(permission_store, workflow_id)
+
+    def _load_owned(request: Request, workflow_id: str) -> Workflow:
+        """The caller's workflow, or the 404 every workflow route gives. Blocking."""
+        workflow = _store().get(workflow_id, user_id=require_user(request, auth_provider))
+        if workflow is None:
+            raise _not_found()
+        return workflow
+
+    async def _readable_workflow(
+        request: Request, workflow_id: str
+    ) -> tuple[Workflow, WorkflowViewerRole]:
+        """A workflow its owner or someone it is shared with may read, or the 404."""
+        user_id = require_user(request, auth_provider)
+        found = await asyncio.to_thread(
+            readable_workflow,
+            _store(),
+            workflow_id,
+            user_id,
+            permission_store=permission_store,
+        )
+        if found is None:
+            raise _not_found()
+        return found
+
+    async def _owner_names(workflows: Sequence[Workflow]) -> dict[str, str]:
+        """Display names for the owners of workflows shown to a viewer, in one batch."""
+        owners = sorted({workflow.user_id for workflow in workflows})
+        if not owners or permission_store is None:
+            return {}
+        return await asyncio.to_thread(display_names_or_ids, permission_store, owners)
 
     async def _writer(request: Request) -> str | None:
         """The caller, once an agent tool's write from a shared session is refused."""
@@ -254,7 +367,7 @@ def create_workflows_router(
         except InvalidWorkflowError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         return WorkflowList(
-            data=[_summary(workflow) for workflow in page],
+            data=[_summary(workflow, shareable=_shareable(workflow.id)) for workflow in page],
             first_id=page[0].id if page else None,
             last_id=page[-1].id if page else None,
             next_cursor=workflow_page_cursor(page[-1]) if has_more and page else None,
@@ -289,20 +402,102 @@ def create_workflows_router(
             plan_saved=True,
             source_session_id=request.headers.get(ORCHESTRATION_SOURCE_HEADER),
         )
-        return _object(workflow)
+        return _object(workflow, shareable=_shareable(workflow.id))
+
+    # Before ``/workflows/{workflow_id}``, which would otherwise match ``shared``.
+    @router.get("/workflows/shared", response_model=SharedWorkflowList)
+    async def list_shared_workflows(
+        request: Request,
+        limit: int = Query(default=_DEFAULT_PAGE, ge=1, le=MAX_SHARED_WORKFLOWS_PAGE_SIZE),
+        after: str | None = Query(
+            default=None, max_length=64, description="Cursor: a previous page's next_cursor"
+        ),
+    ) -> SharedWorkflowList:
+        """List one page of the workflows other people shared with the caller.
+
+        A grant to the caller or to any of their groups counts, and each workflow is
+        listed once, ordered by ID. Deleted workflows, those of deleted accounts and the
+        caller's own are left out, so a page can be short, or empty while
+        ``next_cursor`` is set. Each item
+        has ``viewer_role`` ``"viewer"`` and the owner's ``owner_display_name``. Empty
+        on a server that cannot share workflows and for the local user.
+
+        :param limit: Max workflows to return (1–100, default 50).
+        :param after: Cursor, a previous page's ``next_cursor``.
+        :raises OmnigentError: 401 if unauthenticated in multi-user mode, 403 for an
+            agent's request, 400 for a malformed cursor.
+        """
+        if request_from_agent(request):
+            raise OmnigentError(
+                "Agents cannot list the workflows shared with you", code=ErrorCode.FORBIDDEN
+            )
+        user_id = require_user(request, auth_provider)
+        if user_id in (None, RESERVED_USER_LOCAL) or not stores_workflow_grants(permission_store):
+            return SharedWorkflowList()
+        assert permission_store is not None and user_id is not None
+        try:
+            cursor = uuid_to_bytes(after).hex() if after is not None else None
+        except InvalidUuidError as exc:
+            raise OmnigentError(
+                "Invalid shared workflows cursor", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        store = _store()
+
+        def page() -> tuple[list[Workflow], str | None]:
+            principals = permission_store.caller_principals(user_id)
+            workflow_ids, next_cursor = permission_store.list_workflows_shared_with(
+                principals, limit=limit, after_workflow_id=cursor
+            )
+            loaded = store.get_many(workflow_ids)
+            # A deleted owner's workflows stop being shared before their cleanup ends.
+            deleted = permission_store.deleted_accounts(
+                [workflow.user_id for workflow in loaded.values()]
+            )
+            shared = [
+                workflow
+                for workflow_id in workflow_ids
+                if (workflow := loaded.get(workflow_id)) is not None
+                and workflow.user_id != user_id
+                and workflow.user_id not in deleted
+            ]
+            return shared, next_cursor
+
+        shared, next_cursor = await asyncio.to_thread(page)
+        names = await _owner_names(shared)
+        return SharedWorkflowList(
+            data=[
+                _summary(
+                    workflow,
+                    shareable=_shareable(workflow.id),
+                    viewer_role="viewer",
+                    owner_display_name=names.get(workflow.user_id, workflow.user_id),
+                )
+                for workflow in shared
+            ],
+            next_cursor=next_cursor,
+        )
 
     @router.get("/workflows/{workflow_id}", response_model=WorkflowObject)
     async def get_workflow(request: Request, workflow_id: str) -> WorkflowObject:
-        """Return one of the caller's workflows, with its steps.
+        """Return a workflow the caller owns or that is shared with them, with its steps.
+
+        ``viewer_role`` says which, and someone it is shared with also gets the owner's
+        ``owner_display_name``. Agents read shared workflows too, so a run of one can
+        load its description.
 
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 404 if
-            the caller has no such workflow.
+            the caller can't read such a workflow.
         """
-        user_id = require_user(request, auth_provider)
-        workflow = await asyncio.to_thread(_store().get, workflow_id, user_id=user_id)
-        if workflow is None:
-            raise _not_found()
-        return _object(workflow)
+        workflow, role = await _readable_workflow(request, workflow_id)
+        owner_name = None
+        if role == "viewer":
+            owner_name = (await _owner_names([workflow])).get(workflow.user_id, workflow.user_id)
+        return _object(
+            workflow,
+            shareable=_shareable(workflow.id),
+            viewer_role=role,
+            owner_display_name=owner_name,
+        )
 
     @router.patch("/workflows/{workflow_id}", response_model=WorkflowObject)
     async def update_workflow(
@@ -372,11 +567,13 @@ def create_workflows_router(
             plan_saved=body.steps is not None,
             source_session_id=request.headers.get(ORCHESTRATION_SOURCE_HEADER),
         )
-        return _object(workflow)
+        return _object(workflow, shareable=_shareable(workflow.id))
 
     @router.delete("/workflows/{workflow_id}", response_model=WorkflowDeleted)
     async def delete_workflow(request: Request, workflow_id: str) -> WorkflowDeleted:
-        """Delete one of the caller's workflows.
+        """Delete one of the caller's workflows, and then who it was shared with.
+
+        Grants a failed cleanup leaves are inert, since readers check the workflow.
 
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 404 if
             the caller has no such workflow.
@@ -385,6 +582,17 @@ def create_workflows_router(
         deleted = await asyncio.to_thread(_store().delete, workflow_id, user_id=user_id)
         if not deleted:
             raise _not_found()
+        if stores_workflow_grants(permission_store):
+            assert permission_store is not None
+            try:
+                await asyncio.to_thread(
+                    permission_store.delete_for_workflow,
+                    normalize_uuid(workflow_id) or workflow_id,
+                )
+            except Exception:
+                _logger.exception(
+                    "could not delete the grants of deleted workflow %s", workflow_id
+                )
         return WorkflowDeleted(id=workflow_id)
 
     def _readable(user_id: str | None, session: Conversation) -> bool:
@@ -438,6 +646,7 @@ def create_workflows_router(
                     if is_current
                     else "idle",
                     background_work_running=is_current and session.background_work_running is True,
+                    sandbox_launching=is_current and _sandbox_launching(session),
                     archived=session.archived,
                     progress=_progress(latest_plan, step_statuses),
                     steps=[WorkflowStep(**step) for step in latest_plan.content.get("steps", [])],
@@ -578,9 +787,33 @@ def create_workflows_router(
         return runs, page[-1] if more and page else None
 
     def _name_workflows(runs: Sequence[WorkflowRun], user_id: str | None) -> None:
-        """Name each run's workflow, and its descendants', if the caller owns it."""
+        """Name each run's workflow, and its descendants', if the caller can read it.
+
+        A workflow shared by a deleted owner goes unnamed, as it is unreadable.
+        """
         every = [*runs, *(descendant for run in runs for descendant in run.descendant_runs)]
-        names = _store().names([run.workflow_id for run in every], user_id=user_id)
+        workflow_ids = list(dict.fromkeys(run.workflow_id for run in every if run.workflow_id))
+        names = _store().names(workflow_ids, user_id=user_id)
+        others = [workflow_id for workflow_id in workflow_ids if workflow_id not in names]
+        if others and user_id not in (None, RESERVED_USER_LOCAL):
+            assert user_id is not None
+            if stores_workflow_grants(permission_store):
+                assert permission_store is not None
+                principals = permission_store.caller_principals(user_id)
+                # Grants first: get_many reads whoever owns a workflow.
+                granted = [
+                    workflow_id
+                    for workflow_id in others
+                    if permission_store.resolve_workflow_access(principals, workflow_id)
+                    is not None
+                ]
+                shared = _store().get_many(granted) if granted else {}
+                deleted = permission_store.deleted_accounts(
+                    [workflow.user_id for workflow in shared.values()]
+                )
+                for workflow_id, workflow in shared.items():
+                    if workflow.user_id not in deleted:
+                        names[workflow_id] = workflow.name
         for run in every:
             run.workflow_name = names.get(run.workflow_id)
 
@@ -625,6 +858,34 @@ def create_workflows_router(
         _name_workflows(runs, user_id)
         return runs
 
+    def _name_automations(
+        request: Request, runs: Sequence[WorkflowRun], user_id: str | None
+    ) -> None:
+        """
+        Name the automation whose scheduled run started each run's session, when the
+        caller may see that automation. Blocking.
+        """
+        if scheduled_task_store is None:
+            return
+        sessions = conversation_store.get_conversations([run.session_id for run in runs])
+        origins = {
+            session_id: task_id
+            for session_id, session in sessions.items()
+            if (task_id := session.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY))
+        }
+        if not origins:
+            return
+        tasks = scheduled_task_store.get_many(sorted(set(origins.values())))
+        caller_id = None if user_id == RESERVED_USER_LOCAL else user_id
+        for run in runs:
+            task = tasks.get(origins.get(run.session_id, ""))
+            if (
+                task is not None
+                and not is_proactive_task(task)
+                and scheduled_task_viewer_role(request, task, caller_id, permission_store)
+            ):
+                run.automation = WorkflowRunAutomation(id=task.id, name=task.name)
+
     def _readable_session(user_id: str | None, session_id: str) -> Conversation | None:
         try:
             session = conversation_store.get_conversation(uuid_to_bytes(session_id).hex())
@@ -640,10 +901,12 @@ def create_workflows_router(
         before: str | None = None,
         session_id: str | None = None,
     ) -> WorkflowRunList:
-        """List one of the caller's workflows' runs, newest first.
+        """List the runs of a workflow the caller owns or that is shared with them, newest first.
 
         A run is the plan that named the workflow, so a session that ran it
-        twice is listed twice. Sessions the caller can't read are left out.
+        twice is listed twice. Sessions the caller can't read are left out, so
+        someone a workflow is shared with sees their own runs, and its owner
+        doesn't see theirs; a page can be short while ``next_cursor`` is set.
         Each run names the session that started it and the workflow runs below it.
 
         :param limit: Page size, e.g. ``20``.
@@ -652,8 +915,8 @@ def create_workflows_router(
             workflow, e.g. for its Tasks tab. Read access to the session stands
             in for owning the workflow, so people it is shared with see it too.
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 404 if
-            the caller has no such workflow or can't read the session, 400 for
-            an invalid cursor.
+            the caller can't read such a workflow or the session, 400 for an
+            invalid cursor.
         """
         # Imported here: the journal router checks workflows through this module.
         from omnigent.server.session_journal import open_store as open_journal_store
@@ -679,9 +942,7 @@ def create_workflows_router(
                 else []
             )
         else:
-            workflow = await asyncio.to_thread(_store().get, workflow_id, user_id=user_id)
-            if workflow is None:
-                raise _not_found()
+            workflow, _ = await _readable_workflow(request, workflow_id)
             if journal is None:
                 return WorkflowRunList()
             try:
@@ -694,7 +955,10 @@ def create_workflows_router(
 
         def runs(store: SessionJournalStore) -> list[WorkflowRun]:
             listed = _runs(store, plans, user_id)
-            return _link_runs(store, listed, plans, user_id) if listed else listed
+            if not listed:
+                return listed
+            _name_automations(request, listed, user_id)
+            return _link_runs(store, listed, plans, user_id)
 
         data = await asyncio.to_thread(runs, journal)
         return WorkflowRunList(data=data, next_cursor=next_cursor)
@@ -753,4 +1017,7 @@ def create_workflows_router(
 
         return await asyncio.to_thread(page, journal)
 
+    register_workflow_permissions_routes(
+        router, load_owned_workflow=_load_owned, permission_store=permission_store
+    )
     return router

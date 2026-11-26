@@ -64,6 +64,7 @@ import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
 import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
+import { subagentHandbackReport } from "./subagentHandback";
 import { readTaskActivity } from "./taskActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
@@ -95,8 +96,19 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
   const agents = agentNamesByResponseId(items);
+  const handbacks = new Set<string>();
   for (const item of items) {
     if (!item.response_id) continue;
+    if (isFunctionCallItem(item)) {
+      const report = handbackReportBlock(item);
+      if (report !== null) {
+        handbacks.add(item.call_id);
+        blocks.push(report);
+        continue;
+      }
+    }
+    // The handback's result only confirms delivery; the report already shows.
+    if (isFunctionCallOutputItem(item) && handbacks.has(item.call_id)) continue;
     if (isSlashCommandItem(item)) {
       const echo = skillEchoBlock(item);
       if (echo !== null) blocks.push(echo);
@@ -235,10 +247,31 @@ function answersFromToolResult(
     const at = output.indexOf(`"${question.question}${ANSWER_SEPARATOR}`);
     if (at === -1) continue;
     const from = at + question.question.length + 1 + ANSWER_SEPARATOR.length;
-    const end = output.indexOf('"', from);
-    answers[question.question] = end === -1 ? output.slice(from) : output.slice(from, end);
+    const end = answerEnd(output, from, payload.questions);
+    answers[question.question] = output.slice(from, end);
   }
   return answers;
+}
+
+/**
+ * Where the answer that starts at ``from`` ends. Answers are not escaped, so one can hold
+ * quotes of its own (a session marker's title). It ends at the next answer's
+ * ``", "<question>"=`` boundary; the last answer ends at the last quote, as the trailing
+ * sentence has none.
+ */
+function answerEnd(
+  output: string,
+  from: number,
+  questions: AskUserQuestionPayload["questions"],
+): number {
+  let next = -1;
+  for (const question of questions) {
+    const at = output.indexOf(`", "${question.question}${ANSWER_SEPARATOR}`, from);
+    if (at !== -1 && (next === -1 || at < next)) next = at;
+  }
+  if (next !== -1) return next;
+  const last = output.lastIndexOf('"');
+  return last >= from ? last : output.length;
 }
 
 function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
@@ -368,13 +401,28 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
   };
 }
 
-function functionCallToBlock(item: FunctionCallItem): ToolGroup {
-  let args: Record<string, unknown>;
+function parsedArguments(item: FunctionCallItem): Record<string, unknown> {
   try {
-    args = JSON.parse(item.arguments) as Record<string, unknown>;
+    return JSON.parse(item.arguments) as Record<string, unknown>;
   } catch {
-    args = {};
+    return {};
   }
+}
+
+/** A sub-agent's handback call rendered as its final answer, or ``null``. */
+function handbackReportBlock(item: FunctionCallItem): TextDone | null {
+  const report = subagentHandbackReport(item.name, parsedArguments(item));
+  if (report === null) return null;
+  return {
+    type: "text_done",
+    ctx: ctxFor(item),
+    fullText: report,
+    hasCodeBlocks: report.includes("```"),
+  };
+}
+
+function functionCallToBlock(item: FunctionCallItem): ToolGroup {
+  const args = parsedArguments(item);
   const execution: ToolExecution = {
     name: item.name,
     arguments: args,

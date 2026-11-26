@@ -9,7 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
-import type { Components } from "streamdown";
+import remarkEmoji from "remark-emoji";
+import { defaultRemarkPlugins, type Components } from "streamdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { cn } from "@/lib/utils";
 import {
@@ -130,6 +131,12 @@ export const PULL_REQUEST_MARKDOWN_COMPONENTS: Components = {
   img: PullRequestImage,
   video: PullRequestVideo,
 };
+
+/** GitHub renders `:shortcode:` emoji. Streamdown's remarkPlugins replaces its defaults, so extend them. */
+export const PULL_REQUEST_MARKDOWN_REMARK_PLUGINS = [
+  ...Object.values(defaultRemarkPlugins),
+  remarkEmoji,
+];
 
 // ── Description drafts ──────────────────────────────────────────────────────
 // Kept outside React so a draft, and uploads still landing in it, survive the
@@ -361,6 +368,7 @@ export function PullRequestDescription({
           <MessageResponse
             allowGitHubAttachmentImages
             components={PULL_REQUEST_MARKDOWN_COMPONENTS}
+            remarkPlugins={PULL_REQUEST_MARKDOWN_REMARK_PLUGINS}
           >
             {body}
           </MessageResponse>
@@ -567,6 +575,7 @@ function PullRequestDescriptionEditor({
               <MessageResponse
                 allowGitHubAttachmentImages
                 components={PULL_REQUEST_MARKDOWN_COMPONENTS}
+                remarkPlugins={PULL_REQUEST_MARKDOWN_REMARK_PLUGINS}
               >
                 {draft.body}
               </MessageResponse>

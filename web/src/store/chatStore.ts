@@ -97,11 +97,17 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
+import { provesNotDelivered } from "@/lib/sendRefusal";
 import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
 import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
-import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import {
+  createInitialConversationState,
+  hasUnsentWorkToCarry,
+  isConversationStateKey,
+  unsentWorkOf,
+} from "./conversationState";
 import { fetchConversationSnapshot } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
@@ -116,6 +122,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { isFirstPlan } from "@/lib/sessionJournal";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -140,7 +147,7 @@ import {
 import {
   forgetUnsentSend,
   peekQueuedSends,
-  peekUnsentSend,
+  peekUnsentSends,
   rememberQueuedSends,
   rememberUnsentSend,
 } from "@/lib/unsentSends";
@@ -172,10 +179,16 @@ import type {
   Session,
   SessionStatus,
 } from "@/lib/types";
-import { downloadSessionFile, uploadFile } from "@/lib/filesApi";
-import { attachmentKey } from "@/lib/attachments";
+import { deleteSessionFile, downloadSessionFile, uploadFile } from "@/lib/filesApi";
+import { attachmentFilename, attachmentKey } from "@/lib/attachments";
+import {
+  beginUploadProgress,
+  endUploadProgress,
+  reportUploadProgress,
+  uploadProgressKey,
+} from "./uploadProgress";
 import { sendVerdictFromServer, snapshotRefusesSend } from "@/lib/userInputDelivery";
-import type { ActiveResponse } from "./types";
+import type { ActiveResponse, UploadFailure } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
@@ -259,7 +272,54 @@ export interface SendOptions {
    * parent transcript/composer. The optimistic bubble is still rolled back and
    * status still settles.
    */
-  onError?: (message: string) => void;
+  onError?: (message: string, refused?: boolean) => void;
+  /** Fires when policy denies the input, so a caller can tell denial from acceptance. */
+  onDenied?: () => void;
+  /**
+   * Once aborted, a send still waiting to post, uploading, or awaiting its POST's answer
+   * stops waiting and fails (through `onError`); a POST already out still runs.
+   */
+  signal?: AbortSignal;
+  /** Fires when a POST still out as `signal` aborted is then accepted after all. */
+  onAcceptedLate?: () => void;
+  /**
+   * Not the composer's message (the Browser design tools' outbox): the composer's retry state
+   * and reload recovery are left alone, and `onError` fires only once the failure is known,
+   * with `refused` when the server's answer shows the runner never got it.
+   */
+  external?: boolean;
+  /** An external send resending one the server refused, so an item under its id proves nothing. */
+  retriesRefused?: boolean;
+  /** Asked once uploads are done, just before posting: a reason given fails the send unposted. */
+  beforePost?: () => Promise<string | null>;
+  /**
+   * A parked upload's Retry. Its message is not the composer's: the composer's restored-send
+   * tracker stays as it is. A failure before the POST parks it again.
+   */
+  retryOfParkedUpload?: boolean;
+  /** Resources a parked attempt created, which this Retry carries on as its own to delete. */
+  inheritedUploads?: OwnedUpload[];
+}
+
+// Who hears of each send the runner takes, by its committed item's id and by the pending
+// input it drained: the design outbox, whose sends' failures may turn out to have arrived.
+const deliveredSendListeners = new Set<(id: string) => void>();
+
+/** Hear of every send the runner takes (see `deliveredSendListeners`). */
+export function onSendDelivered(listener: (id: string) => void): () => void {
+  deliveredSendListeners.add(listener);
+  return () => deliveredSendListeners.delete(listener);
+}
+
+/** `work`, or a rejection once `signal` aborts; the work itself runs on. */
+function unlessAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return work;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void work.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 /**
@@ -637,6 +697,8 @@ export interface PendingUserMessage {
   posted?: boolean;
   /** The send's POST has gone unanswered for {@link SEND_STILL_SENDING_AFTER_MS}. */
   stillSending?: boolean;
+  /** Replayed from the snapshot's `pending_inputs`: the session accepted it, though this page didn't post it. */
+  replayed?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -650,6 +712,8 @@ export interface PendingUserMessage {
    * it. Unset on snapshot-replayed entries.
    */
   sentMidTurn?: boolean;
+  /** Set on a send whose upload failed before posting; see `failedUploads`. */
+  uploadFailure?: UploadFailure;
 }
 
 /**
@@ -749,6 +813,12 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * Sends whose upload failed before posting. Kept out of `pendingUserMessages`, so a
+   * later message's consumed event can never pair with one. Each shows its failed
+   * attachment with Retry and Remove until the user picks one.
+   */
+  failedUploads: PendingUserMessage[];
   /**
    * Recent shell mirrors and the bubbles they settled. Retaining both client
    * and server ids protects later inputs from duplicate or legacy receipts.
@@ -1621,7 +1691,7 @@ function nativeSandboxLaunching(state: ConversationState): boolean {
 const SANDBOX_LAUNCH_MAX_WAIT_MS = 20 * 60_000;
 
 /** Whether a message sent now is held locally for startup rather than posted. */
-function wouldHoldSend(state: ConversationState): boolean {
+export function wouldHoldSend(state: ConversationState): boolean {
   // The server saves startup messages itself, so it needs no local hold.
   return (
     !state.startupPending &&
@@ -1959,27 +2029,67 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 // by File identity dedupes across attempts. Keyed by session too, since a File
 // could be sent to more than one. WeakMap so entries vanish when the File is
 // dropped from the queue/pending state.
-const uploadedFileBlockCache = new WeakMap<File, Map<string, ContentBlock>>();
+type UploadedFileBlock = Extract<ContentBlock, { file_id: string }>;
+/** A resource one send attempt created, held privately until its POST starts. */
+interface OwnedUpload {
+  file: File;
+  block: UploadedFileBlock;
+}
 
-/**
- * Upload a file to a session and return its content block, reusing a prior
- * successful upload of the same File to the same session. Deduping here means
- * a failed post (or a later file's upload failing) doesn't re-upload files
- * that already landed when the message is retried.
- */
-async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBlock> {
-  const cached = uploadedFileBlockCache.get(file)?.get(sessionId);
-  if (cached !== undefined) return cached;
-  const uploaded = await uploadFile(sessionId, file);
-  const block: ContentBlock = file.type.startsWith("image/")
-    ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
-    : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
-  let bySession = uploadedFileBlockCache.get(file);
-  if (bySession === undefined) {
-    bySession = new Map<string, ContentBlock>();
+/** Publishes uploads to the shared cache, so a later send with the same File reuses them. */
+function publishUploads(sessionId: string, uploads: readonly OwnedUpload[]): void {
+  for (const { file, block } of uploads) {
+    const bySession = uploadedFileBlockCache.get(file) ?? new Map<string, UploadedFileBlock>();
+    bySession.set(sessionId, block);
     uploadedFileBlockCache.set(file, bySession);
   }
-  bySession.set(sessionId, block);
+}
+const uploadedFileBlockCache = new WeakMap<File, Map<string, UploadedFileBlock>>();
+/** The error a stopped upload's send reports; a parked one shows it in place of a server reason. */
+const UPLOAD_CANCELLED_MESSAGE = "Upload cancelled";
+
+/** The placeholder id an attachment carries until its upload returns the real one. */
+function pendingFileIdOf(file: File): string {
+  return `${PENDING_FILE_PREFIX}${attachmentKey(file)}`;
+}
+
+/** How a batch upload is observed and stopped: see `uploadFileBlocks`. */
+export interface UploadBatchGuard {
+  signal?: AbortSignal;
+  /** Told when each file's upload begins, so a failure can name the file. */
+  onFileStart?: (file: File) => void;
+  onProgress?: (file: File, loaded: number, total: number | null) => void;
+  /** Told of each resource this batch created; a reused cache hit is not reported. */
+  onUploaded?: (file: File, block: UploadedFileBlock) => void;
+  /** Uploads already created for these Files, reused before the shared cache is consulted. */
+  reuse?: Map<File, UploadedFileBlock>;
+  /** Keep the batch's uploads out of the shared cache; the caller publishes them once posted. */
+  deferPublish?: boolean;
+}
+
+/** Keep new uploads private to their batch until every file succeeds. */
+async function uploadFileBlock(
+  sessionId: string,
+  file: File,
+  newUploads: Map<File, UploadedFileBlock>,
+  guard: UploadBatchGuard,
+): Promise<UploadedFileBlock> {
+  const cached =
+    newUploads.get(file) ??
+    guard.reuse?.get(file) ??
+    uploadedFileBlockCache.get(file)?.get(sessionId);
+  if (cached !== undefined) return cached;
+  guard.onFileStart?.(file);
+  const { onProgress } = guard;
+  const uploaded = await uploadFile(sessionId, file, {
+    signal: guard.signal,
+    onUploadProgress: onProgress && ((loaded, total) => onProgress(file, loaded, total)),
+  });
+  const block: UploadedFileBlock = file.type.startsWith("image/")
+    ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
+    : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
+  newUploads.set(file, block);
+  guard.onUploaded?.(file, block);
   return block;
 }
 
@@ -2005,7 +2115,7 @@ async function rewindAttachmentFiles(
         if (inline) return fileFromDataUri(inline, attachment.filename);
         if (!attachment.fileId) return null;
         const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
-        const block: ContentBlock = {
+        const block: UploadedFileBlock = {
           type: attachment.type,
           file_id: attachment.fileId,
           filename: attachment.filename,
@@ -2026,15 +2136,40 @@ async function rewindAttachmentFiles(
   return downloads.filter((file): file is File => file !== null);
 }
 
-async function uploadFileBlocks(
+/**
+ * Upload `files` to a session in order, as the content blocks a user message carries.
+ * A failure removes the batch's earlier uploads and rejects with the first failure's error.
+ */
+export async function uploadFileBlocks(
   sessionId: string,
   files: readonly File[],
+  guard: UploadBatchGuard = {},
 ): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
-  // Stop at the first failure so later uploads cannot outlive a requeued send.
-  for (const file of files) {
-    // oxlint-disable-next-line no-await-in-loop
-    blocks.push(await uploadFileBlock(sessionId, file));
+  const newUploads = new Map<File, UploadedFileBlock>();
+  try {
+    // Stop at the first failure so later uploads cannot outlive a requeued send.
+    for (const file of files) {
+      // oxlint-disable-next-line no-await-in-loop
+      blocks.push(await uploadFileBlock(sessionId, file, newUploads, guard));
+    }
+  } catch (error) {
+    await Promise.all(
+      [...newUploads.values()].map(async (block) => {
+        try {
+          await deleteSessionFile(sessionId, block.file_id);
+        } catch (cleanupError) {
+          console.warn("Couldn't remove an upload from a failed attachment batch", cleanupError);
+        }
+      }),
+    );
+    throw error;
+  }
+  if (!guard.deferPublish) {
+    publishUploads(
+      sessionId,
+      [...newUploads].map(([file, block]) => ({ file, block })),
+    );
   }
   return blocks;
 }
@@ -2198,7 +2333,10 @@ export interface PendingInitialPrompt {
 // host-provided routing (the host router may not carry react-router
 // state through navigate() → useLocation()). Both surfaces share this
 // module-level singleton, so it works identically standalone and embedded.
-const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
+// Stashed prompts per conversation, oldest first; each is consumed once, in order.
+const pendingInitialPrompts = new Map<string, PendingInitialPrompt[]>();
+// Pages showing a conversation, each listening for prompts stashed for it.
+const initialPromptListeners = new Map<string, Set<() => void>>();
 
 /**
  * Stash the first message for a freshly created conversation so ChatPage
@@ -2219,7 +2357,34 @@ export function setPendingInitialPrompt(
   prompt: PendingInitialPrompt,
 ): void {
   if (!prompt.text && !prompt.files?.length) return;
-  pendingInitialPrompts.set(conversationId, prompt);
+  pendingInitialPrompts.set(conversationId, [
+    ...(pendingInitialPrompts.get(conversationId) ?? []),
+    prompt,
+  ]);
+  for (const listener of initialPromptListeners.get(conversationId) ?? []) listener();
+}
+
+/**
+ * Hear each prompt stashed for `conversationId` while the listener is subscribed, so a page
+ * already showing the session takes a floating-panel launch that arrives after its route.
+ *
+ * @returns An unsubscribe function.
+ */
+export function onPendingInitialPrompt(conversationId: string, listener: () => void): () => void {
+  const listeners = initialPromptListeners.get(conversationId) ?? new Set<() => void>();
+  listeners.add(listener);
+  initialPromptListeners.set(conversationId, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && initialPromptListeners.get(conversationId) === listeners) {
+      initialPromptListeners.delete(conversationId);
+    }
+  };
+}
+
+/** Whether a page is showing `conversationId` and would take a prompt stashed for it now. */
+export function isListeningForInitialPrompt(conversationId: string): boolean {
+  return (initialPromptListeners.get(conversationId)?.size ?? 0) > 0;
 }
 
 /**
@@ -2234,10 +2399,25 @@ export function setPendingInitialPrompt(
  *   already consumed).
  */
 export function consumePendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
-  const prompt = pendingInitialPrompts.get(conversationId);
+  const [prompt, ...rest] = pendingInitialPrompts.get(conversationId) ?? [];
   if (prompt === undefined) return null;
-  pendingInitialPrompts.delete(conversationId);
+  if (rest.length === 0) pendingInitialPrompts.delete(conversationId);
+  else pendingInitialPrompts.set(conversationId, rest);
   return prompt;
+}
+
+/**
+ * Put back a prompt a page consumed but didn't send, ahead of any stashed since. It doesn't notify
+ * listeners, so the page putting it back doesn't take it again.
+ */
+export function returnPendingInitialPrompt(
+  conversationId: string,
+  prompt: PendingInitialPrompt,
+): void {
+  pendingInitialPrompts.set(conversationId, [
+    prompt,
+    ...(pendingInitialPrompts.get(conversationId) ?? []),
+  ]);
 }
 
 const HARNESS_CATALOG_QUERY = {
@@ -2293,6 +2473,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   rewindPrefill: null,
   blocks: [],
   pendingUserMessages: [],
+  failedUploads: [],
   settledShellInputs: [],
   btwSidechat: null,
   queuedMessages: [],
@@ -2774,12 +2955,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
-    const retryId = pinnedState?.pendingRetryStableId ?? null;
-    const restoredDraft = pinnedState?.restoredSendDraft ?? null;
+    const retryId = opts?.external ? null : (pinnedState?.pendingRetryStableId ?? null);
+    const restoredDraft = opts?.external ? null : (pinnedState?.restoredSendDraft ?? null);
     // Submitting consumes what the composer held, a restored failed send
     // included: drop its tracker too, or delivery evidence for that send could
     // later retract a NEW draft that merely repeats the same text.
-    if (retryId !== null || restoredDraft !== null) {
+    if ((retryId !== null || restoredDraft !== null) && opts?.retryOfParkedUpload !== true) {
       pinnedSetter({ pendingRetryStableId: null, restoredSendDraft: null });
     }
     // A restored failed send keeps its stable id only when resent untouched:
@@ -2793,11 +2974,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // An untouched retry of a send the server refused goes out under the id of
     // an item the transcript already holds, so that item cannot prove THIS
     // attempt was delivered: the refusal stands until a live acknowledgement.
-    const retriesRefusedSend =
-      reusableRetryId !== null &&
-      restoredDraft !== null &&
-      restoredDraft.stableId === reusableRetryId &&
-      restoredDraft.serverRefused === true;
+    const retriesRefusedSend = opts?.external
+      ? opts.retriesRefused === true
+      : reusableRetryId !== null &&
+        restoredDraft !== null &&
+        restoredDraft.stableId === reusableRetryId &&
+        restoredDraft.serverRefused === true;
     const stableId = opts?.stableId ?? reusableRetryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
@@ -2915,7 +3097,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // id would collide across attachments and strand a ghost chip (React
       // dedupes on the shared key) until a refresh replaces it with the
       // server's unique file_id.
-      const fileId = `${PENDING_FILE_PREFIX}${attachmentKey(file)}`;
+      const fileId = pendingFileIdOf(file);
       return file.type.startsWith("image/")
         ? { type: "input_image" as const, file_id: fileId, filename }
         : { type: "input_file" as const, file_id: fileId, filename };
@@ -2956,6 +3138,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // The run's Stop in progress, which this message ends once the session takes it.
+    const endPlanStop = supersedePlanStop(submitConversationId);
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -2970,6 +3154,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    // Whether this attempt reached its POST: a failure before it can't have been delivered.
+    let posting = false;
+    // A parked message keeps its reload-recovery record until Remove or Retry settles it.
+    let keepUnsentRecord = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2977,9 +3165,33 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
     };
 
+    // Composer sends only: Cancel stops the upload and, before the fence below, parks the message.
+    const interactive = !opts?.external;
+    const uploadAbort = new AbortController();
+    // Only a send that can park keeps its uploads private; an owner's retry must reuse them.
+    const deferPublish =
+      !opts?.external && opts?.onError === undefined && initialDraft === undefined;
+    const uploads = {
+      uploading: false,
+      cancelled: false,
+      file: undefined as File | undefined,
+      /** Resources this attempt's batch created, which Remove may delete; reuses are not included. */
+      owned: [...(opts?.inheritedUploads ?? [])] as OwnedUpload[],
+    };
+    const uploadKeyOf = (file: File) => uploadProgressKey(tempId, pendingFileIdOf(file));
+    const cancelUpload = () => {
+      if (posting) return;
+      uploads.cancelled = true;
+      uploadAbort.abort();
+    };
+    const endProgress = () => {
+      for (const file of files ?? []) endUploadProgress(uploadKeyOf(file));
+    };
+
     inFlightSends.set(stableId, false);
     try {
       await waitForPrior();
+      opts?.signal?.throwIfAborted();
       if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
@@ -2991,7 +3203,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
       // tells the single-user `local` viewer apart from one not yet resolved.
       const senderId = getCurrentUserId();
-      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+      if (!compacts && sentOnScreen && senderId !== null && text.trim() && !opts?.external) {
         rememberUnsentSend(sessionId, {
           stableId,
           text,
@@ -3004,6 +3216,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (compacts) {
         // Compact controls emit turn status edges, but no user
         // message acknowledgement. Keep the send latch without a pending bubble.
+        posting = true;
         await postEvent(sessionId, { type: "compact", data: {} });
         queryClient?.invalidateQueries({ queryKey: ["conversations"] });
         return;
@@ -3014,12 +3227,50 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
       // a prior successful upload of the same File so a retry after a
       // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-      const fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
+      if (interactive) {
+        for (const file of files ?? []) {
+          beginUploadProgress(uploadKeyOf(file), {
+            name: attachmentFilename(file),
+            size: file.size,
+            cancel: cancelUpload,
+          });
+        }
+      }
+      uploads.uploading = true;
+      const fileBlocks = await unlessAborted(
+        uploadFileBlocks(sessionId, files ?? [], {
+          signal: uploadAbort.signal,
+          onFileStart: (file) => {
+            uploads.file = file;
+          },
+          onUploaded: (file, block) => {
+            uploads.owned.push({ file, block });
+          },
+          reuse: new Map(
+            (opts?.inheritedUploads ?? []).map((upload) => [upload.file, upload.block]),
+          ),
+          deferPublish,
+          onProgress: (file, loaded, total) =>
+            reportUploadProgress(uploadKeyOf(file), loaded, total),
+        }),
+        opts?.signal,
+      );
+      uploads.uploading = false;
+      // Only a failure, or a Cancel while an upload runs, names a file; later stops name the message.
+      uploads.file = undefined;
       const serverContent: ContentBlock[] = [
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
       ];
       if (initialDraft && !initialSendPending()) return;
+      opts?.signal?.throwIfAborted();
+      // A Cancel stops waiting on the hook, so the message can't stay stuck behind it.
+      const heldBack = opts?.beforePost
+        ? await unlessAborted(opts.beforePost(), uploadAbort.signal)
+        : null;
+      opts?.signal?.throwIfAborted();
+      if (uploads.cancelled) throw new DOMException(UPLOAD_CANCELLED_MESSAGE, "AbortError");
+      if (heldBack !== null) throw new Error(heldBack);
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -3050,8 +3301,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await withStillSendingMark(sessionId, tempId, () =>
-        postEvent(
+      // The fence: no await since the cancel check above, so Cancel can't race the POST.
+      endProgress();
+      // Only a message that is going to the server publishes its uploads for reuse.
+      publishUploads(sessionId, uploads.owned);
+      posting = true;
+      const postResult = await withStillSendingMark(sessionId, tempId, () => {
+        const post = postEvent(
           sessionId,
           {
             type: "message",
@@ -3062,14 +3318,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             },
           },
           { holdWhenHostOffline: true },
-        ),
-      );
+        );
+        // Given up on while out, it may still be accepted: the caller hears of that.
+        post.then(
+          (result) => {
+            if (opts?.signal?.aborted && !result.denied) opts.onAcceptedLate?.();
+          },
+          () => {},
+        );
+        return unlessAborted(post, opts?.signal);
+      });
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
       // bubble. Settle local state from the POST response instead of
       // depending on the live stream being connected.
       if (postResult.denied) {
+        opts?.onDenied?.();
         // Target the session this send posted to: the user may have navigated
         // away while the POST was open, and settling the VISIBLE conversation
         // would clobber an unrelated chat's composer state.
@@ -3087,6 +3352,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -3122,6 +3388,26 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
+      endProgress();
+      // A stop counts only when the upload itself was aborted: a press during the cleanup of a
+      // real failure must not replace that failure's reason.
+      const cancelled =
+        uploads.cancelled && (err as { name?: unknown } | null)?.name === "AbortError";
+      // A failed batch removed what it created; what came from an earlier attempt stays owned.
+      if (uploads.uploading) uploads.owned = [...(opts?.inheritedUploads ?? [])];
+      if (opts?.external && !posting) {
+        // Never posted (held back, or its upload failed or was stopped): drop only this
+        // attempt's bubble and latch. A turn seen starting since isn't this send's to end.
+        const target = postedSessionId ?? submitConversationId;
+        (target === null ? setActive : setterFor(target))((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          ...(!alreadyStreaming && s.sessionStatus !== "running" && s.activeResponse === null
+            ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
+            : {}),
+        }));
+        opts.onError?.(message, true);
+        return;
+      }
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
       // it, or the next sub-agent created under this parent would wrongly open
@@ -3138,8 +3424,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // The host is offline and the server recorded nothing: queue the message
       // ahead of this conversation's others and send it once the host is back.
       const holdTarget = postedSessionId ?? submitConversationId;
+      // Not an external send: its outbox keeps it, and this queue is the composer's.
       const heldForHost =
-        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+        !opts?.external &&
+        err instanceof ApiError &&
+        err.code === HOST_OFFLINE_CODE &&
+        holdTarget !== null;
       if (heldForHost) {
         holdSendForHost(holdTarget, message, {
           text,
@@ -3151,7 +3441,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
-      if (!heldForHost) opts?.onError?.(message);
+      // An external send hears of the failure below, once it's known.
+      if (!heldForHost && !opts?.external) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3168,8 +3459,34 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // unknown unless this retries a previously refused send.
       const answeredWithRefusal = err instanceof ApiError && err.code !== null;
       let serverRefused = answeredWithRefusal || retriesRefusedSend;
+      // What this attempt itself shows, for an external send's caller: a coded answer after
+      // forwarding (a lost runner) doesn't prove the runner never got it.
+      let refusedByServer = provesNotDelivered(err);
+      // Failing before its POST, this attempt can't have reached the runner.
+      let refusedThisAttempt = refusedByServer || !posting;
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
+      // A send whose owner already handles failure (its onError, a held first message, an
+      // external send) keeps the ordinary failure path. Any other send stopped during its upload
+      // (failed, or cancelled) keeps its message on its bubble until the user retries or removes it.
+      const owned =
+        opts?.onError !== undefined ||
+        heldForHost ||
+        opts?.external === true ||
+        (initialDraft !== undefined && !initialDispatched);
+      // Parking is the upload phase's owner only: once the POST starts, the ordinary send path owns it.
+      const parkable =
+        !owned &&
+        (cancelled || (uploads.uploading && opts?.signal?.aborted !== true)) &&
+        draftSessionId !== null &&
+        (files?.length ?? 0) > 0;
+      const parkedEntry = parkable
+        ? (draftState.pendingUserMessages.find((p) => p.tempId === tempId) ?? {
+            tempId,
+            content,
+            createdAtS: Math.floor(Date.now() / 1000),
+          })
+        : undefined;
       // A live `session_input_consumed` for this very attempt proves the runner
       // took it, whatever became of the POST's answer.
       let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
@@ -3185,17 +3502,42 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // The server records a rejection before answering the POST, so a fresh
         // snapshot settles it; if that fetch fails too, the draft comes back
         // unsettled and the next live acknowledgement or snapshot decides.
-        const verdict = await sendVerdictFromServer(draftSessionId, stableId);
+        const verdict = await boundedSendVerdict(draftSessionId, stableId, opts?.signal);
         // The acknowledgement may have landed while that fetch was out; it
         // outranks whatever the fetch said or failed to say.
         if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
-        else if (verdict === "refused") serverRefused = true;
-        else if (verdict === "delivered") deliveredDespiteFailure = true;
-        else unsettled = true;
+        else if (verdict === "refused") {
+          serverRefused = true;
+          refusedByServer = true;
+          refusedThisAttempt = true;
+        } else if (verdict === "delivered") deliveredDespiteFailure = true;
+        else {
+          unsettled = true;
+          refusedThisAttempt = refusedByServer;
+        }
+      }
+      // A coded 5xx can be the runner's own rejection, which the server records first.
+      if (
+        opts?.external &&
+        answeredWithRefusal &&
+        !refusedThisAttempt &&
+        !retriesRefusedSend &&
+        !deliveredDespiteFailure &&
+        draftSessionId !== null &&
+        (await boundedSendVerdict(draftSessionId, stableId, opts?.signal)) === "refused" &&
+        inFlightSends.get(stableId) !== true
+      ) {
+        refusedByServer = true;
+        refusedThisAttempt = true;
+      }
+      if (inFlightSends.get(stableId) === true) deliveredDespiteFailure = true;
+      if (!heldForHost && opts?.external && !deliveredDespiteFailure) {
+        opts.onError?.(message, refusedThisAttempt);
       }
       if (
         !callerHandlesError &&
         !deliveredDespiteFailure &&
+        !parkable &&
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
@@ -3223,21 +3565,82 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
         failTarget === null ? get() : (setterForState(failTarget) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
+      let parked: PendingUserMessage | null = null;
+      if (parkable && parkedEntry !== undefined && failTarget !== null) {
+        keepUnsentRecord = true;
+        const parkedIn = failTarget;
+        // Retry and Remove each act once, whichever comes first.
+        let settled = false;
+        const failedFile = uploads.file;
+        const ownedUploads = [...uploads.owned];
+        parked = {
+          ...parkedEntry,
+          initialDraft: undefined,
+          uploadFailure: {
+            fileId: failedFile === undefined ? undefined : pendingFileIdOf(failedFile),
+            message: cancelled ? UPLOAD_CANCELLED_MESSAGE : message,
+            stableId,
+            retry: () => {
+              if (settled) return;
+              settled = true;
+              setterFor(parkedIn)((s) => ({
+                failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
+              }));
+              void get().send(text, agentId, files, {
+                stableId,
+                replyDraft: opts?.replyDraft,
+                pinnedConversationId: parkedIn,
+                retryOfParkedUpload: true,
+                inheritedUploads: ownedUploads,
+              });
+            },
+            remove: () => {
+              if (settled) return;
+              settled = true;
+              setterFor(parkedIn)((s) => ({
+                failedUploads: s.failedUploads.filter((p) => p.tempId !== tempId),
+              }));
+              forgetUnsentSend(parkedIn, stableId);
+              // Only uploads this attempt created privately: none is in the shared cache yet.
+              for (const { file, block } of ownedUploads) {
+                if (uploadedFileBlockCache.get(file)?.get(parkedIn)?.file_id === block.file_id) {
+                  uploadedFileBlockCache.get(file)?.delete(parkedIn);
+                }
+                deleteSessionFile(parkedIn, block.file_id).catch((error: unknown) =>
+                  console.warn("Couldn't remove a removed message's upload", error),
+                );
+              }
+            },
+          },
+        };
+      }
+      // A private upload that never reaches the POST, and isn't parked, is removed rather than orphaned.
+      if (deferPublish && !posting && parked === null && postedSessionId !== null) {
+        for (const { block } of uploads.owned) {
+          deleteSessionFile(postedSessionId, block.file_id).catch((error: unknown) =>
+            console.warn("Couldn't remove an unposted attachment upload", error),
+          );
+        }
+      }
+      // Roll back the optimistic bubble — no server idle will fire. A parked send moves to
+      // `failedUploads` instead, so the consumed-event FIFO never sees it.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        ...(parked !== null ? { failedUploads: [...s.failedUploads, parked] } : {}),
       }));
       // A delivered send needs no card. One the server never answered may still
-      // arrive, so its card names the send for the commit that retracts it.
+      // arrive, so its card names the send for the commit that retracts it. A cancel
+      // or a parked upload already says what happened, so it adds none.
       const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
-      const failureCard: ErrorBlock | null = deliveredDespiteFailure
-        ? null
-        : {
-            ...makeClientErrorBlock(message, code),
-            ...(serverRefused
-              ? {}
-              : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
-          };
+      const failureCard: ErrorBlock | null =
+        deliveredDespiteFailure || parked !== null
+          ? null
+          : {
+              ...makeClientErrorBlock(message, code),
+              ...(serverRefused
+                ? {}
+                : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
+            };
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
@@ -3270,8 +3673,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }
       }
     } finally {
+      endProgress();
       inFlightSends.delete(stableId);
-      if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
+      if (postedSessionId !== null && !keepUnsentRecord)
+        forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -3328,6 +3733,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const endPlanStop = supersedePlanStop(submitConversationId);
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3375,6 +3781,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server persisted the visible receipt, so
         // navigation can rely on the snapshot — mark the echo settled
         // and drop any stash copy. Without this, an echo stashed by a
@@ -3541,7 +3948,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
 
     // Sends the server hasn't acknowledged, carried across the re-bind below.
-    let unsentOnRebind: PendingUserMessage[] = [];
+    let unsentOnRebind: ReturnType<typeof unsentWorkOf> = {
+      pendingUserMessages: [],
+      failedUploads: [],
+    };
     if (!wasLive) {
       // Drop any retained-but-dead entry so `acquire` builds a fresh one. A
       // re-bind has to start from the initial state: `bindStream` PREPENDS its
@@ -3549,11 +3959,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // entry's stale transcript would duplicate and mis-order it. Unsent
       // bubbles are the one thing worth keeping — the server can't replay what
       // it was never told about.
-      unsentOnRebind =
-        conversationRegistry
-          .peek(conversationId)
-          ?.getState()
-          .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      const deadEntry = conversationRegistry.peek(conversationId)?.getState();
+      if (deadEntry !== undefined) unsentOnRebind = unsentWorkOf(deadEntry);
       conversationRegistry.release(conversationId);
     }
     const entry = conversationRegistry.acquire(conversationId);
@@ -3566,7 +3973,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // placeholder, is the whole point of keeping streams open.
       entry.setState({
         loadingConversation: true,
-        ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
+        ...(hasUnsentWorkToCarry(unsentOnRebind) ? unsentOnRebind : {}),
       });
     }
     // Paint whatever the entry already holds. For a live entry that is the
@@ -4611,6 +5018,8 @@ function mirrorActiveEntry(): void {
 export async function ensureConversationStreamed(id: string): Promise<void> {
   if (id === "" || isTempConvId(id)) return;
   const existing = conversationRegistry.peek(id);
+  // A dead entry's unsent work is carried into the rebuilt one, as `switchTo` does.
+  let carried: ReturnType<typeof unsentWorkOf> | null = null;
   if (existing !== undefined) {
     // Reuse only while a load is in flight (guards a double-bind) or the stream
     // is actually live. A non-reconnectable `server_closed` tears down the
@@ -4619,10 +5028,15 @@ export async function ensureConversationStreamed(id: string): Promise<void> {
     // mirrors switchTo's `isConversationStreamCurrent` liveness gate.
     if (existing.getState().loadingConversation || isConversationStreamCurrent(id)) return;
     // Dead or failed: drop the entry so the acquire below rebinds.
+    carried = unsentWorkOf(existing.getState());
     conversationRegistry.release(id);
   }
   const entry = conversationRegistry.acquire(id);
-  entry.setState({ loadingConversation: true, conversationLoadError: null });
+  entry.setState({
+    loadingConversation: true,
+    conversationLoadError: null,
+    ...(carried !== null && hasUnsentWorkToCarry(carried) ? carried : {}),
+  });
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
 }
 
@@ -5501,6 +5915,7 @@ async function bindStream(
       const toPending = (p: PendingInput): PendingUserMessage => ({
         tempId: p.pendingId,
         content: p.content,
+        replayed: true,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       let candidatePending: PendingUserMessage[];
@@ -5614,11 +6029,15 @@ async function bindStream(
         sessionCostUsd:
           state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
             ? state.sessionCostUsd
-            : (session.totalCostUsd ?? state.sessionCostUsd),
+            : session.costHidden
+              ? null
+              : (session.totalCostUsd ?? state.sessionCostUsd),
         sessionUsageByModel:
           state.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
             ? state.sessionUsageByModel
-            : (session.usageByModel ?? state.sessionUsageByModel),
+            : session.costHidden
+              ? withoutModelCosts(session.usageByModel ?? state.sessionUsageByModel)
+              : (session.usageByModel ?? state.sessionUsageByModel),
         todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -5626,6 +6045,7 @@ async function bindStream(
         }[],
       };
     });
+    if (session.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
@@ -5635,6 +6055,16 @@ async function bindStream(
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
   }
+}
+
+/** Drop per-model USD while keeping token counts, once the server hides cost. */
+function withoutModelCosts(
+  usageByModel: Record<string, ModelUsage> | null,
+): Record<string, ModelUsage> | null {
+  if (usageByModel === null) return null;
+  return Object.fromEntries(
+    Object.entries(usageByModel).map(([model, usage]) => [model, { ...usage, totalCostUsd: null }]),
+  );
 }
 
 /** Hydrate display-only subtree totals without delaying session reconciliation. */
@@ -5668,16 +6098,23 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     ) {
       return;
     }
+    if (usage.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
     // A live cost/model update during the read wins independently for each field.
     entrySetter(entry)((state) => ({
       ...(revisions.cost === revisionsBeforeFetch.cost &&
       state.sessionCostUsd === before.sessionCostUsd
-        ? { sessionCostUsd: usage.totalCostUsd ?? state.sessionCostUsd }
+        ? {
+            sessionCostUsd: usage.costHidden ? null : (usage.totalCostUsd ?? state.sessionCostUsd),
+          }
         : {}),
       ...(revisions.models === revisionsBeforeFetch.models &&
       state.sessionUsageByModel === before.sessionUsageByModel
-        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        ? {
+            sessionUsageByModel: usage.costHidden
+              ? withoutModelCosts(usage.usageByModel ?? state.sessionUsageByModel)
+              : (usage.usageByModel ?? state.sessionUsageByModel),
+          }
         : {}),
     }));
   } catch {
@@ -5871,8 +6308,14 @@ function reconnectStatusPatch(
   patch.backgroundAgents = snapshotBackgroundAgents(session);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
-  if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
-  if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (session.costHidden) {
+    if (queryClient !== null) invalidateAgentCosts(queryClient, true);
+    patch.sessionCostUsd = null;
+    patch.sessionUsageByModel = withoutModelCosts(session.usageByModel ?? s.sessionUsageByModel);
+  } else {
+    if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
+    if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  }
   if (!settleTurn) return patch;
   patch.sessionStatus = session.status;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
@@ -6427,8 +6870,52 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
+}
+
+/** A tool call or result's identity within its turn, e.g. ``resp_1/result/call_9``. */
+function toolBlockKey(responseId: string, kind: "call" | "result", callId: string): string {
+  return `${responseId}/${kind}/${callId}`;
+}
+
+/**
+ * Keys of the tool calls and results already on screen. The stream names tool
+ * items by provisional ids, so their saved copies can't be matched by item id.
+ */
+function shownToolBlockKeys(blocks: AnyBlock[]): Set<string> {
+  const keys = new Set<string>();
+  for (const block of blocks) {
+    if (block.type === "tool_group") {
+      for (const execution of block.executions) {
+        if (execution.callId)
+          keys.add(toolBlockKey(block.ctx.responseId, "call", execution.callId));
+      }
+    } else if (block.type === "tool_result" && block.callId) {
+      keys.add(toolBlockKey(block.ctx.responseId, "result", block.callId));
+    }
+  }
+  return keys;
+}
+
+/** Whether saved tool *block* repeats a call or result in *shown*, from {@link shownToolBlockKeys}. */
+function repeatsShownToolBlock(block: AnyBlock, shown: Set<string>): boolean {
+  const { responseId } = block.ctx;
+  if (block.type === "tool_group") {
+    return (
+      block.executions.length > 0 &&
+      block.executions.every(
+        (execution) =>
+          Boolean(execution.callId) &&
+          shown.has(toolBlockKey(responseId, "call", execution.callId)),
+      )
+    );
+  }
+  if (block.type === "tool_result" && block.callId) {
+    return shown.has(toolBlockKey(responseId, "result", block.callId));
+  }
+  return false;
 }
 
 /** A reconnect backfill's outcome; only a failed read leaves history owed. */
@@ -6445,7 +6932,8 @@ type ReconnectBackfill = "applied" | "failed" | "skipped";
  * than one page can't leave an unreachable hole between the window and the
  * live tail; if `RECONNECT_BACKFILL_MAX_PAGES` is hit without overlap, the
  * window is re-hydrated wholesale instead (see
- * `rehydrateWindowOnReconnect`). Dedupes by `itemId` and runs concurrently
+ * `rehydrateWindowOnReconnect`). Dedupes by `itemId` (tool calls and results
+ * also by turn and call id) and runs concurrently
  * with the live pump — the same race-safe "stream-then-snapshot" shape
  * `bindStream` uses, so a turn that completes between the fetch and the
  * reopen is still caught by one or the other.
@@ -6507,7 +6995,6 @@ async function reconcileOnReconnect(
     return "failed";
   }
   if (stale()) return "skipped";
-  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   // A live turn edge or send latch change during these reads owns the turn lifecycle.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
     settleStatus
@@ -6576,7 +7063,10 @@ async function reconcileOnReconnect(
     const seen = new Set(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
-    const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+    const shownTools = shownToolBlockKeys(currentBlocks);
+    const unseen = snapshotBlocks.filter(
+      (b) => b.ctx.itemId && !seen.has(b.ctx.itemId) && !repeatsShownToolBlock(b, shownTools),
+    );
     const reconciledBlocks =
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
@@ -6644,6 +7134,7 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -7279,6 +7770,12 @@ function makeLiveTextBlock(
   };
 }
 
+/** One native live-stream chunk awaiting its frame's commit. */
+interface LiveDeltaChunk {
+  delta: string;
+  index?: number;
+}
+
 /**
  * Fold one streamed chunk into its in-flight preview block in `blocks`.
  *
@@ -7290,45 +7787,118 @@ function makeLiveTextBlock(
  * The server reconciles and deduplicates chunks, so each received delta is
  * appended directly.
  *
+ * :param blocks: the current blocks.
+ * :param activeResponse: the live turn, whose id a new preview joins.
+ * :param itemId: the provisional id, e.g. ``"live:2ca51d97-..."``.
+ * :param chunk: incremental text for this chunk and its stream index.
+ * :returns: the new blocks, or `blocks` itself when the chunk is ignored.
+ */
+function foldLiveDelta(
+  blocks: AnyBlock[],
+  activeResponse: ActiveResponse | null,
+  itemId: string,
+  { delta, index }: LiveDeltaChunk,
+): AnyBlock[] {
+  const at = blocks.findIndex((b) => b.ctx.itemId === itemId);
+  if (at === -1) {
+    const responseId = activeResponse?.state === "streaming" ? activeResponse.responseId : itemId;
+    return [...blocks, makeLiveTextBlock(itemId, delta, responseId, index)];
+  }
+  const existing = blocks[at]!;
+  if (existing.type !== "text_done") return blocks;
+  const fullText = existing.fullText + delta;
+  const next = blocks.slice();
+  const missedChunk =
+    index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
+  next[at] = {
+    ...existing,
+    fullText,
+    hasCodeBlocks: fullText.includes("```"),
+    ...(index !== undefined ? { streamIndex: index } : {}),
+    ...(missedChunk ? { previewInterrupted: true } : {}),
+  };
+  return next;
+}
+
+/**
+ * Fold a message's buffered chunks into its preview in one store commit.
+ *
  * :param set: store setter.
  * :param messageId: vendor's stable per-message id.
- * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
+ * :param chunks: the message's chunks in arrival order.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: number): void {
+function applyLiveDeltas(set: Setter, messageId: string, chunks: LiveDeltaChunk[]): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
-    const startupPatch =
-      delta.length > 0
-        ? {
-            mcpStartup: null,
-            mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
-          }
-        : {};
-    const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
-    if (at === -1) {
-      const live = s.activeResponse;
-      const responseId = live?.state === "streaming" ? live.responseId : itemId;
-      return {
-        ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
-      };
-    }
-    const existing = s.blocks[at]!;
-    if (existing.type !== "text_done") return {};
-    const fullText = existing.fullText + delta;
-    const next = s.blocks.slice();
-    const missedChunk =
-      index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
-    next[at] = {
-      ...existing,
-      fullText,
-      hasCodeBlocks: fullText.includes("```"),
-      ...(index !== undefined ? { streamIndex: index } : {}),
-      ...(missedChunk ? { previewInterrupted: true } : {}),
-    };
-    return { ...startupPatch, blocks: next };
+    const blocks = chunks.reduce(
+      (acc, chunk) => foldLiveDelta(acc, s.activeResponse, itemId, chunk),
+      s.blocks,
+    );
+    if (blocks === s.blocks) return {};
+    const startupPatch = chunks.some((chunk) => chunk.delta.length > 0)
+      ? {
+          mcpStartup: null,
+          mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
+        }
+      : {};
+    return { ...startupPatch, blocks };
   });
+}
+
+/**
+ * Per-stream buffer that coalesces native live deltas into one commit.
+ *
+ * `queue` holds a chunk until `drain` folds every buffered message into
+ * `blocks`, and reports a message's first chunk so its preview can paint
+ * without waiting a frame. A drain skips messages ignored or conversations
+ * disposed since their chunks arrived, so a late frame cannot recreate a
+ * removed preview. `close` drains one last time and ignores later drains; it
+ * runs when the stream's binding is aborted, before e.g. a retry drops its
+ * previews, so the replaced pump cannot recreate one from its buffered tail.
+ */
+interface LiveDeltaBuffer {
+  queue: (messageId: string, chunk: LiveDeltaChunk) => boolean;
+  drain: () => void;
+  close: () => void;
+}
+
+function createLiveDeltaBuffer(
+  id: string,
+  ignored: Set<string>,
+  set: Setter,
+  signal: AbortSignal,
+): LiveDeltaBuffer {
+  const pending = new Map<string, LiveDeltaChunk[]>();
+  const seen = new Set<string>();
+  let closed = false;
+  const drain = (): void => {
+    if (closed || pending.size === 0) return;
+    const batch = [...pending];
+    pending.clear();
+    if (isConversationDisposed(id)) return;
+    for (const [messageId, chunks] of batch) {
+      if (!ignored.has(messageId)) applyLiveDeltas(set, messageId, chunks);
+    }
+  };
+  const close = (): void => {
+    drain();
+    closed = true;
+    signal.removeEventListener("abort", close);
+  };
+  signal.addEventListener("abort", close);
+  return {
+    queue(messageId, chunk) {
+      const chunks = pending.get(messageId);
+      if (chunks) chunks.push(chunk);
+      else pending.set(messageId, [chunk]);
+      if (seen.has(messageId)) return false;
+      seen.add(messageId);
+      return true;
+    },
+    drain,
+    close,
+  };
 }
 
 /** Append live output to the matching in-progress tool execution. */
@@ -7373,12 +7943,27 @@ export function reviveStrayCompletedResponse(set: Setter): void {
 }
 
 /**
+ * Commit buffered native live deltas before any other event takes effect,
+ * so session edges and items see the preview text that arrived before them.
+ */
+async function* drainLiveDeltasBeforeOtherEvents(
+  events: AsyncIterable<StreamEvent>,
+  live: LiveDeltaBuffer,
+): AsyncIterable<StreamEvent> {
+  for await (const ev of events) {
+    if (ev.type !== "text_delta" || ev.messageId === undefined) live.drain();
+    yield ev;
+  }
+}
+
+/**
  * Wrap a parsed event stream, diverting terminal-observed live deltas.
  *
  * A `text_delta` carrying a `messageId` is native live streaming:
- * it is folded into its provisional preview block in `blocks` (see
- * `applyLiveDelta`) and NOT yielded downstream, because the `BlockStream`
- * reducer's response-scoped text path would otherwise emit a stray bubble
+ * it is queued in `live` for the next frame's commit into its provisional
+ * preview block in `blocks` (see `foldLiveDelta`) and NOT yielded
+ * downstream, because the `BlockStream` reducer's response-scoped text
+ * path would otherwise emit a stray bubble
  * (these deltas carry no response id and their authoritative text arrives
  * as a separate committed item). Every other event passes through
  * untouched.
@@ -7390,6 +7975,8 @@ export function reviveStrayCompletedResponse(set: Setter): void {
  *     deltas arrived before the new turn was named.
  * :param set: store setter.
  * :param get: store getter.
+ * :param live: buffer the deltas wait in until `requestFrame`'s commit.
+ * :param requestFrame: schedules the frame that drains `live`.
  * :returns: events with native live deltas removed.
  */
 async function* tapLiveDeltas(
@@ -7398,6 +7985,8 @@ async function* tapLiveDeltas(
   ignored: Set<string>,
   set: Setter,
   get: Getter,
+  live: LiveDeltaBuffer,
+  requestFrame: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
     if (ev.type === "message_done" && ev.messageId !== undefined) {
@@ -7412,7 +8001,10 @@ async function* tapLiveDeltas(
           ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.delta, ev.index);
+        // A message's first and final chunks paint at once; the rest batch per frame.
+        const first = live.queue(ev.messageId, { delta: ev.delta, index: ev.index });
+        if (first || ev.final === true) live.drain();
+        else requestFrame();
       }
       continue;
     }
@@ -7697,7 +8289,9 @@ export async function pumpStreamEvents(
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
-  const rawEvents = parseSseStream(body, sseResult);
+  // Native live deltas commit once per frame with the buffered blocks below.
+  const live = createLiveDeltaBuffer(id, ignoredMessages, set, controller.signal);
+  const rawEvents = drainLiveDeltasBeforeOtherEvents(parseSseStream(body, sseResult), live);
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
   // (one SSE connection); bounded by item count like `blocks` itself.
@@ -7743,6 +8337,8 @@ export async function pumpStreamEvents(
     ignoredMessages,
     set,
     get,
+    live,
+    () => scheduler.schedule(() => flush()),
   );
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
@@ -7752,6 +8348,8 @@ export async function pumpStreamEvents(
   // applying any sidecar state in the same commit. No-ops if switched away.
   const flush = (trailing?: AnyBlock, extra?: Partial<ChatState>): void => {
     scheduler.cancel();
+    // Buffered live previews commit ahead of the buffered blocks.
+    live.drain();
     if (isConversationDisposed(id)) {
       buffer.length = 0;
       return;
@@ -8063,6 +8661,8 @@ export async function pumpStreamEvents(
     flush();
     return "dropped";
   } finally {
+    // Commit buffered live text, including after a reconnect's attempt abort.
+    live.close();
     // Drop any pending frame + its buffered blocks so a queued flush
     // can't apply this stream's blocks after switchTo bound another.
     // `abortController` lifecycle is owned by `startStreamPump`'s loop,
@@ -8253,6 +8853,26 @@ function retractDeliveredSendDraft(
 }
 
 /**
+ * {@link sendVerdictFromServer}, bounded by a read timeout and the send's own signal.
+ *
+ * @returns `"refused"` or `"delivered"`, or `null` when the read fails, times out or aborts.
+ */
+async function boundedSendVerdict(
+  sessionId: string,
+  stableId: string,
+  signal?: AbortSignal,
+): Promise<"refused" | "delivered" | null> {
+  try {
+    return await unlessAborted(
+      withReadTimeout((timeout) => sendVerdictFromServer(sessionId, stableId, timeout)),
+      signal,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The send a previous page of this tab left unanswered, as a failed-send draft.
  *
  * `send` records each message's text before its POST and drops it once the
@@ -8272,28 +8892,32 @@ function unsentSendToRestore(
   conversationId: string,
   items: readonly { id: string }[],
 ): ConversationState["failedSendDraft"] {
-  const unsent = peekUnsentSend(conversationId);
-  // A send still open in this tab settles on its own.
-  if (unsent !== null && inFlightSends.has(unsent.stableId)) return null;
+  // A send still open in this tab, or a message parked on its bubble, owns its own record.
+  const parkedHere = conversationRegistry.peek(conversationId)?.getState().failedUploads ?? [];
+  const unsent = peekUnsentSends(conversationId).filter(
+    (record) =>
+      !inFlightSends.has(record.stableId) &&
+      !parkedHere.some((p) => p.uploadFailure?.stableId === record.stableId),
+  );
   // Messages this page still queues aren't lost; only a reload empties the queue.
   const queuedHere = new Set(useChatStore.getState().queuedMessages.map((m) => m.stableId));
   const stored = peekQueuedSends(conversationId);
   const queued = stored.filter((send) => !queuedHere.has(send.stableId));
-  if (unsent === null && queued.length === 0) return null;
+  if (unsent.length === 0 && queued.length === 0) return null;
   const viewerId = getCurrentUserId();
   // The viewer can't be checked before identity resolves; try again once it does.
   if (viewerId === null) {
     restoreUnsentSendOnceIdentified(conversationId, items);
     return null;
   }
-  if (unsent !== null) forgetUnsentSend(conversationId, unsent.stableId);
+  for (const record of unsent) forgetUnsentSend(conversationId, record.stableId);
   if (queued.length > 0) {
     rememberQueuedSends(
       conversationId,
       stored.filter((send) => queuedHere.has(send.stableId)),
     );
   }
-  const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
+  const sends = [...unsent, ...queued].filter(
     // Another account may have signed in to this tab since.
     (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
   );
@@ -8831,7 +9455,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       const patch: {
         tokensUsed?: number;
         contextWindow?: number;
-        sessionCostUsd?: number;
+        sessionCostUsd?: number | null;
         sessionUsageByModel?: Record<string, ModelUsage>;
       } = {};
       if (event.contextTokens !== undefined) {
@@ -8840,13 +9464,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       if (event.contextWindow !== undefined) {
         patch.contextWindow = event.contextWindow;
       }
-      if (event.totalCostUsd !== undefined) {
+      if (event.costHidden) {
+        patch.sessionCostUsd = null;
+      } else if (event.totalCostUsd !== undefined) {
         patch.sessionCostUsd = event.totalCostUsd;
       }
       if (event.usageByModel !== undefined) {
         patch.sessionUsageByModel = event.usageByModel;
       }
-      if (event.totalCostUsd !== undefined || event.usageByModel !== undefined) {
+      const costChanged = event.totalCostUsd !== undefined || event.costHidden === true;
+      const modelsChanged = event.usageByModel !== undefined || event.costHidden === true;
+      if (costChanged || modelsChanged) {
         const entry =
           sourceConversationId === null
             ? undefined
@@ -8855,12 +9483,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // A same-value receipt is still newer than an in-flight usage read.
           const revisions = sessionUsageRevisions.get(entry);
           sessionUsageRevisions.set(entry, {
-            cost: (revisions?.cost ?? 0) + (event.totalCostUsd !== undefined ? 1 : 0),
-            models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
+            cost: (revisions?.cost ?? 0) + (costChanged ? 1 : 0),
+            models: (revisions?.models ?? 0) + (modelsChanged ? 1 : 0),
           });
         }
       }
-      if (Object.keys(patch).length > 0) {
+      if (event.costHidden) {
+        if (queryClient !== null) invalidateAgentCosts(queryClient, true);
+        applyToConversation((s) => ({
+          ...patch,
+          sessionUsageByModel: withoutModelCosts(event.usageByModel ?? s.sessionUsageByModel),
+        }));
+      } else if (Object.keys(patch).length > 0) {
         applyToConversation(patch);
       }
       return;
@@ -9235,10 +9869,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           );
           if (settled !== null) patch.blocks = settled;
         }
-        // A `runner_disconnected` card is an observation ("can't reach the
-        // runner"), not a turn result: any live status edge from the runner
-        // proves it is reachable again, so the stale card goes.
-        if (event.status !== "failed") {
+        // A live runner makes its disconnect card stale. Automatic resume
+        // failure supersedes it too, including its manual resume action.
+        if (event.status !== "failed" || statusError?.code === "session_recovery_failed") {
           const current = patch.blocks ?? s.blocks;
           const reachable = current.filter(
             (b) => !(b.type === "error" && b.code === "runner_disconnected"),
@@ -9303,6 +9936,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });
+      // A native Stop's receipt places its message in the transcript.
+      if (sourceConversationId && event.clearedPendingId) {
+        notePlanStopReceipt(sourceConversationId, event.clearedPendingId, event.itemId);
+      }
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,
       // superseding any failure read still in flight from before the delivery.
@@ -9324,6 +9961,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
       if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      for (const listener of deliveredSendListeners) {
+        listener(event.itemId);
+        if (event.clearedPendingId) listener(event.clearedPendingId);
+      }
       applyToConversation((s) => {
         const committedIds = new Set([event.itemId]);
         // A late copy of an item already shown is not a new message.
@@ -9663,7 +10304,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         isFirstPlan(event.entry) &&
         event.conversationId === useChatStore.getState().conversationId
       ) {
-        showTasksTabBesideChat(event.conversationId);
+        showTasksTabBesideChat(event.conversationId, "first-plan");
       }
       return;
     case "session_changed_files_invalidated":

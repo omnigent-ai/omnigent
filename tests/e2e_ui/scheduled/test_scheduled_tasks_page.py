@@ -19,9 +19,10 @@ never exercised.
 from __future__ import annotations
 
 import re
+import sqlite3
 import uuid
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -223,7 +224,7 @@ def test_automations_introduction_first_visit(
 ) -> None:
     """Walk through first-visit onboarding and keep it dismissed after a reload."""
     page.set_viewport_size(viewport)
-    if viewport["width"] < 768:
+    if viewport["width"] < 1181:
         page.goto(f"{live_server}/tasks")
     else:
         page.goto(live_server)
@@ -418,14 +419,26 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.fill("9:45 AM")
     time_input.blur()
     expect(time_input).to_have_value("09:45 AM")
-    _close_schedule_popover(page)
+    # Pick an hour in the nested picker, then click the prompt: one click
+    # outside both popovers closes the picker and the schedule popover together.
+    time_input.click()
+    picker = page.get_by_test_id("schedule-time-picker")
+    expect(picker).to_be_visible()
+    picker.get_by_role("listbox", name="Hours").get_by_role("option", name="10").click()
+    expect(time_input).to_have_value("10:45 AM")
+    expect(picker).to_be_visible()
+    prompt_input = page.get_by_test_id("task-prompt-input")
+    prompt_input.click()
+    expect(picker).to_have_count(0)
+    expect(page.get_by_test_id("schedule-fields")).to_have_count(0)
+    expect(prompt_input).to_be_focused()
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     created_row = _row_by_name(page, typed_name)
     expect(created_row).to_be_visible(timeout=30_000)
     # `to_contain_text`: the line may also carry the server next-run suffix.
     expect(created_row.get_by_test_id("task-schedule-line")).to_contain_text(
-        "Every day at 9:45 AM",
+        "Every day at 10:45 AM",
         timeout=30_000,
     )
 
@@ -1157,7 +1170,6 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
     assert len(automation_projects) == 1
     assert created["project_id"] == automation_projects[0]["id"]
-    assert created["rrule"].startswith("FREQ=MINUTELY;INTERVAL=10"), created
     expect(_row_by_name(page, name)).to_contain_text("Runs when new items match")
     expect(_row_by_name(page, name).get_by_test_id("task-next-run")).to_have_count(0)
     # The prompt's details are covered by the dialog and renderer tests.
@@ -1227,6 +1239,59 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     expect(page.get_by_test_id("task-trigger-preview")).to_have_count(0)
     expect(page.get_by_test_id("task-trigger-edit-as-prompt")).to_have_count(0)
     page.get_by_role("button", name="Cancel", exact=True).click()
+
+
+@pytest.mark.min_server_version("0.24.0")
+@pytest.mark.usefixtures("automations_v2_host")
+def test_editing_a_trigger_keeps_its_withheld_rule(
+    page: Page,
+    automations_v2_server: str,
+    automations_v2_server_dir: Path,
+) -> None:
+    """Saving a trigger's edits leaves the rule the API withholds as it was saved."""
+    live_server = automations_v2_server
+    name = f"Weekday trigger {uuid.uuid4().hex[:8]}"
+    page.set_viewport_size({"width": 390, "height": 900})
+    _open_automations_page(page, live_server)
+    page.get_by_test_id("suggestion-trigger-jira").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-trigger-scope").fill("ES")
+    page.get_by_role("tab", name="Instructions", exact=True).click()
+    page.get_by_test_id("task-trigger-instructions").fill("Triage the ticket.")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).not_to_be_visible()
+    expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    task = next(t for t in tasks if t["name"] == name)
+    url = f"{live_server}/v1/scheduled-tasks/{task['id']}"
+    try:
+        assert task["rrule"] is None, task
+        # A weekday rule an agent might save for the trigger, which the form never builds.
+        weekday_rule = "FREQ=MINUTELY;INTERVAL=10;BYDAY=MO,TU,WE,TH,FR"
+        httpx.patch(url, json={"rrule": weekday_rule}, timeout=10).raise_for_status()
+        _row_by_name(page, name).get_by_test_id("task-row-menu").click()
+        page.get_by_test_id("task-edit").click()
+        page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+        expect(page.get_by_test_id("task-trigger-schedule-replacement")).to_have_count(0)
+        page.get_by_role("tab", name="Instructions", exact=True).click()
+        page.get_by_test_id("task-trigger-instructions").fill("Investigate the ticket.")
+        page.get_by_test_id("create-scheduled-task-submit").click()
+        expect(page.get_by_role("dialog")).to_have_count(0)
+
+        saved = httpx.get(url, timeout=10).json()
+        assert "Investigate the ticket." in saved["prompt"], saved
+        assert saved["rrule"] is None, saved
+        # Read-only, so the check can't migrate an older server's database.
+        database = automations_v2_server_dir / "chat.db"
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as db:
+            rows = db.execute(
+                "SELECT rrule FROM scheduled_tasks WHERE id = ?", (bytes.fromhex(task["id"]),)
+            ).fetchall()
+        assert rows == [(weekday_rule,)]
+    finally:
+        httpx.delete(url, timeout=10)
 
 
 def test_ten_minute_host_schedule_round_trip(

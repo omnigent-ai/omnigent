@@ -57,9 +57,18 @@ Copyright 2024 Daytona.
 opentelemetry-distro - https://pypi.org/project/opentelemetry-distro/
 Copyright The OpenTelemetry Authors.
 
+@pierre/trees - https://github.com/pierrecomputer/pierre (adapted in web/src/components/file-tree/vendored/)
+Copyright 2025 Pierre Computer Company.
+
 ________________
 
 This Software contains code from the following open source projects, licensed under the MIT license (https://opensource.org/license/mit):
+
+setuptools - https://pypi.org/project/setuptools/
+Copyright setuptools contributors.
+
+@headless-tree/core - https://github.com/lukasbach/headless-tree (ideas adapted in web/src/components/file-tree/vendored/)
+Copyright (c) 2023 Lukas Bach.
 
 pyyaml - https://pypi.org/project/pyyaml/
 Copyright (c) 2017-2021 Ingy döt Net. Copyright (c) 2006-2016 Kirill Simonov.

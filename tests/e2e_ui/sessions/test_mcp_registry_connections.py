@@ -302,7 +302,7 @@ async def _check_session_management(page, session_id: str, width: int, info: dic
     for enabled in (True, False):
         info["enabled_connections"] = ["mcp"] if enabled else []
         await page.reload()
-        if width < 768:
+        if width < 1181:
             await page.get_by_role("button", name="Conversation actions", exact=True).click()
             await page.get_by_role("menuitem", name="Agent info", exact=True).click()
         else:

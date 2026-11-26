@@ -13,7 +13,10 @@ export interface WorkflowDetail extends SavedWorkflow {
   planning_session_id?: string | null;
   /** Epoch seconds of its last write. */
   updated_at?: number;
-  /** The planning chat's proposal the description was saved from, until written otherwise. */
+  /**
+   * The planning chat's proposal the description was saved from or kept over, until written
+   * otherwise.
+   */
   description_source?: string | null;
 }
 
@@ -196,6 +199,7 @@ interface RawRun {
   is_current?: boolean;
   session_status: WorkflowRun["sessionStatus"];
   background_work_running?: boolean;
+  sandbox_launching?: boolean;
   archived: boolean;
   progress: {
     total: number;
@@ -209,6 +213,7 @@ interface RawRun {
   workflow_id?: string;
   workflow_name?: string | null;
   started_by?: { session_id: string; title: string } | null;
+  automation?: { id: string; name: string } | null;
   descendant_runs?: RawRun[];
   descendant_run_count?: number;
   descendant_runs_cursor?: string | null;
@@ -226,6 +231,7 @@ function toWorkflowRun(run: RawRun): WorkflowRun {
     isCurrent: run.is_current === true,
     sessionStatus: run.session_status,
     backgroundWorkRunning: run.background_work_running ?? false,
+    sandboxLaunching: run.sandbox_launching ?? false,
     archived: run.archived,
     progress: {
       total: run.progress.total,
@@ -239,6 +245,7 @@ function toWorkflowRun(run: RawRun): WorkflowRun {
     startedBy: run.started_by
       ? { sessionId: run.started_by.session_id, title: run.started_by.title }
       : undefined,
+    automation: run.automation ? { id: run.automation.id, name: run.automation.name } : undefined,
     workflowName: run.workflow_name,
     descendantRuns: (run.descendant_runs ?? []).map(toWorkflowRun),
     descendantRunCount: run.descendant_run_count,

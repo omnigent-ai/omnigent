@@ -10,14 +10,19 @@ import { setOmnigentHostConfig } from "./host";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ScheduledTaskApiError,
+  cloneCreatedMessage,
+  cloneFailedMessage,
+  cloneScheduledTask,
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  listScheduledTaskRunPullRequests,
   listScheduledTaskRuns,
   listScheduledTasks,
   listSharedScheduledTasks,
   listAutomationFailures,
   runScheduledTaskNow,
+  reportLocalTimezone,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -80,13 +85,13 @@ describe("runScheduledTaskNow", () => {
 });
 
 describe("listScheduledTasks", () => {
-  // Servers that predate task projects omit the key.
+  // Servers that predate task projects or shareable omit the keys; absent is shareable.
   it.each([
-    ["absent", {}, null],
-    ["present", { project_id: "proj_1" }, "proj_1"],
+    ["absent", {}, null, true],
+    ["present", { project_id: "proj_1", shareable: false }, "proj_1", false],
   ])(
-    "GETs /v1/scheduled-tasks and camelCases the rows (project %s)",
-    async (_, extra, projectId) => {
+    "GETs /v1/scheduled-tasks and camelCases the rows (project and shareable %s)",
+    async (_, extra, projectId, shareable) => {
       fetchMock.mockResolvedValueOnce(
         mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
       );
@@ -103,6 +108,7 @@ describe("listScheduledTasks", () => {
         hostId: null,
         workspace: null,
         projectId,
+        shareable,
       });
     },
   );
@@ -375,6 +381,24 @@ describe("createScheduledTask", () => {
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
 
+  it("sends a saved workflow in place of a prompt, and reads it back", async () => {
+    const workflowId = "0123456789abcdef0123456789abcdef";
+    fetchMock.mockResolvedValue(
+      mockResponse({ ...TASK_WIRE, workflow_id: workflowId, workflow_details: "Only bugs" }),
+    );
+    const created = await createScheduledTask({
+      name: "n",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      workflowId,
+      workflowDetails: "Only bugs",
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).not.toHaveProperty("prompt");
+    expect(body).toMatchObject({ workflow_id: workflowId, workflow_details: "Only bugs" });
+    expect(created).toMatchObject({ workflowId, workflowDetails: "Only bugs" });
+  });
+
   it("sends picked MCP services and omits an empty pick", async () => {
     fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
     const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
@@ -387,6 +411,17 @@ describe("createScheduledTask", () => {
 });
 
 describe("updateScheduledTask", () => {
+  it("stops running a saved workflow with an explicit null, and leaves it when omitted", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    await updateScheduledTask("st_1", { workflowId: null, prompt: "Summarize" });
+    await updateScheduledTask("st_1", { workflowDetails: "Only bugs" });
+    await updateScheduledTask("st_1", { workflowDetails: null });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0]).toEqual({ workflow_id: null, prompt: "Summarize" });
+    expect(bodies[1]).toEqual({ workflow_details: "Only bugs" });
+    expect(bodies[2]).toEqual({ workflow_details: null });
+  });
+
   it.each([undefined, null, 2.5])(
     "preserves, clears, or sets the cost limit (%s)",
     async (maxCostUsd) => {
@@ -427,6 +462,81 @@ describe("updateScheduledTask", () => {
   });
 });
 
+describe("cloneScheduledTask", () => {
+  it("POSTs /v1/scheduled-tasks/{id}/clone and returns the copy", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TASK_WIRE, id: "st_2", name: "Nightly triage (copy)" }),
+    );
+    const clone = await cloneScheduledTask({ id: "st 1", hostId: "host_a" });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/scheduled-tasks/st%201/clone");
+    expect(init.method).toBe("POST");
+    // The original's host routes the request to its replica.
+    expect(JSON.parse(init.body)).toEqual({ host_id: "host_a" });
+    expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
+    expect(clone).toMatchObject({ id: "st_2", name: "Nightly triage (copy)" });
+  });
+
+  it("sends the browser tools mode header so the copy's source session keeps it", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, id: "st_2" }));
+      await cloneScheduledTask({ id: "st_1", hostId: null });
+      const [, init] = fetchMock.mock.calls[0];
+      // An unpinned automation names no host.
+      expect(JSON.parse(init.body)).toEqual({});
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
+  it("throws the server's reason", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "invalid_input", message: "Only an automation can be cloned" } },
+        { ok: false, status: 400 },
+      ),
+    );
+    const error = await cloneScheduledTask({ id: "st_1", hostId: null }).catch(
+      (err: unknown) => err,
+    );
+    expect(error).toMatchObject({ status: 400, message: "Only an automation can be cloned" });
+    expect(cloneFailedMessage(error)).toBe(
+      "Couldn't clone the automation: Only an automation can be cloned",
+    );
+  });
+
+  it.each([
+    ["a server error", new ScheduledTaskApiError("boom", 500, null)],
+    ["a network failure", new Error("offline")],
+  ])("keeps the reason out of the toast for %s", (_label, error) => {
+    expect(cloneFailedMessage(error)).toBe("Couldn't clone the automation");
+  });
+
+  it.each([
+    [
+      "an armed copy",
+      { state: "active", nextRunAt: "2026-11-20T09:00:00Z" },
+      "Automation cloned. Pause or delete the original so they don't both run.",
+    ],
+    [
+      "a paused copy",
+      { state: "paused", nextRunAt: null },
+      "Automation cloned. The copy is paused like the original.",
+    ],
+    [
+      "a copy whose schedule ran out",
+      { state: "active", nextRunAt: null },
+      "Automation cloned. Its schedule has no runs left.",
+    ],
+  ] as const)("tells the owner what's left after %s", (_label, clone, text) => {
+    expect(cloneCreatedMessage(clone)).toBe(text);
+  });
+});
+
 describe("deleteScheduledTask", () => {
   it("DELETEs /v1/scheduled-tasks/{id}", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true, id: "st_1" }));
@@ -434,6 +544,52 @@ describe("deleteScheduledTask", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/v1/scheduled-tasks/st_1");
     expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("reportLocalTimezone", () => {
+  const mockBrowserZone = (timeZone: string) =>
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      timeZone,
+    } as Intl.ResolvedDateTimeFormatOptions);
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("PUTs the browser's zone as the caller's default", async () => {
+    mockBrowserZone("America/Chicago");
+    fetchMock.mockResolvedValueOnce(mockResponse({ timezone: "America/Chicago" }));
+    await reportLocalTimezone();
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/scheduled-tasks/default-timezone");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({ timezone: "America/Chicago" });
+  });
+
+  it.each(["empty", "throws"])("does not report a zone when discovery %s", async (failure) => {
+    if (failure === "throws") {
+      vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockImplementationOnce(() => {
+        throw new Error("timezone discovery unavailable");
+      });
+    } else {
+      mockBrowserZone("");
+    }
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a failed request", () => fetchMock.mockRejectedValueOnce(new TypeError("offline"))],
+    [
+      "a server that predates the endpoint",
+      () => fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 405 })),
+    ],
+  ])("ignores %s", async (_case, respond) => {
+    mockBrowserZone("America/Chicago");
+    respond();
+    await expect(reportLocalTimezone()).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -522,5 +678,56 @@ describe("random worktree setting", () => {
     const task = await updateScheduledTask("st_1", { baseBranch });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
     expect(task.baseBranch).toBe(baseBranch);
+  });
+});
+
+describe("listScheduledTaskRunPullRequests", () => {
+  it("pages after a run and maps each run's PRs and the refresh flag", async () => {
+    const pr = {
+      url: "https://github.com/example/repo/pull/1",
+      provider: "github",
+      repository: "example/repo",
+      number: 1,
+      relationship: "created",
+      state: "MERGED",
+      is_draft: false,
+      state_checked_at: 1_700_000_100,
+    };
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [{ run_id: "run_1", pull_requests: [pr] }, { run_id: "run_2" }],
+        refresh_pending: true,
+        next_cursor: null,
+      }),
+    );
+    const page = await listScheduledTaskRunPullRequests("st/1", { limit: 20, after: "run 0" });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/scheduled-tasks/st%2F1/run-pull-requests?limit=20&after=run+0",
+    );
+    expect(page).toEqual({
+      runs: [
+        { runId: "run_1", pullRequests: [pr] },
+        { runId: "run_2", pullRequests: [] },
+      ],
+      refreshPending: true,
+    });
+  });
+
+  it("reads an answer without runs or the refresh flag as empty and settled", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    expect(await listScheduledTaskRunPullRequests("st_1", { limit: 20 })).toEqual({
+      runs: [],
+      refreshPending: false,
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st_1/run-pull-requests?limit=20");
+  });
+
+  it("rejects with the server's error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ detail: "Scheduled task not found" }, { ok: false, status: 404 }),
+    );
+    await expect(listScheduledTaskRunPullRequests("st_1", { limit: 20 })).rejects.toMatchObject({
+      status: 404,
+    });
   });
 });

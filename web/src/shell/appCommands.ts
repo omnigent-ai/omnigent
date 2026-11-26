@@ -18,7 +18,10 @@ import {
   settingsShortcutKeys,
   sidebarToggleShortcutKeys,
 } from "@/components/KeyboardShortcut";
-import { useNavigate } from "@/lib/routing";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useLocation, useNavigate } from "@/lib/routing";
+import { useSettingsRoute } from "@/shell/settingsNav";
+import { settingsSearchCommand } from "@/shell/settingsSearch/settingsSearchCommand";
 
 export interface ActionCommand {
   id: string;
@@ -48,6 +51,9 @@ export function useAppCommands({
   rightSidebarShortcutEnabled,
 }: AppCommandOptions): ActionCommand[] {
   const navigate = useNavigate();
+  const { inSettings } = useSettingsRoute();
+  const { pathname, search } = useLocation();
+  const mobile = useIsMobileViewport();
   return useMemo<ActionCommand[]>(
     () => [
       {
@@ -80,6 +86,11 @@ export function useAppCommands({
         run: () => navigate("/settings"),
         shortcut: settingsShortcutKeys(),
       },
+      settingsSearchCommand({
+        settingsLocation: inSettings ? { pathname, search } : null,
+        mobile,
+        navigate,
+      }),
       {
         id: "toggle-left-sidebar",
         label: "Toggle conversations sidebar",
@@ -97,15 +108,24 @@ export function useAppCommands({
         shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
+    [
+      navigate,
+      pathname,
+      search,
+      inSettings,
+      mobile,
+      onToggleLeftSidebar,
+      onToggleRightSidebar,
+      rightSidebarShortcutEnabled,
+    ],
   );
 }
 
 /** The commands whose label or a keyword contains `query`, ignoring case; all of them for a blank query. */
-export function filterAppCommands(
-  commands: readonly ActionCommand[],
+export function filterAppCommands<Command extends { label: string; keywords: readonly string[] }>(
+  commands: readonly Command[],
   query: string,
-): readonly ActionCommand[] {
+): readonly Command[] {
   const q = query.trim().toLowerCase();
   if (q === "") return commands;
   return commands.filter(

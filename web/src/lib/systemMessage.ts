@@ -54,6 +54,7 @@ export type SystemMessageKind =
   | "task_cancelled"
   | "timer_fired"
   | "terminal_idle"
+  | "session_resumed"
   | "subagent_wake"
   | "interrupted"
   | "generic";
@@ -94,6 +95,10 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
   const newlineIdx = text.indexOf("\n");
   const firstLine = newlineIdx === -1 ? text : text.slice(0, newlineIdx);
   const body = newlineIdx === -1 ? "" : text.slice(newlineIdx + 1);
+
+  if (firstLine === "[System: session resumed]") {
+    return { kind: "session_resumed", label: "Session resumed", body };
+  }
 
   if (INTERRUPT_RE.test(firstLine)) {
     return { kind: "interrupted", label: "Interrupted", body: "" };

@@ -15,9 +15,11 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -222,6 +224,7 @@ describe("HeaderConversationMenu", () => {
     // breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) shortcuts.
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
       "Add nested agent",
+      "Open in new window",
       "Pin",
       "Share",
       "Fork",
@@ -234,6 +237,52 @@ describe("HeaderConversationMenu", () => {
     ]);
     expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
     expect(screen.getByTestId("header-rename-conversation")).toBeInTheDocument();
+  });
+
+  it("opens the session in a sized popup from Open in new window", () => {
+    const popup = { location: { pathname: "blank", href: "about:blank" }, focus: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+    try {
+      renderMenu();
+      openMenu();
+      fireEvent.click(screen.getByTestId("header-open-session-window"));
+      expect(open).toHaveBeenCalledWith(
+        "",
+        "omnigent-session-conv-1",
+        "popup,width=960,height=820",
+      );
+      expect(popup.location.href).toBe("/c/conv-1?window=session");
+      expect(popup.focus).toHaveBeenCalled();
+      expect(screen.getByTestId("location")).toHaveTextContent(/^\/c\/conv-1$/);
+    } finally {
+      open.mockRestore();
+    }
+  });
+
+  it.each([
+    ["its own session", "conv-1", false],
+    ["a session it moved to", "conv-9", true],
+  ])("inside a pop-out showing %s, offers Open in new window: %s", (_name, popOutFor, offered) => {
+    document.documentElement.dataset.sessionWindow = "true";
+    document.documentElement.dataset.sessionWindowFor = popOutFor;
+    try {
+      renderMenu();
+      openMenu();
+      expect(screen.queryByTestId("header-open-session-window") !== null).toBe(offered);
+      expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.sessionWindow;
+      delete document.documentElement.dataset.sessionWindowFor;
+    }
+  });
+
+  it("hides Mark as unread for a muted session", () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, labels: { ...CONVERSATION.labels, [MUTED_LABEL_KEY]: "1" } },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-mark-unread-conversation")).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
   });
 
   it("opens from the keyboard and focuses the first action", () => {
@@ -252,7 +301,7 @@ describe("HeaderConversationMenu", () => {
       openMenu();
       expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
       expect(screen.getByRole("menu").firstElementChild).toBe(
-        screen.getByRole("menuitem", { name: "Pin" }),
+        screen.getByRole("menuitem", { name: "Open in new window" }),
       );
     },
   );
@@ -416,6 +465,76 @@ describe("HeaderConversationMenu", () => {
     expect(mocks.deleteConversation).toHaveBeenCalledWith({
       id: "conv-1",
       deleteBranch: true,
+    });
+  });
+
+  describe("in ⌘K", () => {
+    const sessionCommands = () =>
+      Object.values(usePaletteCommandsStore.getState().groups).filter(
+        (group) => group.heading === "Session",
+      );
+    const runCommand = (label: string) => {
+      const command = sessionCommands()[0]?.commands.find((row) => row.label === label);
+      if (!command) throw new Error(`No ⌘K command "${label}"`);
+      act(() => command.run());
+    };
+
+    it("offers the menu's actions for the session shown and withdraws them on unmount", () => {
+      const view = renderMenu();
+      expect(sessionCommands()).toHaveLength(1);
+      expect(sessionCommands()[0].commands.map((command) => command.id)).toEqual([
+        "open-session:conv-1:add-nested-agent",
+        "open-session:conv-1:pin",
+        "open-session:conv-1:share",
+        "open-session:conv-1:fork",
+        "open-session:conv-1:export",
+        "open-session:conv-1:rename",
+        "open-session:conv-1:mark-unread",
+        "open-session:conv-1:archive",
+        "open-session:conv-1:delete",
+      ]);
+      view.unmount();
+      expect(sessionCommands()).toEqual([]);
+    });
+
+    it("runs the menu's own handlers", () => {
+      renderMenu();
+      runCommand("Pin session");
+      expect(mocks.togglePinned).toHaveBeenCalledWith({ id: "conv-1", pinned: true });
+      runCommand("Fork session");
+      expect(mocks.fork).toHaveBeenCalledTimes(1);
+      runCommand("Rename session");
+      fireEvent.change(screen.getByRole("textbox", { name: "Session name" }), {
+        target: { value: "Roadmap planning" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+      expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
+      runCommand("Delete session");
+      expect(screen.getByRole("dialog", { name: "Delete session?" })).toBeVisible();
+    });
+
+    it("drops a row built for the previous session once another is shown", () => {
+      const view = renderMenu();
+      const stalePin = sessionCommands()[0].commands.find((row) => row.label === "Pin session");
+      view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
+      expect(sessionCommands()[0].commands[0].id).toMatch(/^open-session:conv-2:/);
+      act(() => stalePin?.run());
+      expect(mocks.togglePinned).not.toHaveBeenCalled();
+    });
+
+    it("doesn't run a held row once its action can't run, as when sharing turns off", () => {
+      const onShare = vi.fn();
+      const view = renderMenu({ onShare });
+      const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");
+      view.rerender(menuTree({ onShare, shareDisabled: true, shareDisabledReason: "Off." }));
+      act(() => share?.run());
+      expect(onShare).not.toHaveBeenCalled();
+    });
+
+    it("keeps Share listed with its reason when sharing is off", () => {
+      renderMenu({ shareDisabled: true, shareDisabledReason: "Sharing is turned off." });
+      const share = sessionCommands()[0].commands.find((row) => row.label === "Share session");
+      expect(share?.availability).toEqual({ available: false, reason: "Sharing is turned off." });
     });
   });
 

@@ -8,6 +8,7 @@ export const OWNER_ONLY_REASONS = {
   runNow: "Only the automation's owner can run it.",
   edit: "Only the automation's owner can edit it.",
   share: "Only the automation's owner can share it.",
+  clone: "Only the automation's owner can clone it.",
   pause: "Only the automation's owner can pause it.",
   resume: "Only the automation's owner can resume it.",
   delete: "Only the automation's owner can delete it.",

@@ -1,12 +1,8 @@
 import type { StorybookConfig } from "@storybook/react-vite";
 import { mergeConfig } from "vite";
 
-function shikiManualChunk(id: string): string | undefined {
-  const normalized = id.replaceAll("\\", "/");
-  if (normalized.includes("/@shikijs/langs/")) return undefined;
-  if (normalized.includes("/shiki") || normalized.includes("/@shikijs/")) return "shiki";
-  return undefined;
-}
+// `.ts` extension: Storybook loads this file with Node's own ESM resolver, which needs one.
+import { shikiManualChunk } from "../vite.shiki.ts";
 
 const config: StorybookConfig = {
   stories: ["../src/**/*.stories.@(js|jsx|mjs|ts|tsx)"],

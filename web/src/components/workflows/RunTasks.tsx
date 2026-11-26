@@ -14,8 +14,9 @@ import { Link, useNavigate } from "@/lib/routing";
 import { parseEvent } from "@/lib/sse";
 import { cn } from "@/lib/utils";
 import { continuePlanMessage, stopPlanMessage, taskActionMessage } from "@/lib/workflow";
-import { PlanRunButton, type PlanRunControl } from "@/shell/PlanRunButton";
+import { PlanRunButton, type PlanRunButtonState } from "@/shell/PlanRunButton";
 import { ProgressStrip, taskMenuAction, type TaskMenuAction } from "@/shell/TasksPanel";
+import { supersedePlanStop, trackPlanStop } from "@/store/planStops";
 import { openTasksTab } from "@/store/sessionTasksActions";
 
 /** The queries that list a run, e.g. `["workflow-runs", workflowId]`. */
@@ -42,15 +43,25 @@ function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys, runId: st
       setPending(false);
     }
   };
-  const post = async (text: string) => {
-    if (!runId) return;
+  // Resolves to the session's receipt, or null when it didn't take the message.
+  const deliver = async (text: string) => {
+    if (!runId) return null;
     const result = await sendUserMessage(sessionId, text, runId);
-    if (result.denied) toast.error("A policy blocked the message.");
+    if (!result.denied) return result;
+    toast.error("A policy blocked the message.");
+    return null;
+  };
+  // Any other message the session takes ends the Stop in progress when it was sent.
+  const post = async (text: string) => {
+    const endPlanStop = supersedePlanStop(sessionId);
+    if (await deliver(text)) endPlanStop();
   };
   return {
     pending,
     act: (request: () => Promise<void>) => void act(request),
     send: (text: string) => void act(() => post(text)),
+    stop: (planName: string | null) =>
+      void act(() => trackPlanStop(sessionId, () => deliver(stopPlanMessage(planName)))),
     post,
   };
 }
@@ -75,12 +86,14 @@ async function pendingQuestionFor(sessionId: string, stepId: string): Promise<st
  * runs, continues, retries or stops its task in the run's session.
  *
  * @param sessionId - The run's session; null when it has none, or takes no actions.
+ * @param stopping - Whether the run is already stopping, so its tasks offer no Stop.
  * @returns What a task's ⋯ menu offers, or undefined without a session.
  */
 export function useRunTaskMenus(
   sessionId: string | null | undefined,
   refreshKeys: RunRefreshKeys,
   runId: string | null,
+  stopping = false,
 ): ((item: StepProgress) => TaskMenuAction | undefined) | undefined {
   const session = useRunSession(sessionId ?? "", refreshKeys, runId);
   const navigate = useNavigate();
@@ -101,7 +114,7 @@ export function useRunTaskMenus(
     const menuAction = taskMenuAction(
       item,
       (action, taskName) => session.send(taskActionMessage(action, taskName)),
-      () => session.send(stopPlanMessage(null)),
+      stopping ? undefined : () => session.stop(null),
     );
     return menuAction?.action === "proceed"
       ? { ...menuAction, onSelect: () => proceed(item) }
@@ -157,7 +170,7 @@ export function RunPlanButton({
   runId: string;
   /** The plan's name for the control message, e.g. the workflow's. */
   planName: string | null;
-  control: PlanRunControl;
+  control: PlanRunButtonState;
   refreshKeys: RunRefreshKeys;
   className?: string;
 }) {
@@ -168,7 +181,7 @@ export function RunPlanButton({
       disabled={session.pending}
       className={cn("z-10", className)}
       onClick={() =>
-        session.send(control === "stop" ? stopPlanMessage(planName) : continuePlanMessage(planName))
+        control === "stop" ? session.stop(planName) : session.send(continuePlanMessage(planName))
       }
     />
   );

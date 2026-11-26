@@ -13,7 +13,7 @@ export type StepStatus = "started" | "done" | "needs_input" | "failed";
 
 const STEP_STATUSES: readonly string[] = ["started", "done", "needs_input", "failed"];
 
-/** What a task waiting for the user says, in pink: the sidebar's Needs response color. */
+/** What a task waiting for the user says, in pink. */
 export const WAITING_FOR_YOU = "Waiting for you";
 
 /** The phase of a workflow question's prompt, which already marks its own task waiting. */
@@ -241,7 +241,7 @@ export interface StepProgress {
   state: StepState;
   /** The step's newest status; null until it has one. */
   status: JournalEntry | null;
-  /** When the step's current attempt started, in epoch seconds, if it wrote a start. */
+  /** When the step's current attempt first started, in epoch seconds, if it wrote a start. */
   startedAt: number | null;
   /** True for an item of the agent's own task list, which has no history. */
   native: boolean;
@@ -249,15 +249,20 @@ export interface StepProgress {
   activeForm: string | null;
 }
 
-/** The start of the attempt that wrote a step's newest status, if it wrote one. */
+/**
+ * The first start of the attempt that wrote a step's newest status, if it
+ * wrote one. Only done or failed ends an attempt, as for {@link isRestart}, so
+ * a start the agent restates or resumes after waiting keeps the attempt's time.
+ */
 function attemptStart(statuses: readonly JournalEntry[]): JournalEntry | null {
+  let first: JournalEntry | null = null;
   for (let index = statuses.length - 1; index >= 0; index -= 1) {
     const status = statusOf(statuses[index]);
-    if (status === "started") return statuses[index];
-    // An earlier attempt finished, so the newest one wrote no start.
-    if (index < statuses.length - 1 && (status === "done" || status === "failed")) return null;
+    // An earlier attempt finished here, so the newest one began after it.
+    if (index < statuses.length - 1 && (status === "done" || status === "failed")) break;
+    if (status === "started") first = statuses[index];
   }
-  return null;
+  return first;
 }
 
 /**

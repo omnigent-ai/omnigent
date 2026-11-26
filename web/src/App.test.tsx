@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { PROJECT_KANBAN_BOARD_STORAGE_KEY } from "@/lib/projectKanbanPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { RoutingProvider, basenamedRouting, reactRouterRouting } from "@/lib/routing";
 
@@ -13,21 +14,46 @@ vi.mock("@/shell/AppShell", () => ({
   AppShell: () => (
     <div>
       <span>app shell</span>
+      <Link to="/inbox">Inbox</Link>
       <Outlet />
     </div>
   ),
 }));
-vi.mock("@/pages/ChatPage", () => ({
-  ChatPage: () => (
-    <div>
-      chat page
-      <input aria-label="Page draft" />
-      <Link to="/c/other">Another chat</Link>
-    </div>
-  ),
+vi.mock("@/pages/ChatPage", async () => {
+  const { useLocation } = await import("react-router-dom");
+  return {
+    ChatPage: () => {
+      const { pathname, search } = useLocation();
+      return (
+        <div>
+          chat page
+          <input aria-label="Page draft" />
+          <Link to="/c/other">Another chat</Link>
+          <span data-testid="chat-location">{pathname + search}</span>
+        </div>
+      );
+    },
+  };
+});
+vi.mock("@/pages/ProjectHomePage", () => ({
+  ProjectHomePage: () => <div>project home page</div>,
+}));
+// Stays suspended, like a page whose code is still downloading.
+vi.mock("@/pages/InboxPage", () => ({
+  InboxPage: () => {
+    throw new Promise(() => {});
+  },
 }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
+const floatingPage = vi.hoisted(() => ({ suspend: false }));
+vi.mock("@/shell/floatingComposer/FloatingComposerPage", () => ({
+  FloatingComposerPage: () => {
+    // Suspends as the lazy page does while its chunk loads.
+    if (floatingPage.suspend) throw new Promise(() => {});
+    return <div>floating composer page</div>;
+  },
+}));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
 vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
 vi.mock("@/pages/WorkflowDetailPage", () => ({
@@ -276,6 +302,32 @@ describe("Workflow routes", () => {
   });
 });
 
+describe("Project home route", () => {
+  afterEach(() => localStorage.clear());
+
+  it("opens the board, or the project's composer once the board is turned off", async () => {
+    renderRoute("/projects/My%20Project", { project_kanban: true });
+    expect(await screen.findByText("project home page")).toBeInTheDocument();
+    cleanup();
+
+    localStorage.setItem(PROJECT_KANBAN_BOARD_STORAGE_KEY, "false");
+    renderRoute("/projects/My%20Project", { project_kanban: true });
+    expect(await screen.findByTestId("chat-location")).toHaveTextContent("/?project=My%20Project");
+    expect(screen.queryByText("project home page")).toBeNull();
+  });
+});
+
+describe("Shell page loading", () => {
+  it("shows the pane spinner when an in-app click opens a page still loading", async () => {
+    renderRoute("/");
+    fireEvent.click(await screen.findByRole("link", { name: "Inbox" }));
+
+    expect(await screen.findByRole("status", { name: "Loading" })).toBeInTheDocument();
+    expect(screen.queryByText("chat page")).toBeNull();
+    expect(screen.getByText("app shell")).toBeInTheDocument();
+  });
+});
+
 describe("Canvas route", () => {
   it("preserves healthy chat state across pathname changes", () => {
     renderRoute("/c/first");
@@ -354,6 +406,52 @@ describe("Extension page routes", () => {
   });
 });
 
+describe("Floating composer route", () => {
+  afterEach(() => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    floatingPage.suspend = false;
+  });
+
+  it("shows only a quiet background while the panel page's code loads", () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    floatingPage.suspend = true;
+    renderRoute("/compose/floating", { floating_composer: true });
+    expect(screen.getByRole("status")).toHaveClass("bg-background");
+    expect(screen.getByText("Loading Omnigent…")).toHaveClass("sr-only");
+  });
+
+  it("is not found with the flag off, or outside the desktop app", async () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating");
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    cleanup();
+
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    renderRoute("/compose/floating", { floating_composer: true });
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText("floating composer page")).toBeNull();
+  });
+
+  it("shows only a quiet background while the panel's server info loads", () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating", {}, "loading");
+    expect(screen.getByRole("status")).toHaveClass("bg-background");
+    expect(screen.queryByLabelText("Loading")).toBeNull();
+    cleanup();
+
+    // Other gated pages keep their spinner.
+    renderRoute("/workflows", {}, "loading");
+    expect(screen.getByLabelText("Loading")).toBeInTheDocument();
+  });
+
+  it("renders the panel page in the desktop app with the flag on, outside the shell", async () => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = { kind: "electron" };
+    renderRoute("/compose/floating", { floating_composer: true });
+    expect(await screen.findByText("floating composer page")).toBeInTheDocument();
+    expect(screen.queryByText("app shell")).toBeNull();
+  });
+});
+
 describe("Usage release feature route", () => {
   it("does not register /usage while the feature is off", async () => {
     renderUsageRoute(false);
@@ -389,7 +487,7 @@ describe("Automation routes", () => {
 
   it("waits for server info before loading automations", () => {
     renderRoute("/tasks", {}, "loading");
-    expect(screen.getByRole("status")).toHaveTextContent("Loading Omnigent");
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
     expect(screen.queryByText("not found")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
   });

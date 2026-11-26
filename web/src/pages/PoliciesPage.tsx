@@ -36,7 +36,12 @@ import {
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentUserId,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isSingleUserMode } from "@/lib/capabilities";
@@ -339,14 +344,21 @@ function AddDefaultPolicyDialog({
                         return (
                           <div className="mt-0.5 space-y-1.5">
                             {current.length > 0 && (
-                              <div className="flex flex-wrap gap-1">
+                              <SettingsDataRegion
+                                entry={POLICIES_ADD_ENTRY}
+                                region="values"
+                                className="flex flex-wrap gap-1"
+                              >
                                 {current.map((v) => (
                                   <span
                                     key={v}
+                                    data-settings-region-row
                                     className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-sm"
                                   >
                                     {v}
                                     <button
+                                      data-settings-row-action="remove"
+                                      aria-label={`Remove ${v}`}
                                       type="button"
                                       onClick={() => {
                                         const next = current.filter((x) => x !== v);
@@ -361,7 +373,7 @@ function AddDefaultPolicyDialog({
                                     </button>
                                   </span>
                                 ))}
-                              </div>
+                              </SettingsDataRegion>
                             )}
                             <ModelValueCombobox
                               inputProps={{
@@ -425,6 +437,7 @@ function AddDefaultPolicyDialog({
           )}
           <div className="flex justify-end gap-2 pt-1">
             <Button
+              data-settings-dialog-action="Cancel"
               type="button"
               variant="outline"
               onClick={() => {
@@ -469,11 +482,16 @@ export function PoliciesPage() {
   // / login_url:null shape) is NOT single-user and keeps its admin gate.
   const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
-  const { data: policies = [], refetch, error } = useDefaultPolicies();
+  const {
+    data: policies = [],
+    refetch,
+    error,
+    isFetching,
+  } = useDefaultPolicies(isSingleUser || meIsAdmin === true);
   // The backend may restrict listing global policies (HTTP 403). Treat that
   // like the non-admin case and hide the section rather than surfacing a raw
   // fetch error.
-  const policiesForbidden = error instanceof PoliciesForbiddenError;
+  const policiesForbidden = error instanceof PoliciesForbiddenError && !isFetching;
   const { data: registry = [] } = usePolicyRegistry();
   const updatePolicy = useUpdateDefaultPolicy();
   const deletePolicy = useDeleteDefaultPolicy();
@@ -493,11 +511,17 @@ export function PoliciesPage() {
   // because no auth endpoints exist and the backend skips admin enforcement.
   useEffect(() => {
     if (isSingleUser || capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
-      if (userId === null) return;
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active || userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
-    })();
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {
@@ -515,7 +539,7 @@ export function PoliciesPage() {
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Global Policies</h1>
+        <h1 className="mb-2 text-2xl font-medium">Global Policies</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
@@ -543,7 +567,7 @@ export function PoliciesPage() {
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="settings-page-title text-2xl font-medium">Global Policies</h1>
+          <h1 className="text-2xl font-medium">Global Policies</h1>
           <p className="mt-1 text-sm text-muted-foreground max-md:hidden">
             Policies applied to all sessions.
           </p>
