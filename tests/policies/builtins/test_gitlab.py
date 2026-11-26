@@ -146,6 +146,10 @@ def test_projects_can_be_pinned_to_a_server() -> None:
         (f"g'lab' issue note 12 -m > -R {_URL}", "ASK"),
         (f'"glab" issue note 12 -m > -R {_URL}', "ASK"),
         (rf"g\lab issue create -R {_URL} -t $TITLE -d Details", "ASK"),
+        (f"glab issue note 12 -m hi\r-R\r{_URL}", "ASK"),
+        (f"glab issue create -t Fix -d b\r-R\r{_URL}", "ASK"),
+        (f"glab issue note 12 -m Details -R {_URL}\r", "ASK"),
+        (r"-t Fix -d 'literal\rtext'", "ALLOW"),
         ("-t Fix -d >> -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d < -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d 2> -R https://gitlab.com/team/sub/app", "ASK"),
@@ -282,6 +286,8 @@ def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
         ("echo ready", "ALLOW"),
         ("echo ready > output.txt", "ASK"),
         ('echo "$COMMAND"', "ASK"),
+        (f"glab mr delete 12 -R {_URL}; echo '\r'", "DENY"),
+        (f"glab issue\tlist -R {_URL}", "ALLOW"),
     ],
 )
 def test_shell_boundaries(command: str, expected: str) -> None:

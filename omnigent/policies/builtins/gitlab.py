@@ -32,6 +32,7 @@ from omnigent.policies.schema import PolicyEvent, PolicyResponse
 
 _Project = tuple[str | None, str]
 _GATED_COMMAND = re.compile(r"\b(?:git|glab)\b", re.IGNORECASE)
+_UNMODELLED_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _CLI_ENVIRONMENT = frozenset(
     {
         "GITLAB_HOST",
@@ -206,13 +207,19 @@ def _evaluate_shell(
     """Reuse shell boundaries and preserve the strictest decision across a command."""
     if depth > MAX_SHELL_NESTING:
         return _ask("GitLab policy cannot inspect further nested shell commands. Approve?")
-    decision = None
+    decision = (
+        _ask("Unmodelled shell control characters require approval.")
+        if _UNMODELLED_CONTROL.search(command)
+        else None
+    )
     try:
         segments = split_command_segments(command)
     except UnsupportedShellSyntax as error:
         segments = error.completed_segments
         decision = _ask("GitLab policy cannot fully inspect this shell syntax. Approve?")
     for segment in segments:
+        if _UNMODELLED_CONTROL.search(segment):
+            continue
         try:
             raw_tokens = shlex.split(segment)
         except ValueError:
