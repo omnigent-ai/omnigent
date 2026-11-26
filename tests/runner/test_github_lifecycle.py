@@ -23,6 +23,9 @@ from omnigent.runner.pull_request_errors import (
 from omnigent.runner.session_prs import PullRequestRef
 
 TOKEN = "ghp_example_token_value"
+OTHER_TOKEN = "ghp_other_account_token"
+# The token lookup FakeGitHub replaces, for tests of how an action picks its account.
+_REAL_PR_TOKEN = github._pr_token
 HEAD = "a" * 40
 MOVED = "1" * 40
 PR_URL = "https://github.com/example-org/example-repo/pull/7"
@@ -44,22 +47,28 @@ class FakeGitHub:
         # Pull request numbers whose auto-merge mutation GitHub refuses, or never answers.
         self.refused: set[int] = set()
         self.lost: set[int] = set()
+        # A mutation answer that replaces the confirmed one, by pull request number.
+        self.answers: dict[int, Any] = {}
+        # The token each read and change ran with: ("view" | "node" | "mutation" | "gh", token).
+        self.tokens: list[tuple[str, str | None]] = []
         monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: TOKEN)
         monkeypatch.setattr(github, "_host_args", lambda _root, ref: ["--hostname", ref.host])
-        monkeypatch.setattr(github, "_pr_json", lambda _root, _ref, fields: self._view(fields))
+        monkeypatch.setattr(github, "_pr_json", self._view)
         monkeypatch.setattr(github, "_gh", self._gh)
         monkeypatch.setattr(github, "_pr_json_write", self._json_write)
         monkeypatch.setattr(
             pr_resource, "_selected_pr", lambda _session, url: PullRequestRef.from_url(url)
         )
 
-    def _view(self, fields: str) -> dict[str, Any]:
+    def _view(self, root: str, reference: PullRequestRef, fields: str) -> dict[str, Any]:
+        self.tokens.append(("view", github._pr_token(root, reference)))
         return {field: self.state[field] for field in fields.split(",")}
 
     def _gh(
         self, argv: list[str], *, cwd: str, token: str | None = None
     ) -> tuple[int | None, str, str]:
         self.gh_calls.append((argv, token))
+        self.tokens.append(("gh", token))
         code, stderr = self.gh_answer
         return code, "", stderr
 
@@ -73,14 +82,16 @@ class FakeGitHub:
         endpoint: str,
         fields: dict[str, Any],
     ) -> tuple[int | None, str, str]:
-        assert (method, endpoint, token) == ("POST", "graphql", TOKEN)
+        assert (method, endpoint) == ("POST", "graphql")
         variables = fields["variables"]
         if "enablePullRequestAutoMerge" not in fields["query"]:
+            self.tokens.append(("node", token))
             number = variables["number"]
             node = {"id": f"PR_{number}", "headRefOid": self.heads[number]}
             node["state"] = self.node_states[number]
             return 0, json.dumps({"data": {"repository": {"pullRequest": node}}}), ""
         self.mutations.append(variables["input"])
+        self.tokens.append(("mutation", token))
         number = int(variables["input"]["pullRequestId"].removeprefix("PR_"))
         if number in self.lost:
             return None, "", ""
@@ -92,6 +103,7 @@ class FakeGitHub:
                 "",
             )
         payload = {"pullRequest": {"id": f"PR_{number}", "autoMergeRequest": {"enabledAt": "t"}}}
+        payload = self.answers.get(number, payload)
         return 0, json.dumps({"data": {"enablePullRequestAutoMerge": payload}}), ""
 
     def pr_commands(self) -> list[list[str]]:
@@ -361,3 +373,91 @@ def test_auto_merge_naming_another_providers_pull_request_sends_none(fake: FakeG
         _auto_merge(_item(PR_URL), _item(GITLAB_URL))
 
     assert fake.mutations == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {},
+        {"pullRequest": None},
+        {"pullRequest": {"id": "PR_99", "autoMergeRequest": {"enabledAt": "t"}}},
+        {"pullRequest": {"id": "PR_7", "autoMergeRequest": None}},
+        {"pullRequest": {"id": "PR_7", "autoMergeRequest": {"enabledAt": None}}},
+        {"pullRequest": {"id": "PR_7", "autoMergeRequest": {"enabledAt": ""}}},
+    ],
+    ids=["empty", "no-pr", "another-pr", "no-request", "no-time", "empty-time"],
+)
+def test_auto_merge_github_doesnt_confirm_for_this_pr_is_unconfirmed_and_goes_on(
+    fake: FakeGitHub, answer: dict[str, Any]
+) -> None:
+    fake.answers[7] = answer
+
+    result = _auto_merge(_item(PR_URL), _item(OTHER_URL))
+
+    assert result["results"] == [
+        {"pr_url": PR_URL, "error": UNKNOWN_OUTCOME_MESSAGE, "reason": None, "unconfirmed": True},
+        {"pr_url": OTHER_URL, "enabled_at": "t"},
+    ]
+    assert len(fake.mutations) == 2
+
+
+def _no_login_chosen(monkeypatch: pytest.MonkeyPatch, *active: str | None) -> list[str]:
+    """A local host with no login chosen; each active-account lookup answers the next token."""
+    lookups: list[str] = []
+    monkeypatch.setattr(github, "_pr_token", _REAL_PR_TOKEN)
+    monkeypatch.setattr(github, "_in_sandbox", lambda: False)
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repository: None)
+
+    def lookup(_root: str, host: str = "github.com") -> str | None:
+        lookups.append(host)
+        return active[min(len(lookups), len(active)) - 1]
+
+    monkeypatch.setattr(github, "_gh_active_token", lookup, raising=False)
+    return lookups
+
+
+@pytest.mark.parametrize(
+    "change", [lambda: _state("closed"), lambda: _draft(True)], ids=["close", "to-draft"]
+)
+def test_a_lifecycle_change_with_no_login_chosen_stays_the_account_active_when_it_began(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, change: Any
+) -> None:
+    """Switching gh's active account after the state check must not change who writes."""
+    lookups = _no_login_chosen(monkeypatch, TOKEN, OTHER_TOKEN)
+
+    change()
+
+    assert lookups == ["github.com"]
+    assert [kind for kind, _token in fake.tokens] == ["view", "gh"]
+    assert {token for _kind, token in fake.tokens} == {TOKEN}
+
+
+def test_each_auto_merge_item_reads_and_changes_as_one_account(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An account switch between two pull requests can't split one's check from its change."""
+    lookups = _no_login_chosen(monkeypatch, TOKEN, OTHER_TOKEN)
+
+    _auto_merge(_item(PR_URL), _item(OTHER_URL))
+
+    assert lookups == ["github.com", "github.com"]
+    assert fake.tokens == [
+        ("node", TOKEN),
+        ("mutation", TOKEN),
+        ("node", OTHER_TOKEN),
+        ("mutation", OTHER_TOKEN),
+    ]
+
+
+def test_a_lifecycle_change_whose_active_account_cant_be_read_is_never_sent(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _no_login_chosen(monkeypatch, None)
+
+    with pytest.raises(ValueError, match="Couldn't read the host's GitHub sign-in"):
+        _state("closed")
+    result = _auto_merge(_item(PR_URL))
+
+    assert result["results"][0]["error"].startswith("Couldn't read the host's GitHub sign-in")
+    assert "unconfirmed" not in result["results"][0]
+    assert fake.tokens == []

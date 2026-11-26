@@ -59,6 +59,11 @@ def set_state(root: str, reference: PullRequestRef, *, state: str) -> dict[str, 
     """Close (``closed``) or reopen (``open``) the pull request."""
     if state not in ("closed", "open"):
         raise InvalidPullRequestInput("Expected state to be closed or open")
+    with github._one_pr_account(root, reference, timed_out=AUTHENTICATION_TIMED_OUT):
+        return _set_state(root, reference, state=state)
+
+
+def _set_state(root: str, reference: PullRequestRef, *, state: str) -> dict[str, Any]:
     current = github._pr_json(root, reference, "state")
     if current is None:
         raise ValueError(_LOAD_FAILED)
@@ -81,6 +86,11 @@ def set_state(root: str, reference: PullRequestRef, *, state: str) -> dict[str, 
 
 def set_draft(root: str, reference: PullRequestRef, *, draft: bool) -> dict[str, Any]:
     """Make the pull request a draft again (``draft``), or mark it ready for review."""
+    with github._one_pr_account(root, reference, timed_out=AUTHENTICATION_TIMED_OUT):
+        return _set_draft(root, reference, draft=draft)
+
+
+def _set_draft(root: str, reference: PullRequestRef, *, draft: bool) -> dict[str, Any]:
     current = github._pr_json(root, reference, "isDraft")
     if current is None:
         raise ValueError(_LOAD_FAILED)
@@ -120,34 +130,48 @@ def enable_auto_merge(root: str, items: list[AutoMergeItem]) -> dict[str, Any]:
 
 
 def _enable_one(root: str, item: AutoMergeItem) -> dict[str, Any]:
+    """One pull request's auto-merge, with its read and its change run as one account."""
     result: dict[str, Any] = {"pr_url": item.reference.url}
     try:
-        node = pull_request_node(root, item.reference, _AUTO_MERGE_STATE_SELECTION)
-        if node.get("headRefOid") != item.expected_head_oid:
-            raise PullRequestChangedError()
-        if node.get("state") != "OPEN":
-            result.update(error="Only an open pull request can merge automatically.", reason=None)
-            return result
-        payload = mutate(
-            root,
-            item.reference,
-            _AUTO_MERGE_MUTATION,
-            "enablePullRequestAutoMerge",
-            action="turn on auto-merge",
-            expected_head_oid=item.expected_head_oid,
-            input={
-                "pullRequestId": node["id"],
-                "mergeMethod": item.merge_method.upper(),
-                "expectedHeadOid": item.expected_head_oid,
-            },
-        )
+        with github._one_pr_account(root, item.reference, timed_out=AUTHENTICATION_TIMED_OUT):
+            result["enabled_at"] = _enable(root, item)
     except UnknownOutcomeError as exc:
         # Auto-merge may be on: a client must not offer this one as safe to retry.
         result.update(error=str(exc), reason=None, unconfirmed=True)
-        return result
     except ValueError as exc:
         result.update(error=str(exc), reason=getattr(exc, "reason", None))
-        return result
-    request = (payload.get("pullRequest") or {}).get("autoMergeRequest") or {}
-    result["enabled_at"] = request.get("enabledAt")
     return result
+
+
+def _enable(root: str, item: AutoMergeItem) -> str:
+    """Turn on auto-merge for one pull request, and answer when GitHub says it was enabled.
+
+    :raises UnknownOutcomeError: When GitHub's answer doesn't confirm auto-merge on this
+        pull request, since the change may still have been made.
+    """
+    node = pull_request_node(root, item.reference, _AUTO_MERGE_STATE_SELECTION)
+    if node.get("headRefOid") != item.expected_head_oid:
+        raise PullRequestChangedError()
+    if node.get("state") != "OPEN":
+        raise ValueError("Only an open pull request can merge automatically.")
+    payload = mutate(
+        root,
+        item.reference,
+        _AUTO_MERGE_MUTATION,
+        "enablePullRequestAutoMerge",
+        action="turn on auto-merge",
+        expected_head_oid=item.expected_head_oid,
+        input={
+            "pullRequestId": node["id"],
+            "mergeMethod": item.merge_method.upper(),
+            "expectedHeadOid": item.expected_head_oid,
+        },
+    )
+    pull_request = payload.get("pullRequest")
+    if not isinstance(pull_request, dict) or pull_request.get("id") != node["id"]:
+        raise github_failures.unknown_outcome()
+    request = pull_request.get("autoMergeRequest")
+    enabled_at = request.get("enabledAt") if isinstance(request, dict) else None
+    if not isinstance(enabled_at, str) or not enabled_at:
+        raise github_failures.unknown_outcome()
+    return enabled_at
