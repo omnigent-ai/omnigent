@@ -19,6 +19,7 @@ from fastapi.routing import APIRoute
 
 from omnigent.errors import OmnigentError
 from omnigent.runtime import set_runner_router
+from omnigent.server import server_config
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -28,6 +29,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.pull_request_viewers import OWNER_ONLY_CHANGES_MESSAGE, READ_CAPABILITIES
+from omnigent.server.read_only_code_hosts import READ_ONLY_CODE_HOST_MESSAGE
 from omnigent.server.routes import _host_filesystem
 from omnigent.server.routes.sessions import create_sessions_router, routes_resources
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -666,3 +668,83 @@ async def test_unsure_who_reads_the_threads_the_server_shows_no_rights(
 
     assert response.status_code == 200, response.text
     assert response.json()["data"][0]["can_reply"] is False
+
+
+# The owner's routes that change the pull request on its code host.
+_CODE_HOST_WRITES = [
+    route
+    for route in _OWNER_ONLY_ROUTES
+    if route[0] == "POST"
+    and route[1] not in {"/resources/github/prs", "/resources/github/preferences"}
+]
+
+
+@pytest.fixture
+async def read_only_client(
+    db_uri: str, host: _RecordingHost, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[httpx.AsyncClient]:
+    """A server that serves pull requests on ``github.com`` read-only."""
+    del host
+    monkeypatch.setattr(server_config, "read_only_code_hosts", lambda: ("github.com",))
+    transport = httpx.ASGITransport(app=_app(db_uri))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as session:
+        yield session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "options"),
+    _CODE_HOST_WRITES,
+    ids=[f"{method} {path}" for method, path, _options in _CODE_HOST_WRITES],
+)
+async def test_the_owner_s_change_on_a_read_only_host_is_refused_before_the_host(
+    read_only_client: httpx.AsyncClient,
+    host: _RecordingHost,
+    method: str,
+    path: str,
+    options: dict[str, Any],
+) -> None:
+    response = await _call(read_only_client, method, path, options, caller=_OWNER)
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["message"] == READ_ONLY_CODE_HOST_MESSAGE
+    assert host.writes == []
+
+
+@pytest.mark.asyncio
+async def test_the_account_choice_on_a_read_only_host_still_reaches_the_host(
+    read_only_client: httpx.AsyncClient, host: _RecordingHost
+) -> None:
+    options = {"json": {"account": "", "pr_url": _PR}}
+    response = await _call(
+        read_only_client, "POST", "/resources/github/preferences", options, caller=_OWNER
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(host.calls) == 1, host.calls
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_host_s_info_is_marked_and_offers_no_changes(
+    read_only_client: httpx.AsyncClient,
+) -> None:
+    response = await _call(read_only_client, "GET", "/resources/github", {}, caller=_OWNER)
+
+    assert response.status_code == 200, response.text
+    info = response.json()
+    assert info["read_only"] is True
+    assert info["capabilities"] == {
+        "account_switching": True,
+        "merging": False,
+        "line_counts": True,
+    }
+    assert info["pr"]["number"] == 42
+
+
+@pytest.mark.asyncio
+async def test_without_read_only_hosts_the_owner_s_info_is_unmarked(
+    client: httpx.AsyncClient,
+) -> None:
+    response = await _call(client, "GET", "/resources/github", {}, caller=_OWNER)
+
+    assert "read_only" not in response.json()

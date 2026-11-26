@@ -39,10 +39,11 @@ from omnigent.host.workspace_pull_request_input import (
     MAX_PULL_REQUEST_URL_CHARACTERS,
 )
 from omnigent.runner import pr_resource
+from omnigent.server import server_config, workspace_access, workspace_api
 from omnigent.server import session_pull_requests as server_prs
-from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.server.pull_request_viewers import PullRequestViewer
+from omnigent.server.read_only_code_hosts import READ_ONLY_CODE_HOST_MESSAGE
 from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callable_methods
 from omnigent.stores.session_pull_request_store import SessionPullRequests
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
@@ -1144,12 +1145,13 @@ async def test_a_hosts_refusal_reason_reaches_the_client(
         ("comment_changed", ["comment_changed"]),
         ("pull_request_changed", ["pull_request_changed"]),
         ("invalid_input", ["invalid_input"]),
-        ("read_only_code_host", []),
+        ("read_only_code_host", ["read_only_code_host"]),
+        ("merge_queue_full", []),
         ("<b>Click here</b>", []),
         ("", []),
         (None, []),
     ],
-    ids=["comment", "head", "input", "other-known", "arbitrary", "empty", "none"],
+    ids=["comment", "head", "input", "read-only", "other-known", "arbitrary", "empty", "none"],
 )
 async def test_only_an_allowed_reason_from_the_host_is_attached(
     tmp_path: Path, reason: str | None, attached: list[str]
@@ -1184,6 +1186,7 @@ def test_a_pull_request_failure_carries_only_its_reason() -> None:
         "comment_changed",
         "pull_request_changed",
         "invalid_input",
+        "read_only_code_host",
     } == workspace_api.PULL_REQUEST_FAILURE_REASONS
 
 
@@ -1400,3 +1403,63 @@ async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
     [thread] = payload_dict(response.payload)["data"]
     assert thread["can_reply"] is owner
     assert thread["comments"]["data"][0]["can_update"] is owner
+
+
+# Every change to the pull request on its code host, with a valid request for it.
+_CODE_HOST_CHANGES = sorted(_PULL_REQUEST_WRITES - {"SetPullRequestAccount"})
+_CHANGE_REQUESTS = {**host_tests._OWNER_CALLS, **host_tests._REVIEW_CALLS}
+
+
+@pytest.fixture
+def read_only_github(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The server serves pull requests on ``github.com`` read-only."""
+    monkeypatch.setattr(server_config, "read_only_code_hosts", lambda: ("github.com",))
+
+
+@pytest.mark.usefixtures("read_only_github")
+@pytest.mark.parametrize("method", _CODE_HOST_CHANGES)
+async def test_a_change_to_a_pr_on_a_read_only_host_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    method: str,
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await getattr(client, WORKSPACE_METHODS[method].python_name)(_CHANGE_REQUESTS[method][0])
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
+    assert _failure_reasons(refused.value) == ["read_only_code_host"]
+    assert host_calls == []
+
+
+@pytest.mark.usefixtures("read_only_github")
+async def test_a_change_naming_no_pr_is_refused_when_the_first_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(pb.CreateCommentRequest(body="Looks good"))
+
+    assert refused.value.message == READ_ONLY_CODE_HOST_MESSAGE
+    assert host_calls == []
+
+
+@pytest.mark.usefixtures("read_only_github")
+@pytest.mark.parametrize("method", ["SetPullRequestAccount", "GetMergeOptions"])
+async def test_reads_and_the_account_choice_on_a_read_only_host_reach_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    await getattr(client, WORKSPACE_METHODS[method].python_name)(_CHANGE_REQUESTS[method][0])
+
+    assert [call.method for call in host_calls] == [method]
+    assert len(owner_calls) == 1
