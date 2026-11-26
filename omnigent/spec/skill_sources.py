@@ -552,10 +552,8 @@ def _plugin_install_paths(
                 continue
             if not any(resolved.is_relative_to(root) for root in plugin_roots):
                 _log.warning(
-                    "Skipping entry for plugin %r: installPath %r is outside the trusted roots %s",
+                    "Skipping entry for plugin %r: installPath is outside the trusted roots",
                     key,
-                    path,
-                    ", ".join(str(root) for root in plugin_roots),
                 )
                 continue
             # Python 3.13+ returns a dead path for a symlink loop instead of
