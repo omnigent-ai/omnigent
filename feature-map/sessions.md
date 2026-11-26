@@ -65,8 +65,9 @@ the header menu), and each place is a separate entry point.
   the search. Desktop and mobile search use the same context.
 - `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
   sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
-  device for this server; changing one reloads the page. In the old palette,
-  search **Enable feature preview: new QuickPick command palette** to opt in.
+  device for this server; changing one reloads the page. **Clear all flag overrides**
+  removes all choices for this server and reloads. In the old palette, search
+  **Enable feature preview: new QuickPick command palette** to opt in.
   An amber header flag shows active overrides and opens the picker.
 - `palette-session-commands`: ⌘K lists the open session's header-menu actions
   under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,

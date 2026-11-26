@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -61,10 +61,70 @@ describe("FeatureFlagsPicker", () => {
   it("lists only reported features with their current choice", () => {
     renderPicker();
     expect(screen.getByRole("option", { name: /Canvas/ })).toHaveTextContent("Automatic (Off)");
-    expect(screen.getByRole("option", { name: /Session cost sidebar/ })).toHaveTextContent(
-      "Automatic (On)",
+    const overview = screen.getByRole("option", { name: /Session cost sidebar/ });
+    expect(overview).toHaveTextContent("Automatic (On)");
+    const systemName = within(overview).getByText("session_overview");
+    expect(systemName).toHaveClass("text-sm", "text-muted-foreground");
+    expect(systemName.parentElement).toHaveClass("flex-col");
+    expect(systemName.parentElement).toBe(
+      overview.querySelector('[data-slot="quick-pick-label"]')?.parentElement,
     );
     expect(screen.queryByRole("option", { name: /Sidebar grouping/ })).toBeNull();
+    expect(screen.queryByRole("option", { name: "Clear all flag overrides" })).toBeNull();
+  });
+
+  it("hides clear all when stored choices are not in effect", () => {
+    localStorage.setItem(key, '{"project_kanban":true,"unknown":true}');
+    renderPicker();
+    expect(screen.queryByRole("option", { name: "Clear all flag overrides" })).toBeNull();
+  });
+
+  it("offers clear all when an override equals the server value", () => {
+    localStorage.setItem(key, '{"canvas":false}');
+    renderPicker();
+    expect(screen.getByRole("option", { name: "Clear all flag overrides" })).toBeVisible();
+  });
+
+  it("lists clear all last and clears the server entry before reloading", () => {
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        quick_pick_palette: true,
+        canvas: true,
+        session_overview: false,
+        unknown: true,
+      }),
+    );
+    const input = renderPicker(false);
+    const options = screen.getAllByRole("option");
+    expect(options.at(-1)).toHaveTextContent("Clear all flag overrides");
+    fireEvent.change(input, { target: { value: "canvas" } });
+    expect(screen.queryByRole("option", { name: "Clear all flag overrides" })).toBeNull();
+    fireEvent.change(input, { target: { value: "clear all" } });
+    let savedAtReload: string | null | undefined;
+    reload.mockImplementation(() => {
+      savedAtReload = localStorage.getItem(key);
+    });
+    fireEvent.click(screen.getByRole("option", { name: "Clear all flag overrides" }));
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(reload).toHaveBeenCalledOnce();
+    expect(savedAtReload).toBeNull();
+  });
+
+  it("shows a failure without reloading when clear all is refused", () => {
+    const saved = '{"canvas":true}';
+    localStorage.setItem(key, saved);
+    renderPicker();
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    fireEvent.click(screen.getByRole("option", { name: "Clear all flag overrides" }));
+    expect(screen.getByText("Couldn't clear the flag overrides.")).toHaveAttribute(
+      "role",
+      "status",
+    );
+    expect(localStorage.getItem(key)).toBe(saved);
+    expect(reload).not.toHaveBeenCalled();
   });
 
   it("opens when QuickPick is enabled by an override and lists its own setting", () => {
