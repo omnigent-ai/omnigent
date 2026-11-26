@@ -5,6 +5,7 @@ import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContex
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   LazyFileActionHost,
+  LazyGoToFileHost,
   LazyShowAllPullRequestsCommand,
   LazyWorkspaceTabsHost,
   routeToWorkspaceTabs,
@@ -3373,6 +3374,21 @@ function AppShellImpl() {
             sessionId={serverConversationId}
             pullRequestsAvailable={railTabsAvailable.github}
             showAll={() => openGithubTab()}
+          />
+        </Suspense>
+      )}
+      {/* The finder serves every window with the tabs sidebar, at any width: Go to File and Search
+        Text for its session, Sessions on any page. Its code, with the preview's editor, loads only
+        then. */}
+      {tabsSidebar && (
+        <Suspense fallback={null}>
+          <LazyGoToFileHost
+            key={serverConversationId ?? "no-session"}
+            // Files and Text only where the session's files can be browsed; Sessions always.
+            sessionId={showFilesPanel ? (serverConversationId ?? null) : null}
+            openFile={openFileViewer}
+            showTextSearch={() => showTabsPage("content-search")}
+            textSearch={railTabsAvailable["content-search"]}
           />
         </Suspense>
       )}
