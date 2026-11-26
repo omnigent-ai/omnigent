@@ -23,7 +23,9 @@ export function assertColdLoad(id, settled) {
     !Number.isFinite(settled.markerTs) ||
     settled.markerTs < 0 ||
     !Number.isFinite(settled.paintedTs) ||
-    settled.paintedTs < 0
+    settled.paintedTs < 0 ||
+    !Number.isFinite(settled.settleTs) ||
+    settled.settleTs < settled.paintedTs
   ) {
     throw new Error(`cold load ${id} failed: ${JSON.stringify(settled)}`);
   }

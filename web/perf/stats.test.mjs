@@ -9,7 +9,8 @@ test("cold-load marker timeouts fail instead of producing a sample", () => {
     /cold load example failed/,
   );
   assert.throws(() => assertColdLoad("example", {}), /cold load example failed/);
-  assert.doesNotThrow(() => assertColdLoad("example", { markerTs: 12, paintedTs: 16 }));
+  assert.throws(() => assertColdLoad("example", { markerTs: 12, paintedTs: 16, settleTs: -1 }), /cold load example failed/);
+  assert.doesNotThrow(() => assertColdLoad("example", { markerTs: 12, paintedTs: 16, settleTs: 20 }));
 });
 
 test("arm order counterbalances adjacent pairs", () => {

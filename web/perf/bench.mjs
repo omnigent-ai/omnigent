@@ -370,7 +370,7 @@ async function main() {
       `window.__waitSettled(${JSON.stringify(MARKERS[id])}, { timeoutMs: 30000, sinceTs: performance.now() - 1 })`,
       true,
     );
-    if (settled && settled.markerTs > 0) return settled;
+    if (settled && !settled.timeout && settled.markerTs > 0 && settled.paintedTs >= 0 && settled.settleTs >= settled.paintedTs) return settled;
     process.stdout.write(
       `gotoSession ${id} retry ${attempt}: ${JSON.stringify(settled).slice(0, 160)}\n`,
     );
@@ -479,7 +479,7 @@ async function main() {
     );
     await clickSidebarRow(TITLES[target]);
     const ts = await settlePromise;
-    if (!ts || ts.timeout || ts.paintedTs < 0)
+    if (!ts || ts.timeout || !Number.isFinite(ts.paintedTs) || ts.paintedTs < 0 || !Number.isFinite(ts.settleTs) || ts.settleTs < ts.paintedTs)
       throw new Error(`switch to ${target} failed: ${JSON.stringify(ts)}`);
     await page.eval(
       `new Promise((resolve) => setTimeout(resolve, Math.max(0, ${ts.clickTs} + 1500 - performance.now())))`,
