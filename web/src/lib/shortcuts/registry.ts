@@ -780,6 +780,23 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
     label: "Open the focused row in a new tab (⇧ to switch to it)",
     chords: () => [mod({ key: "Enter" }), mod({ shift: true, key: "Enter" })],
   },
+  // The new pull request page's: delete the selected rows from its list, and step down and up a
+  // PR's stack as on github.com. Text fields and menus keep these keys.
+  "pullRequests.removeSelected": {
+    group: "workspace",
+    label: "Remove selected pull requests",
+    chords: () => [mod({ eitherCommandKey: true, key: "Backspace" })],
+  },
+  "pullRequestStack.next": {
+    group: "workspace",
+    label: "Next in stack",
+    chords: () => [{ shift: true, code: "KeyJ" }],
+  },
+  "pullRequestStack.previous": {
+    group: "workspace",
+    label: "Previous in stack",
+    chords: () => [{ shift: true, code: "KeyK" }],
+  },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
 const BINDINGS = { ...APP_BINDINGS, ...WORKSPACE_SIDEBAR_DEFINITIONS };
