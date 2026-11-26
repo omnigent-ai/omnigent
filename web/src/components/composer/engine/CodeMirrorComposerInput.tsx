@@ -407,6 +407,14 @@ function caretOffCards(doc: Text, selection: EditorSelection, previous: number):
  */
 function settleQuoteCards(transaction: Transaction): Transaction | readonly TransactionSpec[] {
   if (isSyncOrHistory(transaction)) return transaction;
+  // Arrows, clicks and other selection-only changes need only the caret moved off a card.
+  if (!transaction.docChanged) {
+    const { newDoc, newSelection, startState } = transaction;
+    const selection = caretOffCards(newDoc, newSelection, startState.selection.main.head);
+    return selection.eq(newSelection)
+      ? transaction
+      : [transaction, { selection, sequential: true }];
+  }
   const inserts: { from: number; to: number; text: string }[] = [];
   transaction.changes.iterChanges((_fromA, _toA, from, to, text) =>
     inserts.push({ from, to, text: text.toString() }),
@@ -419,7 +427,7 @@ function settleQuoteCards(transaction: Transaction): Transaction | readonly Tran
   const removed = removedQuote(transaction);
   let settled = after;
   if (removed !== null) settled = removeQuoteFromDocument(start, removed);
-  else if (transaction.docChanged) {
+  else {
     // Inserted text loses its tokens; the last insert goes first, so earlier offsets hold.
     for (const insert of inserts.reverse()) {
       const text = stripQuoteMarks(insert.text);
