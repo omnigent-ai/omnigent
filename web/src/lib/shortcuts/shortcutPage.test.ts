@@ -162,6 +162,21 @@ describe("shortcutPageGroups", () => {
     ).toContain("Panes");
   });
 
+  it("lists Next and Previous session instead of the recent switcher with quick_pick_palette on", () => {
+    const desktop = { ...BROWSER_TAB, native: true, electron: true };
+    expect(labelsIn(desktop, "Navigation")).toContain("Switch recent sessions");
+    expect(labelsIn({ ...desktop, quickPick: true }, "Navigation")).toEqual(
+      expect.arrayContaining(["Next session", "Previous session"]),
+    );
+    expect(labelsIn({ ...desktop, quickPick: true }, "Navigation")).not.toContain(
+      "Switch recent sessions",
+    );
+    // A browser tab keeps Ctrl+Tab, so the page lists neither there.
+    expect(labelsIn({ ...BROWSER_TAB, quickPick: true }, "Navigation")).not.toContain(
+      "Next session",
+    );
+  });
+
   it("adds desktop menu rows only when the shell hands commands to the page", () => {
     const desktop = { ...BROWSER_TAB, native: true, electron: true, desktopCommands: true };
     expect(labelsIn(BROWSER_TAB, "General")).not.toContain("Quit Omnigent");
