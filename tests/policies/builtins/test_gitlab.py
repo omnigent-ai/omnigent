@@ -236,7 +236,6 @@ def test_deferred_glab_operations_still_require_approval(command: str) -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        f"git clone {_URL}",
         f"git fetch --future-option {_URL}",
         f"git push {_URL} main",
         "git config push.followTags true",
@@ -245,7 +244,7 @@ def test_deferred_glab_operations_still_require_approval(command: str) -> None:
         "git -c alias.upload=push upload",
     ],
 )
-def test_git_remote_and_configuration_handling_is_deferred(command: str) -> None:
+def test_unresolved_git_and_configuration_still_require_approval(command: str) -> None:
     assert _result(command, write_repos=[_PROJECT]) == "ASK"
 
 
@@ -273,7 +272,9 @@ def test_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
     + [("command /usr/bin/", "GIT.EXE")],
 )
 def test_git_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
-    assert _result(f"{prefix}{spelling} push {_URL} main") == "ASK"
+    command = f"{prefix}{spelling} push {_URL} HEAD:refs/heads/feature"
+    assert _result(command, write_repos=[_PROJECT]) == "ALLOW"
+    assert _result(command) == "DENY"
 
 
 @pytest.mark.parametrize(
@@ -304,6 +305,16 @@ def test_backslash_paths_require_approval_before_posix_parsing(executable: str) 
         "export GITLAB_HOST=gitlab.other.example",
         "GLAB_CONFIG_DIR=/tmp/config",
         "export GIT_CONFIG_COUNT=1",
+        "export GIT_SSH_COMMAND=example",
+        "GIT_NAMESPACE=example git fetch https://gitlab.com/team/sub/app",
+        "GIT_AUTHOR_NAME=example git commit -m Fix",
+        "export GIT_CONFIG_COUNT",
+        "printf -v GIT_CONFIG_COUNT 1",
+        "printf -vGIT_CONFIG_COUNT 1",
+        "command printf -v GIT_CONFIG_COUNT 1",
+        "declare -x GIT_CONFIG_COUNT",
+        "declare -n example=GIT_CONFIG_COUNT",
+        "unset GIT_SSH_COMMAND",
         'alias glab="another-command"',
         "GITLAB_HOST=gitlab.other.example glab issue list",
         "python -m glab",
@@ -418,7 +429,7 @@ async def test_policy_resolution_preserves_allow_deny_and_ask() -> None:
         assert result.action == expected
 
 
-def test_registry_exposes_only_initial_scope_settings() -> None:
+def test_registry_exposes_transfer_settings() -> None:
     load_registry()
     assert any(entry.handler == _HANDLER for entry in get_registry())
     assert (
@@ -429,6 +440,10 @@ def test_registry_exposes_only_initial_scope_settings() -> None:
                 "read_all": False,
                 "read_repos": [_PROJECT],
                 "write_repos": [_PROJECT],
+                "write_branches": ["feature"],
+                "allow_destructive": False,
+                "deny_force_push": True,
+                "deny_tag_push": True,
                 "shell_tools": ["sys_os_shell"],
                 "deny_reason": "Project restricted.",
             },
@@ -436,9 +451,333 @@ def test_registry_exposes_only_initial_scope_settings() -> None:
         is None
     )
     for configuration in (
-        {"write_branches": ["main"]},
-        {"allow_destructive": True},
+        {"write_branches": "main"},
+        {"allow_destructive": "yes"},
+        {"deny_force_push": 1},
+        {"deny_tag_push": "false"},
         {"read_all": "yes"},
         {"deny_reason": 123},
     ):
         assert validate_factory_params(_HANDLER, configuration) is not None
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        f"clone {_URL}.git",
+        f"clone -qvbmain --depth=1 {_URL} checkout",
+        f"clone --bare -- {_URL}",
+        f"fetch {_URL}",
+        f"fetch -qv --depth 1 --no-recurse-submodules {_URL} main",
+        f"fetch -- {_URL} refs/heads/main:refs/remotes/example/main",
+        f"pull --ff-only --no-recurse-submodules {_URL} main",
+        f"pull --no-rebase --no-edit {_URL} refs/heads/main",
+    ],
+)
+def test_explicit_git_downloads_check_read_permissions(arguments: str) -> None:
+    assert _result(f"git {arguments}") == "ALLOW"
+    assert _result(f"git {arguments}", read_all=False) == "DENY"
+    assert _result(f"git {arguments}", read_all=False, read_repos=[_PROJECT]) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (f"{_URL} HEAD:refs/heads/feature", "ALLOW"),
+        (f"{_URL} refs/heads/feature", "ALLOW"),
+        (f"-qvu --atomic --no-recurse-submodules {_URL} main:refs/heads/feature", "ALLOW"),
+        (f"--signed=no {_URL} HEAD:refs/heads/feature", "ALLOW"),
+        (f"--repo={_URL} HEAD:refs/heads/feature", "ASK"),
+        (f"{_URL} HEAD:refs/heads/main", "DENY"),
+        (f"{_URL} HEAD:refs/heads/Feature", "DENY"),
+        (f"{_URL} HEAD:refs/heads/heads/feature", "DENY"),
+        (f"{_URL} HEAD:refs/heads/feature main:refs/heads/main", "DENY"),
+        ("https://gitlab.com/team/other HEAD:refs/heads/feature", "DENY"),
+        (f"{_URL} main", "ASK"),
+        (f"{_URL} HEAD:feature", "ASK"),
+        (f"{_URL} HEAD:heads/feature", "ASK"),
+        (f"{_URL}", "ASK"),
+        ("origin HEAD:refs/heads/feature", "ASK"),
+        (f"{_URL} :", "ASK"),
+        (f"{_URL} HEAD:refs/heads/../feature", "ASK"),
+        (f"{_URL} HEAD:refs/heads/.hidden", "ASK"),
+        (f"{_URL} HEAD:refs/heads/feature.lock", "ASK"),
+    ],
+)
+def test_push_checks_every_exact_destination(arguments: str, expected: str) -> None:
+    assert (
+        _result(f"git push {arguments}", write_repos=[_PROJECT], write_branches=["feature"])
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "setting", "permissive"),
+    [
+        (f"-f {_URL} HEAD:refs/heads/feature", "deny_force_push", "ALLOW"),
+        (f"-uf {_URL} HEAD:refs/heads/feature", "deny_force_push", "ALLOW"),
+        (
+            f"--force-with-lease=refs/heads/feature: {_URL} HEAD:refs/heads/feature",
+            "deny_force_push",
+            "ALLOW",
+        ),
+        (f"--force-if-includes {_URL} HEAD:refs/heads/feature", "deny_force_push", "ALLOW"),
+        (f"{_URL} +HEAD:refs/heads/feature", "deny_force_push", "ALLOW"),
+        ("--force", "deny_force_push", "ASK"),
+        ("--force-with-lease", "deny_force_push", "ASK"),
+        ("--tags", "deny_tag_push", "ASK"),
+        ("--delete", "allow_destructive", "ASK"),
+        (f"{_URL} refs/tags/v1", "deny_tag_push", "ALLOW"),
+        (f"{_URL} HEAD:refs/tags/v1", "deny_tag_push", "ALLOW"),
+        (f"{_URL} tag v1", "deny_tag_push", "ASK"),
+        (f"{_URL} HEAD:refs/heads/feature tag v1", "deny_tag_push", "ASK"),
+        (f"--tags {_URL}", "deny_tag_push", "ASK"),
+        (f"--follow-tags {_URL} HEAD:refs/heads/feature", "deny_tag_push", "ASK"),
+        (f"--delete {_URL} refs/heads/feature", "allow_destructive", "ALLOW"),
+        (f"{_URL} :refs/heads/feature", "allow_destructive", "ALLOW"),
+        (f"--prune {_URL} HEAD:refs/heads/feature", "allow_destructive", "ASK"),
+    ],
+)
+def test_push_guards_require_explicit_opt_in(
+    arguments: str, setting: str, permissive: str
+) -> None:
+    configuration = {"write_repos": [_PROJECT], "write_branches": ["feature"]}
+    assert _result(f"git push {arguments}", **configuration) == "DENY"
+    configuration[setting] = setting == "allow_destructive"
+    assert _result(f"git push {arguments}", **configuration) == permissive
+
+
+def test_opt_ins_do_not_bypass_project_or_branch_checks() -> None:
+    configuration = {
+        "deny_force_push": False,
+        "deny_tag_push": False,
+        "allow_destructive": True,
+        "write_repos": [_PROJECT],
+        "write_branches": ["feature"],
+    }
+    assert _result(f"git push -f {_URL} HEAD:refs/heads/main", **configuration) == "DENY"
+    assert _result(f"git push --delete {_URL} refs/heads/main", **configuration) == "DENY"
+    assert (
+        _result("git push https://gitlab.com/team/other refs/tags/v1", **configuration) == "DENY"
+    )
+    assert _result(f"glab issue create -R {_URL} -t Fix -d Details", **configuration) == "ALLOW"
+    assert _result(f"glab mr delete 12 -R {_URL}", **configuration) == "DENY"
+
+
+@pytest.mark.parametrize("remote", [_URL, "origin", ""])
+def test_mirror_respects_force_tag_and_deletion_guards(remote: str) -> None:
+    configuration = {
+        "write_repos": [_PROJECT],
+        "allow_destructive": True,
+        "deny_force_push": False,
+        "deny_tag_push": False,
+    }
+    command = f"git push --mirror {remote}"
+    assert _result(command, **configuration) == "ASK"
+    for guard, value in [
+        ("allow_destructive", False),
+        ("deny_force_push", True),
+        ("deny_tag_push", True),
+    ]:
+        assert _result(command, **(configuration | {guard: value})) == "DENY"
+
+
+@pytest.mark.parametrize("arguments", ["--force", "--tags", "--delete", "--mirror"])
+def test_push_guards_apply_only_when_https_host_is_not_known_foreign(arguments: str) -> None:
+    foreign = _response(
+        f"git push {arguments} https://git.example.com/team/app HEAD:refs/heads/feature"
+    )
+    assert foreign is not None and foreign["result"] == "ASK"
+    assert "outside configured GitLab hosts" in foreign["reason"]
+    for remote in [_URL, "origin", "", _URL + "/../other"]:
+        assert _result(f"git push {arguments} {remote}", write_repos=[_PROJECT]) == "DENY"
+
+
+@pytest.mark.parametrize("extra", ["--push-option=ci.skip", "--all", "other"])
+def test_known_forbidden_branch_stays_denied_with_unresolved_effects(extra: str) -> None:
+    response = _response(
+        f"git push {_URL} HEAD:refs/heads/main {extra}",
+        write_repos=[_PROJECT],
+        write_branches=["feature"],
+    )
+    assert response is not None and response["result"] == "DENY"
+    assert "branch is not permitted" in response["reason"]
+
+
+@pytest.mark.parametrize("name", ["refs/heads/main", "+example"])
+def test_tag_shorthand_name_is_not_a_branch_or_force_refspec(name: str) -> None:
+    response = _response(
+        f"git push {_URL} tag {name}",
+        write_repos=[_PROJECT],
+        write_branches=["feature"],
+        deny_tag_push=False,
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "additional effects" in response["reason"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        f"clone -c core.filemode=false {_URL}",
+        f"clone --config core.filemode=false {_URL}",
+        f"clone --recurse-submodules {_URL}",
+        f"clone --reference /tmp/example {_URL}",
+        f"fetch --multiple {_URL} other",
+        f"fetch --all {_URL}",
+        f"fetch --submodule-prefix example {_URL}",
+        f"pull --recurse-submodules {_URL} main",
+        f"push --recurse-submodules=on-demand {_URL} HEAD:refs/heads/feature",
+        f"push --recurse-submodules=check {_URL} HEAD:refs/heads/feature",
+        f"push --push-option=ci.skip {_URL} HEAD:refs/heads/feature",
+        f"push -oci.skip {_URL} HEAD:refs/heads/feature",
+        f"push --receive-pack=example {_URL} HEAD:refs/heads/feature",
+        f"push --all {_URL}",
+        f"push --future-option value {_URL} HEAD:refs/heads/feature",
+        f"-c push.followTags=true push {_URL} HEAD:refs/heads/feature",
+        f"-C /tmp/example push {_URL} HEAD:refs/heads/feature",
+        f"push --repo {_URL} --repo https://gitlab.com/team/other HEAD:refs/heads/feature",
+        "clone git@gitlab.com:team/sub/app.git",
+        "fetch https://gitlab.com.example.net/team/sub/app main",
+        "pull /tmp/example main",
+    ],
+)
+def test_unmodelled_transfer_effects_ask(arguments: str) -> None:
+    assert _result(f"git {arguments}", write_repos=[_PROJECT]) == "ASK"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        f"push -o --force {_URL} HEAD:refs/heads/feature",
+        f"push --push-option --delete {_URL} HEAD:refs/heads/feature",
+        f"push --receive-pack --tags {_URL} HEAD:refs/heads/feature",
+        f"push --recurse-submodules --force {_URL} HEAD:refs/heads/feature",
+        "push --push-option --force",
+        "push --receive-pack --tags",
+        "push --recurse-submodules --force",
+        f"push --future-option --force {_URL} HEAD:refs/heads/feature",
+    ],
+)
+def test_git_option_values_do_not_become_push_guards(arguments: str) -> None:
+    response = _response(f"git {arguments}", write_repos=[_PROJECT])
+    assert response is not None and response["result"] == "ASK"
+    assert "Force pushes" not in response["reason"]
+    assert "deletion is not permitted" not in response["reason"]
+    assert "Tag pushes" not in response["reason"]
+
+
+@pytest.mark.parametrize("branch", ["", "bad..name", "bad.lock", "bad/", "-bad", "bad name"])
+def test_invalid_branch_configuration_fails(branch: str) -> None:
+    with pytest.raises(ValueError, match="write_branches"):
+        gitlab_policy(write_branches=[branch])
+
+
+def test_git_transfer_shell_composition_and_host_pinning() -> None:
+    configuration = {
+        "hosts": ["gitlab.com", "gitlab.example.com:8443"],
+        "write_repos": ["https://gitlab.example.com:8443/team/sub/app"],
+    }
+    command = "git push https://gitlab.example.com:8443/team/sub/app HEAD:refs/heads/feature"
+    assert _result(f'bash -c "{command}"', **configuration) == "ALLOW"
+    assert _result(f"git push {_URL} HEAD:refs/heads/feature", **configuration) == "DENY"
+    assert _result(f"git fetch origin && {command}", **configuration) == "ASK"
+    assert (
+        _result(f"git fetch origin && git push {_URL} HEAD:refs/heads/feature", **configuration)
+        == "DENY"
+    )
+
+
+@pytest.mark.parametrize(
+    ("remote", "expected"),
+    [
+        ("https://user:example@gitlab.com/team/sub/app.git", "ASK"),
+        (_URL + ".wiki.git", "DENY"),
+        (_URL + "/snippets/12.git", "DENY"),
+        (_URL + "/", "ASK"),
+    ],
+)
+def test_git_project_identity_is_not_reduced_to_parent(remote: str, expected: str) -> None:
+    assert _result(f"git fetch {remote}", read_all=False, read_repos=[_PROJECT]) == expected
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "printf -v GIT_CONFIG_COUNT 1; export GIT_CONFIG_COUNT;",
+        "printf -vGIT_CONFIG_COUNT 1;",
+        "printf -v GIT_CONFIG_COUNT 1; "
+        "printf -v GIT_CONFIG_KEY_0 url.https://git.example.com/team/.insteadOf; "
+        "printf -v GIT_CONFIG_VALUE_0 https://gitlab.com/; "
+        "export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0;",
+        "env -u GIT_CONFIG_COUNT",
+    ],
+)
+def test_protected_environment_names_keep_otherwise_permitted_transfers_pending(
+    prefix: str,
+) -> None:
+    response = _response(
+        f"{prefix} git push {_URL} HEAD:refs/heads/feature", write_repos=[_PROJECT]
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"glab issue create -R {_URL} -t HOME -d Details",
+        "git commit -m HOME",
+        'git commit -m "Document GIT_DIR"',
+        'echo "GIT"_DIR',
+        "git add git_helpers.py",
+    ],
+)
+def test_protected_environment_names_in_literal_text_conservatively_ask(command: str) -> None:
+    response = _response(command, write_repos=[_PROJECT])
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]
+
+
+def test_protected_environment_names_do_not_weaken_a_known_denial() -> None:
+    assert (
+        _result(
+            f"export GIT_CONFIG_COUNT; git push {_URL} HEAD:refs/heads/main",
+            write_repos=[_PROJECT],
+            write_branches=["feature"],
+        )
+        == "DENY"
+    )
+
+
+def test_protected_environment_name_matching_respects_identifier_boundaries() -> None:
+    assert _result("git add test_git_helpers.py prefix_GIT_DIR.txt HOMELAND.txt") == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "CURL_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "SSH_ASKPASS",
+    ],
+)
+def test_execution_and_transport_environment_names_require_approval(name: str) -> None:
+    response = _response(
+        f"export {name}; git push {_URL} HEAD:refs/heads/feature", write_repos=[_PROJECT]
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]
+
+
+@pytest.mark.parametrize("name", ["Git_Config_Count", "gIt_CoNfIg_KeY_0", "Path", "ssl_cert_file"])
+def test_protected_environment_names_ignore_case_across_hosts(name: str) -> None:
+    response = _response(
+        f"set {name}=example; git push {_URL} HEAD:refs/heads/feature", write_repos=[_PROJECT]
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]

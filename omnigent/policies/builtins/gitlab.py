@@ -1,7 +1,7 @@
-"""Project permissions for a bounded set of glab issue and merge-request commands.
+"""Project permissions for bounded Git transfers and glab activities.
 
 Only explicitly supported command/option combinations can run automatically.
-Git remote commands, MR writes, and custom API requests require approval.
+Unresolved Git destinations, MR writes, and custom API requests require approval.
 The policy examines shell text; existing CLI configuration must be trusted.
 GitLab MCP tools and direct HTTP clients are outside this policy's scope.
 """
@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from omnigent.git_providers.gitlab import _valid_project, instance_authority
+from omnigent.policies.builtins._git import parse_git_arguments
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
     SHELL_TOOLS,
@@ -46,7 +47,25 @@ _CLI_ENVIRONMENT = frozenset(
         "XDG_CONFIG_HOME",
         "XDG_CONFIG_DIRS",
         "PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "CURL_CA_BUNDLE",
+        "SSH_ASKPASS",
     }
+)
+_CLI_ENVIRONMENT_NAMES = re.compile(
+    r"(?:(?<=-[A-Za-z])|(?<![A-Za-z0-9_]))(?:"
+    + "|".join(sorted(_CLI_ENVIRONMENT))
+    + r"|(?:GIT|GITLAB|GLAB|LD|DYLD)_[A-Za-z0-9_]*)(?![A-Za-z0-9_])",
+    re.IGNORECASE | re.ASCII,
 )
 _LOCAL_GIT_COMMANDS = frozenset(
     {
@@ -90,6 +109,143 @@ _COMMAND_OPTIONS = {
     ("mr", "view"): _option_spec("output:F page:p per-page:P", "comments:c system-logs:s"),
     ("mr", "diff"): _option_spec("color", "raw"),
 }
+
+_GIT_OPTIONS = {
+    "clone": _option_spec(
+        "branch:b origin:o depth shallow-since shallow-exclude",
+        "quiet:q verbose:v progress no-progress no-checkout:n bare single-branch "
+        "no-single-branch no-tags",
+    ),
+    "fetch": _option_spec(
+        "depth deepen shallow-since shallow-exclude",
+        "quiet:q verbose:v progress no-progress tags:t no-tags:n prune:p prune-tags:P "
+        "force:f append:a keep:k dry-run no-recurse-submodules unshallow",
+    ),
+    "pull": _option_spec(
+        "depth deepen shallow-since shallow-exclude",
+        "quiet:q verbose:v progress no-progress no-recurse-submodules ff-only "
+        "no-rebase no-edit no-commit no-stat:n stat",
+    ),
+    "push": _option_spec(
+        "receive-pack exec push-option:o recurse-submodules",
+        "quiet:q verbose:v progress no-progress porcelain dry-run:n force:f "
+        "force-with-lease force-if-includes delete:d tags follow-tags all mirror prune "
+        "set-upstream:u atomic thin no-thin signed no-signed "
+        "no-recurse-submodules",
+    ),
+}
+_PUSH_OPTIONAL_VALUES = frozenset({"force-with-lease", "signed"})
+
+
+def _valid_branch(value: str) -> bool:
+    """Validate a literal ref suffix without resolving revisions or local refs."""
+    return bool(value) and not (
+        value == "@"
+        or value.startswith(("-", "/"))
+        or value.endswith(("/", "."))
+        or any(part in value for part in ("..", "@{", "//"))
+        or any(char.isspace() or ord(char) < 32 or char in "~^:?*[\\" for char in value)
+        or "\x7f" in value
+        or any(part.startswith(".") or part.endswith(".lock") for part in value.split("/"))
+    )
+
+
+@dataclass(frozen=True)
+class _GitTransfer:
+    project: _Project | None
+    write: bool
+    branches: tuple[str, ...] = ()
+    tag: bool = False
+    force: bool = False
+    delete: bool = False
+    unresolved: bool = False
+    foreign_host: bool = False
+
+
+def _git_transfer(tokens: list[str], hosts: frozenset[str]) -> _GitTransfer | None:
+    """Classify only explicit HTTPS destinations and individually named push refs."""
+    command = tokens[1]
+    options = _GIT_OPTIONS.get(command)
+    if options is None:
+        return None
+    args = parse_git_arguments(
+        tokens[2:], options, _PUSH_OPTIONAL_VALUES if command == "push" else frozenset()
+    )
+    if args is None:
+        return None
+    operands = list(args.operands)
+    if not operands and command != "push":
+        return None
+    remote = operands.pop(0) if operands else ""
+    # Git remote names and local paths require configuration or filesystem resolution.
+    project = _project_ref(remote, hosts) if remote.startswith("https://") else None
+    authority = None
+    if remote.startswith("https://"):
+        try:
+            parsed = urlsplit(remote)
+            authority = instance_authority(f"{parsed.scheme}://{parsed.netloc}")
+        except ValueError:
+            pass
+    foreign_host = authority is not None and authority not in hosts
+    if command != "push":
+        if command == "clone" and len(operands) > 1:
+            return None
+        return _GitTransfer(project, write=False, foreign_host=foreign_host)
+
+    force = any(
+        args.has(name) for name in ("force", "force-with-lease", "force-if-includes", "mirror")
+    )
+    tag = any(args.has(name) for name in ("tags", "follow-tags", "mirror"))
+    delete = args.has("delete") or args.has("mirror") or args.has("prune")
+    unresolved = (
+        not operands
+        or any(
+            args.has(name)
+            for name in (
+                "all",
+                "mirror",
+                "prune",
+                "tags",
+                "follow-tags",
+                "push-option",
+                "receive-pack",
+                "exec",
+            )
+        )
+        or args.has("recurse-submodules")
+    )
+    branches: list[str] = []
+    refspecs = iter(operands)
+    for refspec in refspecs:
+        if refspec == "tag":
+            tag, unresolved = True, True
+            next(refspecs, None)
+            continue
+        if refspec.startswith("+"):
+            force, refspec = True, refspec[1:]
+        source, separator, destination = refspec.partition(":")
+        if not separator:
+            destination = source
+        if (separator and not source and destination) or args.has("delete"):
+            delete = True
+        if (source and not _valid_branch(source)) or ":" in destination:
+            unresolved = True
+        if destination.startswith("refs/heads/") and _valid_branch(destination[11:]):
+            branches.append(destination[11:])
+        elif destination.startswith("refs/tags/") and _valid_branch(destination[10:]):
+            tag = True
+        else:
+            unresolved = True
+    return _GitTransfer(
+        project=project,
+        write=True,
+        branches=tuple(branches),
+        tag=tag,
+        force=force,
+        delete=delete,
+        unresolved=unresolved,
+        foreign_host=foreign_host,
+    )
 
 
 @dataclass(frozen=True)
@@ -221,6 +377,11 @@ def _evaluate_shell(
         segments = error.completed_segments
         decision = _ask("GitLab policy cannot fully inspect this shell syntax. Approve?")
     for segment in segments:
+        if _CLI_ENVIRONMENT_NAMES.search(segment):
+            decision = _worse(
+                decision,
+                _ask("Commands naming protected CLI environment variables require approval."),
+            )
         if _UNMODELLED_CONTROL.search(segment):
             continue
         if _has_unmodelled_shell_effects(segment):
@@ -235,13 +396,11 @@ def _evaluate_shell(
             if _GATED_COMMAND.search(segment):
                 decision = _worse(decision, _ask("Could not parse the git/glab command. Approve?"))
             continue
-        if any(
-            (name := token.partition("=")[0]) in _CLI_ENVIRONMENT
-            or name.startswith(("GITLAB_", "GLAB_", "GIT_CONFIG"))
-            for token in raw_tokens
-            if "=" in token
-        ):
-            decision = _worse(decision, _ask("CLI environment changes require approval."))
+        if _CLI_ENVIRONMENT_NAMES.search(" ".join(raw_tokens)):
+            decision = _worse(
+                decision,
+                _ask("Commands naming protected CLI environment variables require approval."),
+            )
         tokens = real_invocation_tokens(raw_tokens)
         while tokens[:1] == ["!"]:
             tokens = real_invocation_tokens(tokens[1:])
@@ -276,15 +435,24 @@ def gitlab_policy(
     read_all: bool = True,
     read_repos: list[str] | None = None,
     write_repos: list[str] | None = None,
+    write_branches: list[str] | None = None,
+    allow_destructive: bool = False,
+    deny_tag_push: bool = True,
+    deny_force_push: bool = True,
     shell_tools: list[str] | None = None,
     deny_reason: str = "GitLab operation blocked by policy.",
 ) -> Callable[[PolicyEvent], PolicyResponse | None]:
-    """Allow supported glab activities only on explicitly selected GitLab projects.
+    """Allow supported Git/glab activities on explicitly selected GitLab projects.
 
     :param hosts: Trusted GitLab HTTPS authorities; defaults to gitlab.com.
     :param read_all: Allow supported reads across projects on the configured hosts.
     :param read_repos: Readable project paths or host-pinned HTTPS project URLs.
-    :param write_repos: Projects on which issues may be created or commented on.
+    :param write_repos: Projects permitting supported issue writes and Git pushes.
+    :param write_branches: Exact, case-sensitive push destination branch names;
+        None or empty means unrestricted. Does not apply to issues or tags.
+    :param allow_destructive: Permit explicit ref deletions through write checks.
+    :param deny_tag_push: Deny tag pushes, including bulk tag flags, by default.
+    :param deny_force_push: Deny force flags and force-prefixed refspecs by default.
     :param shell_tools: Tools whose command argument is checked; defaults to all shell tools.
     :param deny_reason: Prefix for DENY explanations.
     :returns: A policy returning DENY, ASK, or None when it abstains.
@@ -306,7 +474,23 @@ def gitlab_policy(
         return result
 
     allowed_read, allowed_write = projects(read_repos), projects(write_repos)
+    allowed_branches = frozenset(write_branches or [])
+    if any(not _valid_branch(branch) for branch in allowed_branches):
+        raise ValueError("gitlab_policy: write_branches must contain literal branch names")
     tools = SHELL_TOOLS if shell_tools is None else frozenset(shell_tools)
+
+    def gate_project(project: _Project, write: bool) -> PolicyResponse | None:
+        allowed = allowed_write if write else allowed_read
+        if (
+            (write or not read_all)
+            and project not in allowed
+            and (None, project[1]) not in allowed
+        ):
+            return _deny(
+                f"{deny_reason} Project {project[0]}/{project[1]} is not permitted "
+                f"for this {'write' if write else 'read'}."
+            )
+        return None
 
     def check(tokens: list[str]) -> PolicyResponse | None:
         executable = (
@@ -319,7 +503,37 @@ def gitlab_policy(
                 index = None
             if index == 1 and tokens[index] in _LOCAL_GIT_COMMANDS:
                 return None
-            return _ask("Git remote operations and configuration require approval.")
+            if index != 1:
+                return _ask("Git global options and configuration require approval.")
+            transfer = _git_transfer(tokens, owned_hosts)
+            if transfer is None:
+                return _ask("Unsupported Git options or configuration require approval.")
+            if transfer.foreign_host:
+                return _ask("The explicit HTTPS destination is outside configured GitLab hosts.")
+            if transfer.force and deny_force_push:
+                return _deny(f"{deny_reason} Force pushes are not permitted.")
+            if transfer.tag and deny_tag_push:
+                return _deny(f"{deny_reason} Tag pushes are not permitted.")
+            if transfer.delete and not allow_destructive:
+                return _deny(f"{deny_reason} Remote ref deletion is not permitted.")
+            if transfer.project is None:
+                return _ask(
+                    "Use an explicit HTTPS GitLab project URL; "
+                    "remote resolution requires approval."
+                )
+            decision = gate_project(transfer.project, transfer.write)
+            if decision is not None:
+                return decision
+            if allowed_branches and any(
+                branch not in allowed_branches for branch in transfer.branches
+            ):
+                return _deny(f"{deny_reason} Push destination branch is not permitted.")
+            if transfer.unresolved:
+                return _ask(
+                    "Git push destinations or additional effects require approval; "
+                    "use explicit refs/heads/ destinations."
+                )
+            return None
         if executable != "glab":
             if _GATED_COMMAND.search(" ".join(tokens)):
                 return _ask("This command form mentions git/glab but cannot be resolved. Approve?")
@@ -351,16 +565,9 @@ def gitlab_policy(
         ) or (not needs_number and args.operands):
             return _ask("Unsupported glab operands require approval; use a numeric issue/MR ID.")
         write = (group, action) in {("issue", "create"), ("issue", "note")}
-        allowed = allowed_write if write else allowed_read
-        if (
-            (write or not read_all)
-            and project not in allowed
-            and (None, project[1]) not in allowed
-        ):
-            return _deny(
-                f"{deny_reason} Project {project[0]}/{project[1]} is not permitted "
-                f"for this {'write' if write else 'read'}."
-            )
+        decision = gate_project(project, write)
+        if decision is not None:
+            return decision
         if write:
             required = ("title", "description") if action == "create" else ("message",)
             if any(not args.last(name) or args.last(name) == "-" for name in required):
@@ -388,8 +595,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
         "kind": "factory",
         "name": "GitLab Project Access",
         "description": (
-            "Project permissions for supported glab issue and MR reads, issue creation, "
-            "and issue comments. Other GitLab operations require approval."
+            "Project permissions for explicit Git downloads and pushes, glab issue and MR "
+            "reads, and issue writes. Unresolved operations require approval."
         ),
         "params_schema": {
             "type": "object",
@@ -413,7 +620,30 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                 "write_repos": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Projects permitting issue creation and comments.",
+                    "description": "Projects permitting supported issue writes and Git pushes.",
+                },
+                "write_branches": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Exact push destination branch names; empty permits all. "
+                        "Does not restrict tags or issues."
+                    ),
+                },
+                "allow_destructive": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Permit explicit remote ref deletions through write checks.",
+                },
+                "deny_tag_push": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Deny pushes that update tags.",
+                },
+                "deny_force_push": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Deny force flags and force-prefixed push refspecs.",
                 },
                 "shell_tools": {
                     "type": "array",
