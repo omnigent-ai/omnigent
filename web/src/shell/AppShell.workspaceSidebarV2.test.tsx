@@ -200,6 +200,9 @@ vi.mock("./InlineTerminalsSection", () => ({ InlineTerminalsSection: () => null 
 vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useSession } from "@/hooks/useSession";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
+import { LEVEL_READ } from "@/lib/permissionsApi";
 import { readRecentWorkspaceFiles } from "@/lib/recentWorkspaceFiles";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
@@ -449,6 +452,48 @@ describe("workspace_sidebar_v2", () => {
 
     expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
     expect(goToFile.props).toMatchObject({ sessionId: "conv_ws", textSearch: false });
+  });
+
+  it.each([
+    [
+      "a read-only viewer the session doesn't share its files with",
+      () => {
+        const session = vi.mocked(useSession);
+        const original = session.getMockImplementation()!;
+        session.mockImplementation(
+          () =>
+            ({
+              session: { id: "conv_ws", permissionLevel: LEVEL_READ, shareWorkspaceFiles: false },
+              isLoading: false,
+              error: null,
+            }) as never,
+        );
+        onTestFinished(() => {
+          session.mockImplementation(original);
+        });
+      },
+    ],
+    [
+      "a session whose environment has no filesystem",
+      () => {
+        const environment = vi.mocked(useWorkspaceEnvironment);
+        const original = environment.getMockImplementation()!;
+        environment.mockImplementation(
+          () => ({ data: { available: false, root: null }, isLoading: false }) as never,
+        );
+        onTestFinished(() => {
+          environment.mockImplementation(original);
+        });
+      },
+    ],
+  ])("keeps Go to File's Sessions but searches no files for %s", async (_, arrange) => {
+    arrange();
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: null, textSearch: false });
   });
 
   it("offers Go to File's text search when the session has content search", async () => {

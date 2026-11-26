@@ -3384,7 +3384,8 @@ function AppShellImpl() {
         <Suspense fallback={null}>
           <LazyGoToFileHost
             key={serverConversationId ?? "no-session"}
-            sessionId={serverConversationId ?? null}
+            // Files and Text only where the session's files can be browsed; Sessions always.
+            sessionId={showFilesPanel ? (serverConversationId ?? null) : null}
             openFile={openFileViewer}
             showTextSearch={() => showTabsPage("content-search")}
             textSearch={railTabsAvailable["content-search"]}
