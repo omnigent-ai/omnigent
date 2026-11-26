@@ -194,15 +194,17 @@ def test_a_draft_change_runs_gh_pr_ready(
 
 
 @pytest.mark.parametrize(
-    "is_draft, draft, refusal",
+    "pr_state, is_draft, draft, refusal",
     [
-        (True, True, "This pull request is already a draft."),
-        (False, False, "This pull request is already ready for review."),
+        ("OPEN", True, True, "This pull request is already a draft."),
+        ("OPEN", False, False, "This pull request is already ready for review."),
+        ("MERGED", False, True, "This pull request is merged, so it can't become a draft."),
     ],
 )
 def test_a_draft_change_that_wouldnt_change_anything_is_refused_with_nothing_sent(
-    fake: FakeGitHub, is_draft: bool, draft: bool, refusal: str
+    fake: FakeGitHub, pr_state: str, is_draft: bool, draft: bool, refusal: str
 ) -> None:
+    fake.state["state"] = pr_state
     fake.state["isDraft"] = is_draft
 
     with pytest.raises(ValueError, match=refusal):

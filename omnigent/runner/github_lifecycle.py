@@ -91,9 +91,11 @@ def set_draft(root: str, reference: PullRequestRef, *, draft: bool) -> dict[str,
 
 
 def _set_draft(root: str, reference: PullRequestRef, *, draft: bool) -> dict[str, Any]:
-    current = github._pr_json(root, reference, "isDraft")
+    current = github._pr_json(root, reference, "state,isDraft")
     if current is None:
         raise ValueError(_LOAD_FAILED)
+    if draft and current.get("state") == "MERGED":
+        raise ValueError("This pull request is merged, so it can't become a draft.")
     if draft and current.get("isDraft") is True:
         raise ValueError("This pull request is already a draft.")
     if not draft and current.get("isDraft") is False:
