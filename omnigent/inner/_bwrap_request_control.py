@@ -69,7 +69,8 @@ class BwrapRequestControl:
 
     Control uses AF_UNIX SOCK_SEQPACKET. The launcher owner enables SO_PASSCRED
     before spawn and retains its outer pidfd until receive succeeds. Only run
-    closes the transferred resources.
+    closes the transferred resources. The owner must retain its credentials and
+    signaling authority until run finishes retiring both pinned lifetimes.
     """
 
     def __init__(
