@@ -165,7 +165,7 @@ describe("FilesPageViewer", () => {
   });
 
   it("puts find, the file's paths, its download and the finders in File actions", async () => {
-    useFileFinderStore.getState().setAvailableSession("conv_1");
+    useFileFinderStore.getState().setAvailableSession("conv_1", { textSearch: true });
     renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
     await userEvent.click(screen.getByRole("button", { name: "File actions" }));
     const menu = screen.getByRole("menu");
@@ -226,8 +226,16 @@ describe("FilesPageViewer", () => {
     expect(screen.queryByRole("menuitem", { name: "Search Text in Workspace…" })).toBeNull();
   });
 
-  it("opens a finder from File actions only once focus is back on ⋯", async () => {
+  it("offers Go to File but not Search Text where the session's files can't be searched for text", async () => {
     useFileFinderStore.getState().setAvailableSession("conv_1");
+    renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
+    await userEvent.click(screen.getByRole("button", { name: "File actions" }));
+    expect(screen.getByRole("menuitem", { name: "Go to File in Workspace…" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Search Text in Workspace…" })).toBeNull();
+  });
+
+  it("opens a finder from File actions only once focus is back on ⋯", async () => {
+    useFileFinderStore.getState().setAvailableSession("conv_1", { textSearch: true });
     renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
     const trigger = screen.getByRole("button", { name: "File actions" });
     const openFromMenu = async (row: string, kind: "files" | "text") => {

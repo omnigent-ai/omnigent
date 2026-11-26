@@ -51,7 +51,8 @@ Filename search remains in Files.
   row shows only where the session can search text and that line is at most 4,096
   characters.
 - Tabs sidebar's Files tab: with a text file open, choose **File actions (⋯) →
-  Search Text in Workspace…**, shown while the session can search.
+  Search Text in Workspace…**, shown while the session can search text. **Go to
+  File in Workspace…** beside it needs only the session's file finder.
 
 ## Driving it with the repro environment
 
