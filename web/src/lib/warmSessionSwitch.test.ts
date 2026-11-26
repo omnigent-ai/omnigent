@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as capabilities from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -11,6 +11,10 @@ import {
 } from "./warmSessionSwitch";
 
 const initialStoreState = useChatStore.getState();
+
+beforeEach(() => {
+  vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue(null);
+});
 
 afterEach(() => {
   useChatStore.setState(initialStoreState);
@@ -47,37 +51,63 @@ describe("switchSessionBeforeNavigate", () => {
     const entry = conversationRegistry.acquire("conv_b");
     entry.setState({ abortController: new AbortController(), blocks: [] });
 
-    switchSessionBeforeNavigate("conv_b");
+    switchSessionBeforeNavigate("conv_b", "conv_a");
 
     // The synchronous half of `switchTo` (root write + live mirror) ran before
     // the navigation commit that follows the click.
     expect(useChatStore.getState().conversationId).toBe("conv_b");
     expect(useChatStore.getState().loadingConversation).toBe(false);
     // The store is now one frame ahead of the URL; the gate reads this window.
-    expect(warmSwitchInFlight("conv_b")).toBe(true);
+    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(true);
   });
 
   it("leaves the store alone when the flag is off", () => {
     useChatStore.setState({ conversationId: "conv_a" });
 
-    switchSessionBeforeNavigate("conv_b");
+    switchSessionBeforeNavigate("conv_b", "conv_a");
 
     expect(useChatStore.getState().conversationId).toBe("conv_a");
     expect(conversationRegistry.peek("conv_b")).toBeUndefined();
-    expect(warmSwitchInFlight("conv_b")).toBe(false);
+    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
   });
 
-  it("only reports the window for the in-flight target and clears it", () => {
+  it("does not open a window for the already-active session", () => {
+    spyFeatures({ warm_switch_keep_mounted_ui: true });
+    useChatStore.setState({ conversationId: "conv_a" });
+    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+
+    switchSessionBeforeNavigate("conv_a", "conv_a");
+
+    expect(switchTo).not.toHaveBeenCalled();
+    expect(warmSwitchInFlight("conv_a", "conv_a")).toBe(false);
+    expect(warmSwitchInFlight("conv_a", "conv_b")).toBe(false);
+  });
+
+  it("returning to the source URL closes the window without waiting for navigation", () => {
+    spyFeatures({ warm_switch_keep_mounted_ui: true });
+    useChatStore.setState({ conversationId: "conv_b" });
+    const entry = conversationRegistry.acquire("conv_a");
+    entry.setState({ abortController: new AbortController(), blocks: [] });
+
+    switchSessionBeforeNavigate("conv_a", "conv_a");
+
+    expect(useChatStore.getState().conversationId).toBe("conv_a");
+    expect(warmSwitchInFlight("conv_a", "conv_a")).toBe(false);
+  });
+
+  it("only reports the window for the in-flight target and source URL and clears it", () => {
     spyFeatures({ warm_switch_keep_mounted_ui: true });
     useChatStore.setState({ conversationId: "conv_a" });
     const entry = conversationRegistry.acquire("conv_b");
     entry.setState({ abortController: new AbortController(), blocks: [] });
 
-    switchSessionBeforeNavigate("conv_b");
+    switchSessionBeforeNavigate("conv_b", "conv_a");
 
-    expect(warmSwitchInFlight("conv_a")).toBe(false);
-    expect(warmSwitchInFlight(null)).toBe(false);
+    expect(warmSwitchInFlight("conv_a", "conv_a")).toBe(false);
+    expect(warmSwitchInFlight("conv_b", "conv_b")).toBe(false);
+    expect(warmSwitchInFlight("conv_b", "conv_c")).toBe(false);
+    expect(warmSwitchInFlight(null, "conv_a")).toBe(false);
     clearWarmSwitchInFlight();
-    expect(warmSwitchInFlight("conv_b")).toBe(false);
+    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
   });
 });

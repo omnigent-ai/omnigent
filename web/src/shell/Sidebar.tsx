@@ -838,6 +838,17 @@ function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): s
   return incomplete ? `${label}; more automations not yet checked` : label;
 }
 
+function isPlainPrimaryClick(event: MouseEvent<HTMLAnchorElement>): boolean {
+  return (
+    !event.defaultPrevented &&
+    event.button === 0 &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !event.altKey
+  );
+}
+
 function SidebarImpl({
   open,
   onClose,
@@ -982,9 +993,7 @@ function SidebarImpl({
   // clicks open tabs); we only close the drawer on a plain primary click on
   // mobile. Stable identity (useStableCallback) so it doesn't defeat the row memo.
   const onNavClick = useStableCallback((e: MouseEvent<HTMLAnchorElement>) => {
-    if (e.defaultPrevented) return;
-    if (e.button !== 0) return;
-    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    if (!isPlainPrimaryClick(e)) return;
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
   });
   // A search result that opens its row closes the phone's menu, as a section link does.
@@ -2613,8 +2622,7 @@ function ConversationList({
   const [optimisticActiveId, setOptimisticActiveId] = useState<string | null>(null);
   useEffect(() => setOptimisticActiveId(null), [activeId]);
   const activateRow = useCallback((id: string, event: MouseEvent<HTMLAnchorElement>) => {
-    if (event.defaultPrevented || event.button !== 0) return;
-    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (!isPlainPrimaryClick(event)) return;
     setOptimisticActiveId(id);
   }, []);
   const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
@@ -6215,6 +6223,7 @@ function ConversationRowImpl({
   const desktopCommands = useAvailableDesktopCommands();
   const sessionShortcuts = isActive ? desktopCommands : NO_DESKTOP_COMMANDS;
   const hostsById = useContext(HostsByIdContext);
+  const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   // A client-only `temp:` row (navigate-first create window): no server session
@@ -6747,19 +6756,12 @@ function ConversationRowImpl({
             return;
           }
           activateRow(conversation.id, e);
-          // Same guards as activateRow: modified clicks open a new tab and must
-          // not move this one, and draft rows navigate away from /c/:id.
           if (
-            e.button === 0 &&
-            !e.defaultPrevented &&
-            !e.metaKey &&
-            !e.ctrlKey &&
-            !e.shiftKey &&
-            !e.altKey &&
-            conversation.nested_draft_source_id === undefined &&
+            isPlainPrimaryClick(e) &&
+            !conversation.nested_draft_source_id &&
             conversation.project_draft_name === undefined
           ) {
-            switchSessionBeforeNavigate(conversation.id);
+            switchSessionBeforeNavigate(conversation.id, urlConvId ?? null);
           }
           onClick(e);
         }}
