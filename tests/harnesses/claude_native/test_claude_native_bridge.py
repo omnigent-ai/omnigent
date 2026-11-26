@@ -11930,7 +11930,9 @@ def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
     saved_provider = provider_config(7.0)["providers"]["anthropic-local"]
     saved_provider.pop("default")
     saved_config["providers"]["launch-named"] = saved_provider
-    saved_config["inference"] = {"harnesses": {"claude-native": {"provider": "launch-named"}}}
+    saved_config["inference"] = {
+        "harnesses": {"claude-native": {"provider": "launch-named", "model_allowlist": []}}
+    }
     saved_path = tmp_path / "inference.json"
     saved_path.write_text(json.dumps(saved_config), encoding="utf-8")
     monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(saved_path))

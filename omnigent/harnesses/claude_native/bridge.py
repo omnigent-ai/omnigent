@@ -4295,7 +4295,7 @@ def _transcript_model_pricing(
         model,
         provider_config=provider_config,
         harness="claude-native",
-        provider_entry=resolve_bound_provider(provider_config, "claude-native"),
+        provider_entry=resolve_bound_provider(provider_config, "claude-native", allow_empty=True),
     )
     if pricing is not None:
         _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)
