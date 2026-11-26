@@ -1074,7 +1074,10 @@ async def test_terminal_shell_answers_unknown_in_time_when_its_liveness_check_st
 async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_read(
     client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Several close paths asking at once start one tmux probe and one read between them."""
+    """Several close paths asking at once start one tmux probe and one read between them.
+
+    Busy, since only a read begun after a request may answer it idle.
+    """
     instance = registry.get("conv_abc", "bash", "s1")
     assert instance is not None
     probes = 0
@@ -1090,7 +1093,7 @@ async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_rea
     async def inspect_shell(self: TerminalInstance) -> ShellInspection:
         nonlocal reads
         reads += 1
-        return ShellInspection(ShellState.IDLE)
+        return ShellInspection(ShellState.BUSY, "vim", 0)
 
     instance.is_alive = live_tmux  # type: ignore[method-assign]
     monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
@@ -1108,7 +1111,7 @@ async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_rea
     release.set()
     responses = await asyncio.gather(*requests)
 
-    assert [resp.json()["state"] for resp in responses] == ["idle"] * 3
+    assert [resp.json()["state"] for resp in responses] == ["busy"] * 3
     assert (probes, reads) == (1, 1)
 
 

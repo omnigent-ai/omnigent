@@ -519,6 +519,10 @@ async def test_a_tmux_that_never_answers_is_unknown_and_stopped(
     assert tmux.killed.is_set()
 
 
+IDLE = ShellInspection(ShellState.IDLE)
+BUSY_VIM = ShellInspection(ShellState.BUSY, "vim", 0)
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -536,7 +540,7 @@ async def test_concurrent_requests_for_one_terminal_share_one_read() -> None:
         nonlocal reads
         reads += 1
         await release.wait()
-        return ShellInspection(ShellState.IDLE)
+        return BUSY_VIM
 
     inspector = ShellInspector()
     waiting = [asyncio.create_task(inspector.inspect("terminal-a", read)) for _ in range(3)]
@@ -545,7 +549,7 @@ async def test_concurrent_requests_for_one_terminal_share_one_read() -> None:
     waiting[0].cancel()
     await asyncio.sleep(0)
     release.set()
-    assert await asyncio.gather(*waiting[1:]) == [ShellInspection(ShellState.IDLE)] * 2
+    assert await asyncio.gather(*waiting[1:]) == [BUSY_VIM] * 2
     assert waiting[0].cancelled()
     assert reads == 1
 
@@ -577,19 +581,89 @@ async def test_a_gone_terminal_answers_none() -> None:
 @pytest.mark.asyncio
 async def test_an_answer_is_reused_briefly_then_read_again() -> None:
     clock = _Clock()
-    answers = iter([ShellInspection(ShellState.IDLE), ShellInspection(ShellState.BUSY, "vim", 0)])
+    answers = iter([BUSY_VIM, UNKNOWN])
 
     async def read() -> ShellInspection:
         return next(answers)
 
     inspector = ShellInspector(cache_seconds=0.25, clock=clock)
-    assert await inspector.inspect("terminal-a", read) == ShellInspection(ShellState.IDLE)
+    assert await inspector.inspect("terminal-a", read) == BUSY_VIM
     clock.now = 0.2
-    assert await inspector.inspect("terminal-a", read) == ShellInspection(ShellState.IDLE)
+    assert await inspector.inspect("terminal-a", read) == BUSY_VIM
     clock.now = 0.3
-    assert await inspector.inspect("terminal-a", read) == ShellInspection(
-        ShellState.BUSY, "vim", 0
-    )
+    assert await inspector.inspect("terminal-a", read) == UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_an_idle_answer_from_before_the_request_is_read_again() -> None:
+    clock = _Clock()
+    answers = iter([IDLE, BUSY_VIM])
+    reads = 0
+
+    async def read() -> ShellInspection:
+        nonlocal reads
+        reads += 1
+        return next(answers)
+
+    inspector = ShellInspector(cache_seconds=0.25, clock=clock)
+    assert await inspector.inspect("terminal-a", read) == IDLE
+    # Within the cache window, but input may have come since that read began.
+    clock.now = 0.1
+    assert await inspector.inspect("terminal-a", read) == BUSY_VIM
+    assert reads == 2
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_joins_an_earlier_read_answering_idle_reads_again() -> None:
+    clock = _Clock()
+    release = asyncio.Event()
+    answers = iter([IDLE, BUSY_VIM])
+    reads = 0
+
+    async def read() -> ShellInspection:
+        nonlocal reads
+        reads += 1
+        answer = next(answers)
+        if answer is IDLE:
+            await release.wait()
+        return answer
+
+    inspector = ShellInspector(clock=clock)
+    first = asyncio.create_task(inspector.inspect("terminal-a", read))
+    await asyncio.sleep(0)
+    # Asked while the first read runs: typing may land between them.
+    clock.now = 0.1
+    second = asyncio.create_task(inspector.inspect("terminal-a", read))
+    await asyncio.sleep(0)
+    release.set()
+    assert await first == IDLE
+    assert await second == BUSY_VIM
+    assert reads == 2
+
+
+@pytest.mark.asyncio
+async def test_requests_after_a_stale_idle_share_one_new_read() -> None:
+    clock = _Clock()
+    answers = iter([IDLE, IDLE])
+    reads = 0
+    release = asyncio.Event()
+
+    async def read() -> ShellInspection:
+        nonlocal reads
+        reads += 1
+        answer = next(answers)
+        if reads == 2:
+            await release.wait()
+        return answer
+
+    inspector = ShellInspector(clock=clock)
+    assert await inspector.inspect("terminal-a", read) == IDLE
+    clock.now = 0.1
+    later = [asyncio.create_task(inspector.inspect("terminal-a", read)) for _ in range(3)]
+    await asyncio.sleep(0)
+    release.set()
+    assert await asyncio.gather(*later) == [IDLE] * 3
+    assert reads == 2
 
 
 @pytest.mark.asyncio

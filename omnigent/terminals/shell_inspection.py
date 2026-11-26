@@ -504,7 +504,9 @@ class ShellInspector:
     """Runs inspections one per terminal at a time, under a shared limit, with a short cache.
 
     A request for a terminal already being read waits for that read; a request within
-    :data:`CACHE_SECONDS` of the last answer reuses it. Each read, a liveness check included,
+    :data:`CACHE_SECONDS` of the last answer reuses it. Idle is the exception: it lets a close
+    skip asking, so it only comes from a read that began at or after the request, never from one
+    that may predate input typed since. Each read, a liveness check included,
     gets :data:`INSPECTION_TIMEOUT_SECONDS` in all, and is cancelled past it. Keys must name one
     terminal, e.g. its tmux socket path; callers check that the caller may see that terminal
     first. A read answers ``None`` for a terminal that's gone.
@@ -522,8 +524,10 @@ class ShellInspector:
         self._cache_seconds = cache_seconds
         self._clock = clock
         self._timeout_seconds = timeout_seconds
-        self._answers: dict[str, tuple[float, ShellInspection | None]] = {}
-        self._in_flight: dict[str, asyncio.Task[ShellInspection | None]] = {}
+        # Per terminal: when the last answer arrived, when its read began, and the answer.
+        self._answers: dict[str, tuple[float, float, ShellInspection | None]] = {}
+        # Per terminal: the read under way, with when it began.
+        self._in_flight: dict[str, tuple[float, asyncio.Task[ShellInspection | None]]] = {}
 
     async def inspect(
         self, key: str, read: Callable[[], Awaitable[ShellInspection | None]]
@@ -536,24 +540,36 @@ class ShellInspector:
         :returns: The inspection, or ``None`` for a gone terminal; unknown when ``read`` raises
             or runs past the budget.
         """
-        now = self._clock()
+        asked = self._clock()
         self._answers = {
             name: answer
             for name, answer in self._answers.items()
-            if now - answer[0] < self._cache_seconds
+            if asked - answer[0] < self._cache_seconds
         }
         cached = self._answers.get(key)
-        if cached is not None:
-            return cached[1]
-        task = self._in_flight.get(key)
-        if task is None:
-            task = asyncio.ensure_future(self._read(key, read))
-            self._in_flight[key] = task
+        if cached is not None and _answers_for(cached[1], cached[2], asked=asked):
+            return cached[2]
+        began, task = self._in_flight.get(key) or self._start(key, read)
         # Shielded so one cancelled caller doesn't cancel the read the others wait on.
-        return await asyncio.shield(task)
+        answer = await asyncio.shield(task)
+        if _answers_for(began, answer, asked=asked):
+            return answer
+        # An idle read that began before this request may predate input: read again, sharing it.
+        flight = self._in_flight.get(key)
+        if flight is None or flight[0] < asked:
+            flight = self._start(key, read)
+        return await asyncio.shield(flight[1])
+
+    def _start(
+        self, key: str, read: Callable[[], Awaitable[ShellInspection | None]]
+    ) -> tuple[float, asyncio.Task[ShellInspection | None]]:
+        began = self._clock()
+        flight = (began, asyncio.ensure_future(self._read(key, began, read)))
+        self._in_flight[key] = flight
+        return flight
 
     async def _read(
-        self, key: str, read: Callable[[], Awaitable[ShellInspection | None]]
+        self, key: str, began: float, read: Callable[[], Awaitable[ShellInspection | None]]
     ) -> ShellInspection | None:
         try:
             async with self._slots:
@@ -564,7 +580,15 @@ class ShellInspector:
                 # A surprise answers unknown, so no exception text holding a row is logged.
                 except Exception:  # noqa: BLE001
                     answer = UNKNOWN
-            self._answers[key] = (self._clock(), answer)
+            self._answers[key] = (self._clock(), began, answer)
             return answer
         finally:
-            self._in_flight.pop(key, None)
+            # A newer read for this terminal may have replaced this one; leave it.
+            flight = self._in_flight.get(key)
+            if flight is not None and flight[1] is asyncio.current_task():
+                del self._in_flight[key]
+
+
+def _answers_for(began: float, answer: ShellInspection | None, *, asked: float) -> bool:
+    """Whether a read that began at ``began`` can answer a request made at ``asked``."""
+    return answer is None or answer.state is not ShellState.IDLE or began >= asked
