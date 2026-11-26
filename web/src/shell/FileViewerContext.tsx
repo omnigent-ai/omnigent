@@ -131,8 +131,9 @@ export function useShowPullRequests():
     if (!context) return null;
     if (context.showPullRequests) return context.showPullRequests;
     const { openGithubTab } = context;
-    return (_target: PullRequestsTarget, options: ShowPullRequestsOptions) => {
-      if (options.classic === "open") openGithubTab();
+    return (target: PullRequestsTarget, options: ShowPullRequestsOptions) => {
+      if (options.classic === "open")
+        openGithubTab(target.kind === "pull" ? target.url : undefined);
     };
   }, [context]);
 }
