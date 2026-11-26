@@ -9,6 +9,7 @@ is ever logged, cached or put in an error.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import ipaddress
 import json
@@ -40,7 +41,7 @@ MAX_CONCURRENT_READS = 4
 MAX_CACHED_REVISIONS = 64
 # An edit that doesn't bump the pull request's update time is seen within this.
 LINKED_URLS_TTL_SECONDS = 300.0
-# Bounds the whole fetch, so a server sending a byte at a time can't hold a slot past it.
+# Bounds the whole fetch, every hop and the body, so no read holds a slot past it.
 FETCH_DEADLINE_SECONDS = 30.0
 # How long a read waits for a slot, inside the server's wait for the first reply.
 SLOT_WAIT_SECONDS = 10.0
@@ -262,7 +263,7 @@ def _sniff(data: bytes) -> str | None:
     return None
 
 
-def _read_image(
+async def _read_image(
     response: httpx.Response, *, deadline: float, clock: Callable[[], float]
 ) -> PullRequestImage:
     content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
@@ -276,8 +277,7 @@ def _read_image(
         raise ImageRefused("too_large")
     chunks: list[bytes] = []
     size = 0
-    # Counted after decoding, so a compressed answer stops at the cap too.
-    for chunk in response.iter_bytes():
+    async for chunk in response.aiter_bytes():
         size += len(chunk)
         if size > MAX_IMAGE_BYTES:
             raise ImageRefused("too_large")
@@ -290,7 +290,7 @@ def _read_image(
     return PullRequestImage(content_type=content_type, data=data)
 
 
-def _transport_for(url: httpx.URL) -> httpx.HTTPTransport:
+def _transport_for(url: httpx.URL) -> httpx.AsyncHTTPTransport:
     """A transport for one request, with TLS always verified and the proxy set explicitly.
 
     Requests go through a transport, not a client: a client logs every URL it fetches,
@@ -299,15 +299,15 @@ def _transport_for(url: httpx.URL) -> httpx.HTTPTransport:
     proxy = urllib.request.getproxies().get("https")
     if proxy and urllib.request.proxy_bypass(url.host):
         proxy = None
-    return httpx.HTTPTransport(verify=client_ssl_context(), trust_env=False, proxy=proxy)
+    return httpx.AsyncHTTPTransport(verify=client_ssl_context(), trust_env=False, proxy=proxy)
 
 
-def _fetch(
+async def _fetch(
     url: httpx.URL,
     *,
     pr_host: str,
     token: str | None,
-    transport: httpx.BaseTransport | None,
+    transport: httpx.AsyncBaseTransport | None,
     clock: Callable[[], float],
 ) -> PullRequestImage:
     """Fetch an allowed image, following at most ``MAX_REDIRECTS`` checked redirects."""
@@ -324,8 +324,8 @@ def _fetch(
             headers["Authorization"] = f"token {token}"
         request = httpx.Request("GET", current, headers=headers, extensions={"timeout": timeout})
         try:
-            with transport or _transport_for(current) as hop_transport:
-                response = hop_transport.handle_request(request)
+            async with transport or _transport_for(current) as hop_transport:
+                response = await hop_transport.handle_async_request(request)
                 try:
                     if response.status_code in _REDIRECT_STATUSES:
                         location = response.headers.get("location")
@@ -335,13 +335,39 @@ def _fetch(
                         continue
                     if response.status_code != 200:
                         raise ImageRefused("fetch_failed")
-                    return _read_image(response, deadline=deadline, clock=clock)
+                    return await _read_image(response, deadline=deadline, clock=clock)
                 finally:
-                    response.close()
+                    await response.aclose()
         # Their messages can name the URL, and a signed URL is a credential.
         except (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, ssl.SSLError, OSError):
             raise ImageRefused("fetch_failed") from None
     raise ImageRefused("fetch_failed")
+
+
+def _fetch_in_time(
+    url: httpx.URL,
+    *,
+    pr_host: str,
+    token: str | None,
+    transport: httpx.AsyncBaseTransport | None,
+    clock: Callable[[], float],
+) -> PullRequestImage:
+    """The fetch, every hop and the body, cut off at one wall-clock deadline.
+
+    Each hop's own waits are capped too, but only this bounds their sum. Blocking: it runs
+    its own event loop, so call it off any running one.
+    """
+
+    async def within_deadline() -> PullRequestImage:
+        async with asyncio.timeout(FETCH_DEADLINE_SECONDS):
+            return await _fetch(
+                url, pr_host=pr_host, token=token, transport=transport, clock=clock
+            )
+
+    try:
+        return asyncio.run(within_deadline())
+    except TimeoutError:
+        raise ImageRefused("fetch_failed") from None
 
 
 def read_pull_request_image(
@@ -349,10 +375,10 @@ def read_pull_request_image(
     reference: PullRequestRef,
     image_url: str,
     *,
-    transport: httpx.BaseTransport | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> PullRequestImage:
-    """The image at ``image_url``, when the pull request links to it.
+    """The image at ``image_url``, when the pull request links to it. Blocking.
 
     The pull request read, its listings and the fetch all run as one account. A host
     the user hasn't set up for GitHub is refused before ``gh`` runs or a token is read.
@@ -373,6 +399,8 @@ def read_pull_request_image(
     if not _read_slots.acquire(timeout=SLOT_WAIT_SECONDS):
         raise ImageRefused("fetch_failed")
     try:
-        return _fetch(url, pr_host=reference.host, token=token, transport=transport, clock=clock)
+        return _fetch_in_time(
+            url, pr_host=reference.host, token=token, transport=transport, clock=clock
+        )
     finally:
         _read_slots.release()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import gzip
 import json
@@ -9,7 +10,8 @@ import logging
 import re
 import ssl
 import threading
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
@@ -21,6 +23,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.runner import github_images
 from omnigent.runner import github_resource as github
 from omnigent.runner.github_images import ImageRefused, checked_image_url, read_pull_request_image
@@ -391,7 +394,7 @@ def test_a_declared_size_over_the_cap_is_refused_unread(fake: FakeGitHub) -> Non
     too_large = str(github_images.MAX_IMAGE_BYTES + 1)
 
     def declared(_request: httpx.Request) -> httpx.Response:
-        def never_read() -> Iterator[bytes]:
+        async def never_read() -> AsyncIterator[bytes]:
             pytest.fail("the body must not be read")
             yield b""
 
@@ -407,7 +410,7 @@ def test_a_stream_past_the_cap_stops_there(
     monkeypatch.setattr(github_images, "MAX_IMAGE_BYTES", 1000)
     sent: list[int] = []
 
-    def chunks() -> Iterator[bytes]:
+    async def chunks() -> AsyncIterator[bytes]:
         for _ in range(100):
             sent.append(1)
             yield PNG[:8] + b"\x00" * 392
@@ -429,7 +432,7 @@ def test_a_compressed_answer_is_refused_before_it_is_decoded(
     bomb = gzip.compress(PNG + b"\x00" * 1_000_000)
     read: list[bytes] = []
 
-    def body() -> Iterator[bytes]:
+    async def body() -> AsyncIterator[bytes]:
         read.append(bomb)
         yield bomb
 
@@ -480,7 +483,7 @@ def test_each_hop_waits_no_longer_than_the_time_left(fake: FakeGitHub) -> None:
 def test_a_server_sending_past_the_deadline_is_cut_off(fake: FakeGitHub) -> None:
     now = [0.0]
 
-    def drip() -> Iterator[bytes]:
+    async def drip() -> AsyncIterator[bytes]:
         yield PNG[:8]
         for _ in range(10):
             now[0] += 10.0
@@ -492,6 +495,44 @@ def test_a_server_sending_past_the_deadline_is_cut_off(fake: FakeGitHub) -> None
 
     assert _refusal(lambda: _read(ASSET, transport, clock=lambda: now[0])) == "fetch_failed"
     assert now[0] <= github_images.FETCH_DEADLINE_SECONDS + 10.0
+
+
+def _slow(header_seconds: float, *, status: int = 200, body_seconds: float = 0.0) -> Any:
+    """An answer whose headers, then its one body part, each take real time to arrive."""
+    headers = {"location": SIGNED} if status == 302 else {"content-type": "image/png"}
+
+    async def answer(_request: httpx.Request) -> httpx.Response:
+        async def body() -> AsyncIterator[bytes]:
+            await asyncio.sleep(body_seconds)
+            yield PNG
+
+        await asyncio.sleep(header_seconds)
+        return httpx.Response(status, headers=headers, content=body())
+
+    return answer
+
+
+async def test_a_read_from_the_hosts_worker_thread_runs_its_own_event_loop(
+    fake: FakeGitHub,
+) -> None:
+    """The host calls the read from its event loop, through a worker thread."""
+    image = await run_sync_on_thread(_read, ASSET, Transport(_image()))
+
+    assert image.data == PNG
+
+
+def test_the_whole_fetch_ends_at_its_deadline_though_no_wait_passes_its_cap(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each wait is under its hop's cap, but together they would run 0.8 s past the deadline."""
+    monkeypatch.setattr(github_images, "FETCH_DEADLINE_SECONDS", 2.0)
+    # The redirect takes 1 s of the 2; the image's headers and its body take 0.9 s each.
+    transport = Transport(_slow(1.0, status=302), _slow(0.9, body_seconds=0.9))
+    started = time.monotonic()
+
+    assert _refusal(lambda: _read(ASSET, transport)) == "fetch_failed"
+
+    assert time.monotonic() - started < 2.4
 
 
 @pytest.mark.parametrize(
@@ -727,10 +768,14 @@ def tls_server(tmp_path: Path) -> Iterator[tuple[int, Path]]:
 
 def _fetch_from(port: int) -> int:
     url = httpx.URL(f"https://localhost:{port}/a.png")
-    with github_images._transport_for(url) as transport:
-        response = transport.handle_request(httpx.Request("GET", url))
-        response.close()
-        return response.status_code
+
+    async def fetch() -> int:
+        async with github_images._transport_for(url) as transport:
+            response = await transport.handle_async_request(httpx.Request("GET", url))
+            await response.aclose()
+            return response.status_code
+
+    return asyncio.run(fetch())
 
 
 def test_a_server_with_an_untrusted_certificate_is_refused(
