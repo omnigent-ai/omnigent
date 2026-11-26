@@ -61,6 +61,7 @@ The schema alone does not fix session pricing. Before activating writes:
 
 Validate the migration on an isolated database with
 `pytest tests/db/test_migration_launch_pricing_context.py --reruns 0 -n 0`.
-The checks cover all three SQL dialects, existing rows and overrides, older SQL
-writes, reference round trips and pre-activation downgrade. They do not replace
-deployment validation of the revision guard or application acceptance.
+The checks render upgrade DDL for SQLite, PostgreSQL and MySQL. SQLite lifecycle
+checks cover existing rows and overrides, older SQL writes, reference round trips
+and pre-activation downgrade. They do not replace deployment validation of the
+revision guard or application acceptance.
