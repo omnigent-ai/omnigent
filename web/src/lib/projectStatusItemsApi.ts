@@ -11,6 +11,8 @@ export type StatusItemMetric =
   | "time_to_merged_median_hours"
   | "time_to_merged_p90_hours"
   | "changes_landed"
+  | "daily_active_humans"
+  | "spend_per_finished_ticket_usd"
   | "tickets_submitted";
 
 /** 7d / 30d / all as on the Summary, or `trend`: the KPI tiles' 7 full days plus today. */
@@ -19,7 +21,7 @@ export type StatusItemRange = "7d" | "30d" | "all" | "trend";
 export interface ProjectStatusItem {
   day_utc: string | null;
   at: number | null;
-  kind: "ticket" | "pull_request" | "session";
+  kind: "ticket" | "pull_request" | "session" | "person";
   /** Ticket ID, PR URL or root session ID. */
   id: string;
   title: string | null;
@@ -49,6 +51,8 @@ export interface ProjectStatusItems {
   items: ProjectStatusItem[];
   excluded: ProjectStatusItem[];
   truncated: boolean;
+  /** Rows about other people withheld from this viewer; the numbers still count them. */
+  hidden_items?: number;
 }
 
 export interface StatusItemsQuery {

@@ -24,6 +24,7 @@ from omnigent.entities.project_kpi import (
     SetProjectKpis,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.server.project_kpis import (
     LANDED_COMMIT_LABELS,
     KpiInputs,
@@ -51,6 +52,7 @@ from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.project_status import move_member_resolver
 from omnigent.server.routes.projects import refuse_unless_owner_or_lead
+from omnigent.server.usage_events import usage_event_store
 
 if TYPE_CHECKING:
     from omnigent.entities import Project
@@ -143,6 +145,8 @@ StatusItemMetric = Literal[
     "time_to_merged_median_hours",
     "time_to_merged_p90_hours",
     "changes_landed",
+    "daily_active_humans",
+    "spend_per_finished_ticket_usd",
     "tickets_submitted",
 ]
 
@@ -152,7 +156,7 @@ class ProjectStatusItem(BaseModel):
 
     day_utc: str | None = Field(description="Its UTC day; null for an undated merge.")
     at: int | None = Field(description="When it happened; null for day-granular spend.")
-    kind: Literal["ticket", "pull_request", "session"]
+    kind: Literal["ticket", "pull_request", "session", "person"]
     id: str = Field(description="Ticket ID, PR URL, or root session ID.")
     title: str | None
     url: str | None = Field(description="The PR's URL; null for tickets and sessions.")
@@ -192,6 +196,13 @@ class ProjectStatusItems(BaseModel):
         description="Items the counting rules leave out, each with its reason."
     )
     truncated: bool
+    hidden_items: int = Field(
+        default=0,
+        description=(
+            "Rows about other people the caller may not see: a member sees only their own "
+            "person rows and agents see none. The day values and total still count them."
+        ),
+    )
 
 
 class ProjectKpiRevisionPage(BaseModel):
@@ -239,6 +250,33 @@ def submitted_series(project: Project, rows: list[dict[str, Any]]) -> MetricSeri
             for row in rows
         ],
     )
+
+
+def is_agent(request: Request) -> bool:
+    """Whether an agent session, not a person, made the request."""
+    return (
+        ORCHESTRATION_SOURCE_HEADER in request.headers
+        or RUNNER_TUNNEL_TOKEN_HEADER in request.headers
+    )
+
+
+def human_activity(
+    request: Request,
+    ticket_store: ProjectTicketStore,
+    project: Project,
+    user_id: str | None,
+    since: int | None,
+) -> list[tuple[str, int]]:
+    """``(user_id, at)`` for what people did by hand: ticket events and session messages."""
+    rows = ticket_store.human_ticket_activity(project.id, user_id=user_id, since_epoch=since)
+    usage = usage_event_store(request.app)
+    if usage is not None:
+        rows.extend(
+            (event.user_id, event.created_at)
+            for event in usage.events(project.id, since_epoch=since, names=("message.sent",))
+            if event.user_id
+        )
+    return rows
 
 
 def daily_trends(
@@ -328,6 +366,9 @@ def create_project_kpis_router(
                 )
             ),
             history_since=since,
+            human_activity=functools.cache(
+                lambda: human_activity(request, ticket_store, project, user_id, since)
+            ),
             ticket_labels=functools.cache(
                 lambda: project_status_cache.get_or_compute(
                     project.id,
@@ -548,7 +589,27 @@ def create_project_kpis_router(
             )
         else:
             series = load_series([metric], inputs, member_of)[metric]
+        viewer = user_member_key(user_id)
+        owner = project.user_id == user_id and not is_agent(request)
+        if member is not None and series.kind == "weekday_mean" and not owner:
+            # One person's activity by day is theirs and the owner's to see.
+            if is_agent(request) or member != viewer:
+                raise OmnigentError(
+                    "Only the project owner can see another person's activity",
+                    code=ErrorCode.FORBIDDEN,
+                )
         result = drilldown(series, period, range_id, member) if series.dated else None
+        hidden = 0
+        if result is not None and not owner:
+            for key in ("items", "excluded"):
+                shown = [
+                    row
+                    for row in result[key]
+                    if row["kind"] != "person"
+                    or (not is_agent(request) and row["member"] == viewer)
+                ]
+                hidden += len(result[key]) - len(shown)
+                result[key] = shown
         rows = [] if result is None else [*result["items"], *result["excluded"]]
         ticket_ids = {row["id"].removeprefix("ticket:") for row in rows if row["kind"] == "ticket"}
         titles = ticket_store.ticket_titles(project.id, sorted(ticket_ids), user_id=user_id)
@@ -565,6 +626,9 @@ def create_project_kpis_router(
                 row["url"] = None
             elif row["kind"] == "session":
                 row["title"] = session_titles[row["id"]]
+                row["url"] = None
+            elif row["kind"] == "person":
+                row["title"] = None
                 row["url"] = None
             else:
                 row["title"] = None
@@ -592,7 +656,7 @@ def create_project_kpis_router(
                 "excluded": [],
                 "truncated": False,
             }
-        return {**base, **result, "available": series.available}
+        return {**base, **result, "available": series.available, "hidden_items": hidden}
 
     @router.get("/projects/{project_id}/status/items", response_model=ProjectStatusItems)
     async def project_status_items(

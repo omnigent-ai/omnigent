@@ -19,6 +19,8 @@ KpiMetricId = Literal[
     "time_to_merged_median_hours",
     "time_to_merged_p90_hours",
     "changes_landed",
+    "daily_active_humans",
+    "spend_per_finished_ticket_usd",
     "none",
 ]
 KpiDirection = Literal["at_least", "at_most"]
@@ -96,6 +98,25 @@ KPI_METRICS: tuple[KpiMetric, ...] = (
         description=(
             "Distinct commits landed in the window: each ticket now at or past the landed "
             "stage counts its verified (else approved) commit once, dated by its move there."
+        ),
+    ),
+    KpiMetric(
+        id="daily_active_humans",
+        label="Daily active people",
+        unit="count",
+        description=(
+            "People active per weekday, averaged over the window's weekdays (UTC Mon-Fri; "
+            "quiet days count as 0): anyone who filed, commented on, moved or labeled a "
+            "ticket by hand, or sent a message in a project session. Agents don't count."
+        ),
+    ),
+    KpiMetric(
+        id="spend_per_finished_ticket_usd",
+        label="Spend per finished ticket",
+        unit="usd",
+        description=(
+            "Agent spend in the window divided by the tickets that reached a completed "
+            "stage in it, in US dollars."
         ),
     ),
 )

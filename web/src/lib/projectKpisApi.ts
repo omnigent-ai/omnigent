@@ -10,6 +10,8 @@ export type KpiMetricId =
   | "time_to_merged_median_hours"
   | "time_to_merged_p90_hours"
   | "changes_landed"
+  | "daily_active_humans"
+  | "spend_per_finished_ticket_usd"
   | "none";
 export type KpiDirection = "at_least" | "at_most";
 export type KpiUnit = "count" | "usd" | "hours";

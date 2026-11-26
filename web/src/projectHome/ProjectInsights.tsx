@@ -248,6 +248,18 @@ export function InsightsPanels({ numbers }: { numbers: InsightsNumbers }) {
             {shipping.changes_landed != null && (
               <Stat value={formatTelemetryNumber(shipping.changes_landed)} label="Changes landed" />
             )}
+            {shipping.daily_active_humans != null && (
+              <Stat
+                value={formatTelemetryNumber(shipping.daily_active_humans)}
+                label="Daily active people (weekdays)"
+              />
+            )}
+            {shipping.spend_per_finished_ticket_usd != null && (
+              <Stat
+                value={`$${shipping.spend_per_finished_ticket_usd.toFixed(2)}`}
+                label="Spend per finished ticket"
+              />
+            )}
             <Stat
               value={formatTelemetryNumber(shipping.time_to_merged_median_hours, " h")}
               label="Median to merge"

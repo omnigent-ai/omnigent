@@ -32,6 +32,7 @@ const KIND_LABEL: Record<ProjectStatusItem["kind"], string> = {
   ticket: "Ticket",
   pull_request: "PR",
   session: "Session",
+  person: "Person",
 };
 
 function rangeText(items: ProjectStatusItems): string {
@@ -123,7 +124,11 @@ function StatusItemsBody({
         <span className="font-semibold tabular-nums" data-testid="project-status-items-total">
           {formatKpiValue(items.total, unit)}
         </span>
-        {items.sample_size ? ` from ${items.sample_size} tickets` : ""}
+        {items.sample_size
+          ? items.metric === "daily_active_humans"
+            ? ` over ${items.sample_size} weekdays`
+            : ` from ${items.sample_size} tickets`
+          : ""}
       </p>
       {items.days.length > 0 && items.days.length <= 31 && (
         <ol className="flex flex-wrap gap-1.5" aria-label="By day">
@@ -170,6 +175,12 @@ function StatusItemsBody({
       )}
       {items.truncated && (
         <p className="text-xs text-muted-foreground">Showing the newest 500 rows.</p>
+      )}
+      {(items.hidden_items ?? 0) > 0 && (
+        <p className="text-xs text-muted-foreground">
+          {items.hidden_items} {items.hidden_items === 1 ? "row" : "rows"} about other people{" "}
+          aren&apos;t shown to you; the numbers above still count them.
+        </p>
       )}
     </div>
   );
@@ -268,6 +279,7 @@ function ItemLink({ row, projectName }: { row: ProjectStatusItem; projectName: s
         {row.url.replace(/^https?:\/\//, "")}
       </a>
     );
+  if (row.kind === "person") return <span className="text-foreground">Active that day</span>;
   if (row.kind === "session")
     return (
       <Link to={`/c/${encodeURIComponent(row.id)}`} className={className}>

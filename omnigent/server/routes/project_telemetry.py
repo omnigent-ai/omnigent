@@ -52,6 +52,7 @@ from omnigent.server.routes.project_kpis import (
     ProjectStatusTrendDay,
     WindowParam,
     daily_trends,
+    human_activity,
 )
 from omnigent.server.routes.project_status import _measure, move_member_resolver
 from omnigent.server.usage_events import usage_event_store
@@ -67,6 +68,8 @@ THROUGHPUT_METRICS = (
     "merged_prs",
     "rework_tickets",
     "time_to_merged_median_hours",
+    "daily_active_humans",
+    "spend_per_finished_ticket_usd",
 )
 
 
@@ -141,6 +144,13 @@ class Throughput(BaseModel):
 
     tickets_shipped: float | None
     merged_prs: float | None
+    daily_active_humans: float | None = Field(
+        default=None,
+        description="People active per weekday, averaged over the window's weekdays.",
+    )
+    spend_per_finished_ticket_usd: float | None = Field(
+        default=None, description="Spend divided by tickets finished in the window."
+    )
     changes_landed: int | None = Field(
         default=None,
         description="Distinct commits landed in the window; null if the project never landed one.",
@@ -341,6 +351,9 @@ def create_project_telemetry_router(
             stage_histories=histories,
             stages=stages,
             history_since=period.since_epoch,
+            human_activity=functools.cache(
+                lambda: human_activity(request, ticket_store, project, user_id, period.since_epoch)
+            ),
             ticket_labels=functools.cache(
                 lambda: project_status_cache.get_or_compute(
                     project.id,

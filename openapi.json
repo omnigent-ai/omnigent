@@ -4926,6 +4926,8 @@
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
               "changes_landed",
+              "daily_active_humans",
+              "spend_per_finished_ticket_usd",
               "none"
             ],
             "title": "Id",
@@ -7152,6 +7154,8 @@
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
               "changes_landed",
+              "daily_active_humans",
+              "spend_per_finished_ticket_usd",
               "none"
             ],
             "title": "Metric",
@@ -7424,6 +7428,8 @@
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
               "changes_landed",
+              "daily_active_humans",
+              "spend_per_finished_ticket_usd",
               "none"
             ],
             "title": "Metric",
@@ -8218,7 +8224,8 @@
             "enum": [
               "ticket",
               "pull_request",
-              "session"
+              "session",
+              "person"
             ],
             "title": "Kind",
             "type": "string"
@@ -8354,6 +8361,13 @@
             "title": "Excluded",
             "type": "array"
           },
+          "hidden_items": {
+            "default": 0,
+            "description": "Rows about other people the caller may not see: a member sees only their own person rows and agents see none. The day values and total still count them.",
+            "format": "int64",
+            "title": "Hidden Items",
+            "type": "integer"
+          },
           "items": {
             "items": {
               "$ref": "#/components/schemas/ProjectStatusItem"
@@ -8381,6 +8395,8 @@
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
               "changes_landed",
+              "daily_active_humans",
+              "spend_per_finished_ticket_usd",
               "tickets_submitted"
             ],
             "title": "Metric",
@@ -18301,6 +18317,19 @@
             "description": "Distinct commits landed in the window; null if the project never landed one.",
             "title": "Changes Landed"
           },
+          "daily_active_humans": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "People active per weekday, averaged over the window's weekdays.",
+            "title": "Daily Active Humans"
+          },
           "merged_prs": {
             "anyOf": [
               {
@@ -18364,6 +18393,19 @@
             ],
             "description": "Tickets reopened after finishing or sent back from review, in the window.",
             "title": "Rework Tickets"
+          },
+          "spend_per_finished_ticket_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Spend divided by tickets finished in the window.",
+            "title": "Spend Per Finished Ticket Usd"
           },
           "spend_usd": {
             "anyOf": [
@@ -26994,6 +27036,8 @@
                 "time_to_merged_median_hours",
                 "time_to_merged_p90_hours",
                 "changes_landed",
+                "daily_active_humans",
+                "spend_per_finished_ticket_usd",
                 "tickets_submitted"
               ],
               "title": "Metric",

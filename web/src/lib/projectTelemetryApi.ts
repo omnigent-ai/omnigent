@@ -36,6 +36,9 @@ export interface TelemetryThroughput {
   merged_prs: number | null;
   /** Distinct commits landed in the window; null when the project never landed one. */
   changes_landed?: number | null;
+  /** People active per weekday, averaged over the window's weekdays. */
+  daily_active_humans?: number | null;
+  spend_per_finished_ticket_usd?: number | null;
   /** Tickets reopened after finishing or sent back from review, in the window. */
   rework_tickets: number | null;
   rework_reopened_tickets?: number | null;

@@ -23,6 +23,7 @@ from omnigent.server.project_kpis import (
     item_day,
     item_epoch,
     trend_since_day,
+    weekday_mean,
 )
 from omnigent.server.project_status import MemberKey, StatusPeriod, status_period
 from omnigent.server.project_status_spend import micros_to_cents
@@ -43,7 +44,7 @@ def range_bounds(range_id: DrilldownRange, period: StatusPeriod) -> tuple[int | 
 
 def _row(item: SeriesItem, metric_kind: str) -> dict[str, Any]:
     value: float | None = None
-    if metric_kind == "daily_sum":
+    if metric_kind == "daily_sum" or (metric_kind == "ratio" and item.kind == "session"):
         value = micros_to_cents(int(item.value or 0)) / 100
     elif item.value is not None:
         value = round(item.value, 1)
@@ -114,12 +115,16 @@ def drilldown(
                 "day_utc": iso,
                 "value": aggregate(series.kind, day_items).value,
                 "items": len({item.key for item in day_items})
-                if series.kind == "distinct"
+                if series.kind in ("distinct", "weekday_mean")
                 else len(day_items),
             }
         )
         day += timedelta(days=1)
+    if series.kind == "weekday_mean":
+        # Days with nobody active count as 0, as on the tile.
+        total = weekday_mean(in_range, [entry["day_utc"] for entry in days])
     rows: list[dict[str, Any]] = []
+    weekend: list[dict[str, Any]] = []
     if series.kind == "distinct":
         # One row per key per day: its latest move that day.
         seen: dict[tuple[str | None, str], SeriesItem] = {}
@@ -127,6 +132,16 @@ def drilldown(
             seen[(item_day(item), item.key)] = item
         for (_, key), item in seen.items():
             rows.append({**_row(item, series.kind), "counted_in_total": credited[key] is item})
+    elif series.kind == "weekday_mean":
+        # One row per person per day; weekend days are listed as left out.
+        latest: dict[tuple[str | None, str], SeriesItem] = {}
+        for item in sorted(in_range, key=lambda entry: item_epoch(entry) or 0):
+            latest[(item_day(item), item.key)] = item
+        for (day_utc, _), item in latest.items():
+            if day_utc is not None and date.fromisoformat(day_utc).weekday() >= 5:
+                weekend.append({**_row(item, series.kind), "reason": "Weekend: not counted"})
+            else:
+                rows.append({**_row(item, series.kind), "counted_in_total": True})
     else:
         rows = [{**_row(item, series.kind), "counted_in_total": True} for item in in_range]
     rows.sort(key=lambda row: (row["day_utc"] or "", row["at"] or 0), reverse=True)
@@ -137,6 +152,8 @@ def drilldown(
         and (entry.only_when_bounded or _in_range(item_epoch(entry.item), since, until))
         and (member is None or entry.item.member == member)
     ]
+    weekend.sort(key=lambda row: (row["day_utc"] or "", row["at"] or 0), reverse=True)
+    excluded = [*weekend, *excluded]
     return {
         "since_day_utc": since_day,
         "today_utc": period.today_utc,

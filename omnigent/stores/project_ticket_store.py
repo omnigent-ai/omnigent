@@ -942,6 +942,23 @@ class ProjectTicketStore:
                 stmt = stmt.where(SqlProjectTicketEvent.created_at >= since_epoch)
             return [tuple(row) for row in session.execute(stmt)]  # type: ignore[misc]
 
+    def human_ticket_activity(
+        self, project_id: str, *, user_id: str | None, since_epoch: int | None
+    ) -> builtins.list[tuple[str, int]]:
+        """``(user_id, created_at)`` for each ticket event a person made by hand, not an agent."""
+        with self._session("list_human_ticket_activity") as session:
+            self._project(session, project_id, user_id)
+            stmt = select(SqlProjectTicketEvent.user_id, SqlProjectTicketEvent.created_at).where(
+                SqlProjectTicketEvent.workspace_id == current_workspace_id(),
+                SqlProjectTicketEvent.project_id == _identifier(project_id),
+                SqlProjectTicketEvent.session_id.is_(None),
+                SqlProjectTicketEvent.agent_id.is_(None),
+            )
+            if since_epoch is not None:
+                stmt = stmt.where(SqlProjectTicketEvent.created_at >= since_epoch)
+            # Single-user mode records no user; that's the local person.
+            return [(actor or "local", at) for actor, at in session.execute(stmt)]
+
     def ticket_session_links(
         self, project_id: str, *, user_id: str | None
     ) -> builtins.list[tuple[str, str, int]]:

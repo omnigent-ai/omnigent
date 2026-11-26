@@ -13,6 +13,12 @@ the on-target check uses (today is still in progress, so it's left out).
 - ``time_to_merged_*`` use tickets now in the final completed stage, dated by
   their latest move there: hours from creation to that move. The median is the
   usual middle value; p90 is nearest-rank.
+- ``daily_active_humans`` is the mean, over the range's weekdays (UTC Monday to Friday,
+  days with nobody active counting as 0), of distinct people active that day: anyone who
+  filed, commented on, moved or labeled a ticket by hand, or sent a message in a project
+  session. Agents' actions don't count. Over 7 days it's the weekday 7-day rolling average.
+- ``spend_per_finished_ticket_usd`` is the range's spend divided by distinct tickets
+  moved into a completed stage in it; no spend is counted twice (see the spend source).
 - ``changes_landed`` counts distinct commits: each ticket now at or past the landed
   stage contributes its ``verified`` (else ``approved``) SHA once, dated by its latest
   move from before that stage to it or later. Tickets sharing a SHA count once.
@@ -35,7 +41,13 @@ from omnigent.entities.project_kpi import (
     UNMEASURED_METRIC,
     ProjectKpi,
 )
-from omnigent.server.project_status import MemberKey, MemberTotals, StatusPeriod, StatusSources
+from omnigent.server.project_status import (
+    MemberKey,
+    MemberTotals,
+    StatusPeriod,
+    StatusSources,
+    user_member_key,
+)
 from omnigent.server.project_status_spend import micros_to_cents
 
 if TYPE_CHECKING:
@@ -45,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 KpiStatus = Literal["met", "missed", "no_data", "unavailable", "not_measured"]
 StageHistories = dict[str, list[dict[str, Any]]]
-SeriesKind = Literal["distinct", "daily_sum", "median", "p90"]
+SeriesKind = Literal["distinct", "daily_sum", "median", "p90", "weekday_mean", "ratio"]
 #: Full UTC days, ending yesterday, that the on-target check and trend cover.
 TREND_DAYS = 7
 DAY = 86_400
@@ -73,7 +85,7 @@ class MetricValue:
 UNAVAILABLE_VALUE = MetricValue(None, available=False)
 
 
-ItemKind = Literal["ticket", "pull_request", "session"]
+ItemKind = Literal["ticket", "pull_request", "session", "person"]
 
 
 @dataclass(frozen=True)
@@ -143,6 +155,8 @@ class KpiInputs:
     history_since: int | None = None
     #: Each ticket's current stage and ``LANDED_COMMIT_LABELS`` values; ``None`` when unread.
     ticket_labels: Callable[[], TicketLabels] | None = None
+    #: ``(user_id, at)`` for each thing a person did by hand; ``None`` when unread.
+    human_activity: Callable[[], list[tuple[str, int]]] | None = None
 
 
 def _day_start(day_utc: str) -> int:
@@ -179,8 +193,35 @@ def nearest_rank(values: Iterable[float], percentile: float) -> float:
     return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
 
 
+def _is_weekday(day_utc: str) -> bool:
+    return date.fromisoformat(day_utc).weekday() < 5
+
+
+def weekday_mean(items: list[SeriesItem], days: Iterable[str]) -> MetricValue:
+    """Mean distinct keys per weekday over *days*; a day with no items counts as 0."""
+    weekdays = [day for day in days if _is_weekday(day)]
+    if not weekdays:
+        return MetricValue(None, sample_size=0)
+    keys: dict[str, set[str]] = {day: set() for day in weekdays}
+    for item in items:
+        day = item_day(item)
+        if day in keys:
+            keys[day].add(item.key)
+    mean = sum(len(found) for found in keys.values()) / len(weekdays)
+    return MetricValue(round(mean, 1), sample_size=len(weekdays))
+
+
 def aggregate(kind: SeriesKind, items: list[SeriesItem]) -> MetricValue:
     """The metric's value for a set of in-range items."""
+    if kind == "weekday_mean":
+        # Without a range, only the days the items fall on are known (one drill-down day).
+        return weekday_mean(items, sorted({day for item in items if (day := item_day(item))}))
+    if kind == "ratio":
+        tickets = len({item.key for item in items if item.kind == "ticket"})
+        micros = sum(int(item.value or 0) for item in items if item.kind == "session")
+        if not tickets:
+            return MetricValue(None, sample_size=0)
+        return MetricValue(round(micros_to_cents(micros) / 100 / tickets, 2), sample_size=tickets)
     if kind == "distinct":
         return MetricValue(len({item.key for item in items}))
     if kind == "daily_sum":
@@ -192,11 +233,29 @@ def aggregate(kind: SeriesKind, items: list[SeriesItem]) -> MetricValue:
     return MetricValue(round(measure, 1), sample_size=len(sample))
 
 
+def _range_days(series: MetricSeries, since: int | None, until: int) -> list[str]:
+    """Every UTC day ``[since, until)`` touches; unbounded starts at the first item's day."""
+    last = datetime.fromtimestamp(until - 1, tz=UTC).date()
+    if since is not None:
+        first = datetime.fromtimestamp(since, tz=UTC).date()
+    else:
+        known = [day for item in series.items if (day := item_day(item))]
+        if not known:
+            return []
+        first = date.fromisoformat(min(known))
+    return [
+        (first + timedelta(days=offset)).isoformat() for offset in range((last - first).days + 1)
+    ]
+
+
 def series_value(series: MetricSeries, since: int | None, until: int) -> MetricValue:
     """The series' value over ``[since, until)``; ``since=None`` has no lower bound."""
     if not series.available:
         return UNAVAILABLE_VALUE
-    return aggregate(series.kind, items_in_range(series, since, until))
+    items = items_in_range(series, since, until)
+    if series.kind == "weekday_mean":
+        return weekday_mean(items, _range_days(series, since, until))
+    return aggregate(series.kind, items)
 
 
 MemberOfMove = Callable[[dict[str, Any]], "MemberKey | None"]
@@ -557,6 +616,25 @@ def load_series(
             )
         else:
             series["spend_usd"] = UNAVAILABLE_SERIES
+    if "daily_active_humans" in wanted:
+        if inputs.human_activity is None:
+            series["daily_active_humans"] = UNAVAILABLE_SERIES
+        else:
+            series["daily_active_humans"] = MetricSeries(
+                "weekday_mean",
+                items=[
+                    SeriesItem(at, user_id, "person", member=user_member_key(user_id))
+                    for user_id, at in inputs.human_activity()
+                ],
+            )
+    if "spend_per_finished_ticket_usd" in wanted:
+        parts = load_series(["spend_usd", "tickets_shipped"], inputs, member_of)
+        spend, shipped = parts["spend_usd"], parts["tickets_shipped"]
+        series["spend_per_finished_ticket_usd"] = (
+            MetricSeries("ratio", items=[*spend.items, *shipped.items])
+            if spend.available and spend.dated
+            else UNAVAILABLE_SERIES
+        )
     if "changes_landed" in wanted:
         if inputs.ticket_labels is None:
             series["changes_landed"] = UNAVAILABLE_SERIES
