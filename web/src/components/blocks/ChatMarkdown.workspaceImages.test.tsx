@@ -50,6 +50,21 @@ function imageResponse(
   });
 }
 
+/** Hold the next file read open; the returned call answers it and lets the UI settle. */
+function deferFileRead() {
+  let finishRequest!: (response: Response) => void;
+  const request = new Promise<Response>((resolve) => {
+    finishRequest = resolve;
+  });
+  fetchMock.mockReturnValue(request);
+  return async (response: Response) => {
+    await act(async () => {
+      finishRequest(response);
+      await request;
+    });
+  };
+}
+
 beforeEach(() => {
   fetchMock.mockReset().mockImplementation(() => Promise.resolve(imageResponse()));
   createObjectURL
@@ -226,12 +241,13 @@ describe("assistant workspace markdown images", () => {
 
   it("opens an outside-workspace image whose family read failed only when clicked", async () => {
     VIEWER.openFile.mockClear();
-    fetchMock.mockResolvedValue(new Response("missing", { status: 404 }));
+    const answerRead = deferFileRead();
     renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     expect(fetchMock.mock.calls[0][0]).toContain("scope=family");
-    const chip = await screen.findByRole("button", { name: "Open Screenshot (shot.png)" });
+    await answerRead(new Response("missing", { status: 404 }));
+    const chip = screen.getByRole("button", { name: "Open Screenshot (shot.png)" });
     expect(VIEWER.openFile).not.toHaveBeenCalled();
     fireEvent.click(chip);
 
@@ -259,29 +275,23 @@ describe("assistant workspace markdown images", () => {
     ["an old server", false],
     ["a workspace-only acknowledgement", true],
   ] as const)("keeps the chip when %s answers a family read", async (_name, acknowledged) => {
-    fetchMock.mockResolvedValue(imageResponse({}, acknowledged));
+    const answerRead = deferFileRead();
     renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    expect(await screen.findByRole("button", { name: "Open Screenshot (shot.png)" })).toBeVisible();
+    await answerRead(imageResponse({}, acknowledged));
+    expect(screen.getByRole("button", { name: "Open Screenshot (shot.png)" })).toBeVisible();
     expect(createObjectURL).not.toHaveBeenCalled();
     expect(document.querySelector("img")).toBeNull();
   });
 
   it("opens a workspace image whose preview failed in the file viewer", async () => {
     VIEWER.openFile.mockClear();
-    let finishRequest!: (response: Response) => void;
-    const request = new Promise<Response>((resolve) => {
-      finishRequest = resolve;
-    });
-    fetchMock.mockReturnValue(request);
+    const answerRead = deferFileRead();
     renderMarkdown("![Screenshot](/workspace/project/shots/shot.png)");
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    await act(async () => {
-      finishRequest(new Response("missing", { status: 404 }));
-      await request;
-    });
+    await answerRead(new Response("missing", { status: 404 }));
     fireEvent.click(screen.getByRole("button", { name: "Open Screenshot (shot.png)" }));
 
     expect(VIEWER.openFile).toHaveBeenCalledOnce();

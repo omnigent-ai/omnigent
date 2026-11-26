@@ -1066,13 +1066,18 @@ def register_resources_routes(
         except NotImplementedError:
             return None
         host_owner = routing_host_session(source, conversation_store)
-        source_host_id = host_owner.host_id if host_owner is not None else None
+        # Without a known host nothing shows that a member's files share this
+        # session's filesystem, and without a known workspace the own-workspace
+        # exclusion below cannot be applied.
+        source_workspace = source.workspace or (host_owner.workspace if host_owner else None)
+        if host_owner is None or host_owner.host_id is None or not source_workspace:
+            return None
+        source_host_id = host_owner.host_id
         # The displayed session reads its own workspace with ``scope=workspace``,
         # so a member rooted at the same or an enclosing directory never serves it.
-        source_root = (
-            source.workspace or (host_owner.workspace if host_owner else None) or ""
-        ).rstrip("/")
-        if source_root.startswith("/") and absolute_path.startswith(f"{source_root}/"):
+        # A "/" workspace holds every path.
+        source_root = source_workspace.rstrip("/")
+        if not source_root.startswith("/") or absolute_path.startswith(f"{source_root}/"):
             return None
         match: tuple[str, str] | None = None
         matched_root_length = -1
@@ -1114,11 +1119,19 @@ def register_resources_routes(
             raise HTTPException(status_code=400, detail="Family scope requires a canonical path")
         match = await asyncio.to_thread(_family_workspace_match, source, absolute_path)
         if match is None:
-            raise HTTPException(
-                status_code=404,
-                detail="No session in this family has a workspace holding that path",
-            )
+            raise _family_path_not_found()
         return match
+
+    def _family_path_not_found() -> HTTPException:
+        """The one answer for a family path with no readable member workspace.
+
+        A matching member the caller cannot browse gets this same answer, so it
+        does not reveal where an unshared sibling's workspace is.
+        """
+        return HTTPException(
+            status_code=404,
+            detail="No session in this family has a readable workspace holding that path",
+        )
 
     async def _authorize_absolute_browse(
         conversation: Conversation,
@@ -3510,7 +3523,16 @@ def register_resources_routes(
             # session, under that session's own browse authorization.
             session_id, relative_path = await _family_workspace_target(source, relative_path)
             absolute, scope = False, "workspace"
-        conv, owner = await _authorize_browse_read_with_owner(session_id, request, relative_path)
+            try:
+                conv, owner = await _authorize_browse_read_with_owner(
+                    session_id, request, relative_path
+                )
+            except OmnigentError as exc:
+                raise _family_path_not_found() from exc
+        else:
+            conv, owner = await _authorize_browse_read_with_owner(
+                session_id, request, relative_path
+            )
         if scope == "workspace" and (absolute or ntpath.isabs(relative_path)):
             raise HTTPException(status_code=400, detail="Workspace scope requires a relative path")
 

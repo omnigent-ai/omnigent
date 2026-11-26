@@ -4809,7 +4809,12 @@ _FAMILY_ENCLOSING_ID = "f6e5d4c3b2a1409f8e7d6c5b4a392817"
 class _FamilyConversationStore(_ConversationStore):
     """The default session plus two family workers that each have their own workspace."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        local_host_id: str | None = "host-main",
+        source_workspace: str = "/workspace/project/app",
+    ) -> None:
         """
         Build a family around the default session on ``host-main``.
 
@@ -4818,6 +4823,9 @@ class _FamilyConversationStore(_ConversationStore):
         files and holds a workspace of its own, and one member's workspace is
         ``/``. Two more members share the displayed workspace or enclose it.
 
+        :param local_host_id: Host of the displayed session and its same-host
+            members; ``None`` leaves them hostless.
+        :param source_workspace: The displayed session's workspace.
         :returns: None.
         """
         super().__init__()
@@ -4825,8 +4833,8 @@ class _FamilyConversationStore(_ConversationStore):
         self._conversations[_FAMILY_SOURCE_ID] = dataclasses.replace(
             source,
             family_id=_FAMILY_SOURCE_ID,
-            workspace="/workspace/project/app",
-            host_id="host-main",
+            workspace=source_workspace,
+            host_id=local_host_id,
         )
         for conversation_id, workspace, host_id in (
             (_FAMILY_WORKER_ID, "/workspace/project-worktrees/worker", "host-main"),
@@ -4849,7 +4857,7 @@ class _FamilyConversationStore(_ConversationStore):
                 agent_id="087b7cb7ac30abf4debfaa578d052ec6",
                 family_id=_FAMILY_SOURCE_ID,
                 workspace=workspace,
-                host_id=host_id,
+                host_id=local_host_id if host_id == "host-main" else host_id,
             )
 
     def get_session_family(self, session_id: str) -> list[Conversation]:
@@ -4980,6 +4988,75 @@ async def test_filesystem_family_scope_rejects_reads_outside_member_workspaces(
     assert response.status_code == status, response.text
     assert fake_runner.calls == []
     assert "X-Omnigent-File-Scope" not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "store_options",
+    [
+        # Hostless sessions give no evidence that their files share a filesystem.
+        {"local_host_id": None},
+        # A "/" workspace holds every path, so nothing is outside it.
+        {"source_workspace": "/"},
+    ],
+)
+async def test_filesystem_family_scope_fails_closed_without_a_host_or_bounded_workspace(
+    runner_globals_reset: None,
+    store_options: dict[str, Any],
+) -> None:
+    del runner_globals_reset
+    app = _sessions_app(_FamilyConversationStore(**store_options))
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        response = await client.get(
+            f"/v1/sessions/{_FAMILY_SOURCE_ID}/resources/environments/default"
+            "/filesystem/workspace/project-worktrees/worker/shot.png",
+            params={"scope": "family", "base": "host"},
+        )
+
+    assert response.status_code == 404, response.text
+    assert fake_runner.calls == []
+    assert "X-Omnigent-File-Scope" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_filesystem_family_scope_answers_an_unshared_member_like_no_match(
+    runner_globals_reset: None,
+) -> None:
+    """A collaborator cannot tell a path in an unshared sibling's workspace from no match."""
+    del runner_globals_reset
+    permissions = _StubPermissionStore()
+    permissions.add_grant("alice@example.com", _FAMILY_SOURCE_ID, LEVEL_EDIT)
+    app = _sessions_app(
+        _FamilyConversationStore(),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=permissions,
+    )
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        responses = [
+            await client.get(
+                f"/v1/sessions/{_FAMILY_SOURCE_ID}/resources/environments/default"
+                f"/filesystem{path}",
+                params={"scope": "family", "base": "host"},
+                headers={"X-Forwarded-Email": "alice@example.com"},
+            )
+            for path in (
+                "/workspace/project-worktrees/worker/shot.png",
+                "/workspace/nowhere/shot.png",
+            )
+        ]
+
+    unshared, unmatched = responses
+    assert unshared.status_code == unmatched.status_code == 404
+    assert unshared.json() == unmatched.json()
+    assert fake_runner.calls == []
 
 
 @pytest.mark.asyncio
