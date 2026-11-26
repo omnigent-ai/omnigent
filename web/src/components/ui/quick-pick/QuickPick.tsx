@@ -164,7 +164,9 @@ export interface QuickPickProps<Value> {
   renderPreview?: (item: QuickPickItem<Value>) => ReactNode;
   /**
    * `sidebar` is a search field in a sidebar: results show only while there is a query, as
-   * two-line rows, with the field in a muted well and a button that clears it.
+   * two-line rows, with the field in a muted well and a button that clears it. `switcher` is a
+   * compact list for a transient switcher driven by shortcuts: no visible query field, and the
+   * list sized to its rows.
    */
   presentation?: QuickPickPresentation;
   /** Receives the query field, such as to focus it from outside the picker. */
@@ -172,7 +174,7 @@ export interface QuickPickProps<Value> {
   className?: string;
 }
 
-export type QuickPickPresentation = "default" | "sidebar";
+export type QuickPickPresentation = "default" | "switcher" | "sidebar";
 
 function readRecents(historyKey: string | undefined): string[] {
   return historyKey ? readQuickPickHistory(historyKey) : [];
@@ -454,6 +456,7 @@ export function QuickPick<Value>({
   // Keyed by the row, not its position, so an option keeps its ID when results above it change.
   const optionId = (row: QuickPickRow<Value>) => `${baseId}-option-${encodeURIComponent(row.key)}`;
   const sidebar = presentation === "sidebar";
+  const switcher = presentation === "switcher";
   // A sidebar search shows only its field until there is something to search for, so
   // no row is listed (or can be picked) while collapsed.
   const collapsed = sidebar && query.trim().length === 0;
@@ -1104,11 +1107,13 @@ export function QuickPick<Value>({
         className,
       )}
     >
+      {/* A switcher has no visible query; the field still holds focus and the list's keys. */}
       <div
         onKeyDown={handleHeaderKeyDown}
         className={cn(
           "flex items-center gap-2",
           sidebar ? "rounded-lg bg-muted px-2" : "border-b border-border px-3 py-2",
+          switcher && "sr-only",
         )}
       >
         {onBack ? (
@@ -1145,6 +1150,7 @@ export function QuickPick<Value>({
           autoCorrect="off"
           spellCheck={false}
           placeholder={placeholder}
+          readOnly={switcher}
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
           onKeyDown={handleKeyDown}
@@ -1183,7 +1189,13 @@ export function QuickPick<Value>({
           onKeyDown={handleResultsKeyDown}
           className={cn(
             "overflow-y-auto p-1",
-            fillHeight ? "min-h-0 flex-1" : renderPreview ? PREVIEW_HEIGHT : "max-h-72",
+            fillHeight
+              ? "min-h-0 flex-1"
+              : switcher
+                ? "max-h-[min(24rem,60vh)] min-h-16"
+                : renderPreview
+                  ? PREVIEW_HEIGHT
+                  : "max-h-72",
             renderPreview && "w-[45%] shrink-0",
             collapsed && "hidden",
           )}
