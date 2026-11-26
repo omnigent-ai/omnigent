@@ -8138,14 +8138,14 @@ async def _antigravity_startup_agent_spec(
     session_id: str,
     resolve: Callable[[str], Awaitable[AgentSpec | None]],
 ) -> AgentSpec | None:
-    """Keep Antigravity recovery available during a transient bundle-fetch failure."""
+    """Prepare framework guidance if optional Antigravity instruction retrieval fails."""
     from omnigent.runner._entry import AgentSpecFetchError
 
     try:
         return await resolve(session_id)
     except AgentSpecFetchError:
         _logger.warning(
-            "Could not fetch Antigravity startup instructions; continuing with framework "
+            "Could not fetch Antigravity startup instructions; preparing framework "
             "guidance: session=%s",
             session_id,
             extra={"session_id": session_id},

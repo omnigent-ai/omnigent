@@ -720,6 +720,11 @@ Cross-harness journeys:
   If a named child is unavailable, automatic launch and terminal re-creation
   retain the shared resolver's parent-agent fallback; the CLI uses framework
   guidance only. Existing fallback behavior is preserved in each path.
+  CLI instruction loading is best effort: fetch or corrupt-bundle failures warn
+  and use framework guidance. The runner's added fallback handles transient
+  instruction fetch failures. Relay initialization still requires a resolved
+  session bundle, so a persistent outage can prevent terminal creation.
+  Authorization and startup-policy rejections remain launch failures.
   `tests/runner/test_app_native_startup_instructions.py::test_antigravity_startup_rule_is_ready_before_terminal_launch`
   checks authored instructions, image guidance and memory before a mocked
   terminal boundary, for fresh and resumed sessions.

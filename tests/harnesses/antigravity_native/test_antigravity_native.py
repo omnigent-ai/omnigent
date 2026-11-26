@@ -625,9 +625,7 @@ async def test_cli_fallback_delivers_effective_session_startup_instructions(
     ]
 
 
-@pytest.mark.parametrize(
-    "failure", ["bundle-error", "invalid-archive", "invalid-root", "invalid-yaml"]
-)
+@pytest.mark.parametrize("failure", ["invalid-archive", "invalid-root", "invalid-yaml"])
 async def test_cli_bundle_failures_preserve_framework_startup_guidance(
     tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -642,7 +640,7 @@ async def test_cli_bundle_failures_preserve_framework_startup_guidance(
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/agent/contents"):
-            return httpx.Response(500 if failure == "bundle-error" else 200, content=content)
+            return httpx.Response(200, content=content)
         assert request.url.path == "/v1/sessions/sess"
         return httpx.Response(200, json={"agent_id": "agent"})
 

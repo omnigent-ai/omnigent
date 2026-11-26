@@ -257,12 +257,12 @@ async def test_startup_instructions_without_a_spec_ask_the_server_nothing(
         with pytest.raises(type(error)) as raised:
             await _antigravity_startup_agent_spec("sess", resolve)
         assert raised.value is error
-        assert "continuing with framework guidance" not in caplog.text
+        assert "preparing framework guidance" not in caplog.text
         return
 
     spec = await _antigravity_startup_agent_spec("sess", resolve)
     assert spec is None
-    assert ("continuing with framework guidance" in caplog.text) is (resolution_failure == "fetch")
+    assert ("preparing framework guidance" in caplog.text) is (resolution_failure == "fetch")
 
     class _NoCalls:
         def __getattr__(self, name: str) -> object:
