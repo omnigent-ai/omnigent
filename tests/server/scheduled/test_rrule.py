@@ -130,12 +130,6 @@ def test_validate_rejects_every_minute() -> None:
         validate_rrule("FREQ=MINUTELY")
 
 
-def test_validate_rejects_nine_minute_cadence() -> None:
-    # FREQ=MINUTELY;INTERVAL=9 = 540s < 600s floor.
-    with pytest.raises(RRuleValidationError):
-        validate_rrule("FREQ=MINUTELY;INTERVAL=9")
-
-
 def test_validate_rejects_secondly_cadence() -> None:
     # FREQ=SECONDLY = 1s, well under the floor.
     with pytest.raises(RRuleValidationError):

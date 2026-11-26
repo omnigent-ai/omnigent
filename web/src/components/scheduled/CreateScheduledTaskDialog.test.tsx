@@ -2140,12 +2140,13 @@ describe("CreateScheduledTaskDialog submit", () => {
   );
 
   it.each([
-    { sandbox: false, subhour: true, minimum: 10 },
-    { sandbox: true, subhour: true, minimum: 60 },
-    { sandbox: false, subhour: false, minimum: 60 },
+    { sandbox: false, subhour: true, newSandbox: false, minimum: 10 },
+    { sandbox: true, subhour: true, newSandbox: false, minimum: 60 },
+    { sandbox: true, subhour: true, newSandbox: true, minimum: 10 },
+    { sandbox: false, subhour: false, newSandbox: false, minimum: 60 },
   ])(
-    "offers minutes directly through Interval (sandbox=$sandbox, subhour=$subhour)",
-    async ({ sandbox, subhour, minimum }) => {
+    "offers minutes directly through Interval (sandbox=$sandbox, subhour=$subhour, newSandbox=$newSandbox)",
+    async ({ sandbox, subhour, newSandbox, minimum }) => {
       render(
         <CapabilitiesProvider
           info={{
@@ -2153,6 +2154,7 @@ describe("CreateScheduledTaskDialog submit", () => {
             features: { automations_v2: true },
             managed_sandboxes_enabled: sandbox,
             scheduled_task_subhour: subhour,
+            scheduled_task_subhour_new_sandbox: newSandbox,
           }}
         >
           <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
