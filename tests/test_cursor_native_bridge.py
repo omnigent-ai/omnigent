@@ -67,7 +67,7 @@ def _send_keys_calls(captured: list[list[str]]) -> list[list[str]]:
 def test_clear_composer_floods_backspace_until_pane_stable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The clear sends only Backspace bursts, stopping once the pane settles.
+    """The clear sends End, then Backspace bursts, stopping once the pane settles.
 
     Two distinct captures (draft shrinking) then a repeat (empty) means three
     bursts: the third sees no change and returns. It must never send the old
@@ -83,8 +83,8 @@ def test_clear_composer_floods_backspace_until_pane_stable(
     cursor_native_bridge._clear_composer(_SOCK, _TARGET)
 
     tails = _send_keys_calls(captured)
-    # No End: right after a cold --resume it swallows the following paste (#10955).
-    assert not any("End" in t for t in tails)
+    # End once (a draft is showing), then one Backspace burst per round until stable.
+    assert tails[0] == ["-t", _TARGET, "End"]
     bursts = [t for t in tails if "BSpace" in t]
     assert all(
         t == ["-t", _TARGET, "-N", str(cursor_native_bridge._COMPOSER_CLEAR_CHUNK), "BSpace"]
@@ -111,6 +111,25 @@ def test_clear_composer_terminates_on_empty_composer(
 
     bursts = [t for t in _send_keys_calls(captured) if "BSpace" in t]
     assert len(bursts) == 1, "empty composer should settle after a single burst"
+
+
+def test_clear_composer_skips_end_on_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No End when the empty-composer placeholder shows.
+
+    Regression for #10955: End sent right after a cold ``--resume`` makes
+    cursor-agent hold the next input, so the following paste is lost.
+    """
+    captured = _install_fake_tmux(
+        monkeypatch, pane_captures=[f"history\n  → {cursor_native_bridge._IDLE_MARKERS[1]}"]
+    )
+
+    cursor_native_bridge._clear_composer(_SOCK, _TARGET)
+
+    tails = _send_keys_calls(captured)
+    assert not any("End" in t for t in tails)
+    assert any("BSpace" in t for t in tails)
 
 
 def test_clear_composer_is_bounded_when_pane_never_settles(

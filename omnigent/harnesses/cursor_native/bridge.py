@@ -744,15 +744,18 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     cursor-agent restores the interrupted prompt back into the composer when a
     turn is cancelled (Stop button -> :func:`inject_interrupt`), and its input
     widget ignores the readline ``C-a``/``C-k``/``C-u`` keys we'd otherwise use
-    to clear a line — only ``Backspace`` deletes. So flood ``Backspace`` in
+    to clear a line — only ``Backspace`` deletes. So jump to the end (``End``,
+    skipped when the empty-composer placeholder shows) and flood ``Backspace`` in
     ``send-keys -N`` bursts until the pane stops changing (the draft is gone)
     or a generous round cap is hit. A burst against
     an already-empty composer is a harmless no-op (unlike ``C-c``, which would
     arm cursor-agent's exit), so this is safe to run before every injection.
     """
-    # No ``End`` first: sent while a cold ``--resume`` is still loading, it leaves
-    # cursor-agent holding the next input, so the paste is swallowed (#10955).
     previous = _capture_pane(socket_path, tmux_target)
+    # ``End`` only when there is a draft: sent at the placeholder while a cold
+    # ``--resume`` is still loading, it makes cursor-agent swallow the paste (#10955).
+    if not any(marker in previous for marker in _IDLE_MARKERS):
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "End")
     for _ in range(_COMPOSER_CLEAR_MAX_ROUNDS):
         _run_tmux(
             socket_path,
