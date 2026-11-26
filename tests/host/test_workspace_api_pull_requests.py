@@ -1059,12 +1059,12 @@ def _failure_reasons(error: ConnectError) -> list[str]:
 
 @pytest.fixture
 def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Each GitHub review or merge queue call a method made on the host."""
+    """Each GitHub review, merge queue or stack call a method made on the host."""
     return host_tests.record_review_calls(monkeypatch)
 
 
 @pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
-async def test_a_github_change_to_a_linked_pr_runs_on_the_servers_word(
+async def test_a_github_call_to_a_linked_pr_runs_on_the_servers_word(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],
@@ -1084,7 +1084,7 @@ async def test_a_github_change_to_a_linked_pr_runs_on_the_servers_word(
 
 
 @pytest.mark.parametrize("method", sorted(host_tests._SELECTED_PR_CALLS))
-async def test_a_github_change_to_an_unlinked_pr_is_refused_before_the_host(
+async def test_a_github_call_to_an_unlinked_pr_is_refused_before_the_host(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     host_calls: list[HostWorkspaceCallFrame],

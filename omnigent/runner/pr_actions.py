@@ -1,16 +1,17 @@
-"""Review, comment and merge queue changes on the session's selected pull request.
+"""Review, comment and merge queue changes, and the stack read, on the session's selected
+pull request.
 
-These are the wrappers the workspace API's review and merge queue methods call. Each
-checks its fields and the session's link to a GitHub pull request, then runs the
-GitHub code in :mod:`omnigent.runner.github_reviews` or
-:mod:`omnigent.runner.github_merge_queue`.
+These are the wrappers the workspace API's review, merge queue and stack methods call.
+Each checks its fields and the session's link to a GitHub pull request, then runs the
+GitHub code in :mod:`omnigent.runner.github_reviews`,
+:mod:`omnigent.runner.github_merge_queue` or :mod:`omnigent.runner.github_stack`.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from omnigent.runner import github_merge_queue, github_reviews, pr_resource
+from omnigent.runner import github_merge_queue, github_reviews, github_stack, pr_resource
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
     COMMENT_REVIEW_EVENT,
@@ -367,3 +368,10 @@ def dequeue_pull_request(
 ) -> dict[str, Any]:
     """Remove the pull request from its merge queue."""
     return github_merge_queue.dequeue(root, _target(session_id, pr_url))
+
+
+def get_pull_request_stack(
+    root: str, *, session_id: str | None, pr_url: str | None
+) -> dict[str, Any]:
+    """The stack around the pull request, found through its branches."""
+    return github_stack.pull_request_stack(root, _target(session_id, pr_url))
