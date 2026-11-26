@@ -796,6 +796,10 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
         return None
 
     posted: list[dict[str, Any]] = []
+    posts_when_subscribed: list[int] = []
+
+    async def on_subscribed() -> None:
+        posts_when_subscribed.append(len(posted))
 
     monkeypatch.setattr(fake_client, "request", fake_request)
     monkeypatch.setattr(codex_native_forwarder, "_sleep", fake_sleep)
@@ -810,6 +814,7 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
                 thread_id="thread_123",
                 usage_coalescer=_usage_coalescer(client),
                 elicitation_tracker=_elicitation_tracker(),
+                on_subscribed=on_subscribed,
             )
 
     asyncio.run(run())
@@ -818,6 +823,8 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
         ("thread/resume", {"threadId": "thread_123"}),
     ]
+    # Once, after the retry succeeded and its replay landed.
+    assert posts_when_subscribed == [len(posted)]
     assert [payload["data"]["item_data"]["role"] for payload in posted[:2]] == [
         "user",
         "assistant",
@@ -826,6 +833,31 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
     assert posted[2]["data"] == _expected_status_data("running", "turn_123")
     state = read_bridge_state(tmp_path)
     assert state is not None and state.active_turn_id == "turn_123"
+
+
+def test_subscribe_until_ready_skips_on_subscribed_when_subscribing_fails(tmp_path: Path) -> None:
+    """A thread the forwarder cannot subscribe to never runs the success callback."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    fake_client = _FakeCodexAppServerClient(error=RuntimeError("thread not found"))
+    on_subscribed = AsyncMock()
+
+    async def run() -> None:
+        async with _recording_forwarder_client([]) as client:
+            await codex_native_forwarder._subscribe_until_ready(
+                fake_client,  # type: ignore[arg-type]
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                thread_id="thread_123",
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                on_subscribed=on_subscribed,
+            )
+
+    asyncio.run(run())
+
+    assert len(fake_client.requests) == 1
+    on_subscribed.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

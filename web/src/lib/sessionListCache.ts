@@ -705,6 +705,35 @@ export function overlayArchivedIntoCaches(
 }
 
 /**
+ * Write a server-confirmed `updated_at` onto the session's cached list rows,
+ * keeping any newer one, so recency-sorted lists (⌘K's recent sessions) see an
+ * archive the push stream hasn't delivered.
+ */
+export function settleUpdatedAtIntoCaches(
+  queryClient: QueryClient,
+  id: string,
+  updatedAt: number,
+): void {
+  const itemsById = new Map<string, SessionListWireItem>([[id, { id, updated_at: updatedAt }]]);
+  const isOlder = (data: ConversationsInfiniteData | undefined): boolean =>
+    data?.pages.some((page) =>
+      page.data.some((row) => row.id === id && (row.updated_at ?? 0) < updatedAt),
+    ) ?? false;
+  for (const [root, filtersFromKey] of [
+    ["conversations", filtersFromConversationQueryKey],
+    ["project-sessions", filtersFromProjectQueryKey],
+  ] as const) {
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: [root],
+    })) {
+      if (!isOlder(data)) continue;
+      const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromKey(key));
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+  }
+}
+
+/**
  * Settle server-known fields on the open session's fetched sidebar row, merged
  * as the lists merge a streamed row but keeping the fetched owner and access
  * level, which a streamed shared row may not carry. A detail request in flight

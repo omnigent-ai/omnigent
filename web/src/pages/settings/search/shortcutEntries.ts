@@ -11,22 +11,13 @@ const SHORTCUT_KEYWORDS = ["shortcut", "keyboard", "hotkey", "keys"] as const;
 // One object per binding and heading, so rows and effects that depend on an entry stay stable.
 const entryCache = new Map<string, SettingsEntry>();
 
-/** A page row the registry binds: its label and keys come from the binding. */
-export type BoundShortcutRow = ShortcutPageRow & {
-  shortcutId: NonNullable<ShortcutPageRow["shortcutId"]>;
-};
-
-export function isBoundShortcutRow(row: ShortcutPageRow): row is BoundShortcutRow {
-  return row.shortcutId !== undefined;
-}
-
-export function shortcutSettingsEntryId(row: Pick<BoundShortcutRow, "shortcutId">): string {
+export function shortcutSettingsEntryId(row: Pick<ShortcutPageRow, "shortcutId">): string {
   return `shortcut.${row.shortcutId}`;
 }
 
 /** The entry for one page row, listed under `group`'s heading. */
 export function shortcutSettingsEntry(
-  row: BoundShortcutRow,
+  row: ShortcutPageRow,
   group: ShortcutPageGroup,
 ): SettingsEntry {
   const id = shortcutSettingsEntryId(row);
@@ -45,9 +36,7 @@ export function shortcutSettingsEntry(
   return entry;
 }
 
-/** Every registry-bound row the page lists for these groups, in page order. */
+/** Every row the page lists for these groups, in page order. */
 export function shortcutSettingsEntries(groups: readonly ShortcutPageGroup[]): SettingsEntry[] {
-  return groups.flatMap((group) =>
-    group.items.filter(isBoundShortcutRow).map((row) => shortcutSettingsEntry(row, group)),
-  );
+  return groups.flatMap((group) => group.items.map((row) => shortcutSettingsEntry(row, group)));
 }

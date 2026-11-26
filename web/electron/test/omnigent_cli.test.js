@@ -34,6 +34,7 @@ const {
   readLocalHostId,
   liveDaemonRecordFor,
 } = require("../src/omnigent_cli");
+const { isHostThisMachine } = require("../src/hostIdentity");
 
 describe("cliCommandParts", () => {
   it("keeps plain CLI paths bare and adds fixed isaac argv without a shell", () => {
@@ -382,6 +383,29 @@ describe("matchesServer", () => {
       assert.equal(matchesServer({ server_url: recordUrl }, serverUrl), expected);
     });
   }
+  const workspaceApi = "https://ws.example.com/api/2.0/omnigent";
+  const workspaceUi = "https://ws.example.com/omnigent";
+  for (const [record, serverUrl, expected] of [
+    [{ server_url: workspaceApi }, workspaceUi, true],
+    [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}?o=1`, true],
+    [{ target: `${workspaceApi}/` }, `${workspaceUi}/`, true],
+    [{ server_url: `${workspaceApi}s` }, workspaceUi, true],
+    [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}?o=2`, false],
+    [{ server_url: workspaceApi }, "https://other.example.com/omnigent", false],
+    [{ server_url: workspaceApi }, "http://ws.example.com/omnigent", false],
+    [{ server_url: "https://ws.example.com/api/2.0/other" }, workspaceUi, false],
+    [{ target: `${workspaceApi}?o=1` }, `${workspaceUi}/?o=1`, true],
+    [
+      { server_url: "http://localhost:6767/api/2.0/omnigent" },
+      "http://127.0.0.1:6767/omnigent",
+      true,
+    ],
+  ]) {
+    it(`${JSON.stringify(record)} ${expected ? "matches" : "does not match"} ${serverUrl}`, () => {
+      assert.equal(matchesServer(record, serverUrl), expected);
+    });
+  }
+
   it("matches on server_url or target, ignoring trailing slashes", () => {
     assert.equal(matchesServer({ server_url: "https://x.com/" }, "https://x.com"), true);
     assert.equal(matchesServer({ target: "https://x.com" }, "https://x.com/"), true);
@@ -679,6 +703,33 @@ describe("liveDaemonRecordFor", () => {
     mock.method(fs, "readFileSync", () => JSON.stringify(record));
     assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
     assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
+  });
+
+  it("finds a workspace daemon from the window's web-UI mount", async () => {
+    const record = {
+      pid: process.pid,
+      target: "https://ws.example.com/api/2.0/omnigent?o=123",
+      mode: "server",
+      server_url: "https://ws.example.com/api/2.0/omnigent",
+      host_id: "host_local",
+    };
+    mock.method(fs, "readdirSync", () => ["live.json"]);
+    mock.method(fs, "readFileSync", () => JSON.stringify(record));
+    const windowServerUrl = "https://ws.example.com/omnigent?o=123";
+    assert.equal(liveDaemonRecordFor(windowServerUrl)?.pid, process.pid);
+    // No bearer token is stored for the window's URL, so the probe must not send a request.
+    const fetch = mock.method(globalThis, "fetch", async () => ({ ok: true }));
+    const { connected, verified } = await getHostConnectionFast(windowServerUrl);
+    assert.deepEqual({ connected, verified }, { connected: true, verified: false });
+    assert.equal(fetch.mock.callCount(), 0);
+    assert.equal(
+      isHostThisMachine(
+        { hostId: "local", serverUrl: windowServerUrl },
+        { readLocalHostId: () => "local", liveDaemonRecordFor },
+      ),
+      true,
+    );
+    assert.equal(liveDaemonRecordFor("https://ws.example.com/omnigent?o=456"), null);
   });
 });
 

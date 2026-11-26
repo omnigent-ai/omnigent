@@ -1,21 +1,17 @@
 import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type * as ShortcutRegistry from "@/lib/shortcuts/registry";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
 import type { WorkspaceHistoryFacts } from "./model";
 import { useWorkspaceHistoryCommands } from "./useWorkspaceHistoryCommands";
 
 const platform = vi.hoisted(() => ({ native: false }));
-vi.mock("@/lib/shortcuts/registry", async (importOriginal) => {
-  const registry = await importOriginal<typeof ShortcutRegistry>();
-  return {
-    ...registry,
-    currentShortcutEnvironment: (overrides = {}) =>
-      registry.currentShortcutEnvironment({ native: platform.native, ...overrides }),
-  };
-});
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
+  isNativeShell: () => platform.native,
+}));
 
 const BACK_ONLY: WorkspaceHistoryFacts = {
   back: { target: "Files", waitingForPage: false },

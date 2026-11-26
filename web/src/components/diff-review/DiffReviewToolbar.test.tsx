@@ -15,7 +15,8 @@ import { DiffReviewToolbar, DiffReviewToolbarProgress } from "./DiffReviewToolba
 /** One TypeScript file's worth of line counts. */
 function breakdownOf(additions: number, deletions: number): LineBreakdown {
   return {
-    totals: { additions, deletions },
+    totals: { files: 1, additions, deletions },
+    notViewed: { files: 1, additions, deletions },
     languages: [{ language: "TypeScript", files: 1, additions, deletions }],
   };
 }
@@ -87,6 +88,8 @@ describe("DiffReviewToolbar's owned files filter", () => {
       wrapLines: false,
       allCollapsed: false,
       canCollapse: false,
+      fileOrder: "path",
+      setFileOrder: () => {},
       toggleAllFiles: () => {},
     }).filter((command) => command.id === "filter-files" || command.id === "toggle-owned-files");
     render(
@@ -154,6 +157,8 @@ describe("DiffReviewToolbar's line counts in a narrow review", () => {
       wrapLines: false,
       allCollapsed: false,
       canCollapse: false,
+      fileOrder: "path",
+      setFileOrder: () => {},
       toggleAllFiles: () => {},
       // The tree toggle opens its own popover; this toolbar shows the rest.
     }).filter((command) => command.id !== "toggle-tree");

@@ -21,8 +21,11 @@ import omnigent.inner.codex_native_executor as codex_native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
+    CODEX_STARTUP_PENDING_CODE,
     CodexNativeBridgeState,
     clear_active_turn_id_if_matches,
+    clear_bridge_startup_error,
+    end_startup_pending,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -36,8 +39,10 @@ from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
     NativeTurnAcceptance,
+    TextChunk,
     TurnComplete,
 )
 from omnigent.inner.native_attachments import attachment_cache_dir
@@ -3929,6 +3934,95 @@ def test_run_turn_surfaces_coded_startup_failure(
     assert "HQ7M-2KPD" not in str(record.attributes)
 
 
+def _publish_started_thread(bridge_dir: Path) -> None:
+    """Publish bridge state, then clear the record, in the runner's thread-start order."""
+    _start_state(bridge_dir)
+    clear_bridge_startup_error(bridge_dir)
+
+
+def _record_sign_in_prompt(bridge_dir: Path) -> None:
+    """Replace the still-starting record with the one a later sign-in prompt leaves."""
+    write_bridge_startup_error(
+        bridge_dir,
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex can't start until you sign in to Databricks",
+        remediation="Open the sign-in link and sign in.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("startup_outcome", "expected_error_code"),
+    [
+        (_publish_started_thread, None),
+        (_record_sign_in_prompt, "databricks_sign_in_pending"),
+        (end_startup_pending, "codex_app_server_stopped"),
+    ],
+    ids=["thread-started", "sign-in-prompt", "launch-ended"],
+)
+def test_run_turn_holds_the_message_while_codex_is_still_starting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    startup_outcome: Callable[[Path], None],
+    expected_error_code: str | None,
+) -> None:
+    """
+    A still-starting record holds the message until startup resolves, instead of failing it.
+
+    The runner records that Codex is still starting when its pane outlives the
+    thread-start budget, then keeps waiting. The turn says once why the message
+    waits and keeps polling: a thread start delivers the message exactly once,
+    while a sign-in prompt or the launch ending fails it, undelivered, with that cause.
+    """
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    hold_polls: list[float] = []
+
+    async def _resolve_startup_on_second_poll(seconds: float) -> None:
+        hold_polls.append(seconds)
+        if len(hold_polls) == 2:
+            startup_outcome(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _resolve_startup_on_second_poll)
+    write_bridge_startup_error(
+        tmp_path,
+        "Codex is still starting in this session's terminal.",
+        code=CODEX_STARTUP_PENDING_CODE,
+        title="Codex is still starting",
+    )
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    notice, *waits, outcome = events
+    assert isinstance(notice, TextChunk)
+    assert "your message will be sent once it's ready" in notice.text.lower()
+    # A keep-alive per check, and one more before a submission, refresh only the idle watchdog.
+    submitted = expected_error_code is None
+    assert [type(event) for event in waits] == [ExecutorWait] * (3 if submitted else 2)
+    assert hold_polls == [0.25, 0.25]
+    if expected_error_code is None:
+        assert isinstance(outcome, TurnComplete)
+        assert _FakeCodexNativeClient.requests == [
+            (
+                "turn/start",
+                {
+                    "threadId": "thread_123",
+                    "input": [{"type": "text", "text": "hello"}],
+                    "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
+                },
+            )
+        ]
+    else:
+        assert isinstance(outcome, ExecutorError)
+        assert outcome.code == expected_error_code
+        assert outcome.undelivered is True
+        assert _FakeCodexNativeClient.requests == []
+
+
 class _UnreachableClient(_FakeCodexNativeClient):
     """Fail the connect the way a vanished app-server does; ``error`` says how."""
 
@@ -4420,24 +4514,287 @@ def test_bridge_state_polling_backs_off_after_fast_window(
     assert isinstance(events[0], ExecutorError)
 
 
+def test_run_turn_waits_for_the_state_when_the_record_clears_first(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A held message keeps waiting when its record clears before the bridge state appears.
+
+    A sign-in can be recorded and finished between two polls of the hold; the
+    runner clears that record before Plan setup and publishes the bridge state
+    after it. The message then waits for the state as it would at launch, and
+    is sent once, with no error in between.
+    """
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    polls: list[float] = []
+
+    async def _clear_then_publish(seconds: float) -> None:
+        polls.append(seconds)
+        if len(polls) == 1:
+            clear_bridge_startup_error(tmp_path)
+        elif len(polls) == 3:
+            _start_state(tmp_path)
+
+    monkeypatch.setattr(asyncio, "sleep", _clear_then_publish)
+    write_bridge_startup_error(
+        tmp_path, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+    )
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert [type(event) for event in events] == [
+        TextChunk,
+        ExecutorWait,
+        ExecutorWait,
+        TurnComplete,
+    ]
+    # One hold poll, then the bounded wait's fast polls until the state appears.
+    assert polls == [0.25, 0.05, 0.05]
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
+
+
 @pytest.mark.asyncio
-async def test_cancelled_bridge_polling_wait_exits_cleanly(tmp_path: Path) -> None:
-    """Cancelling a queued first turn interrupts its polling sleep."""
+async def test_interrupt_during_submission_stops_the_turn_codex_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A Stop that races ``turn/start`` interrupts the turn Codex accepts, once its id is known.
+
+    Codex can accept a message before its turn id is recorded. The interrupt
+    waits for the submission in flight instead of finding no recorded turn and
+    stopping nothing, then interrupts the accepted turn.
+    """
+    accept_turn = asyncio.Event()
+    submitting = asyncio.Event()
+
+    class _SlowAckClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/start":
+                submitting.set()
+                await accept_turn.wait()
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _SlowAckClient
+    )
+    _start_state(tmp_path)
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
+    async def _run() -> list[object]:
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}], [], ""
+            )
+        ]
+
+    turn = asyncio.create_task(_run())
+    await asyncio.wait_for(submitting.wait(), timeout=5)
+    interrupt = asyncio.create_task(executor.interrupt_session("session"))
+    await asyncio.sleep(0)
+    assert not interrupt.done()
+    accept_turn.set()
+
+    assert await asyncio.wait_for(interrupt, timeout=5) is True
+    assert [type(event) for event in await turn] == [TurnComplete]
+    accepted = read_bridge_state(tmp_path)
+    assert accepted is not None
+    assert [method for method, _params in _SlowAckClient.requests] == [
+        "turn/start",
+        "turn/interrupt",
+    ]
+    assert _SlowAckClient.requests[1][1] == {
+        "threadId": "thread_123",
+        "turnId": accepted.active_turn_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_interrupt_does_not_wait_for_a_steer_held_for_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Stop interrupts a compacting turn at once, even while a steer waits for it to settle.
+
+    Only a turn start awaiting Codex's acknowledgment is waited for. A steer
+    refused during compaction waits up to a minute for the very turn change the
+    interrupt causes, so waiting for it would leave Stop doing nothing meanwhile.
+    """
+
+    class _CompactingClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/steer":
+                type(self).requests.append((method, params))
+                raise _compact_steer_refusal()
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _CompactingClient
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    steer = asyncio.create_task(executor.enqueue_session_message("session", "hello"))
+    async with asyncio.timeout(5):
+        while not _CompactingClient.requests:
+            await asyncio.sleep(0.01)
+
+    try:
+        async with asyncio.timeout(2):
+            assert await executor.interrupt_session("session") is True
+        assert _CompactingClient.requests[-1] == (
+            "turn/interrupt",
+            {"threadId": "thread_123", "turnId": "turn_compact"},
+        )
+    finally:
+        steer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await steer
+
+
+def test_a_refused_submission_after_a_late_hold_reports_its_own_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A refusal after the hold reports Codex's cause, not the still-starting record held on.
+
+    The still-starting record can land just after the hold check, so the locked
+    read finds it and the message holds again. Once Codex starts, an otherwise
+    unclassified ``turn/start`` refusal must fail the turn with that refusal,
+    not tell the person their message will still be sent.
+    """
+
+    class _RefusingClient(_FakeCodexNativeClient):
+        requests: list[tuple[str, dict[str, Any]]] = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/start":
+                raise CodexAppServerResponseError({"code": -32603, "message": "synthetic refusal"})
+            return await super().request(method, params)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RefusingClient
+    )
+    real_state_read = codex_native_executor.read_bridge_state_result
+    locked_reads = 0
+
+    def _record_lands_after_the_hold_check(bridge_dir: Path) -> Any:
+        nonlocal locked_reads
+        locked_reads += 1
+        if locked_reads == 1:
+            write_bridge_startup_error(
+                bridge_dir, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+            )
+        return real_state_read(bridge_dir)
+
+    async def _start_codex(_seconds: float) -> None:
+        if codex_native_executor.read_bridge_startup_error(tmp_path) is not None:
+            _publish_started_thread(tmp_path)
+
+    monkeypatch.setattr(
+        codex_native_executor, "read_bridge_state_result", _record_lands_after_the_hold_check
+    )
+    monkeypatch.setattr(asyncio, "sleep", _start_codex)
+    write_bridge_startup_timeout(tmp_path, 120.0)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    error = events[-1]
+    assert isinstance(error, ExecutorError)
+    assert "synthetic refusal" in error.message
+    assert error.code != CODEX_STARTUP_PENDING_CODE
+    assert "sent once it's ready" not in error.message
+
+
+def test_stop_as_codex_finishes_starting_submits_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A Stop that lands in the hold's last poll ends the turn before the message is sent.
+
+    The adapter checks for Stop only between events. When the thread starts in
+    the same poll the Stop arrived in, the hold still yields once more, so the
+    adapter sees the Stop and closes the turn with nothing submitted.
+    """
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    stopped = False
+
+    async def _stop_while_codex_starts(_seconds: float) -> None:
+        nonlocal stopped
+        _publish_started_thread(tmp_path)
+        stopped = True
+
+    monkeypatch.setattr(asyncio, "sleep", _stop_while_codex_starts)
+    write_bridge_startup_error(
+        tmp_path, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def _drive_like_the_adapter() -> list[object]:
+        events: list[object] = []
+        turn = executor.run_turn(
+            [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}], [], ""
+        )
+        async for event in turn:
+            events.append(event)
+            if stopped:
+                break
+        await turn.aclose()
+        return events
+
+    events = asyncio.run(_drive_like_the_adapter())
+
+    assert [type(event) for event in events] == [TextChunk, ExecutorWait, ExecutorWait]
+    assert _FakeCodexNativeClient.requests == []
+
+
+@pytest.mark.parametrize("startup_pending", [False, True], ids=["bounded-wait", "startup-hold"])
+@pytest.mark.asyncio
+async def test_cancelled_bridge_polling_wait_exits_cleanly(
+    tmp_path: Path, startup_pending: bool
+) -> None:
+    """Cancelling a queued first turn interrupts its polling sleep, also while Codex starts."""
+    if startup_pending:
+        write_bridge_startup_error(
+            tmp_path, "Codex is still starting.", code=CODEX_STARTUP_PENDING_CODE
+        )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    events: list[object] = []
+
     async def _drive() -> None:
-        async for _event in executor.run_turn(
+        async for event in executor.run_turn(
             [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
             [],
             "",
         ):
-            pass
+            events.append(event)
 
     task = asyncio.create_task(_drive())
     await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    # A held message ends with its notice alone: nothing failed and nothing was sent.
+    assert [type(event) for event in events] == (
+        [TextChunk, ExecutorWait] if startup_pending else []
+    )
 
 
 @pytest.mark.parametrize(

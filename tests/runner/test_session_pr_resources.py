@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import json
+import subprocess
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -21,7 +27,7 @@ from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.runner.slow_io import run_slow_io
 from omnigent.workspace_fs import WorkspaceReader
-from tests._helpers.polling import poll_until_async
+from tests._helpers.polling import poll_until, poll_until_async
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
@@ -855,6 +861,574 @@ async def test_runner_serves_a_pr_the_server_vouches_for(
     assert served.json()["pr"]["number"] == 42
     assert default.json()["selected_pr_url"] == A
     assert SessionPrRegistry("fresh").list() == []
+
+
+def _is_panel_view(args: list[str]) -> bool:
+    """Whether a ``gh`` call is the selected PR's full panel read."""
+    return args[:2] == ["pr", "view"] and "statusCheckRollup" in args[-1]
+
+
+def test_panel_polls_share_a_recent_read_and_refresh_an_older_one_in_the_background(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[int] = []
+    second_read_may_finish = threading.Event()
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(len(views) + 1)
+            if len(views) == 2:
+                second_read_may_finish.wait(budget(5))
+            body = f"Read {len(views)}"
+            return 0, json.dumps({"number": 42, "title": "Selected", "body": body}), ""
+        return 0, json.dumps({"title": "Listed"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    first = poll()
+    assert first["pr"]["body"] == "Read 1"
+    assert "cache_age_s" not in first
+    again = poll()
+    assert again["pr"]["body"] == "Read 1"
+    assert again["cache_age_s"] >= 0
+    assert views == [1]
+
+    monkeypatch.setattr(pr_resource, "_PANEL_READ_FRESH_SECONDS", 0.0)
+    # Older results answer at once while one background read replaces them.
+    assert poll()["pr"]["body"] == "Read 1"
+    poll_until(lambda: views == [1, 2], timeout_s=budget(5), interval_s=0.01)
+    assert poll()["pr"]["body"] == "Read 1"
+    assert views == [1, 2]
+    second_read_may_finish.set()
+    poll_until(lambda: poll()["pr"]["body"] != "Read 1", timeout_s=budget(5), interval_s=0.01)
+
+    # An expired result is never served: the request waits for the newest read.
+    monkeypatch.setattr(pr_resource, "_PANEL_READ_STALE_SECONDS", 0.0)
+    assert poll()["pr"]["body"] == f"Read {len(views)}"
+
+
+def _count_polls_waiting_on_reads(monkeypatch: pytest.MonkeyPatch) -> threading.Semaphore:
+    """Release the returned semaphore each time a request waits for, or takes, a shared read."""
+    waiting = threading.Semaphore(0)
+    served = pr_resource._served
+
+    def counting(read: object, requested_at: float) -> dict[str, object]:
+        waiting.release()
+        return served(read, requested_at)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pr_resource, "_served", counting)
+    return waiting
+
+
+def test_concurrent_identical_panel_reads_share_one_forge_read(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[list[str]] = []
+    read_started = threading.Event()
+    read_may_finish = threading.Event()
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+            read_started.set()
+            read_may_finish.wait(budget(5))
+        return 0, json.dumps({"number": 42, "title": "Shared"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    waiting = _count_polls_waiting_on_reads(monkeypatch)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        reads = [
+            pool.submit(
+                pr_resource.cached_pr_info,
+                tracked,
+                session_id="session",
+                pr_url=B,
+                allow_cached=True,
+            )
+            for _ in range(3)
+        ]
+        assert read_started.wait(budget(5))
+        # The other two requests are waiting on the running read before it may finish.
+        assert all(waiting.acquire(timeout=budget(5)) for _ in range(2))
+        read_may_finish.set()
+        payloads = [read.result(timeout=budget(5)) for read in reads]
+    assert [payload["pr"]["title"] for payload in payloads] == ["Shared"] * 3
+    assert len(views) == 1
+
+
+def test_a_failed_shared_read_reaches_every_waiting_poll_and_the_next_poll_retries(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads_started: list[dict[str, object]] = []
+    first_read_started = threading.Event()
+    first_read_may_fail = threading.Event()
+    read_pr_info = pr_resource.pr_info
+
+    def first_read_fails(root: str, **kwargs: Any) -> dict[str, Any]:
+        reads_started.append(kwargs)
+        if len(reads_started) == 1:
+            first_read_started.set()
+            first_read_may_fail.wait(budget(5))
+            raise ValueError("PR tracking is busy; try again.")
+        return read_pr_info(root, **kwargs)
+
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    monkeypatch.setattr(pr_resource, "pr_info", first_read_fails)
+    waiting = _count_polls_waiting_on_reads(monkeypatch)
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        polls = [pool.submit(poll) for _ in range(2)]
+        assert first_read_started.wait(budget(5))
+        assert waiting.acquire(timeout=budget(5))
+        first_read_may_fail.set()
+        for result in polls:
+            with pytest.raises(ValueError, match="busy"):
+                result.result(timeout=budget(5))
+    assert poll()["pr"]["state"] == "OPEN"
+    assert len(reads_started) == 2
+
+
+def test_panel_writes_and_new_tracked_prs_make_the_next_poll_read_again(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Tracked"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Tracked", B: "Tracked"})
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    poll()
+    poll()
+    assert len(views) == 1
+    # A failed write may still have changed the PR.
+    with suppress(ValueError, KeyError):
+        pr_resource.create_pr_comment(tracked, session_id="session", pr_url=B, body="Done")
+    poll()
+    assert len(views) == 2
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url("https://github.com/example/three/pull/7")],
+        relationship="worked_on",
+        source="test",
+    )
+    assert len(poll()["prs"]) == 3
+    assert len(views) == 3
+
+
+def test_a_poll_after_a_panel_write_does_not_join_or_keep_a_read_begun_before_it(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[int] = []
+    first_read_started = threading.Event()
+    first_read_may_finish = threading.Event()
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(number := len(views) + 1)
+            if number == 1:
+                first_read_started.set()
+                first_read_may_finish.wait(budget(5))
+            body = f"Read {number}"
+            return 0, json.dumps({"number": 42, "title": "Selected", "body": body}), ""
+        return 0, json.dumps({"title": "Listed"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        earlier = pool.submit(poll)
+        assert first_read_started.wait(budget(5))
+        # A failed write may still have changed the PR.
+        with suppress(ValueError, KeyError):
+            pr_resource.create_pr_comment(tracked, session_id="session", pr_url=B, body="Done")
+        later = pool.submit(poll)
+        assert later.result(timeout=budget(5))["pr"]["body"] == "Read 2"
+        first_read_may_finish.set()
+        assert earlier.result(timeout=budget(5))["pr"]["body"] == "Read 1"
+    assert poll()["pr"]["body"] == "Read 2"
+
+
+def test_a_failed_registry_check_after_a_read_lets_the_next_poll_read_again(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    def unreadable_registry(*_args: object) -> bool:
+        raise PermissionError("registry unreadable")
+
+    monkeypatch.setattr(github, "_gh", gh)
+    monkeypatch.setattr(pr_resource, "_lists_tracked_prs", unreadable_registry)
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    # Uncached titles make the read write the registry, so the check after it runs.
+    assert poll()["pr"]["title"] == "Selected"
+    assert not [key for key in pr_resource._RUNNING_PANEL_READS if key[0] == tracked]
+    poll()
+    assert len(views) == 2
+
+
+async def test_a_reconnected_runner_reads_the_forge_after_an_edit_it_could_not_see(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host serves panel edits while this runner is offline; reconnecting drops older reads."""
+    from omnigent.runner._entry import _on_tunnel_reconnect
+
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    poll()
+    poll()
+    assert len(views) == 1
+    # The host served an edit that this process never saw.
+    caught_up: list[bool] = []
+
+    async def catch_up_scan() -> None:
+        caught_up.append(True)
+
+    await _on_tunnel_reconnect(catch_up_scan)()
+    poll()
+    assert len(views) == 2
+    assert caught_up == [True]
+    await _on_tunnel_reconnect(None)()
+
+
+def test_a_read_without_allow_cached_reads_the_forge_even_while_a_poll_runs(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refresh and the other one-shot reads never take an earlier read, finished or running."""
+    views: list[int] = []
+    first_read_started = threading.Event()
+    first_read_may_finish = threading.Event()
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(number := len(views) + 1)
+            if number == 1:
+                first_read_started.set()
+                first_read_may_finish.wait(budget(5))
+            body = f"Read {number}"
+            return 0, json.dumps({"number": 42, "title": "Selected", "body": body}), ""
+        return 0, json.dumps({"title": "Listed"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    read = functools.partial(pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        poll = pool.submit(read, allow_cached=True)
+        assert first_read_started.wait(budget(5))
+        fresh = read()
+        first_read_may_finish.set()
+        assert poll.result(timeout=budget(5))["pr"]["body"] == "Read 1"
+    assert fresh["pr"]["body"] == "Read 2"
+    assert "cache_age_s" not in fresh
+    assert read()["pr"]["body"] == "Read 3"
+
+
+def test_a_poll_after_a_pr_is_tracked_does_not_take_an_earlier_read(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll that starts after the agent links a PR lists it, and so do the polls after it."""
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    listed = threading.Event()
+    release = threading.Event()
+    list_prs = pr_resource._session_prs_with_titles
+
+    def held_first_listing(*args: Any, **kwargs: Any) -> Any:
+        if not listed.is_set():
+            listed.set()
+            release.wait(budget(5))
+        return list_prs(*args, **kwargs)
+
+    monkeypatch.setattr(pr_resource, "_session_prs_with_titles", held_first_listing)
+    poll = functools.partial(
+        pr_resource.cached_pr_info, tracked, session_id="session", pr_url=B, allow_cached=True
+    )
+    linked = "https://github.com/example/three/pull/7"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        earlier = pool.submit(poll)
+        assert listed.wait(budget(5))
+        SessionPrRegistry("session").record(
+            [PullRequestRef.from_url(linked)], relationship="created", source="test"
+        )
+        later = poll()
+        release.set()
+        assert {pr["url"] for pr in earlier.result(timeout=budget(5))["prs"]} == {A, B}
+    assert linked in {pr["url"] for pr in later["prs"]}
+    assert linked in {pr["url"] for pr in poll()["prs"]}
+
+
+def _forge(state: dict[str, str]) -> object:
+    """A ``gh`` stub whose PR views report ``state["value"]``, as the forge holds it now."""
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        return 0, json.dumps({"number": 42, "title": "Selected", "state": state["value"]}), ""
+
+    return gh
+
+
+async def test_a_panel_merge_shows_on_the_next_panel_read(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The panel refetches after its own merge; that read must show the merge."""
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    monkeypatch.setattr(github, "_run_pr_merge", lambda *_a, **_kw: forge.update(value="MERGED"))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = await client.get(path, params={"pr_url": B})
+        merged = await client.post(
+            f"{path}/merge",
+            json={"pr_url": B, "merge_method": "squash", "expected_head": "a" * 40},
+        )
+        after = await client.get(path, params={"pr_url": B})
+    assert before.json()["pr"]["state"] == "OPEN"
+    assert merged.status_code == 200, merged.text
+    assert after.json()["pr"]["state"] == "MERGED"
+
+
+async def test_a_panel_merge_answers_and_shows_when_its_write_cannot_be_recorded(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that can't leave its cross-process record still succeeds, and polls still see it."""
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    monkeypatch.setattr(github, "_run_pr_merge", lambda *_a, **_kw: forge.update(value="MERGED"))
+    # A directory where the write record would go makes recording it fail.
+    SessionPrRegistry("session").path.with_suffix(".panel-writes").mkdir(parents=True)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    poll = {"pr_url": B, "allow_cached": "true"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = [await client.get(path, params=poll) for _ in range(2)]
+        merged = await client.post(
+            f"{path}/merge",
+            json={"pr_url": B, "merge_method": "squash", "expected_head": "a" * 40},
+        )
+        after = await client.get(path, params=poll)
+    assert [response.json()["pr"]["state"] for response in before] == ["OPEN", "OPEN"]
+    assert merged.status_code == 200, merged.text
+    assert after.json()["pr"]["state"] == "MERGED"
+
+
+_PANEL_COMMENT_IN_ANOTHER_PROCESS = """
+import sys
+from omnigent.runner import github_resource, pr_resource
+github_resource._gh = lambda *_args, **_kwargs: (0, "{}", "")
+try:
+    pr_resource.create_pr_comment(sys.argv[1], session_id="session", pr_url=sys.argv[2], body="Hi")
+except Exception:
+    pass  # A failed write may still have changed the PR.
+"""
+
+
+async def test_a_poll_reads_the_forge_after_another_process_writes_through_the_panel(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host serves panel edits while the runner is offline, in its own process."""
+    from omnigent.runner._entry import _on_tunnel_reconnect
+
+    views: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if _is_panel_view(args):
+            views.append(args)
+        return 0, json.dumps({"number": 42, "title": "Selected"}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    SessionPrRegistry("session").update_titles({A: "Listed", B: "Selected"})
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    poll = {"pr_url": B, "allow_cached": "true"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        await client.get(path, params=poll)
+        other_process = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-c", _PANEL_COMMENT_IN_ANOTHER_PROCESS, tracked, B],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=budget(60),
+        )
+        reads_before = len(views)
+        # The runner was offline while the host served the edit, so it reconnects first.
+        await _on_tunnel_reconnect(None)()
+        after = await client.get(path, params=poll)
+    assert other_process.returncode == 0, other_process.stderr
+    assert after.status_code == 200, after.text
+    assert len(views) == reads_before + 1
+
+
+async def test_panel_reads_answer_for_their_own_session_and_selected_pr(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sessions sharing a workspace, and PRs within one session, never answer for each other."""
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        repository = args[args.index("-R") + 1] if "-R" in args else "workspace"
+        return 0, json.dumps({"number": 42, "title": repository.rsplit("/", 1)[-1]}), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    other = "https://github.com/example/three/pull/42"
+    SessionPrRegistry("other").record(
+        [PullRequestRef.from_url(other)], relationship="created", source="test"
+    )
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        reads = [
+            await client.get(f"/v1/sessions/{session}/resources/github", params={"pr_url": url})
+            for session, url in [("session", A), ("session", B), ("other", other), ("session", A)]
+        ]
+    assert [read.status_code for read in reads] == [200] * 4
+    assert [read.json()["pr"]["title"] for read in reads] == ["one", "two", "three", "one"]
+    assert {pr["url"] for pr in reads[2].json()["prs"]} == {other}
+    assert {pr["url"] for pr in reads[3].json()["prs"]} == {A, B}
+
+
+async def test_a_panel_read_shows_a_forge_change_made_before_it(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refresh, the turn-end refetch and focus refetches are one-shot reads of the forge.
+
+    A PR merged outside the app before such a read must show as merged in it: a
+    merged PR stops the panel's poll, so no later poll would correct an older answer.
+    """
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/session/resources/github"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = await client.get(path, params={"pr_url": B})
+        forge["value"] = "MERGED"
+        refreshed = await client.get(path, params={"pr_url": B})
+    assert before.json()["pr"]["state"] == "OPEN"
+    assert refreshed.json()["pr"]["state"] == "MERGED"
+
+
+def test_a_read_after_a_pr_is_tracked_lists_it_while_an_earlier_read_runs(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that starts after the agent links a PR lists it, even if an older read is busy."""
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    listed = threading.Event()
+    release = threading.Event()
+    list_prs = pr_resource._session_prs_with_titles
+
+    def held_first_listing(*args: Any, **kwargs: Any) -> Any:
+        if not listed.is_set():
+            listed.set()
+            release.wait(budget(5))
+        return list_prs(*args, **kwargs)
+
+    monkeypatch.setattr(pr_resource, "_session_prs_with_titles", held_first_listing)
+    reader = WorkspaceReader(Path(tracked))
+    linked = "https://github.com/example/three/pull/7"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        earlier = pool.submit(reader.github_info, session_id="session", pr_url=B)
+        assert listed.wait(budget(5))
+        SessionPrRegistry("session").record(
+            [PullRequestRef.from_url(linked)], relationship="created", source="test"
+        )
+        later = pool.submit(reader.github_info, session_id="session", pr_url=B)
+        release.set()
+        assert {pr["url"] for pr in earlier.result(timeout=budget(5))["prs"]} == {A, B}
+        assert linked in {pr["url"] for pr in later.result(timeout=budget(5))["prs"]}
+
+
+async def test_a_poll_after_the_agent_links_a_pr_shows_it_not_an_earlier_setup_state(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A poll may answer with an earlier setup state, but never after the session tracks a PR."""
+    monkeypatch.setattr(github, "_git", lambda *_a, **_kw: (128, "", "not a git repository"))
+    monkeypatch.setattr(github, "_gh", _forge({"value": "OPEN"}))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/untracked/resources/github"
+    poll = {"allow_cached": "true"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        before = [await client.get(path, params=poll) for _ in range(2)]
+        SessionPrRegistry("untracked").record(
+            [PullRequestRef.from_url(A)], relationship="created", source="test"
+        )
+        linked = await client.get(path, params=poll)
+    assert [response.json()["reason"] for response in before] == ["not_a_git_repo"] * 2
+    assert linked.status_code == 200, linked.text
+    assert linked.json()["selected_pr_url"] == A
+    assert linked.json()["pr"]["state"] == "OPEN"
+
+
+def test_host_pr_reads_without_the_poll_flag_reflect_the_forge_now(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host serves an offline runner's panel; its one-shot reads stay fresh after a poll."""
+    from omnigent.host.connect import HostProcess
+
+    forge = {"value": "OPEN"}
+    monkeypatch.setattr(github, "_gh", _forge(forge))
+    reader = WorkspaceReader(Path(tracked))
+    polled = HostProcess._dispatch_fs_op(
+        reader, "github_info", "session", {"pr_url": B, "allow_cached": True}
+    )
+    forge["value"] = "MERGED"
+    fresh = HostProcess._dispatch_fs_op(reader, "github_info", "session", {"pr_url": B})
+    assert polled["pr"]["state"] == "OPEN"  # type: ignore[index]
+    assert fresh["pr"]["state"] == "MERGED"  # type: ignore[index]
 
 
 async def test_pr_panel_reads_answer_while_changed_file_listings_hold_the_slow_pool(

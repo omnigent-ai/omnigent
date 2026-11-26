@@ -7,8 +7,10 @@ export {
   useFileTreeSpriteSheet,
 } from "./FileTree";
 export { type FileTreeResolvedIcon, resolveFileIcon } from "./icons";
+export { splitNameForTruncation } from "./MiddleTruncate";
 export { FileTreeModel } from "./model";
 export { orderTreePaths } from "./order";
+export { compareTreeEntries } from "./path-store/sort";
 export type {
   FileTreeBatchOperation,
   FileTreeCompareEntry,

@@ -85,7 +85,7 @@ import { RunnerStartingIndicator, SandboxActionBanner } from "@/pages/ChatIndica
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { shouldQueueSend } from "@/lib/messageQueue";
+import { type ComposerSendOptions, shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { insertPastedText } from "@/lib/composerText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -374,6 +374,7 @@ export function SideChatPane({
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -504,12 +505,14 @@ export function SideChatPane({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -1161,11 +1164,7 @@ function SideChatComposer({
     ...quotes.map((replyQuote) => replyQuote.before),
   ]);
   const sendContext: ComposerSendContext = {
-    mentions: composerInlineMentions(
-      sharedTags?.files ?? [],
-      sharedTags?.sessions ?? [],
-      harness ?? null,
-    ),
+    mentions: composerInlineMentions(sharedTags ?? { files: [], sessions: [] }, harness ?? null),
     reviewComments,
   };
   const addFiles = (incoming: File[]) => {
@@ -1351,7 +1350,7 @@ function SideChatComposer({
       .finally(() => setInterrupting(false));
   };
 
-  const submit = () => {
+  const submit = ({ queue = false }: ComposerSendOptions = {}) => {
     if (settingsSavePending()) return;
     const trimmed = outgoingText;
     const refused = () => {
@@ -1419,7 +1418,7 @@ function SideChatComposer({
         child.status,
         child.sessionStatus,
         useChatStore.getState().queuedMessages,
-        readAlwaysSteer(),
+        readAlwaysSteer() && !queue,
         // A codex /side command posts now even mid-turn, as the full-screen composer does.
         gridCell && usesNativeSideChatFork(harness) && isSideChatCommand(message.trim()),
         holdsInitialDraft(child),
@@ -1448,11 +1447,16 @@ function SideChatComposer({
   };
 
   const handleKeyDown = (event: ComposerKeyboardEvent, intent: ComposerKeyIntent) => {
-    // Mod+Enter submits any draft, then steers the whole queue into the running turn.
+    // Mod+Enter inverts Always steer mid-turn: with it on, the draft waits in the queue
+    // for the turn to end; otherwise it submits any draft, then steers the whole queue.
     if (queues && intent.shouldSteerAllFromKeyboard) {
       event.preventDefault();
       // An open "@" menu keeps its draft unsent, so the queue waits with it.
       if (settingsSavePending() || mentionMenuOpen) return;
+      if (canSend && busy && readAlwaysSteer()) {
+        submit({ queue: true });
+        return;
+      }
       submit();
       steerAllQueuedMessages(childId);
       return;
@@ -1727,7 +1731,7 @@ function SideChatComposer({
                 interrupt={showInterrupt}
                 busy={showInterrupt && interrupting}
                 disabled={showInterrupt ? interrupting || !interruptReady : !canSend || !ready}
-                onClick={showInterrupt ? interruptSideChat : submit}
+                onClick={showInterrupt ? interruptSideChat : () => submit()}
                 data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
               />
             </>

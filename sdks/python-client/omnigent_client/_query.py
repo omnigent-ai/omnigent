@@ -24,7 +24,7 @@ class QueryResult:
     :param text: The assistant's final text, joined across tool-loop
         iterations. Empty string if the agent produced no text.
     :param files: Files the agent produced on this turn (via the
-        ``upload_file`` builtin or equivalent). Empty list if none.
+        ``sys_files_upload`` tool or equivalent). Empty list if none.
         Each entry is a :class:`File` with ``id``, ``filename``,
         ``bytes``, and ``created_at``; use
         :meth:`FilesNamespace.download` or

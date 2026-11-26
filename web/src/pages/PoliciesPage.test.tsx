@@ -1,12 +1,7 @@
-// Tests for the admin PoliciesPage (global default policies: list, toggle,
-// add, delete).
-//
-// Browser e2e is impractical (admin/accounts-gated), so the surface is pinned
-// here by mocking the mode-agnostic identity probe (resolveIdentity /
-// getCurrentIsAdmin gate admin — works under OIDC too) and the react-query
-// policy hooks (useDefaultPolicies / usePolicyRegistry + add/update/delete
-// mutations) so no QueryClient or network is needed.
+// Policy controls and identity recovery. Most collaborators are mocked;
+// recovery exercises the real query hook and cache.
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,14 +45,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 
 beforeEach(() => identityUpdates.clear());
-vi.mock("@/hooks/useDefaultPolicies", () => ({
+vi.mock("@/hooks/useDefaultPolicies", async (importOriginal) => ({
+  ...(await importOriginal<typeof defaultPolicies>()),
   useDefaultPolicies: vi.fn(),
   useAddDefaultPolicy: vi.fn(),
   useUpdateDefaultPolicy: vi.fn(),
   useDeleteDefaultPolicy: vi.fn(),
-  // Same class the component imports (both resolve to this mocked module), so
-  // the component's `instanceof PoliciesForbiddenError` check matches.
-  PoliciesForbiddenError: class PoliciesForbiddenError extends Error {},
 }));
 vi.mock("@/hooks/usePolicies", () => ({ usePolicyRegistry: vi.fn() }));
 
@@ -130,6 +123,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("PoliciesPage gating", () => {
@@ -139,25 +133,6 @@ describe("PoliciesPage gating", () => {
     expect(screen.getByText("Loading...")).toBeInTheDocument();
   });
 
-  it("shows policy controls when identity recovers while the page stays open", async () => {
-    vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
-    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
-    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
-    const view = renderPage();
-    await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
-    expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
-
-    vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
-    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
-    act(() => {
-      for (const listener of identityUpdates) listener();
-    });
-
-    expect(await screen.findByRole("button", { name: "Add policy" })).toBeInTheDocument();
-    view.unmount();
-    expect(identityUpdates.size).toBe(0);
-  });
-
   it("blocks non-admins with a permission message", async () => {
     vi.mocked(identity.resolveIdentity).mockResolvedValue("alice");
     vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
@@ -165,7 +140,75 @@ describe("PoliciesPage gating", () => {
     expect(
       await screen.findByText("You don't have permission to manage global policies."),
     ).toBeInTheDocument();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(false);
   });
+
+  it.each([true, false])(
+    "recovers an exhausted policies query after identity becomes available (allowed: %s)",
+    async (allowed) => {
+      const actual = await vi.importActual<typeof defaultPolicies>("@/hooks/useDefaultPolicies");
+      vi.mocked(defaultPolicies.useDefaultPolicies).mockImplementation(actual.useDefaultPolicies);
+      vi.mocked(identity.resolveIdentity).mockResolvedValue(null);
+      vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+      vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      client.setQueryData(actual.DEFAULT_POLICIES_QUERY_KEY, [policy({ name: "previous_policy" })]);
+      const denied = new actual.PoliciesForbiddenError("Not permitted to list default policies");
+      await expect(
+        client.fetchQuery({
+          queryKey: actual.DEFAULT_POLICIES_QUERY_KEY,
+          queryFn: () => Promise.reject(denied),
+        }),
+      ).rejects.toBe(denied);
+      let respond!: (response: Response) => void;
+      const fetch = vi.fn().mockReturnValue(
+        new Promise<Response>((resolve) => {
+          respond = resolve;
+        }),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const view = render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <PoliciesPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(identity.resolveIdentity).toHaveBeenCalled());
+      expect(screen.getByText("Loading...")).toBeInTheDocument();
+      expect(fetch).not.toHaveBeenCalled();
+
+      vi.mocked(identity.getCurrentUserId).mockReturnValue("admin");
+      vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+      act(() => {
+        for (const listener of identityUpdates) listener();
+      });
+
+      await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+      expect(
+        screen.queryByText("You don't have permission to manage global policies."),
+      ).not.toBeInTheDocument();
+      respond(
+        new Response(
+          JSON.stringify({ object: "list", data: [policy({ name: "recovered_policy" })] }),
+          { status: allowed ? 200 : 403 },
+        ),
+      );
+      if (allowed) {
+        expect(await screen.findByText("recovered_policy")).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Add policy" })).toBeInTheDocument();
+      } else {
+        expect(
+          await screen.findByText("You don't have permission to manage global policies."),
+        ).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "Add policy" })).not.toBeInTheDocument();
+      }
+      expect(fetch.mock.calls[0][0]).toBe("/v1/policies");
+      view.unmount();
+      expect(identityUpdates.size).toBe(0);
+      client.clear();
+    },
+  );
 
   it("hides the section with a permission message when the list call is forbidden", async () => {
     // An admin whose workspace restricts global policies: the list call 403s,
@@ -451,6 +494,7 @@ describe("PoliciesPage single-user mode", () => {
     expect(
       screen.queryByText("You don't have permission to manage global policies."),
     ).not.toBeInTheDocument();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(true);
   });
 
   it("shows policies list directly without probing identity", async () => {
@@ -458,6 +502,7 @@ describe("PoliciesPage single-user mode", () => {
     renderPage();
     expect(await screen.findByText("block_canada")).toBeInTheDocument();
     expect(identity.resolveIdentity).not.toHaveBeenCalled();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(true);
   });
 });
 
@@ -480,5 +525,6 @@ describe("PoliciesPage on a multi-user header-auth deploy", () => {
       await screen.findByText("You don't have permission to manage global policies."),
     ).toBeInTheDocument();
     expect(identity.resolveIdentity).toHaveBeenCalled();
+    expect(defaultPolicies.useDefaultPolicies).toHaveBeenLastCalledWith(false);
   });
 });

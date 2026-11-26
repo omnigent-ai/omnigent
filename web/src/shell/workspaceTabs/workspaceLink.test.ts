@@ -51,6 +51,24 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
       "omnigent://changes?path=a.go&base=main&file-tab=1",
       { place: { kind: "changes", path: "a.go", range: { base: "main" }, fileTab: true } },
     ],
+    [
+      "omnigent://changes?path=a.go&compare=branch-point",
+      {
+        place: {
+          kind: "changes",
+          path: "a.go",
+          comparison: { kind: "saved", intent: "branch-point" },
+        },
+      },
+    ],
+    [
+      "omnigent://changes?compare-base=v1.2&compare-head=feature",
+      { place: { kind: "changes", comparison: { kind: "typed", base: "v1.2", head: "feature" } } },
+    ],
+    [
+      "omnigent://changes?compare-base=main",
+      { place: { kind: "changes", comparison: { kind: "typed", base: "main", head: "" } } },
+    ],
     ["omnigent://pulls", { place: { kind: "pulls" } }],
     [
       `omnigent://pull?url=${encodeURIComponent(PR)}`,
@@ -155,6 +173,9 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     [`omnigent://pull?url=${encodeURIComponent(PR)}&view=checks`, "no view"],
     [`omnigent://pull?url=${encodeURIComponent(PR)}&commit=xyz`, "isn't a commit SHA"],
     ["omnigent://changes?head=HEAD", "needs a base"],
+    ["omnigent://changes?compare-head=HEAD", "needs a base"],
+    ["omnigent://changes?compare=sideways", "can't compare with “sideways”"],
+    ["omnigent://changes?compare=head&compare-base=main", "not both"],
     ["omnigent://terminal", "needs an ID"],
     ["omnigent://agent", "needs an ID"],
     ["omnigent://files/abc", "doesn't take an ID"],

@@ -2,21 +2,38 @@
 // rail's host doesn't provide, which are the shell close question, ending a shell, and Back
 // and Forward. Loaded on demand, so the classic sidebar never downloads it.
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
+
+import { useWarmSharedDiffWorkers } from "@/components/diff-review/sharedDiffWorkers";
+import {
+  tabsSidebarForwardedShortcuts,
+  useBrowserForwardedChords,
+} from "@/hooks/useBrowserForwardedChords";
 
 import { useDeleteTerminal } from "@/hooks/useTerminals";
+import { useValueAfterDeferredRender } from "@/hooks/useValueAfterDeferredRender";
 import type { TerminalInfo } from "@/lib/terminals";
 
 import { CloseShellDialog } from "../CloseShellDialog";
 import type { WorkspaceHistoryDirection } from "../workspaceCommands/model";
 import { useWorkspaceHistoryCommands } from "../workspaceCommands/useWorkspaceHistoryCommands";
+import { CloseShellsDialog } from "./CloseShellsDialog";
 import { useTabsShellClose } from "./useTabsShellClose";
 import { useWorkspaceHistory } from "./useWorkspaceHistory";
 import { WorkspaceTabsPanel, type WorkspaceTabsPanelProps } from "./WorkspaceTabsPanel";
+import { workspaceTabsSession } from "./workspaceTabsSessions";
+
+const NO_FORWARDED_SHORTCUTS: readonly [] = [];
+
+/** Whether the session has a closed tab to reopen. */
+function useCanReopenTab(conversationId: string): boolean {
+  const { store } = useMemo(() => workspaceTabsSession(conversationId), [conversationId]);
+  return useSyncExternalStore(store.subscribe, () => store.snapshot().canReopen);
+}
 
 export type WorkspaceTabsHostProps = Omit<
   WorkspaceTabsPanelProps,
-  "confirmCloseShell" | "endShell" | "historyCommands" | "onHistoryGo"
+  "confirmCloseShell" | "confirmCloseShells" | "endShell" | "historyCommands" | "onHistoryGo"
 > & {
   /** The session's terminals, which a shell tab's close ends. */
   terminals: readonly TerminalInfo[];
@@ -33,9 +50,20 @@ export function WorkspaceTabsHost({
   ...panelProps
 }: WorkspaceTabsHostProps) {
   const { conversationId, onReveal } = panelProps;
-  const deleteTerminal = useDeleteTerminal(conversationId);
+  // Diffs finds the highlighting workers already started, rather than waiting for its own.
+  useWarmSharedDiffWorkers();
+  // Going inert restyles everything in the rail, so a collapse takes it in a frame of its own,
+  // after the toggle's. Leaving inert stays immediate, so what an expand focuses can take focus.
+  const inertNow = panelProps.inert ?? false;
+  const inertLater = useValueAfterDeferredRender(inertNow);
+  // The sidebar names the shells a close couldn't end in one message of its own.
+  const deleteTerminal = useDeleteTerminal(conversationId, { reportsFailure: false });
   const { mutateAsync: deleteTerminalAsync } = deleteTerminal;
-  const shellClose = useTabsShellClose({ terminals, deleteTerminal: deleteTerminalAsync });
+  const shellClose = useTabsShellClose({
+    sessionId: conversationId,
+    terminals,
+    deleteTerminal: deleteTerminalAsync,
+  });
 
   const historySessionId = bindsHistory ? conversationId : null;
   const history = useWorkspaceHistory(historySessionId);
@@ -53,6 +81,13 @@ export function WorkspaceTabsHost({
     facts: history.facts,
     go,
   });
+  // A focused browser page hands its app chords to the sidebar that binds history, one per window.
+  const canReopen = useCanReopenTab(conversationId);
+  // A drawer and a grid cell never fill the window, so their pages keep ⇧⌘F.
+  const canFullScreen = panelProps.placement !== "drawer" && !panelProps.contained;
+  useBrowserForwardedChords(
+    bindsHistory ? tabsSidebarForwardedShortcuts(canReopen, canFullScreen) : NO_FORWARDED_SHORTCUTS,
+  );
   const historyProps = useMemo(
     () => (bindsHistory ? { historyCommands, onHistoryGo: go } : {}),
     [bindsHistory, historyCommands, go],
@@ -63,12 +98,23 @@ export function WorkspaceTabsHost({
       <WorkspaceTabsPanel
         {...panelProps}
         {...historyProps}
+        inert={inertNow && inertLater}
+        inertPending={inertNow && !inertLater}
         confirmCloseShell={shellClose.confirmCloseShell}
+        confirmCloseShells={shellClose.confirmCloseShells}
         endShell={shellClose.endShell}
       />
+      <CloseShellsDialog
+        open={(shellClose.question?.count ?? 0) > 1}
+        shellLabels={shellClose.question?.label ?? null}
+        shellCount={shellClose.question?.count ?? 0}
+        onCancel={() => shellClose.answerQuestion(false)}
+        onConfirm={() => shellClose.answerQuestion(true)}
+      />
       <CloseShellDialog
-        open={shellClose.question !== null}
+        open={shellClose.question !== null && shellClose.question.count === 1}
         shellLabel={shellClose.question?.label ?? null}
+        busy={shellClose.question?.busy}
         onCancel={() => shellClose.answerQuestion(false)}
         onConfirm={() => shellClose.answerQuestion(true)}
       />

@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 
+import { PushUnresolved, RepositoryContextProblem } from "@/lib/workspaceSidebarApi";
+
 import {
   codeHostBlobUrl,
   pullRequestFileLink,
   sourceRepository,
   stackComparisonFileLink,
+  type WorkspaceRepositoryContext,
+  workspaceFileLink,
 } from "./codeHostFileLink";
 
 const HEAD = "a".repeat(40);
@@ -16,10 +20,22 @@ describe("codeHostBlobUrl", () => {
         host: "github.com",
         owner: "acme",
         repo: "app",
-        sha: HEAD,
+        revision: HEAD,
         path: "docs/a b/#notes?.md",
       }),
     ).toBe(`https://github.com/acme/app/blob/${HEAD}/docs/a%20b/%23notes%3F.md`);
+  });
+
+  it("keeps a branch name's slashes and encodes the rest", () => {
+    expect(
+      codeHostBlobUrl({
+        host: "github.com",
+        owner: "acme",
+        repo: "app",
+        revision: "me/fix#2",
+        path: "a.ts",
+      }),
+    ).toBe("https://github.com/acme/app/blob/me/fix%232/a.ts");
   });
 
   it("anchors one line or an ordered range", () => {
@@ -28,7 +44,7 @@ describe("codeHostBlobUrl", () => {
         host: "github.com",
         owner: "acme",
         repo: "app",
-        sha: HEAD,
+        revision: HEAD,
         path: "a.ts",
         lines: { start, end },
       });
@@ -244,5 +260,110 @@ describe("stackComparisonFileLink", () => {
     expect(stackComparisonFileLink({ ...facts, change: "deleted" })?.url).toBe(
       blob(PARENT, "src/old.ts"),
     );
+  });
+});
+
+describe("workspaceFileLink", () => {
+  const PUSHED = "c".repeat(40);
+  const pushedContext: WorkspaceRepositoryContext = {
+    problem: RepositoryContextProblem.UNSPECIFIED,
+    branch: "me/feature",
+    headSha: PUSHED,
+    push: {
+      remoteName: "origin",
+      branch: "me/feature",
+      host: "github.com",
+      owner: "acme",
+      repo: "app",
+      trackingSha: PUSHED,
+    },
+    pushUnresolved: PushUnresolved.UNSPECIFIED,
+    remotes: [{ name: "origin", host: "github.com", owner: "acme", repo: "app" }],
+    workspacePrefix: "packages/web/",
+  };
+  const link = (context: WorkspaceRepositoryContext, path = "src/a.ts", githubHosts?: string[]) =>
+    workspaceFileLink({ context, path, githubHosts });
+  const notPushed = { ...pushedContext, push: { ...pushedContext.push!, trackingSha: "" } };
+
+  it("opens a pushed HEAD at its commit, below the workspace's place in the repository", () => {
+    expect(link(pushedContext)).toEqual({
+      label: "Open in GitHub",
+      url: `https://github.com/acme/app/blob/${PUSHED}/packages/web/src/a.ts`,
+    });
+    expect(
+      workspaceFileLink({ context: pushedContext, path: "src/a.ts", lines: { start: 9, end: 4 } })
+        ?.url,
+    ).toBe(`https://github.com/acme/app/blob/${PUSHED}/packages/web/src/a.ts#L4-L9`);
+  });
+
+  it("opens the pushed branch, without line anchors, when HEAD has commits the push remote doesn't", () => {
+    const ahead = { ...pushedContext, headSha: HEAD };
+    const branchUrl = "https://github.com/acme/app/blob/me/feature/packages/web/src/a.ts";
+    expect(link(ahead)?.url).toBe(branchUrl);
+    // The branch's lines may not be the ones on screen.
+    expect(
+      workspaceFileLink({ context: ahead, path: "src/a.ts", lines: { start: 4, end: 9 } })?.url,
+    ).toBe(branchUrl);
+  });
+
+  it("opens the repository the branch pushes to, such as a fork", () => {
+    const fork = { ...pushedContext, push: { ...pushedContext.push!, owner: "me" } };
+    expect(link(fork)?.url).toBe(`https://github.com/me/app/blob/${PUSHED}/packages/web/src/a.ts`);
+  });
+
+  it("says why when the branch isn't pushed yet", () => {
+    const pushFirst = {
+      label: "Open in GitHub",
+      url: null,
+      unavailableReason: "Push this branch to open the file in GitHub.",
+    };
+    expect(link(notPushed)).toEqual(pushFirst);
+    expect(link({ ...pushedContext, push: undefined })).toEqual(pushFirst);
+    expect(link({ ...pushedContext, branch: "", push: undefined })).toMatchObject({
+      url: null,
+      unavailableReason: "Check out a branch to open the file in GitHub.",
+    });
+    expect(
+      link({ ...pushedContext, push: undefined, pushUnresolved: PushUnresolved.REFSPEC }),
+    ).toMatchObject({
+      url: null,
+      unavailableReason: "This branch doesn't push to one GitHub repository.",
+    });
+  });
+
+  it("recognizes a GitHub Enterprise host only from evidence", () => {
+    const enterprise = {
+      ...pushedContext,
+      push: { ...pushedContext.push!, host: "git.example.com" },
+      remotes: [{ name: "origin", host: "git.example.com", owner: "acme", repo: "app" }],
+    };
+    expect(link(enterprise)).toBeNull();
+    expect(link({ ...enterprise, push: undefined })).toBeNull();
+    expect(link(enterprise, "src/a.ts", ["git.example.com"])?.url).toBe(
+      `https://git.example.com/acme/app/blob/${PUSHED}/packages/web/src/a.ts`,
+    );
+  });
+
+  it("offers nothing without a repository context it can map paths through", () => {
+    expect(workspaceFileLink({ context: undefined, path: "src/a.ts" })).toBeNull();
+    expect(
+      link({ ...pushedContext, problem: RepositoryContextProblem.NOT_A_REPOSITORY }),
+    ).toBeNull();
+    // An older host doesn't say where the workspace sits in its repository.
+    expect(link({ ...pushedContext, workspacePrefix: undefined })).toBeNull();
+    expect(link({ ...pushedContext, workspacePrefix: "" })?.url).toBe(
+      `https://github.com/acme/app/blob/${PUSHED}/src/a.ts`,
+    );
+  });
+
+  it.each([
+    "/etc/hosts",
+    "~/notes.md",
+    "C:\\code\\a.ts",
+    "../other/a.ts",
+    "src/./a.ts",
+    "src//a.ts",
+  ])("offers nothing for %s, which isn't a path in the workspace", (path) => {
+    expect(link(pushedContext, path)).toBeNull();
   });
 });

@@ -1,10 +1,14 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import { type ComponentProps, type ReactNode, useState } from "react";
+import { toast } from "sonner";
 
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import * as host from "@/lib/host";
+import { resetUiFeatureOverridesForTests } from "@/lib/uiFeatureOverrides";
 import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 import type { WorkspaceHistoryFacts } from "./workspaceCommands/model";
@@ -27,6 +31,12 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
   useProjects: (...args: unknown[]) => useProjects(...args),
+}));
+
+let sidebarSessions: { pages: { data: unknown[] }[] } | undefined;
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: () => sidebarSessions,
 }));
 
 function conv(
@@ -68,7 +78,8 @@ function searchPages(...pages: (ReturnType<typeof conv> & Partial<Conversation>)
   return { data: { pages: pages.map((data) => ({ data })) } };
 }
 
-const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8 };
+// ⌘K's own search keeps archived sessions, as the server does by default.
+const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8, includeArchived: true };
 
 /** Find a session row by its full label text even when the highlighter has
     split it around a <mark> (so the text lives across several nodes). */
@@ -99,6 +110,7 @@ function withQueryClient(queryClient = new QueryClient()) {
 
 beforeEach(() => {
   navigate.mockClear();
+  sidebarSessions = undefined;
   useConversations.mockReset();
   useSessionSearch.mockReset();
   useProjects.mockReturnValue({ data: [] });
@@ -106,7 +118,12 @@ beforeEach(() => {
   setSessions([]);
   setSearchGroups({});
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  // QuickPick records accepted commands under Recent; a later case starts without them.
+  localStorage.clear();
+  resetUiFeatureOverridesForTests();
+});
 
 /** Every non-empty live region's text, so both palettes' status messages read the same. */
 const announced = () =>
@@ -118,7 +135,7 @@ const announced = () =>
 
 describe("CommandPalette — sessions", () => {
   it.each([false, true])(
-    "requests active sessions and keeps owned and shared results (sessionsOnly=%s)",
+    "keeps owned and shared sessions, and archived ones only in ⌘K (sessionsOnly=%s)",
     (sessionsOnly) => {
       const sessions = [
         { ...conv("owned", "Owned session"), owner: "current-user", permission_level: 4 },
@@ -128,12 +145,83 @@ describe("CommandPalette — sessions", () => {
       setSessions(sessions);
       renderPalette({ sessionsOnly });
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", !sessionsOnly, { enabled: true });
       expect(screen.getByText("Owned session")).toBeTruthy();
       expect(screen.getByText("Shared session")).toBeTruthy();
-      expect(screen.queryByText("Archived session")).toBeNull();
+      if (sessionsOnly) {
+        expect(screen.queryByText("Archived session")).toBeNull();
+      } else {
+        expect(labelRow("Archived session").closest('[role="option"]')?.textContent).toContain(
+          "Archived",
+        );
+      }
     },
   );
+
+  it("lists a just-archived session first among the recent sessions and opens it", () => {
+    // Archiving bumps updated_at, so the session lands above older activity.
+    setSessions([
+      ...Array.from({ length: 5 }, (_, index) => ({
+        ...conv(`active-${index}`, `Active ${index}`),
+        updated_at: 10 - index,
+      })),
+      { ...conv("mistake", "Archived too early"), archived: true, updated_at: 20 },
+    ]);
+    const { onOpenChange } = renderPalette();
+
+    const rows = screen
+      .getAllByRole("option")
+      .map((option) => option.textContent ?? "")
+      .filter((text) => text.includes("Active") || text.includes("Archived too early"));
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toContain("Archived too early");
+    expect(rows[0]).toContain("Archived");
+    expect(rows.slice(1).some((text) => text.includes("Archived"))).toBe(false);
+    expect(screen.queryByText("Active 4")).toBeNull();
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/mistake");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("shows the sidebar's loaded sessions until the archived-inclusive list loads", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />, { wrapper: withQueryClient() });
+
+    expect(screen.getByText("Cached session")).toBeTruthy();
+
+    // Once loaded, the list replaces the sidebar's rows, even when it's empty.
+    setSessions([]);
+    rerender(<CommandPalette {...props} />);
+    expect(screen.queryByText("Cached session")).toBeNull();
+  });
+
+  it("doesn't fill Find a session's list from the sidebar", () => {
+    sidebarSessions = { pages: [{ data: [conv("cached", "Cached session")] }] };
+    useConversations.mockReturnValue({ data: undefined, isFetching: true });
+    renderPalette({ sessionsOnly: true });
+
+    expect(screen.queryByText("Cached session")).toBeNull();
+  });
+
+  it("keeps the row of a session opened from the recent list for the sidebar to list", () => {
+    const archived = { ...conv("archived", "Archived session"), archived: true, owner: "me" };
+    setSessions([archived]);
+    const queryClient = new QueryClient();
+    renderPalette({}, queryClient);
+
+    fireEvent.click(labelRow("Archived session"));
+
+    expect(navigate).toHaveBeenCalledWith("/c/archived");
+    expect(queryClient.getQueryData(["conversation-backfill", "archived"])).toEqual(archived);
+  });
 
   it.each([false, true])(
     "shows project and parent context without needing the parent in results (sessionsOnly=%s)",
@@ -414,7 +502,7 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(useConversations).toHaveBeenCalledWith("", true, { enabled: true });
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
@@ -648,6 +736,21 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     expect(screen.getByLabelText("Close search")).toBeTruthy();
   });
 
+  it("pins the mobile sheet to the top of the visible viewport in the iOS app", () => {
+    // The iOS app's dialogs center on the keyboard-aware viewport inline; the sheet must not.
+    vi.stubGlobal("omnigentNative", { kind: "ios" });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    setMobile(true);
+    renderPalette();
+
+    const style = (dialogContent() as HTMLElement | null)?.style;
+    expect(style?.top).toBe("0px");
+    expect(style?.height).toBe("var(--omnigent-viewport-height, 100dvh)");
+    expect(style?.maxHeight).toBe("var(--omnigent-viewport-height, 100dvh)");
+  });
+
   it("keeps the centered dialog and shows no close button on desktop", () => {
     setMobile(false);
     renderPalette();
@@ -761,7 +864,11 @@ describe("CommandPalette — title and content groups", () => {
 
   it("does not search while the palette is closed or listing sessions only", () => {
     renderPalette({ open: false });
-    expect(useSessionSearch).toHaveBeenCalledWith("", "title", { enabled: false, limit: 8 });
+    expect(useSessionSearch).toHaveBeenCalledWith("", "title", {
+      enabled: false,
+      limit: 8,
+      includeArchived: true,
+    });
     cleanup();
     useSessionSearch.mockClear();
     renderPalette({ sessionsOnly: true });
@@ -769,6 +876,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenLastCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
   });
 
@@ -1026,6 +1134,7 @@ describe("CommandPalette — title and content groups", () => {
     expect(useSessionSearch).toHaveBeenCalledWith("deploy", "content", {
       enabled: false,
       limit: 8,
+      includeArchived: true,
     });
     expect(screen.queryByText("In messages")).toBeNull();
     const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
@@ -1154,6 +1263,96 @@ describe("CommandPalette — actions", () => {
   });
 });
 
+describe("CommandPalette — QuickPick preview bootstrap", () => {
+  const label = "Enable feature preview: new QuickPick command palette";
+  const origin = window.location.origin;
+  const key = `omnigent:ui-feature-overrides:v1:${JSON.stringify(origin)}`;
+  const isQuickPick = "QUICK_PICK_PALETTE" in commandPaletteModule;
+
+  function searchPreview() {
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "preview" } });
+  }
+
+  const reload = vi.fn();
+  beforeEach(() => {
+    reload.mockReset();
+    vi.stubGlobal("location", { origin, reload });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.skipIf(isQuickPick)(
+    "offers the command only in search and saves the opt-in before reloading",
+    () => {
+      serverInfo.mockReturnValue({
+        session_search_scope: true,
+        features: { quick_pick_palette: false },
+      });
+      renderPalette();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+      searchPreview();
+      const command = screen.getByRole("option", { name: label });
+      let savedAtReload: string | null = null;
+      reload.mockImplementation(() => {
+        savedAtReload = localStorage.getItem(key);
+      });
+      fireEvent.click(command);
+      expect(localStorage.getItem(key)).toBe('{"quick_pick_palette":true}');
+      expect(reload).toHaveBeenCalledOnce();
+      expect(savedAtReload).toBe('{"quick_pick_palette":true}');
+    },
+  );
+
+  it.skipIf(isQuickPick)("offers the command when an override turns QuickPick off", () => {
+    localStorage.setItem(key, '{"quick_pick_palette":false}');
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: true },
+    });
+    renderPalette();
+    searchPreview();
+    expect(screen.getByRole("option", { name: label })).toBeVisible();
+  });
+
+  it.skipIf(isQuickPick)("does not reload if storage refuses the opt-in", () => {
+    serverInfo.mockReturnValue({
+      session_search_scope: true,
+      features: { quick_pick_palette: false },
+    });
+    renderPalette();
+    searchPreview();
+    const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    const errorToast = vi.spyOn(toast, "error").mockImplementation(() => "");
+    onTestFinished(() => {
+      storage.mockRestore();
+      errorToast.mockRestore();
+    });
+    fireEvent.click(screen.getByRole("option", { name: label }));
+    expect(errorToast).toHaveBeenCalledWith("Couldn't save the feature preview on this device.");
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(isQuickPick).each(["server-on", "override-on", "unreported", "no-identity"])(
+    "does not offer the bootstrap for %s",
+    (scenario) => {
+      if (scenario === "override-on") localStorage.setItem(key, '{"quick_pick_palette":true}');
+      if (scenario === "no-identity") {
+        const identity = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+        onTestFinished(() => identity.mockRestore());
+      }
+      const features =
+        scenario === "unreported" ? {} : { quick_pick_palette: scenario === "server-on" };
+      serverInfo.mockReturnValue({ session_search_scope: true, features });
+      renderPalette();
+      searchPreview();
+      expect(screen.queryByRole("option", { name: label })).toBeNull();
+    },
+  );
+});
+
 describe("CommandPalette — empty state", () => {
   it("shows an empty state when nothing matches", () => {
     setSessions([]);
@@ -1280,14 +1479,18 @@ describe("CommandPalette — commands a mounted feature offers", () => {
     expect(document.activeElement).toBe(screen.getByText("Where the command moves focus"));
   });
 
-  it("lists none without the workspace_sidebar_v2 flag", async () => {
-    withSidebarFlag(false);
-    openPalette(vi.fn());
-    fireEvent.change(screen.getByTestId("command-palette-input"), {
-      target: { value: "in the workspace" },
-    });
+  // The QuickPick palette lists them under its own flag; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "lists none without the workspace_sidebar_v2 flag",
+    async () => {
+      withSidebarFlag(false);
+      openPalette(vi.fn());
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "in the workspace" },
+      });
 
-    await screen.findByText("No results found");
-    expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
-  });
+      await screen.findByText("No results found");
+      expect(screen.queryByRole("option", { name: /Go back in the workspace/ })).toBeNull();
+    },
+  );
 });

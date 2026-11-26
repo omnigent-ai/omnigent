@@ -9,8 +9,9 @@ import { lazy, Suspense, useCallback, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { requestFileFinder, useFileFinderAvailable } from "@/store/fileFinder";
+import { useShowIgnoredFiles, writeShowIgnoredFiles } from "@/lib/filesTreeIgnoredPreferences";
 import type { ChangedSort } from "@/lib/changedSort";
 import type { CommentSelectionRequest } from "@/shell/commentSelectionHandoff";
 import { useFilesTreePageCommands } from "@/shell/fileTree/useFilesTreePageCommands";
@@ -21,6 +22,7 @@ import { PullRequestPanel } from "@/shell/PullRequestPanel";
 import { PullRequestPageBody } from "@/pullRequestPage/PullRequestPageBody";
 
 import type { OpenOptions } from "../planOpen";
+import type { TabLanding } from "../workspaceTabsStore";
 import {
   WORKSPACE_SIDEBAR_LAYOUT,
   WORKSPACE_TOOLBAR_CLASS,
@@ -32,11 +34,13 @@ import {
 import type { LineRange, WorkspaceLink, WorkspacePlace } from "../workspacePlace";
 import {
   changedFileViewed,
+  changesComparisonShown,
   changesDefaultComparison,
   changesFileInNewTab,
   changesOverview,
   fileTabFileChosen,
   fileViewDiffRequested,
+  allPullRequestsChosen,
   pullRequestChosen,
   pullRequestSectionChosen,
   shownPullRequestPlace,
@@ -49,6 +53,7 @@ import {
 } from "./placeViewActions";
 import { FILES_TREE_WIDTH } from "./filesTreeWidth";
 import { FilesPageTree } from "./FilesPageTree";
+import { useFilesTreeOptionCommands } from "./filesTreeOptions";
 import { type FilesPageLeaveGuard, FilesPageViewer } from "./FilesPageViewer";
 import {
   HIDE_FILES_TREE_LABEL,
@@ -73,6 +78,8 @@ export interface PlaceViewFileSettings {
 export interface WorkspacePlaceViewProps {
   conversationId: string;
   place: FilesPlace | ChangesPlace | PullRequestPlace;
+  /** How the tab last landed on `place`, by a step, a link or an open. */
+  landing?: TabLanding;
   /**
    * This is the session's Files tab, which browses with its tree. Other file tabs
    * show just their file, so a tree click can't land in a different tab.
@@ -183,7 +190,12 @@ function FilesPlaceView({
     enabled: commandsActive,
   });
   useFilesTreeShowRequests(active ? conversationId : undefined, tree.show);
-  // Every Files place, the Files tab or a file tab, shows the same tree beside its file.
+  // Git-ignored files are a per-device choice of the Files tree, beside the panel's settings.
+  const showIgnored = useShowIgnoredFiles();
+  const treeOptions = { ...files, showIgnored, onShowIgnoredChange: writeShowIgnoredFiles };
+  useFilesTreeOptionCommands(treeOptions, commandsActive);
+  // Every Files place, the Files tab or a file tab, shows the same tree beside its file; the
+  // tree's options sit in its own header.
   const treeToggle = (
     <WorkspaceSidebarToggle
       state={tree}
@@ -191,6 +203,13 @@ function FilesPlaceView({
       hideLabel={HIDE_FILES_TREE_LABEL}
     />
   );
+  // A file picked in the tree or the breadcrumbs: a file tab steps to it, the Files tab opens it.
+  const openPickedFile = (path: string, options?: { newTab?: boolean }) =>
+    run(
+      filesTab || options?.newTab
+        ? treeFileChosen(path, { newTab: options?.newTab })
+        : fileTabFileChosen(place, path),
+    );
   return (
     <WorkspaceSidebarLayout
       data-testid="workspace-files-place"
@@ -200,17 +219,18 @@ function FilesPlaceView({
       sidebar={
         <FilesPageTree
           conversationId={conversationId}
+          active={active}
+          commandsActive={commandsActive}
           activePath={place.path}
           sort={files.sort}
+          onSortChange={files.onSortChange}
           showHidden={files.showHidden}
+          onShowHiddenChange={files.onShowHiddenChange}
+          showIgnored={showIgnored}
+          onShowIgnoredChange={writeShowIgnoredFiles}
           onFileSelect={(path, options) => {
             tree.dismissPopover();
-            // A file tab's tree steps that tab; the Files tab's opens there as before.
-            run(
-              filesTab || options?.newTab
-                ? treeFileChosen(path, { newTab: options?.newTab })
-                : fileTabFileChosen(place, path),
-            );
+            openPickedFile(path, options);
           }}
         />
       }
@@ -254,6 +274,8 @@ function FilesPlaceView({
           toolbarLeading={treeToggle}
           registerLeaveGuard={registerLeaveGuard}
           permissionLevel={files.permissionLevel}
+          commentId={place.comment}
+          onOpenFile={(path) => openPickedFile(path)}
           // The Files tab closes its file back to the tree; another file tab goes to the Files tab.
           onClose={() =>
             filesTab
@@ -286,6 +308,7 @@ function ChangesPlaceView({
   onCommentOnFile,
   files,
   position,
+  landing,
 }: WorkspacePlaceViewProps & { place: ChangesPlace }) {
   const run = useRunAction(onNavigate, onOpen);
   const range = place.range;
@@ -302,6 +325,12 @@ function ChangesPlaceView({
           requestedRange={
             range ? { base: range.base, head: range.head ?? "Working Copy" } : undefined
           }
+          comparison={
+            place.comparison ??
+            (range ? { kind: "typed", base: range.base, head: range.head ?? "" } : undefined)
+          }
+          onComparisonShown={(shown, { step }) => run(changesComparisonShown(place, shown, step))}
+          landing={landing}
           active={active}
           sort={files.sort}
           onViewFile={(path) => run(changedFileViewed(path))}
@@ -361,6 +390,7 @@ function PullRequestPlaceView({
           section={place.view}
           active={active}
           onSectionChange={(section) => run(pullRequestSectionChosen(place, section))}
+          onShowAllPullRequests={() => run(allPullRequestsChosen())}
         />
       )}
     </div>

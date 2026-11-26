@@ -1,5 +1,5 @@
 import type { Chord } from "@/lib/shortcuts/chord";
-import type { ShortcutId } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import type { ShortcutId } from "@/lib/shortcuts/registry";
 import { createContext, useContext, useEffect } from "react";
 import type { LucideIcon } from "lucide-react";
 import { create } from "zustand";
@@ -47,6 +47,11 @@ export interface PaletteCommand {
   movesFocus?: boolean;
   /** Run with the palette left open, for a command that switches its scope. */
   keepsPaletteOpen?: boolean;
+  /**
+   * With `keepsPaletteOpen`, the picker of this `successorName` that opens in the palette's
+   * place, such as the session switcher; it returns focus where the palette would.
+   */
+  continuesAs?: string;
   /** The shortcut that runs it outside the palette; its active chord shows at the row's end. */
   shortcut?: ShortcutId;
   /**
@@ -58,6 +63,11 @@ export interface PaletteCommand {
   availability?: CommandAvailability;
   /** Ends or removes something, styled as a menu's destructive item is. */
   destructive?: boolean;
+  /**
+   * False when the label names the user's data, such as a pull request's title, so a query
+   * matching that title keeps the matching sessions above the commands.
+   */
+  leadsSources?: boolean;
   /** A setting's row, built by `settingCommand`: accepting it opens its values. */
   setting?: PaletteSetting;
   /**

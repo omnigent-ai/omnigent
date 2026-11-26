@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  AppWindowIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
@@ -68,15 +69,16 @@ import {
   automationDeletedWith,
   useDeleteSourceAutomations,
 } from "@/lib/automationFromSession";
+import { type OpenSessionCommandId, useOpenSessionPaletteCommands } from "./openSessionCommands";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
+import { useAddSiblingSessionHotkey } from "@/hooks/useAddSiblingSessionHotkey";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
+import { isOwnSessionWindow } from "@/lib/sessionWindow";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
-import { useIsEmbedded } from "@/lib/embedded";
-import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier, isFocusInDialogOrMenu } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
@@ -131,7 +133,7 @@ export function HeaderConversationMenu({
   const info = useServerInfo();
   const queryClient = useQueryClient();
   const isMobile = useIsMobileViewport();
-  const isEmbedded = useIsEmbedded();
+  const openSessionWindow = useOpenSessionWindow();
   const { trackClick } = useOmnigentAnalytics();
   const togglePinned = useTogglePinnedConversation();
   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
@@ -185,32 +187,7 @@ export function HeaderConversationMenu({
     setAutomationOpen(false);
   }, [conversation.id]);
 
-  useEffect(() => {
-    if (!canAddAgent) return;
-    const handleAddAgent = (event: globalThis.KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.repeat ||
-        event.isComposing ||
-        !hasCommandModifier(event) ||
-        !event.altKey ||
-        event.shiftKey ||
-        event.getModifierState("AltGraph") ||
-        event.code !== "KeyA"
-      ) {
-        return;
-      }
-      const embedRoot = getEmbedRoot();
-      if (isEmbedded && (!embedRoot || !event.composedPath().includes(embedRoot))) return;
-      if (isFocusInDialogOrMenu() || document.activeElement?.closest(".xterm, .monaco-editor"))
-        return;
-      event.preventDefault();
-      event.stopPropagation();
-      navigate(addAgentPath);
-    };
-    window.addEventListener("keydown", handleAddAgent);
-    return () => window.removeEventListener("keydown", handleAddAgent);
-  }, [addAgentPath, canAddAgent, isEmbedded, navigate]);
+  useAddSiblingSessionHotkey(() => navigate(addAgentPath), !!canAddAgent);
 
   const closeMenu = () => {
     setMenuOpen(false);
@@ -290,6 +267,63 @@ export function HeaderConversationMenu({
   useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
+  const runOpenSessionCommand = (id: OpenSessionCommandId) => {
+    switch (id) {
+      case "add-nested-agent":
+        navigate(addAgentPath);
+        return;
+      case "pin":
+      case "unpin":
+        togglePin();
+        return;
+      case "share":
+        onShare();
+        return;
+      case "fork":
+        onFork();
+        return;
+      case "export":
+        void exportConversation();
+        return;
+      case "rename":
+        setRenameOpen(true);
+        return;
+      case "mark-unread":
+        markConversationUnread(conversation.id, conversation.updated_at);
+        return;
+      case "create-automation":
+        setAutomationOpen(true);
+        return;
+      case "archive":
+      case "unarchive":
+        archiveConversation();
+        return;
+      case "delete":
+        setDeleteOpen(true);
+        return;
+    }
+  };
+  // ⌘K offers these same items for the session shown here.
+  useOpenSessionPaletteCommands({
+    conversationId: conversation.id,
+    facts: {
+      canAddAgent: canAddAgent === true,
+      pinnable: canPin,
+      pinned: isPinned,
+      pinSaving,
+      canShare,
+      shareDisabledReason: shareDisabled
+        ? (shareDisabledReason ?? "Sharing is unavailable.")
+        : undefined,
+      canFork,
+      forkDisabledReason,
+      canMarkUnread: canFlagUnread(conversation),
+      canCreateAutomation,
+      archived: isArchived,
+      desktopShortcuts,
+    },
+    onRun: runOpenSessionCommand,
+  });
 
   const mainItems = (
     <>
@@ -309,6 +343,16 @@ export function HeaderConversationMenu({
       )}
       {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
+      {openSessionWindow && !isOwnSessionWindow(conversation.id, conversation.id) && (
+        <DropdownMenuItem
+          data-testid="header-open-session-window"
+          className={itemClass}
+          onSelect={() => openSessionWindow(conversation.id)}
+        >
+          <AppWindowIcon className="size-3.5" />
+          Open in new window
+        </DropdownMenuItem>
+      )}
       {canPin && (
         <DropdownMenuItem
           data-testid="header-pin-conversation"

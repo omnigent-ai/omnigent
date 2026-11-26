@@ -10,6 +10,7 @@ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
 import { ShellCommandContext } from "@/shell/ShellCommandContext";
 import type { Comment } from "@/hooks/useComments";
+import { useMarkFullscreenOverlayOpen } from "@/hooks/useMarkFullscreenOverlayOpen";
 import { LOCAL_REVIEW_COMMENT_LANGUAGE, parseLocalReviewComment } from "@/lib/localReviewComments";
 import type { UIMessage } from "ai";
 import { ChevronLeftIcon, ChevronRightIcon, PlayIcon, XIcon } from "lucide-react";
@@ -469,6 +470,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
   const showFullscreen = tableControlEnabled(controls, "fullscreen");
   const showControls = showCopy || showDownload || showFullscreen;
   const closeFullscreen = useCallback(() => setFullscreen(false), []);
+  useMarkFullscreenOverlayOpen(fullscreen);
 
   useEffect(() => {
     if (!fullscreen) return;
@@ -485,6 +487,7 @@ function ChatTable({ children, className, node: _node, ...props }: ChatTableProp
           aria-label="View fullscreen"
           aria-modal="true"
           className="fixed inset-0 z-50 flex flex-col bg-background"
+          data-fullscreen-overlay=""
           data-streamdown="table-fullscreen"
           onClick={closeFullscreen}
           role="dialog"

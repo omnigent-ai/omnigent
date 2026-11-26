@@ -25,7 +25,13 @@ import { selectNextOccurrence, selectSelectionMatches } from "@codemirror/search
 import { Annotation, EditorSelection, StateField } from "@codemirror/state";
 import type { Command, KeyBinding } from "@codemirror/view";
 import { FILE_EDITOR_COMMANDS, type FileEditorCommandId } from "@/components/fileEditorCommands";
-import { codeMirrorKeys, matchesShortcut } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { codeMirrorKeys, matchesShortcut } from "@/lib/shortcuts/registry";
+import {
+  columnSelectDown,
+  columnSelectLeft,
+  columnSelectRight,
+  columnSelectUp,
+} from "./columnSelection";
 
 /** Opens an empty line above each cursor's line, indented like it. */
 export const insertLineAbove: Command = (view) => {
@@ -125,6 +131,10 @@ export const EDITOR_COMMAND_RUNS: Readonly<Record<FileEditorCommandId, Command>>
   "file.selectNextOccurrence": selectNextOccurrence,
   "file.selectAllOccurrences": selectAllOccurrences,
   "file.expandLineSelection": expandLineSelection,
+  "file.columnSelectUp": columnSelectUp,
+  "file.columnSelectDown": columnSelectDown,
+  "file.columnSelectLeft": columnSelectLeft,
+  "file.columnSelectRight": columnSelectRight,
   "file.goToBracket": cursorMatchingBracket,
   "file.fold": foldCode,
   "file.unfold": unfoldCode,

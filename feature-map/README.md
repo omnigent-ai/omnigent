@@ -230,6 +230,7 @@ map an area, remove it here in the same change.
 - Web sign-in: `tests/e2e_ui/auth/`
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
+- Settings search and Appearance settings: `tests/e2e_ui/appearance/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,
   Claude and Codex shell-command settlement, refused-delivery persistence, and
   tool-run folding are mapped)

@@ -669,16 +669,8 @@ describe("authenticatedFetch", () => {
     });
 
     it("retries keyless on wrong_replica 400 response", async () => {
-      vi.doMock("./sessionHost", () => ({
-        getSessionHost: vi.fn(() => "host_789"),
-        setSessionHost: vi.fn(),
-        isHostKeyless: vi.fn(() => false),
-        markHostKeyless: vi.fn(),
-        clearHostKeyless: vi.fn(),
-        modalHostId: vi.fn(() => null),
-        resolveModalHost: vi.fn(),
-        isModalHostResolved: vi.fn(() => true),
-      }));
+      const { setSessionHost } = await import("./sessionHost");
+      setSessionHost("sess_xyz", "host_789");
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,
@@ -901,16 +893,9 @@ describe("authenticatedFetch", () => {
       // A managed fork's or move's launch runs on the replica it lands on, so
       // it must land where its own new host will connect (the client key without an
       // id), never on the source's; any other fork keeps the source's key.
-      vi.doMock("./sessionHost", () => ({
-        getSessionHost: vi.fn(() => "host_source"),
-        setSessionHost: vi.fn(),
-        isHostKeyless: vi.fn(() => false),
-        markHostKeyless: vi.fn(),
-        clearHostKeyless: vi.fn(),
-        modalHostId: vi.fn(() => "host_modal"),
-        resolveModalHost: vi.fn(),
-        isModalHostResolved: vi.fn(() => true),
-      }));
+      const { setSessionHost, resolveModalHost } = await import("./sessionHost");
+      setSessionHost("conv_src", "host_source");
+      resolveModalHost(["host_modal"]);
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,

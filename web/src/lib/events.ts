@@ -1,4 +1,4 @@
-import type { AssistantMessagePhase } from "./conversationItems";
+import type { AssistantMessagePhase, TerminalCommandSubmission } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 import type { JournalEntry } from "./sessionJournal";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
@@ -422,6 +422,7 @@ export interface RoutingDecision {
  */
 export interface TerminalCommandEvent {
   type: "terminal_command";
+  submission?: TerminalCommandSubmission;
   /** `"input"` for the command line; `"output"` for stdout/stderr. */
   kind: "input" | "output";
   input: string | null;

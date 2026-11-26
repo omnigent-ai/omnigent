@@ -235,6 +235,24 @@ The check queries your configured package index — honoring `UV_INDEX_URL` /
 `PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
 mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
 
+**Nightly builds.** Every night (about 04:30 UTC) the newest commit on `main`
+with green CI is tagged as a `vX.Y.Z.devYYYYMMDD` prerelease. Nightlies are git
+tags, not PyPI releases, so installing one builds from source and needs `git`,
+Node.js 22+, and `pnpm`:
+
+```bash
+omni upgrade --nightly          # move onto the newest nightly
+omni upgrade --nightly --check  # report whether a newer nightly is out
+```
+
+A nightly install shows no release notice, and plain `omni upgrade` keeps it on
+its current tag, so rerun `omni upgrade --nightly` (or schedule
+[`scripts/update_nightly.sh`](scripts/update_nightly.sh)) to stay current. When
+the desktop app starts a local server it uses your installed `omni`, so it
+serves the nightly web UI; the desktop app itself updates only with stable
+releases. To return to the latest stable release, rerun the install script
+above (with the same `--extra` flags, if any).
+
 </details>
 
 <details>

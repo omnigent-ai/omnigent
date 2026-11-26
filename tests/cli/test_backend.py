@@ -1806,6 +1806,12 @@ def test_foreground_connect_remote_omits_local_server_prompt(
     assert "Stop it too?" not in result.output
 
 
+# GET /v1/me for an ordinary user, whose host lookups may list only their own sessions.
+_NON_ADMIN_ME = cli._HostHttpResult(
+    status_code=200, body={"user_id": "alice@example.com", "is_admin": False}
+)
+
+
 def test_host_status_json_reports_daemon_host_and_sessions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1823,13 +1829,23 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     )
 
     runner_status_calls: list[str] = []
+    session_list_scopes: list[object] = []
 
     def _fake_http_json(**kwargs: object) -> cli._HostHttpResult:
         """Return host/session fixtures keyed by request path."""
         path = kwargs["path"]
+        if path == "/v1/info":
+            return cli._HostHttpResult(
+                status_code=200, body={"session_list_scoped_archives": True}
+            )
+        if path == "/v1/me":
+            return _NON_ADMIN_ME
         if path == "/v1/hosts/host_abc":
             return cli._HostHttpResult(status_code=200, body={"status": "online"})
         if path == "/v1/sessions":
+            params = kwargs["params"]
+            assert isinstance(params, dict)
+            session_list_scopes.append(params["visibility"])
             return cli._HostHttpResult(
                 status_code=200,
                 body={
@@ -1868,6 +1884,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     assert '"runner_online": true' in result.output
     assert '"id": "conv_other"' not in result.output
     assert runner_status_calls == ["runner_abc"]
+    assert session_list_scopes == ["mine"]
 
 
 def test_host_status_reports_unreachable_daemon_without_traceback(
@@ -2080,6 +2097,12 @@ def test_host_stop_stops_sessions_before_daemon(
         method = str(kwargs["method"])
         path = str(kwargs["path"])
         events.append((method, path))
+        if method == "GET" and path == "/v1/info":
+            return cli._HostHttpResult(
+                status_code=200, body={"session_list_scoped_archives": True}
+            )
+        if method == "GET" and path == "/v1/me":
+            return _NON_ADMIN_ME
         if method == "GET" and path == "/v1/sessions":
             params = kwargs["params"]
             assert isinstance(params, dict)
@@ -2088,7 +2111,7 @@ def test_host_stop_stops_sessions_before_daemon(
             assert params == {
                 "limit": 1000,
                 "include_archived": "true",
-                "visibility": "all",
+                "visibility": "mine",
             }
             return cli._HostHttpResult(
                 status_code=200,
@@ -2139,6 +2162,8 @@ def test_host_stop_stops_sessions_before_daemon(
 
     assert result.exit_code == 0, result.output
     assert events == [
+        ("GET", "/v1/info"),
+        ("GET", "/v1/me"),
         ("GET", "/v1/sessions"),
         ("GET", "/v1/sessions"),
         ("GET", "/v1/sessions/conv_owned"),
@@ -4817,6 +4842,12 @@ def test_host_stop_drains_sub_agent_sessions_before_signalling(
     requests: list[dict[str, str | int]] = []
 
     def _fake_http(**kwargs: Any) -> cli._HostHttpResult:
+        if kwargs["path"] == "/v1/info":
+            return cli._HostHttpResult(
+                status_code=200, body={"session_list_scoped_archives": True}
+            )
+        if kwargs["path"] == "/v1/me":
+            return _NON_ADMIN_ME
         params = kwargs["params"]
         requests.append(params)
         kind = params.get("kind", "default")
@@ -4866,6 +4897,135 @@ def test_host_stop_drains_sub_agent_sessions_before_signalling(
         (None, None),
         ("sub_agent", None),
         ("sub_agent", "conv_grandchild"),
+    ]
+    assert {params["visibility"] for params in requests} == {"mine"}
+
+
+_SCOPED_ARCHIVES_INFO = cli._HostHttpResult(
+    status_code=200, body={"session_list_scoped_archives": True}
+)
+_ADMIN_ME = cli._HostHttpResult(
+    status_code=200, body={"user_id": "admin@example.com", "is_admin": True}
+)
+_UNREACHABLE = cli._HostHttpResult(status_code=0, body="Connection refused", unreachable=True)
+
+
+def _host_a_daemon_record(monkeypatch: pytest.MonkeyPatch) -> cli._HostDaemonRecord:
+    """Return a server-mode record for ``host_a`` whose server answers at a fixed URL."""
+    monkeypatch.setattr(cli, "_daemon_base_url", lambda record: "https://server.example.com")
+    return cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+        host_id="host_a",
+    )
+
+
+@pytest.mark.parametrize(
+    ("info", "me", "scope"),
+    [
+        (_SCOPED_ARCHIVES_INFO, _NON_ADMIN_ME, "mine"),
+        (_SCOPED_ARCHIVES_INFO, _ADMIN_ME, "all"),
+        (
+            _SCOPED_ARCHIVES_INFO,
+            cli._HostHttpResult(status_code=200, body={"user_id": "alice@example.com"}),
+            "all",
+        ),
+        (_SCOPED_ARCHIVES_INFO, cli._HostHttpResult(status_code=401, body={}), "all"),
+        (_SCOPED_ARCHIVES_INFO, _UNREACHABLE, "all"),
+        (cli._HostHttpResult(status_code=200, body={"version": "0.20.0"}), _NON_ADMIN_ME, "all"),
+        (cli._HostHttpResult(status_code=404, body={"detail": "Not Found"}), _NON_ADMIN_ME, "all"),
+        (_UNREACHABLE, _NON_ADMIN_ME, "all"),
+    ],
+    ids=[
+        "non-admin",
+        "admin",
+        "no-admin-flag",
+        "identity-rejected",
+        "identity-unreachable",
+        "older-server",
+        "no-info-route",
+        "info-unreachable",
+    ],
+)
+def test_host_session_lookup_lists_only_own_sessions_for_a_confirmed_non_admin(
+    monkeypatch: pytest.MonkeyPatch,
+    info: cli._HostHttpResult,
+    me: cli._HostHttpResult,
+    scope: str,
+) -> None:
+    """
+    A daemon's lookup lists only the caller's sessions when that can't miss one on the host.
+
+    Only a session's owner can launch it on an ordinary user's host, so that
+    user's own list holds every host session. An administrator, a caller whose
+    identity can't be confirmed, and a server that drops archived rows from
+    owner-scoped lists all keep ``all``.
+    """
+    scopes: list[object] = []
+
+    def _fake_http(**kwargs: Any) -> cli._HostHttpResult:
+        if kwargs["path"] == "/v1/info":
+            return info
+        if kwargs["path"] == "/v1/me":
+            return me
+        scopes.append(kwargs["params"]["visibility"])
+        return cli._HostHttpResult(
+            status_code=200,
+            body={
+                "data": [{"id": "conv_mine", "host_id": "host_a", "status": "running"}],
+                "has_more": False,
+            },
+        )
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake_http)
+
+    result = cli._sessions_for_daemon(_host_a_daemon_record(monkeypatch), include_sub_agents=True)
+
+    assert result.error is None
+    assert [session["id"] for session in result.sessions] == ["conv_mine"]
+    assert scopes == [scope, scope]
+
+
+def test_admin_host_lookup_finds_a_session_it_runs_but_does_not_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An administrator's daemon reports another user's session launched on its host.
+
+    The owner-access check lets administrators launch sessions they don't own,
+    and such a session is in their ``all`` list but not in ``mine``.
+    """
+    listed = {
+        "mine": [{"id": "conv_mine", "host_id": "host_a", "status": "running"}],
+        "all": [
+            {"id": "conv_mine", "host_id": "host_a", "status": "running"},
+            {"id": "conv_shared_run_here", "host_id": "host_a", "status": "running"},
+            {"id": "conv_shared_elsewhere", "host_id": "host_b", "status": "running"},
+        ],
+    }
+
+    def _fake_http(**kwargs: Any) -> cli._HostHttpResult:
+        if kwargs["path"] == "/v1/info":
+            return _SCOPED_ARCHIVES_INFO
+        if kwargs["path"] == "/v1/me":
+            return _ADMIN_ME
+        return cli._HostHttpResult(
+            status_code=200,
+            body={"data": listed[kwargs["params"]["visibility"]], "has_more": False},
+        )
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake_http)
+
+    result = cli._sessions_for_daemon(_host_a_daemon_record(monkeypatch))
+
+    assert result.error is None
+    assert [session["id"] for session in result.sessions] == [
+        "conv_mine",
+        "conv_shared_run_here",
     ]
 
 

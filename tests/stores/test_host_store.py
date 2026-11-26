@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pytest
 from sqlalchemy import event, insert, update
@@ -14,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
+from omnigent.db.enum_codecs import encode_host_status
 from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -2000,6 +2003,71 @@ def test_managed_sandbox_reaper_pages_and_compare_clear_span_workspaces(
     assert store.list_terminating_managed_sandbox_hosts_page(after=None, limit=1) == []
     remaining = store.list_current_managed_sandbox_hosts_page(after=None, limit=1)
     assert [(workspace_id, host.host_id) for workspace_id, host in remaining] == [(22, host_22)]
+
+
+@pytest.mark.parametrize(
+    ("slot", "index_name"),
+    [
+        ("sandbox_id", "ix_hosts_sandbox_scan"),
+        ("terminating_sandbox_id", "ix_hosts_terminating_sandbox_scan"),
+    ],
+)
+def test_managed_sandbox_reaper_mysql_deep_page_seeks_to_the_cursor(
+    db_uri: str, slot: str, index_name: str
+) -> None:
+    """On MySQL a reaper page deep in either sandbox-id slot examines O(limit) rows."""
+    store = HostStore(db_uri)
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    list_page = (
+        store.list_current_managed_sandbox_hosts_page
+        if slot == "sandbox_id"
+        else store.list_terminating_managed_sandbox_hosts_page
+    )
+    now = now_epoch()
+    # Six hosts share each sandbox ID, two per workspace, so the deep page starts inside
+    # an equal (sandbox ID, workspace) prefix and then crosses workspaces and sandbox IDs.
+    rows = [
+        {
+            "workspace_id": 1 + index % 6 // 2,
+            "host_id": uuid.UUID(int=index + 1).hex,
+            "user_id": "alice@example.com",
+            "name": f"managed-{index}",
+            "status": encode_host_status("offline"),
+            "created_at": now,
+            "updated_at": now,
+            "sandbox_provider": "modal",
+            slot: f"sb-{index // 6:04d}",
+        }
+        for index in range(600)
+    ]
+    with store._engine.begin() as connection:
+        connection.execute(insert(SqlHost), rows)
+        connection.exec_driver_sql("ANALYZE TABLE hosts").all()
+    keys = sorted((row[slot], row["workspace_id"], row["host_id"]) for row in rows)
+    workspace_id, last = list_page(after=None, limit=499)[-1]
+    cursor = (getattr(last, slot), workspace_id, last.host_id)
+    assert cursor == keys[498]
+    plans: list[str] = []
+
+    def explain(conn: Any, _cursor: object, statement: str, params: object, *_: object) -> None:
+        if statement.startswith("SELECT hosts.") and "LIMIT" in statement:
+            plans.append(conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, params).scalar_one())
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        page = list_page(after=cursor, limit=50)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+
+    walked = [(getattr(host, slot), workspace, host.host_id) for workspace, host in page]
+    assert walked == keys[499:549]
+    assert len(plans) == 1
+    assert f"Index range scan on hosts using {index_name}" in plans[0], plans[0]
+    examined = [
+        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
+    ]
+    assert examined and max(examined) <= 51, plans[0]
 
 
 def test_detach_and_resume_rearm_are_atomic_competitors(db_uri: str) -> None:

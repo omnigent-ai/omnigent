@@ -23,7 +23,6 @@ import type {
   FileDiffContentsLoader,
   FileDiffMetadata,
   SelectedLineRange,
-  SupportedLanguages,
   CodeViewScrollListener,
 } from "@pierre/diffs";
 import {
@@ -85,6 +84,7 @@ import {
   type DiffReviewCommand,
   FIND_IN_CHANGES_LABEL,
 } from "./diffReviewCommands";
+import { useDiffFileOrder } from "./diffFileOrderPreference";
 import { useOwnedFilesOnly, writeOwnedFilesOnly } from "./ownedFilesPreference";
 import { useDiffWorkers } from "./sharedDiffWorkers";
 import {
@@ -107,7 +107,6 @@ import {
   ownedFileCount,
   pathFromReviewItemId,
   reviewItemId,
-  syntaxLanguage,
   treeOrderedFiles,
   visibleReviewFiles,
   type DiffFilterAction,
@@ -202,6 +201,12 @@ import {
   type ReviewTextEvent,
   type ReviewTextHighlight,
 } from "./useReviewTextLayer";
+
+/**
+ * A review's own pool starts with plain text and loads each file's language as it highlights it,
+ * as the shared pool does, so the review doesn't wait for every language before it shows.
+ */
+const OWN_POOL_HIGHLIGHTER = { langs: ["text" as const], theme: DIFF_SYNTAX_THEME };
 
 /** How long to wait for a file to render before revealing a line in it anyway. */
 const REVEAL_RENDER_BUDGET_MS = 3000;
@@ -419,7 +424,8 @@ export function DiffReview<A = undefined>({
   presentation,
 }: DiffReviewProps<A>) {
   // The diff lists its files in the tree's order, so the two read the same top to bottom.
-  const files = useMemo(() => treeOrderedFiles(givenFiles), [givenFiles]);
+  const [fileOrder, setFileOrder] = useDiffFileOrder();
+  const files = useMemo(() => treeOrderedFiles(givenFiles, fileOrder), [givenFiles, fileOrder]);
   const viewer = useRef<CodeViewHandle<A>>(null);
   const [shell, setShell] = useState<HTMLDivElement | null>(null);
   const width = useElementWidth(shell);
@@ -636,10 +642,16 @@ export function DiffReview<A = undefined>({
       if (content?.status === "ready") requestPreview(path, content.fileDiff);
     }
   }, [findOpen, shownRich, contents, requestPreview]);
-  // The toolbar's totals and its by-language breakdown come from one pass over the same counts.
+  // The toolbar's totals and its by-language breakdown come from one pass over the same counts;
+  // the toolbar counts only files not yet viewed, so marking one brings its number down.
   const breakdown = useMemo(
-    () => lineBreakdown(listedFiles, (file) => fileLineCounts(file, contents.get(file.path))),
-    [listedFiles, contents],
+    () =>
+      lineBreakdown(
+        listedFiles,
+        (file) => fileLineCounts(file, contents.get(file.path)),
+        (file) => viewedPaths.has(file.path),
+      ),
+    [listedFiles, contents, viewedPaths],
   );
   const expandablePaths = useMemo(
     () =>
@@ -1701,17 +1713,8 @@ export function DiffReview<A = undefined>({
     [reviewScope, findNames.all, findNames.current, startFindRequest],
   );
 
-  const languages = useMemo(() => {
-    const set = new Set<SupportedLanguages>(["text"]);
-    for (const file of files) set.add(syntaxLanguage(file.path));
-    return [...set];
-  }, [files]);
   // The shared pool once it's started; before that, or after it fails, its own as before.
   const workers = useDiffWorkers();
-  const highlighterOptions = useMemo(
-    () => ({ langs: languages, theme: DIFF_SYNTAX_THEME }),
-    [languages],
-  );
   const poolOptions = useMemo(
     () => ({
       poolSize: Math.max(2, Math.min(4, navigator.hardwareConcurrency || 2)),
@@ -2001,6 +2004,8 @@ export function DiffReview<A = undefined>({
         label: `${action.label} for ${name}`,
         icon: action.icon,
         keywords: ["markdown", "rendered", "preview", "diff", file.path],
+        // Named after the file, so sessions matching its name stay above it.
+        leadsSources: false,
         run: action.run,
       },
     ];
@@ -2029,6 +2034,7 @@ export function DiffReview<A = undefined>({
         label: viewed ? `Mark ${name} as not viewed` : `Mark ${name} as viewed`,
         icon: CheckIcon,
         keywords: ["viewed", "reviewed", "done", "seen", file.path],
+        leadsSources: false,
         run: () => toggleFileViewed(file),
       },
     ];
@@ -2149,6 +2155,7 @@ export function DiffReview<A = undefined>({
       icon: SquarePlusIcon,
       keywords: [...command.keywords, command.path],
       availability: command.availability,
+      leadsSources: command.leadsSources,
       run: () => latestOpenInNewTab.current?.(command.path, { background: true }),
     }));
   }, [commandsActive, currentFile, opensInNewTab]);
@@ -2240,6 +2247,8 @@ export function DiffReview<A = undefined>({
         setIgnoreWhitespace: onIgnoreWhitespaceChange,
         wrapLines,
         setWrapLines: onWrapLinesChange,
+        fileOrder,
+        setFileOrder,
         allCollapsed,
         canCollapse: expandablePaths.length > 0,
         toggleAllFiles,
@@ -2274,6 +2283,8 @@ export function DiffReview<A = undefined>({
       wide,
       filters,
       dispatchFilter,
+      fileOrder,
+      setFileOrder,
       layout,
       onLayoutChange,
       canSplit,
@@ -2425,7 +2436,7 @@ export function DiffReview<A = undefined>({
       workers.kind === "own" ? (
         <WorkerPoolContextProvider
           poolOptions={poolOptions}
-          highlighterOptions={highlighterOptions}
+          highlighterOptions={OWN_POOL_HIGHLIGHTER}
         >
           {codeView}
         </WorkerPoolContextProvider>

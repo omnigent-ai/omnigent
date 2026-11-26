@@ -7,13 +7,9 @@ import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
-import {
-  isNativeShell,
-  navigationHostOptions,
-  supportsBrowser,
-  type BrowserHostOptions,
-} from "./nativeBridge";
+import { isNativeShell, supportsBrowser, type BrowserHostOptions } from "./nativeBridge";
 import { fetchSessionHostId } from "./fetchSessionHostId";
+import { previewHostOptions, withPreviewHostRetry } from "./previewHostOptions";
 import { randomUUID } from "./randomUUID";
 import { readSessionWorkspaceState } from "./sessionWorkspaceState";
 
@@ -72,12 +68,17 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     const tabId = randomUUID();
     newViewId = browserViewId(conversationId, tabId);
     const hostId = await fetchSessionHostId(conversationId);
+    const options = await previewHostOptions(hostId, url);
     // Chat and file content can come from an agent, so their links use the
     // agent policy even when a user clicks them.
-    const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, {
-      agent: true,
-      ...navigationHostOptions(hostId),
-    });
+    const viewId = newViewId;
+    const result = await withPreviewHostRetry(conversationId, hostId, (retryOptions) =>
+      bridge.browserOpenOrNavigate(viewId, url, undefined, {
+        agent: true,
+        ...options,
+        ...retryOptions,
+      }),
+    );
     if (result?.ok) {
       newViewId = undefined;
       for (const listener of listeners) listener(conversationId, tabId);

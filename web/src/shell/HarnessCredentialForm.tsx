@@ -13,13 +13,12 @@
  * readiness flips and the dialog's row turns green.
  */
 
-import { Fragment, useState } from "react";
+import { Fragment, type ReactNode, useState } from "react";
 import { KeyRound, UserRound, Waypoints } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
-import { copyText } from "@/lib/clipboard";
 import {
   useDetectedCredentials,
   useStoreCredential,
@@ -38,7 +37,7 @@ export function HarnessCredentialForm({
   harness,
   label,
   host,
-  command,
+  subscription,
   onDone,
 }: {
   harness: string;
@@ -47,9 +46,9 @@ export function HarnessCredentialForm({
    *  and the API call. Falls back to `harness` when not supplied. */
   label?: string;
   host: Host | undefined | null;
-  /** The server's subscription-login command (e.g. `codex login`), shown as a
-   *  copy signpost — the UI can't drive browser OAuth. `null` for Pi. */
-  command: string | null;
+  /** How to sign in with the harness's own subscription, where the caller offers it; the UI
+   *  can't drive its browser login. Absent for Pi, which has no CLI login. */
+  subscription?: ReactNode;
   onDone: (result: StoreCredentialResult) => void;
 }) {
   // What the user sees in toasts — the friendly name, not the canonical id.
@@ -142,29 +141,12 @@ export function HarnessCredentialForm({
       ),
     });
   }
-  if (command) {
+  if (subscription) {
     options.push({
       id: "subscription",
       node: (
         <CredentialOption icon={<UserRound />} label="Sign in with your subscription">
-          <p className="text-sm text-muted-foreground">
-            Use your existing plan — run{" "}
-            <button
-              type="button"
-              className="rounded bg-muted px-1 py-0.5 font-mono hover:text-foreground"
-              data-testid="harness-credential-login-copy"
-              onClick={() => {
-                void copyText(command)
-                  .then(() => showToast("Copied to clipboard."))
-                  .catch(() =>
-                    showToast("Couldn't copy — select and copy manually.", { duration: 0 }),
-                  );
-              }}
-            >
-              {command}
-            </button>{" "}
-            on {host?.name}.
-          </p>
+          {subscription}
         </CredentialOption>
       ),
     });

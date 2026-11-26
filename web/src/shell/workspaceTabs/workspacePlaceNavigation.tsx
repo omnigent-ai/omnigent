@@ -13,6 +13,8 @@ export type WorkspaceFileOpenOptions = OpenFileOptions & {
   view?: "diff";
   /** Open it in a tab of its own, such as from a ⌥-click in the tree. */
   newTab?: boolean;
+  /** Open this comment's thread on the file; it takes the file's own view over `view`. */
+  commentId?: string;
 };
 
 /** What to show of a session's pull requests: all of them, or one pull request. */

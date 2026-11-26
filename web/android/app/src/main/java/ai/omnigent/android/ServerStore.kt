@@ -52,6 +52,20 @@ class ServerStore(
             ?.filter { it.isNotBlank() }
             .orEmpty()
 
+    /**
+     * The server the user last connected to at [origin], as they entered it, or null when they
+     * never connected there. A preset the user has not picked yet is not one.
+     */
+    fun connectedServer(origin: String): String? = serverAt(origin, recentServers())
+
+    /** The organization's preset at [origin], which may name a workspace the origin alone doesn't. */
+    fun presetServer(origin: String): String? = serverAt(origin, managed.serverUrls)
+
+    private fun serverAt(
+        origin: String,
+        servers: List<String>,
+    ): String? = servers.firstOrNull { originOf(it) == origin }
+
     /** Forget the automatic default while retaining recents for an explicit reconnect. */
     fun clearCurrent() {
         prefs.edit().remove(KEY_CURRENT).apply()

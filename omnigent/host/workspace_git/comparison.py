@@ -34,10 +34,13 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
 )
 from omnigent.host.workspace_git.runner import (
     LISTING_OUTPUT_BYTES,
+    CheckedRepository,
     Deadline,
     GitError,
+    GitProblem,
     GitRepository,
     check_revision,
+    checked_or_discovered,
     is_object_name,
 )
 from omnigent.host.workspace_git.working_copy import (
@@ -70,7 +73,14 @@ MAXIMUM_REFS = 1_000
 MAXIMUM_BRANCH_COMMITS = 200
 # Remote HEADs a ref listing may skip while still filling its limit; one per remote.
 _REMOTE_HEAD_ALLOWANCE = 64
-_LOG_FORMAT = "--format=%H%x1f%P%x1f%at%x1f%an%x1f%s"
+# Each commit is a record and then its body, both ended by NUL: Git's output never has a NUL
+# inside a message, so a separator in a subject or body stays part of it.
+_LOG_FORMAT = "--format=%H%x1f%P%x1f%at%x1f%an%x1f%s%x00%b"
+_LOG_FORMAT_WITHOUT_BODIES = "--format=%H%x1f%P%x1f%at%x1f%an%x1f%s%x00"
+# A commit message's body past this many bytes is cut, so a long one never fills the listing;
+# the cut one ends in an ellipsis, within the limit.
+MAXIMUM_COMMIT_BODY_BYTES = 4096
+_BODY_CUT_MARK = "…"
 
 
 def _checked_revision(text: str, field: ComparisonField) -> str | None:
@@ -287,15 +297,16 @@ def _usable_refs(output: str, requested: int) -> tuple[list[str], bool]:
 
 
 async def list_repository_refs(
-    root: Path, _request: ListRepositoryRefsRequest
+    root: Path, _request: ListRepositoryRefsRequest, checked: CheckedRepository = None
 ) -> ListRepositoryRefsResponse:
     """Branch and tag short names, local branches first, and the default branch's name.
 
+    :param checked: The repository a folder check already found at ``root``, reused as is.
     :raises ConnectError: FAILED_PRECONDITION outside a repository.
     """
     deadline = Deadline(LISTING_DEADLINE_S)
     try:
-        repository = await GitRepository.discover(root, deadline)
+        repository = await checked_or_discovered(root, deadline, checked)
         if repository is None:
             raise ConnectError(Code.FAILED_PRECONDITION, "The workspace isn't in a Git repository")
         requested = MAXIMUM_REFS + 1 + _REMOTE_HEAD_ALLOWANCE
@@ -323,15 +334,28 @@ async def list_repository_refs(
     )
 
 
+def _commit_body(text: str) -> str:
+    """A message's body, trimmed, and cut at a character within the body limit."""
+    body = text.strip("\n").rstrip()
+    encoded = body.encode("utf-8")
+    if len(encoded) <= MAXIMUM_COMMIT_BODY_BYTES:
+        return body
+    budget = MAXIMUM_COMMIT_BODY_BYTES - len(_BODY_CUT_MARK.encode("utf-8"))
+    # A character cut in two at the budget is left out whole.
+    return encoded[:budget].decode("utf-8", "ignore").rstrip() + _BODY_CUT_MARK
+
+
 def _parse_commits(output: bytes) -> list[BranchCommit]:
-    """Commits from ``log -z`` records in :data:`_LOG_FORMAT`; malformed records are skipped."""
+    """Commits from ``log -z`` output in :data:`_LOG_FORMAT`; malformed records are skipped."""
     commits: list[BranchCommit] = []
-    for record in output.decode("utf-8", "replace").split("\0"):
+    chunks = output.decode("utf-8", "replace").split("\0")
+    for record, body_text in zip(chunks[::2], [*chunks[1::2], ""], strict=False):
         fields = record.lstrip("\n").split("\x1f", 4)
         if len(fields) < 4 or not is_object_name(fields[0]):
             continue
         object_name, parents, time_text, author_name = fields[:4]
         subject = fields[4] if len(fields) > 4 else ""
+        body = _commit_body(body_text)
         commits.append(
             BranchCommit(
                 object=object_name,
@@ -339,38 +363,60 @@ def _parse_commits(output: bytes) -> list[BranchCommit]:
                 author_name=author_name,
                 author_time_unix=int(time_text) if time_text.isdigit() else 0,
                 root=not parents.strip(),
+                body=body,
             )
         )
     return commits
 
 
-async def list_branch_commits(
-    root: Path, request: ListBranchCommitsRequest
-) -> ListBranchCommitsResponse:
-    """The commits HEAD has beyond its merge base with the base, newest first.
+async def _log_commits(
+    repository: GitRepository, base: str, head: str, deadline: Deadline
+) -> bytes:
+    """``git log`` of the commits ``head`` has beyond ``base``, with their bodies when they fit."""
 
-    A base that can't be compared answers with its reason in ``base.unavailable``.
-    """
-    deadline = Deadline(LISTING_DEADLINE_S)
-    try:
-        repository = await GitRepository.discover(root, deadline)
-        if repository is None:
-            raise ComparisonUnavailableError(COMPARISON_PROBLEM_NOT_A_REPOSITORY)
-        comparison = await resolve_revisions(repository, request.base_revision, "HEAD", deadline)
-        output = await repository.run(
+    async def log(log_format: str) -> bytes:
+        return await repository.run(
             [
                 "log",
                 "-z",
                 f"--max-count={MAXIMUM_BRANCH_COMMITS + 1}",
-                _LOG_FORMAT,
+                log_format,
                 "--end-of-options",
-                comparison.head,
-                f"^{comparison.base}",
+                head,
+                f"^{base}",
                 "--",
             ],
             deadline=deadline,
             stdout_bytes=LISTING_OUTPUT_BYTES,
         )
+
+    try:
+        return await log(_LOG_FORMAT)
+    except GitError as error:
+        if error.problem is not GitProblem.OUTPUT_TOO_LARGE:
+            raise
+    # Messages too long to list together still leave their subjects to show.
+    return await log(_LOG_FORMAT_WITHOUT_BODIES)
+
+
+async def list_branch_commits(
+    root: Path, request: ListBranchCommitsRequest, checked: CheckedRepository = None
+) -> ListBranchCommitsResponse:
+    """The commits a head (HEAD when empty) has past its merge base with the base, newest first.
+
+    A base that can't be compared answers with its reason in ``base.unavailable``.
+
+    :param checked: The repository a folder check already found at ``root``, reused as is.
+    """
+    deadline = Deadline(LISTING_DEADLINE_S)
+    try:
+        repository = await checked_or_discovered(root, deadline, checked)
+        if repository is None:
+            raise ComparisonUnavailableError(COMPARISON_PROBLEM_NOT_A_REPOSITORY)
+        comparison = await resolve_revisions(
+            repository, request.base_revision, request.head_revision or "HEAD", deadline
+        )
+        output = await _log_commits(repository, comparison.base, comparison.head, deadline)
         commits = _parse_commits(output)
         truncated = len(commits) > MAXIMUM_BRANCH_COMMITS
         commits = commits[:MAXIMUM_BRANCH_COMMITS]

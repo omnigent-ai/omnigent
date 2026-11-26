@@ -10,6 +10,7 @@ vi.mock("@/lib/routing", () => ({
 import { SHORTCUT_BINDINGS, type ShortcutId, shortcutKeys } from "@/lib/shortcuts/registry";
 
 import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
+import { type OpenSessionCommandId, openSessionCommands } from "./openSessionCommands";
 
 function commands(rightSidebarShortcutEnabled = true): ActionCommand[] {
   return renderHook(() =>
@@ -58,6 +59,20 @@ describe("filterAppCommands", () => {
     expect(filterAppCommands(all, "  ")).toBe(all);
   });
 
+  it("lists search-only commands only for a matching nonblank query", () => {
+    const preview = {
+      ...all[0]!,
+      id: "preview",
+      label: "Try something new",
+      keywords: ["feature preview"],
+      searchOnly: true,
+    };
+    const withPreview = [...all, preview];
+    expect(filterAppCommands(withPreview, "  ")).toEqual(all);
+    expect(filterAppCommands(withPreview, "preview")).toEqual([preview]);
+    expect(filterAppCommands(withPreview, "unmatched")).toEqual([]);
+  });
+
   it("matches the label or a keyword, ignoring case and outer spaces", () => {
     expect(filterAppCommands(all, " SETT ").map((command) => command.id)).toEqual([
       "go-settings",
@@ -76,16 +91,39 @@ const HOTKEY_COMMANDS: Partial<Record<ShortcutId, string>> = {
   "sidebar.right": "toggle-right-sidebar",
 };
 
+/** Registry hotkeys whose action ⌘K lists among the open session's commands, by the command's id. */
+const SESSION_HOTKEY_COMMANDS: Partial<Record<ShortcutId, OpenSessionCommandId>> = {
+  "session.addSibling": "add-nested-agent",
+  "session.pin": "pin",
+  "session.fork": "fork",
+  "session.archive": "archive",
+  "session.rename": "rename",
+};
+
+/** Every open-session command, as an owner on the desktop sees them. */
+const SESSION_COMMANDS = openSessionCommands({
+  canAddAgent: true,
+  pinnable: true,
+  pinned: false,
+  pinSaving: false,
+  canShare: true,
+  canFork: true,
+  canMarkUnread: true,
+  canCreateAutomation: true,
+  archived: false,
+  desktopShortcuts: true,
+});
+
 const NOT_YET = "Not in ⌘K yet.";
 const WHERE_PRESSED = "Acts on what has focus or is on screen, so it has no ⌘K row.";
+const MENU_ITEM = "A desktop menu item, which runs it with the menu's accelerator.";
 
 /** Registry hotkeys with no ⌘K command, and why. */
 const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = {
   "palette.commands": "Opens ⌘K itself.",
   "palette.sessions": "Opens ⌘K's own session search.",
   "shortcuts.show": NOT_YET,
-  "session.rename": NOT_YET,
-  "session.toggleUnread": NOT_YET,
+  "session.toggleUnread": "⌘K marks the session unread, but has no command to mark it read.",
   "history.back": NOT_YET,
   "history.forward": NOT_YET,
   "sessions.recent": "Switches while Control is held.",
@@ -104,6 +142,32 @@ const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = {
   "pane.next": WHERE_PRESSED,
   "terminal.splitRight": WHERE_PRESSED,
   "terminal.splitDown": WHERE_PRESSED,
+  "composer.send": WHERE_PRESSED,
+  "composer.sendWithQueue": WHERE_PRESSED,
+  "composer.newLine": WHERE_PRESSED,
+  "composer.newLineWithAlt": WHERE_PRESSED,
+  "composer.previousPrompt": WHERE_PRESSED,
+  "composer.nextPrompt": WHERE_PRESSED,
+  "composer.cyclePermissionMode": WHERE_PRESSED,
+  "response.stop": WHERE_PRESSED,
+  "slash.previous": WHERE_PRESSED,
+  "slash.next": WHERE_PRESSED,
+  "slash.apply": WHERE_PRESSED,
+  "slash.dismiss": WHERE_PRESSED,
+  "question.pickOption": WHERE_PRESSED,
+  "question.next": WHERE_PRESSED,
+  "question.cancel": WHERE_PRESSED,
+  "fileViewer.exitFullScreen": WHERE_PRESSED,
+  "tab.close": MENU_ITEM,
+  "window.close": MENU_ITEM,
+  "tab.next": MENU_ITEM,
+  "tab.previous": MENU_ITEM,
+  "tab.reopen": MENU_ITEM,
+  "browser.focusAddressBar": MENU_ITEM,
+  "browser.newTab": MENU_ITEM,
+  "browser.reload": MENU_ITEM,
+  "app.quit": MENU_ITEM,
+  "workspace.searchContents": NOT_YET,
 };
 
 // The New chat row spells out Shift off macOS, as its tooltip does.
@@ -114,7 +178,11 @@ describe("registry hotkeys in ⌘K", () => {
   const byId = new Map(all.map((command) => [command.id, command]));
 
   it("lists every registry hotkey exactly once, as a command or a known gap", () => {
-    const listed = [...Object.keys(HOTKEY_COMMANDS), ...Object.keys(HOTKEYS_WITHOUT_COMMANDS)];
+    const listed = [
+      ...Object.keys(HOTKEY_COMMANDS),
+      ...Object.keys(SESSION_HOTKEY_COMMANDS),
+      ...Object.keys(HOTKEYS_WITHOUT_COMMANDS),
+    ];
     expect(listed.toSorted()).toEqual(SHORTCUT_BINDINGS.map((binding) => binding.id).toSorted());
   });
 
@@ -123,6 +191,13 @@ describe("registry hotkeys in ⌘K", () => {
       const command = byId.get(commandId!);
       expect(command, commandId).toBeDefined();
       expect(sameKeys(command!.shortcut ?? []), id).toEqual(shortcutKeys(id as ShortcutId));
+    }
+  });
+
+  it("finds each mapped session hotkey among the open session's commands", () => {
+    const sessionIds = SESSION_COMMANDS.map((command) => command.id);
+    for (const [id, commandId] of Object.entries(SESSION_HOTKEY_COMMANDS)) {
+      expect(sessionIds, id).toContain(commandId);
     }
   });
 
@@ -144,6 +219,8 @@ describe("registry hotkeys in ⌘K", () => {
             sameKeys(command.shortcut).join() === keys.join()),
       );
       expect(match?.id, id).toBeUndefined();
+      const sessionMatch = SESSION_COMMANDS.find((command) => command.label === binding.label);
+      expect(sessionMatch?.id, id).toBeUndefined();
     }
   });
 });

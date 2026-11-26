@@ -715,6 +715,40 @@ class PullRequestFacet(Protocol):
         ...
 
 
+def offered_capabilities(facet: PullRequestFacet, host: str | None) -> ProviderCapabilities:
+    """Return the capabilities *facet* offers for a pull request or workspace on *host*.
+
+    Every panel step that checks a capability, and every info payload, asks here, so
+    one place decides what a code host offers. Today that is the facet's own
+    :attr:`PullRequestFacet.capabilities` on every host.
+
+    :param facet: The provider's pull request facet.
+    :param host: The pull request's host, else the workspace remote's host; ``None``
+        when neither is known.
+    """
+    del host  # Every host gets the facet's own capabilities.
+    return facet.capabilities
+
+
+def with_offered_capabilities(
+    info: dict[str, Any], facet: PullRequestFacet, host: str | None
+) -> dict[str, Any]:
+    """Return *info* with its ``capabilities`` narrowed to :func:`offered_capabilities`.
+
+    A capability the payload reports stays on only when *facet* offers it on *host*;
+    nothing is turned on, and a payload without ``capabilities`` is returned as is.
+    """
+    reported = info.get("capabilities")
+    if not isinstance(reported, dict):
+        return info
+    offered = offered_capabilities(facet, host).to_json()
+    info["capabilities"] = {
+        name: (value and offered[name]) if name in offered else value
+        for name, value in reported.items()
+    }
+    return info
+
+
 def unsupported_remote_info(host: str) -> dict[str, Any]:
     """Return the info payload for a workspace whose git remote no provider recognizes.
 

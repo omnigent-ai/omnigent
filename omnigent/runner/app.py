@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.inner.claude_model_access import ClaudeModelAccess
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.tool_dispatch import UnknownSessionWorkspace
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
@@ -221,6 +222,7 @@ from omnigent.runner.subagent_work import (
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
 )
+from omnigent.runtime import routing_stamp, set_remote_routing_available
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -1090,6 +1092,15 @@ def _response_failed_event(
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
+def _is_mcp_tool_schema(schema: object) -> bool:
+    """Whether *schema* is an MCP tool, whose name is namespaced ``server__tool``."""
+    return (
+        isinstance(schema, dict)
+        and isinstance(schema.get("name"), str)
+        and "__" in cast(str, schema.get("name"))
+    )
+
+
 def _inject_mcp_schemas(
     event_body: _JsonObject,
     mcp_schemas: list[_JsonObject],
@@ -1624,6 +1635,8 @@ def create_runner_app(
     # warns again for the new pair rather than inheriting the old one's silence.
     _instruction_delivery_warned: dict[str, set[tuple[str, InstructionDelivery]]] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
+    # session_id → the routing availability its built-in schemas were built under.
+    _session_tool_schemas_routing: dict[str, bool] = {}
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
 
@@ -1801,9 +1814,12 @@ def create_runner_app(
 
     # Sessions whose Claude pane reports a background shell still running after
     # its turn ended. Real work: it keeps the runner and its sandbox up, but only
-    # while that session's native pane exists, so a lost "stopped" edge cannot
-    # pin either.
+    # while that session's native pane exists, which the pane reaper bounds, so a
+    # lost "stopped" edge cannot pin either.
     _sessions_with_background_shell: set[str] = set()
+    # When a background shell became the only work sparing each native pane.
+    _background_shell_pane_hold_since: dict[str, float] = {}
+    app.state.background_shell_pane_hold_since = _background_shell_pane_hold_since
 
     _human_wait_hold_s = _resolve_human_wait_hold_s()
     # Dialog each native turn is parked on: its latest ``running`` edge's
@@ -2297,6 +2313,7 @@ def create_runner_app(
             _sessions_with_background_shell.add(session_id)
         else:
             _sessions_with_background_shell.discard(session_id)
+            _background_shell_pane_hold_since.pop(session_id, None)
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
@@ -2810,10 +2827,30 @@ def create_runner_app(
             )
         return None
 
-    async def _session_runtime_cwd(session_id: str) -> Path | None:
+    async def _session_explicit_workspace(
+        session_id: str,
+    ) -> Path | UnknownSessionWorkspace | None:
+        """
+        The session's own server-stored workspace.
+
+        :returns: The workspace, ``None`` when the session has none, or
+            ``UNKNOWN_SESSION_WORKSPACE`` when its metadata could not be read.
+        """
+        from omnigent.runner.tool_dispatch import UNKNOWN_SESSION_WORKSPACE
+
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
+        # A successful read is cached, even an empty one; an uncached session's
+        # metadata was unreadable (or superseded mid-read), so its boundary is unknown.
+        if session_id not in _session_workspace_cache:
+            return UNKNOWN_SESSION_WORKSPACE
+        return None
+
+    async def _session_runtime_cwd(session_id: str) -> Path | None:
+        explicit = await _session_explicit_workspace(session_id)
+        if isinstance(explicit, Path):
+            return explicit
         return runner_workspace.resolve() if runner_workspace is not None else None
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
@@ -2835,6 +2872,7 @@ def create_runner_app(
         global _server_version, _server_accepts_inferred_status
         global _server_accepts_input_only_failures
         _server_version = envelope.server_version
+        set_remote_routing_available(envelope.smart_routing_available)
         _server_accepts_inferred_status = envelope.accepts_inferred_status
         _server_accepts_input_only_failures = envelope.accepts_input_only_failures
         if _server_accepts_input_only_failures:
@@ -4312,6 +4350,7 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
+        _session_tool_schemas_routing.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
@@ -4799,6 +4838,30 @@ def create_runner_app(
         )
         if known:
             _publish_turn_status(conv_id, "idle")
+
+    async def _settle_codex_native_stop(conv_id: str) -> None:
+        """
+        Publish ``idle`` once a Stop has ended a Codex-native turn that Codex itself never ran.
+
+        Codex's own turn events close a Codex session's ``running`` edge, so a turn
+        stopped before its message reached Codex (held while Codex was starting) has
+        nothing else to close it. A turn Codex accepted keeps its own lifecycle.
+
+        :param conv_id: Session whose turn the Stop ended.
+        """
+        if _session_harness_name(conv_id) != "codex-native":
+            return
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="stop", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None and state.active_turn_id is not None:
+            return
+        # Checked after the await, with no await before the publish: a turn that
+        # started meanwhile keeps its own status.
+        if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+            return
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        resource_registry.note_external_session_status(conv_id, "idle")
 
     def _on_proxy_stream_end(
         conv_id: str,
@@ -5924,6 +5987,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and known_bridge_dir is None
         ):
             return
@@ -5946,6 +6010,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.workflows_enabled == workflows_enabled
+            and current.routing_available == routing_stamp()
             and current.bridge_dir == bridge_dir
         ):
             return
@@ -5956,6 +6021,7 @@ def create_runner_app(
         )
 
         relay_spec = _unwrap_spec_entry(spec_entry)
+        relay_routing = routing_stamp()
         relay_schemas: list[_JsonObject] = filter_workflow_tool_schemas(
             build_native_relay_tool_schemas(relay_spec),
             enabled=workflows_enabled,
@@ -5984,6 +6050,7 @@ def create_runner_app(
                 current is not None
                 and current.spec_entry is spec_entry
                 and current.workflows_enabled == workflows_enabled
+                and current.routing_available == routing_stamp()
                 and current.bridge_dir == bridge_dir
             ):
                 return
@@ -6129,6 +6196,7 @@ def create_runner_app(
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
             workflows_enabled=workflows_enabled,
+            routing_available=relay_routing,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -6546,7 +6614,22 @@ def create_runner_app(
         if instructions:
             harness_body["instructions"] = instructions
 
-        if conv not in _session_tool_schemas:
+        # Built-in schemas depend on this process's routing answer, which a later
+        # session-init envelope can change. Rebuild only this session's built-ins
+        # when the answer it was built under has moved, keeping its MCP entries and
+        # hash so discovery is not repeated. Nothing shared is cleared, so another
+        # session's in-flight MCP discovery is never disturbed.
+        routing_now = routing_stamp()
+        routing_stale = (
+            conv in _session_tool_schemas
+            and _session_tool_schemas_routing.get(conv) != routing_now
+        )
+        if conv not in _session_tool_schemas or routing_stale:
+            kept_mcp = (
+                [t for t in _session_tool_schemas.get(conv, []) if _is_mcp_tool_schema(t)]
+                if routing_stale
+                else []
+            )
             all_tools: list[_JsonObject] = []
             if cached_spec is not None:
                 try:
@@ -6571,7 +6654,9 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
-            _session_tool_schemas[conv] = all_tools
+            # Stamped before the MCP await below, so a flip during discovery is seen next turn.
+            _session_tool_schemas[conv] = all_tools + kept_mcp
+            _session_tool_schemas_routing[conv] = routing_now
 
         if cached_spec and cached_spec.mcp_servers:
             from omnigent.runner.mcp_manager import compute_spec_hash
@@ -6591,11 +6676,7 @@ def create_runner_app(
                     _builtin_tools = [
                         t
                         for t in _session_tool_schemas.get(conv, [])
-                        if not (
-                            isinstance(t, dict)
-                            and isinstance(t.get("name"), str)
-                            and "__" in cast(str, t.get("name"))
-                        )
+                        if not _is_mcp_tool_schema(t)
                     ]
                     _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
                     _session_mcp_spec_hash[conv] = _mcp_hash
@@ -8468,6 +8549,8 @@ def create_runner_app(
             )
             if not _had_live_turn:
                 _settle_stop_without_turn(conversation_id)
+            else:
+                await _settle_codex_native_stop(conversation_id)
             return Response(status_code=204)
 
         if body_type == "external_session_status":
@@ -8659,6 +8742,8 @@ def create_runner_app(
             )
             if not _had_live_turn:
                 _settle_stop_without_turn(conversation_id)
+            else:
+                await _settle_codex_native_stop(conversation_id)
             return Response(status_code=204)
 
         if body_type == "effort_change":
@@ -9391,6 +9476,7 @@ def create_runner_app(
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
+        _session_tool_schemas_routing.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
         _session_sub_agent_resolved.pop(session_id, None)
@@ -9553,6 +9639,7 @@ def create_runner_app(
         _session_harness_name=_session_harness_name,
         _session_inboxes=_session_inboxes,
         _session_runtime_cwd=_session_runtime_cwd,
+        _session_explicit_workspace=_session_explicit_workspace,
         _session_spec_cache=_session_spec_cache,
         filesystem_registry=filesystem_registry,
         mcp_execution_registry=mcp_execution_registry,
@@ -9684,6 +9771,7 @@ def create_runner_app(
         )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
         from omnigent.terminals.pane_reaper import (
+            BACKGROUND_SHELL_PANE_HOLD_S,
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
             PaneRef,
@@ -9751,6 +9839,17 @@ def create_runner_app(
             return False
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
+            conv_id = pane.conversation_id
+            if await _native_pane_busy_without_shell(pane):
+                _background_shell_pane_hold_since.pop(conv_id, None)
+                return True
+            if conv_id not in _sessions_with_background_shell:
+                return False
+            now = time.monotonic()
+            held_since = _background_shell_pane_hold_since.setdefault(conv_id, now)
+            return now - held_since < BACKGROUND_SHELL_PANE_HOLD_S
+
+        async def _native_pane_busy_without_shell(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)

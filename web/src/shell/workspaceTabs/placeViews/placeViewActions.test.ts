@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { planOpen, type OpenState } from "../planOpen";
 import {
+  allPullRequestsChosen,
+  changesComparisonShown,
   changesFileInNewTab,
   changesOverview,
   fileTabFileChosen,
@@ -84,13 +86,28 @@ describe("Files tab", () => {
 });
 
 describe("Changes tab", () => {
-  it("goes back to the overview from a file", () => {
+  it("goes back to the overview from a file, keeping the visit's comparison", () => {
     expect(changesOverview({ kind: "changes", path: "a.go" })).toEqual({
       type: "navigate",
       place: { kind: "changes" },
       replace: false,
     });
     expect(changesOverview({ kind: "changes" })).toEqual({ type: "none" });
+    const comparison = { kind: "saved", intent: "branch-point" } as const;
+    expect(changesOverview({ kind: "changes", path: "a.go", comparison })).toMatchObject({
+      place: { kind: "changes", comparison },
+    });
+  });
+
+  it("records a comparison the person picked as a step, and any other in place", () => {
+    const shown = { kind: "typed", base: "v1", head: "" } as const;
+    const current = { kind: "changes", path: "a.go" } as const;
+    expect(changesComparisonShown(current, shown, true)).toEqual({
+      type: "navigate",
+      place: { kind: "changes", path: "a.go", comparison: shown },
+      replace: false,
+    });
+    expect(changesComparisonShown(current, shown, false)).toMatchObject({ replace: true });
   });
 });
 
@@ -116,6 +133,14 @@ describe("pull request tab", () => {
       replace: false,
     });
     expect(pullRequestSectionChosen(page, "summary")).toEqual({ type: "none" });
+  });
+
+  it("shows the session's list of pull requests in its own tab, not this one", () => {
+    expect(allPullRequestsChosen()).toEqual({
+      type: "open",
+      link: { place: { kind: "pulls" } },
+      options: { opener: "user", disposition: "focus" },
+    });
   });
 });
 
@@ -182,6 +207,24 @@ describe("changesFileInNewTab", () => {
       type: "open",
       link: { place: { kind: "changes", path: "b.go", fileTab: true } },
       options: { opener: "user", disposition: "focus", reuse: "same-place", keepSelection: false },
+    });
+  });
+
+  it("gives the file the comparison picked over a linked range, not the range", () => {
+    const lastCommit = { kind: "saved", intent: "head" } as const;
+    const picked = changesComparisonShown(
+      { kind: "changes", range: { base: "v1.2" } },
+      lastCommit,
+      true,
+    );
+    expect(picked).toEqual({
+      type: "navigate",
+      place: { kind: "changes", comparison: lastCommit },
+      replace: false,
+    });
+    const place = { kind: "changes", comparison: lastCommit } as const;
+    expect(changesFileInNewTab(place, "b.go", { background: true })).toMatchObject({
+      link: { place: { kind: "changes", path: "b.go", fileTab: true, comparison: lastCommit } },
     });
   });
 });

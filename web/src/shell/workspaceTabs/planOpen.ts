@@ -170,6 +170,28 @@ export function samePlace(left: WorkspacePlace, right: WorkspacePlace): boolean 
   return formatWorkspaceLink({ place: left }) === formatWorkspaceLink({ place: right });
 }
 
+/** The same place, whatever comparison each visit showed, which is its state, not what it is. */
+function sameShownPlace(left: WorkspacePlace, right: WorkspacePlace): boolean {
+  const withoutComparison = (place: WorkspacePlace): WorkspacePlace => {
+    if (place.kind !== "changes") return place;
+    const { comparison: _comparison, ...rest } = place;
+    return rest;
+  };
+  return samePlace(withoutComparison(left), withoutComparison(right));
+}
+
+/**
+ * The place a hidden tab brought forward shows. A Changes visit's old comparison would undo the
+ * session's since; only a comparison the open asks for lands with it.
+ */
+function broughtForward(state: OpenState, tab: PlanTab, asked: WorkspacePlace): WorkspacePlace {
+  const shown = tab.place;
+  if (shown.kind !== "changes" || tab.id === state.selectedTabId) return shown;
+  const { comparison: _recorded, ...rest } = shown;
+  const comparison = asked.kind === "changes" ? asked.comparison : undefined;
+  return comparison === undefined ? rest : { ...rest, comparison };
+}
+
 function withoutPosition(place: WorkspacePlace): WorkspacePlace {
   if (place.kind !== "files" && place.kind !== "changes") return place;
   const { line: _line, comment: _comment, ...rest } = place;
@@ -337,14 +359,16 @@ export function planOpen(state: OpenState, link: WorkspaceLink, options: OpenOpt
       options.reuse === "same-place"
         ? preferredTab(
             state,
-            (tab) => tab.id !== state.selectedTabId && !tab.binding && samePlace(tab.place, place),
+            (tab) =>
+              tab.id !== state.selectedTabId && !tab.binding && sameShownPlace(tab.place, place),
           )
         : identity === null
           ? undefined
           : preferredTab(state, (tab) => !tab.binding && tabIdentity(tab) === identity);
     // Selecting a tab with its own place keeps its sub-view; an already selected one is no step.
     if (shown) {
-      return { ok: true, plan: navigate(state, shown, shown.place, !options.keepSelection) };
+      const forward = broughtForward(state, shown, place);
+      return { ok: true, plan: navigate(state, shown, forward, !options.keepSelection) };
     }
     return create(state, place, !options.keepSelection);
   }
