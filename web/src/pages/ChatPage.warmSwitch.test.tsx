@@ -133,6 +133,7 @@ function renderPage(
 }
 
 beforeEach(() => {
+  window.history.replaceState({}, "", "/c/conv_a");
   useChatStore.setState({
     conversationId: "conv_a",
     blocks: [userBlock("item_a", "alpha transcript")],
@@ -143,6 +144,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState({}, "", "/");
   useChatStore.getState().abortController?.abort();
   conversationRegistry.clear();
   clearWarmSwitchInFlight();
@@ -249,12 +251,35 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     expect(commitLog.at(-1)).toMatchObject({ urlConvId: "conv_a", activeConversationId: "conv_b" });
     expect(screen.getByText("beta transcript")).toBeInTheDocument();
     expect(transcriptNode()).toBe(surfaceBefore);
+    window.history.replaceState({}, "", "/c/conv_a?diff=1");
     await act(() => vi.advanceTimersByTimeAsync(1000));
 
     expect(useChatStore.getState().conversationId).toBe("conv_a");
     expect(screen.getByText("alpha transcript")).toBeInTheDocument();
     expect(screen.queryByText("Loading conversation…")).toBeNull();
     expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
+  });
+
+  it("keeps the target mounted when browser navigation precedes a slow router commit", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    initChatStore(qc);
+    seedLiveEntry("conv_a", "alpha transcript");
+    seedLiveEntry("conv_b", "beta transcript");
+    renderPage({ warm_switch_keep_mounted_ui: true }, qc, true);
+    await screen.findByText("alpha transcript");
+    const surfaceBefore = transcriptNode();
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+    window.history.pushState({}, "", "/c/conv_b");
+    expect(commitLog.at(-1)).toMatchObject({ urlConvId: "conv_a", activeConversationId: "conv_b" });
+    await act(() => vi.advanceTimersByTimeAsync(1500));
+
+    expect(useChatStore.getState().conversationId).toBe("conv_b");
+    expect(screen.getByText("beta transcript")).toBeInTheDocument();
+    expect(transcriptNode()).toBe(surfaceBefore);
+    expect(screen.queryByText("Loading conversation…")).toBeNull();
+    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(true);
   });
 
   it.each([null, { name: "example-skill", args: "check" }])(

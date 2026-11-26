@@ -1,6 +1,10 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
-import { clearWarmSwitchInFlight, warmSwitchInFlight } from "@/lib/warmSessionSwitch";
+import {
+  clearWarmSwitchInFlight,
+  restoreWarmSwitchIfNavigationCanceled,
+  warmSwitchInFlight,
+} from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -494,11 +498,8 @@ export function ChatPage() {
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
     if (warmSwitchPending) {
-      // A canceled or blocked navigation must yield back to the unchanged URL.
-      const timeout = window.setTimeout(() => {
-        clearWarmSwitchInFlight();
-        void useChatStore.getState().switchTo(urlConvId ?? null);
-      }, 1000);
+      // The browser path moves before React commits; only an unchanged path needs recovery.
+      const timeout = window.setTimeout(restoreWarmSwitchIfNavigationCanceled, 1000);
       return () => window.clearTimeout(timeout);
     }
     clearWarmSwitchInFlight();
