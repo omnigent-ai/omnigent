@@ -40,6 +40,8 @@ export type WorkspacePlace =
       range?: ExplicitRange;
       /** The session's comparison this visit showed; showing the visit again applies it. */
       comparison?: ComparisonChoice;
+      /** The folder, absolute, whose review showed `comparison`; absent for the workspace. */
+      comparisonRoot?: string;
       fileTab?: true;
     }
   | { kind: "pulls" }
