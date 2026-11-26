@@ -387,6 +387,13 @@ interface FileViewerProps {
    * "X/N" index won't line up with the list. Defaults to "recent".
    */
   sort?: ChangedSort;
+  /**
+   * A display name shown as the header's heading in place of the copyable
+   * workspace path, for files that live outside a workspace (project files).
+   */
+  title?: string;
+  /** Name the main actions in the header (Comments, Download) instead of bare icons. */
+  labelledActions?: boolean;
 }
 
 /**
@@ -429,6 +436,8 @@ function FileViewerBody({
   viewport,
   onCommentsOpenChange,
   sort = "recent",
+  title,
+  labelledActions = false,
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
@@ -653,10 +662,12 @@ function FileViewerBody({
         setLinkCopied(true);
         window.clearTimeout(linkCopiedTimerRef.current);
         linkCopiedTimerRef.current = window.setTimeout(() => setLinkCopied(false), 2000);
+        // From the More menu the button's checkmark isn't visible, so confirm here.
+        if (labelledActions) toast.success("Link copied");
       },
       (err) => console.warn("Failed to copy file link", err),
     );
-  }, [activeSelection, syncUrl, rebasePath, conversationId, path]);
+  }, [activeSelection, syncUrl, rebasePath, conversationId, path, labelledActions]);
 
   const copyCommentLink = useCallback(
     (commentId: string) => {
@@ -1386,6 +1397,7 @@ function FileViewerBody({
   toolbarActions.push({
     key: "comments",
     label: commentsOpen ? "Hide comments" : "Show comments",
+    textLabel: labelledActions ? "Comments" : undefined,
     icon: <MessageSquareTextIcon className="size-4" />,
     active: commentsOpen,
     onSelect: () => {
@@ -1442,7 +1454,16 @@ function FileViewerBody({
       onSelect: () => revealInFileManager(revealTarget),
     });
   }
-  if (!isDeletedFile && (fileQuery.data || isVideo)) {
+  if (!isDeletedFile && (fileQuery.data || isVideo) && labelledActions) {
+    toolbarActions.push({
+      key: "download",
+      label: "Download file",
+      textLabel: "Download",
+      tooltip: "Download",
+      icon: <DownloadIcon className="size-4" />,
+      onSelect: downloadFile,
+    });
+  } else if (!isDeletedFile && (fileQuery.data || isVideo)) {
     settingsMenu.push({
       key: "download",
       label: "Download file",
@@ -1477,24 +1498,35 @@ function FileViewerBody({
       onSelect: () => setHideWhitespace((prev) => !prev),
     });
   }
+  if (labelledActions) {
+    settingsMenu.push({
+      key: "copy-link",
+      label: "Copy link",
+      icon: <Link2Icon className="size-4" />,
+      active: false,
+      onSelect: copyFileLink,
+    });
+  }
   toolbarActions.push({
     key: "view-settings",
     label: "View settings",
-    tooltip: "View settings",
+    tooltip: labelledActions ? "More" : "View settings",
     icon: <MoreHorizontalIcon className="size-4" />,
     menu: settingsMenu,
   });
-  toolbarActions.push({
-    key: "copy-link",
-    label: "Copy link to file",
-    tooltip: linkCopied ? "Copied!" : "Copy link",
-    icon: linkCopied ? (
-      <CheckIcon className="size-4 text-green-500" />
-    ) : (
-      <Link2Icon className="size-4" />
-    ),
-    onSelect: copyFileLink,
-  });
+  if (!labelledActions) {
+    toolbarActions.push({
+      key: "copy-link",
+      label: "Copy link to file",
+      tooltip: linkCopied ? "Copied!" : "Copy link",
+      icon: linkCopied ? (
+        <CheckIcon className="size-4 text-green-500" />
+      ) : (
+        <Link2Icon className="size-4" />
+      ),
+      onSelect: copyFileLink,
+    });
+  }
   if (onShare) {
     toolbarActions.push({
       key: "share-file",
@@ -1546,13 +1578,14 @@ function FileViewerBody({
       <Button
         type="button"
         variant={action.active ? "default" : "ghost"}
-        size="icon-sm"
+        size={action.textLabel ? "sm" : "icon-sm"}
         aria-label={action.disabledLabel ?? action.label}
         disabled={action.disabled}
         tabIndex={interactive ? undefined : -1}
         onClick={interactive ? action.onSelect : undefined}
       >
         {action.icon}
+        {action.textLabel}
       </Button>
     );
     return action.disabled ? <span className="inline-flex">{button}</span> : button;
@@ -1726,32 +1759,46 @@ function FileViewerBody({
               </KeyboardShortcutTooltip>
             </div>
           )}
-          {/* Always show the file path/name in the toolbar, in every view. */}
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  aria-label={`Copy file path: ${path}`}
-                  className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => {
-                    const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
-                    if (absolutePath === null) {
-                      toast.error("Workspace path unavailable");
-                      return;
-                    }
-                    void copyText(absolutePath).then(
-                      () => toast.success("File path copied"),
-                      () => toast.error("Failed to copy file path"),
-                    );
-                  }}
-                >
-                  {path}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>Copy file path</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          {/* Always show the file's name in the toolbar, in every view; a titled
+              (non-workspace) file shows its title instead of a copyable path. */}
+          {title !== undefined ? (
+            <div
+              data-testid="file-viewer-title"
+              className="flex min-w-0 items-baseline gap-2"
+              title={`${title} · ${path}`}
+            >
+              <span className="truncate text-[15px] font-semibold text-foreground">{title}</span>
+              <span className="hidden min-w-0 truncate text-xs font-normal text-muted-foreground sm:inline">
+                {path}
+              </span>
+            </div>
+          ) : (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={`Copy file path: ${path}`}
+                    className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => {
+                      const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
+                      if (absolutePath === null) {
+                        toast.error("Workspace path unavailable");
+                        return;
+                      }
+                      void copyText(absolutePath).then(
+                        () => toast.success("File path copied"),
+                        () => toast.error("Failed to copy file path"),
+                      );
+                    }}
+                  >
+                    {path}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>Copy file path</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"
@@ -1925,7 +1972,7 @@ function FileViewerBody({
             aria-hidden
             className="pointer-events-none absolute left-[-9999px] top-0 font-mono text-sm whitespace-nowrap"
           >
-            {path}
+            {title ?? path}
           </span>
         </div>
       </div>

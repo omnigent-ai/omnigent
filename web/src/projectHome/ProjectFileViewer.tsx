@@ -167,6 +167,8 @@ export function ProjectFileDialog({
             agentId={null}
             conversationId={projectFileScopeId(projectId, fileId)}
             path={file.data.filename}
+            title={file.data.title || file.data.filename}
+            labelledActions
             onClose={onClose}
             onCloseTab={onClose}
           />

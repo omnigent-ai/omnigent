@@ -277,6 +277,8 @@ interface RenderProps {
   escapeCloses?: boolean;
   onShare?: () => void;
   shareDisabledReason?: string;
+  title?: string;
+  labelledActions?: boolean;
 }
 
 /**
@@ -304,6 +306,8 @@ function viewerTree({
   escapeCloses = false,
   onShare,
   shareDisabledReason,
+  title,
+  labelledActions,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -327,6 +331,8 @@ function viewerTree({
           onNavigateTo={onNavigateTo}
           onShare={onShare}
           shareDisabledReason={shareDisabledReason}
+          title={title}
+          labelledActions={labelledActions}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -2112,6 +2118,18 @@ describe("FileViewer view-settings menu", () => {
     expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
     // Hiding whitespace changes only means something in the diff view.
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  it("a titled viewer shows its title as the heading and names Comments and Download", () => {
+    render(viewerTree({ open: true, title: "Weekly report", labelledActions: true }));
+    expect(screen.getByTestId("file-viewer-title")).toHaveTextContent("Weekly report");
+    expect(screen.queryByRole("button", { name: /^Copy file path/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Show comments" })).toHaveTextContent("Comments");
+    expect(screen.getByRole("button", { name: "Download file" })).toHaveTextContent("Download");
+    expect(screen.queryByRole("button", { name: "Copy link to file" })).toBeNull();
+    openSettingsMenu();
+    expect(screen.getByRole("menuitem", { name: "Copy link" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Download file" })).toBeNull();
   });
 
   it("toggling Wrap lines in a code file flips the code viewer's wrapLines prop", () => {
