@@ -111,7 +111,11 @@ describe("shortcut registry", () => {
     expect(APP_SHORTCUT_BINDINGS).toHaveLength(
       SHORTCUT_BINDINGS.length + QUICK_PICK_SHORTCUT_BINDINGS.length,
     );
-    expect(APP_SHORTCUT_BINDINGS.map((binding) => binding.id).slice(10, 14)).toEqual([
+    // The Session menu's three keep their page position, between Close window and Quit.
+    const ids = APP_SHORTCUT_BINDINGS.map((binding) => binding.id);
+    const pin = ids.indexOf("session.pin");
+    expect(ids.slice(pin - 1, pin + 4)).toEqual([
+      "window.close",
       "session.pin",
       "session.archive",
       "session.fork",
@@ -154,6 +158,9 @@ describe("shortcut registry", () => {
       // With quick_pick_palette on, Ctrl+Tab steps sessions instead of switching recent ones.
       "session.next sessions.recent": "takes over",
       "session.previous sessions.recent": "takes over",
+      // A focused file editor adds a cursor and takes the key first; the message steps yield.
+      "file.addCursorAbove message.previous": "focused editor first",
+      "file.addCursorBelow message.next": "focused editor first",
     };
     const environments = [true, false].flatMap((isMac) =>
       [true, false].flatMap((native) =>
@@ -163,7 +170,7 @@ describe("shortcut registry", () => {
     const collisions = new Set<string>();
     for (const environment of environments) {
       const owners = new Map<string, string[]>();
-      for (const binding of APP_SHORTCUT_BINDINGS) {
+      for (const binding of [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS]) {
         for (const chord of activeShortcutChords(binding.id, environment)) {
           const signature = chordKeys(chord, environment.mac).join(" ");
           owners.set(signature, [...(owners.get(signature) ?? []), binding.id]);

@@ -163,8 +163,7 @@ function messageStepChord(key: "ArrowUp" | "ArrowDown", environment: ShortcutEnv
   return { mod: true, alt: true, key, exactKey: true, matchesAltGraph: environment.mac };
 }
 
-// The transcript has always stepped with Shift held too. Off macOS that's Ctrl+Alt+Shift and an
-// arrow, Next and Previous session's chord, so only macOS keeps it.
+// Shift variants are macOS-only; elsewhere they're Next and Previous session's chords.
 function messageStepWithShift(
   key: "ArrowUp" | "ArrowDown",
   environment: ShortcutEnvironment,
@@ -182,8 +181,8 @@ export const OPEN_SESSION_CHORDS = {
 // The desktop menu owns these chords; elsewhere Ctrl+Alt+P and Ctrl+Alt+F are Go to a file
 // and Search text in files, so the browser takes Pin and Fork on macOS only.
 const browserOpenSessionChord =
-  (chord: Chord, offMac: boolean) => (environment: ShortcutEnvironment) =>
-    environment.desktopMenu || (!environment.mac && !offMac) ? [] : [chord];
+  (chord: Chord, alsoOffMac: boolean) => (environment: ShortcutEnvironment) =>
+    environment.desktopMenu || (!environment.mac && !alsoOffMac) ? [] : [chord];
 
 /** Sidebar slots in order: ⌘1–⌘9 pick the first nine and ⌘0 the tenth, as browser tabs do. */
 export const SESSION_NUMBER_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
