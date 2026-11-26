@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -42,6 +43,8 @@ class StackGraph:
         # Branches whose list fails, or runs past the walk's deadline.
         self.failing: set[str] = set()
         self.timing_out: set[str] = set()
+        self.default_branch: str | None = "main"
+        self.deadlines: list[float | None] = []
         self.current = next(pr for pr in prs if pr["number"] == current)
         monkeypatch.setattr(github, "_pr_token", self._token)
         monkeypatch.setattr(github, "_gh", self._gh)
@@ -54,6 +57,15 @@ class StackGraph:
     def _gh(
         self, argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
     ) -> tuple[int, str, str]:
+        # Every call runs under the walk's one deadline.
+        deadline = github._gh_deadline.get()
+        assert deadline is not None
+        assert deadline <= time.monotonic() + github_stack.WALK_SECONDS
+        self.deadlines.append(deadline)
+        if argv[:2] == ["repo", "view"]:
+            if self.default_branch is None:
+                return 1, "", "HTTP 502"
+            return 0, json.dumps({"defaultBranchRef": {"name": self.default_branch}}), ""
         flag = "--head" if "--head" in argv else "--base"
         branch = argv[argv.index(flag) + 1]
         self.lists.append((flag, branch))
@@ -145,7 +157,8 @@ def test_the_walk_stops_at_the_gh_call_cap(monkeypatch: pytest.MonkeyPatch) -> N
     stack = github_stack.pull_request_stack("/workspace", _reference(1))
 
     assert stack["truncated"] is True
-    assert len(graph.lists) == github_stack.MAX_GH_CALLS
+    # The default branch's read is one of the calls.
+    assert len(graph.lists) == github_stack.MAX_GH_CALLS - 1
 
 
 def test_a_stack_within_both_caps_is_not_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -193,6 +206,7 @@ def test_the_walk_stops_when_its_deadline_cuts_a_list_short(
     assert stack["truncated"] is True
     assert _numbers(stack) == [1, 2]
     assert ("--base", "branch-3") not in graph.lists
+    assert len(set(graph.deadlines)) == 1
 
 
 def test_another_repositorys_branch_with_the_same_name_is_not_in_the_stack(
@@ -230,3 +244,42 @@ def test_a_pull_request_github_cant_load_is_refused(monkeypatch: pytest.MonkeyPa
 
     assert str(refused.value) == "GitHub could not load this pull request. Refresh to retry."
     assert graph.lists == []
+
+
+def test_the_walk_never_looks_past_the_default_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A backport from main, and a PR that heads main into a release branch.
+    prs = [*_chain(2), _pr(9, "main", "release-1")]
+    graph = StackGraph(monkeypatch, prs, current=1)
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(1))
+
+    assert _numbers(stack) == [1, 2]
+    assert ("--head", "main") not in graph.lists
+    assert stack["truncated"] is False
+
+
+def test_a_long_lived_branch_with_its_release_prs_is_a_base_not_a_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A develop branch, released to main twice, with a feature PR and one stacked on it.
+    prs = [
+        _pr(1, "develop", "main"),
+        _pr(2, "develop", "main"),
+        _pr(3, "feature", "develop"),
+        _pr(4, "feature-part-2", "feature"),
+    ]
+    StackGraph(monkeypatch, prs, current=4)
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(4))
+
+    assert _numbers(stack) == [3, 4]
+    assert stack["truncated"] is False
+
+
+def test_without_the_default_branch_the_walk_still_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    graph = StackGraph(monkeypatch, _chain(3), current=2)
+    graph.default_branch = None
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(2))
+
+    assert _numbers(stack) == [1, 2, 3]

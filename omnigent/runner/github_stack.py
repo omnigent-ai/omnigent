@@ -67,19 +67,38 @@ def _list_by(
     return found, len(entries) < _LIST_LIMIT
 
 
+def _default_branch(root: str, reference: PullRequestRef, token: str | None) -> str | None:
+    """The repository's default branch, or ``None`` when ``gh`` can't say."""
+    rc, output, _ = github._gh(
+        ["repo", "view", github._repo_argument(reference), "--json", "defaultBranchRef"],
+        cwd=root,
+        token=token,
+    )
+    if rc != 0:
+        return None
+    try:
+        name = json.loads(output).get("defaultBranchRef", {}).get("name")
+    except (ValueError, AttributeError):
+        return None
+    return name if isinstance(name, str) and name else None
+
+
 def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """The stack around the pull request: its ancestors and descendants, nearest first.
 
     The walk stops at ``MAX_DEPTH`` steps from the pull request, after ``MAX_GH_CALLS``
     calls or ``WALK_SECONDS``, or when it meets a pull request or head it already saw. Any
     of those, or a list that failed or was cut at its limit, marks the answer ``truncated``.
+    It never looks past the repository's default branch, and a branch that heads more than
+    one pull request, such as a long-lived ``develop``, is a base rather than a member.
     """
     with github._gh_deadline_scope(time.monotonic() + WALK_SECONDS):
         current = github._pr_json(root, reference, _FIELDS)
         if current is None:
             raise ValueError(_UNLOADED)
         token = github._pr_token(root, reference)
-        members, truncated = _walk(root, reference, token, current)
+        default_branch = _default_branch(root, reference, token)
+        members, truncated = _walk(root, reference, token, current, default_branch)
     members.append(_member(current, current=True))
     return {
         "object": "session.github.pr_stack",
@@ -90,14 +109,18 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
 
 
 def _walk(
-    root: str, reference: PullRequestRef, token: str | None, current: dict[str, Any]
+    root: str,
+    reference: PullRequestRef,
+    token: str | None,
+    current: dict[str, Any],
+    default_branch: str | None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """The other members, breadth first, and whether the walk stopped before the end."""
     seen_numbers = {current.get("number")}
     seen_heads = {current.get("headRefOid")}
     members: list[dict[str, Any]] = []
     truncated = False
-    calls = 0
+    calls = 1  # The default branch's read.
     # Each entry is (pull request, depth, direction): "up" finds the PR whose head is its
     # base, "down" the PRs stacked on its head.
     queue: deque[tuple[dict[str, Any], int, str]] = deque(
@@ -111,7 +134,8 @@ def _walk(
             continue  # Its head is another repository's branch, so nothing here builds on it.
         else:
             branch, flag = entry.get("headRefName"), "--base"
-        if not isinstance(branch, str) or not branch:
+        # The default branch is where stacks end: nothing above it, and its PRs aren't one.
+        if not isinstance(branch, str) or not branch or branch == default_branch:
             continue
         if depth >= MAX_DEPTH or calls >= MAX_GH_CALLS:
             return members, True
@@ -120,10 +144,13 @@ def _walk(
         if github._gh_timed_out.get():
             return members, True
         truncated = truncated or not complete
+        # Another repository's branch only shares the name of the one walked here.
+        found = [other for other in found if other.get("isCrossRepository") is False]
+        if direction == "up" and (len(found) > 1 or not complete):
+            # A stacked branch heads one pull request; one that heads several, such as
+            # ``develop`` with its past release PRs, is a long-lived base.
+            continue
         for other in found:
-            # Another repository's branch only shares the name of the one walked here.
-            if other.get("isCrossRepository") is not False:
-                continue
             number, head = other.get("number"), other.get("headRefOid")
             if number in seen_numbers or head in seen_heads:
                 truncated = True
