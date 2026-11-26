@@ -66,9 +66,7 @@ describe("textSearchView", () => {
       { phase: "settled", result: result([match("a.ts", 1)], { truncated: true }) },
       input,
     );
-    expect(capped.status).toBe(
-      "1+ results in 1 file. Narrow the search, or open it in Search, to see the rest.",
-    );
+    expect(capped.status).toBe("1+ results in 1 file. Narrow the search to see the rest.");
     const warned = textSearchView(
       { phase: "settled", result: result([], { warning: "Skipped large files." }) },
       input,

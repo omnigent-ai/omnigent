@@ -56,8 +56,7 @@ export function textSearchView(state: TextSearchState, input: ContentSearchInput
     case "settled": {
       const { result } = state;
       const note =
-        result.warning ??
-        (result.truncated ? "Narrow the search, or open it in Search, to see the rest." : null);
+        result.warning ?? (result.truncated ? "Narrow the search to see the rest." : null);
       return {
         items: textSearchItems(result.matches, input),
         emptyMessage: `No lines match “${input.query}”.`,
