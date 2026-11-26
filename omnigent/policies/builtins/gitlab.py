@@ -62,9 +62,10 @@ _CLI_ENVIRONMENT = frozenset(
     }
 )
 _CLI_ENVIRONMENT_NAMES = re.compile(
-    r"(?<![A-Za-z0-9_])(?:"
+    r"(?:(?<=-[A-Za-z])|(?<![A-Za-z0-9_]))(?:"
     + "|".join(sorted(_CLI_ENVIRONMENT))
-    + r"|(?:GIT|GITLAB|GLAB|LD|DYLD)_[A-Za-z0-9_]*)(?![A-Za-z0-9_])"
+    + r"|(?:GIT|GITLAB|GLAB|LD|DYLD)_[A-Za-z0-9_]*)(?![A-Za-z0-9_])",
+    re.IGNORECASE | re.ASCII,
 )
 _LOCAL_GIT_COMMANDS = frozenset(
     {

@@ -310,6 +310,7 @@ def test_backslash_paths_require_approval_before_posix_parsing(executable: str) 
         "GIT_AUTHOR_NAME=example git commit -m Fix",
         "export GIT_CONFIG_COUNT",
         "printf -v GIT_CONFIG_COUNT 1",
+        "printf -vGIT_CONFIG_COUNT 1",
         "command printf -v GIT_CONFIG_COUNT 1",
         "declare -x GIT_CONFIG_COUNT",
         "declare -n example=GIT_CONFIG_COUNT",
@@ -704,6 +705,7 @@ def test_git_project_identity_is_not_reduced_to_parent(remote: str, expected: st
     "prefix",
     [
         "printf -v GIT_CONFIG_COUNT 1; export GIT_CONFIG_COUNT;",
+        "printf -vGIT_CONFIG_COUNT 1;",
         "printf -v GIT_CONFIG_COUNT 1; "
         "printf -v GIT_CONFIG_KEY_0 url.https://git.example.com/team/.insteadOf; "
         "printf -v GIT_CONFIG_VALUE_0 https://gitlab.com/; "
@@ -728,6 +730,7 @@ def test_protected_environment_names_keep_otherwise_permitted_transfers_pending(
         "git commit -m HOME",
         'git commit -m "Document GIT_DIR"',
         'echo "GIT"_DIR',
+        "git add git_helpers.py",
     ],
 )
 def test_protected_environment_names_in_literal_text_conservatively_ask(command: str) -> None:
@@ -766,6 +769,15 @@ def test_protected_environment_name_matching_respects_identifier_boundaries() ->
 def test_execution_and_transport_environment_names_require_approval(name: str) -> None:
     response = _response(
         f"export {name}; git push {_URL} HEAD:refs/heads/feature", write_repos=[_PROJECT]
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]
+
+
+@pytest.mark.parametrize("name", ["Git_Config_Count", "gIt_CoNfIg_KeY_0", "Path", "ssl_cert_file"])
+def test_protected_environment_names_ignore_case_across_hosts(name: str) -> None:
+    response = _response(
+        f"set {name}=example; git push {_URL} HEAD:refs/heads/feature", write_repos=[_PROJECT]
     )
     assert response is not None and response["result"] == "ASK"
     assert "CLI environment" in response["reason"]
