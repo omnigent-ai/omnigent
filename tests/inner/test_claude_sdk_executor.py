@@ -8636,20 +8636,56 @@ async def test_turn_options_expose_ask_user_question_only_with_its_hook(
     assert ("AskUserQuestion" in matchers) is bridge_wired
 
 
-@pytest.mark.parametrize("saved", [False, True])
-@pytest.mark.parametrize("active", [None, [], ["claude"]])
-async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
-    from tests._helpers.mcp_disabled_servers import launch_activation
+# The switch matrix, plus strict alone and strict beside an active disable.
+_HOOK_CASES = [
+    *((active, saved, False) for active in (None, [], ["claude"]) for saved in (False, True)),
+    (None, False, True),
+    (["claude"], True, True),
+]
+
+
+@pytest.mark.parametrize(
+    ("active", "saved", "strict", "hermetic"),
+    [*((*case, False) for case in _HOOK_CASES), (None, False, True, True)],
+)
+async def test_disabled_mcp_settings_launch_hook(
+    tmp_path, monkeypatch, active, saved, strict, hermetic
+):
+    from omnigent.inner.claude_sdk_executor import PreparedClaudeCli
+    from tests._helpers.mcp_disabled_servers import (
+        isolate_claude_settings,
+        launch_activation,
+        write_mcp_inheritance,
+    )
 
     active = launch_activation(active)
 
     from omnigent.mcp_disabled_servers import ServerKey, apply_claude_settings, set_disabled
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    workspace = isolate_claude_settings(monkeypatch, tmp_path / "claude")
+    (workspace / ".claude").mkdir()
+    (workspace / ".claude/settings.json").write_text(
+        json.dumps(
+            {
+                "allowedMcpServers": [
+                    {"serverCommand": ["npx", "server"]}
+                    if hermetic
+                    else {"serverName": "inherited"}
+                ]
+            }
+        )
+    )
     if saved:
         set_disabled(ServerKey("claude", "fixture"), True)
+    if strict:
+        write_mcp_inheritance({"inherit": False, "allow": ["fixture"]})
     original = ' {"other": true} '
     with (
+        patch(
+            "omnigent.inner.claude_sdk_executor.prepare_tight_cli_process",
+            side_effect=lambda cli_path, **_kwargs: PreparedClaudeCli(cli_path, False),
+        ),
         patch(
             "omnigent.inner.claude_sdk_executor._claude_settings_payload", return_value=original
         ),
@@ -8657,14 +8693,36 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
             "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
         ) as hook,
     ):
-        options = await _turn_options(_default_executor(active_harnesses=active))
+        options = await _turn_options(
+            _default_executor(
+                active_harnesses=active,
+                cwd=str(workspace),
+                skills_filter="none" if hermetic else "all",
+            )
+        )
     hook.assert_called_once()
-    assert hook.call_args.kwargs == {"executor": "claude-sdk", "active_harnesses": active}
-    if active and saved:
-        assert json.loads(options.settings) == {
-            "other": True,
-            "deniedMcpServers": [{"serverName": "fixture"}],
-        }
+    # Strict discovery reads the environment the SDK starts the CLI with.
+    actual = dict(hook.call_args.kwargs)
+    actual_env = actual.pop("env")
+    expected_env = {**os.environ, **options.env}
+    assert actual_env.keys() == expected_env.keys()
+    assert all(actual_env[key] == value for key, value in expected_env.items())
+    assert actual == {
+        "executor": "claude-sdk",
+        "active_harnesses": active,
+        "cwd": str(workspace),
+        "setting_sources": [] if hermetic else ("user", "project"),
+    }
+    expected = {"other": True}
+    denied = [{"serverName": "fixture"}] if active and saved else []
+    if strict and not hermetic:
+        denied.append({"serverName": "inherited"})
+    if denied:
+        expected["deniedMcpServers"] = denied
+    if strict:
+        expected["allowedMcpServers"] = [{"serverName": "omnigent"}, {"serverName": "fixture"}]
+    if len(expected) > 1:
+        assert json.loads(options.settings) == expected
     else:
         assert options.settings is original
 

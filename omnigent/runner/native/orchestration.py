@@ -73,7 +73,11 @@ from omnigent.errors import (
     OmnigentError,
 )
 from omnigent.harness_plugins import native_provider_for_key
-from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.host.harness_startup import (
+    env_wrapper_chdir,
+    env_wrapper_command,
+    env_wrapper_environment,
+)
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
@@ -8771,7 +8775,9 @@ def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
     )
 
 
-def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
+def _claude_terminal_launch_env(
+    spec: TerminalEnvSpec, *, require_resolved: bool = False
+) -> dict[str, str]:
     """
     Return the environment the native Claude terminal process starts with.
 
@@ -8782,12 +8788,26 @@ def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
 
     :param spec: The Claude terminal launch spec, e.g. one with
         ``command="env"`` and ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
+    :param require_resolved: Refuse unmodeled wrappers for strict MCP discovery.
     :returns: The effective environment, e.g.
         ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
     """
     env = _claude_terminal_pre_wrapper_env(spec)
     wrapper = env_wrapper_environment(spec.command or "", list(spec.args), env)
     if wrapper is None and Path(spec.command or "").name == "env":
+        if require_resolved:
+            from omnigent.config import global_config_path
+            from omnigent.mcp_disabled_servers import McpStrictModeError
+
+            raise McpStrictModeError(
+                "claude-native",
+                global_config_path(),
+                "unresolved env wrapper",
+                problem=(
+                    "the configured env wrapper cannot be resolved for strict MCP discovery; "
+                    "use a supported env wrapper or launch Claude directly"
+                ),
+            )
         _logger.info(
             "Claude terminal env wrapper form is not modeled; trust seeding uses the "
             "pre-wrapper environment"
@@ -9658,6 +9678,7 @@ async def _auto_create_claude_terminal(
 
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
+        apply_claude_launch_mcp_policy,
         augment_claude_args,
         claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
@@ -10429,6 +10450,8 @@ async def _auto_create_claude_terminal(
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+        # Strict MCP discovery runs once the wrapper's cwd and environment are known.
+        defer_inherited_mcp_discovery=True,
         bridge_dir=bridge_dir,
         workspace=Path(workspace),
         ap_server_url=server_url,
@@ -10494,11 +10517,23 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
-            added_dirs=trusted_added_dirs,
+        from omnigent.mcp_inheritance import resolve_mcp_inheritance
+
+        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+        launch_env = _claude_terminal_launch_env(
+            env_spec, require_resolved=not resolve_mcp_inheritance("claude-native").inherit
         )
+        wrapped_command = env_wrapper_command(
+            env_spec.command or "", list(env_spec.args), _claude_terminal_pre_wrapper_env(env_spec)
+        )
+        apply_claude_launch_mcp_policy(
+            bridge_dir,
+            cwd=launch_cwd,
+            env=launch_env,
+            active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+            claude_args=wrapped_command[1] if wrapped_command is not None else env_spec.args,
+        )
+        ensure_claude_workspace_trusted(launch_cwd, env=launch_env, added_dirs=trusted_added_dirs)
     except BaseException as seed_error:
         release_offer()
         # No forwarder owns the routers yet, so release the ones this launch started.
