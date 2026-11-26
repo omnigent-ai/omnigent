@@ -51,7 +51,7 @@ describe("ProjectTeamDialog", () => {
     expect(within(nav).getByRole("button", { name: "New team member" })).toBeInTheDocument();
     expect(screen.getByText("Instructions")).toBeInTheDocument();
     expect(screen.getByTestId("project-team-persona")).toHaveValue("");
-    const templates = screen.getByRole("group", { name: "Start with a role" });
+    const templates = screen.getByRole("group", { name: "Start from a role (optional)" });
     fireEvent.click(within(templates).getByRole("button", { name: "Designer" }));
     const designer = ROLE_TEMPLATES.find((template) => template.name === "Designer")!;
     expect(screen.getByTestId("project-team-name")).toHaveValue("Designer");
@@ -68,7 +68,28 @@ describe("ProjectTeamDialog", () => {
         }),
       ),
     );
-    expect(screen.queryByRole("group", { name: "Start with a role" })).toBeNull();
+    expect(screen.queryByRole("group", { name: "Start from a role (optional)" })).toBeNull();
+  });
+
+  it("starts blank and lets Blank clear a role's prefilled fields", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    const templates = screen.getByRole("group", { name: "Start from a role (optional)" });
+    const blank = within(templates).getByRole("button", { name: "Blank" });
+    expect(blank).toHaveAttribute("aria-pressed", "true");
+    const reviewer = within(templates).getByRole("button", { name: "Reviewer" });
+    expect(reviewer).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(reviewer);
+    expect(reviewer).toHaveAttribute("aria-pressed", "true");
+    expect(blank).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(blank);
+    for (const field of ["name", "persona", "owns", "excludes"]) {
+      expect(screen.getByTestId(`project-team-${field}`)).toHaveValue("");
+    }
+    expect(blank).toHaveAttribute("aria-pressed", "true");
   });
 
   it("says a team member runs its own copy, and links the owner to its tools", () => {

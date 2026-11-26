@@ -88,6 +88,16 @@ export const ROLE_TEMPLATES: readonly Pick<
   },
 ];
 
+const TEMPLATE_FIELDS = ["name", "instructions", "owns", "excludes"] as const;
+
+/** Clears whatever a role template filled in, keeping the agent and model choice. */
+const BLANK_TEMPLATE: (typeof ROLE_TEMPLATES)[number] = {
+  name: "",
+  instructions: "",
+  owns: "",
+  excludes: "",
+};
+
 function draftOf(identity: ProjectIdentity): IdentityDraft {
   return {
     name: identity.name,
@@ -307,20 +317,30 @@ export function ProjectTeamDialog({
                         aria-labelledby="project-team-templates-label"
                         className="flex flex-col gap-1.5 text-sm"
                       >
-                        <span id="project-team-templates-label">Start with a role</span>
+                        <span id="project-team-templates-label">
+                          Start from a role{" "}
+                          <span className="text-muted-foreground">(optional)</span>
+                        </span>
                         <div className="flex flex-wrap gap-1.5">
-                          {ROLE_TEMPLATES.map((template) => (
-                            <Button
-                              key={template.name}
-                              type="button"
-                              variant="outline"
-                              size="xs"
-                              disabled={busy}
-                              onClick={() => setDraft({ ...draft, ...template })}
-                            >
-                              {template.name}
-                            </Button>
-                          ))}
+                          {[BLANK_TEMPLATE, ...ROLE_TEMPLATES].map((template) => {
+                            const pressed = TEMPLATE_FIELDS.every(
+                              (field) => draft[field] === template[field],
+                            );
+                            return (
+                              <Button
+                                key={template.name || "blank"}
+                                type="button"
+                                variant="outline"
+                                size="xs"
+                                aria-pressed={pressed}
+                                className="aria-pressed:border-brand-accent/40 aria-pressed:bg-brand-accent/10 aria-pressed:text-brand-accent dark:aria-pressed:border-brand-accent/40 dark:aria-pressed:bg-brand-accent/15"
+                                disabled={busy}
+                                onClick={() => setDraft({ ...draft, ...template })}
+                              >
+                                {template.name || "Blank"}
+                              </Button>
+                            );
+                          })}
                         </div>
                       </div>
                     )}
