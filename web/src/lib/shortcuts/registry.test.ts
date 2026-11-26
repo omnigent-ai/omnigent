@@ -119,7 +119,7 @@ describe("shortcut registry", () => {
     ]);
   });
 
-  it("matches a secondary chord without showing it", () => {
+  it("matches a secondary chord without showing it, and AltGr as the transcript does", () => {
     const shiftPrevious = {
       key: "ArrowUp",
       code: "ArrowUp",
@@ -130,9 +130,22 @@ describe("shortcut registry", () => {
     };
     expect(matchesShortcut(shiftPrevious, "message.previous", mac)).toBe(true);
     expect(primaryShortcutChords("message.previous", mac)).toEqual([
-      { mod: true, alt: true, key: "ArrowUp", exactKey: true },
+      { mod: true, alt: true, key: "ArrowUp", exactKey: true, matchesAltGraph: true },
     ]);
     expect(shortcutKeys("message.previous", mac)).toEqual(["⌘", "⌥", "↑"]);
+    // Firefox on macOS reports Option as AltGr; elsewhere AltGr is Ctrl+Alt typing a character.
+    const altGraph = { ...shiftPrevious, shiftKey: false, altGraph: true };
+    expect(matchesShortcut(altGraph, "message.previous", mac)).toBe(true);
+    expect(
+      matchesShortcut({ ...altGraph, metaKey: false, ctrlKey: true }, "message.previous", other),
+    ).toBe(false);
+    expect(
+      matchesShortcut(
+        { ...altGraph, metaKey: false, ctrlKey: true, altGraph: false },
+        "message.previous",
+        other,
+      ),
+    ).toBe(true);
   });
 
   it("gives a browser the Session menu's Pin, Fork and Archive keys, and the menu its own", () => {
