@@ -46,6 +46,7 @@ def _wait(check, message: str, timeout: float = 90):
     raise AssertionError(message)
 
 
+@pytest.mark.timeout(360)
 @pytest.mark.parametrize("databricks", [False, True], ids=["direct", "databricks"])
 def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     tmp_path: Path, databricks: bool, page, built_spa
@@ -60,6 +61,14 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     captured: list[dict] = []
     tool_requested = threading.Event()
     tool_completed = threading.Event()
+    control_calls: dict[str, str] = {}
+    control_results: dict[str, list[dict]] = {}
+    agent_id: str | None = None
+    control_tools = {
+        "AGY_RELAY_REVIEW": "sys_scheduled_task_create",
+        "AGY_NATIVE_ASK": "sys_terminal_list",
+        "AGY_NATIVE_DENY": "sys_session_get_info",
+    }
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     if databricks:
@@ -168,6 +177,60 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                         )
                     }
                 ]
+            user_texts = [
+                part.get("text", "")
+                for content in request.get("contents", [])
+                if content.get("role") == "user"
+                for part in content.get("parts", [])
+            ]
+            stage = next(
+                (
+                    marker
+                    for text in reversed(user_texts)
+                    for marker in control_tools
+                    if marker in text
+                ),
+                None,
+            )
+            if stage is not None:
+                declarations = [
+                    declaration
+                    for tool in request.get("tools", [])
+                    for declaration in tool.get("functionDeclarations", [])
+                ]
+                if stage not in control_calls:
+                    declaration = next(
+                        (d for d in declarations if d["name"].endswith(control_tools[stage])),
+                        None,
+                    )
+                    if declaration is None:
+                        parts = [{"text": f"{stage}_TOOL_MISSING"}]
+                    else:
+                        name = declaration["name"]
+                        control_calls[stage] = name
+                        arguments = (
+                            {
+                                "name": "AGY relay demo task",
+                                "prompt": "Reply with AGY-RELAY only.",
+                                "rrule": "FREQ=DAILY;BYHOUR=12;BYMINUTE=0",
+                                "timezone": "UTC",
+                                "agent_id": agent_id,
+                                "permission_mode": None,
+                            }
+                            if stage == "AGY_RELAY_REVIEW"
+                            else {"session_id": session_id}
+                        )
+                        parts = [{"functionCall": {"name": name, "args": arguments}}]
+                else:
+                    results = [
+                        part["functionResponse"]
+                        for content in request.get("contents", [])
+                        for part in content.get("parts", [])
+                        if part.get("functionResponse", {}).get("name") == control_calls[stage]
+                    ]
+                    if results:
+                        control_results[stage] = results
+                    parts = [{"text": f"{stage}_DONE" if results else f"{stage}_RESULT_MISSING"}]
             response = {
                 "candidates": [
                     {
@@ -203,6 +266,22 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             "NO_PROXY": "127.0.0.1,localhost",
         }
     )
+    native_settings: Path | None = None
+    native_settings_bytes: bytes | None = None
+    if not databricks:
+        native_home = tmp_path / "native-home"
+        native_settings = native_home / ".gemini/antigravity-cli/settings.json"
+        native_settings.parent.mkdir(parents=True)
+        native_settings_bytes = json.dumps(
+            {
+                "permissions": {
+                    "ask": ["mcp(omnigent/sys_terminal_list)"],
+                    "deny": ["mcp(omnigent/sys_session_get_info)"],
+                },
+            }
+        ).encode()
+        native_settings.write_bytes(native_settings_bytes)
+        env["HOME"] = str(native_home)
     command = [sys.executable, "-m", "omnigent"]
     session_id: str | None = None
     client: httpx.Client | None = None
@@ -315,6 +394,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 metadata={"host_id": host["host_id"], "workspace": str(workspace)},
             )
             session_id = created["session_id"]
+            agent_id = created["agent_id"]
 
             def terminals():
                 response = client.get(f"/v1/sessions/{session_id}/resources/terminals")
@@ -412,6 +492,48 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             response = client.get(f"/v1/sessions/{session_id}")
             response.raise_for_status()
             assert response.json()["status"] == "idle"
+            if not databricks:
+                pending = page.locator('[data-testid="approval-card"][data-state="pending"]')
+                for marker in control_tools:
+                    composer.fill(f"Exercise {marker} once, then report the result.")
+                    page.get_by_role("button", name="Send", exact=True).click()
+                    if marker != "AGY_NATIVE_DENY":
+                        card = pending.first
+                        expect(card).to_be_visible(timeout=60_000)
+                        expect(card).to_contain_text(
+                            "create scheduled task"
+                            if marker == "AGY_RELAY_REVIEW"
+                            else "Antigravity"
+                        )
+                        if marker == "AGY_RELAY_REVIEW":
+                            tasks = client.get("/v1/scheduled-tasks")
+                            tasks.raise_for_status()
+                            assert not tasks.json()["scheduled_tasks"]
+                        card.get_by_role("button", name="Reject", exact=True).click()
+                    expect(replies.filter(has_text=f"{marker}_DONE")).to_have_count(
+                        1, timeout=60_000
+                    )
+                    expect(page.get_by_test_id("working-indicator")).to_have_count(
+                        0, timeout=30_000
+                    )
+                    expect(pending).to_have_count(0)
+                    result = json.dumps(control_results[marker]).lower()
+                    assert any(
+                        word in result
+                        for word in (
+                            "denied",
+                            "declined",
+                            "rejected",
+                            "cancelled",
+                            "canceled",
+                            "not allowed",
+                        )
+                    ), f"{marker} did not retain its rejection"
+                tasks = client.get("/v1/scheduled-tasks")
+                tasks.raise_for_status()
+                assert not tasks.json()["scheduled_tasks"]
+                assert native_settings is not None
+                assert native_settings.read_bytes() == native_settings_bytes
         finally:
             # Finish the recording before deleting the session and its native stream.
             page.context.close()
