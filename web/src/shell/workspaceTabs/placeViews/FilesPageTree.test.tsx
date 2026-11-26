@@ -377,11 +377,14 @@ describe("FilesPageTree", () => {
           ]),
         ),
     );
+    const refetch = vi.fn();
+    const refetchChanges = vi.fn();
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: { available: true, data: [] },
+      refetch: refetchChanges,
+    } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
     renderTree(
-      {
-        ...listed([{ ...entry("src"), type: "directory", bytes: null }]),
-        refetch: vi.fn(),
-      } as never,
+      { ...listed([{ ...entry("src"), type: "directory", bytes: null }]), refetch } as never,
       false,
       { activePath: "README.md" },
     );
@@ -389,7 +392,18 @@ describe("FilesPageTree", () => {
     expect(await screen.findByRole("treeitem", { name: /old\.ts/ })).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Tree options" }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "Refresh files" }));
+    // An error thrown by the click's handler reaches the window rather than the test.
+    const errors: unknown[] = [];
+    const onError = (event: ErrorEvent) => errors.push(event.error);
+    window.addEventListener("error", onError);
+    try {
+      await userEvent.click(screen.getByRole("menuitem", { name: "Refresh files" }));
+    } finally {
+      window.removeEventListener("error", onError);
+    }
+    expect(errors).toEqual([]);
+    expect(refetch).toHaveBeenCalledTimes(1);
+    expect(refetchChanges).toHaveBeenCalledTimes(1);
     expect(await screen.findByRole("treeitem", { name: /new\.ts/ })).toBeInTheDocument();
     expect(screen.queryByRole("treeitem", { name: /old\.ts/ })).toBeNull();
     expect(screen.getByRole("treeitem", { name: /kept\.ts/ })).toBeInTheDocument();
