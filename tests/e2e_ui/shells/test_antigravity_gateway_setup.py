@@ -71,6 +71,14 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
         "AGY_NATIVE_ASK": "sys_terminal_list",
         "AGY_NATIVE_DENY": "sys_session_get_info",
     }
+
+    def tool_declarations(body: dict) -> list[dict]:
+        return [
+            declaration
+            for tool in body.get("tools", [])
+            for declaration in tool.get("functionDeclarations", [])
+        ]
+
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     if databricks:
@@ -138,8 +146,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 if not tool_requested.is_set():
                     file_tool = next(
                         declaration
-                        for tool in request["tools"]
-                        for declaration in tool.get("functionDeclarations", [])
+                        for declaration in tool_declarations(request)
                         if declaration["name"] in {"read_file", "view_file"}
                     )
                     path_argument = "Path" if file_tool["name"] == "read_file" else "AbsolutePath"
@@ -195,11 +202,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 None,
             )
             if stage is not None:
-                declarations = [
-                    declaration
-                    for tool in request.get("tools", [])
-                    for declaration in tool.get("functionDeclarations", [])
-                ]
+                declarations = tool_declarations(request)
                 if stage not in control_calls:
                     declaration = next(
                         (d for d in declarations if d["name"].endswith(control_tools[stage])),
@@ -213,7 +216,6 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                         parts = [{"text": f"{stage}_TOOL_MISSING"}]
                     else:
                         name = declaration["name"]
-                        control_calls[stage] = name
                         arguments = (
                             {
                                 "name": "AGY relay demo task",
@@ -224,10 +226,14 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                                 "permission_mode": None,
                             }
                             if stage == "AGY_RELAY_REVIEW"
-                            else {"session_id": session_id}
+                            else {}
                         )
                         if declaration is generic:
-                            properties = declaration["parameters"]["properties"]
+                            schema = (
+                                declaration.get("parameters")
+                                or declaration["parametersJsonSchema"]
+                            )
+                            properties = schema["properties"]
                             fields = {key.replace("_", "").lower(): key for key in properties}
                             assert {"servername", "toolname", "arguments"} <= fields.keys(), (
                                 f"Unexpected native MCP call schema: {properties}"
@@ -247,6 +253,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                             for content in request.get("contents", [])
                             for part in content.get("parts", [])
                         )
+                        control_calls[stage] = name
                         parts = [{"functionCall": {"name": name, "args": arguments}}]
                 else:
                     results = [
@@ -584,87 +591,94 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 assert native_settings is not None
                 assert native_settings.read_bytes() == native_settings_bytes
         finally:
-            from omnigent.process_logging import redact_log_text
+            try:
+                with contextlib.suppress(Exception):
+                    from omnigent.process_logging import redact_log_text
 
-            diagnostics = Path(request.config.getoption("output", default="test-results")) / (
-                "agy-databricks" if databricks else "agy-direct"
-            )
-            diagnostics.mkdir(parents=True, exist_ok=True)
-            discovered = {
-                "native_tool_names": sorted(
-                    {
-                        d["name"]
-                        for body in captured
-                        for tool in body.get("tools", [])
-                        for d in tool.get("functionDeclarations", [])
-                    }
-                ),
-                "control_calls": control_calls,
-                "missing_tools": missing_tools,
-                "native_mcp_call_schemas": [
-                    declaration
-                    for body in captured
-                    for tool in body.get("tools", [])
-                    for declaration in tool.get("functionDeclarations", [])
-                    if declaration["name"] == "call_mcp_tool"
-                ][:1],
-            }
-            if session_id is not None:
-                relay_file = (
-                    tmp_path
-                    / "data/antigravity-native"
-                    / (bridge_dir_for_bridge_id(session_id).name)
-                    / "tool_relay.json"
-                )
-                with contextlib.suppress(OSError, ValueError):
-                    relay = json.loads(relay_file.read_text())
-                    discovered["relay_tool_names"] = sorted(
-                        t["name"] for t in relay.get("tools", [])
-                    )
-            errors: list[str] = []
-            for log in (tmp_path / "data").rglob("*.log"):
-                with contextlib.suppress(OSError):
-                    with log.open("rb") as handle:
-                        handle.seek(max(0, log.stat().st_size - 64_000))
-                        lines = handle.read().decode(errors="replace").splitlines()
-                    for line in lines:
-                        if any(word in line.lower() for word in ("mcp", "tool_relay", "error")):
-                            errors.append(
-                                redact_log_text(line, include_whitespace_credentials=True)[:1200]
+                    diagnostics = Path(
+                        request.config.getoption("output", default="test-results")
+                    ) / ("agy-databricks" if databricks else "agy-direct")
+                    diagnostics.mkdir(parents=True, exist_ok=True)
+                    declarations = [d for body in captured for d in tool_declarations(body)]
+                    discovered = {
+                        "native_tool_names": sorted({d["name"] for d in declarations}),
+                        "control_calls": control_calls,
+                        "control_results": {
+                            marker: redact_log_text(
+                                json.dumps(results), include_whitespace_credentials=True
                             )
-            discovered["service_errors"] = errors[-60:]
-            (diagnostics / "relay-discovery.json").write_text(json.dumps(discovered, indent=2))
-            # Finish the recording before deleting the session and its native stream.
-            page.context.close()
-            (tmp_path / "gateway-requests.json").write_text(json.dumps(captured, indent=2))
-            if client is not None:
+                            for marker, results in control_results.items()
+                        },
+                        "missing_tools": missing_tools,
+                        "native_mcp_call_schemas": [
+                            d for d in declarations if d["name"] == "call_mcp_tool"
+                        ][:1],
+                    }
+                    if session_id is not None:
+                        relay_file = (
+                            tmp_path
+                            / "data/antigravity-native"
+                            / (bridge_dir_for_bridge_id(session_id).name)
+                            / "tool_relay.json"
+                        )
+                        with contextlib.suppress(OSError, ValueError):
+                            relay = json.loads(relay_file.read_text())
+                            discovered["relay_tool_names"] = sorted(
+                                t["name"] for t in relay.get("tools", [])
+                            )
+                    errors: list[str] = []
+                    for log in (tmp_path / "data").rglob("*.log"):
+                        with contextlib.suppress(OSError):
+                            with log.open("rb") as handle:
+                                handle.seek(max(0, log.stat().st_size - 64_000))
+                                lines = handle.read().decode(errors="replace").splitlines()
+                            for line in lines:
+                                if any(
+                                    word in line.lower() for word in ("mcp", "tool_relay", "error")
+                                ):
+                                    errors.append(
+                                        redact_log_text(line, include_whitespace_credentials=True)[
+                                            :1200
+                                        ]
+                                    )
+                    discovered["service_errors"] = errors[-60:]
+                    (diagnostics / "relay-discovery.json").write_text(
+                        json.dumps(discovered, indent=2)
+                    )
+            finally:
+                # Finish the recording before deleting the session and its native stream.
+                with contextlib.suppress(Exception):
+                    page.context.close()
+                with contextlib.suppress(OSError):
+                    (tmp_path / "gateway-requests.json").write_text(json.dumps(captured, indent=2))
+                if client is not None:
+                    if session_id is not None:
+                        with contextlib.suppress(httpx.HTTPError):
+                            client.delete(f"/v1/sessions/{session_id}")
+                    client.close()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    cli("host", "stop", "--all", "--force")
+                for process in reversed(processes):
+                    with contextlib.suppress(psutil.NoSuchProcess):
+                        descendants = process.children(recursive=True)
+                        for child in reversed(descendants):
+                            with contextlib.suppress(psutil.NoSuchProcess):
+                                child.terminate()
+                        process.terminate()
+                        _, alive = psutil.wait_procs([*descendants, process], timeout=5)
+                        for child in alive:
+                            with contextlib.suppress(psutil.NoSuchProcess):
+                                child.kill()
                 if session_id is not None:
-                    with contextlib.suppress(httpx.HTTPError):
-                        client.delete(f"/v1/sessions/{session_id}")
-                client.close()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                cli("host", "stop", "--all", "--force")
-            for process in reversed(processes):
-                with contextlib.suppress(psutil.NoSuchProcess):
-                    descendants = process.children(recursive=True)
-                    for child in reversed(descendants):
-                        with contextlib.suppress(psutil.NoSuchProcess):
-                            child.terminate()
-                    process.terminate()
-                    _, alive = psutil.wait_procs([*descendants, process], timeout=5)
-                    for child in alive:
-                        with contextlib.suppress(psutil.NoSuchProcess):
-                            child.kill()
-            if session_id is not None:
-                shutil.rmtree(
-                    tmp_path
-                    / "data"
-                    / "antigravity-native"
-                    / bridge_dir_for_bridge_id(session_id).name,
-                    ignore_errors=True,
-                )
-            gateway.shutdown()
-            thread.join(timeout=5)
+                    shutil.rmtree(
+                        tmp_path
+                        / "data"
+                        / "antigravity-native"
+                        / bridge_dir_for_bridge_id(session_id).name,
+                        ignore_errors=True,
+                    )
+                gateway.shutdown()
+                thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("failure", ["missing-secret", "incompatible-url", "malformed-profile"])
