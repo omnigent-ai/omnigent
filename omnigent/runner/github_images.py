@@ -41,7 +41,8 @@ MAX_CONCURRENT_READS = 4
 MAX_CACHED_REVISIONS = 64
 # An edit that doesn't bump the pull request's update time is seen within this.
 LINKED_URLS_TTL_SECONDS = 300.0
-# Bounds the whole fetch, every hop and the body, so no read holds a slot past it.
+# Bounds the whole fetch, every hop and the body. A stalled DNS lookup can outlast it: the
+# loop's shutdown waits for the resolver thread, so the read keeps its slot until that times out.
 FETCH_DEADLINE_SECONDS = 30.0
 # How long a read waits for a slot, inside the server's wait for the first reply.
 SLOT_WAIT_SECONDS = 10.0
