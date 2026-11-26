@@ -1,6 +1,6 @@
-// ⌘K rows for settings people change often: the appearance mode, the terminal theme and two
-// chat switches, each one row with a page of its values. Each shares its name, choices and
-// write path with its Settings control.
+// ⌘K rows for settings people change often: the appearance mode, the terminal theme, two
+// chat switches and the file viewer's sticky scroll, each one row with a page of its values.
+// Each shares its name, choices and write path with its Settings control or saved preference.
 
 import { useMemo } from "react";
 import { useTheme } from "next-themes";
@@ -9,6 +9,7 @@ import {
   type LucideIcon,
   MonitorIcon,
   PanelsTopLeftIcon,
+  PinIcon,
   SendIcon,
   SquareIcon,
 } from "lucide-react";
@@ -29,6 +30,7 @@ import {
   paneCornersPreference,
 } from "@/lib/paneCornersPreference";
 import { useHostTheme } from "@/lib/embedded";
+import { useStickyScroll, writeStickyScroll } from "@/lib/fileViewPreferences";
 import {
   useFoldAssistantNarration,
   writeFoldAssistantNarration,
@@ -48,6 +50,7 @@ import { HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 import { booleanSetting, type PaletteSetting, settingCommand } from "@/store/paletteSettings";
 
 import { type PaneCornersState, usePaneCorners } from "./useFloatingPanes";
+import { useTabsSidebar } from "./useTabsSidebar";
 
 /** An on/off setting, named as Settings shows it. */
 interface SettingSwitch {
@@ -70,6 +73,25 @@ export const ALWAYS_STEER_SETTING: SettingSwitch = {
   icon: SendIcon,
   keywords: ALWAYS_STEER_ENTRY.keywords,
 };
+
+/** Whether the file viewer pins the lines that open the scopes around the top of the view. */
+export function stickyScrollSetting(
+  enabled: boolean,
+  offered: boolean,
+  write: (enabled: boolean) => void = writeStickyScroll,
+): PaletteSetting {
+  return booleanSetting({
+    id: "file-viewer.sticky-scroll",
+    owner: "app",
+    label: "Sticky scroll",
+    icon: PinIcon,
+    keywords: ["sticky", "scroll", "scopes", "breadcrumbs", "pinned", "header", "file", "code"],
+    // Only the tabs sidebar's code viewer pins scopes.
+    availability: offered ? undefined : HIDDEN,
+    enabled,
+    write,
+  });
+}
 
 /** The appearance mode; embedded in Databricks, System reads "Use Databricks setting". */
 export function appearanceModeSetting(
@@ -168,6 +190,8 @@ export function useSettingsCommands(): PaletteCommand[] {
   const showFinalAnswer = useFoldAssistantNarration();
   const alwaysSteer = useAlwaysSteer();
   const paneCorners = usePaneCorners();
+  const stickyScroll = useStickyScroll();
+  const tabsSidebar = useTabsSidebar();
   return useMemo(
     () => [
       settingCommand(appearanceModeSetting(mode, followsHost, setTheme)),
@@ -181,7 +205,18 @@ export function useSettingsCommands(): PaletteCommand[] {
       ),
       settingCommand(settingSwitchSetting(ALWAYS_STEER_SETTING, alwaysSteer, writeAlwaysSteer)),
       settingCommand(paneCornersSetting(paneCorners)),
+      settingCommand(stickyScrollSetting(stickyScroll, tabsSidebar)),
     ],
-    [mode, followsHost, setTheme, terminalTheme, showFinalAnswer, alwaysSteer, paneCorners],
+    [
+      mode,
+      followsHost,
+      setTheme,
+      terminalTheme,
+      showFinalAnswer,
+      alwaysSteer,
+      paneCorners,
+      stickyScroll,
+      tabsSidebar,
+    ],
   );
 }

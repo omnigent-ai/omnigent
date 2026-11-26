@@ -41,6 +41,11 @@ Filename search remains in Files.
   from the strip or tab search. The Workspace panel's **Cmd+Shift+F** isn't
   bound while the tabs show.
   **Ctrl+Cmd+O** on macOS (**Ctrl+Alt+O** on Windows/Linux) opens the same search.
+- File viewer menu: in the tabs sidebar's file viewer, select text and
+  right-click it (or press **Shift+F10** or the Menu key), then choose **Search
+  Text in Workspace…** to search for the selection's first non-blank line. The
+  row shows only where the session's file finder is available and that line is
+  at most 4,096 characters.
 
 ## Driving it with the repro environment
 
@@ -61,6 +66,12 @@ switch back and confirm its query, options and results return without a new sear
 Click Filter files, include `src/**` and exclude `**/tests/**`, then submit.
 Confirm results respect both filters, including after collapsing the filters or
 switching conversations. Clear both fields and submit to restore the full search.
+With `workspace_sidebar_v2` on, open that file in the tabs sidebar's Files
+viewer, select the phrase and right-click it. Where a shell serves the session's
+file finder (Go to File), choose **Search Text in Workspace…** and confirm a
+search tab opens with the phrase as its query and its line among the results.
+Select only blank lines and confirm the row is gone. Where no shell serves the
+finder, confirm the menu leaves the row out and keeps its other rows.
 Restart the test server with `OMNIGENT_FEATURES=-workspace_content_search` and
 reload: the tab, picker entry and shortcut should be unavailable.
 

@@ -7,6 +7,7 @@ import { EditorView } from "@codemirror/view";
 import type { FindOptions } from "@/components/FindBar";
 import { findQuerySpec } from "./findMatchCollector";
 import { inlineMatchSource, type MatchSource } from "./findMatchSource";
+import { type FindRange, findScopeOf } from "./findScope";
 
 /** What the find bar shows for the current query and selection. */
 export interface FindStatus {
@@ -21,6 +22,8 @@ export interface FindStatus {
   matchCount: number;
   /** 1-based index of the selected match, or 0 when the selection isn't one. */
   ordinal: number;
+  /** Find is limited to the selection it was turned on with. */
+  inSelection?: boolean;
 }
 
 /** CodeMirror's single-line search field writes line breaks as `\n`. */
@@ -48,7 +51,7 @@ export function applyFindQuery(view: EditorView, search: string, options: FindOp
   view.dispatch(
     keepSelection
       ? { effects: setSearchQuery.of(query) }
-      : { effects: setSearchQuery.of(query), selection: { anchor: 0 } },
+      : { effects: setSearchQuery.of(query), selection: { anchor: 0 }, userEvent: "select.search" },
   );
   return query.valid && query.search !== "" && !keepSelection;
 }
@@ -121,6 +124,7 @@ export type MatchLookup =
 export class FindMatchIndex {
   private query: SearchQuery | undefined;
   private doc: Text | undefined;
+  private scope: readonly FindRange[] | null = null;
   private froms: number[] = [];
   private tos: number[] = [];
   private imprecise = new Set<number>();
@@ -134,16 +138,17 @@ export class FindMatchIndex {
     this.source = source;
   }
 
-  /** Starts over when the query or document changed; otherwise keeps the index. */
+  /** Starts over when the query, document or find scope changed; otherwise keeps the index. */
   sync(state: EditorState): void {
     const query = getSearchQuery(state);
-    if (sameMatches(this.query, query) && this.doc === state.doc) return;
+    if (this.belongsTo(state)) return;
     this.reset();
     this.query = query;
     this.doc = state.doc;
+    this.scope = findScopeOf(state);
     this.complete = !query.search || !query.valid;
     if (this.complete) return;
-    this.cancelJob = this.source.start(state.doc, findQuerySpec(query), (batch) => {
+    this.cancelJob = this.source.start(state.doc, findQuerySpec(query, this.scope), (batch) => {
       if (batch.restart) {
         this.froms = [];
         this.tos = [];
@@ -169,7 +174,11 @@ export class FindMatchIndex {
 
   /** Whether the index belongs to `state`'s document and query, finished or not. */
   belongsTo(state: EditorState): boolean {
-    return this.doc === state.doc && sameMatches(this.query, getSearchQuery(state));
+    return (
+      this.doc === state.doc &&
+      this.scope === findScopeOf(state) &&
+      sameMatches(this.query, getSearchQuery(state))
+    );
   }
 
   /** Every match found so far, in document order. */
@@ -191,6 +200,7 @@ export class FindMatchIndex {
     this.cancelJob = undefined;
     this.query = undefined;
     this.doc = undefined;
+    this.scope = null;
     this.froms = [];
     this.tos = [];
     this.imprecise.clear();
@@ -212,8 +222,9 @@ export class FindMatchIndex {
       complete: !query.search || !query.valid,
       matchCount: 0,
       ordinal: 0,
+      inSelection: findScopeOf(state) !== null,
     };
-    if (status.complete || !sameMatches(this.query, query) || this.doc !== state.doc) return status;
+    if (status.complete || !this.belongsTo(state)) return status;
     const selected = this.selectedIndex(state.selection.main);
     return {
       ...status,
