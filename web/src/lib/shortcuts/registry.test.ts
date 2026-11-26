@@ -3,10 +3,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { KeyChordInput } from "./chord";
 import {
   activeShortcutChords,
+  APP_SHORTCUT_BINDINGS,
   codeMirrorKey,
   currentShortcutEnvironment,
   matchedShortcutChordIndex,
   matchesShortcut,
+  menuShortcutChords,
+  OPEN_SESSION_CHORDS,
+  primaryShortcutChords,
+  QUICK_PICK_SHORTCUT_BINDINGS,
   SHORTCUT_BINDINGS,
   SHORTCUT_GROUPS,
   shortcutBinding,
@@ -42,9 +47,6 @@ describe("shortcut registry", () => {
       "shortcuts.show",
       "tab.close",
       "window.close",
-      "session.pin",
-      "session.archive",
-      "session.fork",
       "app.quit",
       "composer.send",
       "composer.sendWithQueue",
@@ -90,8 +92,58 @@ describe("shortcut registry", () => {
       "slash.apply",
       "slash.dismiss",
     ]);
-    for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
+    for (const binding of APP_SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
+  });
+
+  it("keeps the bindings that wait for quick_pick_palette apart, in page order", () => {
+    expect(QUICK_PICK_SHORTCUT_BINDINGS.map((binding) => binding.id)).toEqual([
+      "session.pin",
+      "session.archive",
+      "session.fork",
+      "message.previous",
+      "message.next",
+      "session.next",
+      "session.previous",
+      "session.recent",
+      "session.recentReverse",
+    ]);
+    expect(APP_SHORTCUT_BINDINGS).toHaveLength(
+      SHORTCUT_BINDINGS.length + QUICK_PICK_SHORTCUT_BINDINGS.length,
+    );
+    expect(APP_SHORTCUT_BINDINGS.map((binding) => binding.id).slice(10, 14)).toEqual([
+      "session.pin",
+      "session.archive",
+      "session.fork",
+      "app.quit",
+    ]);
+  });
+
+  it("matches a secondary chord without showing it", () => {
+    const shiftPrevious = {
+      key: "ArrowUp",
+      code: "ArrowUp",
+      metaKey: true,
+      ctrlKey: false,
+      altKey: true,
+      shiftKey: true,
+    };
+    expect(matchesShortcut(shiftPrevious, "message.previous", mac)).toBe(true);
+    expect(primaryShortcutChords("message.previous", mac)).toEqual([
+      { mod: true, alt: true, key: "ArrowUp", exactKey: true },
+    ]);
+    expect(shortcutKeys("message.previous", mac)).toEqual(["⌘", "⌥", "↑"]);
+  });
+
+  it("gives a browser the Session menu's Pin, Fork and Archive keys, and the menu its own", () => {
+    const menu = { mac: true, native: true, desktopMenu: true };
+    expect(activeShortcutChords("session.pin", menu)).toEqual([]);
+    expect(menuShortcutChords("session.pin", menu)).toEqual([OPEN_SESSION_CHORDS.pin]);
+    expect(activeShortcutChords("session.pin", mac)).toEqual([OPEN_SESSION_CHORDS.pin]);
+    // Off macOS, Ctrl+Alt+P and Ctrl+Alt+F stay Go to a file and Search text in files.
+    expect(activeShortcutChords("session.pin", other)).toEqual([]);
+    expect(activeShortcutChords("session.fork", other)).toEqual([]);
+    expect(activeShortcutChords("session.archive", other)).toEqual([OPEN_SESSION_CHORDS.archive]);
   });
 
   it("draws each alternative and part on a binding's own row", () => {

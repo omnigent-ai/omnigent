@@ -7,7 +7,13 @@ vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ pathname: "/", search: "", hash: "", state: null, key: "default" }),
 }));
 
-import { SHORTCUT_BINDINGS, type ShortcutId, shortcutKeys } from "@/lib/shortcuts/registry";
+import {
+  SHORTCUT_BINDINGS,
+  type ShortcutId,
+  shortcutKeys,
+  APP_SHORTCUT_BINDINGS,
+  QUICK_PICK_SHORTCUT_BINDINGS,
+} from "@/lib/shortcuts/registry";
 
 import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
 import { type OpenSessionCommandId, openSessionCommands } from "./openSessionCommands";
@@ -183,7 +189,17 @@ describe("registry hotkeys in ⌘K", () => {
       ...Object.keys(SESSION_HOTKEY_COMMANDS),
       ...Object.keys(HOTKEYS_WITHOUT_COMMANDS),
     ];
-    expect(listed.toSorted()).toEqual(SHORTCUT_BINDINGS.map((binding) => binding.id).toSorted());
+    // Bindings only quick_pick_palette's own shortcuts run have no command here yet.
+    const quickPickOnly = new Set<string>(
+      QUICK_PICK_SHORTCUT_BINDINGS.filter(
+        (binding) => !(binding.id in SESSION_HOTKEY_COMMANDS),
+      ).map((binding) => binding.id),
+    );
+    expect(listed.toSorted()).toEqual(
+      APP_SHORTCUT_BINDINGS.map((binding) => binding.id)
+        .filter((id) => !quickPickOnly.has(id))
+        .toSorted(),
+    );
   });
 
   it("shows each mapped hotkey's chord on its command", () => {
