@@ -17,9 +17,13 @@ import {
   SearchOrder,
   ListBranchCommitsRequestSchema,
   ListBranchCommitsResponseSchema,
+  ListRepositoryRefsRequestSchema,
+  ListRepositoryRefsResponseSchema,
   ListWorkingCopyChangesRequestSchema,
   ListWorkingCopyChangesResponseSchema,
+  ReadBaseFileRequestSchema,
   ReadBaseFileResponseSchema,
+  ResolveWorkingCopyBaseRequestSchema,
   ResolveWorkingCopyBaseResponseSchema,
   GetPullRequestResponseSchema,
   CreateCommentResponseSchema,
@@ -1563,10 +1567,16 @@ describe("Git comparisons through the workspace API", () => {
   it("names a repository folder only to a host that lists comparison.repository", async () => {
     enable("workspace_api_server_access");
     let features: string[] = [];
-    const folders: string[] = [];
+    // The folder each request named, by method; every method answers, so a request sent
+    // by mistake is counted rather than lost to an unimplemented reply.
+    const folders: Record<string, string[]> = {};
+    const record = (method: string, repository: string) => {
+      (folders[method] ??= []).push(repository);
+    };
+    const proto = (body: Uint8Array<ArrayBuffer>) => new Response(body, { headers: PROTO_HEADERS });
     serveMethods({
       GetCapabilities: () =>
-        new Response(
+        proto(
           capabilitiesBody(
             "ResolveWorkingCopyBase",
             "ListWorkingCopyChanges",
@@ -1576,55 +1586,103 @@ describe("Git comparisons through the workspace API", () => {
             "branch_commits",
             ...features,
           ),
-          { headers: PROTO_HEADERS },
         ),
+      ResolveWorkingCopyBase: (body) => {
+        record(
+          "ResolveWorkingCopyBase",
+          fromBinary(ResolveWorkingCopyBaseRequestSchema, body).repository,
+        );
+        return proto(
+          toBinary(
+            ResolveWorkingCopyBaseResponseSchema,
+            create(ResolveWorkingCopyBaseResponseSchema, {
+              base: { kind: ComparisonKind.BRANCH_POINT, base: "b".repeat(40) },
+            }),
+          ),
+        );
+      },
       ListWorkingCopyChanges: (body) => {
-        folders.push(fromBinary(ListWorkingCopyChangesRequestSchema, body).repository);
-        const changes = create(ListWorkingCopyChangesResponseSchema, {
-          base: { kind: ComparisonKind.BRANCH_POINT, base: "b".repeat(40) },
-        });
-        return new Response(toBinary(ListWorkingCopyChangesResponseSchema, changes), {
-          headers: PROTO_HEADERS,
-        });
+        record(
+          "ListWorkingCopyChanges",
+          fromBinary(ListWorkingCopyChangesRequestSchema, body).repository,
+        );
+        return proto(
+          toBinary(
+            ListWorkingCopyChangesResponseSchema,
+            create(ListWorkingCopyChangesResponseSchema, {
+              base: { kind: ComparisonKind.BRANCH_POINT, base: "b".repeat(40) },
+            }),
+          ),
+        );
+      },
+      // A server-streaming request arrives in one envelope: a 5-byte header, then the message.
+      ReadBaseFile: (body) => {
+        record("ReadBaseFile", fromBinary(ReadBaseFileRequestSchema, body.subarray(5)).repository);
+        return new Response(
+          frames([
+            toBinary(
+              ReadBaseFileResponseSchema,
+              create(ReadBaseFileResponseSchema, {
+                metadata: { size: 2n, encoding: ContentEncoding.UTF8 },
+                data: new TextEncoder().encode("hi"),
+              }),
+            ),
+          ]),
+          { headers: CONNECT_HEADERS },
+        );
+      },
+      ListRepositoryRefs: (body) => {
+        record("ListRepositoryRefs", fromBinary(ListRepositoryRefsRequestSchema, body).repository);
+        return proto(
+          toBinary(ListRepositoryRefsResponseSchema, create(ListRepositoryRefsResponseSchema, {})),
+        );
+      },
+      ListBranchCommits: (body) => {
+        record("ListBranchCommits", fromBinary(ListBranchCommitsRequestSchema, body).repository);
+        return proto(
+          toBinary(ListBranchCommitsResponseSchema, create(ListBranchCommitsResponseSchema, {})),
+        );
       },
     });
     const branchPoint = { kind: ComparisonKind.BRANCH_POINT };
+    const file = { commit: "c".repeat(40), path: "a.ts", object: "o".repeat(40) };
+    const range = { base: "main", head: "" };
     const folder = ".worktrees/feature";
+    const askAll = (session: string) => [
+      listWorkingCopyChangesViaWorkspaceApi(session, branchPoint, undefined, folder),
+      resolveWorkingCopyBaseViaWorkspaceApi(session, branchPoint, undefined, folder),
+      readBaseFileViaWorkspaceApi(session, file, undefined, folder),
+      listRepositoryRefsViaWorkspaceApi(session, undefined, folder),
+      listBranchCommitsViaWorkspaceApi(session, range, undefined, folder),
+    ];
 
     // An older host would compare the workspace instead, so nothing is sent to it.
     const older = "s-folder-older";
-    expect(
-      await listWorkingCopyChangesViaWorkspaceApi(older, branchPoint, undefined, folder),
-    ).toBeNull();
-    expect(
-      await resolveWorkingCopyBaseViaWorkspaceApi(older, branchPoint, undefined, folder),
-    ).toBeNull();
-    expect(await listRepositoryRefsViaWorkspaceApi(older, undefined, folder)).toBeNull();
-    expect(
-      await listBranchCommitsViaWorkspaceApi(older, { base: "main", head: "" }, undefined, folder),
-    ).toBeNull();
-    expect(
-      await readBaseFileViaWorkspaceApi(
-        older,
-        { commit: "c".repeat(40), path: "a.ts", object: "o".repeat(40) },
-        undefined,
-        folder,
-      ),
-    ).toBeNull();
-    expect(folders).toEqual([]);
-    // Its workspace listing still goes through.
+    expect(await Promise.all(askAll(older))).toEqual([null, null, null, null, null]);
+    for (const method of [
+      "ListWorkingCopyChanges",
+      "ResolveWorkingCopyBase",
+      "ReadBaseFile",
+      "ListRepositoryRefs",
+      "ListBranchCommits",
+    ]) {
+      expect(methodCalls(method), method).toHaveLength(0);
+    }
+    // Its workspace listing still goes through, naming no folder.
     await listWorkingCopyChangesViaWorkspaceApi(older, branchPoint);
-    expect(folders).toEqual([""]);
+    expect(folders).toEqual({ ListWorkingCopyChanges: [""] });
 
+    // A host that lists the feature gets the folder on every one of the five requests.
     features = ["comparison.repository"];
-    const listed = await listWorkingCopyChangesViaWorkspaceApi(
-      "s-folder-current",
-      branchPoint,
-      undefined,
-      folder,
-    );
-    expect(listed?.base?.base).toBe("b".repeat(40));
-    expect(folders).toEqual(["", folder]);
+    const answers = await Promise.all(askAll("s-folder-current"));
+    expect(answers.every((answer) => answer !== null)).toBe(true);
+    expect(folders).toEqual({
+      ListWorkingCopyChanges: ["", folder],
+      ResolveWorkingCopyBase: [folder],
+      ReadBaseFile: [folder],
+      ListRepositoryRefs: [folder],
+      ListBranchCommits: [folder],
+    });
   });
 
   it("answers null when the host doesn't serve the method", async () => {
