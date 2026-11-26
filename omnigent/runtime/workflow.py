@@ -2340,7 +2340,54 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` env vars and the
         ``use_responses=True`` default.
     """
-    env: dict[str, str] = {}
+    env: dict[str, str] = {"HARNESS_OPENAI_AGENTS_AZURE_ENTRA": ""}
+    azure_entra = spec.executor.config.get("azure_entra")
+    if azure_entra is not None and str(azure_entra).strip().lower() not in {
+        "true",
+        "false",
+        "1",
+        "0",
+        "yes",
+        "no",
+    }:
+        raise ValueError("azure_entra must be a boolean")
+    azure_endpoint = spec.executor.config.get("azure_endpoint")
+    if _config_flag_is_true(azure_entra):
+        from omnigent.inner.azure_entra import normalize_azure_endpoint
+
+        if (
+            spec.executor.auth is not None
+            or spec.executor.profile
+            or spec.executor.config.get("profile")
+        ):
+            raise ValueError("azure_entra cannot be combined with executor.auth or profile")
+        if not isinstance(azure_endpoint, str) or not azure_endpoint.strip():
+            raise ValueError("azure_entra requires azure_endpoint")
+        model = _resolve_spec_model(spec)
+        if not model or not model.strip():
+            raise ValueError("azure_entra requires an explicit model deployment name")
+        env.update(
+            {
+                "HARNESS_OPENAI_AGENTS_AZURE_ENTRA": "1",
+                "HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL": normalize_azure_endpoint(azure_endpoint),
+                "HARNESS_OPENAI_AGENTS_MODEL": model,
+                "HARNESS_OPENAI_AGENTS_API_KEY": "",
+                "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE": "",
+                "HARNESS_OPENAI_AGENTS_GATEWAY_HOST": "",
+                "HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND": "",
+            }
+        )
+        use_responses = spec.executor.config.get("use_responses")
+        if use_responses is not None:
+            env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] = (
+                "true" if _config_flag_is_true(use_responses) else "false"
+            )
+        _set_openai_agents_reasoning_item_id_policy_env(
+            env, spec.executor.config.get("reasoning_item_id_policy")
+        )
+        return env
+    if azure_endpoint is not None:
+        raise ValueError("azure_endpoint requires azure_entra: true")
     model = _resolve_bound_launch_model(spec, "openai-agents-sdk")
     if model is not None:
         env["HARNESS_OPENAI_AGENTS_MODEL"] = model

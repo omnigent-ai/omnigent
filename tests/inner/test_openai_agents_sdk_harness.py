@@ -99,6 +99,7 @@ def test_executor_factory_reads_databricks_profile_env(
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
         reasoning_item_id_policy: str | None = None,
+        azure_entra: bool = False,
     ) -> None:
         captured["client"] = client
         captured["profile"] = profile
@@ -362,6 +363,7 @@ def test_executor_factory_no_env_returns_blank_config(
     assert captured["model"] is None
     assert captured["use_responses"] is True
     assert captured["reasoning_item_id_policy"] is None
+    assert captured["azure_entra"] is False
 
 
 def test_create_app_starts_the_first_turn_prewarm() -> None:

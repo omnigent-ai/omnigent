@@ -89,7 +89,8 @@ with `--no-databricks --extra antigravity`.
 
 Available user-facing extras include:
 
-- **Model providers:** `databricks` (included by default), `bedrock`, `vertex`
+- **Model providers:** `databricks` (included by default), `bedrock`, `vertex`,
+  [`azure`](docs/AZURE_FOUNDRY.md) for keyless Foundry access through the OpenAI Agents SDK harness
 - **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `microsandbox`,
   `cwsandbox`, `e2b`, `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`

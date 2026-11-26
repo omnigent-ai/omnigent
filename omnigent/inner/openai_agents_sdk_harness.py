@@ -123,6 +123,7 @@ _ENV_REASONING_ITEM_ID_POLICY = "HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY"
 # executor.auth: {type: api_key, api_key: …}. Takes precedence over
 # ambient OPENAI_API_KEY in the caller's environment.
 _ENV_API_KEY = "HARNESS_OPENAI_AGENTS_API_KEY"
+_ENV_AZURE_ENTRA = "HARNESS_OPENAI_AGENTS_AZURE_ENTRA"
 
 # Truthy strings the wrap accepts for boolean env vars. Must
 # match the claude-sdk / codex / pi wraps' parsers for
@@ -216,6 +217,22 @@ def _parse_truthy(env_var: str, default: bool) -> bool:
     return raw in _TRUTHY_STRINGS
 
 
+def _parse_strict_bool(env_var: str) -> bool:
+    """Parse a marker env var that must be a clear boolean.
+
+    :param env_var: The env-var name, e.g. ``HARNESS_OPENAI_AGENTS_AZURE_ENTRA``.
+    :returns: ``True`` for ``1``/``true``, ``False`` for unset, empty,
+        ``0``, or ``false`` (case-insensitive).
+    :raises OSError: For any other value.
+    """
+    raw = os.environ.get(env_var, "").strip().lower()
+    if raw in ("1", "true"):
+        return True
+    if raw in ("", "0", "false"):
+        return False
+    raise OSError(f"{env_var} must be 'true' or 'false'.")
+
+
 def _build_openai_agents_sdk_executor() -> Executor:
     """
     Construct an :class:`OpenAIAgentsSDKExecutor` from env-var
@@ -278,6 +295,7 @@ def _build_openai_agents_sdk_executor() -> Executor:
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         reasoning_item_id_policy=reasoning_item_id_policy,
+        azure_entra=_parse_strict_bool(_ENV_AZURE_ENTRA),
     )
 
 

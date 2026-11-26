@@ -758,6 +758,71 @@ def _expose_google_thought_signatures(
             )
 
 
+def _validate_azure_entra_settings(
+    *,
+    client: object,
+    profile: str | None,
+    api_key: str | None,
+    base_url_override: str | None,
+    gateway_host: str | None,
+    gateway_auth_command: str | None,
+    model: str | None,
+) -> None:
+    """Reject settings that conflict with Azure Entra authentication.
+
+    :raises ValueError: On an injected client, another credential source, or
+        a missing endpoint or deployment name.
+    """
+    if client is not None:
+        raise ValueError("azure_entra cannot be combined with an injected client.")
+    conflicts = [
+        name
+        for name, value in (
+            ("api_key", api_key),
+            ("profile", profile),
+            ("gateway_host", gateway_host),
+            ("gateway_auth_command", gateway_auth_command),
+        )
+        if value
+    ]
+    if conflicts:
+        raise ValueError(
+            "azure_entra cannot be combined with other credentials: " + ", ".join(conflicts)
+        )
+    if not base_url_override:
+        raise ValueError("azure_entra requires an Azure endpoint base URL.")
+    if not model:
+        raise ValueError("azure_entra requires a model (the Azure deployment name).")
+
+
+def _get_azure_entra_openai_client(
+    endpoint: str, retry_policy: RetryPolicy
+) -> tuple[AsyncOpenAIClient, httpx.AsyncClient]:
+    """Build an AsyncOpenAI client for Azure OpenAI v1 using Entra ID tokens.
+
+    The endpoint is validated before any credential is created.
+
+    :param endpoint: Azure OpenAI v1 endpoint, e.g.
+        ``"https://example.openai.azure.com/openai/v1/"``.
+    :param retry_policy: Retry policy for the OpenAI client.
+    :returns: The OpenAI client and the owned http client (which closes the
+        credential).
+    """
+    from openai import AsyncOpenAI
+
+    from .azure_entra import build_azure_entra_http_client, normalize_azure_endpoint
+
+    base_url = normalize_azure_endpoint(endpoint)
+    http_client = build_azure_entra_http_client()
+    openai_client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=_OPENAI_KEY_PLACEHOLDER,
+        http_client=http_client,
+        **retry_policy.openai.kwargs(),
+    )
+    return openai_client, http_client
+
+
 class _ShellCommandBearerAuth(httpx.Auth):
     """httpx Auth that refreshes a bearer token through a shell command.
 
@@ -1317,6 +1382,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
         reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
+        azure_entra: bool = False,
     ) -> None:
         """Create an OpenAIAgentsSDKExecutor.
 
@@ -1366,15 +1432,37 @@ class OpenAIAgentsSDKExecutor(Executor):
             ``"preserve"`` retains reasoning item IDs; ``"omit"`` is available
             for legacy providers that reject orphaned reasoning items. ``None``
             leaves the setting unspecified and uses the SDK default.
+        :param azure_entra: When ``True``, authenticate to the Azure OpenAI v1
+            endpoint in *base_url_override* with ``DefaultAzureCredential``
+            (Microsoft Entra ID); *model* is the deployment name. Conflicts
+            with *client*, *api_key*, *profile*, and the gateway values.
         :raises ValueError: If *reasoning_item_id_policy* is not ``"preserve"``
-            or ``"omit"``.
+            or ``"omit"``, or the Azure Entra settings are invalid.
         """
         if reasoning_item_id_policy not in (None, "preserve", "omit"):
             raise ValueError("reasoning_item_id_policy must be 'preserve', 'omit', or unset")
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self._azure_http_client: httpx.AsyncClient | None = None
+        if azure_entra:
+            _validate_azure_entra_settings(
+                client=client,
+                profile=profile,
+                api_key=api_key,
+                base_url_override=base_url_override,
+                gateway_host=gateway_host,
+                gateway_auth_command=gateway_auth_command,
+                model=model,
+            )
+            raw_client, self._azure_http_client = _get_azure_entra_openai_client(
+                str(base_url_override), self._retry_policy
+            )
+        else:
+            raw_client = None
         raw_client = (
             client
             if client is not None
+            else raw_client
+            if raw_client is not None
             else _get_openai_async_client(
                 profile=profile,
                 api_key=api_key,
@@ -1502,7 +1590,12 @@ class OpenAIAgentsSDKExecutor(Executor):
         """Release session state and the client created by this executor."""
         self._session_states.clear()
         if self._owns_client:
-            await self._client.close()
+            try:
+                await self._client.close()
+            finally:
+                azure_http_client, self._azure_http_client = self._azure_http_client, None
+                if azure_http_client is not None:
+                    await azure_http_client.aclose()
 
     async def interrupt_session(self, session_key: str) -> bool:
         """
