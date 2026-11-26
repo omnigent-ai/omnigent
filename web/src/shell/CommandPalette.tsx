@@ -3,6 +3,7 @@
 // cmdk filtering is off and the static actions are filtered here.
 
 import type React from "react";
+import { readlineStepAsArrow } from "@/lib/listNavigationKeys";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
@@ -266,6 +267,8 @@ export function CommandPalette({
           value={selectedValue}
           onValueChange={setSelectedValue}
           onKeyDown={(event) => {
+            // Ctrl-N/Ctrl-P step as the arrows do, which vimBindings would also give Ctrl+J/K.
+            if (readlineStepAsArrow(event)) return;
             if (SELECTION_KEYS.has(event.key)) userMovedSelection.current = true;
           }}
         >

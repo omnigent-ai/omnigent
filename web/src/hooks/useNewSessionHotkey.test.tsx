@@ -1,18 +1,27 @@
-import { cleanup, renderHook } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { QuickPick } from "@/components/ui/quick-pick";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { EmbeddedProvider } from "@/lib/embedded";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setEmbedRoot } from "@/lib/host";
 
 import { isNewSessionHotkey, useNewSessionHotkey } from "./useNewSessionHotkey";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
+const shell = vi.hoisted(() => ({ native: false }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isNativeShell: () => shell.native,
+}));
 
 afterEach(() => {
   cleanup();
   setEmbedRoot(null);
   navigate.mockReset();
+  shell.native = false;
   document.body.innerHTML = "";
 });
 
@@ -65,7 +74,8 @@ describe("isNewSessionHotkey", () => {
     ]) {
       expect(isNewSessionHotkey(event({ ...command, ...init }), isMac)).toBe(false);
     }
-    const altGraph = event({ ...command, key: "O", code: "KeyO", shiftKey: true });
+    // AltGr off macOS; on macOS, Option, which Firefox reports as AltGr.
+    const altGraph = event({ ...command, key: "O", code: "KeyO", shiftKey: true, altKey: isMac });
     vi.spyOn(altGraph, "getModifierState").mockImplementation((key) => key === "AltGraph");
     expect(isNewSessionHotkey(altGraph, isMac)).toBe(false);
   });
@@ -172,5 +182,87 @@ describe("useNewSessionHotkey", () => {
 
     expect(navigate).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(false);
+  });
+});
+
+describe("useNewSessionHotkey with an open pick list (native Windows/Linux)", () => {
+  it("leaves Ctrl-N to the list's field, and still starts a session elsewhere", () => {
+    shell.native = true;
+    renderHook(() => useNewSessionHotkey(true, false));
+    const field = document.createElement("input");
+    field.setAttribute("data-pick-list-input", "");
+    document.body.append(field);
+    const ctrlN = { key: "n", code: "KeyN", ctrlKey: true };
+    expect(press(ctrlN, field).defaultPrevented).toBe(false);
+    expect(navigate).not.toHaveBeenCalled();
+    expect(press(ctrlN).defaultPrevented).toBe(true);
+    expect(navigate).toHaveBeenCalledWith("/");
+  });
+});
+
+describe("useNewSessionHotkey with a real QuickPick (native Windows/Linux)", () => {
+  it("lets Ctrl-N step a ⌘K picker without starting a session", () => {
+    shell.native = true;
+    function Shell() {
+      useNewSessionHotkey(true, false);
+      return (
+        <TooltipProvider>
+          <QuickPick
+            label="Review picker"
+            stepsWithCtrlNP
+            segments={[
+              {
+                sourceId: "files",
+                ranking: "client",
+                items: ["one", "two"].map((id) => ({ id, label: id, value: id })),
+              },
+            ]}
+            query=""
+            onQueryChange={vi.fn()}
+            emptyMessage="No results"
+            onAccept={vi.fn()}
+          />
+        </TooltipProvider>
+      );
+    }
+    render(<Shell />);
+    const field = screen.getByRole("combobox", { name: "Review picker" });
+    field.focus();
+    fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(document.getElementById(field.getAttribute("aria-activedescendant")!)).toHaveTextContent(
+      "two",
+    );
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("still starts a session from a sidebar search that shows no list yet", () => {
+    shell.native = true;
+    function Shell() {
+      useNewSessionHotkey(true, false);
+      return (
+        <TooltipProvider>
+          <QuickPick
+            label="Search settings"
+            presentation="sidebar"
+            segments={[
+              {
+                sourceId: "settings",
+                ranking: "client",
+                items: [{ id: "theme", label: "Theme", value: "theme" }],
+              },
+            ]}
+            query=""
+            onQueryChange={vi.fn()}
+            emptyMessage="No results"
+            onAccept={vi.fn()}
+          />
+        </TooltipProvider>
+      );
+    }
+    render(<Shell />);
+    const field = screen.getByRole("combobox", { name: "Search settings" });
+    field.focus();
+    fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(navigate).toHaveBeenCalledOnce();
   });
 });
