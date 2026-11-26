@@ -55,23 +55,23 @@ function compare(a, b) {
 
 async function main() {
   return withLifecycle(async (scope) => {
-  async function run(command, args, cwd) {
-    const child = scope.spawn(command, args, { cwd, stdio: "inherit" });
-    await scope.wait(child);
-  }
-  const args = process.argv.slice(2);
-  const arg = (name, fallback) => {
-    const index = args.indexOf(name);
-    return index < 0 ? fallback : args[index + 1];
-  };
-  const output = path.resolve(arg("--out", path.join(here, "out", "ab")));
-  const samples = Number(arg("--samples", "30"));
-  const throttle = Number(arg("--throttle", "1"));
-  if (!Number.isInteger(samples) || samples < 1 || !Number.isFinite(throttle) || throttle < 1)
-    throw new Error("invalid sample count or throttle");
-  fs.mkdirSync(output, { recursive: true });
-  if (!fs.existsSync(path.join(here, "fixtures", "sessions.json")))
-    await run(process.execPath, [path.join(here, "fixture-gen.mjs")], repo);
+    async function run(command, args, cwd) {
+      const child = scope.spawn(command, args, { cwd, stdio: "inherit" });
+      await scope.wait(child);
+    }
+    const args = process.argv.slice(2);
+    const arg = (name, fallback) => {
+      const index = args.indexOf(name);
+      return index < 0 ? fallback : args[index + 1];
+    };
+    const output = path.resolve(arg("--out", path.join(here, "out", "ab")));
+    const samples = Number(arg("--samples", "30"));
+    const throttle = Number(arg("--throttle", "1"));
+    if (!Number.isInteger(samples) || samples < 1 || !Number.isFinite(throttle) || throttle < 1)
+      throw new Error("invalid sample count or throttle");
+    fs.mkdirSync(output, { recursive: true });
+    if (!fs.existsSync(path.join(here, "fixtures", "sessions.json")))
+      await run(process.execPath, [path.join(here, "fixture-gen.mjs")], repo);
     async function build(arm) {
       const dist = arg(`--${arm}-dist`);
       if (dist) return path.resolve(dist);
@@ -82,11 +82,19 @@ async function main() {
         fs.rmdirSync(worktree);
         const temporary = worktree;
         scope.cleanup(() => {
-          const listed = spawnSync("git", ["worktree", "list", "--porcelain"], { cwd: repo, encoding: "utf8" });
-          if (listed.error || listed.status !== 0) throw listed.error ?? new Error(`git worktree list failed: ${listed.status}`);
+          const listed = spawnSync("git", ["worktree", "list", "--porcelain"], {
+            cwd: repo,
+            encoding: "utf8",
+          });
+          if (listed.error || listed.status !== 0)
+            throw listed.error ?? new Error(`git worktree list failed: ${listed.status}`);
           if (listed.stdout.split("\n").includes(`worktree ${temporary}`)) {
-            const removed = spawnSync("git", ["worktree", "remove", "--force", temporary], { cwd: repo, stdio: "inherit" });
-            if (removed.error || removed.status !== 0) throw removed.error ?? new Error(`git worktree remove failed: ${removed.status}`);
+            const removed = spawnSync("git", ["worktree", "remove", "--force", temporary], {
+              cwd: repo,
+              stdio: "inherit",
+            });
+            if (removed.error || removed.status !== 0)
+              throw removed.error ?? new Error(`git worktree remove failed: ${removed.status}`);
           } else fs.rmSync(temporary, { recursive: true, force: true });
         });
         await run("git", ["worktree", "add", "--detach", worktree, source], repo);
@@ -135,6 +143,8 @@ async function main() {
           serverOut,
           "--latency-ms",
           arg("--latency-ms", "0"),
+          "--features",
+          arg(i ? "--features-b" : "--features-a", ""),
         ],
         { stdio: ["ignore", log, log] },
       );

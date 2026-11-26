@@ -20,28 +20,30 @@ test("mock pages history without gaps and delays API responses", { timeout: 3000
   const fixtures = path.join(output, "fixtures");
   let server;
   try {
-  const generated = spawnSync(process.execPath, [
-    path.join(here, "fixture-gen.mjs"),
-    "--out",
-    fixtures,
-  ]);
-  assert.equal(generated.status, 0, generated.stderr.toString());
-  const fixture = JSON.parse(fs.readFileSync(path.join(fixtures, "items_a.json"), "utf8"));
-  server = spawn(
-    process.execPath,
-    [
-      path.join(here, "server.mjs"),
-      "--fixtures",
-      fixtures,
-      "--port",
-      "0",
+    const generated = spawnSync(process.execPath, [
+      path.join(here, "fixture-gen.mjs"),
       "--out",
-      output,
-      "--latency-ms",
-      "50-60",
-    ],
-    { stdio: ["ignore", "pipe", "inherit"] },
-  );
+      fixtures,
+    ]);
+    assert.equal(generated.status, 0, generated.stderr.toString());
+    const fixture = JSON.parse(fs.readFileSync(path.join(fixtures, "items_a.json"), "utf8"));
+    server = spawn(
+      process.execPath,
+      [
+        path.join(here, "server.mjs"),
+        "--fixtures",
+        fixtures,
+        "--port",
+        "0",
+        "--out",
+        output,
+        "--latency-ms",
+        "50-60",
+        "--features",
+        "example_feature",
+      ],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
     const startup = await Promise.race([
       once(server.stdout, "data").then(([chunk]) => ({ chunk })),
       once(server, "exit").then(([code]) => ({ code })),
@@ -51,6 +53,8 @@ test("mock pages history without gaps and delays API responses", { timeout: 3000
     assert.ok(port, "server did not report a port");
     server.stdout.resume();
     const base = `http://127.0.0.1:${port}`;
+    const info = await globalThis.fetch(`${base}/v1/info`).then((response) => response.json());
+    assert.deepEqual(info.features, { example_feature: true });
     const socket = cdpConnect(`ws://127.0.0.1:${port}/v1/sessions/updates`);
     await socket.ready;
     socket.close();
@@ -135,23 +139,32 @@ test("mock pages history without gaps and delays API responses", { timeout: 3000
       resolveRepositoryContext: {},
     };
     await forEachSequential([false, true], async (useBinaryFormat) => {
-      const workspace = createClient(WorkspaceService, createConnectTransport({
-        baseUrl: `${base}/v1/sessions/conv_perf_a/workspace`, useBinaryFormat, fetch: globalThis.fetch,
-      }));
+      const workspace = createClient(
+        WorkspaceService,
+        createConnectTransport({
+          baseUrl: `${base}/v1/sessions/conv_perf_a/workspace`,
+          useBinaryFormat,
+          fetch: globalThis.fetch,
+        }),
+      );
       await forEachSequential(Object.entries(methods), async ([name, request]) => {
         const result = await workspace[name](request);
         const schema = WorkspaceService.method[name].output;
         assert.ok(equals(schema, result, fromBinary(schema, toBinary(schema, result))), name);
         assert.ok(equals(schema, result, fromJson(schema, toJson(schema, result))), name);
         if (name === "statPath") assert.equal(result.entry?.path, "dialog_7");
-        if (name === "searchFiles") assert.ok(result.results.some((item) => item.entry?.path === "dialog_7/stepper_00002.md"));
+        if (name === "searchFiles")
+          assert.ok(
+            result.results.some((item) => item.entry?.path === "dialog_7/stepper_00002.md"),
+          );
         if (name === "resolveWorkingCopyBase") assert.equal(result.base?.head, "HEAD");
         if (name === "listWorkingCopyChanges") {
           assert.equal(result.files.length, 120);
           assert.ok(result.files.every((file) => file.status && file.linesAdded !== undefined));
         }
         if (name === "listRepositoryRefs") assert.ok(result.refs.includes("main"));
-        if (name === "listBranchCommits") assert.equal(result.commits[0]?.subject, "Example commit");
+        if (name === "listBranchCommits")
+          assert.equal(result.commits[0]?.subject, "Example commit");
         if (name === "resolveRepositoryContext") assert.equal(result.branch, "main");
       });
       const schema = WorkspaceService.method.readFile.output;
@@ -197,7 +210,20 @@ test("mock pages history without gaps and delays API responses", { timeout: 3000
       return readUntilCompleted(next);
     }
     const events = await readUntilCompleted();
-    assert.ok(events.includes("event: response.output_item.done"));
+    const frames = events.split("\n\n").flatMap((frame) => {
+      const type = frame.match(/^event: (.+)$/m)?.[1];
+      const data = frame.match(/^data: (.+)$/m)?.[1];
+      return type && data ? [{ type, data: JSON.parse(data) }] : [];
+    });
+    const completed = frames.find(
+      (frame) => frame.type === "response.output_item.done" && frame.data.item.type === "message",
+    )?.data;
+    assert.ok(completed);
+    assert.equal(completed.message_id, completed.item.stream_message_id);
+    assert.equal(completed.message_id, `msg_${completed.item.response_id}`);
+    const deltas = frames.filter((frame) => frame.type === "response.output_text.delta");
+    assert.ok(deltas.every((frame) => frame.data.message_id === completed.message_id));
+    assert.equal(completed.item.content[0].text, deltas.map((frame) => frame.data.delta).join(""));
     const natural = await globalThis
       .fetch(`${base}/__perf__/stream/start`, {
         method: "POST",

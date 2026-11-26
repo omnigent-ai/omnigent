@@ -449,15 +449,31 @@ function genTree(rng, totalEntries) {
   // Build a deep, wide directory tree from synthetic path segments.
   const topDirs = Array.from({ length: 8 }, (_, i) => `${WORDS[(i * 7) % WORDS.length]}_${i}`);
   const entries = new Map();
-  entries.set("dialog_7", { name: "dialog_7", path: "dialog_7", type: "ENTRY_TYPE_DIRECTORY", ignored: false });
-  entries.set("dialog_7/stepper_00002.md", { name: "stepper_00002.md", path: "dialog_7/stepper_00002.md", type: "ENTRY_TYPE_FILE", ignored: false });
+  entries.set("dialog_7", {
+    name: "dialog_7",
+    path: "dialog_7",
+    type: "ENTRY_TYPE_DIRECTORY",
+    ignored: false,
+  });
+  entries.set("dialog_7/stepper_00002.md", {
+    name: "stepper_00002.md",
+    path: "dialog_7/stepper_00002.md",
+    type: "ENTRY_TYPE_FILE",
+    ignored: false,
+  });
   while (entries.size < totalEntries) {
     const depth = rng.int(1, 6);
     const segs = [rng.pick(topDirs)];
     for (let d = 1; d < depth; d++) segs.push(`${rng.pick(WORDS)}${rng.int(0, 9)}`);
     for (let d = 0; d < segs.length && entries.size < totalEntries; d++) {
       const dir = segs.slice(0, d + 1).join("/");
-      if (!entries.has(dir)) entries.set(dir, { name: segs[d], path: dir, type: "ENTRY_TYPE_DIRECTORY", ignored: false });
+      if (!entries.has(dir))
+        entries.set(dir, {
+          name: segs[d],
+          path: dir,
+          type: "ENTRY_TYPE_DIRECTORY",
+          ignored: false,
+        });
     }
     if (entries.size >= totalEntries) break;
     const dir = segs.join("/");
@@ -466,7 +482,13 @@ function genTree(rng, totalEntries) {
       const ext = rng.pick(["ts", "tsx", "py", "md", "json", "css", "sql"]);
       const name = `${rng.pick(WORDS)}_${entries.size.toString().padStart(5, "0")}.${ext}`;
       const filePath = `${dir}/${name}`;
-      entries.set(filePath, { name, path: filePath, type: "ENTRY_TYPE_FILE", size: rng.int(200, 90000), ignored: rng.chance(0.02) });
+      entries.set(filePath, {
+        name,
+        path: filePath,
+        type: "ENTRY_TYPE_FILE",
+        size: rng.int(200, 90000),
+        ignored: rng.chance(0.02),
+      });
     }
   }
   return [...entries.values()];
@@ -518,13 +540,15 @@ function genMarkdown(rng, sectionCount) {
   const languages = ["typescript", "python", "json", "bash", "sql", "rust"];
   for (let index = 0; index < sectionCount; index++) {
     const language = languages[index % languages.length];
-    sections.push([
-      `## ${rng.pick(SUBJECTS)} ${index + 1}`,
-      `${paragraph(rng, 3)} See [the guide](https://example.com/guide) and use \`example_value\` for this step.`,
-      `- ${sentence(rng)}\n  - ${sentence(rng)}\n  - ${sentence(rng)}\n- ${sentence(rng)}`,
-      `| name | state | value |\n| --- | --- | --- |\n| ${rng.pick(WORDS)} | ready | ${rng.int(1, 999)} |\n| ${rng.pick(WORDS)} | pending | ${rng.int(1, 999)} |`,
-      `\`\`\`${language}\n${codeSnippet(rng, language, 12)}\n\`\`\``,
-    ].join("\n\n"));
+    sections.push(
+      [
+        `## ${rng.pick(SUBJECTS)} ${index + 1}`,
+        `${paragraph(rng, 3)} See [the guide](https://example.com/guide) and use \`example_value\` for this step.`,
+        `- ${sentence(rng)}\n  - ${sentence(rng)}\n  - ${sentence(rng)}\n- ${sentence(rng)}`,
+        `| name | state | value |\n| --- | --- | --- |\n| ${rng.pick(WORDS)} | ready | ${rng.int(1, 999)} |\n| ${rng.pick(WORDS)} | pending | ${rng.int(1, 999)} |`,
+        `\`\`\`${language}\n${codeSnippet(rng, language, 12)}\n\`\`\``,
+      ].join("\n\n"),
+    );
   }
   return sections.join("\n\n");
 }

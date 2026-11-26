@@ -31,6 +31,21 @@ export function assertColdLoad(id, settled) {
   }
 }
 
+export function assertSwitch(target, timing) {
+  if (
+    !timing ||
+    timing.timeout ||
+    !Number.isFinite(timing.clickTs) ||
+    !Number.isFinite(timing.markerTs) ||
+    timing.markerTs < timing.clickTs ||
+    !Number.isFinite(timing.paintedTs) ||
+    timing.paintedTs < timing.markerTs ||
+    !Number.isFinite(timing.settleTs) ||
+    timing.settleTs < timing.paintedTs
+  )
+    throw new Error(`switch to ${target} failed: ${JSON.stringify(timing)}`);
+}
+
 export function findChrome(explicit) {
   const cache = path.join(os.homedir(), ".cache", "ms-playwright");
   const playwright = fs.existsSync(cache)

@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   armOrder,
   assertColdLoad,
+  assertSwitch,
   cdpConnect,
   ensurePortFree,
   findChrome,
@@ -250,136 +251,147 @@ function busyStats(entries, t0, t1) {
 }
 
 await withLifecycle(async (scope) => {
-const delay = (milliseconds) => timerDelay(milliseconds, undefined, { signal: scope.signal });
-const browsers = [];
-async function launchBrowser(port) {
-  await ensurePortFree(port);
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "perf-bench-"));
-  scope.directory(profile);
-  const child = scope.spawn(
-    CHROME,
-    [
-      `--user-data-dir=${profile}`,
-      `--remote-debugging-port=${port}`,
-      "--headless=new",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-features=Translate,BackForwardCache",
-      "--window-size=1600,1000",
-      "--enable-precise-memory-info",
-      "--disable-component-update",
-      "about:blank",
-    ],
-    { stdio: "ignore" },
-  );
-  browsers.push({ child, profile });
-}
-await verifyFixtures(BASE, CHROME, DBG_PORT, path.join(OUT, "fixture-check-a.json"));
-if (AB_URL)
-  await verifyFixtures(AB_URL, CHROME, DBG_PORT_B, path.join(OUT, "fixture-check-b.json"));
-await launchBrowser(DBG_PORT);
-
-const results = {
-  startedAt: new Date().toISOString(),
-  base: BASE,
-  cpuThrottle: CPU_THROTTLE,
-  cycles: CYCLES || "per-scenario default",
-  scenarios: {},
-};
-
-async function perfMetrics(cdp) {
-  const { metrics } = await cdp.send("Performance.getMetrics");
-  const out = {};
-  for (const m of metrics) out[m.name] = m.value;
-  return out;
-}
-function metricsDelta(after, before) {
-  const d = {};
-  for (const k of [
-    "ScriptDuration",
-    "TaskDuration",
-    "LayoutDuration",
-    "RecalcStyleDuration",
-    "LayoutCount",
-    "RecalcStyleCount",
-  ]) {
-    if (Number.isFinite(after[k]) && Number.isFinite(before[k]))
-      d[k] = Math.round((after[k] - before[k]) * 1000) / 1000;
+  const delay = (milliseconds) => timerDelay(milliseconds, undefined, { signal: scope.signal });
+  const browsers = [];
+  async function launchBrowser(port) {
+    await ensurePortFree(port);
+    const profile = fs.mkdtempSync(path.join(os.tmpdir(), "perf-bench-"));
+    scope.directory(profile);
+    const child = scope.spawn(
+      CHROME,
+      [
+        `--user-data-dir=${profile}`,
+        `--remote-debugging-port=${port}`,
+        "--headless=new",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-features=Translate,BackForwardCache",
+        "--window-size=1600,1000",
+        "--enable-precise-memory-info",
+        "--disable-component-update",
+        "about:blank",
+      ],
+      { stdio: "ignore" },
+    );
+    browsers.push({ child, profile });
   }
-  if (Number.isFinite(after.JSHeapUsedSize))
-    d.JSHeapUsedSizeAfterMB = Math.round((after.JSHeapUsedSize / 1048576) * 10) / 10;
-  return d;
-}
+  await verifyFixtures(BASE, CHROME, DBG_PORT, path.join(OUT, "fixture-check-a.json"));
+  if (AB_URL)
+    await verifyFixtures(AB_URL, CHROME, DBG_PORT_B, path.join(OUT, "fixture-check-b.json"));
+  await launchBrowser(DBG_PORT);
 
-async function main() {
-  const version = await waitHttp(`http://127.0.0.1:${DBG_PORT}/json/version`, scope.signal);
-  let cdp = cdpConnect(version.webSocketDebuggerUrl);
-  const clients = [cdp];
-  scope.cleanup(() => clients.forEach((client) => client.close()));
-  await cdp.ready;
-  const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
-  const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
-  cdp.setDefaultSession(sessionId);
-  await cdp.send("Page.enable");
-  await cdp.send("Runtime.enable");
-  await cdp.send("Network.enable");
-  await cdp.send("Performance.enable");
-  await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_THROTTLE });
-  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: INIT_SCRIPT + SETTLED_FN });
-
-  const consoleErrors = [];
-  const recordErrors = (method, params) => {
-    if (method === "Runtime.exceptionThrown") {
-      consoleErrors.push(
-        params.exceptionDetails?.exception?.description ?? params.exceptionDetails?.text ?? "?",
-      );
-    } else if (method === "Runtime.consoleAPICalled" && params.type === "error") {
-      consoleErrors.push((params.args ?? []).map((a) => a.value ?? a.description ?? "").join(" "));
-    }
+  const results = {
+    startedAt: new Date().toISOString(),
+    base: BASE,
+    cpuThrottle: CPU_THROTTLE,
+    cycles: CYCLES || "per-scenario default",
+    scenarios: {},
   };
-  cdp.onEvent(recordErrors);
 
-  const page = { eval: (expr, awaitPromise) => inPageEval(cdp, expr, awaitPromise) };
-  const cyclesFor = (def) => CYCLES || def;
-  const indices = (count) => Array.from({ length: count }, (_, index) => index);
-
-  async function navigate(url) {
-    let listener;
-    let timer;
-    let onAbort;
-    const loaded = new Promise((resolve, reject) => {
-      listener = (method) => { if (method === "Page.loadEventFired") resolve(); };
-      cdp.onEvent(listener);
-      timer = setTimeout(() => reject(new Error(`navigation timed out: ${url}`)), 30000);
-      onAbort = () => reject(scope.signal.reason);
-      scope.signal.addEventListener("abort", onAbort, { once: true });
-    });
-    try {
-      await cdp.send("Page.navigate", { url });
-      await loaded;
-    } finally {
-      clearTimeout(timer);
-      cdp.offEvent(listener);
-      scope.signal.removeEventListener("abort", onAbort);
+  async function perfMetrics(cdp) {
+    const { metrics } = await cdp.send("Performance.getMetrics");
+    const out = {};
+    for (const m of metrics) out[m.name] = m.value;
+    return out;
+  }
+  function metricsDelta(after, before) {
+    const d = {};
+    for (const k of [
+      "ScriptDuration",
+      "TaskDuration",
+      "LayoutDuration",
+      "RecalcStyleDuration",
+      "LayoutCount",
+      "RecalcStyleCount",
+    ]) {
+      if (Number.isFinite(after[k]) && Number.isFinite(before[k]))
+        d[k] = Math.round((after[k] - before[k]) * 1000) / 1000;
     }
+    if (Number.isFinite(after.JSHeapUsedSize))
+      d.JSHeapUsedSizeAfterMB = Math.round((after.JSHeapUsedSize / 1048576) * 10) / 10;
+    return d;
   }
 
-  async function gotoSession(id, attempt = 0) {
-    await navigate(`${BASE}/c/${id}`);
-    const settled = await page.eval(
-      `window.__waitSettled(${JSON.stringify(MARKERS[id])}, { timeoutMs: 30000, sinceTs: performance.now() - 1 })`,
-      true,
-    );
-    if (settled && !settled.timeout && settled.markerTs > 0 && settled.paintedTs >= 0 && settled.settleTs >= settled.paintedTs) return settled;
-    process.stdout.write(
-      `gotoSession ${id} retry ${attempt}: ${JSON.stringify(settled).slice(0, 160)}\n`,
-    );
-    if (attempt < 2) return gotoSession(id, attempt + 1);
-    throw new Error(`gotoSession: ${id} never settled`);
-  }
+  async function main() {
+    const version = await waitHttp(`http://127.0.0.1:${DBG_PORT}/json/version`, scope.signal);
+    let cdp = cdpConnect(version.webSocketDebuggerUrl);
+    const clients = [cdp];
+    scope.cleanup(() => clients.forEach((client) => client.close()));
+    await cdp.ready;
+    const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
+    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+    cdp.setDefaultSession(sessionId);
+    await cdp.send("Page.enable");
+    await cdp.send("Runtime.enable");
+    await cdp.send("Network.enable");
+    await cdp.send("Performance.enable");
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_THROTTLE });
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: INIT_SCRIPT + SETTLED_FN });
 
-  async function clickSidebarRow(title) {
-    const rect = await page.eval(`(() => {
+    const consoleErrors = [];
+    const recordErrors = (method, params) => {
+      if (method === "Runtime.exceptionThrown") {
+        consoleErrors.push(
+          params.exceptionDetails?.exception?.description ?? params.exceptionDetails?.text ?? "?",
+        );
+      } else if (method === "Runtime.consoleAPICalled" && params.type === "error") {
+        consoleErrors.push(
+          (params.args ?? []).map((a) => a.value ?? a.description ?? "").join(" "),
+        );
+      }
+    };
+    cdp.onEvent(recordErrors);
+
+    const page = { eval: (expr, awaitPromise) => inPageEval(cdp, expr, awaitPromise) };
+    const cyclesFor = (def) => CYCLES || def;
+    const indices = (count) => Array.from({ length: count }, (_, index) => index);
+
+    async function navigate(url) {
+      let listener;
+      let timer;
+      let onAbort;
+      const loaded = new Promise((resolve, reject) => {
+        listener = (method) => {
+          if (method === "Page.loadEventFired") resolve();
+        };
+        cdp.onEvent(listener);
+        timer = setTimeout(() => reject(new Error(`navigation timed out: ${url}`)), 30000);
+        onAbort = () => reject(scope.signal.reason);
+        scope.signal.addEventListener("abort", onAbort, { once: true });
+      });
+      try {
+        await cdp.send("Page.navigate", { url });
+        await loaded;
+      } finally {
+        clearTimeout(timer);
+        cdp.offEvent(listener);
+        scope.signal.removeEventListener("abort", onAbort);
+      }
+    }
+
+    async function gotoSession(id, attempt = 0) {
+      await navigate(`${BASE}/c/${id}`);
+      const settled = await page.eval(
+        `window.__waitSettled(${JSON.stringify(MARKERS[id])}, { timeoutMs: 30000, sinceTs: performance.now() - 1 })`,
+        true,
+      );
+      if (
+        settled &&
+        !settled.timeout &&
+        settled.markerTs > 0 &&
+        settled.paintedTs >= 0 &&
+        settled.settleTs >= settled.paintedTs
+      )
+        return settled;
+      process.stdout.write(
+        `gotoSession ${id} retry ${attempt}: ${JSON.stringify(settled).slice(0, 160)}\n`,
+      );
+      if (attempt < 2) return gotoSession(id, attempt + 1);
+      throw new Error(`gotoSession: ${id} never settled`);
+    }
+
+    async function clickSidebarRow(title) {
+      const rect = await page.eval(`(() => {
       const wanted = ${JSON.stringify(title)};
       const btns = [...document.querySelectorAll("button, [role=button], a, li, div")].filter((el) => {
         const t = (el.getAttribute("aria-label") || el.textContent || "").trim();
@@ -392,100 +404,99 @@ async function main() {
       const r = el.getBoundingClientRect();
       return { x: r.x + r.width / 2, y: r.y + Math.min(r.height / 2, 12) };
     })()`);
-    if (!rect) throw new Error(`sidebar row not found: ${title}`);
-    await cdp.send("Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      ...rect,
-      button: "left",
-      clickCount: 1,
-    });
-    await cdp.send("Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      ...rect,
-      button: "left",
-      clickCount: 1,
-    });
-  }
+      if (!rect) throw new Error(`sidebar row not found: ${title}`);
+      await cdp.send("Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        ...rect,
+        button: "left",
+        clickCount: 1,
+      });
+      await cdp.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        ...rect,
+        button: "left",
+        clickCount: 1,
+      });
+    }
 
-  async function openRail() {
-    const isOpen = await page.eval(
-      `!![...document.querySelectorAll("button")].find(x=>(x.getAttribute("aria-label")||"")==="Collapse right panel")`,
-    );
-    if (isOpen) return;
-    await page.eval(`(() => {
+    async function openRail() {
+      const isOpen = await page.eval(
+        `!![...document.querySelectorAll("button")].find(x=>(x.getAttribute("aria-label")||"")==="Collapse right panel")`,
+      );
+      if (isOpen) return;
+      await page.eval(`(() => {
       const b = [...document.querySelectorAll("button")].find(x=>(x.getAttribute("aria-label")||"").includes("Expand right panel"));
       if (b) b.click();
     })()`);
-    await delay(600);
-  }
+      await delay(600);
+    }
 
-  async function closeRail() {
-    await page.eval(`(() => {
+    async function closeRail() {
+      await page.eval(`(() => {
       const button = [...document.querySelectorAll("button")].find(x => (x.getAttribute("aria-label") || "").includes("Collapse right panel"));
       if (button) button.click();
     })()`);
-    await delay(600);
-    const stillOpen = await page.eval(
-      `!![...document.querySelectorAll("button")].find(x => (x.getAttribute("aria-label") || "").includes("Collapse right panel"))`,
-    );
-    if (stillOpen) throw new Error("could not collapse right panel");
-  }
+      await delay(600);
+      const stillOpen = await page.eval(
+        `!![...document.querySelectorAll("button")].find(x => (x.getAttribute("aria-label") || "").includes("Collapse right panel"))`,
+      );
+      if (stillOpen) throw new Error("could not collapse right panel");
+    }
 
-  async function clickRailTab(label) {
-    const found = await page.eval(`(() => {
+    async function clickRailTab(label) {
+      const found = await page.eval(`(() => {
       const tab = document.querySelector('[aria-label="Workspace"] [data-workspace-tab="${label.toLowerCase()}"]');
       if (!tab) return false;
       tab.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
       tab.click();
       return true;
     })()`);
-    if (!found) throw new Error(`workspace tab not found: ${label}`);
-  }
+      if (!found) throw new Error(`workspace tab not found: ${label}`);
+    }
 
-  async function assertRailTab(tab) {
-    const state = await page.eval(`(() => {
+    async function assertRailTab(tab) {
+      const state = await page.eval(`(() => {
       const rail = document.querySelector('[aria-label="Workspace"]');
       const tab = rail?.querySelector('[data-workspace-tab="${tab}"]');
       return { hidden: rail?.getAttribute("aria-hidden"), selected: tab?.getAttribute("aria-selected") };
     })()`);
-    if (state.hidden !== "false" || state.selected !== "true")
-      throw new Error(`workspace ${tab} tab not open: ${JSON.stringify(state)}`);
-  }
+      if (state.hidden !== "false" || state.selected !== "true")
+        throw new Error(`workspace ${tab} tab not open: ${JSON.stringify(state)}`);
+    }
 
-  // Shared switch measurement. Pre-condition: page settled somewhere.
-  async function measureSwitch({ target, label, extraMarker = null }) {
-    const warm = [
-      "rail-closed",
-      "rail-files",
-      "rail-changes",
-      "rail-closed-file",
-      "a",
-      "b",
-    ].includes(label);
-    const evicting = label === "evicting";
-    const beforeStreams =
-      warm || evicting
-        ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json())
-        : null;
-    if (warm && !beforeStreams.activeStreams[target])
-      throw new WarmSampleInvalid(`target ${target} has no retained stream before warm switch`);
-    await page.eval(`window.__resetPerf()`);
-    const before = await perfMetrics(cdp);
-    const marker = extraMarker ?? MARKERS[target];
-    // Armed BEFORE the click; anchors on the click itself.
-    const settlePromise = page.eval(
-      `window.__waitSettled(${JSON.stringify(marker)}, { timeoutMs: 25000 })`,
-      true,
-    );
-    await clickSidebarRow(TITLES[target]);
-    const ts = await settlePromise;
-    if (!ts || ts.timeout || !Number.isFinite(ts.paintedTs) || ts.paintedTs < 0 || !Number.isFinite(ts.settleTs) || ts.settleTs < ts.paintedTs)
-      throw new Error(`switch to ${target} failed: ${JSON.stringify(ts)}`);
-    await page.eval(
-      `new Promise((resolve) => setTimeout(resolve, Math.max(0, ${ts.clickTs} + 1500 - performance.now())))`,
-      true,
-    );
-    const snap = await page.eval(`(() => {
+    // Shared switch measurement. Pre-condition: page settled somewhere.
+    async function measureSwitch({ target, label, extraMarker = null }) {
+      const warm = [
+        "rail-closed",
+        "rail-files",
+        "rail-changes",
+        "rail-closed-file",
+        "a",
+        "b",
+      ].includes(label);
+      const evicting = label === "evicting";
+      const beforeStreams =
+        warm || evicting
+          ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json())
+          : null;
+      if (warm && !beforeStreams.activeStreams[target])
+        throw new WarmSampleInvalid(`target ${target} has no retained stream before warm switch`);
+      await page.eval(`window.__resetPerf()`);
+      const before = await perfMetrics(cdp);
+      const marker = extraMarker ?? MARKERS[target];
+      // Armed BEFORE the click; anchors on the click itself.
+      const settlePromise = page.eval(
+        `window.__waitSettled(${JSON.stringify(marker)}, { timeoutMs: 25000 })`,
+        true,
+      );
+      await clickSidebarRow(TITLES[target]);
+      const ts = await settlePromise;
+      assertSwitch(target, ts);
+      await page.eval(
+        `new Promise((resolve) => setTimeout(resolve, Math.max(0, ${ts.clickTs} + 1500 - performance.now())))`,
+        true,
+      );
+      const snap = await page.eval(`(() => {
       const events = window.__perf.events.filter((e) => e.id > 0 && e.s >= (window.__perf.clickTs ?? 0) - 1);
       const clickEv = events.length ? events[events.length - 1] : null;
       return {
@@ -502,224 +513,234 @@ async function main() {
         placeholderPainted: window.__perf.placeholderPainted,
       };
     })()`);
-    const lts = await page.eval("window.__perf.longTasks");
-    const lafs = await page.eval("window.__perf.lafs");
-    if (snap.pathname !== `/c/${target}`)
-      throw new Error(`switch target mismatch: expected ${target}, got ${snap.pathname}`);
-    if (["rail-closed", "evicting", "a", "b"].includes(label) && snap.railHidden !== "true")
-      throw new Error(`workspace rail is not collapsed: ${snap.railHidden}`);
-    const commitEvents = snap.commits.filter(
-      (event) => event.ts >= ts.clickTs && event.ts < ts.clickTs + 1500,
-    );
-    const pointerCommitEvents = snap.commits.filter(
-      (event) => event.ts >= snap.pointerTs && event.ts < ts.clickTs,
-    );
-    const placeholderMount = snap.placeholder.find(
-      (event) => event.kind === "mount" && event.ts >= ts.clickTs,
-    );
-    const placeholderUnmount =
-      placeholderMount &&
-      snap.placeholder.find((event) => event.kind === "unmount" && event.ts >= placeholderMount.ts);
-    const placeholderPaint =
-      placeholderMount &&
-      snap.placeholderPainted.find(
-        (time) =>
-          time >= placeholderMount.ts && (!placeholderUnmount || time < placeholderUnmount.ts),
+      const lts = await page.eval("window.__perf.longTasks");
+      const lafs = await page.eval("window.__perf.lafs");
+      if (snap.pathname !== `/c/${target}`)
+        throw new Error(`switch target mismatch: expected ${target}, got ${snap.pathname}`);
+      if (["rail-closed", "evicting", "a", "b"].includes(label) && snap.railHidden !== "true")
+        throw new Error(`workspace rail is not collapsed: ${snap.railHidden}`);
+      const commitEvents = snap.commits.filter(
+        (event) => event.ts >= ts.clickTs && event.ts < ts.clickTs + 1500,
       );
-    const afterStreams =
-      warm || evicting
-        ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json())
-        : null;
-    if (
-      warm &&
-      (afterStreams.streamOpens[target] !== beforeStreams.streamOpens[target] ||
-        !afterStreams.activeStreams[target])
-    )
-      throw new WarmSampleInvalid(
-        `target ${target} re-bound during warm switch: ${JSON.stringify({ beforeStreams, afterStreams })}`,
+      const pointerCommitEvents = snap.commits.filter(
+        (event) => event.ts >= snap.pointerTs && event.ts < ts.clickTs,
       );
-    if (
-      evicting &&
-      (afterStreams.streamOpens[target] ?? 0) <= (beforeStreams.streamOpens[target] ?? 0)
-    )
-      throw new Error(`target ${target} did not re-bind during evicting rotation`);
-    return {
-      label,
-      target,
-      ...(warm || evicting
-        ? { streamOpens: beforeStreams.streamOpens[target], retainedStream: warm }
-        : {}),
-      cold: evicting,
-      clickTs: ts.clickTs,
-      markerTs: ts.markerTs,
-      paintedTs: ts.paintedTs,
-      settleTs: ts.settleTs,
-      busyEnd: ts.busyEnd,
-      clickToMarkerMs: ts.markerTs > 0 ? Math.round((ts.markerTs - ts.clickTs) * 10) / 10 : null,
-      clickToPaintedMs: ts.paintedTs > 0 ? Math.round((ts.paintedTs - ts.clickTs) * 10) / 10 : null,
-      // Work-done time: the last busy signal (painted OR long task/LoAF end),
-      // i.e. when the main thread actually finished the switch's work.
-      clickToWorkDoneMs:
-        ts.paintedTs > 0
-          ? Math.round(
-              (Math.max(ts.paintedTs, ts.busyEnd > ts.clickTs ? ts.busyEnd : 0) - ts.clickTs) * 10,
-            ) / 10
-          : null,
-      clickToSettledMs: ts.settleTs > 0 ? Math.round((ts.settleTs - ts.clickTs) * 10) / 10 : null,
-      busyDuringSwitch: busyStats(lts, ts.clickTs, ts.settleTs > 0 ? ts.settleTs : ts.clickTs + 1),
-      lafBusy: busyStats(lafs, ts.clickTs, ts.settleTs > 0 ? ts.settleTs : ts.clickTs + 1),
-      interaction: snap.interactionDur,
-      interactionStartDelay:
-        snap.interactionStart !== null
-          ? Math.round((snap.interactionStart - ts.clickTs) * 10) / 10
-          : null,
-      commits: commitEvents.length,
-      commitsToPaint: snap.commits.filter(
-        (event) => event.ts >= ts.clickTs && event.ts <= ts.paintedTs,
-      ).length,
-      commitsPointerToClick: pointerCommitEvents.length,
-      pointerToClickMs: snap.pointerTs >= 0 ? ts.clickTs - snap.pointerTs : null,
-      placeholder: {
-        mounted: Boolean(placeholderMount),
-        painted: Boolean(placeholderPaint),
-        mountedMs:
-          placeholderMount && placeholderUnmount && placeholderUnmount.ts !== placeholderMount.ts
-            ? placeholderUnmount.ts - placeholderMount.ts
+      const placeholderMount = snap.placeholder.find(
+        (event) => event.kind === "mount" && event.ts >= ts.clickTs,
+      );
+      const placeholderUnmount =
+        placeholderMount &&
+        snap.placeholder.find(
+          (event) => event.kind === "unmount" && event.ts >= placeholderMount.ts,
+        );
+      const placeholderPaint =
+        placeholderMount &&
+        snap.placeholderPainted.find(
+          (time) =>
+            time >= placeholderMount.ts && (!placeholderUnmount || time < placeholderUnmount.ts),
+        );
+      const afterStreams =
+        warm || evicting
+          ? await globalThis.fetch(`${BASE}/__perf__/counters`).then((response) => response.json())
+          : null;
+      if (
+        warm &&
+        (afterStreams.streamOpens[target] !== beforeStreams.streamOpens[target] ||
+          !afterStreams.activeStreams[target])
+      )
+        throw new WarmSampleInvalid(
+          `target ${target} re-bound during warm switch: ${JSON.stringify({ beforeStreams, afterStreams })}`,
+        );
+      if (
+        evicting &&
+        (afterStreams.streamOpens[target] ?? 0) <= (beforeStreams.streamOpens[target] ?? 0)
+      )
+        throw new Error(`target ${target} did not re-bind during evicting rotation`);
+      return {
+        label,
+        target,
+        ...(warm || evicting
+          ? { streamOpens: beforeStreams.streamOpens[target], retainedStream: warm }
+          : {}),
+        cold: evicting,
+        clickTs: ts.clickTs,
+        markerTs: ts.markerTs,
+        paintedTs: ts.paintedTs,
+        settleTs: ts.settleTs,
+        busyEnd: ts.busyEnd,
+        clickToMarkerMs: ts.markerTs > 0 ? Math.round((ts.markerTs - ts.clickTs) * 10) / 10 : null,
+        clickToPaintedMs:
+          ts.paintedTs > 0 ? Math.round((ts.paintedTs - ts.clickTs) * 10) / 10 : null,
+        // Work-done time: the last busy signal (painted OR long task/LoAF end),
+        // i.e. when the main thread actually finished the switch's work.
+        clickToWorkDoneMs:
+          ts.paintedTs > 0
+            ? Math.round(
+                (Math.max(ts.paintedTs, ts.busyEnd > ts.clickTs ? ts.busyEnd : 0) - ts.clickTs) *
+                  10,
+              ) / 10
             : null,
-        visibleMs: !placeholderPaint
-          ? 0
-          : placeholderUnmount
-            ? placeholderUnmount.ts - placeholderPaint
+        clickToSettledMs: ts.settleTs > 0 ? Math.round((ts.settleTs - ts.clickTs) * 10) / 10 : null,
+        busyDuringSwitch: busyStats(
+          lts,
+          ts.clickTs,
+          ts.settleTs > 0 ? ts.settleTs : ts.clickTs + 1,
+        ),
+        lafBusy: busyStats(lafs, ts.clickTs, ts.settleTs > 0 ? ts.settleTs : ts.clickTs + 1),
+        interaction: snap.interactionDur,
+        interactionStartDelay:
+          snap.interactionStart !== null
+            ? Math.round((snap.interactionStart - ts.clickTs) * 10) / 10
             : null,
-      },
-      domNodes: snap.domNodes,
-      heapMB: snap.heapMB,
-      cdp: metricsDelta(await perfMetrics(cdp), before),
-    };
-  }
+        commits: commitEvents.length,
+        commitsToPaint: snap.commits.filter(
+          (event) => event.ts >= ts.clickTs && event.ts <= ts.paintedTs,
+        ).length,
+        commitsPointerToClick: pointerCommitEvents.length,
+        pointerToClickMs: snap.pointerTs >= 0 ? ts.clickTs - snap.pointerTs : null,
+        placeholder: {
+          mounted: Boolean(placeholderMount),
+          painted: Boolean(placeholderPaint),
+          mountedMs:
+            placeholderMount && placeholderUnmount && placeholderUnmount.ts !== placeholderMount.ts
+              ? placeholderUnmount.ts - placeholderMount.ts
+              : null,
+          visibleMs: !placeholderPaint
+            ? 0
+            : placeholderUnmount
+              ? placeholderUnmount.ts - placeholderPaint
+              : null,
+        },
+        domNodes: snap.domNodes,
+        heapMB: snap.heapMB,
+        cdp: metricsDelta(await perfMetrics(cdp), before),
+      };
+    }
 
-  // Separate browser processes isolate the arms' caches and renderer heaps.
-  if (AB_URL) {
-    const arms = [{ name: "a", url: BASE, sessionId, client: cdp }];
-    await launchBrowser(DBG_PORT_B);
-    const versionB = await waitHttp(`http://127.0.0.1:${DBG_PORT_B}/json/version`, scope.signal);
-    const clientB = cdpConnect(versionB.webSocketDebuggerUrl);
-    clients.push(clientB);
-    clientB.onEvent(recordErrors);
-    await clientB.ready;
-    const second = await clientB.send("Target.createTarget", { url: "about:blank" });
-    const attached = await clientB.send("Target.attachToTarget", {
-      targetId: second.targetId,
-      flatten: true,
-    });
-    arms.push({ name: "b", url: AB_URL, sessionId: attached.sessionId, client: clientB });
-    await forEachSequential(arms, async (arm) => {
-      BASE = arm.url;
-      cdp = arm.client;
-      cdp.setDefaultSession(arm.sessionId);
-      await cdp.send("Page.enable");
-      await cdp.send("Runtime.enable");
-      await cdp.send("Network.enable");
-      await cdp.send("Performance.enable");
-      await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_THROTTLE });
-      if (arm.name === "b")
-        await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-          source: INIT_SCRIPT + SETTLED_FN,
+    // Separate browser processes isolate the arms' caches and renderer heaps.
+    if (AB_URL) {
+      const arms = [{ name: "a", url: BASE, sessionId, client: cdp }];
+      await launchBrowser(DBG_PORT_B);
+      const versionB = await waitHttp(`http://127.0.0.1:${DBG_PORT_B}/json/version`, scope.signal);
+      const clientB = cdpConnect(versionB.webSocketDebuggerUrl);
+      clients.push(clientB);
+      clientB.onEvent(recordErrors);
+      await clientB.ready;
+      const second = await clientB.send("Target.createTarget", { url: "about:blank" });
+      const attached = await clientB.send("Target.attachToTarget", {
+        targetId: second.targetId,
+        flatten: true,
+      });
+      arms.push({ name: "b", url: AB_URL, sessionId: attached.sessionId, client: clientB });
+      await forEachSequential(arms, async (arm) => {
+        BASE = arm.url;
+        cdp = arm.client;
+        cdp.setDefaultSession(arm.sessionId);
+        await cdp.send("Page.enable");
+        await cdp.send("Runtime.enable");
+        await cdp.send("Network.enable");
+        await cdp.send("Performance.enable");
+        await cdp.send("Emulation.setCPUThrottlingRate", { rate: CPU_THROTTLE });
+        if (arm.name === "b")
+          await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+            source: INIT_SCRIPT + SETTLED_FN,
+          });
+        await cdp.send("Page.bringToFront");
+        await gotoSession(ROTATION[0]);
+        await closeRail();
+        await forEachSequential(ROTATION.slice(1), (id) =>
+          measureSwitch({ target: id, label: "warmup" }),
+        );
+        await delay(1500);
+      });
+      const samples = { a: [], b: [] };
+      const count = Number(argOf("--samples", "30"));
+      if (!Number.isInteger(count) || count < 1)
+        throw new Error("--samples must be a positive integer");
+      let discardedPairs = 0;
+      async function rewarm(arm, target) {
+        BASE = arm.url;
+        cdp = arm.client;
+        cdp.setDefaultSession(arm.sessionId);
+        await cdp.send("Page.bringToFront");
+        const others = ROTATION.filter((id) => id !== target);
+        await forEachSequential([...others, target, others[0]], async (id) => {
+          const current = await page.eval("location.pathname");
+          if (current !== `/c/${id}`) await measureSwitch({ target: id, label: "warmup" });
         });
-      await cdp.send("Page.bringToFront");
-      await gotoSession(ROTATION[0]);
+      }
+      async function collectPair(index, attempt = 0) {
+        const target = ROTATION[index % ROTATION.length];
+        const pair = [];
+        try {
+          await forEachSequential(armOrder(index), async (name) => {
+            const arm = arms.find((candidate) => candidate.name === name);
+            BASE = arm.url;
+            cdp = arm.client;
+            cdp.setDefaultSession(arm.sessionId);
+            await cdp.send("Page.bringToFront");
+            await forEachSequential(arms, async (visibleArm) => {
+              cdp = visibleArm.client;
+              cdp.setDefaultSession(visibleArm.sessionId);
+              if (await page.eval("document.hidden"))
+                throw new Error(`arm ${visibleArm.name} is hidden`);
+            });
+            cdp = arm.client;
+            cdp.setDefaultSession(arm.sessionId);
+            const sample = await measureSwitch({ target, label: arm.name });
+            sample.orderPosition = armOrder(index)[0] === arm.name ? "first" : "second";
+            pair.push({ name, sample });
+          });
+        } catch (error) {
+          if (!(error instanceof WarmSampleInvalid) || attempt >= 2) throw error;
+          discardedPairs++;
+          console.warn(`Discarding pair ${index + 1}: ${error.message}`);
+          await forEachSequential(arms, (arm) => rewarm(arm, target));
+          return collectPair(index, attempt + 1);
+        }
+        pair.forEach(({ name, sample }) => {
+          samples[name].push(sample);
+          process.stdout.write(`AB ${name} ${index + 1}/${count}: ${sample.clickToPaintedMs}ms\n`);
+        });
+      }
+      await forEachSequential(indices(count), (index) => collectPair(index));
+      results.discardedPairs = discardedPairs;
+      results.scenarios.ab = samples;
+    }
+
+    // ── Scenario: switch (rail closed) ─────────────────────────
+    if (!AB_URL && (SCENARIOS.includes("switch") || SCENARIOS.includes("switchEvicting"))) {
+      const evicting = SCENARIOS.includes("switchEvicting");
+      const rotation = evicting ? SESSIONS : ROTATION;
+      await gotoSession(rotation[0]);
       await closeRail();
-      await forEachSequential(ROTATION.slice(1), (id) =>
+      await forEachSequential(rotation.slice(1), (id) =>
         measureSwitch({ target: id, label: "warmup" }),
       );
       await delay(1500);
-    });
-    const samples = { a: [], b: [] };
-    const count = Number(argOf("--samples", "30"));
-    if (!Number.isInteger(count) || count < 1)
-      throw new Error("--samples must be a positive integer");
-    let discardedPairs = 0;
-    async function rewarm(arm, target) {
-      BASE = arm.url;
-      cdp = arm.client;
-      cdp.setDefaultSession(arm.sessionId);
-      await cdp.send("Page.bringToFront");
-      const others = ROTATION.filter((id) => id !== target);
-      await forEachSequential([...others, target, others[0]], async (id) => {
-        const current = await page.eval("location.pathname");
-        if (current !== `/c/${id}`) await measureSwitch({ target: id, label: "warmup" });
-      });
-    }
-    async function collectPair(index, attempt = 0) {
-      const target = ROTATION[index % ROTATION.length];
-      const pair = [];
-      try {
-        await forEachSequential(armOrder(index), async (name) => {
-          const arm = arms.find((candidate) => candidate.name === name);
-          BASE = arm.url;
-          cdp = arm.client;
-          cdp.setDefaultSession(arm.sessionId);
-          await cdp.send("Page.bringToFront");
-          await forEachSequential(arms, async (visibleArm) => {
-            cdp = visibleArm.client;
-            cdp.setDefaultSession(visibleArm.sessionId);
-            if (await page.eval("document.hidden"))
-              throw new Error(`arm ${visibleArm.name} is hidden`);
+
+      const samples = [];
+      const cycles = cyclesFor(evicting ? 6 : 10);
+      await forEachSequential(indices(cycles), (cyc) =>
+        forEachSequential(rotation, async (id) => {
+          const s = await measureSwitch({
+            target: id,
+            label: evicting ? "evicting" : "rail-closed",
           });
-          cdp = arm.client;
-          cdp.setDefaultSession(arm.sessionId);
-          const sample = await measureSwitch({ target, label: arm.name });
-          sample.orderPosition = armOrder(index)[0] === arm.name ? "first" : "second";
-          pair.push({ name, sample });
-        });
-      } catch (error) {
-        if (!(error instanceof WarmSampleInvalid) || attempt >= 2) throw error;
-        discardedPairs++;
-        console.warn(`Discarding pair ${index + 1}: ${error.message}`);
-        await forEachSequential(arms, (arm) => rewarm(arm, target));
-        return collectPair(index, attempt + 1);
-      }
-      pair.forEach(({ name, sample }) => {
-        samples[name].push(sample);
-        process.stdout.write(`AB ${name} ${index + 1}/${count}: ${sample.clickToPaintedMs}ms\n`);
-      });
+          samples.push(s);
+          process.stdout.write(
+            `switch cyc${cyc} ${id} marker=${s.clickToMarkerMs} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms\n`,
+          );
+        }),
+      );
+      results.scenarios[evicting ? "switchEvicting" : "switch"] = samples;
     }
-    await forEachSequential(indices(count), (index) => collectPair(index));
-    results.discardedPairs = discardedPairs;
-    results.scenarios.ab = samples;
-  }
 
-  // ── Scenario: switch (rail closed) ─────────────────────────
-  if (!AB_URL && (SCENARIOS.includes("switch") || SCENARIOS.includes("switchEvicting"))) {
-    const evicting = SCENARIOS.includes("switchEvicting");
-    const rotation = evicting ? SESSIONS : ROTATION;
-    await gotoSession(rotation[0]);
-    await closeRail();
-    await forEachSequential(rotation.slice(1), (id) =>
-      measureSwitch({ target: id, label: "warmup" }),
-    );
-    await delay(1500);
-
-    const samples = [];
-    const cycles = cyclesFor(evicting ? 6 : 10);
-    await forEachSequential(indices(cycles), (cyc) =>
-      forEachSequential(rotation, async (id) => {
-        const s = await measureSwitch({ target: id, label: evicting ? "evicting" : "rail-closed" });
-        samples.push(s);
-        process.stdout.write(
-          `switch cyc${cyc} ${id} marker=${s.clickToMarkerMs} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms\n`,
-        );
-      }),
-    );
-    results.scenarios[evicting ? "switchEvicting" : "switch"] = samples;
-
-  }
-
-  // ── Rail-open setup helpers ────────────────────────────────
-  async function expandAllRootDirs(maxExpands = 10) {
-    async function expand(remaining) {
-      if (!remaining) return;
-      const clicked = await page.eval(`(() => {
+    // ── Rail-open setup helpers ────────────────────────────────
+    async function expandAllRootDirs(maxExpands = 10) {
+      async function expand(remaining) {
+        if (!remaining) return;
+        const clicked = await page.eval(`(() => {
         const rail = document.querySelector('[aria-label="Workspace"]');
         const btn = [...(rail?.querySelectorAll("button[aria-expanded]") ?? [])]
           .filter(el => el.getAttribute("aria-expanded") === "false")
@@ -728,176 +749,181 @@ async function main() {
         btn.click();
         return true;
       })()`);
-      if (!clicked) return;
-      await delay(700);
-      return expand(remaining - 1);
+        if (!clicked) return;
+        await delay(700);
+        return expand(remaining - 1);
+      }
+      await expand(maxExpands);
+      return page.eval(
+        `document.querySelector('[aria-label="Workspace"]')?.querySelectorAll("button[aria-expanded]").length ?? 0`,
+      );
     }
-    await expand(maxExpands);
-    return page.eval(
-      `document.querySelector('[aria-label="Workspace"]')?.querySelectorAll("button[aria-expanded]").length ?? 0`,
-    );
-  }
 
-  async function setupFilesPanel(id) {
-    await openRail();
-    await clickRailTab("Files");
-    await delay(1200);
-    const rows = await expandAllRootDirs();
-    await assertRailTab("files");
-    const expanded = await page.eval(
-      `document.querySelector('[aria-label="Workspace"]')?.querySelectorAll('button[aria-expanded="true"]').length ?? 0`,
-    );
-    if (!expanded) throw new Error(`files tree has no expanded directories for ${id}`);
-    process.stdout.write(`setupFiles ${id}: expandable rows=${rows} expanded=${expanded}\n`);
-  }
+    async function setupFilesPanel(id) {
+      await openRail();
+      await clickRailTab("Files");
+      await delay(1200);
+      const rows = await expandAllRootDirs();
+      await assertRailTab("files");
+      const expanded = await page.eval(
+        `document.querySelector('[aria-label="Workspace"]')?.querySelectorAll('button[aria-expanded="true"]').length ?? 0`,
+      );
+      if (!expanded) throw new Error(`files tree has no expanded directories for ${id}`);
+      process.stdout.write(`setupFiles ${id}: expandable rows=${rows} expanded=${expanded}\n`);
+    }
 
-  // Open a file through the app's own ui.open_file SSE event (runner-native).
-  async function openFileViaSse(conversationId, filePath, waitMs = 2500) {
-    const ok = await globalThis
-      .fetch(`${BASE}/__perf__/openfile`, {
-        method: "POST",
-        body: JSON.stringify({ session: conversationId, path: filePath }),
-      })
-      .then((r) => r.json())
-      .catch(() => ({ ok: false }));
-    await delay(waitMs);
-    const visible = await page.eval(`(() => {
+    // Open a file through the app's own ui.open_file SSE event (runner-native).
+    async function openFileViaSse(conversationId, filePath, waitMs = 2500) {
+      const ok = await globalThis
+        .fetch(`${BASE}/__perf__/openfile`, {
+          method: "POST",
+          body: JSON.stringify({ session: conversationId, path: filePath }),
+        })
+        .then((r) => r.json())
+        .catch(() => ({ ok: false }));
+      await delay(waitMs);
+      const visible = await page.eval(`(() => {
       const rail = document.querySelector('[aria-label="Workspace"]');
       return rail ? (rail.textContent || "").includes(${JSON.stringify(filePath.split("/").at(-1))}) : false;
     })()`);
-    return { ok: ok.ok === true, visible };
-  }
+      return { ok: ok.ok === true, visible };
+    }
 
-  // ── Scenario: collapsed rail retaining session D's large file ──
-  if (SCENARIOS.includes("switchCollapsedFile") || SCENARIOS.includes("switchCollapsedFileEdit")) {
-    const editMode = SCENARIOS.includes("switchCollapsedFileEdit");
-    await gotoSession(ROTATION[0]);
-    await forEachSequential(ROTATION.slice(1), (id) =>
-      measureSwitch({ target: id, label: "warmup" }),
-    );
-    await openRail();
-    await clickRailTab("Files");
-    const file = "dialog_7/stepper_00002.md";
-    const opened = await openFileViaSse("conv_perf_d", file, 5000);
-    if (!opened.ok || !opened.visible)
-      throw new Error(`could not open session D file: ${JSON.stringify(opened)}`);
-    if (editMode) {
-    await page.eval(`(() => {
+    // ── Scenario: collapsed rail retaining session D's large file ──
+    if (
+      SCENARIOS.includes("switchCollapsedFile") ||
+      SCENARIOS.includes("switchCollapsedFileEdit")
+    ) {
+      const editMode = SCENARIOS.includes("switchCollapsedFileEdit");
+      await gotoSession(ROTATION[0]);
+      await forEachSequential(ROTATION.slice(1), (id) =>
+        measureSwitch({ target: id, label: "warmup" }),
+      );
+      await openRail();
+      await clickRailTab("Files");
+      const file = "dialog_7/stepper_00002.md";
+      const opened = await openFileViaSse("conv_perf_d", file, 5000);
+      if (!opened.ok || !opened.visible)
+        throw new Error(`could not open session D file: ${JSON.stringify(opened)}`);
+      if (editMode) {
+        await page.eval(`(() => {
       const button = [...document.querySelectorAll('button[aria-label="View mode: Preview"]')].find((element) => element.getBoundingClientRect().width);
       if (!button) throw new Error("viewer mode button not found");
       button.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
     })()`);
-    await delay(500);
-    await page.eval(`(() => {
+        await delay(500);
+        await page.eval(`(() => {
       const edit = [...document.querySelectorAll('[role="menuitem"]')].find((item) => item.textContent.trim() === "Edit");
       if (!edit) throw new Error("viewer Edit mode not found");
       edit.click();
     })()`);
-    await delay(2000);
-    if (!await page.eval(`!!document.querySelector('.monaco-editor .view-line')`))
-      throw new Error("session D Monaco viewer not rendered");
-    }
-    await closeRail();
-    await measureSwitch({ target: "conv_perf_b", label: "warmup" });
-    const samples = [];
-    await forEachSequential(indices(cyclesFor(10)), (cycle) =>
-      forEachSequential(ROTATION, async (id) => {
-        const sample = await measureSwitch({ target: id, label: "rail-closed-file" });
-        if (id === "conv_perf_d") {
-          sample.viewerRetained = await page.eval(`(() => {
+        await delay(2000);
+        if (!(await page.eval(`!!document.querySelector('.monaco-editor .view-line')`)))
+          throw new Error("session D Monaco viewer not rendered");
+      }
+      await closeRail();
+      await measureSwitch({ target: "conv_perf_b", label: "warmup" });
+      const samples = [];
+      await forEachSequential(indices(cyclesFor(10)), (cycle) =>
+        forEachSequential(ROTATION, async (id) => {
+          const sample = await measureSwitch({ target: id, label: "rail-closed-file" });
+          if (id === "conv_perf_d") {
+            sample.viewerRetained = await page.eval(`(() => {
           const rail = document.querySelector('[aria-label="Workspace"]');
           const text = rail?.textContent || "";
           return { file: text.includes("stepper_00002.md"), content: ${editMode} ? !!rail?.querySelector(".monaco-editor .view-line") : !!rail?.querySelector(".markdown-preview"), hidden: rail?.getAttribute("aria-hidden") === "true" };
         })()`);
-          if (
-            !sample.viewerRetained.file ||
-            !sample.viewerRetained.content ||
-            !sample.viewerRetained.hidden
-          )
-            throw new Error(
-              `session D viewer is not mounted and collapsed: ${JSON.stringify(sample.viewerRetained)}`,
-            );
-        }
-        samples.push(sample);
-        process.stdout.write(`switchCollapsedFile ${cycle} ${id}: ${sample.clickToPaintedMs}ms\n`);
-      }),
-    );
-    results.scenarios[editMode ? "switchCollapsedFileEdit" : "switchCollapsedFile"] = samples;
-  }
+            if (
+              !sample.viewerRetained.file ||
+              !sample.viewerRetained.content ||
+              !sample.viewerRetained.hidden
+            )
+              throw new Error(
+                `session D viewer is not mounted and collapsed: ${JSON.stringify(sample.viewerRetained)}`,
+              );
+          }
+          samples.push(sample);
+          process.stdout.write(
+            `switchCollapsedFile ${cycle} ${id}: ${sample.clickToPaintedMs}ms\n`,
+          );
+        }),
+      );
+      results.scenarios[editMode ? "switchCollapsedFileEdit" : "switchCollapsedFile"] = samples;
+    }
 
-  // ── Scenario: switch with Files tab open + expanded dirs ───
-  if (SCENARIOS.includes("switchFiles")) {
-    await gotoSession(ROTATION[0]);
-    await forEachSequential(ROTATION, async (id) => {
-      if (id !== ROTATION[0]) await measureSwitch({ target: id, label: "warmup" });
-      await setupFilesPanel(id);
-    });
-    await delay(1500);
-    const samples = [];
-    const cycles = cyclesFor(10);
-    await forEachSequential(indices(cycles), (cyc) =>
-      forEachSequential(ROTATION, async (id) => {
-        const s = await measureSwitch({ target: id, label: "rail-files" });
-        await assertRailTab("files");
-        samples.push(s);
-        process.stdout.write(
-          `switchFiles cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`,
-        );
-      }),
-    );
-    results.scenarios.switchFiles = samples;
-  }
+    // ── Scenario: switch with Files tab open + expanded dirs ───
+    if (SCENARIOS.includes("switchFiles")) {
+      await gotoSession(ROTATION[0]);
+      await forEachSequential(ROTATION, async (id) => {
+        if (id !== ROTATION[0]) await measureSwitch({ target: id, label: "warmup" });
+        await setupFilesPanel(id);
+      });
+      await delay(1500);
+      const samples = [];
+      const cycles = cyclesFor(10);
+      await forEachSequential(indices(cycles), (cyc) =>
+        forEachSequential(ROTATION, async (id) => {
+          const s = await measureSwitch({ target: id, label: "rail-files" });
+          await assertRailTab("files");
+          samples.push(s);
+          process.stdout.write(
+            `switchFiles cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`,
+          );
+        }),
+      );
+      results.scenarios.switchFiles = samples;
+    }
 
-  // ── Scenario: switch with Changes tab open ──────────────────
-  // The Changes surface is the folder tree with changed-file badges plus the
-  // flat 120-file changed list. A programmatic diff open did not register a
-  // viewer tab in this build (row clicks and ui.open_file both fail to mount
-  // FileViewer here), so this scenario measures the Changes surface itself.
-  if (SCENARIOS.includes("switchChanges")) {
-    await gotoSession(ROTATION[0]);
-    await forEachSequential(ROTATION, async (id) => {
-      if (id !== ROTATION[0]) await measureSwitch({ target: id, label: "warmup" });
-      await openRail();
-      await clickRailTab("Changes");
-      await delay(2000);
-      const visible = await page.eval(`(() => {
+    // ── Scenario: switch with Changes tab open ──────────────────
+    // The Changes surface is the folder tree with changed-file badges plus the
+    // flat 120-file changed list. A programmatic diff open did not register a
+    // viewer tab in this build (row clicks and ui.open_file both fail to mount
+    // FileViewer here), so this scenario measures the Changes surface itself.
+    if (SCENARIOS.includes("switchChanges")) {
+      await gotoSession(ROTATION[0]);
+      await forEachSequential(ROTATION, async (id) => {
+        if (id !== ROTATION[0]) await measureSwitch({ target: id, label: "warmup" });
+        await openRail();
+        await clickRailTab("Changes");
+        await delay(2000);
+        const visible = await page.eval(`(() => {
         const rail = document.querySelector('[aria-label="Workspace"]');
         return rail ? (rail.textContent || "").includes("profiler_52.tsx") : false;
       })()`);
-      await assertRailTab("changes");
-      if (!visible) throw new Error(`changes list not visible for ${id}`);
-      process.stdout.write(`setupChanges ${id} changesVisible=${visible}\n`);
-    });
-    await delay(2000);
-    const samples = [];
-    const cycles = cyclesFor(10);
-    await forEachSequential(indices(cycles), (cyc) =>
-      forEachSequential(ROTATION, async (id) => {
-        const s = await measureSwitch({ target: id, label: "rail-changes" });
         await assertRailTab("changes");
-        samples.push(s);
-        process.stdout.write(
-          `switchChanges cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`,
-        );
-      }),
-    );
-    results.scenarios.switchChanges = samples;
-  }
+        if (!visible) throw new Error(`changes list not visible for ${id}`);
+        process.stdout.write(`setupChanges ${id} changesVisible=${visible}\n`);
+      });
+      await delay(2000);
+      const samples = [];
+      const cycles = cyclesFor(10);
+      await forEachSequential(indices(cycles), (cyc) =>
+        forEachSequential(ROTATION, async (id) => {
+          const s = await measureSwitch({ target: id, label: "rail-changes" });
+          await assertRailTab("changes");
+          samples.push(s);
+          process.stdout.write(
+            `switchChanges cyc${cyc} ${id} painted=${s.clickToPaintedMs} settled=${s.clickToSettledMs}ms dom=${s.domNodes}\n`,
+          );
+        }),
+      );
+      results.scenarios.switchChanges = samples;
+    }
 
-  // ── Scenario: cold load ────────────────────────────────────
-  if (SCENARIOS.includes("cold")) {
-    const samples = [];
-    const perSession = CYCLES || 4;
-    await forEachSequential(indices(perSession), (i) =>
-      forEachSequential(SESSIONS, async (id) => {
-        await cdp.send("Network.clearBrowserCache");
-        await navigate(`${BASE}/c/${id}`);
-        const settled = await page.eval(
-          `window.__waitSettled(${JSON.stringify(MARKERS[id])}, { timeoutMs: 30000, sinceTs: performance.now() - 1 })`,
-          true,
-        );
-        assertColdLoad(id, settled);
-        const snap = await page.eval(`(() => {
+    // ── Scenario: cold load ────────────────────────────────────
+    if (SCENARIOS.includes("cold")) {
+      const samples = [];
+      const perSession = CYCLES || 4;
+      await forEachSequential(indices(perSession), (i) =>
+        forEachSequential(SESSIONS, async (id) => {
+          await cdp.send("Network.clearBrowserCache");
+          await navigate(`${BASE}/c/${id}`);
+          const settled = await page.eval(
+            `window.__waitSettled(${JSON.stringify(MARKERS[id])}, { timeoutMs: 30000, sinceTs: performance.now() - 1 })`,
+            true,
+          );
+          assertColdLoad(id, settled);
+          const snap = await page.eval(`(() => {
           const nav = performance.getEntriesByType("navigation")[0];
           return {
             lcp: window.__perf.lcp,
@@ -907,36 +933,36 @@ async function main() {
             commits: window.__reactCommits,
           };
         })()`);
-        const lts = await page.eval("window.__perf.longTasks");
-        samples.push({
-          target: id,
-          iter: i,
-          markerTs: settled.markerTs,
-          paintedTs: settled.paintedTs,
-          settleTs: settled.settleTs,
-          markerVisibleMs: settled.markerTs, // relative to navigation start (time origin)
-          paintedMs: settled.paintedTs,
-          lcpMs: snap.lcp,
-          dclMs: snap.dcl,
-          busy: busyStats(lts, 0, 1e12),
-          commits: snap.commits,
-          domNodes: snap.domNodes,
-          heapMB: snap.heapMB, // performance.memory.usedJSHeapSize (precise mode)
-        });
-        process.stdout.write(
-          `cold ${id} marker=${Math.round(settled.markerTs)} lcp=${Math.round(snap.lcp)} heap=${snap.heapMB}MB\n`,
-        );
-      }),
-    );
-    results.scenarios.cold = samples;
-  }
+          const lts = await page.eval("window.__perf.longTasks");
+          samples.push({
+            target: id,
+            iter: i,
+            markerTs: settled.markerTs,
+            paintedTs: settled.paintedTs,
+            settleTs: settled.settleTs,
+            markerVisibleMs: settled.markerTs, // relative to navigation start (time origin)
+            paintedMs: settled.paintedTs,
+            lcpMs: snap.lcp,
+            dclMs: snap.dcl,
+            busy: busyStats(lts, 0, 1e12),
+            commits: snap.commits,
+            domNodes: snap.domNodes,
+            heapMB: snap.heapMB, // performance.memory.usedJSHeapSize (precise mode)
+          });
+          process.stdout.write(
+            `cold ${id} marker=${Math.round(settled.markerTs)} lcp=${Math.round(snap.lcp)} heap=${snap.heapMB}MB\n`,
+          );
+        }),
+      );
+      results.scenarios.cold = samples;
+    }
 
-  // ── Idle sampler shared by idle / idleViewer ───────────────
-  async function idleSample(cdp2, seconds = 10) {
-    await page.eval(`window.__resetPerf()`);
-    const before = await perfMetrics(cdp2);
-    const sample = await page.eval(
-      `(async () => {
+    // ── Idle sampler shared by idle / idleViewer ───────────────
+    async function idleSample(cdp2, seconds = 10) {
+      await page.eval(`window.__resetPerf()`);
+      const before = await perfMetrics(cdp2);
+      const sample = await page.eval(
+        `(async () => {
       const t0 = performance.now();
       const lt0 = window.__perf.longTasks.length;
       let dropped = 0;
@@ -953,52 +979,52 @@ async function main() {
         droppedFrames: dropped,
       };
     })()`,
-      true,
-    );
-    const after = await perfMetrics(cdp2);
-    const guardrails = await page.eval(
-      `({ commits: window.__reactCommits, heapMB: (performance.memory?.usedJSHeapSize ?? 0) / 1048576 })`,
-    );
-    return {
-      ...sample,
-      ...guardrails,
-      cdp: metricsDelta(after, before),
-      taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000,
-      scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000,
-    };
-  }
+        true,
+      );
+      const after = await perfMetrics(cdp2);
+      const guardrails = await page.eval(
+        `({ commits: window.__reactCommits, heapMB: (performance.memory?.usedJSHeapSize ?? 0) / 1048576 })`,
+      );
+      return {
+        ...sample,
+        ...guardrails,
+        cdp: metricsDelta(after, before),
+        taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000,
+        scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000,
+      };
+    }
 
-  // ── Scenario: idle steady state (rail closed) ──────────────
-  if (SCENARIOS.includes("idle")) {
-    const samples = [];
-    const iters = CYCLES || 2;
-    await forEachSequential(SESSIONS, (id) =>
-      forEachSequential(indices(iters), async (i) => {
-        await gotoSession(id);
-        await delay(2000);
-        samples.push({ target: id, iter: i, rail: "closed", ...(await idleSample(cdp)) });
-        process.stdout.write(`idle ${id} task=${Math.round(samples.at(-1).taskDurationMs)}ms\n`);
-      }),
-    );
-    results.scenarios.idle = samples;
-  }
+    // ── Scenario: idle steady state (rail closed) ──────────────
+    if (SCENARIOS.includes("idle")) {
+      const samples = [];
+      const iters = CYCLES || 2;
+      await forEachSequential(SESSIONS, (id) =>
+        forEachSequential(indices(iters), async (i) => {
+          await gotoSession(id);
+          await delay(2000);
+          samples.push({ target: id, iter: i, rail: "closed", ...(await idleSample(cdp)) });
+          process.stdout.write(`idle ${id} task=${Math.round(samples.at(-1).taskDurationMs)}ms\n`);
+        }),
+      );
+      results.scenarios.idle = samples;
+    }
 
-  // ── Streaming helper ───────────────────────────────────────
-  async function streamSample(target, iter, extra = {}) {
-    if (extra.history !== "full") await gotoSession(target);
-    await delay(1500);
-    await page.eval(`window.__resetPerf()`);
-    const before = await perfMetrics(cdp);
-    const startRes = await globalThis
-      .fetch(`${BASE}/__perf__/stream/start`, {
-        method: "POST",
-        body: JSON.stringify({ session: target, duration_ms: 10000, events_per_sec: 20 }),
-      })
-      .then((r) => r.json());
-    if (!startRes.ok || !startRes.total_events)
-      throw new Error(`stream injection failed: ${JSON.stringify(startRes)}`);
-    const sample = await page.eval(
-      `(async () => {
+    // ── Streaming helper ───────────────────────────────────────
+    async function streamSample(target, iter, extra = {}) {
+      if (extra.history !== "full") await gotoSession(target);
+      await delay(1500);
+      await page.eval(`window.__resetPerf()`);
+      const before = await perfMetrics(cdp);
+      const startRes = await globalThis
+        .fetch(`${BASE}/__perf__/stream/start`, {
+          method: "POST",
+          body: JSON.stringify({ session: target, duration_ms: 10000, events_per_sec: 20 }),
+        })
+        .then((r) => r.json());
+      if (!startRes.ok || !startRes.total_events)
+        throw new Error(`stream injection failed: ${JSON.stringify(startRes)}`);
+      const sample = await page.eval(
+        `(async () => {
       const t0 = performance.now();
       const lt0 = window.__perf.longTasks.length;
       const commit0 = window.__reactCommits;
@@ -1018,155 +1044,163 @@ async function main() {
         commits: window.__reactCommits - commit0,
       };
     })()`,
-      true,
-    );
-    const after = await perfMetrics(cdp);
-    const stopRes = await globalThis
-      .fetch(`${BASE}/__perf__/stream/stop`, {
-        method: "POST",
-        body: JSON.stringify({ token: startRes.token }),
-      })
-      .then((response) => response.json());
-    if (!stopRes.ok || !Number.isInteger(stopRes.emitted) || stopRes.emitted < 1) {
-      throw new Error(`stream stop failed: ${JSON.stringify(stopRes)}`);
-    }
-    const out = {
-      target,
-      iter,
-      plannedEvents: startRes.total_events,
-      injectedEvents: stopRes.emitted,
-      ...sample,
-      commitsPerEvent: Math.round((sample.commits / stopRes.emitted) * 100) / 100,
-      taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000,
-      scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000,
-      heapMB: await page.eval("(performance.memory?.usedJSHeapSize ?? 0) / 1048576"),
-      cdp: metricsDelta(after, before),
-      ...extra,
-    };
-    process.stdout.write(
-      `stream ${target} commits=${sample.commits} task=${Math.round(out.taskDurationMs)}ms\n`,
-    );
-    return out;
-  }
-
-  if (SCENARIOS.includes("stream")) {
-    const samples = [];
-    await forEachSequential(indices(cyclesFor(5)), async (i) => {
-      samples.push(await streamSample("conv_perf_a", i, { history: "window-only" }));
-    });
-    results.scenarios.stream = samples;
-  }
-
-  // ── Scenario: deep history (full page-in of sessions a and b) ──
-  // The StickToBottom wrapper re-sticks programmatic scrollTop writes, so the
-  // scroll-up must come from trusted wheel events (CDP Input) to escape the
-  // lock and let HistoryAutoLoader chain-load pages.
-  async function wheelScrollUp(cdp2, times = 1) {
-    await forEachSequential(indices(times), () =>
-      cdp2.send("Input.dispatchMouseEvent", {
-        type: "mouseWheel",
-        x: 800,
-        y: 450,
-        deltaX: 0,
-        deltaY: -1200,
-      }),
-    );
-  }
-  async function pageInFullHistory(id, cdp2) {
-    const marker = OLD_MARKERS[id];
-    // Primary: the app's message deep-link — /c/{id}?message={oldestItem}
-    // pages back until that item renders (app-native, fast).
-    const oldestId = id === "conv_perf_a" ? "itm_a_00001" : "itm_b_00001";
-    await navigate(`${BASE}/c/${id}?message=${oldestId}`);
-    async function waitForOldest(attempt) {
-      if (attempt >= 90) return -1;
-      if (attempt >= 30) await wheelScrollUp(cdp2, 3);
-      await delay(attempt < 30 ? 1200 : 900);
-      if (await page.eval(`(document.body?.textContent ?? "").includes(${JSON.stringify(marker)})`))
-        return attempt + 1;
-      return waitForOldest(attempt + 1);
-    }
-    return waitForOldest(0);
-  }
-
-  if (SCENARIOS.includes("deepHistory")) {
-    const out = { load: [], stream: [], idleDeep: [] };
-    await forEachSequential(indices(cyclesFor(15)), (iteration) => forEachSequential(["conv_perf_a", "conv_perf_b"], async (id) => {
-      await gotoSession(id);
-      await delay(1500);
-      const loadT0 = Date.now();
-      const attempts = await pageInFullHistory(id, cdp);
-      const loadMs = Date.now() - loadT0;
-      const probe = await page.eval(`(() => {
-        const sc = document.querySelector('[data-virtualized-transcript]') ?? document.querySelector('[role="log"]');
-        return { markerSeen: (document.body?.textContent ?? "").includes(${JSON.stringify(OLD_MARKERS[id])}), scrollHeight: sc?.scrollHeight ?? null };
-      })()`);
-      out.load.push({ target: id, loadMs, attempts, ...probe });
-      process.stdout.write(
-        `deepHistory load ${id}: ${loadMs}ms attempts=${attempts} seen=${probe.markerSeen} h=${probe.scrollHeight}\n`,
+        true,
       );
-      if (!probe.markerSeen) throw new Error(`oldest history marker not visible for ${id}`);
-      // The deep-link scroll position can be restored after a programmatic scroll.
-      // Keep the loaded session mounted and wait until the latest marker is visible.
-      async function waitForLatest(attempt) {
-        if (attempt >= 20) return false;
-        await page.eval(
-          `(() => { const sc = document.querySelector('[data-virtualized-transcript]'); if (sc) sc.scrollTop = sc.scrollHeight; })()`,
-        );
-        await cdp.send("Input.dispatchMouseEvent", {
+      const after = await perfMetrics(cdp);
+      const stopRes = await globalThis
+        .fetch(`${BASE}/__perf__/stream/stop`, {
+          method: "POST",
+          body: JSON.stringify({ token: startRes.token }),
+        })
+        .then((response) => response.json());
+      if (!stopRes.ok || !Number.isInteger(stopRes.emitted) || stopRes.emitted < 1) {
+        throw new Error(`stream stop failed: ${JSON.stringify(stopRes)}`);
+      }
+      const out = {
+        target,
+        iter,
+        plannedEvents: startRes.total_events,
+        injectedEvents: stopRes.emitted,
+        ...sample,
+        commitsPerEvent: Math.round((sample.commits / stopRes.emitted) * 100) / 100,
+        taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000,
+        scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000,
+        heapMB: await page.eval("(performance.memory?.usedJSHeapSize ?? 0) / 1048576"),
+        cdp: metricsDelta(after, before),
+        ...extra,
+      };
+      process.stdout.write(
+        `stream ${target} commits=${sample.commits} task=${Math.round(out.taskDurationMs)}ms\n`,
+      );
+      return out;
+    }
+
+    if (SCENARIOS.includes("stream")) {
+      const samples = [];
+      await forEachSequential(indices(cyclesFor(5)), async (i) => {
+        samples.push(await streamSample("conv_perf_a", i, { history: "window-only" }));
+      });
+      results.scenarios.stream = samples;
+    }
+
+    // ── Scenario: deep history (full page-in of sessions a and b) ──
+    // The StickToBottom wrapper re-sticks programmatic scrollTop writes, so the
+    // scroll-up must come from trusted wheel events (CDP Input) to escape the
+    // lock and let HistoryAutoLoader chain-load pages.
+    async function wheelScrollUp(cdp2, times = 1) {
+      await forEachSequential(indices(times), () =>
+        cdp2.send("Input.dispatchMouseEvent", {
           type: "mouseWheel",
           x: 800,
           y: 450,
           deltaX: 0,
-          deltaY: 12000,
-        });
-        await delay(1200);
-        if (
-          await page.eval(
-            `(document.body?.textContent ?? "").includes(${JSON.stringify(MARKERS[id])})`,
-          )
-        )
-          return true;
-        return waitForLatest(attempt + 1);
-      }
-      const latestVisible = await waitForLatest(0);
-      out.load.at(-1).latestVisible = latestVisible;
-      if (!latestVisible) throw new Error(`latest marker not visible for ${id}`);
-      await delay(1500);
-      const idleDeep = await idleSample(cdp);
-      out.idleDeep.push({ target: id, ...idleDeep });
-      process.stdout.write(
-        `deepHistory idle ${id} task=${Math.round(idleDeep.taskDurationMs)}ms\n`,
+          deltaY: -1200,
+        }),
       );
-
-      {
-        const s = await streamSample(id, iteration, {
-          history: "full",
-          idleTaskMs: idleDeep.taskDurationMs,
-        });
-        s.taskMsPerEvent =
-          Math.round(
-            ((s.taskDurationMs - idleDeep.taskDurationMs) / Math.max(1, s.injectedEvents)) * 100,
-          ) / 100;
-        out.stream.push(s);
+    }
+    async function pageInFullHistory(id, cdp2) {
+      const marker = OLD_MARKERS[id];
+      // Primary: the app's message deep-link — /c/{id}?message={oldestItem}
+      // pages back until that item renders (app-native, fast).
+      const oldestId = id === "conv_perf_a" ? "itm_a_00001" : "itm_b_00001";
+      await navigate(`${BASE}/c/${id}?message=${oldestId}`);
+      async function waitForOldest(attempt) {
+        if (attempt >= 90) return -1;
+        if (attempt >= 30) await wheelScrollUp(cdp2, 3);
+        await delay(attempt < 30 ? 1200 : 900);
+        if (
+          await page.eval(`(document.body?.textContent ?? "").includes(${JSON.stringify(marker)})`)
+        )
+          return attempt + 1;
+        return waitForOldest(attempt + 1);
       }
-    }));
-    results.scenarios.deepHistory = out;
+      return waitForOldest(0);
+    }
+
+    if (SCENARIOS.includes("deepHistory")) {
+      const out = { load: [], stream: [], idleDeep: [] };
+      await forEachSequential(indices(cyclesFor(15)), (iteration) =>
+        forEachSequential(["conv_perf_a", "conv_perf_b"], async (id) => {
+          await gotoSession(id);
+          await delay(1500);
+          const loadT0 = Date.now();
+          const attempts = await pageInFullHistory(id, cdp);
+          const loadMs = Date.now() - loadT0;
+          const probe = await page.eval(`(() => {
+        const sc = document.querySelector('[data-virtualized-transcript]') ?? document.querySelector('[role="log"]');
+        return { markerSeen: (document.body?.textContent ?? "").includes(${JSON.stringify(OLD_MARKERS[id])}), scrollHeight: sc?.scrollHeight ?? null };
+      })()`);
+          out.load.push({ target: id, loadMs, attempts, ...probe });
+          process.stdout.write(
+            `deepHistory load ${id}: ${loadMs}ms attempts=${attempts} seen=${probe.markerSeen} h=${probe.scrollHeight}\n`,
+          );
+          if (!probe.markerSeen) throw new Error(`oldest history marker not visible for ${id}`);
+          // The deep-link scroll position can be restored after a programmatic scroll.
+          // Keep the loaded session mounted and wait until the latest marker is visible.
+          async function waitForLatest(attempt) {
+            if (attempt >= 20) return false;
+            await page.eval(
+              `(() => { const sc = document.querySelector('[data-virtualized-transcript]'); if (sc) sc.scrollTop = sc.scrollHeight; })()`,
+            );
+            await cdp.send("Input.dispatchMouseEvent", {
+              type: "mouseWheel",
+              x: 800,
+              y: 450,
+              deltaX: 0,
+              deltaY: 12000,
+            });
+            await delay(1200);
+            if (
+              await page.eval(
+                `(document.body?.textContent ?? "").includes(${JSON.stringify(MARKERS[id])})`,
+              )
+            )
+              return true;
+            return waitForLatest(attempt + 1);
+          }
+          const latestVisible = await waitForLatest(0);
+          out.load.at(-1).latestVisible = latestVisible;
+          if (!latestVisible) throw new Error(`latest marker not visible for ${id}`);
+          await delay(1500);
+          const idleDeep = await idleSample(cdp);
+          out.idleDeep.push({ target: id, ...idleDeep });
+          process.stdout.write(
+            `deepHistory idle ${id} task=${Math.round(idleDeep.taskDurationMs)}ms\n`,
+          );
+
+          {
+            const s = await streamSample(id, iteration, {
+              history: "full",
+              idleTaskMs: idleDeep.taskDurationMs,
+            });
+            s.taskMsPerEvent =
+              Math.round(
+                ((s.taskDurationMs - idleDeep.taskDurationMs) / Math.max(1, s.injectedEvents)) *
+                  100,
+              ) / 100;
+            out.stream.push(s);
+          }
+        }),
+      );
+      results.scenarios.deepHistory = out;
+    }
+
+    results.consoleErrors = consoleErrors.slice(0, 50);
+    const suffix = CPU_THROTTLE === 4 ? "-4x" : "";
+    fs.writeFileSync(path.join(OUT, `results-v2${suffix}.json`), JSON.stringify(results, null, 1));
+    console.log(`\nraw results → ${path.join(OUT, `results-v2${suffix}.json`)}`);
+    clients.forEach((client) => client.close());
   }
 
-  results.consoleErrors = consoleErrors.slice(0, 50);
-  const suffix = CPU_THROTTLE === 4 ? "-4x" : "";
-  fs.writeFileSync(path.join(OUT, `results-v2${suffix}.json`), JSON.stringify(results, null, 1));
-  console.log(`\nraw results → ${path.join(OUT, `results-v2${suffix}.json`)}`);
-  clients.forEach((client) => client.close());
-}
-
-const watchdogMs = Number(argOf("--watchdog-minutes", "25")) * 60_000;
-const watchdog = setTimeout(() => scope.abort(new Error(`watchdog: run exceeded ${watchdogMs / 60000} min`)), watchdogMs);
-watchdog.unref();
-try {
-  await main();
-} finally {
-  clearTimeout(watchdog);
-}
+  const watchdogMs = Number(argOf("--watchdog-minutes", "25")) * 60_000;
+  const watchdog = setTimeout(
+    () => scope.abort(new Error(`watchdog: run exceeded ${watchdogMs / 60000} min`)),
+    watchdogMs,
+  );
+  watchdog.unref();
+  try {
+    await main();
+  } finally {
+    clearTimeout(watchdog);
+  }
 });

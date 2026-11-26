@@ -68,6 +68,8 @@ lost. Results include raw samples and `ab-summary.json`; processes and temporary
 worktrees are cleaned up on completion or interruption. Use separate output
 folders and distinct `--port-a`, `--port-b`, `--cdp-port` and `--cdp-port-b`
 when running alongside other processes. `--latency-ms` applies to both servers.
+Use `--features-a` and `--features-b` for comma-separated mock server feature
+names, or `server.mjs --features` for a single server.
 
 The summary uses nearest-rank p50/p75/p90 and paired bootstrap 95% intervals
 for B-minus-A deltas, with commit, long-task, layout, style and heap guardrails.

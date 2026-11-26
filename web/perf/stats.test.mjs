@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { bootstrapDelta, percentile } from "./ab.mjs";
-import { armOrder, assertColdLoad } from "./cdp.mjs";
+import { armOrder, assertColdLoad, assertSwitch } from "./cdp.mjs";
 
 test("cold-load marker timeouts fail instead of producing a sample", () => {
   assert.throws(
@@ -9,8 +9,27 @@ test("cold-load marker timeouts fail instead of producing a sample", () => {
     /cold load example failed/,
   );
   assert.throws(() => assertColdLoad("example", {}), /cold load example failed/);
-  assert.throws(() => assertColdLoad("example", { markerTs: 12, paintedTs: 16, settleTs: -1 }), /cold load example failed/);
-  assert.doesNotThrow(() => assertColdLoad("example", { markerTs: 12, paintedTs: 16, settleTs: 20 }));
+  assert.throws(
+    () => assertColdLoad("example", { markerTs: 12, paintedTs: 16, settleTs: -1 }),
+    /cold load example failed/,
+  );
+  assert.doesNotThrow(() =>
+    assertColdLoad("example", { markerTs: 12, paintedTs: 16, settleTs: 20 }),
+  );
+});
+
+test("switch measurements reject markers seen before the click", () => {
+  assert.throws(
+    () => assertSwitch("example", { clickTs: 20, markerTs: 19, paintedTs: 24, settleTs: 30 }),
+    /switch to example failed/,
+  );
+  assert.throws(
+    () => assertSwitch("example", { clickTs: 20, markerTs: 21, paintedTs: 20, settleTs: 30 }),
+    /switch to example failed/,
+  );
+  assert.doesNotThrow(() =>
+    assertSwitch("example", { clickTs: 20, markerTs: 21, paintedTs: 24, settleTs: 30 }),
+  );
 });
 
 test("arm order counterbalances adjacent pairs", () => {

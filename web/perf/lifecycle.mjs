@@ -53,30 +53,43 @@ export async function withLifecycle(work) {
   } finally {
     process.off("SIGINT", onInt);
     process.off("SIGTERM", onTerm);
-    await Promise.all([...children].map(async ([child, { exited, graceMs }]) => {
-      try {
-        if (child.exitCode === null && child.signalCode === null && child.pid) {
-          child.kill("SIGTERM");
-          let timer;
-          const done = await Promise.race([
-            exited.then(() => true),
-            new Promise((resolve) => { timer = setTimeout(() => resolve(false), graceMs); }),
-          ]);
-          clearTimeout(timer);
-          if (!done) {
-            child.kill("SIGKILL");
-            await exited;
+    await Promise.all(
+      [...children].map(async ([child, { exited, graceMs }]) => {
+        try {
+          if (child.exitCode === null && child.signalCode === null && child.pid) {
+            child.kill("SIGTERM");
+            let timer;
+            const done = await Promise.race([
+              exited.then(() => true),
+              new Promise((resolve) => {
+                timer = setTimeout(() => resolve(false), graceMs);
+              }),
+            ]);
+            clearTimeout(timer);
+            if (!done) {
+              child.kill("SIGKILL");
+              await exited;
+            }
           }
+        } catch (error) {
+          errors.push(error);
         }
-      } catch (error) {
-        errors.push(error);
-      }
-    }));
-    await cleanups.reverse().reduce((previous, cleanup) => previous.then(async () => {
-      try { await cleanup(); } catch (error) { errors.push(error); }
-    }), Promise.resolve());
+      }),
+    );
+    await cleanups.reverse().reduce(
+      (previous, cleanup) =>
+        previous.then(async () => {
+          try {
+            await cleanup();
+          } catch (error) {
+            errors.push(error);
+          }
+        }),
+      Promise.resolve(),
+    );
   }
-  if (failure && errors.length) throw new AggregateError([failure, ...errors], "work and cleanup failed");
+  if (failure && errors.length)
+    throw new AggregateError([failure, ...errors], "work and cleanup failed");
   if (failure) throw new AggregateError([failure], failure.message);
   if (errors.length) throw new AggregateError(errors, "cleanup failed");
   return result;

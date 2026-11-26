@@ -20,6 +20,9 @@ function argOf(name, fallback) {
 const PORT = Number(argOf("--port", 5299));
 const DIST = path.resolve(here, argOf("--dist", "dist"));
 const LOG_PATH = path.resolve(argOf("--out", path.join(here, "out")), "unmatched.log");
+const featureNames = argOf("--features", "").split(",").filter(Boolean);
+if (featureNames.some((name) => !/^[a-z][a-z0-9_]*$/.test(name)))
+  throw new Error("--features must be comma-separated feature names");
 const latencyArg = argOf("--latency-ms", "0");
 if (!/^\d+(?:-\d+)?$/.test(latencyArg))
   throw new Error("--latency-ms must be a nonnegative number or min-max");
@@ -136,7 +139,9 @@ function serveStatic(req, res, pathname) {
     "content-length": fs.statSync(file).size,
     "cache-control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
   });
-  fs.createReadStream(file).on("error", () => res.destroy()).pipe(res);
+  fs.createReadStream(file)
+    .on("error", () => res.destroy())
+    .pipe(res);
 }
 
 // ── Mock API state ───────────────────────────────────────────
@@ -153,7 +158,7 @@ const SERVER_INFO = {
   public_sharing_enabled: false,
   server_version: "perf-mock-0.0.0",
   smart_routing_enabled: false,
-  features: {},
+  features: Object.fromEntries(featureNames.map((name) => [name, true])),
   harness_install_enabled: false,
   dictation_available: false,
   automations_enabled: false,
@@ -316,7 +321,9 @@ function workspaceMethod(res, method, body, contentType) {
     path: entry.path,
     type: entry.type,
     ignored: entry.ignored,
-    ...(entry.type === "ENTRY_TYPE_FILE" ? { size: String(Buffer.byteLength(fileContentFor(entry.path))) } : {}),
+    ...(entry.type === "ENTRY_TYPE_FILE"
+      ? { size: String(Buffer.byteLength(fileContentFor(entry.path))) }
+      : {}),
   });
   const json = (obj) => {
     const buf = encode(obj);
@@ -346,7 +353,7 @@ function workspaceMethod(res, method, body, contentType) {
           "StatPath",
           "SearchFiles",
           "git",
-         ],
+        ],
       });
       return;
     case "ListDirectory": {
@@ -409,13 +416,15 @@ function workspaceMethod(res, method, body, contentType) {
       });
       return;
     case "ListWorkingCopyChanges":
-      json({ files: changes.map((change) => ({
-        path: change.path,
-        status: change.change_type.replace("CHANGE_TYPE_", "CHANGE_STATUS_"),
-        linesAdded: change.additions,
-        linesRemoved: change.deletions,
-        binary: change.binary,
-      })) });
+      json({
+        files: changes.map((change) => ({
+          path: change.path,
+          status: change.change_type.replace("CHANGE_TYPE_", "CHANGE_STATUS_"),
+          linesAdded: change.additions,
+          linesRemoved: change.deletions,
+          binary: change.binary,
+        })),
+      });
       return;
     case "ListRepositoryRefs":
       json({
@@ -498,6 +507,7 @@ function injectStreamTurn(sessionId, opts) {
   const total = Math.round((durationMs / 1000) * eventsPerSec);
   const token = randomUUID();
   const responseId = `resp_stream_${token}`;
+  const messageId = `msg_${responseId}`;
   const callId = `call_stream_${token}`;
   for (const res of set) {
     sseWrite(res, "response.created", {
@@ -517,6 +527,7 @@ function injectStreamTurn(sessionId, opts) {
   const textEnd = Math.floor(total * 0.55);
   const toolEnd = Math.floor(total * 0.85);
   let i = 0;
+  let streamedText = "";
   let finished = false;
   const finish = () => {
     if (finished) return i;
@@ -524,15 +535,15 @@ function injectStreamTurn(sessionId, opts) {
     clearInterval(iv);
     for (const res of set) {
       sseWrite(res, "response.output_item.done", {
+        message_id: messageId,
         item: {
           id: `itm_stream_${responseId}`,
           type: "message",
           response_id: responseId,
+          stream_message_id: messageId,
           status: "completed",
           role: "assistant",
-          content: [
-            { type: "output_text", text: `Streamed ${i} events for the perf streaming scenario.` },
-          ],
+          content: [{ type: "output_text", text: streamedText }],
         },
       });
       sseWrite(res, "response.completed", {
@@ -544,13 +555,18 @@ function injectStreamTurn(sessionId, opts) {
   };
   const iv = setInterval(() => {
     const n = i++;
+    const word = words[n % words.length];
+    let textDelta = "";
+    if (n < textEnd)
+      textDelta =
+        (n % 12 === 11 ? "\n" : n % 5 === 4 ? " " : word) + (n % 7 === 3 ? `-${word}` : "");
+    else if (n > toolEnd) textDelta = n % 5 === 4 ? " " : word;
+    streamedText += textDelta;
     for (const res of set) {
-      const word = words[n % words.length];
       if (n < textEnd) {
         sseWrite(res, "response.output_text.delta", {
-          delta:
-            (n % 12 === 11 ? "\n" : n % 5 === 4 ? " " : word) + (n % 7 === 3 ? `-${word}` : ""),
-          message_id: `msg_${responseId}`,
+          delta: textDelta,
+          message_id: messageId,
           index: n,
         });
       } else if (n === textEnd) {
@@ -583,8 +599,8 @@ function injectStreamTurn(sessionId, opts) {
         });
       } else {
         sseWrite(res, "response.output_text.delta", {
-          delta: n % 5 === 4 ? " " : word,
-          message_id: `msg_${responseId}`,
+          delta: textDelta,
+          message_id: messageId,
           index: n,
         });
       }

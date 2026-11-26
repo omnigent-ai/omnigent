@@ -25,7 +25,9 @@ test(
       ]);
       assert.equal(generated.status, 0, generated.stderr.toString());
       const markdown = fs.readFileSync(path.join(fixtures, "markdown.txt"), "utf8");
-      assert.ok(Buffer.byteLength(markdown) > 256 * 1024 && Buffer.byteLength(markdown) < 1024 * 1024);
+      assert.ok(
+        Buffer.byteLength(markdown) > 256 * 1024 && Buffer.byteLength(markdown) < 1024 * 1024,
+      );
       assert.equal((markdown.match(/^## /gm) ?? []).length, 120);
       assert.equal((markdown.match(/^  - /gm) ?? []).length, 240);
       assert.equal((markdown.match(/^\| --- /gm) ?? []).length, 120);
@@ -39,7 +41,11 @@ test(
         const segments = entry.path.split("/");
         for (let index = 1; index < segments.length; index++) {
           const ancestor = segments.slice(0, index).join("/");
-          assert.equal(entries.get(ancestor)?.type, "ENTRY_TYPE_DIRECTORY", `missing directory ${ancestor}`);
+          assert.equal(
+            entries.get(ancestor)?.type,
+            "ENTRY_TYPE_DIRECTORY",
+            `missing directory ${ancestor}`,
+          );
         }
       }
       vite = await createServer({
