@@ -145,6 +145,15 @@ let sharedOwner: WorkingCopyComparisonOwner | null = null;
 /** Reviews of repository folders inside sessions' workspaces, such as worktrees, one per folder. */
 const repositoryOwners = new Map<string, WorkingCopyComparisonOwner>();
 
+/** A session's comparison listener, with what stops it on each owner it was attached to. */
+interface SessionSubscription {
+  sessionId: string;
+  listener: () => void;
+  stops: (() => void)[];
+}
+/** Listeners from `subscribeSessionComparisons`, attached to each folder owner as it's made. */
+const sessionSubscriptions = new Set<SessionSubscription>();
+
 /** The document's one comparison owner, created on first use. */
 export function workingCopyComparisons(): WorkingCopyComparisonOwner {
   sharedOwner ??= createOwner();
@@ -171,6 +180,9 @@ export function workingCopyComparisonsAt(
   if (!owner) {
     owner = createOwner(repository, workspaceKey);
     repositoryOwners.set(key, owner);
+    for (const subscription of sessionSubscriptions) {
+      subscription.stops.push(owner.subscribe(subscription.sessionId, subscription.listener));
+    }
   }
   return owner;
 }
@@ -185,12 +197,23 @@ export function sessionChoiceCount(sessionId: string): number {
   return count;
 }
 
-/** Calls `listener` when the session's comparisons change in the workspace's or a folder's review. */
+/**
+ * Calls `listener` when the session's comparisons change in the workspace's review or in a
+ * folder's, including a folder whose review opens later.
+ */
 export function subscribeSessionComparisons(sessionId: string, listener: () => void): () => void {
-  const stops = [workingCopyComparisons(), ...repositoryOwners.values()].map((owner) =>
-    owner.subscribe(sessionId, listener),
-  );
-  return () => stops.forEach((stop) => stop());
+  const subscription: SessionSubscription = {
+    sessionId,
+    listener,
+    stops: [workingCopyComparisons(), ...repositoryOwners.values()].map((owner) =>
+      owner.subscribe(sessionId, listener),
+    ),
+  };
+  sessionSubscriptions.add(subscription);
+  return () => {
+    sessionSubscriptions.delete(subscription);
+    subscription.stops.forEach((stop) => stop());
+  };
 }
 
 /** Replaces the shared owner, for tests; `null` makes the next use create a real one. */

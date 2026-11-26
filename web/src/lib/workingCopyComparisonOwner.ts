@@ -26,7 +26,10 @@ export interface ComparisonConsumer {
   /** Whether this view may read the workspace now: permission, serveability, environment. */
   enabled: boolean;
   sessionHostId: string | null;
-  /** The session's workspace root, once known; a typed comparison belongs to it. */
+  /**
+   * The session's workspace root, once known, also in a repository folder's review. A typed
+   * comparison belongs to it, or to the owner's folder inside it.
+   */
   root?: string | null;
 }
 
@@ -313,7 +316,7 @@ export class WorkingCopyComparisonOwner {
     const session = this.session(sessionId);
     if (!session.workspace) return;
     session.choices += 1;
-    this.deps.customComparisons?.write(sessionId, session.workspace, spec);
+    this.deps.customComparisons?.write(sessionId, this.savedIn(session.workspace), spec);
     this.applyCustom(session, spec);
     this.clearChoiceState(session);
     session.dirty = true;
@@ -548,12 +551,26 @@ export class WorkingCopyComparisonOwner {
 
   private readCustom(session: SessionState): RevisionSpec | null {
     if (!session.workspace) return null;
-    return this.deps.customComparisons?.read(session.sessionId, session.workspace) ?? null;
+    return (
+      this.deps.customComparisons?.read(session.sessionId, this.savedIn(session.workspace)) ?? null
+    );
+  }
+
+  /**
+   * Where a typed comparison is saved: the workspace, or for a repository folder that folder
+   * inside it, so a folder's choice never overwrites the workspace's or another folder's.
+   */
+  private savedIn(workspace: ComparisonWorkspace): ComparisonWorkspace {
+    if (!this.repository) return workspace;
+    return {
+      hostId: workspace.hostId,
+      root: `${workspace.root.replace(/\/+$/, "")}/${this.repository}`,
+    };
   }
 
   private clearCustom(session: SessionState): void {
     if (session.workspace) {
-      this.deps.customComparisons?.clear(session.sessionId, session.workspace);
+      this.deps.customComparisons?.clear(session.sessionId, this.savedIn(session.workspace));
     }
     this.applyCustom(session, null);
   }
@@ -656,6 +673,8 @@ export class WorkingCopyComparisonOwner {
     session.problem = null;
     session.attempted = false;
     session.dirty = true;
+    // Recovery chains ran under the previous comparison, so the new one starts with none.
+    session.recoveryUsed.clear();
     this.settleRecoveries(session, Number.POSITIVE_INFINITY, false);
     this.publish(session);
   }
