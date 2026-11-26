@@ -92,7 +92,10 @@ export function useSessionsFinderView(active: boolean, query: string): SessionsF
       ...contentSessions.map((session) =>
         paletteSessionItem(session, MESSAGE_MATCHES_GROUP, highlight),
       ),
-      ...paletteShowMoreItems("content", contentSearch, contentSessions, MESSAGE_MATCHES_GROUP),
+      // Like the title group, only the query the server answered pages, never one typed since.
+      ...(showingServerMatches
+        ? paletteShowMoreItems("content", contentSearch, contentSessions, MESSAGE_MATCHES_GROUP)
+        : []),
     ];
   }, [
     typed,

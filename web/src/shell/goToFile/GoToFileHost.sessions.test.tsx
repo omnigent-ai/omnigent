@@ -50,12 +50,19 @@ const searches = vi.hoisted(() => ({
   // A failed group or page, as the search reports it; none by default.
   failed: null as null | { more: boolean },
   retries: 0,
+  // The query the server last answered, when the debounce lags the typed one; null keeps up.
+  answered: null as string | null,
+  // Whether message matches have another page, and how often it was asked for.
+  contentMore: false,
+  contentPagesFetched: 0,
 }));
 vi.mock("../usePaletteSessionSearch", () => ({
   usePaletteSessionSearch: (options: { open: boolean }) => {
     searches.options.push(options);
     const [query, setQuery] = useState("");
     const typed = options.open && query.trim() !== "";
+    const debouncedQuery = searches.answered ?? query;
+    const showingServerMatches = typed && debouncedQuery === query;
     const paging = {
       hasNextPage: false,
       isFetchNextPageError: false,
@@ -65,17 +72,25 @@ vi.mock("../usePaletteSessionSearch", () => ({
     return {
       query,
       setQuery,
-      debouncedQuery: query,
+      debouncedQuery,
       visibleSessions: typed
         ? query.toLowerCase().includes("upload")
           ? [paletteSession(NAMED)]
           : []
         : [paletteSession(RECENT)],
       contentSessions:
-        typed && query.toLowerCase().includes("upload") ? [paletteSession(MESSAGED)] : [],
-      showingServerMatches: typed,
+        showingServerMatches && query.toLowerCase().includes("upload")
+          ? [paletteSession(MESSAGED)]
+          : [],
+      showingServerMatches,
       titleSearch: paging,
-      contentSearch: paging,
+      contentSearch: {
+        ...paging,
+        hasNextPage: searches.contentMore,
+        fetchNextPage: () => {
+          searches.contentPagesFetched += 1;
+        },
+      },
       searchFetching: false,
       loadError: searches.failed !== null,
       loadMoreError: searches.failed?.more === true,
@@ -150,6 +165,9 @@ beforeEach(() => {
   searches.remembered.length = 0;
   searches.failed = null;
   searches.retries = 0;
+  searches.answered = null;
+  searches.contentMore = false;
+  searches.contentPagesFetched = 0;
   fetchSessionItemsPage.mockReset();
   fetchSessionItemsPage.mockImplementation(async (sessionId: string) => ({
     hasMore: false,
@@ -224,6 +242,19 @@ describe("the finder's Sessions tab", () => {
       expect.stringContaining("Storage cleanup"),
     ]);
     expect(within(dialog).getByText("In messages")).toBeInTheDocument();
+  });
+
+  it("offers no message page for a query typed since the server answered", async () => {
+    searches.contentMore = true;
+    renderHost();
+    const dialog = openSessions("upload");
+    expect(within(dialog).getByRole("option", { name: /Show more/ })).toBeInTheDocument();
+
+    // "uploads" is typed while the server's answer is still for "upload".
+    searches.answered = "upload";
+    await userEvent.type(within(dialog).getByRole("combobox", { name: "Search sessions" }), "s");
+    expect(within(dialog).queryByRole("option", { name: /Show more/ })).toBeNull();
+    expect(searches.contentPagesFetched).toBe(0);
   });
 
   it("lists recent sessions before a query", () => {
