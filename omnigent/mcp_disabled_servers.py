@@ -364,9 +364,11 @@ def _claude_inherited_denials(
         without also blocking an allowlisted server or the ``omnigent`` relay.
     """
     from omnigent.host.mcp_inventory import managed_claude_mcp_config
+    from omnigent.onboarding import ambient
 
     settings: list[tuple[Path, dict[str, object]]] = []
     managed_settings: list[Mapping[str, object]] = []
+    managed_paths = ambient.claude_code_platform_managed_settings_paths()
     for path in _claude_inherited_settings_paths(cwd, executor, env, setting_sources):
         try:
             text = path.read_text(encoding="utf-8")
@@ -380,6 +382,19 @@ def _claude_inherited_denials(
             raise McpStrictModeError(executor, path, "invalid JSON") from error
         if not isinstance(payload, dict):
             raise McpStrictModeError(executor, path, "not a JSON object")
+        if payload.get("allowManagedMcpServersOnly") is True and any(
+            path == managed or path.parent == managed.with_name("managed-settings.d")
+            for managed in managed_paths
+        ):
+            raise McpStrictModeError(
+                executor,
+                path,
+                "managed-only MCP allowlist",
+                problem=(
+                    f"{path} enables a managed-only MCP allowlist, so Omnigent cannot "
+                    "enforce its invocation MCP allowlist"
+                ),
+            )
         settings.append((path, payload))
         servers = payload.get("managedMcpServers")
         if isinstance(servers, dict):

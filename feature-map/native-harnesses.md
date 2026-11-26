@@ -418,6 +418,10 @@ plugin MCP servers. Codex plugin MCPs and macOS-managed preferences are not
 discovered. Arbitrary Claude launcher scripts that change context or discard
 injected settings are outside strict discovery; use direct Claude or a supported
 `env` wrapper when relying on the allowlist.
+A file-managed `allowManagedMcpServersOnly: true` refuses strict launch because
+the invocation allowlist cannot be relied on. Claude remote, MDM and Windows
+registry managed-policy sources are not inspected; this discovery covers managed
+settings files and their drop-ins.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal

@@ -256,7 +256,10 @@ def test_malformed_sdk_settings_refuse_strict_launch(settings, caplog):
 
 
 @pytest.mark.parametrize("executor", ["claude-native", "claude-sdk"])
-def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude_project):
+@pytest.mark.parametrize("managed_only", [None, "managed", "drop-in", "user", "disabled"])
+def test_claude_strict_denies_inherited_allow_entries(
+    executor, tmp_path, claude_project, managed_only
+):
     """Claude unions allowlists across sources, so inherited entries must become denies."""
     from omnigent.onboarding import ambient
 
@@ -315,6 +318,34 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
     )
     original = {"deniedMcpServers": [{"serverName": "caller"}]}
     settings = original if executor == "claude-native" else json.dumps(original)
+    if managed_only in ("managed", "drop-in"):
+        drop_in = managed.with_name("managed-settings.d") / "10-team.json"
+        _write_json(managed, {})
+        _write_json(drop_in, {})
+        locked = managed if managed_only == "managed" else drop_in
+        _write_json(locked, {"allowManagedMcpServersOnly": True})
+        for scopes in (None, []):
+            with pytest.raises(McpStrictModeError, match="managed-only") as raised:
+                apply_claude_settings(
+                    settings,
+                    executor=executor,
+                    active_harnesses=None,
+                    cwd=claude_project / "sub",
+                    setting_sources=scopes,
+                )
+            assert raised.value.path == locked
+        write_mcp_inheritance({"inherit": True})
+        assert (
+            apply_claude_settings(settings, executor=executor, active_harnesses=None) is settings
+        )
+        return
+    if managed_only is not None:
+        path = (
+            tmp_path / "claude/claude-config/settings.json" if managed_only == "user" else managed
+        )
+        payload = json.loads(path.read_text())
+        payload["allowManagedMcpServersOnly"] = managed_only == "user"
+        _write_json(path, payload)
     result = apply_claude_settings(
         settings, executor=executor, active_harnesses=None, cwd=claude_project / "sub"
     )

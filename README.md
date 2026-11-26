@@ -586,6 +586,10 @@ Strict mode refuses `env` wrapper forms whose launch environment cannot be resol
 Arbitrary Claude launcher scripts can change that context or discard injected settings;
 strict discovery does not inspect them. Use Claude directly or a supported `env` wrapper
 when relying on the allowlist.
+A file-managed `allowManagedMcpServersOnly: true` also stops strict launches,
+because Claude can ignore the invocation allowlist. These checks inspect managed
+settings files and their drop-ins. Claude remote, MDM and Windows registry
+managed-policy sources are not inspected.
 If one of those Claude settings or
 Codex config files exists but cannot be read or parsed, or a `-c mcp_servers`
 override is not a TOML table, the launch stops with an error naming it. A malformed `inherit` or `allow` value is
