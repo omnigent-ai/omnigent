@@ -44,7 +44,8 @@ LINKED_URLS_TTL_SECONDS = 300.0
 FETCH_DEADLINE_SECONDS = 30.0
 # How long a read waits for a slot, inside the server's wait for the first reply.
 SLOT_WAIT_SECONDS = 10.0
-_TIMEOUT = httpx.Timeout(10.0, connect=10.0).as_dict()
+# Each hop's connect, header and body reads, cut to the fetch's time left.
+_HOP_TIMEOUT_SECONDS = 10.0
 # The pull request read and its listings share the gh deadline other PR actions use.
 _READ_PULL_REQUEST_SECONDS = 15.0
 _PAGE_SIZE = 100
@@ -57,7 +58,8 @@ _ATTACHMENT_PATH = re.compile(r"/user-attachments/assets/[0-9a-f-]+")
 _GITHUB_IMAGE_HOSTS = frozenset(
     {"private-user-images.githubusercontent.com", "user-images.githubusercontent.com"}
 )
-# Encoded dots and slashes could reach a path the allowlist never checked.
+# Encoded dots and slashes in the path could reach one the allowlist never checked. A query
+# may carry them: GitHub's signed image URLs do.
 _ENCODED_TRAVERSAL = re.compile(r"%(?:2e|2f|5c)", re.IGNORECASE)
 _UNKNOWN_HOST = "Sign in to this GitHub host with gh, or set GH_HOST to it, before viewing its PRs"
 _READ_FAILED = "GitHub returned an unexpected pull request response."
@@ -97,10 +99,11 @@ def checked_image_url(url: str, pr_host: str) -> httpx.URL:
     :raises ImageRefused: ``host_not_allowed``.
     """
     without_fragment = url.split("#", 1)[0]
+    before_query = without_fragment.split("?", 1)[0]
     if (
         any(ord(character) <= 0x20 or ord(character) == 0x7F for character in without_fragment)
         or "\\" in without_fragment
-        or _ENCODED_TRAVERSAL.search(without_fragment)
+        or _ENCODED_TRAVERSAL.search(before_query)
     ):
         raise ImageRefused("host_not_allowed")
     try:
@@ -265,6 +268,9 @@ def _read_image(
     content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
     if content_type not in IMAGE_TYPES:
         raise ImageRefused("not_image")
+    # Refused before decoding, so a compressed answer is never expanded at all.
+    if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+        raise ImageRefused("not_image")
     declared = response.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
         raise ImageRefused("too_large")
@@ -308,11 +314,15 @@ def _fetch(
     deadline = clock() + FETCH_DEADLINE_SECONDS
     current = url
     for hop in range(MAX_REDIRECTS + 1):
+        left = deadline - clock()
+        if left <= 0:
+            raise ImageRefused("fetch_failed")
+        timeout = httpx.Timeout(min(_HOP_TIMEOUT_SECONDS, left)).as_dict()
         headers = {"Accept": "image/*", "Accept-Encoding": "identity"}
         # GitHub's attachment URL redirects to a signed URL that needs no token.
         if hop == 0 and token is not None and current.raw_host.decode() == pr_host.lower():
             headers["Authorization"] = f"token {token}"
-        request = httpx.Request("GET", current, headers=headers, extensions={"timeout": _TIMEOUT})
+        request = httpx.Request("GET", current, headers=headers, extensions={"timeout": timeout})
         try:
             with transport or _transport_for(current) as hop_transport:
                 response = hop_transport.handle_request(request)

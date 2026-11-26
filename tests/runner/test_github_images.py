@@ -211,6 +211,23 @@ def test_encoded_and_dot_segment_paths_are_refused_before_github_is_asked(
     assert transport.seen == []
 
 
+def test_a_signed_url_whose_query_carries_encoded_slashes_is_followed(
+    fake: FakeGitHub,
+) -> None:
+    signed = SIGNED + "&X-Amz-Credential=key%2F20261127%2Fus-east-1%2Fs3%2Faws4_request"
+    transport = Transport(_redirect(signed), _image())
+
+    assert _read(ASSET, transport).data == PNG
+    assert str(transport.seen[1].url) == signed
+
+
+def test_an_encoded_slash_in_the_path_is_refused_even_with_a_clean_query() -> None:
+    with pytest.raises(ImageRefused):
+        checked_image_url(
+            "https://user-images.githubusercontent.com/1%2F..%2Fa.png?x=1", "github.com"
+        )
+
+
 def test_a_fragment_is_dropped_before_the_check_and_never_fetched(fake: FakeGitHub) -> None:
     linked = f"{ASSET}#preview"
     fake.pull["body"] = linked
@@ -405,15 +422,59 @@ def test_a_stream_past_the_cap_stops_there(
     assert len(sent) == 3
 
 
-def test_a_compressed_answer_is_counted_decoded(
-    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("encoding", ["gzip", "br", "deflate", "gzip, identity"])
+def test_a_compressed_answer_is_refused_before_it_is_decoded(
+    fake: FakeGitHub, encoding: str
 ) -> None:
-    monkeypatch.setattr(github_images, "MAX_IMAGE_BYTES", 10_000)
     bomb = gzip.compress(PNG + b"\x00" * 1_000_000)
-    transport = Transport(_image(data=bomb, **{"content-encoding": "gzip"}))
+    read: list[bytes] = []
 
-    assert _refusal(lambda: _read(ASSET, transport)) == "too_large"
-    assert len(bomb) < 10_000
+    def body() -> Iterator[bytes]:
+        read.append(bomb)
+        yield bomb
+
+    headers = {"content-type": "image/png", "content-encoding": encoding}
+    transport = Transport(lambda _request: httpx.Response(200, headers=headers, content=body()))
+
+    assert _refusal(lambda: _read(ASSET, transport)) == "not_image"
+    assert read == []
+
+
+def test_an_answer_marked_identity_is_served(fake: FakeGitHub) -> None:
+    transport = Transport(_image(**{"content-encoding": "identity"}))
+
+    assert _read(ASSET, transport).data == PNG
+
+
+def _after(now: list[float], seconds: float, answer: Any) -> Any:
+    """An answer that takes ``seconds`` of the fake clock to arrive."""
+
+    def answer_later(request: httpx.Request) -> httpx.Response:
+        now[0] += seconds
+        return answer(request)
+
+    return answer_later
+
+
+def test_a_redirect_hop_past_the_deadline_is_never_sent(fake: FakeGitHub) -> None:
+    now = [0.0]
+    transport = Transport(
+        _after(now, 20.0, _redirect(SIGNED)), _after(now, 20.0, _redirect(SIGNED)), _image()
+    )
+
+    assert _refusal(lambda: _read(ASSET, transport, clock=lambda: now[0])) == "fetch_failed"
+    assert len(transport.seen) == 2
+
+
+def test_each_hop_waits_no_longer_than_the_time_left(fake: FakeGitHub) -> None:
+    now = [0.0]
+    transport = Transport(_after(now, 25.0, _redirect(SIGNED)), _image())
+
+    _read(ASSET, transport, clock=lambda: now[0])
+
+    first, second = (request.extensions["timeout"] for request in transport.seen)
+    assert set(first.values()) == {10.0}
+    assert set(second.values()) == {5.0}
 
 
 def test_a_server_sending_past_the_deadline_is_cut_off(fake: FakeGitHub) -> None:
