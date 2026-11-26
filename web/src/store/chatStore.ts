@@ -4175,11 +4175,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // `session.superseded` redirect was missed, unless the user moved on or a
     // redirect is already pending. A native clear names none.
     if (!sessionId || sessionId === conversationId) return;
+    const { conversationId: viewed, redirectToConversationId: pending } = get();
+    const followsHere = viewed === conversationId && pending === null;
     useChatStore.setState((s) =>
       s.conversationId === conversationId && s.redirectToConversationId === null
         ? { redirectToConversationId: sessionId }
         : {},
     );
+    // The live redirect, which reports a stopped loop, was missed.
+    if (followsHere) reportLoopStoppedBySupersession(conversationId);
   },
 
   rewindToPrompt: async (itemId) => {
@@ -4195,10 +4199,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const untouched = !sessionDraftWasWritten(target);
     const text: SessionDraft = { text: rewound.prompt, files: [] };
     if (untouched) setSessionDraft(target, text);
+    const { conversationId: viewed, redirectToConversationId: pending } = get();
+    const followsHere = viewed === conversationId && pending !== target;
     useChatStore.setState((s) => ({
       ...(untouched ? { rewindPrefill: { ...text, conversationId: target } } : {}),
       ...(s.conversationId === conversationId ? { redirectToConversationId: target } : {}),
     }));
+    // The live redirect, which reports a stopped loop, has not arrived first.
+    if (followsHere) reportLoopStoppedBySupersession(conversationId);
     if (!untouched || rewound.attachments.length === 0) return;
     // The text is in; the attachments follow once they download, unless the
     // draft has changed since.
