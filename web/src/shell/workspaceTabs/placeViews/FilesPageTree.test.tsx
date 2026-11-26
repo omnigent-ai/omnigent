@@ -47,6 +47,8 @@ vi.mock("sonner", () => ({ toast: { info: vi.fn() } }));
 // `real` renders the actual tree, for cases that need its own reveal lifecycle.
 const captured = vi.hoisted(() => ({
   tree: null as ComponentProps<typeof FilesTree> | null,
+  /** Every reveal request the tree was given, render by render. */
+  reveals: [] as ComponentProps<typeof FilesTree>["activeReveal"][],
   real: false,
 }));
 
@@ -87,6 +89,7 @@ vi.mock("@/shell/fileTree/FilesTree", async (importOriginal) => {
   return {
     FilesTree: (props: ComponentProps<typeof FilesTree>) => {
       captured.tree = props;
+      captured.reveals.push(props.activeReveal ?? null);
       return captured.real ? <actual.FilesTree {...props} /> : <div data-testid="files-tree" />;
     },
   };
@@ -178,6 +181,7 @@ const listedLocations = () => vi.mocked(useWorkspaceAllFiles).mock.calls.map((ca
 
 beforeEach(() => {
   captured.tree = null;
+  captured.reveals = [];
   captured.real = false;
   vi.mocked(useWorkspaceAllFiles).mockClear();
   vi.mocked(useWorkspaceFileSearch).mockReturnValue({ data: undefined } as never);
@@ -328,7 +332,7 @@ describe("FilesPageTree", () => {
     expect(rememberedBrowseLocation("conv_1")).toBeNull();
   });
 
-  it("keeps sort, hidden files, the name filter and the folder's actions in its ⋯", async () => {
+  it("keeps the name filter, refresh and the folder's actions in its ⋯", async () => {
     rememberBrowseLocation("conv_1", "/work/repo/src/lib");
     const refetch = vi.fn();
     const refetchChanges = vi.fn();
@@ -336,20 +340,11 @@ describe("FilesPageTree", () => {
       data: { available: true, data: [] },
       refetch: refetchChanges,
     } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
-    const { onSortChange, onShowHiddenChange } = renderTree({
-      ...listed([entry("src/lib/a.ts")]),
-      refetch,
-    } as never);
+    renderTree({ ...listed([entry("src/lib/a.ts")]), refetch } as never);
     // The tree's header holds no separate filter button; the ⋯ offers the filter.
     expect(screen.queryByRole("button", { name: "Filter Files Tree by Name" })).toBeNull();
     const options = () => screen.getByRole("button", { name: "Tree options" });
-    await userEvent.click(options());
-    expect(screen.getByRole("menuitemradio", { name: "Filename" })).toBeChecked();
-    await userEvent.click(screen.getByRole("menuitemradio", { name: "Size" }));
-    expect(onSortChange).toHaveBeenCalledExactlyOnceWith("size");
-    await userEvent.click(options());
-    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" }));
-    expect(onShowHiddenChange).toHaveBeenCalledExactlyOnceWith(true);
+    // Sort and hidden files are checked in the controlled case below.
     await userEvent.click(options());
     expect(screen.getByRole("menuitem", { name: "Filter by name" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("menuitem", { name: "Refresh files" }));
@@ -818,23 +813,28 @@ describe("FilesPageTree", () => {
       expect(screen.getByTestId("files-tree")).toBeInTheDocument();
     });
 
-    it("keeps the tree for a deleted file the globs let through, and settles a reveal there", () => {
+    it("keeps the tree for a deleted file the globs let through, and settles a reveal there", async () => {
+      captured.real = true;
       vi.useFakeTimers();
       vi.mocked(toast.info).mockClear();
       vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
         data: { available: true, data: [{ path: "README.md", status: "deleted" }] },
       } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
-      renderTree(listed([entry("pnpm.lock")]));
+      renderTree(listed([entry("pnpm.lock")]), false, { activePath: "README.md" });
       openFilter();
       setGlob("Files to exclude", "*.lock");
+      vi.useRealTimers();
       // Only Git knows README.md now, but it passes, so the tree shows it rather than say none do.
       expect(screen.queryByText("No files here pass the filter.")).toBeNull();
-      expect(captured.tree?.changedFiles).toEqual([{ path: "README.md", status: "deleted" }]);
-      // The tree is there to take the viewed file's reveal, so the page doesn't call it missing.
+      const row = await screen.findByRole("treeitem", { name: /README\.md/ });
+      // The tree takes up the viewed deleted file's reveal and settles it, rather than miss it.
       act(() => {
-        requestActiveFileReveal("conv_1", "src/a.ts");
+        requestActiveFileReveal("conv_1", "README.md");
       });
-      expect(captured.tree?.activeReveal).toMatchObject({ file: "src/a.ts" });
+      expect(captured.reveals).toContainEqual(expect.objectContaining({ file: "README.md" }));
+      await waitFor(() => expect(captured.tree?.activeReveal ?? null).toBeNull());
+      expect(row).toHaveAttribute("aria-selected", "true");
+      expect(captured.tree?.patterns).toEqual({ include: "", exclude: "*.lock" });
       expect(toast.info).not.toHaveBeenCalled();
     });
 
