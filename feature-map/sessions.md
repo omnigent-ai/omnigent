@@ -101,6 +101,14 @@ the header menu), and each place is a separate entry point.
   override it on this device, and a reload keeps the choice. Settings →
   Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
   `tests/e2e_ui/sessions/test_floating_panes.py`).
+- `workspace-full-screen`: with the tabs sidebar (`workspace_sidebar_v2`), ⇧⌘F
+  (Ctrl+Shift+F off the Mac) and the ⌘K row **Make the workspace full screen** /
+  **Exit workspace full screen** toggle the workspace sidebar's full screen. From
+  a closed sidebar, both open it straight into full screen; a focused browser page
+  hands the chord over.
+  The classic layout, a phone and a grid route don't offer them
+  (`web/src/shell/AppShell.workspaceSidebarV2.test.tsx`,
+  `tests/e2e_ui/sessions/test_workspace_sidebar_v2.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
