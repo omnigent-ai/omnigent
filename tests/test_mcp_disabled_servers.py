@@ -354,7 +354,8 @@ def test_claude_strict_reads_linked_worktree_and_main_checkout_settings(
 
 
 @pytest.mark.parametrize("executor", ["claude-native", "claude-sdk"])
-def test_claude_strict_refuses_inherited_command_entries(claude_project, executor):
+@pytest.mark.parametrize("source", ["user", "project", "local", "managed"])
+def test_claude_strict_refuses_inherited_command_entries(claude_project, executor, source):
     """Claude then admits stdio servers by command alone, ignoring the name allowlist."""
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     # Both servers satisfy the command entry, so neither keeping nor denying it works.
@@ -367,13 +368,39 @@ def test_claude_strict_refuses_inherited_command_entries(claude_project, executo
             }
         },
     )
-    settings = claude_project / ".claude/settings.json"
+    settings = {
+        "user": claude_project.parent / "claude-config/settings.json",
+        "project": claude_project / ".claude/settings.json",
+        "local": claude_project / ".claude/settings.local.json",
+        "managed": claude_project.parent / "managed/managed-settings.json",
+    }[source]
     _write_json(settings, {"allowedMcpServers": [{"serverCommand": ["npx", "server"]}]})
     with pytest.raises(McpStrictModeError, match="including for the omnigent relay") as raised:
         apply_claude_settings(
             {} if executor == "claude-native" else None, executor=executor, active_harnesses=None
         )
     assert raised.value.path == settings
+    if source == "managed":
+        with pytest.raises(McpStrictModeError, match="including for the omnigent relay"):
+            apply_claude_settings(
+                {} if executor == "claude-native" else None,
+                executor=executor,
+                active_harnesses=None,
+                setting_sources=[],
+            )
+    else:
+        for contents in (settings.read_text(), "{invalid JSON"):
+            settings.write_text(contents)
+            result = apply_claude_settings(
+                {} if executor == "claude-native" else None,
+                executor=executor,
+                active_harnesses=None,
+                setting_sources=[],
+            )
+            parsed = json.loads(result) if isinstance(result, str) else result
+            assert parsed == {
+                "allowedMcpServers": [{"serverName": "omnigent"}, {"serverName": "kept"}]
+            }
 
 
 @pytest.mark.parametrize(
@@ -431,7 +458,10 @@ def test_claude_strict_logs_unreadable_server_configs(claude_project, caplog):
     ) in caplog.text
 
 
-def test_claude_strict_reads_settings_for_the_launch_environment(tmp_path, claude_project):
+@pytest.mark.parametrize("config_dir", ["launch-config", ""])
+def test_claude_strict_reads_settings_for_the_launch_environment(
+    tmp_path, claude_project, config_dir
+):
     """A relative config directory resolves against the launch cwd, not this process's."""
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     _write_json(
@@ -439,9 +469,10 @@ def test_claude_strict_reads_settings_for_the_launch_environment(tmp_path, claud
         {"allowedMcpServers": [{"serverName": "process_user"}]},
     )
     launch = tmp_path / "launch"
-    launch_settings = launch / "launch-config/settings.json"
+    launch_settings = launch / config_dir / "settings.json"
     _write_json(launch_settings, {"allowedMcpServers": [{"serverName": "launch_user"}]})
-    env = {"CLAUDE_CONFIG_DIR": "launch-config"}
+    user_home = tmp_path / "user-home"
+    env = {"CLAUDE_CONFIG_DIR": config_dir, "HOME": str(user_home)}
     result = apply_claude_settings(
         {}, executor="claude-native", active_harnesses=None, cwd=launch, env=env
     )
@@ -449,7 +480,7 @@ def test_claude_strict_reads_settings_for_the_launch_environment(tmp_path, claud
     # The launch's own global config supplies the allowlisted server's transport.
     url = "https://mcp.example.com/kept"
     _write_json(
-        launch / "launch-config/.claude.json",
+        (launch / config_dir if config_dir else user_home) / ".claude.json",
         {"mcpServers": {"kept": {"type": "http", "url": url}}},
     )
     _write_json(launch_settings, {"allowedMcpServers": [{"serverUrl": url}]})

@@ -8645,7 +8645,10 @@ _HOOK_CASES = [
 
 
 @pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
-async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict):
+@pytest.mark.parametrize("hermetic", [False, True])
+async def test_disabled_mcp_settings_launch_hook(
+    tmp_path, monkeypatch, active, saved, strict, hermetic
+):
     from omnigent.inner.claude_sdk_executor import PreparedClaudeCli
     from tests._helpers.mcp_disabled_servers import (
         isolate_claude_settings,
@@ -8661,7 +8664,15 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
     workspace = isolate_claude_settings(monkeypatch, tmp_path / "claude")
     (workspace / ".claude").mkdir()
     (workspace / ".claude/settings.json").write_text(
-        json.dumps({"allowedMcpServers": [{"serverName": "inherited"}]})
+        json.dumps(
+            {
+                "allowedMcpServers": [
+                    {"serverCommand": ["npx", "server"]}
+                    if hermetic
+                    else {"serverName": "inherited"}
+                ]
+            }
+        )
     )
     if saved:
         set_disabled(ServerKey("claude", "fixture"), True)
@@ -8681,19 +8692,28 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
         ) as hook,
     ):
         options = await _turn_options(
-            _default_executor(active_harnesses=active, cwd=str(workspace))
+            _default_executor(
+                active_harnesses=active,
+                cwd=str(workspace),
+                skills_filter="none" if hermetic else "all",
+            )
         )
     hook.assert_called_once()
     # Strict discovery reads the environment the SDK starts the CLI with.
-    assert hook.call_args.kwargs == {
+    actual = dict(hook.call_args.kwargs)
+    actual_env = actual.pop("env")
+    expected_env = {**os.environ, **options.env}
+    assert actual_env.keys() == expected_env.keys()
+    assert all(actual_env[key] == value for key, value in expected_env.items())
+    assert actual == {
         "executor": "claude-sdk",
         "active_harnesses": active,
         "cwd": str(workspace),
-        "env": {**os.environ, **options.env},
+        "setting_sources": [] if hermetic else ("user", "project"),
     }
     expected = {"other": True}
     denied = [{"serverName": "fixture"}] if active and saved else []
-    if strict:
+    if strict and not hermetic:
         denied.append({"serverName": "inherited"})
     if denied:
         expected["deniedMcpServers"] = denied

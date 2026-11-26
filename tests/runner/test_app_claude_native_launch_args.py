@@ -1711,9 +1711,8 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
         workspace / ".claude/settings.json": "workspace_project",
     }
     for path, name in inherited.items():
-        if config_dir or name != "launch_user":
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"allowedMcpServers": [{"serverName": name}]}))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"allowedMcpServers": [{"serverName": name}]}))
     monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
     monkeypatch.setattr(
         "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
@@ -1743,7 +1742,7 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     launch_args = registry.launch_required_terminal.call_args.kwargs["spec"].args
     settings = json.loads(Path(launch_args[launch_args.index("--settings") + 1]).read_text())
     # ``workspace`` is the launch cwd's Git root, which Claude also reads.
-    denied = [*(["launch_user"] if config_dir else []), "launch_project", "workspace_project"]
+    denied = ["launch_user", "launch_project", "workspace_project"]
     assert settings["deniedMcpServers"] == [{"serverName": name} for name in denied]
 
 

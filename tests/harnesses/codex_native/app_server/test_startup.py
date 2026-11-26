@@ -1360,8 +1360,9 @@ _HOOK_CASES = [
 
 
 @pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
+@pytest.mark.parametrize("command_config", [False, True])
 async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
-    tmp_path, monkeypatch, active, saved, strict
+    tmp_path, monkeypatch, active, saved, strict, command_config
 ):
     from tests._helpers.mcp_disabled_servers import (
         isolate_codex_system_layers,
@@ -1386,6 +1387,8 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     harness = _respawn_harness(tmp_path, monkeypatch, ready)
     server = harness.server
     server.active_harnesses = active
+    if command_config:
+        server.app_server_command = ("codex", "-c", 'mcp_servers.extra.command="true"')
 
     (tmp_path / "source-codex-home/config.toml").write_text(
         '[mcp_servers.fixture]\ncommand="true"\n'
@@ -1406,12 +1409,12 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
         hook.assert_called_once()
         assert hook.call_args.kwargs["executor"] == "codex-native"
         assert hook.call_args.kwargs["active_harnesses"] == active
+        assert hook.call_args.kwargs["launch_args"] == server.app_server_command[1:]
         baseline = tuple(hook.call_args.args[0])
-        expected = (
-            (*baseline, "mcp_servers.fixture.enabled=false")
-            if (active and saved) or strict
-            else baseline
-        )
+        denied_names = ["extra"] if strict and command_config else []
+        if (active and saved) or strict:
+            denied_names.append("fixture")
+        expected = (*baseline, *(f"mcp_servers.{name}.enabled=false" for name in denied_names))
         assert tuple(server.config_overrides) == expected
     finally:
         await server.close()

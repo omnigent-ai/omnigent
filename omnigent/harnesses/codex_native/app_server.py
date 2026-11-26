@@ -2866,6 +2866,7 @@ class CodexNativeAppServer:
             active_harnesses=self.active_harnesses,
             codex_home=self.codex_home,
             cwd=self.cwd,
+            launch_args=self.app_server_command[1:],
         )
         self.config_overrides = list(mcp_plan.config_overrides)
         await self._spawn_app_server_process(resolved_listen)

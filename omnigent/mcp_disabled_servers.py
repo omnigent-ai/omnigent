@@ -29,7 +29,7 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
 from omnigent.config import global_config_path
-from omnigent.harnesses.codex_native.launch_args import _merge_tables
+from omnigent.harnesses.codex_native.launch_args import _merge_tables, codex_config_overrides
 from omnigent.mcp_inheritance import McpInheritance, resolve_mcp_inheritance
 
 HarnessKey = Literal["claude", "codex"]
@@ -235,15 +235,22 @@ def _claude_name(key: ServerKey) -> str:
 
 
 def _claude_inherited_settings_paths(
-    cwd: Path, executor: str, env: Mapping[str, str] | None
+    cwd: Path,
+    executor: str,
+    env: Mapping[str, str] | None,
+    setting_sources: Collection[str] | None,
 ) -> list[Path]:
     """List the user, project, local and managed settings files Claude merges from *cwd*."""
     from omnigent.onboarding import ambient
 
-    paths = [ambient.claude_user_settings_path(cwd, env)]
-    for directory in _claude_project_directories(cwd):
-        paths.append(directory / ".claude" / "settings.json")
-        paths.append(directory / ".claude" / "settings.local.json")
+    sources = {"user", "project", "local"} if setting_sources is None else set(setting_sources)
+    paths = [ambient.claude_user_settings_path(cwd, env)] if "user" in sources else []
+    if sources & {"project", "local"}:
+        for directory in _claude_project_directories(cwd):
+            if "project" in sources:
+                paths.append(directory / ".claude" / "settings.json")
+            if "local" in sources:
+                paths.append(directory / ".claude" / "settings.local.json")
     for managed in ambient.claude_code_platform_managed_settings_paths():
         paths.append(managed)
         drop_ins = managed.with_name("managed-settings.d")
@@ -322,7 +329,11 @@ def _claude_url_matches(value: str, config: Mapping[str, object]) -> bool:
 
 
 def _claude_inherited_denials(
-    cwd: Path, inheritance: McpInheritance, executor: str, env: Mapping[str, str] | None
+    cwd: Path,
+    inheritance: McpInheritance,
+    executor: str,
+    env: Mapping[str, str] | None,
+    setting_sources: Collection[str] | None,
 ) -> list[dict[str, object]]:
     """Deny inherited MCP admissions outside the strict allowlist.
 
@@ -337,7 +348,7 @@ def _claude_inherited_denials(
 
     allowlisted: list[tuple[str, Mapping[str, object]]] | None = None
     denials: list[dict[str, object]] = []
-    for path in _claude_inherited_settings_paths(cwd, executor, env):
+    for path in _claude_inherited_settings_paths(cwd, executor, env, setting_sources):
         try:
             text = path.read_text(encoding="utf-8")
         except (FileNotFoundError, NotADirectoryError):
@@ -416,6 +427,7 @@ def apply_claude_settings(
     cwd: Path | str | None = None,
     env: Mapping[str, str] | None = None,
     discover_inherited: bool = True,
+    setting_sources: Collection[str] | None = None,
 ) -> dict[str, object]: ...
 
 
@@ -428,6 +440,7 @@ def apply_claude_settings(
     cwd: Path | str | None = None,
     env: Mapping[str, str] | None = None,
     discover_inherited: bool = True,
+    setting_sources: Collection[str] | None = None,
 ) -> str | None: ...
 
 
@@ -439,6 +452,7 @@ def apply_claude_settings(
     cwd: Path | str | None = None,
     env: Mapping[str, str] | None = None,
     discover_inherited: bool = True,
+    setting_sources: Collection[str] | None = None,
 ) -> dict[str, object] | str | None:
     """Add Claude deny and strict-mode allow entries without modifying the caller's settings.
 
@@ -448,6 +462,8 @@ def apply_claude_settings(
     launch *cwd* and *env* (default: this process's), are added to ``deniedMcpServers``.
     ``discover_inherited=False`` skips that reading, for a caller that applies these
     settings again once the launch context is known.
+    ``setting_sources`` narrows ordinary files to the CLI's effective scopes;
+    managed policy always applies.
 
     :raises McpStrictModeError: In strict mode, when the caller's settings or an
         inherited settings file cannot be read as a JSON object.
@@ -477,7 +493,9 @@ def apply_claude_settings(
         if not inheritance.inherit and discover_inherited:
             launch_cwd = Path(cwd) if cwd is not None else Path.cwd()
             wanted.extend(
-                _claude_inherited_denials(launch_cwd.absolute(), inheritance, executor, env)
+                _claude_inherited_denials(
+                    launch_cwd.absolute(), inheritance, executor, env, setting_sources
+                )
             )
         additions: list[dict[str, object]] = []
         for entry in wanted:
@@ -723,6 +741,7 @@ def plan_codex_launch(
     active_harnesses: Collection[str] | None,
     codex_home: Path,
     cwd: Path,
+    launch_args: Sequence[str] = (),
 ) -> CodexLaunchPlan:
     """Plan synchronously from prepared config files; never spawn or await a probe.
 
@@ -741,11 +760,12 @@ def plan_codex_launch(
     if not entries and inheritance.inherit:
         return CodexLaunchPlan(original, original, "none", ())
     config_path = codex_home / "config.toml"
+    effective_overrides = (*codex_config_overrides(launch_args), *original)
     unreadable: list[Path] = []
     managed_enabled: list[str] = []
     try:
         servers = _codex_server_names(
-            codex_home.resolve(), cwd.absolute(), original, unreadable, managed_enabled
+            codex_home.resolve(), cwd.absolute(), effective_overrides, unreadable, managed_enabled
         )
     except (OSError, ValueError, RuntimeError, RecursionError) as error:
         _log_read_failure(
@@ -779,10 +799,10 @@ def plan_codex_launch(
             tuple(dropped),
             extra={"executor": executor},
         )
-    baseline = (*original, *_codex_disable_overrides(strict, original, config_path))
+    baseline = (*original, *_codex_disable_overrides(strict, effective_overrides, config_path))
     if not applied:
         return CodexLaunchPlan(baseline, baseline, "none", tuple(dropped))
-    overrides = _codex_disable_overrides([*strict, *applied], original, config_path)
+    overrides = _codex_disable_overrides([*strict, *applied], effective_overrides, config_path)
     return CodexLaunchPlan((*original, *overrides), baseline, "applied", tuple(dropped))
 
 

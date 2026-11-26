@@ -205,19 +205,32 @@ def mcp_flagless_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[st
         yield base_url
 
 
-@pytest.fixture(scope="module")
-def server_version(mcp_enabled_server: str) -> str:
+@pytest.fixture
+def mcp_journey_server(request: pytest.FixtureRequest, control: str) -> str:
+    """Select the server once for both compatibility checks and the journey."""
+    return request.getfixturevalue(
+        "mcp_enabled_server" if control == "switch" else "mcp_flagless_server"
+    )
+
+
+@pytest.fixture
+def server_version(mcp_journey_server: str) -> str:
     """Check compatibility against the same isolated server the journey uses."""
-    return resolve_server_version(mcp_enabled_server)
+    return resolve_server_version(mcp_journey_server)
 
 
 @pytest.mark.min_server_version("0.22.0.dev0")
-@pytest.mark.min_runner_version("0.22.0.dev0")
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("control", ["switch", "strict"])
+@pytest.mark.parametrize(
+    "control",
+    [
+        pytest.param("switch", marks=pytest.mark.min_runner_version("0.22.0.dev0")),
+        pytest.param("strict", marks=pytest.mark.min_runner_version("0.24.0.dev0")),
+    ],
+)
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 def test_disabled_server_absent_from_real_native_session(
-    request: pytest.FixtureRequest,
+    mcp_journey_server: str,
     mock_llm_server_url: str,
     tmp_path: Path,
     harness: str,
@@ -225,9 +238,7 @@ def test_disabled_server_absent_from_real_native_session(
 ) -> None:
     if shutil.which(harness) is None:
         pytest.skip(f"needs the {harness} CLI")
-    server = request.getfixturevalue(
-        "mcp_enabled_server" if control == "switch" else "mcp_flagless_server"
-    )
+    server = mcp_journey_server
     home = tmp_path / "host" / "home"
     home.mkdir(parents=True)
     workspace = tmp_path / "workspace"

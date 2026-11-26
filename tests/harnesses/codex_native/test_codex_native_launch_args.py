@@ -196,6 +196,22 @@ def test_profile_materialization_preserves_layers_and_private_edits(
     assert (source / "config.toml").read_text() == original
 
 
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (
+            ["-c", "one=1", "--config", "two=2", "-cthree=3", "--config=four=4", "-c=five=5"],
+            ["one=1", "two=2", "three=3", "four=4", "five=5"],
+        ),
+        (["--model", "--config=not-an-option", "-c", "real=1"], ["real=1"]),
+        (["--remote-auth-token-env", "-c", "--config=real=1"], ["real=1"]),
+        (["-c", "before=1", "--", "--config=after=2"], ["before=1"]),
+    ],
+)
+def test_config_overrides_follow_cli_order_and_skip_unrelated_values(args, expected) -> None:
+    assert launch_args.codex_config_overrides(args) == expected
+
+
 def test_missing_profile_does_not_mutate_private_config(tmp_path: Path) -> None:
     source = tmp_path / "source"
     private = tmp_path / "private"

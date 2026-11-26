@@ -92,6 +92,15 @@ def test_reads_user_config_and_ignores_project_config(config_home, tmp_path, mon
         yaml.safe_dump({"mcp": {"inherit": False, "allow": ["docs"]}})
     )
     assert resolve_mcp_inheritance("codex") == McpInheritance(False, frozenset({"docs"}))
+    (project / ".omnigent/config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "mcp": {"inherit": True, "allow": ["project-only"]},
+                "harness": {"codex": {"mcp": {"inherit": True, "allow": ["extra"]}}},
+            }
+        )
+    )
+    assert resolve_mcp_inheritance("codex") == McpInheritance(False, frozenset({"docs"}))
 
 
 @pytest.mark.parametrize("failure", ["malformed", "not-a-mapping", "permission"])

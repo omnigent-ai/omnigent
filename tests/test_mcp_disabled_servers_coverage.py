@@ -270,15 +270,14 @@ def test_native_failure_traceback_and_junit_exclude_request_bodies(
     monkeypatch.setattr(scenario, "poll_until", poll)
     if outcome == "diagnostic-error":
         monkeypatch.setattr(scenario, "_mcp_failure_metadata", fail_diagnostics)
-    request = MagicMock()
-    request.getfixturevalue.return_value = "http://server.example.test"
     with pytest.raises((AssertionError, RuntimeError, ValueError)) as captured:
         scenario.test_disabled_server_absent_from_real_native_session(
-            request, "http://provider.example.test", tmp_path, "codex", control
+            "http://server.example.test",
+            "http://provider.example.test",
+            tmp_path,
+            "codex",
+            control,
         )
-    request.getfixturevalue.assert_called_once_with(
-        "mcp_enabled_server" if control == "switch" else "mcp_flagless_server"
-    )
     representation = captured.getrepr(style="long", showlocals=True)
     formatted = str(representation)
     report = pytest.TestReport(

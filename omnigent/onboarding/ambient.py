@@ -586,7 +586,9 @@ def claude_user_settings_path(
     configured = env.get("CLAUDE_CONFIG_DIR")
     home = env.get("HOME")
     config_dir = (
-        Path(configured) if configured else (Path(home) if home else Path.home()) / ".claude"
+        Path(configured)
+        if configured is not None
+        else (Path(home) if home else Path.home()) / ".claude"
     )
     return Path(cwd or "") / config_dir / "settings.json"
 
@@ -612,9 +614,7 @@ def read_claude_user_settings_with_sources(
     cwd: str | None = None,
 ) -> tuple[dict[str, object] | None, tuple[Path, ...]]:
     """Read user settings and retain the directory and file actually selected."""
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = Path(configured) if configured else Path.home() / ".claude"
-    settings_path = Path(os.path.abspath(Path(cwd or "") / config_dir / "settings.json"))
+    settings_path = Path(os.path.abspath(claude_user_settings_path(cwd)))
     try:
         resolved_path = settings_path.resolve(strict=True)
         payload = json.loads(resolved_path.read_text(encoding="utf-8"))
