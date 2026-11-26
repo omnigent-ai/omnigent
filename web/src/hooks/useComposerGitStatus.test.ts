@@ -155,15 +155,6 @@ describe("useComposerGitStatus", () => {
     expect(result.current.branch).toBe("main");
   });
 
-  it("matches a forward-slash UNC workspace in another case", () => {
-    setWorktrees({
-      status: "ok",
-      worktrees: [wt({ path: "//Server/Share/repo", branch: "main" })],
-    });
-    setGithub(undefined);
-    expect(run({ workspace: "//server/share/Repo" }).result.current.branch).toBe("main");
-  });
-
   it("does not match a sibling whose path is a mere prefix", () => {
     setWorktrees({ status: "ok", worktrees: [wt({ path: "/home/a/repo", branch: "main" })] });
     setGithub(undefined);

@@ -137,7 +137,8 @@ interface VerifiedGitWorktreeCache {
 
 function normalizedHostPath(path: string): string {
   const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
-  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+  // Drive and UNC paths ignore case, as in {@link matchKind}.
+  return /^(?:[A-Za-z]:\/|\/\/)/.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 export function pathIsWithinWorktree(path: string, root: string): boolean {
