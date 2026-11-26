@@ -29,6 +29,7 @@ from omnigent.server.project_kpis import (
     KpiStatus,
     MetricSeries,
     SeriesItem,
+    has_landed_commits,
     kpi_history_since,
     kpi_rows,
     load_series,
@@ -44,6 +45,7 @@ from omnigent.server.project_status import (
 )
 from omnigent.server.project_status_cache import project_status_cache
 from omnigent.server.project_status_items import DrilldownRange, drilldown, range_bounds
+from omnigent.server.project_status_trends import trend_rows
 from omnigent.server.role_side_chat import refuse_role_side_chat
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.project_status import move_member_resolver
@@ -195,6 +197,31 @@ class ProjectKpiRevisionPage(BaseModel):
     object: Literal["list"]
     data: list[ProjectKpiRevision]
     has_more: bool
+
+
+class ProjectStatusTrendDay(BaseModel):
+    """One chart bucket; a metric is null when its source isn't available."""
+
+    day_utc: str = Field(description="The bucket's first UTC day.")
+    tickets_filed: int = Field(description="Tickets created in the bucket.")
+    tickets_finished: int = Field(description="Distinct tickets moved into a completed stage.")
+    open_tickets: int = Field(description="Tickets not in a completed stage at the bucket's end.")
+    changes_landed: int | None = Field(
+        description="Distinct commits landed; null when the project never landed one."
+    )
+    prs_merged: int | None
+    spend_usd: float | None
+
+
+class ProjectStatusTrends(BaseModel):
+    """The Summary's trend charts over a window, day by day or, for long ranges, by week."""
+
+    object: Literal["project.status_trends"]
+    project_id: str
+    window: Literal["7d", "30d", "all"]
+    today_utc: str
+    bucket: Literal["day", "week"]
+    days: list[ProjectStatusTrendDay]
 
 
 def submitted_series(project: Project, rows: list[dict[str, Any]]) -> MetricSeries:
@@ -565,6 +592,55 @@ def create_project_kpis_router(
         return await asyncio.to_thread(
             build_items, request, project, metric, range, member, user_id
         )
+
+    def build_trends(
+        request: Request, project: Project, window: StatusWindow, user_id: str | None
+    ) -> dict[str, Any]:
+        period = status_period(window, now_epoch())
+        # The burndown replays every ticket's moves, so read the whole history.
+        inputs = inputs_for(request, project, period, user_id, None)
+        series = load_series(
+            ["tickets_shipped", "merged_prs", "spend_usd", "changes_landed"], inputs
+        )
+        filed = submitted_series(
+            project,
+            ticket_store.requested_tickets(
+                project.id, user_id=user_id, since_epoch=period.since_epoch
+            ),
+        )
+        result = trend_rows(
+            period,
+            {
+                "tickets_filed": filed,
+                "tickets_finished": series["tickets_shipped"],
+                "changes_landed": series["changes_landed"] if has_landed_commits(inputs) else None,
+                "prs_merged": series["merged_prs"] if series["merged_prs"].dated else None,
+                "spend_usd": series["spend_usd"] if series["spend_usd"].dated else None,
+            },
+            inputs.stage_histories(),
+        )
+        return {
+            "object": "project.status_trends",
+            "project_id": project.id,
+            "window": window,
+            "today_utc": period.today_utc,
+            **result,
+        }
+
+    @router.get("/projects/{project_id}/status/trends", response_model=ProjectStatusTrends)
+    async def project_status_trends(
+        request: Request,
+        project_id: str,
+        window: WindowParam = "7d",
+    ) -> dict[str, Any]:
+        """Per-day tickets filed and finished, open tickets, changes landed, PRs and spend.
+
+        Any project member may read it. Each day's value equals the Summary drill-down's
+        value for that day; ranges over 90 days use 7-day buckets ending today.
+        """
+        user_id = require_user(request, auth_provider)
+        project = await load_project(project_id, user_id)
+        return await asyncio.to_thread(build_trends, request, project, window, user_id)
 
     @router.get("/projects/{project_id}/kpis/revisions", response_model=ProjectKpiRevisionPage)
     async def list_project_kpi_revisions(

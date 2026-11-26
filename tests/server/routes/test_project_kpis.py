@@ -642,3 +642,64 @@ async def test_summary_and_insights_count_changes_landed_only_once_one_landed(
     )
     [row] = items.json()["items"]
     assert (row["title"], row["detail"]) == ("Landed", {"commit": SHA_A})
+
+
+def test_trend_buckets_and_the_open_ticket_burndown() -> None:
+    from omnigent.server.project_status_trends import buckets, open_tickets_at
+
+    size, week = buckets(status_period("7d", NOW), None)
+    assert (size, week[0].day_utc, len(week)) == ("day", "2026-03-04", 7)
+    assert week[-1].until == NOW + 1
+    size, long = buckets(status_period("all", NOW), "2025-01-01")
+    assert size == "week" and long[-1].day_utc == "2026-03-04"
+    assert long[0].since <= _epoch("2025-01-01T00:00:00") < long[0].until
+    histories = {
+        "done": [_entry("open", 10, created=True), _entry("merged", 20, complete=True)],
+        "reopened": [
+            _entry("open", 10, created=True),
+            _entry("merged", 15, complete=True),
+            _entry("open", 30),
+        ],
+        "late": [_entry("open", 40, created=True)],
+    }
+    assert open_tickets_at(histories, [5, 11, 16, 21, 31, 41]) == [0, 2, 1, 0, 1, 2]
+
+
+async def test_trends_endpoint_matches_the_drilldown_day_by_day(
+    multi_user_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+) -> None:
+    owner = _as_user("owner@example.com")
+    created = (
+        await multi_user_client.post("/v1/projects", json={"name": "Trends"}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    stages = (await multi_user_client.get(f"{path}/tickets", headers=owner)).json()["stages"]
+    done = next(stage["id"] for stage in stages if stage["is_complete"])
+    for index in range(3):
+        ticket = (
+            await multi_user_client.post(
+                f"{path}/tickets", json={"title": f"T{index}"}, headers=owner
+            )
+        ).json()
+        if index:
+            labels = [{"key": "verified", "value": f"{index}" * 40}]
+            await multi_user_client.patch(
+                f"{path}/tickets/{ticket['id']}",
+                json={"labels": labels, "stage_id": done},
+                headers=owner,
+            )
+    body = (
+        await multi_user_client.get(
+            f"{path}/status/trends", params={"window": "7d"}, headers=owner
+        )
+    ).json()
+    assert (body["bucket"], len(body["days"])) == ("day", 7)
+    today = body["days"][-1]
+    assert (today["tickets_filed"], today["tickets_finished"], today["open_tickets"]) == (3, 2, 1)
+    assert today["changes_landed"] == 2
+    for metric, field in (("tickets_shipped", "tickets_finished"), ("changes_landed", None)):
+        items = await multi_user_client.get(
+            f"{path}/status/items", params={"metric": metric, "range": "7d"}, headers=owner
+        )
+        drill = [day["value"] for day in items.json()["days"]]
+        assert drill == [day[field or metric] for day in body["days"]]

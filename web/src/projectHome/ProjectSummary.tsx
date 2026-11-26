@@ -28,6 +28,7 @@ import { cn } from "@/lib/utils";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { MemberName, memberDisplayName } from "./MemberName";
 import { ProjectInsightsSection } from "./ProjectInsights";
+import { ProjectTrends } from "./ProjectTrends";
 import { ProjectKpiTiles } from "./ProjectKpis";
 import { useProjectIdentities } from "./useProjectIdentities";
 import { ProjectStatusItemsDialog, type StatusDrilldown } from "./ProjectStatusItems";
@@ -81,6 +82,11 @@ export function ProjectSummary({ projectName }: { projectName: string }) {
         {summary.data ? (
           <>
             <HeadlineNumbers summary={summary.data} onDrill={setDrilldown} />
+            <ProjectTrends
+              projectId={projectId}
+              statusWindow={statusWindow}
+              onDrill={setDrilldown}
+            />
             <p className="text-xs text-muted-foreground">
               {summary.data.since_day_utc
                 ? `${summary.data.since_day_utc} to ${summary.data.today_utc}, UTC`

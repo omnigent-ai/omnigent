@@ -8730,6 +8730,134 @@
         "title": "ProjectStatusTotals",
         "type": "object"
       },
+      "ProjectStatusTrendDay": {
+        "description": "One chart bucket; a metric is null when its source isn't available.",
+        "properties": {
+          "changes_landed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Distinct commits landed; null when the project never landed one.",
+            "title": "Changes Landed"
+          },
+          "day_utc": {
+            "description": "The bucket's first UTC day.",
+            "title": "Day Utc",
+            "type": "string"
+          },
+          "open_tickets": {
+            "description": "Tickets not in a completed stage at the bucket's end.",
+            "format": "int64",
+            "title": "Open Tickets",
+            "type": "integer"
+          },
+          "prs_merged": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prs Merged"
+          },
+          "spend_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spend Usd"
+          },
+          "tickets_filed": {
+            "description": "Tickets created in the bucket.",
+            "format": "int64",
+            "title": "Tickets Filed",
+            "type": "integer"
+          },
+          "tickets_finished": {
+            "description": "Distinct tickets moved into a completed stage.",
+            "format": "int64",
+            "title": "Tickets Finished",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "day_utc",
+          "tickets_filed",
+          "tickets_finished",
+          "open_tickets",
+          "changes_landed",
+          "prs_merged",
+          "spend_usd"
+        ],
+        "title": "ProjectStatusTrendDay",
+        "type": "object"
+      },
+      "ProjectStatusTrends": {
+        "description": "The Summary's trend charts over a window, day by day or, for long ranges, by week.",
+        "properties": {
+          "bucket": {
+            "enum": [
+              "day",
+              "week"
+            ],
+            "title": "Bucket",
+            "type": "string"
+          },
+          "days": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectStatusTrendDay"
+            },
+            "title": "Days",
+            "type": "array"
+          },
+          "object": {
+            "const": "project.status_trends",
+            "title": "Object",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "today_utc": {
+            "title": "Today Utc",
+            "type": "string"
+          },
+          "window": {
+            "enum": [
+              "7d",
+              "30d",
+              "all"
+            ],
+            "title": "Window",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "project_id",
+          "window",
+          "today_utc",
+          "bucket",
+          "days"
+        ],
+        "title": "ProjectStatusTrends",
+        "type": "object"
+      },
       "ProjectTelemetry": {
         "description": "One project's telemetry over a UTC window, from data Omnigent already keeps.",
         "properties": {
@@ -25667,6 +25795,66 @@
           }
         },
         "summary": "Project Status Summary",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/status/trends": {
+      "get": {
+        "description": "Per-day tickets filed and finished, open tickets, changes landed, PRs and spend.\n\nAny project member may read it. Each day's value equals the Summary drill-down's\nvalue for that day; ranges over 90 days use 7-day buckets ending today.",
+        "operationId": "project_status_trends_v1_projects__project_id__status_trends_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "description": "7d, 30d or all, in UTC days, as on the Summary page.",
+              "enum": [
+                "7d",
+                "30d",
+                "all"
+              ],
+              "title": "Window",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectStatusTrends"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Project Status Trends",
         "tags": [
           "projects"
         ]

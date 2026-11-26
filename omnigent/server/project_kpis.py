@@ -375,18 +375,22 @@ def landed_items(
     return items, excluded
 
 
-def changes_landed_total(inputs: KpiInputs) -> int | None:
-    """Changes landed in the window; ``None`` when the project has never landed a commit."""
+def has_landed_commits(inputs: KpiInputs) -> bool:
+    """Whether any ticket is at or past the landed stage with a landed commit."""
     if inputs.ticket_labels is None:
-        return None
-    labelled = inputs.ticket_labels()
+        return False
     stages = inputs.stages()
     start = landed_stage_index(inputs.project.config or {}, stages)
     rank = {str(stage["id"]): index for index, stage in enumerate(stages)}
-    if start is None or not any(
+    return start is not None and any(
         landed_commit(labels) and rank.get(stage_id or "", -1) >= start
-        for stage_id, labels in labelled.values()
-    ):
+        for stage_id, labels in inputs.ticket_labels().values()
+    )
+
+
+def changes_landed_total(inputs: KpiInputs) -> int | None:
+    """Changes landed in the window; ``None`` when the project has never landed a commit."""
+    if not has_landed_commits(inputs):
         return None
     value = compute_metrics(["changes_landed"], inputs)["changes_landed"]
     return int(value.value or 0) if value.available else None

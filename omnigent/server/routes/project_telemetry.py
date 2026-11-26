@@ -24,6 +24,7 @@ from omnigent.server.project_status import (
     load_status_sources,
     status_period,
 )
+from omnigent.server.project_status_cache import project_status_cache
 from omnigent.server.project_telemetry import (
     PersonMessage,
     ProjectTelemetryReader,
@@ -224,8 +225,13 @@ def create_project_telemetry_router(
             stages=stages,
             history_since=period.since_epoch,
             ticket_labels=functools.cache(
-                lambda: ticket_store.label_values(
-                    project.id, LANDED_COMMIT_LABELS, user_id=user_id
+                lambda: project_status_cache.get_or_compute(
+                    project.id,
+                    "tickets",
+                    ("ticket_labels",),
+                    lambda: ticket_store.label_values(
+                        project.id, LANDED_COMMIT_LABELS, user_id=user_id
+                    ),
                 )
             ),
         )
