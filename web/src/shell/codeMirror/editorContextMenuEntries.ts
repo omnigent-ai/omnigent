@@ -43,6 +43,8 @@ export interface EditorMenuContext {
   editable: boolean;
   /** The main selection has text. */
   hasSelection: boolean;
+  /** Some range of the selection has text, as a column whose main range is a cursor can. */
+  hasSelectedText: boolean;
   /** The selection makes a workspace search query and the finder serves this session. */
   canSearchWorkspace: boolean;
   canComment: boolean;
@@ -108,7 +110,7 @@ export function editorMenuEntries(context: EditorMenuContext): EditorMenuEntry[]
       action: "cut",
       label: "Cut",
       keys: clipboardKeys("X", mac),
-      enabled: hasSelection,
+      enabled: context.hasSelectedText,
     });
   }
   clipboard.push({
@@ -116,7 +118,7 @@ export function editorMenuEntries(context: EditorMenuContext): EditorMenuEntry[]
     action: "copy",
     label: "Copy",
     keys: clipboardKeys("C", mac),
-    enabled: hasSelection,
+    enabled: context.hasSelectedText,
   });
   if (editable) {
     clipboard.push({

@@ -125,6 +125,8 @@ export function EditorContextMenu({
         entries: editorMenuEntries({
           editable: current.editable,
           hasSelection: !main.empty,
+          // Copy and Cut take every range, so a column with an empty main range still has text.
+          hasSelectedText: state.selection.ranges.some((range) => !range.empty),
           canSearchWorkspace: current.canSearch && query !== null,
           canComment: current.selectionActions.canComment,
           canAttachToAgent: current.selectionActions.canAttachToAgent,

@@ -100,6 +100,15 @@ function rightClick(view: EditorView): MouseEvent {
   return event;
 }
 
+/** Shift+F10 in the editor, the keyboard's way to open the menu. */
+function pressShiftF10(view: EditorView): void {
+  act(() => {
+    view.contentDOM.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+}
+
 const menuItems = () => screen.queryAllByRole("menuitem").map((item) => item.textContent);
 
 describe("EditorContextMenu", () => {
@@ -204,6 +213,45 @@ describe("EditorContextMenu", () => {
       document.execCommand = original;
     }
   });
+
+  // A column over "alpha\nb" from column 2 to 4: "ph" on the first line, and a cursor after
+  // the short second line, which is the main range.
+  const COLUMN_WITH_EMPTY_MAIN = EditorSelection.create(
+    [EditorSelection.range(2, 4), EditorSelection.cursor(7)],
+    1,
+  );
+
+  /** A right-click on "ph": without layout, the click's position is given. */
+  function rightClickOnPh(view: EditorView): void {
+    vi.spyOn(view, "posAtCoords").mockReturnValue(3);
+    rightClick(view);
+  }
+
+  it.each([
+    ["a right-click on its text", rightClickOnPh],
+    ["Shift+F10", pressShiftF10],
+  ])(
+    "offers Cut and Copy from %s for a column whose main range is a cursor",
+    async (_opener, open) => {
+      const original = document.execCommand;
+      const execCommand = vi.fn(() => true);
+      document.execCommand = execCommand;
+      try {
+        const { view } = editorWithMenu("alpha\nb", COLUMN_WITH_EMPTY_MAIN, { editable: true });
+        open(view);
+        expect(view.state.selection.ranges.map((range) => [range.from, range.to])).toEqual([
+          [2, 4],
+          [7, 7],
+        ]);
+        const cut = screen.getByRole("menuitem", { name: /^Cut/ });
+        expect(cut).not.toHaveAttribute("aria-disabled", "true");
+        await userEvent.click(screen.getByRole("menuitem", { name: /^Copy/ }));
+        expect(execCommand).toHaveBeenCalledWith("copy");
+      } finally {
+        document.execCommand = original;
+      }
+    },
+  );
 
   function delayedClipboard() {
     let resolve: (text: string) => void = () => {};

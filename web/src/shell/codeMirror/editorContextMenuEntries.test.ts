@@ -11,6 +11,7 @@ import {
 const READ_ONLY: EditorMenuContext = {
   editable: false,
   hasSelection: false,
+  hasSelectedText: false,
   canSearchWorkspace: false,
   canComment: false,
   canAttachToAgent: false,
@@ -44,7 +45,12 @@ describe("editorMenuEntries", () => {
   });
 
   it("adds the editing commands, with their shortcuts, in an editable file", () => {
-    const entries = editorMenuEntries({ ...READ_ONLY, editable: true, hasSelection: true });
+    const entries = editorMenuEntries({
+      ...READ_ONLY,
+      editable: true,
+      hasSelection: true,
+      hasSelectedText: true,
+    });
     expect(rows(entries)).toEqual([
       "Cut",
       "Copy",
@@ -62,6 +68,15 @@ describe("editorMenuEntries", () => {
     expect(item(entries, "cut")).toMatchObject({ enabled: true, keys: ["⌘", "X"] });
     expect(item(entries, "file.toggleLineComment").shortcut).toBe("file.toggleLineComment");
     expect(item(entries, "find-and-replace").shortcut).toBe("file.findAndReplace");
+  });
+
+  it("offers Cut and Copy for text in any range, though the main range is a cursor", () => {
+    const context = { ...READ_ONLY, editable: true, canComment: true, hasSelectedText: true };
+    const entries = editorMenuEntries(context);
+    expect(item(entries, "cut").enabled).toBe(true);
+    expect(item(entries, "copy").enabled).toBe(true);
+    // A comment is on the main range, so it still needs text there.
+    expect(rows(entries)).not.toContain("Add comment");
   });
 
   it("leads with Search Text in Workspace and its shortcut for a selection", () => {
