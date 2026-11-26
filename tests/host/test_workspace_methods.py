@@ -64,8 +64,11 @@ _PULL_REQUEST_OWNER_METHODS = frozenset(
         "EnqueuePullRequest",
         "DequeuePullRequest",
         "GetPullRequestStack",
+        "ReadPullRequestImage",
     }
 )
+# The owner methods that stream their answer; every other pull request method is unary.
+_PULL_REQUEST_OWNER_STREAMS = frozenset({"ReadPullRequestImage"})
 # The owner methods that change the pull request; a lost answer may hide a change.
 _PULL_REQUEST_WRITES = _PULL_REQUEST_OWNER_METHODS - {
     "ListLabels",
@@ -74,6 +77,7 @@ _PULL_REQUEST_WRITES = _PULL_REQUEST_OWNER_METHODS - {
     "GetPendingReview",
     "GetMergeQueue",
     "GetPullRequestStack",
+    "ReadPullRequestImage",
 }
 # Only the server's call frame carries these; a request message never does.
 _SERVER_ONLY_FIELDS = frozenset(
@@ -101,9 +105,10 @@ def test_only_the_reads_have_no_side_effects() -> None:
     assert {name for name in pull_requests if WORKSPACE_METHODS[name].no_side_effects} == marked
 
 
-def test_no_pull_request_method_streams() -> None:
+def test_only_the_image_read_streams() -> None:
     pull_requests = _PULL_REQUEST_READS | _PULL_REQUEST_OWNER_METHODS
-    assert not any(WORKSPACE_METHODS[name].streaming for name in pull_requests)
+    streamed = {name for name in pull_requests if WORKSPACE_METHODS[name].streaming}
+    assert streamed == _PULL_REQUEST_OWNER_STREAMS
 
 
 def test_no_request_message_can_name_a_session_or_vouch_for_a_pull_request() -> None:

@@ -3865,7 +3865,9 @@ export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequ
  */
 export declare type PullRequestFailure = Message<"omnigent.api.workspace.v1alpha1.PullRequestFailure"> & {
   /**
-   * One of "comment_changed", "pull_request_changed", "invalid_input" or "read_only_code_host".
+   * One of "comment_changed", "pull_request_changed", "invalid_input" or
+   * "read_only_code_host"; for an image read, one of "not_in_pr", "host_not_allowed",
+   * "too_large", "not_image" or "fetch_failed".
    *
    * @generated from field: string reason = 1;
    */
@@ -4920,7 +4922,10 @@ export declare const WorkspaceService: GenService<{
     output: typeof PreviewReviewerPingResponseSchema;
   },
   /**
-   * Streams an image the pull request links to: its metadata, then its bytes.
+   * Streams an image the pull request links to: its metadata, then its bytes. Only the
+   * session's owner may call it. A caller that leaves early may hold one of the host's four
+   * image reads for up to 30 seconds. A client may keep an image in memory, keyed by
+   * `(pr_url, image_url)`, for as long as the page that shows it stays open.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ReadPullRequestImage
    */
