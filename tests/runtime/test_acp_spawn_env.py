@@ -17,8 +17,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.chat import _bundle_agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.workflow import _build_acp_spawn_env
+from omnigent.spec import load
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig, ProviderAuth
 
 _AGENTS = [
@@ -236,6 +238,38 @@ def test_embedded_agent_overrides_config_lookup(_isolate_config: Path) -> None:
     # The embedded command is used, not the one from config
     assert env["HARNESS_ACP_COMMAND"] == "goose acp --custom-flag"
     assert env["HARNESS_ACP_NAME"] == "Different Goose"
+
+
+def test_spec_version_1_bundled_agent_reaches_spawn_env(
+    _isolate_config: Path, tmp_path: Path
+) -> None:
+    """A ``spec_version: 1`` bundle's embedded agent launches without a host ``acp:`` block."""
+    acp_agent = {"name": "GitHub Copilot", "command": "copilot --acp --stdio"}
+    source = tmp_path / "probe"
+    source.mkdir()
+    (source / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "spec_version": 1,
+                "name": "probe",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {
+                        "harness": "acp",
+                        "permission_mode": "bypassPermissions",
+                        "acp_agent": acp_agent,
+                    },
+                },
+                "prompt": "test",
+            }
+        )
+    )
+
+    env = _build_acp_spawn_env(load(_bundle_agent(source), dest=tmp_path / "uploaded"))
+
+    assert env["HARNESS_ACP_COMMAND"] == acp_agent["command"]
+    assert env["HARNESS_ACP_NAME"] == acp_agent["name"]
+    assert env["HARNESS_ACP_PERMISSION_MODE"] == "bypassPermissions"
 
 
 @pytest.mark.parametrize(
