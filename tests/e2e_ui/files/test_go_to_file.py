@@ -11,35 +11,24 @@ dialog's states are in the unit tests (``goToFileView``, ``textSearchView``, ``G
 from __future__ import annotations
 
 import re
-import shutil
 from collections.abc import Iterator
-from pathlib import Path
 
-import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.files._files_page import seeded_workspace
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app, _set_flag
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 _FILES = ("widgets/gadget.py", "widgets/gizmo.py", "README.md")
 _DESKTOP = {"width": 1440, "height": 900}
 
 
 @pytest.fixture
 def go_to_file_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
-    base_url, session_id = seeded_session
-    for path in _FILES:
-        httpx.put(
-            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem/{path}",
-            json={"content": f"contents of {path}\n", "encoding": "utf-8"},
-            timeout=10.0,
-        ).raise_for_status()
-    try:
-        yield (base_url, session_id)
-    finally:
-        shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+    # Removes exactly what it wrote from the session's real workspace afterwards.
+    with seeded_workspace(seeded_session, {path: f"contents of {path}\n" for path in _FILES}):
+        yield seeded_session
 
 
 def _mac(page: Page) -> bool:
