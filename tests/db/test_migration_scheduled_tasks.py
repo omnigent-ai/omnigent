@@ -1542,8 +1542,14 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
         "created_at": 1,
     }
     before = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    before_runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
     with engine.begin() as conn:
         conn.execute(before.insert().values(id=b"a" * 16, rrule="FREQ=DAILY", **values))
+        conn.execute(
+            before_runs.insert().values(
+                id=b"k" * 16, scheduled_task_id=b"a" * 16, status=4, scheduled_at=1
+            )
+        )
     command.upgrade(config, _TRIGGER_CONFIG_REVISION)
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
     runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
@@ -1553,6 +1559,9 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
             "FREQ=DAILY",
             None,
         )
+        assert (
+            conn.execute(sa.select(runs.c.status).where(runs.c.id == b"k" * 16)).scalar_one() == 4
+        )
         # The ORM type compresses on write; a raw insert only needs a non-NULL value.
         conn.execute(
             tasks.insert().values(id=b"b" * 16, rrule=None, trigger_config=b"{}", **values)
@@ -1560,11 +1569,6 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
         assert (
             conn.execute(sa.select(tasks.c.rrule).where(tasks.c.id == b"b" * 16)).scalar_one()
             is None
-        )
-        conn.execute(
-            runs.insert().values(
-                id=b"k" * 16, scheduled_task_id=b"a" * 16, status=4, scheduled_at=1
-            )
         )
         conn.execute(
             runs.insert().values(
