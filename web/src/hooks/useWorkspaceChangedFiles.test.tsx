@@ -2849,3 +2849,106 @@ it("skips re-rendering for a grid session's streamed frames", () => {
   view.unmount();
   conversationRegistry.clear();
 });
+
+describe("useSessionActive status sources with grids on", () => {
+  function GridOn({ children }: { children: ReactNode }) {
+    return (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: true } }}
+      >
+        {children}
+      </CapabilitiesProvider>
+    );
+  }
+
+  // Clear on both sides: a failing test elsewhere in this file can leave entries behind.
+  beforeEach(() => conversationRegistry.clear());
+  afterEach(() => conversationRegistry.clear());
+
+  it("maps each of a grid session's statuses to active as before", () => {
+    stubChatStore("focused-session", "idle");
+    const entry = conversationRegistry.acquire("grid-session");
+    const view = renderHook(() => useSessionActive("grid-session"), { wrapper: GridOn });
+    const seen: boolean[] = [view.result.current];
+    for (const sessionStatus of ["waiting", "running", "failed", "waiting", "idle"] as const) {
+      act(() => entry.setState({ sessionStatus }));
+      seen.push(view.result.current);
+    }
+    expect(seen).toEqual([false, true, true, false, true, false]);
+  });
+
+  it("reads the focused session from the chat store, not its registry entry", () => {
+    stubChatStore("focused-session", "idle");
+    const entry = conversationRegistry.acquire("focused-session");
+    act(() => entry.setState({ sessionStatus: "running" }));
+    const idle = renderHook(() => useSessionActive("focused-session"), { wrapper: GridOn });
+    expect(idle.result.current).toBe(false);
+    idle.unmount();
+
+    stubChatStore("focused-session", "running");
+    act(() => entry.setState({ sessionStatus: "idle" }));
+    const running = renderHook(() => useSessionActive("focused-session"), { wrapper: GridOn });
+    expect(running.result.current).toBe(true);
+  });
+
+  it("follows the status of whichever grid session it's given", () => {
+    stubChatStore("focused-session", "idle");
+    const first = conversationRegistry.acquire("grid-a");
+    const second = conversationRegistry.acquire("grid-b");
+    act(() => first.setState({ sessionStatus: "running" }));
+    const view = renderHook(({ id }: { id: string }) => useSessionActive(id), {
+      wrapper: GridOn,
+      initialProps: { id: "grid-a" },
+    });
+    expect(view.result.current).toBe(true);
+    view.rerender({ id: "grid-b" });
+    expect(view.result.current).toBe(false);
+    act(() => second.setState({ sessionStatus: "waiting" }));
+    expect(view.result.current).toBe(true);
+    // The session it no longer watches can't flip it.
+    act(() => first.setState({ sessionStatus: "idle" }));
+    act(() => second.setState({ sessionStatus: "idle" }));
+    expect(view.result.current).toBe(false);
+    act(() => first.setState({ sessionStatus: "running" }));
+    expect(view.result.current).toBe(false);
+  });
+
+  it("picks up a grid session that goes live after mount on its first change", () => {
+    stubChatStore("focused-session", "idle");
+    const view = renderHook(() => useSessionActive("late-session"), { wrapper: GridOn });
+    expect(view.result.current).toBe(false);
+    const entry = conversationRegistry.acquire("late-session");
+    act(() => entry.setState({ sessionStatus: "running" }));
+    expect(view.result.current).toBe(true);
+  });
+
+  it("refetches an unfocused grid session's changed files when its turn ends", async () => {
+    onlineMock.mockReturnValue(true);
+    stubChatStore("focused-session", "idle");
+    const entry = conversationRegistry.acquire("grid-session");
+    act(() => entry.setState({ sessionStatus: "running" }));
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValue(changedFilesResponse());
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <GridOn>
+          <ChangedFilesProbe id="grid-session" />
+        </GridOn>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    // Frames that leave the status alone don't refetch.
+    act(() => entry.setState({ blocks: [] }));
+    await flushMicrotasks();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    act(() => entry.setState({ sessionStatus: "idle" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "/v1/sessions/grid-session/resources/environments/default/changes",
+    );
+  });
+});
