@@ -600,8 +600,8 @@ def claude_user_settings_path(
 def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
     """Return Claude Code's user ``settings.json``, parsed.
 
-    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    Uses a non-empty ``$CLAUDE_CONFIG_DIR/settings.json`` override, else
+    ``~/.claude/settings.json``.
     As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
     relative value is relative to the CLI's working directory.
 
@@ -618,7 +618,9 @@ def read_claude_user_settings_with_sources(
     cwd: str | None = None,
 ) -> tuple[dict[str, object] | None, tuple[Path, ...]]:
     """Read user settings and retain the directory and file actually selected."""
-    settings_path = Path(os.path.abspath(claude_user_settings_path(cwd)))
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured) if configured else Path.home() / ".claude"
+    settings_path = Path(os.path.abspath(Path(cwd or "") / config_dir / "settings.json"))
     try:
         resolved_path = settings_path.resolve(strict=True)
         payload = json.loads(resolved_path.read_text(encoding="utf-8"))

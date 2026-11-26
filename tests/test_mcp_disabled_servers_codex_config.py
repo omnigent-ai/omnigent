@@ -418,15 +418,49 @@ def test_strict_disables_every_layer_except_allowlist_without_retry(launch, exec
 
 @pytest.mark.skipif(os.name != "posix", reason="Codex reads /etc layers only on POSIX")
 @pytest.mark.parametrize("strict", [False, True])
-def test_strict_refuses_launch_when_a_layer_is_unreadable(launch, caplog, strict):
+@pytest.mark.parametrize(
+    ("layer", "failure"),
+    [
+        ("managed", "parse"),
+        ("managed", "read"),
+        ("user", "read"),
+        ("system", "read"),
+        ("project", "read"),
+    ],
+)
+def test_strict_refuses_launch_when_a_layer_is_unreadable(
+    launch, caplog, strict, layer, failure, monkeypatch
+):
     home, repo = launch
     if strict:
         write_mcp_inheritance({"inherit": False})
     else:
         set_disabled(ServerKey("codex", "user"), True)
-    managed = mcp_disabled_servers.CODEX_MANAGED_CONFIG_PATH
-    _write(managed, "[mcp_servers.managed\n")
-    _write(home / "config.toml", '[mcp_servers.user]\ncommand="true"\n')
+    user = home / "config.toml"
+    system = mcp_disabled_servers.CODEX_SYSTEM_CONFIG_PATH
+    paths = {
+        "managed": mcp_disabled_servers.CODEX_MANAGED_CONFIG_PATH,
+        "user": user,
+        "system": system,
+        "project": repo / ".codex/config.toml",
+    }
+    unreadable = paths[layer]
+    user_config = '[mcp_servers.user]\ncommand="true"\n'
+    if layer == "project":
+        user_config += f'[projects.{json.dumps(str(repo))}]\ntrust_level="trusted"\n'
+    _write(user, user_config)
+    if layer == "user":
+        _write(system, '[mcp_servers.user]\ncommand="true"\n')
+    _write(unreadable, "[mcp_servers.managed\n" if failure == "parse" else "")
+    if failure == "read":
+        read_text = Path.read_text
+
+        def refuse_read(path, *args, **kwargs):
+            if path == unreadable:
+                raise PermissionError("unreadable configuration")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", refuse_read)
     if not strict:
         plan = _plan(home, repo, executor="codex-native")
         assert plan.config_overrides == ("mcp_servers.user.enabled=false",)
@@ -434,9 +468,9 @@ def test_strict_refuses_launch_when_a_layer_is_unreadable(launch, caplog, strict
         return
     with pytest.raises(McpStrictModeError, match="codex-native launch") as refused:
         _plan(home, repo, executor="codex-native")
-    assert refused.value.path == managed
+    assert refused.value.path == unreadable
     assert "harness.codex-native.mcp.inherit: true" in str(refused.value)
-    assert f"mcp_strict_launch_refused executor=codex-native path={managed}" in caplog.text
+    assert f"mcp_strict_launch_refused executor=codex-native path={unreadable}" in caplog.text
 
 
 # Codex accepts these multiline inline tables as whole-table and dotted CLI overrides.

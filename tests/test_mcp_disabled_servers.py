@@ -264,6 +264,31 @@ def test_claude_strict_denies_inherited_allow_entries(
     from omnigent.onboarding import ambient
 
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
+    original = {"deniedMcpServers": [{"serverName": "caller"}]}
+    settings = original if executor == "claude-native" else json.dumps(original)
+    if managed_only in ("managed", "drop-in"):
+        locked = (
+            managed
+            if managed_only == "managed"
+            else managed.with_name("managed-settings.d") / "10-team.json"
+        )
+        _write_json(locked, {"allowManagedMcpServersOnly": True})
+        for scopes in (None, []):
+            with pytest.raises(McpStrictModeError, match="managed-only") as raised:
+                apply_claude_settings(
+                    settings,
+                    executor=executor,
+                    active_harnesses=None,
+                    cwd=claude_project / "sub",
+                    setting_sources=scopes,
+                )
+            assert raised.value.path == locked
+        write_mcp_inheritance({"inherit": True})
+        assert (
+            apply_claude_settings(settings, executor=executor, active_harnesses=None) is settings
+        )
+        return
     url = {"serverUrl": "https://mcp.example.com/*"}
     _write_json(
         tmp_path / "claude/claude-config/settings.json",
@@ -286,7 +311,6 @@ def test_claude_strict_denies_inherited_allow_entries(
         claude_project / ".claude/settings.local.json",
         {"allowedMcpServers": [{"serverName": "local_only"}]},
     )
-    managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
     _write_json(
         managed,
         {
@@ -316,29 +340,6 @@ def test_claude_strict_denies_inherited_allow_entries(
         claude_project / "sub/.claude/settings.json",
         {"allowedMcpServers": [{"serverName": "subdirectory_only"}]},
     )
-    original = {"deniedMcpServers": [{"serverName": "caller"}]}
-    settings = original if executor == "claude-native" else json.dumps(original)
-    if managed_only in ("managed", "drop-in"):
-        drop_in = managed.with_name("managed-settings.d") / "10-team.json"
-        _write_json(managed, {})
-        _write_json(drop_in, {})
-        locked = managed if managed_only == "managed" else drop_in
-        _write_json(locked, {"allowManagedMcpServersOnly": True})
-        for scopes in (None, []):
-            with pytest.raises(McpStrictModeError, match="managed-only") as raised:
-                apply_claude_settings(
-                    settings,
-                    executor=executor,
-                    active_harnesses=None,
-                    cwd=claude_project / "sub",
-                    setting_sources=scopes,
-                )
-            assert raised.value.path == locked
-        write_mcp_inheritance({"inherit": True})
-        assert (
-            apply_claude_settings(settings, executor=executor, active_harnesses=None) is settings
-        )
-        return
     if managed_only is not None:
         path = (
             tmp_path / "claude/claude-config/settings.json" if managed_only == "user" else managed
@@ -624,13 +625,43 @@ def test_claude_strict_reads_settings_for_the_launch_environment(
         )
 
 
-@pytest.mark.parametrize("content", ["{", "[]", None])
-def test_unreadable_claude_settings_refuse_only_strict_launches(content, claude_project, caplog):
+@pytest.mark.parametrize(
+    ("source", "content"),
+    [
+        ("local", "{"),
+        ("local", "[]"),
+        ("local", None),
+        ("managed", None),
+        ("drop-in", None),
+        ("directory", None),
+    ],
+)
+def test_unreadable_claude_settings_refuse_only_strict_launches(
+    source, content, claude_project, caplog, monkeypatch
+):
+    from omnigent.onboarding import ambient
+
     path = claude_project / ".claude/settings.local.json"
+    managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
+    if source == "managed":
+        path = managed
+    elif source in ("drop-in", "directory"):
+        path = managed.with_name("managed-settings.d")
+        if source == "drop-in":
+            path /= "10-team.json"
     if content is None:
         path.mkdir(parents=True)  # Read failure, even when tests run as root.
     else:
         _write_json(path, content)
+    if source == "directory":
+        listdir = os.listdir
+
+        def refuse_directory(directory):
+            if directory == path:
+                raise PermissionError("unreadable settings directory")
+            return listdir(directory)
+
+        monkeypatch.setattr(os, "listdir", refuse_directory)
     set_disabled(ServerKey("claude", "github"), True)
     assert apply_claude_settings({}, executor="claude-native", active_harnesses=["claude"]) == {
         "deniedMcpServers": [{"serverName": "github"}]
