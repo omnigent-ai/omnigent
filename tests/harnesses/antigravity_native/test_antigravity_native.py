@@ -497,8 +497,6 @@ _PLACEHOLDER_ID = "agy_conv_fresh_placeholder"
 
 def _terminal_launch_handler(request: httpx.Request) -> httpx.Response:
     """Minimal handler that accepts the terminal POST and returns a stub resource."""
-    if request.method == "GET":
-        return httpx.Response(200, json={})
     return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
 
 
@@ -699,8 +697,12 @@ async def test_launch_and_record_threads_headless_skip_flag(
     assert "--dangerously-skip-permissions" in captured_args
 
 
+@pytest.mark.parametrize("startup_case", ["authored", "bundle-error", "write-error"])
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    startup_case: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The CLI launch scopes agy to a per-session Gemini dir, like the runner path.
 
@@ -717,13 +719,49 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     user_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
     user_settings.write_text('{"model":"gemini-3-pro"}', encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
+    from tests._helpers.session import bundle_files
+
+    authored = "Begin every reply with AGY-STARTUP."
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                "spec_version: 1\nname: startup-check\n"
+                "executor:\n  type: omnigent\n  config:\n    harness: antigravity-native\n"
+                f"instructions: {authored}\n"
+            ).encode(),
+        }
+    )
+    if startup_case == "write-error":
+
+        def fail_write(*_args: object) -> None:
+            raise PermissionError("read-only rules")
+
+        monkeypatch.setattr(_mod, "write_agent_instructions", fail_write)
 
     captured_args: list[str] = []
     captured_env: dict[str, str] = {}
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(200, json={})
+            if request.url.path.endswith("/agent/contents"):
+                return (
+                    httpx.Response(500)
+                    if startup_case == "bundle-error"
+                    else httpx.Response(
+                        200,
+                        content=bundle,
+                        headers={"Content-Type": "application/gzip"},
+                    )
+                )
+            return httpx.Response(200, json={"agent_id": "authored-agent"})
+        bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+        rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+        if startup_case == "write-error":
+            assert not rule.exists()
+        else:
+            text = rule.read_text(encoding="utf-8")
+            assert WORKSPACE_IMAGE_INSTRUCTION in text
+            assert (authored in text) is (startup_case == "authored")
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         captured_env.update(body["spec"]["env"])
@@ -763,6 +801,8 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     assert iso_settings["showFeedbackSurvey"] is False
     assert "mcp(omnigent/*)" in iso_settings["permissions"]["allow"]
     assert user_settings.read_text(encoding="utf-8") == '{"model":"gemini-3-pro"}'
+    warning = capsys.readouterr().err
+    assert ("Warning:" in warning) is (startup_case != "authored")
 
 
 # ---------------------------------------------------------------------------

@@ -2007,8 +2007,8 @@ def test_seed_isolated_agy_home_merges_omnigent_mcp_allow_rule(
         "theme": "dark",
         "permissions": {
             "allow": ["mcp(other/*)"],
-            "ask": ["shell(git push *)"],
-            "deny": ["shell(rm -rf *)"],
+            "ask": ["shell(git push *)", "mcp(omnigent/*)"],
+            "deny": ["shell(rm -rf *)", "mcp(omnigent/memory_search)"],
         },
     }
     real_settings.write_text(json.dumps(real_payload), encoding="utf-8")
@@ -2024,10 +2024,63 @@ def test_seed_isolated_agy_home_merges_omnigent_mcp_allow_rule(
     assert isolated["theme"] == "dark"
     assert isolated["permissions"] == {
         "allow": ["mcp(other/*)", "mcp(omnigent/*)"],
-        "ask": ["shell(git push *)"],
-        "deny": ["shell(rm -rf *)"],
+        "ask": ["shell(git push *)", "mcp(omnigent/*)"],
+        "deny": ["shell(rm -rf *)", "mcp(omnigent/memory_search)"],
     }
     assert json.loads(real_settings.read_text(encoding="utf-8")) == real_payload
+
+
+@pytest.mark.parametrize("fault", ["read", "replace"])
+def test_relay_permissions_preserve_settings_and_remove_temporary_files_after_io_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    settings = agy_gemini_dir(bridge_dir) / "antigravity-cli/settings.json"
+    settings.parent.mkdir(parents=True)
+    original = b'{"theme":"dark","permissions":{"deny":["mcp(other/write)"]}}'
+    settings.write_bytes(original)
+    read_text = Path.read_text
+
+    def read(path: Path, *args: object, **kwargs: object) -> str:
+        if path == settings:
+            raise PermissionError("settings are unreadable")
+        return read_text(path, *args, **kwargs)
+
+    def replace(*_args: object) -> None:
+        raise OSError("replacement failed")
+
+    if fault == "read":
+        monkeypatch.setattr(Path, "read_text", read)
+    else:
+        monkeypatch.setattr(_mod.os, "replace", replace)
+
+    _mod._seed_isolated_agy_mcp_permissions(bridge_dir)
+
+    assert settings.read_bytes() == original
+    assert list(settings.parent.iterdir()) == [settings]
+
+
+@pytest.mark.parametrize("escaped_parent", ["gemini", "cli"])
+def test_relay_permissions_leave_settings_outside_the_bridge_unchanged(
+    tmp_path: Path, escaped_parent: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    outside = tmp_path / "outside"
+    settings = outside / (
+        "antigravity-cli/settings.json" if escaped_parent == "gemini" else "settings.json"
+    )
+    settings.parent.mkdir(parents=True)
+    original = b'{"theme":"dark","permissions":{"allow":["mcp(other/read)"]}}'
+    settings.write_bytes(original)
+    linked = gemini_dir if escaped_parent == "gemini" else gemini_dir / "antigravity-cli"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(outside, target_is_directory=True)
+
+    _mod._seed_isolated_agy_mcp_permissions(bridge_dir)
+
+    assert settings.read_bytes() == original
+    assert list(settings.parent.iterdir()) == [settings]
 
 
 def test_seed_isolated_agy_home_populates_empty_settings_json(

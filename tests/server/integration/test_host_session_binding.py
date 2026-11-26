@@ -725,9 +725,8 @@ async def test_deleting_one_session_keeps_a_shared_sandbox_host(
     """
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
-    monkeypatch.setattr(
-        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
-    )
+    # No runner connects here. Keep the runner-connect wait at its default so the
+    # launch can't fail (and tear the sandbox down) before the second session binds.
     loop = asyncio.get_running_loop()
     host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
 
@@ -2383,13 +2382,16 @@ async def test_move_cancelled_during_its_startup_write_leaves_nothing_held(
     release.set()
     await asyncio.gather(move, return_exceptions=True)
 
-    # The rollback finishes after the cancelled request.
-    await poll_until_async(
-        lambda: (
-            (current := env.conv_store.get_conversation(session_id)) is not None
+    # The rollback withdraws the startup before it releases the move's claim.
+    def rolled_back() -> bool:
+        current = env.conv_store.get_conversation(session_id)
+        return (
+            current is not None
             and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+            and current.runner_id is None
         )
-    )
+
+    await poll_until_async(rolled_back)
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
     assert conv.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN

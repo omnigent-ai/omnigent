@@ -1466,3 +1466,44 @@ describe("a sidebar that rests empty", () => {
     expect(isOnlyEmptyNewTab(store.tabs())).toBe(true);
   });
 });
+
+describe("telling of opened files", () => {
+  const blank: WorkspaceTab = { id: "N", place: { kind: "new" }, openedBy: "user" };
+
+  it("tells each file an open, a navigation or a new tab lands on", async () => {
+    const onFileOpened = vi.fn();
+    const { store } = makeStore({ initial: initial([files, pulls, blank], "F"), onFileOpened });
+
+    // Opened from the Files tree, shown in the Files tab itself.
+    await store.open({ place: file("src/tree.ts") }, { opener: "user", origin: "files-tree" });
+    // Opened in a tab of its own, as a Search result does.
+    await store.open({ place: file("src/found.ts", 4) }, { opener: "user", disposition: "new" });
+    const fileTab = store.selectedTabId()!;
+    // Stepped to from a file tab's breadcrumbs.
+    await store.navigate(fileTab, file("src/next.ts"));
+    expect(store.fillNewTab("N", file("src/picked.ts"))).toBe("N");
+
+    expect(onFileOpened.mock.calls.map(([path]) => path)).toEqual([
+      "src/tree.ts",
+      "src/found.ts",
+      "src/next.ts",
+      "src/picked.ts",
+    ]);
+  });
+
+  it("tells nothing for a place without a file, or an open that didn't happen", async () => {
+    const onFileOpened = vi.fn();
+    const { store, dirty, requestLeave } = makeStore({
+      initial: initial([files, { id: "E", place: file("src/edited.ts"), openedBy: "user" }], "E"),
+      onFileOpened,
+    });
+    await store.open({ place: { kind: "files" } }, { opener: "user" });
+    await store.open({ place: { kind: "changes" } }, { opener: "user" });
+    // Keeping unsaved edits cancels the navigation, so no file opened.
+    dirty.add("E");
+    requestLeave.mockResolvedValueOnce("cancel");
+    await store.navigate("E", file("src/other.ts"));
+
+    expect(onFileOpened).not.toHaveBeenCalled();
+  });
+});

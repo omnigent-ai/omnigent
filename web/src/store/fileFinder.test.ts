@@ -5,6 +5,8 @@ import {
   type FileFinderPane,
   requestFileFinder,
   requestTextSearch,
+  requestTextSearchFocus,
+  useTextSearchFocus,
   useFileFinderHost,
   useFileFinderPane,
   useFileFinderStore,
@@ -13,7 +15,13 @@ import {
 const store = () => useFileFinderStore.getState();
 
 beforeEach(() => {
-  useFileFinderStore.setState({ availableSessionId: null, request: null, pane: null });
+  useFileFinderStore.setState({
+    availableSessionId: null,
+    textSearchAvailable: false,
+    request: null,
+    textSearchFocus: null,
+    pane: null,
+  });
 });
 
 describe("requestFileFinder", () => {
@@ -73,6 +81,19 @@ describe("useFileFinderHost", () => {
     expect(requestFileFinder("b")).toBe(false);
   });
 
+  it("withdraws its session when it goes away, leaving a newer host's in place", () => {
+    const first = renderHook(() => useFileFinderHost("a", vi.fn(), { textSearch: true }));
+    first.unmount();
+    expect(store().availableSessionId).toBeNull();
+    expect(requestFileFinder("a")).toBe(false);
+    expect(requestTextSearch("a")).toBe(false);
+
+    const older = renderHook(() => useFileFinderHost("a", vi.fn()));
+    renderHook(() => useFileFinderHost("b", vi.fn()));
+    older.unmount();
+    expect(store().availableSessionId).toBe("b");
+  });
+
   it("drops a request left for a session that's no longer open", () => {
     const show = vi.fn();
     useFileFinderStore.setState({ request: { id: 99, sessionId: "old", kind: "files" } });
@@ -120,13 +141,13 @@ describe("useFileFinderPane", () => {
 
 describe("requestTextSearch", () => {
   it("asks the shell serving the session to search its contents", () => {
-    store().setAvailableSession("a");
+    store().setAvailableSession("a", { textSearch: true });
     expect(requestTextSearch("a")).toBe(true);
     expect(store().request).toMatchObject({ sessionId: "a", kind: "text" });
   });
 
   it("carries a query, an empty one too, as a new request each time", () => {
-    store().setAvailableSession("a");
+    store().setAvailableSession("a", { textSearch: true });
     requestTextSearch("a", { query: "needle" });
     const first = store().request!;
     expect(first).toMatchObject({ sessionId: "a", kind: "text", query: "needle" });
@@ -138,14 +159,22 @@ describe("requestTextSearch", () => {
 
   it("refuses a session no shell serves", () => {
     expect(requestTextSearch("a")).toBe(false);
-    store().setAvailableSession("b");
+    store().setAvailableSession("b", { textSearch: true });
     expect(requestTextSearch("a")).toBe(false);
     expect(store().request).toBeNull();
   });
 
+  it("refuses a session whose shell finds files but doesn't search their text", () => {
+    store().setAvailableSession("a");
+    expect(requestTextSearch("a")).toBe(false);
+    expect(store().request).toBeNull();
+    store().setAvailableSession("a", { textSearch: true });
+    expect(requestTextSearch("a")).toBe(true);
+  });
+
   it("reaches the host as a text request, and a finder request stays a file request", () => {
     const show = vi.fn();
-    renderHook(() => useFileFinderHost("a", show));
+    renderHook(() => useFileFinderHost("a", show, { textSearch: true }));
     act(() => {
       requestTextSearch("a");
     });
@@ -154,5 +183,57 @@ describe("requestTextSearch", () => {
       requestFileFinder("a", { query: "x" });
     });
     expect(show).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "files", query: "x" }));
+  });
+});
+
+describe("useTextSearchFocus", () => {
+  it("gives the session's Search field the keyboard once, when a text search asks", () => {
+    const input = document.createElement("input");
+    document.body.append(input);
+    const ref = { current: input };
+    renderHook(() => useTextSearchFocus("a", ref));
+    expect(input).not.toHaveFocus();
+    act(() => requestTextSearchFocus("b"));
+    expect(input).not.toHaveFocus();
+    act(() => requestTextSearchFocus("a"));
+    expect(input).toHaveFocus();
+    expect(store().textSearchFocus).toBeNull();
+    input.remove();
+  });
+
+  it("keeps asking while a hidden Search page can't take the keyboard, then focuses it", () => {
+    vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+    const input = document.createElement("input");
+    document.body.append(input);
+    // Hidden behind another tab, the field ignores focus until its page is selected.
+    let shown = false;
+    const focusField = HTMLInputElement.prototype.focus;
+    vi.spyOn(input, "focus").mockImplementation(function (this: HTMLInputElement) {
+      if (shown) focusField.call(this);
+    });
+    renderHook(() => useTextSearchFocus("a", { current: input }));
+    act(() => requestTextSearchFocus("a"));
+    expect(input).not.toHaveFocus();
+    expect(store().textSearchFocus).not.toBeNull();
+
+    shown = true;
+    act(() => vi.advanceTimersToNextFrame());
+    expect(input).toHaveFocus();
+    expect(store().textSearchFocus).toBeNull();
+    input.remove();
+    vi.useRealTimers();
+  });
+
+  it("gives up on a Search page that never shows, so a later visit isn't grabbed", () => {
+    vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+    const input = document.createElement("input");
+    document.body.append(input);
+    vi.spyOn(input, "focus").mockImplementation(() => {});
+    renderHook(() => useTextSearchFocus("a", { current: input }));
+    act(() => requestTextSearchFocus("a"));
+    for (let frame = 0; frame < 60; frame += 1) act(() => vi.advanceTimersToNextFrame());
+    expect(store().textSearchFocus).toBeNull();
+    input.remove();
+    vi.useRealTimers();
   });
 });

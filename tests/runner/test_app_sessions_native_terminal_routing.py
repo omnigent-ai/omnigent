@@ -955,11 +955,13 @@ async def test_create_session_repl_terminal_dispatch(
 
 
 @pytest.mark.parametrize("cached_predecessor", [False, True])
+@pytest.mark.parametrize("terminal_name", ["claude", "antigravity"])
 @pytest.mark.asyncio
 async def test_ensure_terminal_route_recreates_dead_registered_pane(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     cached_predecessor: bool,
+    terminal_name: str,
 ) -> None:
     """Ensure route detects a dead-but-registered pane and auto-creates.
 
@@ -977,25 +979,65 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     """
     sid = "deadbeef12345678deadbeef12345678"
     auto_create_calls: list[str] = []
+    child = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Child startup guidance.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+    root = AgentSpec(
+        spec_version=1,
+        name="parent",
+        instructions="Parent startup guidance.",
+        sub_agents=[child],
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        assert (agent_id, session_id) == ("agent-root", sid)
+        return root
+
+    class SnapshotClient(NullServerClient):
+        async def get(self, url: str, **kwargs: Any):
+            if url == f"/v1/sessions/{sid}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "agent_id": "agent-root",
+                        "sub_agent_name": "worker",
+                        "harness": f"{terminal_name}-native",
+                    },
+                )
+            return await super().get(url, **kwargs)
 
     async def _stub_auto_create(
         session_id: str,
         resource_registry: object,
         publish_event: object,
-        **_kwargs: object,
+        **kwargs: object,
     ) -> SessionResourceView:
         auto_create_calls.append(session_id)
+        if terminal_name == "antigravity":
+            selected = kwargs["agent_spec"]
+            assert isinstance(selected, AgentSpec)
+            assert selected.name == "worker"
+            assert selected.instructions == "Child startup guidance."
+
         return SessionResourceView(
-            id="terminal_claude_main", type="terminal", session_id=session_id, name="re-created"
+            id=f"terminal_{terminal_name}_main",
+            type="terminal",
+            session_id=session_id,
+            name="re-created",
         )
 
     monkeypatch.setattr(
-        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+        f"omnigent.runner.native.orchestration._auto_create_{terminal_name}_terminal",
+        _stub_auto_create,
     )
 
     registry = TerminalRegistry()
     dead_instance = TerminalInstance(
-        name="claude",
+        name=terminal_name,
         session_key="main",
         socket_path=tmp_path / "dead.sock",
         private_dir=tmp_path / "dead_private",
@@ -1015,31 +1057,36 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     dead_instance.close = _noop_close  # type: ignore[assignment]
 
     with registry._lock:
-        registry._by_conversation[sid] = {("claude", "main"): dead_instance}
-        registry._instance_locks[(sid, "claude", "main")] = threading.Lock()
+        registry._by_conversation[sid] = {(terminal_name, "main"): dead_instance}
+        registry._instance_locks[(sid, terminal_name, "main")] = threading.Lock()
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=SnapshotClient(),  # type: ignore[arg-type]
         terminal_registry=registry,
+        spec_resolver=resolve if terminal_name == "antigravity" else None,
     )
 
     async with _runner_client(app) as client:
         if cached_predecessor:
-            predecessor = make_test_terminal_instance("claude", "main", tmp_path / "old")
+            predecessor = make_test_terminal_instance(terminal_name, "main", tmp_path / "old")
             with registry._lock:
-                registry._by_conversation[sid][("claude", "main")] = predecessor
+                registry._by_conversation[sid][(terminal_name, "main")] = predecessor
             assert (
                 await app.state.session_resource_registry.get_terminal_resource(
-                    sid, "terminal_claude_main"
+                    sid, f"terminal_{terminal_name}_main"
                 )
                 is not None
             )
             with registry._lock:
-                registry._by_conversation[sid][("claude", "main")] = dead_instance
+                registry._by_conversation[sid][(terminal_name, "main")] = dead_instance
         resp = await client.post(
             f"/v1/sessions/{sid}/resources/terminals",
-            json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            json={
+                "terminal": terminal_name,
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
         )
 
     assert resp.status_code == 200, resp.text
@@ -1047,7 +1094,7 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         f"Expected ensure to auto-create after dead pane; got {resp.json()['name']!r}"
     )
     assert auto_create_calls == [sid], (
-        f"Expected _auto_create_claude_terminal to be called; got {auto_create_calls}"
+        f"Expected {terminal_name} auto-create to be called; got {auto_create_calls}"
     )
 
 
