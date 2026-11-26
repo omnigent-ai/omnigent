@@ -109,6 +109,13 @@ in this order:
 - **What it does:** two to four short bullets.
 - **Outputs:** what it produces, such as a PR link, a report or a file. This
   is what done means for the step.
+- **Time limit:** only when the user wants to hear if the step runs long:
+  its limit, such as `**Time limit:** 2 hours`. A limit for every step ("tell
+  me if any step takes over 4 hours") goes on each one. Keep limits when you
+  revise or save a plan, and change them only when asked. In a workflow
+  page's planning chat, a proposal gives limits only to steps the saved
+  workflow doesn't have yet: for a saved step, ask the user to pick a limit
+  from the timer on that step in the plan.
 - **Details:** the exact commands, paths, flags and checks the run needs, and
   the sources they come from. They come last, but keep them: a run has only
   the saved steps and the workflow's description.

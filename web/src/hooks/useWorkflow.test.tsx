@@ -9,7 +9,10 @@ import type { WorkflowRun } from "@/lib/workflowRuns";
 
 import {
   useCloneWorkflow,
+  useSaveStepTimeLimit,
+  useSaveWorkflowDescription,
   useSaveWorkflowPlan,
+  useWorkflow,
   useWorkflowRunDescendants,
   useWorkflowRuns,
 } from "./useWorkflow";
@@ -145,6 +148,68 @@ describe("useSaveWorkflowPlan", () => {
       detail: [{ type: "extra_forbidden", loc: ["body", "expected_description"] }],
     };
     vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(Response.json(saved))
+      .mockResolvedValueOnce(Response.json(refusal, { status: 422 }))
+      .mockResolvedValueOnce(Response.json(saved));
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveWorkflowPlan("workflow"), { wrapper });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync(proposal)).resolves.toEqual(saved);
+    });
+    // It reads the saved plan first, then writes over the steps it read.
+    const bodies = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(bodies).toEqual([{ ...proposal, expected_steps: steps }, { steps }]);
+  });
+
+  it("redoes a refused save over a time limit saved since its read", async () => {
+    const steps = [{ id: "review", name: "Review", goal: "Read it.", depends_on: [] }];
+    const limited = [{ ...steps[0]!, goal: "Read it.\n\n**Time limit:** 2 hours" }];
+    const first = { id: "workflow", name: "Review", description: "Review changes.", steps };
+    const newer = { ...first, steps: limited };
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(Response.json(first))
+      .mockResolvedValueOnce(
+        Response.json({ error: { code: "conflict", message: "changed" } }, { status: 409 }),
+      )
+      .mockResolvedValueOnce(Response.json(newer))
+      .mockResolvedValueOnce(Response.json(newer));
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveWorkflowPlan("workflow"), { wrapper });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync({ steps })).resolves.toEqual(newer);
+    });
+    // The redo names the newer steps and keeps the limit saved in them.
+    const bodies = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(bodies).toEqual([
+      { steps, expected_steps: steps },
+      { steps: limited, expected_steps: limited },
+    ]);
+  });
+
+  it("keeps the description, without the steps check, for a server from before that check", async () => {
+    const steps = [{ id: "review", name: "Review", goal: null, depends_on: [] }];
+    const saved = { id: "workflow", name: "Review", description: "Review changes.", steps };
+    const proposal = {
+      steps,
+      description: "Reviews open changes.",
+      expected_description: "Review changes.",
+      description_source: "proposal",
+    };
+    const refusal = { detail: [{ type: "extra_forbidden", loc: ["body", "expected_steps"] }] };
+    vi.mocked(authenticatedFetch)
+      .mockResolvedValueOnce(Response.json(saved))
       .mockResolvedValueOnce(Response.json(refusal, { status: 422 }))
       .mockResolvedValueOnce(Response.json(saved));
     const client = new QueryClient();
@@ -158,9 +223,198 @@ describe("useSaveWorkflowPlan", () => {
     });
     const bodies = vi
       .mocked(authenticatedFetch)
-      .mock.calls.map(([, init]) => JSON.parse(init!.body as string));
-    expect(bodies).toEqual([proposal, { steps }]);
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(bodies).toEqual([{ ...proposal, expected_steps: steps }, proposal]);
   });
+});
+
+describe("useSaveStepTimeLimit", () => {
+  const steps = [{ id: "review", name: "Review", goal: "Read it.", depends_on: [] }];
+  const saved = { id: "workflow", name: "Review", description: "Review changes.", steps };
+  const conflict = { error: { code: "conflict", message: "the steps changed" } };
+
+  function renderSave() {
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(() => useSaveStepTimeLimit("workflow"), { wrapper });
+    return () => result.current.mutateAsync({ stepId: "review", limit: "1 hour" });
+  }
+
+  const patchCount = () =>
+    vi.mocked(authenticatedFetch).mock.calls.filter(([, init]) => init?.method === "PATCH").length;
+
+  it("writes nothing when it can't read the saved plan", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      Response.json({ error: { message: "Try again" } }, { status: 500 }),
+    );
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow("Try again");
+    });
+    expect(patchCount()).toBe(0);
+  });
+
+  it("gives up after a few writes refused because the steps kept changing", async () => {
+    // Each read finds steps saved since the last one.
+    let reads = 0;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) => {
+      if (init?.method === "PATCH") return Response.json(conflict, { status: 409 });
+      reads += 1;
+      return Response.json({ ...saved, steps: [{ ...steps[0]!, goal: `Read ${reads}.` }] });
+    });
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow("The plan kept changing while it saved. Try again.");
+    });
+    // Each write names the steps read just before it.
+    const written = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(written.map((body) => body.expected_steps[0].goal)).toEqual([
+      "Read 1.",
+      "Read 2.",
+      "Read 3.",
+    ]);
+    expect(reads).toBe(3);
+  });
+
+  it("writes nothing unchecked to a server too old to check the steps it read", async () => {
+    // Another client adds a step after the read, and the server can't tell.
+    let stored: Record<string, unknown> = { ...saved };
+    const added = { id: "report", name: "Report", goal: null, depends_on: ["review"] };
+    const refusal = { detail: [{ type: "extra_forbidden", loc: ["body", "expected_steps"] }] };
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) => {
+      if (init?.method === "PATCH") {
+        // It refuses the field it doesn't know, and would write steps sent without it.
+        const body = JSON.parse(String(init.body));
+        if ("expected_steps" in body) return Response.json(refusal, { status: 422 });
+        stored = { ...stored, steps: body.steps };
+        return Response.json(stored);
+      }
+      const read = Response.json(stored);
+      stored = { ...stored, steps: [...steps, added] };
+      return read;
+    });
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow(
+        "This server is too old to save a step's time limit safely.",
+      );
+    });
+    expect(patchCount()).toBe(1);
+    expect(stored.steps).toEqual([...steps, added]);
+  });
+
+  it("writes nothing for a step no longer in the saved plan", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(Response.json({ ...saved, steps: [] }));
+    const save = renderSave();
+    await act(async () => {
+      await expect(save()).rejects.toThrow("The step is no longer in the saved plan.");
+    });
+    expect(patchCount()).toBe(0);
+  });
+
+  it("writes the steps alone, so a description decision made elsewhere stays", async () => {
+    // The same text written again elsewhere after the read; the server's time for it stands.
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) =>
+      Response.json(
+        init?.method === "PATCH"
+          ? { ...saved, description_updated_at: 200, updated_at: 210 }
+          : { ...saved, description_updated_at: 100, updated_at: 100 },
+      ),
+    );
+    const save = renderSave();
+    let result: { description_updated_at?: number | null } | undefined;
+    await act(async () => {
+      result = await save();
+    });
+    const [body] = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.flatMap(([, init]) => (init?.body ? [JSON.parse(init.body as string)] : []));
+    expect(body).toEqual({
+      steps: [{ ...steps[0], goal: "Read it.\n\n**Time limit:** 1 hour" }],
+      expected_steps: steps,
+    });
+    expect(result?.description_updated_at).toBe(200);
+  });
+});
+
+describe("a saved workflow's response", () => {
+  it.each([
+    ["after", 110],
+    ["in the same second as", 120],
+  ])(
+    "leaves a later write's description shown when it comes %s that write's",
+    async (_, limitAt) => {
+      const steps = [{ id: "review", name: "Review", goal: "Read it.", depends_on: [] }];
+      let stored = {
+        id: "workflow",
+        name: "Review",
+        description: "Old words.",
+        steps,
+        updated_at: 100,
+      };
+      let answerLimit: () => void = () => {};
+      vi.mocked(authenticatedFetch).mockImplementation(async (_path, init) => {
+        if (init?.method !== "PATCH") return Response.json(stored);
+        const body = JSON.parse(String(init.body));
+        if (body.steps) {
+          // The limit's write lands at once, and its response comes late.
+          stored = { ...stored, steps: body.steps, updated_at: limitAt };
+          const written = stored;
+          await new Promise<void>((resolve) => {
+            answerLimit = resolve;
+          });
+          return Response.json(written);
+        }
+        stored = { ...stored, description: body.description, updated_at: 120 };
+        return Response.json(stored);
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      // Every description the workflow's entry holds, in order.
+      const held: unknown[] = [];
+      client.getQueryCache().subscribe((event) => {
+        const data = event.query.state.data as { description?: string } | undefined;
+        if (event.query.queryKey[0] === "workflow" && data) held.push(data.description);
+      });
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const { result } = renderHook(
+        () => ({
+          shown: useWorkflow("workflow"),
+          limit: useSaveStepTimeLimit("workflow"),
+          describe: useSaveWorkflowDescription("workflow"),
+        }),
+        { wrapper },
+      );
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(result.current.shown.data?.description).toBe("Old words.");
+
+      let limitSaved: Promise<unknown> = Promise.resolve();
+      act(() => {
+        limitSaved = result.current.limit.mutateAsync({ stepId: "review", limit: "1 hour" });
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(stored.updated_at).toBe(limitAt);
+      await act(() => result.current.describe.mutateAsync("New words."));
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(result.current.shown.data?.description).toBe("New words.");
+      // A response from the same second as the shown one has the workflow read again instead.
+      await act(async () => {
+        answerLimit();
+        await limitSaved;
+      });
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(result.current.shown.data?.description).toBe("New words.");
+      expect(result.current.shown.data?.steps[0]?.goal).toBe("Read it.\n\n**Time limit:** 1 hour");
+      // The older words never came back, even for a moment.
+      expect(held.slice(held.indexOf("New words."))).not.toContain("Old words.");
+    },
+  );
 });
 
 describe("useWorkflowRuns live refresh", () => {

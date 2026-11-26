@@ -10,15 +10,17 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
-from sqlalchemy import Update, event, select
+from sqlalchemy import Update, event, select, update
 
 from omnigent.db import compression
 from omnigent.db.db_models import MAX_STORED_VALUE_BYTES, SqlPreference, SqlWorkflow
 from omnigent.db.utils import get_or_create_engine
-from omnigent.entities.workflow import InvalidWorkflowError, Workflow
+from omnigent.entities.workflow import InvalidWorkflowError, Workflow, normalize_workflow
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.stores import workflow_store
 from omnigent.stores.workflow_store import (
     WorkflowNameTakenError,
+    WorkflowStepsChangedError,
     WorkflowStore,
     workflow_page_cursor,
 )
@@ -263,6 +265,166 @@ def test_a_description_keeps_its_proposal_until_written_otherwise(store: Workflo
     assert kept_over is not None and kept_over.description == "From the new chat."
     assert kept_over.description_source == declined
     assert store.get(saved.id, user_id=ALICE) == kept_over
+
+
+def test_a_description_keeps_its_time_through_writes_that_leave_it(
+    store: WorkflowStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter(range(100, 1000, 10))
+    monkeypatch.setattr(workflow_store, "now_epoch", lambda: next(clock))
+    saved = _save(store, "deploy")
+    assert (saved.updated_at, saved.description_updated_at) == (100, 100)
+    stepped = store.update(saved.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert stepped is not None
+    assert (stepped.updated_at, stepped.description_updated_at) == (110, 100)
+    renamed = store.update(saved.id, user_id=ALICE, name="deploy-2")
+    assert renamed is not None and renamed.description_updated_at == 100
+    assert store.get(saved.id, user_id=ALICE) == renamed
+    stale = store.update(
+        saved.id, user_id=ALICE, description="From a stale page.", expected_description="Not it."
+    )
+    assert stale is not None and stale.description_updated_at == 100
+    described = store.update(saved.id, user_id=ALICE, description="New words.")
+    assert described is not None
+    assert (described.updated_at, described.description_updated_at) == (140, 140)
+    assert store.get(saved.id, user_id=ALICE) == described
+    # A later steps write keeps the description's time, held in the plan across a reload.
+    stored = store.update(saved.id, user_id=ALICE, steps=STEPS)
+    assert stored is not None and stored.description_updated_at == 140
+    assert store.get(saved.id, user_id=ALICE) == stored
+
+
+def test_a_kept_description_time_goes_once_an_older_server_writes_the_description(
+    store: WorkflowStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter(range(100, 1000, 10))
+    monkeypatch.setattr(workflow_store, "now_epoch", lambda: next(clock))
+    saved = _save(store, "deploy")
+    kept = store.update(saved.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert kept is not None and (kept.updated_at, kept.description_updated_at) == (110, 100)
+    # A server from before the time was kept writes the description alone, leaving the plan.
+    with get_or_create_engine(store.storage_location).begin() as connection:
+        connection.execute(
+            update(SqlWorkflow)
+            .where(SqlWorkflow.id == saved.id)
+            .values(description=compression.encode("Older words."), updated_at=115)
+        )
+    reread = store.get(saved.id, user_id=ALICE)
+    assert reread is not None and reread.description == "Older words."
+    assert reread.description_updated_at == 115
+    # Setting the first description again drops the time kept for it before.
+    restored = store.update(saved.id, user_id=ALICE, description="Run deploy.")
+    assert restored is not None and restored.description_updated_at == 120
+    assert store.get(saved.id, user_id=ALICE) == restored
+    # The next write of the steps keeps the time of the description it has now.
+    stepped = store.update(saved.id, user_id=ALICE, steps=STEPS)
+    assert stepped is not None
+    assert (stepped.updated_at, stepped.description_updated_at) == (130, 120)
+    assert store.get(saved.id, user_id=ALICE) == stepped
+    # The older server changing it away and back again leaves no kept time that counts.
+    for text, written_at in [("Older words.", 135), ("Run deploy.", 138)]:
+        with get_or_create_engine(store.storage_location).begin() as connection:
+            connection.execute(
+                update(SqlWorkflow)
+                .where(SqlWorkflow.id == saved.id)
+                .values(description=compression.encode(text), updated_at=written_at)
+            )
+    back = store.get(saved.id, user_id=ALICE)
+    assert back is not None and back.description == "Run deploy."
+    assert back.description_updated_at == 138
+
+
+def _full_plan_steps(store: WorkflowStore) -> list[dict[str, object]]:
+    """One step whose random goal makes the stored plan as large as the store takes."""
+    noise = "".join(random.Random(3).choices(string.ascii_letters + string.digits, k=30_000))
+
+    def fits(length: int) -> bool:
+        steps = [{"id": "big", "name": "Big", "goal": noise[:length]}]
+        _, text, normalized = normalize_workflow(name="full", description="Run it.", steps=steps)
+        try:
+            store._stored_texts(text, workflow_store._plan_text(normalized))
+        except InvalidWorkflowError:
+            return False
+        return True
+
+    low, high = 0, len(noise)
+    while low < high:
+        middle = (low + high + 1) // 2
+        low, high = (middle, high) if fits(middle) else (low, middle - 1)
+    return [{"id": "big", "name": "Big", "goal": noise[:low]}]
+
+
+def test_a_full_plan_can_still_be_renamed_planned_and_saved_later(
+    store: WorkflowStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter(range(100, 1000, 10))
+    monkeypatch.setattr(workflow_store, "now_epoch", lambda: next(clock))
+    saved = store.create(
+        user_id=ALICE, name="full", description="Run it.", steps=_full_plan_steps(store)
+    )
+    # Writes that leave the steps add nothing to a plan with no room left.
+    renamed = store.update(saved.id, user_id=ALICE, name="full-2")
+    assert renamed is not None and renamed.name == "full-2"
+    planned = store.update(saved.id, user_id=ALICE, planning_session_id="c" * 32)
+    assert planned is not None and planned.planning_session_id == "c" * 32
+    assert planned.description_updated_at == planned.updated_at == 120
+    # Steps that fit still save, the same ones or a little smaller, without room for the time.
+    again = store.update(saved.id, user_id=ALICE, steps=saved.steps)
+    assert again is not None and again.description_updated_at == again.updated_at == 130
+    smaller = [{**saved.steps[0], "goal": saved.steps[0]["goal"][:-1]}]
+    edited = store.update(saved.id, user_id=ALICE, steps=smaller)
+    assert edited is not None and edited.steps[0]["goal"] == smaller[0]["goal"]
+    assert store.get(saved.id, user_id=ALICE) == edited
+
+
+def test_a_write_from_steps_read_earlier_is_refused_once_they_change(
+    store: WorkflowStore,
+) -> None:
+    saved = _save(store, "deploy")
+    limited = [STEPS[0], {**STEPS[1], "goal": "Run the suite\n\n**Time limit:** 2 hours"}]
+    # The steps as read, in any equal form, let the write through.
+    written = store.update(saved.id, user_id=ALICE, steps=limited, expected_steps=saved.steps)
+    assert written is not None and written.steps[1]["goal"].endswith("2 hours")
+    again = store.update(saved.id, user_id=ALICE, steps=STEPS, expected_steps=limited)
+    assert again is not None and again.steps == saved.steps
+    # Steps saved since the read stay, and nothing else changes either.
+    elsewhere = store.update(saved.id, user_id=ALICE, steps=[{"id": "only", "name": "Only"}])
+    assert elsewhere is not None
+    with pytest.raises(WorkflowStepsChangedError):
+        store.update(
+            saved.id,
+            user_id=ALICE,
+            name="renamed",
+            steps=limited,
+            expected_steps=saved.steps,
+        )
+    assert store.get(saved.id, user_id=ALICE) == elsewhere
+
+
+def test_competing_writes_from_the_same_steps_let_only_one_through(
+    store: WorkflowStore, db_uri: str
+) -> None:
+    saved = _save(store, "deploy")
+    ready = Barrier(2)
+
+    def write(goal: str) -> Workflow | None:
+        competing = WorkflowStore(db_uri)
+        ready.wait(timeout=10)
+        try:
+            return competing.update(
+                saved.id,
+                user_id=ALICE,
+                steps=[STEPS[0], {**STEPS[1], "goal": goal}],
+                expected_steps=saved.steps,
+            )
+        except WorkflowStepsChangedError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ["First.", "Second."]))
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert store.get(saved.id, user_id=ALICE) == winners[0]
 
 
 def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> None:

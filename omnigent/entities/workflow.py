@@ -46,6 +46,10 @@ class Workflow:
     :param description_source: The journal entry ID of the planning-chat proposal
         Save plan took the description from or kept it over; ``None`` once it's
         written otherwise.
+    :param description_updated_at: Unix epoch seconds when the description was last
+        written; a write to the steps alone keeps it while the plan has room for it.
+        Otherwise, as for a workflow last written before the store kept it, it can be the
+        workflow's last write.
     """
 
     id: str
@@ -57,6 +61,7 @@ class Workflow:
     steps: list[dict[str, Any]]
     planning_session_id: str | None = None
     description_source: str | None = None
+    description_updated_at: int | None = None
 
 
 def normalize_workflow(

@@ -24,6 +24,7 @@ from omnigent.server.routes.workflow_permissions import UNSHAREABLE_WORKFLOW_MES
 from omnigent.server.schemas import SandboxStatus
 from omnigent.server.sharing_settings import SharingMode
 from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.stores import workflow_store
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -519,7 +520,7 @@ async def test_writes_report_conflicts_bad_input_and_missing_workflows(
 
 
 async def test_draft_planning_is_persistent_private_and_separate_from_runs(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     created = await client.post(
         "/v1/workflows",
@@ -583,9 +584,12 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
     assert (await client.get(path, headers=_headers(ALICE))).json()[
         "planning_session_id"
     ] == planner
-    assert (
-        await client.patch(path, json={"planning_session_id": planner}, headers=_headers(ALICE))
-    ).status_code == 200
+    planned = await client.patch(
+        path, json={"planning_session_id": planner}, headers=_headers(ALICE)
+    )
+    assert planned.status_code == 200
+    described_at = planned.json()["description_updated_at"]
+    assert isinstance(described_at, int)
 
     journal = f"/v1/sessions/{planner}/journal"
     empty = await client.post(
@@ -603,11 +607,28 @@ async def test_draft_planning_is_persistent_private_and_separate_from_runs(
         journal, json=_write("plan", plan, "proposal"), headers=_runner(planner)
     )
     assert proposal.status_code == 200, proposal.text
+    # A minute on, so the steps save can't keep the time by landing in the same second.
+    monkeypatch.setattr(workflow_store, "now_epoch", lambda: described_at + 60)
     saved = await client.patch(
         path, json={"steps": proposal.json()["content"]["steps"]}, headers=_headers(ALICE)
     )
     assert saved.status_code == 200 and saved.json()["is_draft"] is False
     assert saved.json()["planning_session_id"] == planner
+    # Saving the steps alone, as a time limit does, keeps the description's time.
+    assert saved.json()["updated_at"] == described_at + 60
+    assert saved.json()["description_updated_at"] == described_at
+    # A write from steps read before another save is refused, and changes nothing.
+    read = saved.json()["steps"]
+    limited = [{**read[0], "goal": "**Time limit:** 2 hours"}, *read[1:]]
+    stale = await client.patch(
+        path, json={"steps": limited, "expected_steps": STEPS[:1]}, headers=_headers(ALICE)
+    )
+    assert stale.status_code == 409 and stale.json()["error"]["code"] == "conflict"
+    current = await client.patch(
+        path, json={"steps": limited, "expected_steps": read}, headers=_headers(ALICE)
+    )
+    assert current.status_code == 200, current.text
+    assert current.json()["steps"][0]["goal"] == "**Time limit:** 2 hours"
     assert (await client.get(path + "/runs", headers=_headers(ALICE))).json()["data"] == []
     listed = (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0]
     assert listed["id"] == draft["id"] and listed["is_draft"] is False

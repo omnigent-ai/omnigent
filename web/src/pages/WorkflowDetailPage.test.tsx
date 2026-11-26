@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 
 import { showToast } from "@/components/ui/toast";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
+import type { StepTimeLimitChange } from "@/components/workflows/StepTimeLimit";
 import type { WorkflowSessionRequest } from "@/components/workflows/WorkflowSessionDialog";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
@@ -107,11 +108,44 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => {
 vi.mock("@/hooks/useNow", () => ({ useNow: () => new Date("2026-11-12T18:00:00Z") }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn(() => "loading") }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
-// The graph has its own tests; here it lists the steps it was given, and the
-// full-screen view where each stands.
+// The graph has its own tests; here it lists the steps it was given, with their goals,
+// a button for the time limit its owner can set, and the full-screen view where each stands.
 vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
-  WorkflowStepsGraph: ({ steps }: { steps: WorkflowStep[] }) => (
-    <div data-testid="workflow-steps-graph">{steps.map((step) => step.name).join(", ")}</div>
+  WorkflowStepsGraph: ({
+    steps,
+    onTimeLimitChange,
+    timeLimitPaused,
+  }: {
+    steps: WorkflowStep[];
+    onTimeLimitChange?: (change: StepTimeLimitChange) => void;
+    timeLimitPaused?: boolean;
+  }) => (
+    <>
+      <div
+        data-testid="workflow-steps-graph"
+        data-goals={JSON.stringify(steps.map((step) => step.goal))}
+      >
+        {steps.map((step) => step.name).join(", ")}
+      </div>
+      {onTimeLimitChange && (
+        <>
+          <button
+            type="button"
+            disabled={timeLimitPaused}
+            onClick={() => onTimeLimitChange({ stepId: "fix", limit: "4 hours" })}
+          >
+            Limit Fix the test to 4 hours
+          </button>
+          <button
+            type="button"
+            disabled={timeLimitPaused}
+            onClick={() => onTimeLimitChange({ stepId: "fix", limit: null })}
+          >
+            Clear Fix the test's limit
+          </button>
+        </>
+      )}
+    </>
   ),
   WorkflowGraphOverlay: (props: {
     title: string;
@@ -270,6 +304,86 @@ function renderPage(client = new QueryClient()) {
   });
 }
 
+interface StorePatch {
+  steps?: WorkflowStep[];
+  expected_steps?: WorkflowStep[];
+  description?: string;
+  expected_description?: string;
+  description_source?: string | null;
+}
+
+// Answers like the workflow store: steps and a description apply only while still the expected
+// ones. `hold` delays PATCHes, `fail` refuses them, `unknown` fields get an older server's 422,
+// and `afterRead` runs once just after a read.
+function serveLikeTheStore(initial: WorkflowDetail) {
+  const held: (() => void)[] = [];
+  const server = {
+    stored: initial,
+    patches: [] as StorePatch[],
+    hold: false,
+    fail: false,
+    unknown: [] as string[],
+    afterRead: undefined as (() => void) | undefined,
+    release: () =>
+      act(async () => {
+        for (const resolve of held.splice(0)) resolve();
+      }),
+  };
+  vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+    if (options?.method === "PATCH") {
+      const body = JSON.parse(String(options.body));
+      server.patches.push(body);
+      if (server.hold)
+        await new Promise<void>((resolve) => {
+          held.push(resolve);
+        });
+      if (server.fail)
+        return new Response(
+          JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+          { status: 500 },
+        );
+      const unknown = server.unknown.filter((field) => field in body);
+      if (unknown.length > 0) {
+        const detail = unknown.map((field) => ({ type: "extra_forbidden", loc: ["body", field] }));
+        return new Response(JSON.stringify({ detail }), { status: 422 });
+      }
+      const { stored } = server;
+      if (
+        body.expected_steps !== undefined &&
+        JSON.stringify(body.expected_steps) !== JSON.stringify(stored.steps)
+      )
+        return new Response(
+          JSON.stringify({ error: { code: "conflict", message: "Steps changed" } }),
+          { status: 409 },
+        );
+      const describes =
+        body.description !== undefined &&
+        (body.expected_description === undefined ||
+          body.expected_description === stored.description);
+      const now = (stored.updated_at ?? 0) + 100;
+      server.stored = {
+        ...stored,
+        steps: body.steps ?? stored.steps,
+        description: describes ? body.description : stored.description,
+        description_source: describes
+          ? (body.description_source ?? null)
+          : stored.description_source,
+        description_updated_at: describes
+          ? now
+          : (stored.description_updated_at ?? stored.updated_at),
+        updated_at: now,
+      };
+      return new Response(JSON.stringify(server.stored));
+    }
+    const read = new Response(JSON.stringify(server.stored));
+    const afterRead = server.afterRead;
+    server.afterRead = undefined;
+    afterRead?.();
+    return read;
+  });
+  return server;
+}
+
 describe("WorkflowDetailPage", () => {
   beforeEach(() => {
     vi.mocked(useIsMobileViewport).mockReturnValue(false);
@@ -394,6 +508,372 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(stored.steps).toEqual(edited));
     },
   );
+
+  /** A saved workflow whose planning chat holds *entries*, served like the store. */
+  async function workflowWithProposals(
+    saved: WorkflowStep[],
+    entries: JournalEntry[],
+    extra: Partial<WorkflowDetail> = {},
+  ) {
+    vi.mocked(useServerInfo).mockReturnValue(FALLBACK_SERVER_INFO);
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    const server = serveLikeTheStore({
+      ...WORKFLOW,
+      steps: saved,
+      planning_session_id: "a".repeat(32),
+      updated_at: 10,
+      ...extra,
+    });
+    mockJournal(entries);
+    return { patches: server.patches, server, release: server.release };
+  }
+
+  function mockJournal(entries: JournalEntry[], { isLoading = false } = {}) {
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries,
+      isLoading,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+      retry: vi.fn(),
+    });
+  }
+
+  /** A planning-chat proposal, its position following its time. */
+  function plan(createdAt: number, steps: WorkflowStep[], description?: string): JournalEntry {
+    return {
+      id: `proposal-${createdAt}`,
+      position: createdAt,
+      created_at: createdAt,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      content: { steps, ...(description ? { description } : {}) },
+    };
+  }
+
+  const graphGoals = () => JSON.parse(screen.getByTestId("workflow-steps-graph").dataset.goals!);
+  const runButton = () => screen.getByTestId("workflow-detail-run");
+
+  it("keeps a limit set or cleared from the menu over the proposal it was saved from", async () => {
+    // The planning chat's proposal set 2 hours, with a note after it, and Save plan saved it.
+    const noted = "The suite passes\n\n**Time limit:** 2 hours. Tell me if it runs longer.";
+    const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: noted }];
+    const { patches } = await workflowWithProposals(saved, [plan(5, saved)]);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    // A menu pick changes only the length.
+    const fourHours = "The suite passes\n\n**Time limit:** 4 hours. Tell me if it runs longer.";
+    await waitFor(() => expect(graphGoals()).toEqual([null, fourHours]));
+    // The steps alone, so the description and the proposal it stands over stay as they are.
+    expect(patches.at(-1)).toEqual({
+      steps: [WORKFLOW.steps[0], { ...WORKFLOW.steps[1], goal: fourHours }],
+      expected_steps: saved,
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+    expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+    expect(runButton()).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear Fix the test's limit" }));
+    await waitFor(() => expect(graphGoals()).toEqual([null, "The suite passes"]));
+    expect(patches.at(-1)!.steps![1]!.goal).toBe("The suite passes");
+    expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+    expect(runButton()).toBeEnabled();
+  });
+
+  it("leaves no unsaved change once a limit set from the menu is cleared", async () => {
+    // A quote that starts with Details, as an older proposal has it too.
+    const quoted = [
+      WORKFLOW.steps[0]!,
+      { ...WORKFLOW.steps[1]!, goal: "> **Details:** rerun it." },
+    ];
+    await workflowWithProposals(quoted, [plan(5, quoted)]);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() =>
+      expect(graphGoals()).toEqual([
+        null,
+        "> **Time limit:** 4 hours\n>\n> **Details:** rerun it.",
+      ]),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear Fix the test's limit" }));
+    await waitFor(() => expect(graphGoals()).toEqual([null, "> **Details:** rerun it."]));
+    expect(screen.queryByRole("button", { name: "Save plan" })).toBeNull();
+    expect(runButton()).toBeEnabled();
+  });
+
+  it("lets the time limit menus work while the planning chat loads", async () => {
+    const { patches } = await workflowWithProposals(WORKFLOW.steps, []);
+    mockJournal([], { isLoading: true });
+    renderPage();
+    const limit = await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" });
+    expect(limit).toBeEnabled();
+    fireEvent.click(limit);
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(Object.keys(patches[0]!).sort()).toEqual(["expected_steps", "steps"]);
+  });
+
+  it("gives a proposal's new step its limit, and leaves a saved step's limit to the menu", async () => {
+    const { patches } = await workflowWithProposals(WORKFLOW.steps, [
+      plan(50, [
+        WORKFLOW.steps[0]!,
+        { ...WORKFLOW.steps[1]!, goal: "The suite passes\n\n**Time limit:** 1 hour" },
+        { id: "report", name: "Report", goal: "**Time limit:** 30 minutes", depends_on: ["fix"] },
+      ]),
+    ]);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.steps!.map((step) => step.goal)).toEqual([
+      null,
+      "The suite passes",
+      "**Time limit:** 30 minutes",
+    ]);
+  });
+
+  it("holds Run while a time limit saves, until it succeeds or fails", async () => {
+    const twoHours = "The suite passes\n\n**Time limit:** 2 hours";
+    const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: twoHours }];
+    const { server, release } = await workflowWithProposals(saved, [plan(5, saved)]);
+    server.hold = true;
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    // A run copies the saved steps, so it waits for the limit.
+    await waitFor(() => expect(runButton()).toBeDisabled());
+    expect(screen.getByRole("button", { name: "Clear Fix the test's limit" })).toBeDisabled();
+    await release();
+    await waitFor(() => expect(runButton()).toBeEnabled());
+
+    server.fail = true;
+    fireEvent.click(screen.getByRole("button", { name: "Clear Fix the test's limit" }));
+    await waitFor(() => expect(runButton()).toBeDisabled());
+    await release();
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining("Couldn’t save the time limit."),
+      ),
+    );
+    // The failed save keeps the saved limit and lets the menu and Run work again.
+    expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]);
+    expect(runButton()).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Clear Fix the test's limit" })).toBeEnabled();
+  });
+
+  it("holds Save plan while a time limit saves, and the saved limit stays in the plan", async () => {
+    const saved = WORKFLOW.steps;
+    const { patches, server, release } = await workflowWithProposals(saved, [plan(5, saved)]);
+    server.hold = true;
+    const view = renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+
+    // A proposal adding a step arrives while the limit is saving.
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    mockJournal([plan(5, saved), plan(20, [...saved, report])]);
+    view.rerender(<WorkflowDetailPage />);
+    expect(await screen.findByRole("button", { name: "Save plan" })).toBeDisabled();
+
+    server.hold = false;
+    await release();
+    const savePlanButton = screen.getByRole("button", { name: "Save plan" });
+    await waitFor(() => expect(savePlanButton).toBeEnabled());
+    fireEvent.click(savePlanButton);
+    await waitFor(() => expect(patches).toHaveLength(2));
+    expect(patches[1]!.steps).toEqual([
+      saved[0],
+      { ...saved[1], goal: "The suite passes\n\n**Time limit:** 4 hours" },
+      report,
+    ]);
+  });
+
+  const newDescription = "Finds flaky tests and fixes the worst one.";
+  it.each([
+    ["a newer proposal", [plan(5, WORKFLOW.steps)], plan(15, WORKFLOW.steps, newDescription)],
+    ["the first proposal", [], plan(50, WORKFLOW.steps, newDescription)],
+  ] as [string, JournalEntry[], JournalEntry][])(
+    "keeps offering %s's description when it arrives while a time limit saves",
+    async (_, before, arriving) => {
+      // The description was last written by hand, so it names no proposal it was saved from.
+      const { patches, server, release } = await workflowWithProposals(WORKFLOW.steps, before);
+      server.hold = true;
+      const client = new QueryClient();
+      const view = renderPage(client);
+      fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+      await waitFor(() => expect(patches).toHaveLength(1));
+
+      // The proposal comes before the limit's save lands, which moves the workflow's write time.
+      mockJournal([...before, arriving]);
+      view.rerender(<WorkflowDetailPage />);
+      server.hold = false;
+      await release();
+      await waitFor(() =>
+        expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
+      );
+      expect(server.stored.updated_at).toBeGreaterThan(arriving.created_at);
+      expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
+      expect(screen.getByText(newDescription)).toBeInTheDocument();
+      expect(runButton()).toBeDisabled();
+      // Read again, the workflow keeps the description's time, so the offer stays.
+      await act(() => client.invalidateQueries({ queryKey: ["workflow", WORKFLOW.id] }));
+      expect(screen.getByText(newDescription)).toBeInTheDocument();
+    },
+  );
+
+  it("sets a time limit in the plan as saved now, not the page's older copy", async () => {
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
+    renderPage();
+    const limit = await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" });
+
+    // Another page saves a new step meanwhile; it stays.
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    server.stored = { ...server.stored, steps: [...WORKFLOW.steps, report] };
+    fireEvent.click(limit);
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.steps).toEqual([
+      WORKFLOW.steps[0],
+      { ...WORKFLOW.steps[1], goal: "The suite passes\n\n**Time limit:** 4 hours" },
+      report,
+    ]);
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+        "Explore the failures, Fix the test, Report",
+      ),
+    );
+
+    // A step removed meanwhile gets no limit, and the page shows the plan as saved.
+    server.stored = { ...server.stored, steps: [WORKFLOW.steps[0]!] };
+    fireEvent.click(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        "Couldn’t save the time limit. The step is no longer in the saved plan.",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+        /^Explore the failures$/,
+      ),
+    );
+    expect(patches).toHaveLength(1);
+  });
+
+  it("saves a proposal with the limits saved since the page loaded", async () => {
+    const twoHours = "The suite passes\n\n**Time limit:** 2 hours";
+    const saved = [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: twoHours }];
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    const { patches, server } = await workflowWithProposals(saved, [
+      plan(50, [...WORKFLOW.steps, report]),
+    ]);
+    renderPage();
+    const savePlanButton = await screen.findByRole("button", { name: "Save plan" });
+
+    // Another page sets the step's limit to 4 hours meanwhile; this page still shows 2.
+    const fourHours = "The suite passes\n\n**Time limit:** 4 hours";
+    server.stored = {
+      ...server.stored,
+      steps: [WORKFLOW.steps[0]!, { ...WORKFLOW.steps[1]!, goal: fourHours }],
+    };
+    fireEvent.click(savePlanButton);
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.steps).toEqual([
+      WORKFLOW.steps[0],
+      { ...WORKFLOW.steps[1], goal: fourHours },
+      report,
+    ]);
+  });
+
+  it("asks for a new look at a proposal once the plan it was shown against changed", async () => {
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, [
+      plan(50, [...WORKFLOW.steps, report]),
+    ]);
+    renderPage();
+    const savePlanButton = await screen.findByRole("button", { name: "Save plan" });
+
+    // Another page renames a step meanwhile: the proposal isn't saved over it.
+    const renamed = [{ ...WORKFLOW.steps[0]!, name: "Look into the failures" }, WORKFLOW.steps[1]!];
+    server.stored = { ...server.stored, steps: renamed };
+    let reread = false;
+    server.afterRead = () => {
+      // The save's own read; the page's read of the plan as saved now comes next.
+      server.afterRead = () => {
+        reread = true;
+      };
+    };
+    fireEvent.click(savePlanButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn’t save the plan. The plan changed since this proposal was shown. Review it again.",
+    );
+    expect(patches).toEqual([]);
+
+    // Once the page has the plan as saved now, the proposal saves over it.
+    await waitFor(() => expect(reread).toBe(true));
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0]!.expected_steps).toEqual(renamed);
+  });
+
+  it("redoes a time limit save over steps saved between its read and its write", async () => {
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
+    renderPage();
+    const limit = await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" });
+
+    // Another page saves a step just after this save reads the plan.
+    const report = { id: "report", name: "Report", goal: null, depends_on: ["fix"] };
+    server.afterRead = () => {
+      server.stored = { ...server.stored, steps: [...WORKFLOW.steps, report] };
+    };
+    fireEvent.click(limit);
+    await waitFor(() =>
+      expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+        "Explore the failures, Fix the test, Report",
+      ),
+    );
+    // The first write named the steps it read, so it was refused; the second kept the new step.
+    expect(patches.map((patch) => patch.expected_steps?.length)).toEqual([2, 3]);
+    expect(server.stored.steps).toEqual([
+      WORKFLOW.steps[0],
+      { ...WORKFLOW.steps[1], goal: "The suite passes\n\n**Time limit:** 4 hours" },
+      report,
+    ]);
+  });
+
+  it("saves no time limit on a server too old to check the steps it read", async () => {
+    const { patches, server } = await workflowWithProposals(WORKFLOW.steps, []);
+    server.unknown = ["expected_steps"];
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Limit Fix the test to 4 hours" }));
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        "Couldn’t save the time limit. This server is too old to save a step's time limit safely.",
+      ),
+    );
+    // The refused write was the only one, so the plan is as it was.
+    expect(patches).toHaveLength(1);
+    expect(server.stored.steps).toEqual(WORKFLOW.steps);
+    expect(graphGoals()).toEqual([null, "The suite passes"]);
+  });
+
+  it("offers time limits only to the owner, and not while a proposal is unsaved", () => {
+    mockRuns([]);
+    mockWorkflow({ data: { ...WORKFLOW, viewer_role: "viewer" } });
+    renderPage();
+    expect(screen.getByTestId("workflow-steps-graph")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeNull();
+
+    cleanup();
+    mockWorkflow({ data: { ...WORKFLOW, planning_session_id: "a".repeat(32) } });
+    mockJournal([plan(1, [WORKFLOW.steps[0]!])]);
+    renderPage();
+    expect(screen.getByRole("button", { name: "Save plan" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeNull();
+  });
 
   it("expands the planner over the page in place, on wide screens only", () => {
     mockWorkflow({ data: { ...WORKFLOW, steps: [], is_draft: true } });
@@ -565,6 +1045,7 @@ describe("WorkflowDetailPage", () => {
     expect(patches).toEqual([
       {
         steps: WORKFLOW.steps,
+        expected_steps: [],
         description: WORKFLOW.description,
         expected_description: "Pull the board's open tickets and group them",
         description_source: "proposal",
@@ -592,6 +1073,7 @@ describe("WorkflowDetailPage", () => {
     await saveAndReload();
     expect(patches[1]).toEqual({
       steps: WORKFLOW.steps,
+      expected_steps: WORKFLOW.steps,
       description: "Fixes one flaky test.",
       expected_description: WORKFLOW.description,
       description_source: "revision",
@@ -626,7 +1108,7 @@ describe("WorkflowDetailPage", () => {
     expect(description()).toBe("Edited by hand");
     expect(screen.getByRole("status")).toHaveTextContent("Unsaved changes");
     await saveAndReload();
-    expect(patches[2]).toEqual({ steps: edited });
+    expect(patches[2]).toEqual({ steps: edited, expected_steps: WORKFLOW.steps });
     expect(description()).toBe("Edited by hand");
   });
 
@@ -770,34 +1252,6 @@ describe("WorkflowDetailPage", () => {
       );
     }
 
-    // Answers PATCH like the workflow store: a description applies only while the stored one is
-    // still `expected_description`, and keeps the proposal it was saved with as its source.
-    function serveLikeTheStore(initial: WorkflowDetail) {
-      const server = { stored: initial, patches: [] as Record<string, unknown>[] };
-      vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
-        if (options?.method === "PATCH") {
-          const body = JSON.parse(String(options.body));
-          server.patches.push(body);
-          const { stored } = server;
-          const describes =
-            body.description !== undefined &&
-            (body.expected_description === undefined ||
-              body.expected_description === stored.description);
-          server.stored = {
-            ...stored,
-            steps: body.steps ?? stored.steps,
-            description: describes ? body.description : stored.description,
-            description_source: describes
-              ? (body.description_source ?? null)
-              : stored.description_source,
-            updated_at: (stored.updated_at ?? 0) + 100,
-          };
-        }
-        return new Response(JSON.stringify(server.stored));
-      });
-      return server;
-    }
-
     async function renderJournal(entries: JournalEntry[], initial: WorkflowDetail) {
       const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
       vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
@@ -882,6 +1336,7 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(screen.queryByRole("radiogroup")).toBeNull());
       expect(server.patches.at(-1)).toEqual({
         steps: WORKFLOW.steps,
+        expected_steps: WORKFLOW.steps,
         description: "Fixes flaky tests, one at a time.",
         expected_description: "Fixes flaky tests, one at a time.",
         description_source: "repeat",
@@ -917,6 +1372,7 @@ describe("WorkflowDetailPage", () => {
       expect(server.patches).toEqual([
         {
           steps: edited,
+          expected_steps: WORKFLOW.steps,
           description: "Fixes one flaky test.",
           expected_description: "Fixes one flaky test.",
           description_source: "declined",
@@ -951,6 +1407,7 @@ describe("WorkflowDetailPage", () => {
       await waitFor(() => expect(description()).toBe("Finds and fixes flaky tests."));
       expect(server.patches[1]).toEqual({
         steps: edited,
+        expected_steps: edited,
         description: "Finds and fixes flaky tests.",
         expected_description: "Fixes one flaky test.",
         description_source: "newest",
@@ -990,6 +1447,7 @@ describe("WorkflowDetailPage", () => {
         expect(server.patches).toEqual([
           {
             steps: edited,
+            expected_steps: WORKFLOW.steps,
             description: choice === "Keep current" ? "Fixes one flaky test." : "Fixes flaky tests.",
             expected_description: "Fixes one flaky test.",
             description_source: "newer",
@@ -1240,13 +1698,43 @@ describe("WorkflowDetailPage", () => {
             place = () => resolve(placed);
           }),
       );
-      renderPage();
+      const view = renderPage();
       await screen.findByTestId("workflow-detail-title");
       expectSaved();
       // Placed after the cached proposal, it keeps the saved description.
+      await waitFor(() =>
+        expect(
+          vi
+            .mocked(authenticatedFetch)
+            .mock.calls.some(([path]) => String(path).includes("after=p2")),
+        ).toBe(true),
+      );
       await act(async () => place());
-      await act(async () => {});
+      await waitFor(() =>
+        expect(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" })).toBeEnabled(),
+      );
       expectSaved();
+
+      // A time limit set now leaves "p2" as the source, so once the journal catches up, the
+      // wording kept over it there stays declined.
+      const server = serveLikeTheStore(stored);
+      fireEvent.click(screen.getByRole("button", { name: "Limit Fix the test to 4 hours" }));
+      await waitFor(() => expect(server.patches).toHaveLength(1));
+      expect(server.patches[0]).not.toHaveProperty("description_source");
+      const declined: JournalEntry = {
+        ...saved,
+        id: "p2",
+        position: 2,
+        created_at: 400,
+        content: { steps: WORKFLOW.steps, description: "Finds and fixes flaky tests." },
+      };
+      mockJournal([saved, declined]);
+      view.rerender(<WorkflowDetailPage />);
+      await waitFor(() =>
+        expect(graphGoals()).toEqual([null, "The suite passes\n\n**Time limit:** 4 hours"]),
+      );
+      expectSaved();
+      expect(runButton()).toBeEnabled();
     });
   });
 

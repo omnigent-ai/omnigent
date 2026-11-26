@@ -3503,11 +3503,15 @@ class WorkflowObject(WorkflowSummary):
     :param description_source: The planning conversation's journal entry for the proposal
         the description was saved from or kept over, until the description is written
         otherwise.
+    :param description_updated_at: Unix epoch seconds when the description was last written;
+        a write to the steps alone keeps it while the plan has room for it. Otherwise, as for a
+        workflow last written before the server kept it, it can be the workflow's last write.
     """
 
     steps: list[WorkflowStep]
     planning_session_id: str | None = None
     description_source: str | None = None
+    description_updated_at: int | None = None
 
 
 class WorkflowList(BaseModel):
@@ -3703,6 +3707,9 @@ class UpdateWorkflowRequest(BaseModel):
         ``description`` was saved from or kept over; a description written without one
         clears it.
     :param steps: New steps, replacing the old ones.
+    :param expected_steps: Apply the update only while the stored steps are still these,
+        so a change made from what a client read can't undo steps saved since; otherwise
+        it's refused as a ``conflict`` and nothing changes.
     :param planning_session_id: The private owned session for iterating on the plan.
     """
 
@@ -3713,6 +3720,7 @@ class UpdateWorkflowRequest(BaseModel):
     expected_description: str | None = None
     description_source: str | None = None
     steps: list[WorkflowStep] | None = None
+    expected_steps: list[WorkflowStep] | None = None
     planning_session_id: str | None = None
 
 

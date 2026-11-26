@@ -156,6 +156,8 @@ Markdown bullets, with these parts in this order:
 - **What it does:** a few short bullets.
 - **Outputs:** what it produces, such as a PR link or a report. This is what
   done means for the step.
+- **Time limit:** only when the user wants to hear if the step runs long:
+  its limit, such as `**Time limit:** 2 hours` (see "Step time limits").
 - **Details:** the exact commands, paths, flags and checks the work needs,
   last.
 
@@ -410,7 +412,8 @@ or Codex they come from the `omnigent` MCP server: in Claude Code,
      more. It must:
      - tell it to load the `workflow` skill and run the step as its
        workflow: the step's name, its whole goal with its Details, and its
-       inputs, or a saved workflow's name and ID
+       inputs, or a saved workflow's name and ID. Leave out the step's Time
+       limit: you watch it (see "Step time limits")
      - give it everything it needs, since it doesn't see this conversation
      - include the relevant decisions, existing authorization and limits,
        and whether this is an unattended run; tell it to resolve routine
@@ -461,6 +464,67 @@ or Codex they come from the `omnigent` MCP server: in Claude Code,
   human question in the coordinating session. For unattended runs, record
   only substantiated, unrecoverable blockers as `failed` and keep independent
   work moving; never leave a worker waiting for human input.
+
+## Step time limits
+
+A step's description can carry a time limit, such as `**Time limit:** 2
+hours`, which asks you to tell the user if the step runs longer. The user can
+also give limits for this run ("tell me if any step takes over an hour"):
+write them into the steps they cover, so the Tasks tab shows them. A limit
+doesn't stop the step or make it fail, and it's no reason to rush or skip
+checks. You watch it even when a nested agent does the step's work.
+
+When you write `started` on a step with a limit, for its first start, a
+restart (after done or failed, or when the user chose to restart it after an
+overrun), or a Continue after Stop, it starts a new attempt:
+
+1. Call `sys_timer_set` with `seconds` set to the limit (7200 for 2 hours)
+   and `note: "time limit: <step ID>"`. It's separate from the run's other
+   timers. A timer waits at most 1,000,000 seconds (about 11 days). For a
+   longer limit, set it for that long. When it fires before the limit, set
+   it again for the rest, and note the new `timer_id` on the step with the
+   same start time. If the call fails, use the fallback below.
+2. Note it on the step with `sys_journal_write_note` (`step`: its ID): the
+   limit, the time now from `date -u +"%m-%d %H:%M:%SZ"`, and the
+   `timer_id`, such as `Time limit 2h from 11-24 14:05:09Z, timer 4f1c…`.
+   That time names this attempt below.
+3. Cancel it with `sys_timer_cancel` when the step is done or failed, or when
+   you replan without it. On Stop, cancel it with the run's other timers.
+
+Without `sys_timer_set`, start a background timer of your own that fires
+after the limit, such as a background shell that sleeps that long.
+
+The timer's firing arrives as a `[System: timer … fired]` message with its
+note. Whenever you resume or wake for anything else, also compare `date -u`
+with the time in each limited step's note. For a step past its limit:
+
+1. Read it with `sys_journal_read` (`step`: its ID). Stop here if it's done or
+   failed, if the run is stopped, if the firing's `timer_id` isn't the one in
+   the step's latest time limit note, or if you already told the user during
+   this attempt.
+2. Check what it waits on, such as a nested agent's journal, CI or a job, and
+   fix what you can, as for any stalled step.
+3. Tell the user. The limit is their explicit request to hear this, so it
+   meets "Before asking or declaring a blocker" even when nothing is blocked.
+   - In an attended run, ask with `sys_workflow_request_input` on the step.
+     Say how long it has run against its limit and what it waits on, such as
+     "Open PRs for safe upgrades has run 2h 5m, over its 2-hour limit:
+     web-app's tests are still running." Offer the choices that fit what you
+     found, such as Keep waiting (recommend it while the work is moving),
+     Restart it or Stop it. Then act on the answer as for any question:
+     write `started` to go on, or restart or stop the step.
+   - In an unattended run, post it with `sys_user_inbox_post` and keep
+     working: `kind: "followup"`, a `title` such as "<plan name>: <step
+     name> is over its 2-hour time limit", a `body_md` with how long it has
+     run, what it waits on and what you're doing about it, `links` with your
+     session (`{"type": "session", "ref": "<your session ID>"}`, from
+     `sys_session_get_info`), and `topic: "time limit <step ID> <time from
+     its note>"`, so a later attempt's overrun posts a new item.
+   - Without either tool, or when the post is refused (a session can post
+     only a few Inbox items), say it in the step's status text, such as
+     "Over its 2-hour limit; waiting on web-app's tests", and in your reply.
+4. Once the question, post or status went through, note on the step that you
+   told the user, so a later check doesn't tell them again.
 
 ## Measurable goals
 

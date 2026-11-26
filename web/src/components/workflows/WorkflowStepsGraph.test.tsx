@@ -62,14 +62,14 @@ const MARKDOWN_GOAL = [
 const MARKDOWN_STEPS: WorkflowStep[] = [STEPS[0]!, { ...STEPS[1]!, goal: MARKDOWN_GOAL }];
 
 /** Inline code checks whether it names a workspace file, which needs a query client. */
+/** Render *ui* with a query client, and rerender with that same client. */
 function renderWithQueries(ui: ReactElement) {
-  return render(
-    <QueryClientProvider
-      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
-    >
-      {ui}
-    </QueryClientProvider>,
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const withClient = (node: ReactElement) => (
+    <QueryClientProvider client={client}>{node}</QueryClientProvider>
   );
+  const view = render(withClient(ui));
+  return { ...view, rerender: (node: ReactElement) => view.rerender(withClient(node)) };
 }
 
 /** The goal's bold labels, list items and code rendered as Markdown, with no syntax left over. */
@@ -193,6 +193,136 @@ describe("WorkflowStepsGraph", () => {
     expect(fix.textContent).not.toMatch(/\*\*|`/);
     await userEvent.hover(fix);
     expectMarkdownGoal(await screen.findByTestId("workflow-step-card"));
+  });
+});
+
+describe("a step's time limit", () => {
+  const LIMITED: WorkflowStep[] = [
+    STEPS[0]!,
+    { ...STEPS[1]!, goal: "The suite passes\n\n**Time limit:** 2 hours" },
+  ];
+
+  it("shows the limit from the step's description, read-only by default", () => {
+    render(<WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" />);
+    const [explore, fix] = screen.getAllByTestId("workflow-step-node");
+    expect(within(explore!).queryByTestId("workflow-step-time-limit")).toBeNull();
+    const limit = within(fix!).getByTestId("workflow-step-time-limit");
+    expect(limit).toHaveTextContent("2h");
+    expect(limit).toHaveAttribute("title", "Time limit: 2 hours");
+    expect(within(limit).getByText("Time limit: 2 hours")).toHaveClass("sr-only");
+    expect(within(fix!).queryByRole("button")).toBeNull();
+  });
+
+  it("sets and clears a limit from the step's menu", () => {
+    const onTimeLimitChange = vi.fn();
+    const { rerender } = render(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+      />,
+    );
+    const open = (name: string) =>
+      fireEvent.pointerDown(screen.getByRole("button", { name }), { button: 0 });
+
+    open("Set a time limit for Explore the failures");
+    expect(screen.getByRole("menu")).toHaveTextContent(/^Time limit/);
+    expect(screen.getByRole("menuitemradio", { name: "No limit" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "30 minutes" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "explore", limit: "30 minutes" });
+
+    open("Time limit for Fix the test: 2 hours");
+    expect(screen.getByRole("menuitemradio", { name: "2 hours" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.queryAllByRole("menuitem")).toEqual([]);
+    // Re-picking the checked option is ignored, so a limit worded at more length isn't rewritten.
+    onTimeLimitChange.mockClear();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "2 hours" }));
+    expect(onTimeLimitChange).not.toHaveBeenCalled();
+
+    open("Time limit for Fix the test: 2 hours");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "No limit" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "fix", limit: null });
+
+    // Paused while a save is in flight, so a second pick can't write over the first.
+    rerender(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+        timeLimitPaused
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: "Time limit for Fix the test: 2 hours" }),
+    ).toBeDisabled();
+  });
+
+  it("ignores a pick made after its open menu pauses", () => {
+    const onTimeLimitChange = vi.fn();
+    const { rerender } = render(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+      />,
+    );
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Time limit for Fix the test: 2 hours" }),
+      { button: 0 },
+    );
+    rerender(
+      <WorkflowStepsGraph
+        steps={LIMITED}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+        timeLimitPaused
+      />,
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "4 hours" }));
+    expect(onTimeLimitChange).not.toHaveBeenCalled();
+  });
+
+  it("opens a step's hover card again after its open menu goes away", async () => {
+    const { rerender } = renderWithQueries(
+      <WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" onTimeLimitChange={vi.fn()} />,
+    );
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Time limit for Fix the test: 2 hours" }),
+      { button: 0 },
+    );
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    // The step stops being editable while its menu is open, as when a proposal arrives.
+    rerender(<WorkflowStepsGraph steps={LIMITED} title="Triage flaky tests" />);
+    expect(screen.queryByRole("menu")).toBeNull();
+    await userEvent.hover(screen.getAllByTestId("workflow-step-node")[1]!);
+    expect(await screen.findByTestId("workflow-step-card")).toHaveTextContent("Fix the test");
+  });
+
+  it("goes by a limit's length when its line says more", () => {
+    const onTimeLimitChange = vi.fn();
+    const goal = "The suite passes\n\n**Time limit:** 4 hours. Tell me if it runs longer.";
+    render(
+      <WorkflowStepsGraph
+        steps={[STEPS[0]!, { ...STEPS[1]!, goal }]}
+        title="Triage flaky tests"
+        onTimeLimitChange={onTimeLimitChange}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "Time limit for Fix the test: 4 hours" });
+    expect(button).toHaveTextContent("4h");
+    fireEvent.pointerDown(button, { button: 0 });
+    expect(screen.getByRole("menuitemradio", { name: "4 hours" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "8 hours" }));
+    expect(onTimeLimitChange).toHaveBeenLastCalledWith({ stepId: "fix", limit: "8 hours" });
   });
 });
 

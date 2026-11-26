@@ -187,6 +187,19 @@ resolves them or consolidates the remaining human question instead of sending
 the user to each worker. With the `sibling_sessions` feature on, these sessions
 are grouped with the session that started them.
 
+To hear when a step runs long, give it a time limit. On the workflow page, pick
+one from the timer on the step's box in the plan. The limit is a line in the
+step's description, such as `**Time limit:** 2 hours`, so it shows on the step
+and carries into later runs. The planning chat can write the line for steps it
+adds, and Save plan keeps the limits of saved steps, which change only from
+their timers. A limit you ask for in a run's request applies to that run. A
+limit never stops the step. When a step with a limit starts, the agent sets a
+timer for it with `sys_timer_set`, or a background timer of its own without
+one, and cancels it when the step finishes. If the step is still going when the
+timer fires, the agent checks what it waits on and tells you once: with a
+question from `sys_workflow_request_input`, which marks the step Waiting for
+you, or, in an unattended run, with an Inbox item from `sys_user_inbox_post`.
+
 ## Saving and reusing a workflow
 
 To keep a workflow that worked, open the **⋯** menu at the right of the plan's
@@ -457,10 +470,15 @@ it ran.
   `next_cursor`). A page can be short, even empty, while `next_cursor` is set.
 - `PATCH /v1/workflows/{id}`: any of `name`, `description` and `steps`; fields
   left out keep their values. With `expected_description`, the new description
-  applies only while the stored one is still that text. `description_source`
-  names the planning-chat proposal the description was saved from or kept
-  over; the workflow returns it until the description is written without one or
-  another planning chat is attached.
+  applies only while the stored one is still that text. With `expected_steps`,
+  the update applies only while the stored steps are still those, and is
+  otherwise refused as a `conflict` (409). `description_source` names the
+  planning-chat proposal the description was saved from or kept over; the
+  workflow returns it until the description is written without one or another
+  planning chat is attached. The workflow's `description_updated_at` is when
+  the description was last written; a write to the steps alone, such as a time
+  limit's, keeps it while the plan has room for it, and another write can move
+  it to that write's time.
 - `DELETE /v1/workflows/{id}`: deletes it, then who it was shared with.
 
 ### Sharing a workflow

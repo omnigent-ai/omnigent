@@ -12,6 +12,7 @@ Description and plan codecs run in batches in the store.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import uuid
@@ -57,6 +58,10 @@ class WorkflowNameTakenError(Exception):
     """The owner already has a workflow with this name."""
 
 
+class WorkflowStepsChangedError(Exception):
+    """The workflow's steps are no longer the ones the write expected."""
+
+
 def workflow_page_cursor(workflow: Workflow) -> str:
     """Retain the page boundary when its workflow is renamed or deleted."""
     return "name:" + base64.urlsafe_b64encode(workflow.name.encode()).decode("ascii")
@@ -90,11 +95,29 @@ def _is_name_conflict(error: IntegrityError) -> bool:
     )
 
 
-def _plan_text(steps: list[dict[str, Any]], description_source: str | None = None) -> str:
-    """Serialize the plan, and the proposal its description came from, before the codec."""
+def _description_digest(description: str) -> str:
+    """A short fingerprint of a description, so a time kept for it can't pass for another's."""
+    return hashlib.sha256(description.encode("utf-8")).hexdigest()[:16]
+
+
+def _plan_text(
+    steps: list[dict[str, Any]],
+    description_source: str | None = None,
+    description_updated_at: int | None = None,
+    description: str = "",
+    as_of: int | None = None,
+) -> str:
+    """Serialize the plan before the codec, with the proposal its description came from and,
+    when it's older than the workflow's last write, the time *description* was written."""
     plan: dict[str, Any] = {"steps": steps}
     if description_source is not None:
         plan["description_source"] = description_source
+    if description_updated_at is not None:
+        # With the text it was kept for and the write that kept it, *as_of*: a server from before
+        # the time was kept can write the description, and the workflow, without touching it.
+        plan["description_updated_at"] = description_updated_at
+        plan["description_digest"] = _description_digest(description)
+        plan["description_time_as_of"] = as_of
     return json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -195,24 +218,31 @@ class WorkflowStore:
             else []
         )
         pairs = zip(texts[::2], texts[1::2], strict=True)
-        workflows = []
+        workflows: list[Workflow] = []
         for row, (description, plan) in zip(rows, pairs, strict=True):
             saved = json.loads(plan)
-            workflows.append(
-                Workflow(
-                    id=row.id,
-                    user_id=row.user_id,
-                    name=row.name,
-                    description=description.decode("utf-8")
-                    if isinstance(description, bytes)
-                    else description,
-                    created_at=row.created_at,
-                    updated_at=row.updated_at,
-                    steps=saved["steps"],
-                    planning_session_id=row.planning_session_id,
-                    description_source=saved.get("description_source"),
-                )
+            text = description.decode("utf-8") if isinstance(description, bytes) else description
+            # A kept time counts only for the description it was kept with, and only while no
+            # write has come since the one that kept it.
+            kept_at = saved.get("description_updated_at")
+            kept = (
+                kept_at is not None
+                and saved.get("description_digest") == _description_digest(text)
+                and saved.get("description_time_as_of") == row.updated_at
             )
+            workflow = Workflow(
+                id=row.id,
+                user_id=row.user_id,
+                name=row.name,
+                description=text,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                steps=saved["steps"],
+                planning_session_id=row.planning_session_id,
+                description_source=saved.get("description_source"),
+                description_updated_at=kept_at if kept else row.updated_at,
+            )
+            workflows.append(workflow)
         return workflows
 
     def create(
@@ -242,6 +272,7 @@ class WorkflowStore:
             created_at=now,
             updated_at=now,
             steps=workflow_steps,
+            description_updated_at=now,
         )
 
         def write(session: Session) -> Workflow:
@@ -407,6 +438,7 @@ class WorkflowStore:
         expected_description: str | None = None,
         description_source: str | None = None,
         steps: object = None,
+        expected_steps: object = None,
         planning_session_id: str | None = None,
     ) -> Workflow | None:
         """Change an owned workflow's metadata, steps or planning session.
@@ -421,10 +453,14 @@ class WorkflowStore:
             *description* was saved from or kept over; a description written without
             one clears it.
         :param steps: New steps replacing the old ones, or ``None`` to keep them.
+        :param expected_steps: Write only while the stored steps are still these, so a
+            change made from what a writer read can't undo steps saved since; ``None``
+            writes regardless.
         :param planning_session_id: An owner-checked planning session, or ``None`` to keep it.
         :returns: The updated workflow, or ``None`` if the owner has no such workflow.
         :raises InvalidWorkflowError: If a field is invalid or the steps are too large.
         :raises WorkflowNameTakenError: If another of the owner's workflows has the name.
+        :raises WorkflowStepsChangedError: If the stored steps aren't *expected_steps*.
         """
 
         def write(session: Session) -> Workflow | None:
@@ -441,6 +477,16 @@ class WorkflowStore:
             if row is None:
                 return None
             current = self._workflows([row])[0]
+            if expected_steps is not None:
+                # Both in stored form, so an equal plan compares equal however it was sent.
+                _, _, expected = normalize_workflow(
+                    name=row.name, description=current.description, steps=expected_steps
+                )
+                _, _, stored_steps = normalize_workflow(
+                    name=row.name, description=current.description, steps=current.steps
+                )
+                if expected != stored_steps:
+                    raise WorkflowStepsChangedError("the workflow's steps changed since read")
             stale = (
                 expected_description is not None and expected_description != current.description
             )
@@ -454,15 +500,43 @@ class WorkflowStore:
                 description=description if describes else current.description,
                 steps=current.steps if steps is None else steps,
             )
-            # The plan keeps the description's source, so a new source rewrites it.
-            rewrites_plan = steps is not None or source != current.description_source
-            stored = self._stored_texts(
-                text, _plan_text(workflow_steps, source) if rewrites_plan else None
+            now = now_epoch()
+            # Only a steps write starts holding the description's time, since its plan is
+            # size-checked with it; renames and planning-chat writes keep a time already held.
+            was_written_at = (
+                current.updated_at
+                if current.description_updated_at is None
+                else current.description_updated_at
             )
+            was_held = None if was_written_at == current.updated_at else was_written_at
+            if describes:
+                held = None
+            elif steps is not None:
+                held = None if was_written_at == now else was_written_at
+            else:
+                held = was_held
+            # The plan keeps the description's source and time, so a new one rewrites it; a kept
+            # time is kept again as of this write, a rename's too, since it lasts only that long.
+            rewrites_plan = (
+                steps is not None or source != current.description_source or was_held is not None
+            )
+            try:
+                stored = self._stored_texts(
+                    text,
+                    _plan_text(workflow_steps, source, held, text, now) if rewrites_plan else None,
+                )
+            except InvalidWorkflowError:
+                if held is None or not rewrites_plan:
+                    raise
+                # A plan with no room left for the time still saves: the time is then this
+                # write's, as before the store kept one.
+                held = None
+                stored = self._stored_texts(text, _plan_text(workflow_steps, source, None, text))
+            described_at = now if held is None else held
             values: dict[str, Any] = {
                 "name": workflow_name,
                 "description": stored[0],
-                "updated_at": now_epoch(),
+                "updated_at": now,
             }
             if rewrites_plan:
                 values["plan"] = stored[1]
@@ -488,6 +562,7 @@ class WorkflowStore:
                 steps=workflow_steps,
                 planning_session_id=values.get("planning_session_id", row.planning_session_id),
                 description_source=source,
+                description_updated_at=described_at,
             )
 
         try:

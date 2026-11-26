@@ -36,12 +36,14 @@ import {
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
 import { WorkflowRunRow } from "@/components/workflows/WorkflowRunRow";
+import type { StepTimeLimitChange } from "@/components/workflows/StepTimeLimit";
 import { WorkflowStepsGraph } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
 import {
   useCloneWorkflow,
   useWorkflow,
   useWorkflowRuns,
+  useSaveStepTimeLimit,
   useSaveWorkflowDescription,
   useSaveWorkflowPlan,
   WorkflowNotFoundError,
@@ -59,6 +61,7 @@ import { UNSHAREABLE_WORKFLOW_MESSAGE, workflowSharingAvailable } from "@/lib/pe
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
+import { splitTimeLimit, withSavedTimeLimits } from "@/lib/stepTimeLimit";
 import { ApiError } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 
@@ -123,6 +126,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     source,
   );
   const savePlan = useSaveWorkflowPlan(workflowId);
+  const saveTimeLimit = useSaveStepTimeLimit(workflowId);
   useEffect(() => {
     if (plannerFlash === 0) return;
     const timer = setTimeout(() => setPlannerFlash(0), PLANNING_CHAT_FLASH_MS);
@@ -172,16 +176,19 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const summary = { id: workflow.id, name: workflow.name, description: workflow.description };
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
-  const proposedSteps = proposal ? planSteps(proposal) : null;
+  // A saved step's time limit is set from its menu, so a proposal leaves it alone.
+  const proposedSteps = proposal ? withSavedTimeLimits(planSteps(proposal), workflow.steps) : null;
   // Where the description's source sits in this journal: null when it came from another
   // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
-  // Only a proposal newer than that source, or else than the workflow's last write in whole
+  // Only a proposal newer than that source, or else than the description's last write in whole
   // seconds (a tie keeps the description), offers its description, so an edit made since stands.
+  // An older server keeps no such time, so the workflow's last write stands in for it.
+  const describedAt = workflow.description_updated_at ?? workflow.updated_at ?? 0;
   const proposalIsNewer =
     proposal !== null &&
     (!source || sourceAt === null
-      ? proposal.created_at > (workflow.updated_at ?? 0)
+      ? proposal.created_at > describedAt
       : sourceAt !== undefined && proposal.position > sourceAt);
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
   // A different description is only offered: Save plan keeps the current one unless accepted.
@@ -190,21 +197,34 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
       ? proposedDescription
       : null;
   const proposedChosen = newDescription !== null && acceptedProposalId === proposal?.id;
+  // A time limit compares by its value, wherever its line sits in the description.
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
-      steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
+      steps.map(({ id, name, goal, depends_on }) => [
+        id,
+        name,
+        ...splitTimeLimit(goal),
+        depends_on,
+      ]),
     );
   const hasChanges =
     !!proposedSteps?.length &&
     (stepSignature(proposedSteps) !== stepSignature(workflow.steps) || newDescription !== null);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
-  const canRun = !isDraft && !hasChanges;
+  // A run copies the saved steps, so it waits for a time limit being saved.
+  const canRun = !isDraft && !hasChanges && !saveTimeLimit.isPending;
   const canShare = !isViewer && workflowSharingAvailable(info);
   const shareDisabledReason = isSharingOff(info)
     ? SHARING_OFF_REASON
     : workflow.shareable === false
       ? UNSHAREABLE_WORKFLOW_MESSAGE
       : undefined;
+  // A time limit is a line in the step's description, saved with the workflow's steps alone, so
+  // the description and the proposal it stands over stay as they are.
+  const changeTimeLimit = (change: StepTimeLimitChange) =>
+    saveTimeLimit.mutate(change, {
+      onError: (saveError) => showToast(`Couldn’t save the time limit. ${saveError.message}`),
+    });
   const clone = () =>
     cloneWorkflow.mutate(workflow.id, {
       onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
@@ -372,7 +392,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             {hasChanges && (
               <Button
                 size="sm"
-                disabled={savePlan.isPending}
+                // A time limit save writes the steps too, so the two wait for each other.
+                disabled={savePlan.isPending || saveTimeLimit.isPending}
                 loading={savePlan.isPending}
                 onClick={() => {
                   if (!proposal || !proposedSteps) return;
@@ -388,8 +409,9 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                           expected_description: workflow.description,
                           description_source: proposal.id,
                         };
+                  // The proposal's own steps: the save takes each saved step's limit as stored.
                   savePlan.mutate(
-                    { steps: proposedSteps, ...description },
+                    { steps: planSteps(proposal), baseSteps: workflow.steps, ...description },
                     { onSuccess: () => showToast("Plan saved") },
                   );
                 }}
@@ -412,7 +434,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             </div>
           )}
           {(proposedSteps ?? workflow.steps).length > 0 ? (
-            <WorkflowStepsGraph steps={proposedSteps ?? workflow.steps} title={workflow.name} />
+            <WorkflowStepsGraph
+              steps={proposedSteps ?? workflow.steps}
+              title={workflow.name}
+              onTimeLimitChange={!isViewer && !hasChanges ? changeTimeLimit : undefined}
+              timeLimitPaused={saveTimeLimit.isPending || savePlan.isPending}
+            />
           ) : (
             <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
               <WorkflowIcon className="size-8 text-muted-foreground/50" />
