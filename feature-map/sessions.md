@@ -120,6 +120,15 @@ the header menu), and each place is a separate entry point.
   (`web/src/components/chat/TranscriptPaletteCommands.test.tsx`,
   `web/src/canvas/useCanvasHeaderPaletteCommands.test.tsx`,
   `web/src/grid/useGridPaletteCommands.test.tsx`).
+  On the Inbox, ⌘K lists under **Inbox** the **Inbox filter** setting (the tabs)
+  and, for each card, what the card itself offers: Open, Open to respond, Mark
+  as read, Reply…, which expands the card and focuses its reply field where the
+  viewer can reply, and an automation's Open or Mark failed as read. Under
+  **Sessions**, Mark all as read clears every loaded unread session, and the
+  open session's **Conversation** group adds Resume sandbox while its sandbox
+  sleeps or failed to wake (`web/src/pages/InboxPage.test.tsx`,
+  `web/src/shell/markAllReadPaletteCommand.test.tsx`,
+  `web/src/shell/resumeSandboxCommand.test.tsx`).
 - `palette-pane-corners`: where floating panes can show (`workspace_sidebar_v2` or
   `floating_panes` on, and not a touch device), the QuickPick palette lists the
   **Pane corners** setting. **Automatic** follows the server's `floating_panes`
