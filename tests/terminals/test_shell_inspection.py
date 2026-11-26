@@ -128,6 +128,31 @@ SANDBOX_SLEEP_AND_ADOPTED = (
             BWRAP_LAUNCHERS,
             UNKNOWN,
         ),
+        (
+            PLAIN_IDLE + snapshot((210, TMUX, 210, 210, "Ts", "sleep")).split("\n", 1)[1],
+            (),
+            UNKNOWN,
+        ),
+        # tmux can close a window before reaping its exited process.
+        (
+            PLAIN_IDLE + snapshot((210, TMUX, 210, -1, "Zs", "sleep")).split("\n", 1)[1],
+            (),
+            ShellInspection(ShellState.IDLE),
+        ),
+        (
+            PLAIN_IDLE + snapshot((210, TMUX, 210, 210, "Zsl+", "python")).split("\n", 1)[1],
+            (),
+            UNKNOWN,
+        ),
+        (
+            PLAIN_IDLE
+            + snapshot(
+                (210, TMUX, 210, -1, "Zs", "sleep"),
+                (220, TMUX, 220, 220, "Ss+", "bash"),
+            ).split("\n", 1)[1],
+            (),
+            UNKNOWN,
+        ),
     ],
     ids=[
         "plain idle",
@@ -139,6 +164,10 @@ SANDBOX_SLEEP_AND_ADOPTED = (
         "sandbox job and adopted work",
         "work in another window",
         "another pane beside a sandbox",
+        "stopped work in another window",
+        "exited window awaiting reap",
+        "zombie leader with live threads",
+        "unreaped window beside running work",
     ],
 )
 def test_reads_the_probed_pane_layouts(
