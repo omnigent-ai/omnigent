@@ -44,7 +44,6 @@ import {
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
-import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
 import { DesignRequestBody } from "@/components/BrowserPane/designTools/DesignRequestMessage";
 import {
   clipDesignRequest,
@@ -136,12 +135,9 @@ import {
   type TranscriptScrollbarDragDetail,
 } from "@/pages/TranscriptScrollbar";
 
-const COLLAPSE_THRESHOLD = 12000;
+import { USER_MESSAGE_PREVIEW_LINES, useUserMessageCollapse } from "./useUserMessageCollapse";
 
-// Slice a string by threshold and remove corrupted symbols
-function sliceByCodePoint(str: string, limit: number): string {
-  return str.slice(0, limit).replace(/[\uD800-\uDBFF]$/, "");
-}
+const USER_MESSAGE_FADE_MASK = "linear-gradient(to bottom, black calc(100% - 2rem), transparent)";
 
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
@@ -1149,13 +1145,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
     useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(userMessageLinkId(bubble));
-  // Collapse long prompts by default to avoid expensive Markdown parsing and
-  // a large DOM for text the user hasn't asked to read yet.
-  const isLong = renderedText.length > COLLAPSE_THRESHOLD;
-  const [isCollapsed, setIsCollapsed] = useState(isLong);
-  const visibleText = isCollapsed
-    ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
-    : renderedText;
+  const { contentRef, isCollapsed, canExpand, visibleText, toggle } = useUserMessageCollapse(
+    sessionId,
+    bubble.itemId,
+    renderedText,
+  );
+  const messageTextId = useId();
   // Another session's message reaches the agent as plain input, and attachments or a reply
   // quote make a send an ordinary message, so none of these is a command.
   const command =
@@ -1357,37 +1352,50 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               so the Markdown parser never processes hidden text. */}
                 {text && (
                   <>
-                    <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
-                      {isShellCommand ? (
-                        <pre className="whitespace-pre-wrap break-words font-mono text-sm">
-                          <code>{visibleText}</code>
-                        </pre>
-                      ) : designRequest ? (
-                        <DesignRequestCard
-                          request={
-                            isCollapsed
-                              ? clipDesignRequest(designRequest, COLLAPSE_THRESHOLD)
-                              : designRequest
-                          }
-                        />
-                      ) : (
-                        <UserMessageMarkdown text={visibleText} leadingCommand={command?.token} />
-                      )}
-                      {/* Gradient fade at the bottom of collapsed prompts to signal
-                      there is more content below. */}
-                      {isCollapsed && isLong && (
-                        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
-                      )}
+                    <div
+                      id={messageTextId}
+                      data-testid="user-message-preview"
+                      className={cn("relative text-message", isCollapsed && "overflow-hidden")}
+                      style={
+                        isCollapsed
+                          ? {
+                              maxHeight: `calc(var(--text-message) * var(--text-message--line-height) * ${USER_MESSAGE_PREVIEW_LINES})`,
+                              maskImage: canExpand ? USER_MESSAGE_FADE_MASK : undefined,
+                              WebkitMaskImage: canExpand ? USER_MESSAGE_FADE_MASK : undefined,
+                            }
+                          : undefined
+                      }
+                    >
+                      <div ref={contentRef} className="flow-root" data-user-message-content>
+                        {isShellCommand ? (
+                          <pre className="whitespace-pre-wrap break-words font-mono text-sm">
+                            <code>{visibleText}</code>
+                          </pre>
+                        ) : designRequest ? (
+                          <DesignRequestCard
+                            request={
+                              isCollapsed
+                                ? clipDesignRequest(designRequest, visibleText.length)
+                                : designRequest
+                            }
+                          />
+                        ) : (
+                          <UserMessageMarkdown text={visibleText} leadingCommand={command?.token} />
+                        )}
+                      </div>
                     </div>
-                    {isLong && (
+                    {canExpand && (
                       <button
                         type="button"
-                        onClick={() => setIsCollapsed((c) => !c)}
+                        aria-expanded={!isCollapsed}
+                        aria-controls={messageTextId}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggle();
+                        }}
                         className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
                       >
-                        {isCollapsed
-                          ? `Show full prompt (${text.length.toLocaleString()} chars)`
-                          : "Collapse prompt"}
+                        {isCollapsed ? "Show more" : "Show less"}
                       </button>
                     )}
                   </>

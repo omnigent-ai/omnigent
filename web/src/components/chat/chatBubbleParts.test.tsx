@@ -540,7 +540,7 @@ describe("UserBubble literal text", () => {
     expect(screen.queryByRole("region", { name: "Local review comment preview" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Copy Code" })).toBeNull();
     expect(screen.getByText("Expand the prompt to read more review comments.")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: /Show full prompt/ }));
+    await user.click(screen.getByRole("button", { name: /Show more/ }));
     expect(screen.getByRole("region", { name: "Local review comment preview" })).toHaveTextContent(
       "word word word",
     );
@@ -999,10 +999,56 @@ describe("UserBubble long-prompt collapse", () => {
   const EMOJI_AT_BOUNDARY = "a".repeat(COLLAPSE_THRESHOLD - 1) + "🔥" + "b".repeat(100);
   const SHORT_TEXT = "Hello, world!";
 
-  function userBubble(text: string): Extract<Bubble, { kind: "user" }> {
+  let messageSequence = 0;
+  let lineHeight = 20;
+  const messageHeights = new Map<string, number>();
+  const resizeCallbacks = new Set<() => void>();
+
+  beforeEach(() => {
+    lineHeight = 20;
+    messageHeights.clear();
+    resizeCallbacks.clear();
+    const computedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudo) => {
+      const style = computedStyle(element, pseudo);
+      if (element.hasAttribute("data-user-message-content")) {
+        Object.defineProperty(style, "lineHeight", { value: `${lineHeight}px` });
+      }
+      return style;
+    });
+    // jsdom has no layout: supply the measured content height, independently of text length.
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (!this.hasAttribute("data-user-message-content")) return 0;
+      const id = this.closest("[data-user-message-id]")?.getAttribute("data-user-message-id");
+      return messageHeights.get(id ?? "") ?? 20;
+    });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        callback: () => void;
+        constructor(callback: () => void) {
+          this.callback = callback;
+        }
+        observe(element: Element) {
+          if (element.hasAttribute("data-user-message-content")) resizeCallbacks.add(this.callback);
+        }
+        unobserve() {}
+        disconnect() {
+          resizeCallbacks.delete(this.callback);
+        }
+      },
+    );
+  });
+
+  function userBubble(
+    text: string,
+    itemId = `user_collapse_${messageSequence++}`,
+  ): Extract<Bubble, { kind: "user" }> {
     return {
       kind: "user",
-      itemId: "user_collapse_test",
+      itemId,
       content: [{ type: "input_text", text }],
     };
   }
@@ -1011,8 +1057,8 @@ describe("UserBubble long-prompt collapse", () => {
     render(<BubbleView bubble={userBubble(SHORT_TEXT)} isLastAssistant={false} />);
 
     expect(screen.getByTestId("message-bubble")).toHaveTextContent(SHORT_TEXT);
-    expect(screen.queryByRole("button", { name: /show full prompt/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /show more/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /show less/i })).toBeNull();
   });
 
   it("hides the tail when collapsed, shows it when expanded, hides it again when re-collapsed", () => {
@@ -1022,15 +1068,106 @@ describe("UserBubble long-prompt collapse", () => {
 
     // Initially collapsed
     expect(bubble).not.toHaveTextContent(TAIL);
-    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /show more/i })).toBeInTheDocument();
 
     // After expanding
-    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    fireEvent.click(screen.getByRole("button", { name: /show more/i }));
     expect(bubble).toHaveTextContent(TAIL);
 
     // After collapsing again
-    fireEvent.click(screen.getByRole("button", { name: /collapse prompt/i }));
+    fireEvent.click(screen.getByRole("button", { name: /show less/i }));
     expect(bubble).not.toHaveTextContent(TAIL);
+  });
+
+  it("shows a message fitting exactly fifteen rendered lines without a toggle", () => {
+    const bubble = userBubble("A message that fits the preview.");
+    messageHeights.set(bubble.itemId, 300);
+    render(<BubbleView bubble={bubble} />);
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(
+      "A message that fits the preview.",
+    );
+  });
+
+  it("collapses the newest tall message even when its text is short", () => {
+    const newest = userBubble("First line\nSecond line\nLast line");
+    messageHeights.set(newest.itemId, 320);
+    render(
+      <>
+        {Array.from({ length: 5 }, (_, index) => (
+          <BubbleView key={index} bubble={userBubble(`Earlier ${index}`)} />
+        ))}
+        <BubbleView bubble={newest} />
+      </>,
+    );
+    const preview = screen.getAllByTestId("user-message-preview").at(-1)!;
+    const expand = screen.getByRole("button", { name: "Show more" });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+    expect(expand).toHaveAttribute("aria-controls", preview.id);
+    expect(preview).toHaveClass("overflow-hidden");
+    expect(preview.style.maxHeight).toContain("15");
+
+    fireEvent.click(expand);
+    expect(screen.getByRole("button", { name: "Show less" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(preview).not.toHaveClass("overflow-hidden");
+    expect(preview.style.maxHeight).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Show less" }));
+    expect(preview).toHaveClass("overflow-hidden");
+  });
+
+  it("rechecks wrapping and font size without overriding a manual expansion", () => {
+    const bubble = userBubble("Text that wraps differently as the chat width changes.");
+    messageHeights.set(bubble.itemId, 280);
+    render(<BubbleView bubble={bubble} />);
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+
+    act(() => {
+      messageHeights.set(bubble.itemId, 320);
+      for (const callback of resizeCallbacks) callback();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    act(() => {
+      messageHeights.set(bubble.itemId, 500);
+      for (const callback of resizeCallbacks) callback();
+    });
+    expect(screen.getByRole("button", { name: "Show less" })).toBeInTheDocument();
+
+    act(() => {
+      lineHeight = 40;
+      for (const callback of resizeCallbacks) callback();
+    });
+    expect(screen.queryByRole("button", { name: "Show less" })).toBeNull();
+    act(() => {
+      lineHeight = 20;
+      for (const callback of resizeCallbacks) callback();
+    });
+    expect(screen.getByRole("button", { name: "Show less" })).toBeInTheDocument();
+  });
+
+  it("remembers expansion through remounts and conversation switches without mixing sessions", () => {
+    const bubble = userBubble("An overflowing message.");
+    messageHeights.set(bubble.itemId, 400);
+    const scoped = (session: string) => (
+      <ConversationScopeContext.Provider value={session}>
+        <BubbleView bubble={bubble} />
+      </ConversationScopeContext.Provider>
+    );
+    const view = render(scoped("first-session"));
+    fireEvent.click(screen.getByRole("button", { name: "Show more" }));
+    view.rerender(scoped("second-session"));
+    expect(screen.getByRole("button", { name: "Show more" })).toBeInTheDocument();
+    view.rerender(scoped("first-session"));
+    expect(screen.getByRole("button", { name: "Show less" })).toBeInTheDocument();
+    view.unmount();
+
+    const restored = render(scoped("first-session"));
+    fireEvent.click(screen.getByRole("button", { name: "Show less" }));
+    restored.unmount();
+    render(scoped("first-session"));
+    expect(screen.getByRole("button", { name: "Show more" })).toBeInTheDocument();
   });
 
   it("keeps message typography when expanding a prompt over 50K characters", () => {
@@ -1039,7 +1176,7 @@ describe("UserBubble long-prompt collapse", () => {
     const bubble = screen.getByTestId("message-bubble");
     expect(bubble.querySelector(".break-all")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    fireEvent.click(screen.getByRole("button", { name: /show more/i }));
 
     const fallback = bubble.querySelector(".break-all");
     expect(fallback).toHaveClass("text-message", "font-mono", "whitespace-pre-wrap");
@@ -1073,7 +1210,7 @@ describe("UserBubble long-prompt collapse", () => {
 
     const bubble = screen.getByTestId("message-bubble");
 
-    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /show more/i })).toBeInTheDocument();
 
     expect(bubble).not.toHaveTextContent("🔥");
     expect(bubble).not.toHaveTextContent(""); // make sure it's not corrupted
