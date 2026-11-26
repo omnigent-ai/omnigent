@@ -884,6 +884,7 @@ def test_mr_branch_operations_require_authoritative_metadata(action: str) -> Non
         f"create {_MR_CREATE_FIELDS} --auto-merge",
         f"create {_MR_CREATE_FIELDS} --create-source-branch",
         f"create {_MR_CREATE_FIELDS} --target-project team/other",
+        "create " + _MR_CREATE_FIELDS.replace(_URL, "https://gitlab.com/team/other"),
         f"create {_MR_CREATE_FIELDS} --head https://gitlab.com/team/other",
         f"create {_MR_CREATE_FIELDS} --allow-collaboration=true",
         f"create {_MR_CREATE_FIELDS} --source-branch=-invalid",
