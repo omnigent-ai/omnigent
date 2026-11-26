@@ -31,6 +31,7 @@ import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useIsPhoneViewport } from "@/hooks/useIsPhoneViewport";
+import { usePinnedValue } from "@/hooks/usePinnedValue";
 import { useNow } from "@/hooks/useNow";
 import { Link, useSearchParams } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
@@ -144,7 +145,9 @@ function TicketBoard({
   const [laneCounts, setLaneCounts] = useState<Record<string, number | null>>({});
   const reportLaneCount = useCallback(
     (stageId: string, count: number | null) =>
-      setLaneCounts((current) => (current[stageId] === count ? current : { ...current, [stageId]: count })),
+      setLaneCounts((current) =>
+        current[stageId] === count ? current : { ...current, [stageId]: count },
+      ),
     [],
   );
   // Phones show one lane at a time, picked from tabs that carry each lane's shown count.
@@ -161,11 +164,16 @@ function TicketBoard({
   const stageIds = configuration.data?.stages.map((stage) => stage.id) ?? [];
   const projectEmpty = stageIds.length > 0 && stageIds.every((id) => laneCounts[id] === 0);
   const stages = configuration.data?.stages ?? [];
-  // Until every lane has a count, the first stage; then the first lane with tickets.
+  // Until every lane has a count, the first stage; then the first lane with tickets, kept
+  // even if it empties later so the view doesn't jump until the user picks a tab.
   const allCounted = stageIds.length > 0 && stageIds.every((id) => id in shownCounts);
+  const autoLane = usePinnedValue(
+    allCounted ? (stageIds.find((id) => parseInt(shownCounts[id], 10) > 0) ?? null) : null,
+    projectId,
+  );
   const phoneLane =
     (chosenLane !== null && stageIds.includes(chosenLane) ? chosenLane : null) ??
-    (allCounted ? stageIds.find((id) => parseInt(shownCounts[id], 10) > 0) : undefined) ??
+    (autoLane !== null && stageIds.includes(autoLane) ? autoLane : null) ??
     configuration.data?.initial_stage_id ??
     stageIds[0];
   const boardRef = useRef<HTMLDivElement>(null);
@@ -651,7 +659,13 @@ function TicketCard({
   );
 }
 
-function TicketCardContent({ ticket, finished = false }: { ticket: ProjectTicket; finished?: boolean }) {
+function TicketCardContent({
+  ticket,
+  finished = false,
+}: {
+  ticket: ProjectTicket;
+  finished?: boolean;
+}) {
   const now = useNow();
   const playful = usePlayfulTouches();
   const showDone = playful && finished && isRecentlyFinishedForViewer(ticket, now.getTime());
