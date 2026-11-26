@@ -74,6 +74,7 @@ class HostScopedRequestBodyTransform:
 
 
 _CONNECT_RESPONSE = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+_TLS_HANDSHAKE_RECORD = b"\x16"
 _HTTP2_PREFACE_FIRST_LINE = b"PRI * HTTP/2.0\r\n"
 _BUF_SIZE = 65536
 _HEADER_MAX = 65536
@@ -534,11 +535,11 @@ class EgressProxy:
     async def _handle_connect(
         self,
         writer: asyncio.StreamWriter,
-        reader: asyncio.StreamReader,  # noqa: ARG002
+        reader: asyncio.StreamReader,
         target: str,
         proxy_headers: bytes,  # noqa: ARG002
     ) -> None:
-        """Handle CONNECT — TLS MITM, inspect inner HTTP, enforce rules."""
+        """Handle CONNECT — TLS MITM or plain HTTP, inspect inner HTTP, enforce rules."""
         host, port = self._parse_host_port(target, default_port=443)
         host_rule = self._cred_by_host.get(host.lower())
         if host_rule is not None and host_rule.required_tls_port is not None:
@@ -603,6 +604,15 @@ class EgressProxy:
 
         writer.write(_CONNECT_RESPONSE)
         await writer.drain()
+
+        # Node's undici tunnels http:// targets through CONNECT too, then
+        # speaks plain HTTP inside the tunnel instead of a TLS ClientHello.
+        first_byte = await self._peek_tunnel_first_byte(writer.transport)
+        if first_byte == b"":
+            return
+        if first_byte is not None and first_byte != _TLS_HANDSHAKE_RECORD:
+            await self._handle_tunnelled_http(writer, reader, host, port)
+            return
 
         ssl_ctx = self._cert_cache.get_ssl_context(host)
         self._configure_server_ssl_context(host, ssl_ctx)
@@ -786,6 +796,57 @@ class EgressProxy:
                 await asyncio.wait_for(tls_writer.wait_closed(), timeout=2)
             except Exception:  # noqa: BLE001 — TLS close is best-effort
                 pass
+
+    @staticmethod
+    async def _peek_tunnel_first_byte(transport: asyncio.BaseTransport) -> bytes | None:
+        """Return the tunnel's first byte without consuming it, or ``None`` if unsupported."""
+        transport_socket = transport.get_extra_info("socket")
+        if transport_socket is None:
+            return None
+        loop = asyncio.get_running_loop()
+        # A duplicate descriptor lets the loop watch readability while the
+        # transport's own reader stays paused for ``start_tls``.
+        with transport_socket.dup() as peek_socket:
+            while True:
+                readable: asyncio.Future[None] = loop.create_future()
+
+                def _mark_readable(future: asyncio.Future[None] = readable) -> None:
+                    if not future.done():
+                        future.set_result(None)
+
+                try:
+                    loop.add_reader(peek_socket.fileno(), _mark_readable)
+                except NotImplementedError:
+                    return None
+                try:
+                    await asyncio.wait_for(readable, timeout=30)
+                finally:
+                    loop.remove_reader(peek_socket.fileno())
+                with contextlib.suppress(BlockingIOError):
+                    return peek_socket.recv(1, socket.MSG_PEEK)
+
+    async def _handle_tunnelled_http(
+        self,
+        writer: asyncio.StreamWriter,
+        reader: asyncio.StreamReader,
+        host: str,
+        port: int,
+    ) -> None:
+        """Serve plain HTTP inside a CONNECT tunnel as an absolute-form request."""
+        cast(asyncio.ReadTransport, writer.transport).resume_reading()
+        request_line = await asyncio.wait_for(reader.readline(), timeout=30)
+        try:
+            method, path = self._parse_tunnel_request_line(host, request_line)
+        except ValueError:
+            method, path = "", ""
+        # Origin-form only, so the request cannot name a different authority.
+        if not path.startswith("/"):
+            await self._send_forbidden(writer, "malformed inner request")
+            return
+        headers_raw = self._strip_proxy_auth(await self._read_headers(reader))
+        await self._handle_http(
+            writer, reader, method, f"http://{host}:{port}{path}", request_line, headers_raw
+        )
 
     def _allows_unrestricted_host(self, host: str) -> bool:
         """Return whether one rule allows every method and path for *host*."""

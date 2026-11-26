@@ -497,6 +497,104 @@ async def test_proxy_allows_connect_to_permitted_host(
         await proxy.stop()
 
 
+@pytest.mark.asyncio
+async def test_connect_tunnel_forwards_plain_http_to_allowed_host(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """Plain HTTP sent through a CONNECT tunnel reaches an allowed upstream."""
+    cert_path, key_path, _ = ca_paths
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        authority = f"127.0.0.1:{upstream_port}"
+        writer.write(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+        await writer.drain()
+        established = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        assert b" 200 " in established.split(b"\r\n", 1)[0]
+
+        writer.write(
+            f"GET /probe HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert response.startswith(b"HTTP/1.1 200"), f"tunnelled response: {response[:200]!r}"
+    assert [request.method for request in captured] == ["GET"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("listener", "request_target", "expected_response", "expected_methods"),
+    [
+        ("unix", "GET /probe", b"HTTP/1.1 200", ["GET"]),
+        ("tcp", "POST /probe", b"HTTP/1.1 403 Forbidden\r\n", []),
+        ("tcp", "GET http://other.example.com/probe", b"HTTP/1.1 403 Forbidden\r\n", []),
+    ],
+    ids=["unix-listener", "denied-method", "absolute-form-authority"],
+)
+async def test_connect_tunnel_plain_http_keeps_request_policy(
+    ca_paths: tuple[Path, Path, Path],
+    short_tmp_parent: Path,
+    listener: str,
+    request_target: str,
+    expected_response: bytes,
+    expected_methods: list[str],
+) -> None:
+    """Plain HTTP inside a CONNECT tunnel is still checked per request on each listener."""
+    cert_path, key_path, _ = ca_paths
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["GET 127.0.0.1/probe", "GET other.example.com/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+    )
+    try:
+        if listener == "unix":
+            sock_path = short_tmp_parent / "proxy.sock"
+            await proxy.start_unix(sock_path)
+            reader, writer = await asyncio.open_unix_connection(str(sock_path))
+        else:
+            reader, writer = await asyncio.open_connection("127.0.0.1", await proxy.start_tcp())
+        authority = f"127.0.0.1:{upstream_port}"
+        writer.write(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        writer.write(
+            f"{request_target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert response.startswith(expected_response), response[:200]
+    assert [request.method for request in captured] == expected_methods
+
+
 # ---------------------------------------------------------------------------
 # S2 — destination-IP block (``_assert_destination_allowed``)
 # ---------------------------------------------------------------------------
@@ -1226,14 +1324,16 @@ async def test_handle_connect_passes_protocol_to_start_tls_directly(
     monkeypatch.setattr(loop, "start_tls", _fake_start_tls)
 
     try:
-        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
             b"CONNECT allowed.example.com:443 HTTP/1.1\r\nHost: allowed.example.com\r\n\r\n"
         )
         await writer.drain()
-        # Drain the 200 Connection Established and then wait for the
-        # handler to invoke start_tls — the fake raises so the handler
-        # returns immediately and the connection is closed.
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        # Start a TLS handshake record, then wait for the handler to invoke
+        # start_tls — the fake raises so the handler closes the connection.
+        writer.write(b"\x16")
+        await writer.drain()
         with contextlib.suppress(Exception):
             await asyncio.wait_for(writer.wait_closed(), timeout=5)
 
@@ -3094,6 +3194,22 @@ async def test_brokered_rule_needs_placeholder_and_https(
         writer.close()
         await writer.wait_closed()
         assert b"403 Forbidden" in response
+        assert captured == []
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        writer.write(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        writer.write(
+            (
+                "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:443\r\n"
+                f"Authorization: Bearer {rule.synthetic}\r\nContent-Length: 0\r\n\r\n"
+            ).encode()
+        )
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b"credential-bound hosts require HTTPS" in response
         assert captured == []
     finally:
         await proxy.stop()
