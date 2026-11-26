@@ -3,7 +3,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isWorktreeRoot, useHostWorktrees } from "./useHostWorktrees";
+import { isInWorktreeRoot, isWorktreeRoot, useHostWorktrees } from "./useHostWorktrees";
 
 const authenticatedFetchMock = vi.fn();
 vi.mock("@/lib/identity", () => ({
@@ -149,5 +149,19 @@ describe("isWorktreeRoot", () => {
     ["a Windows folder inside it", "C:/repo", "C:\\repo\\app", false],
   ])("compares %s", (_case, root, path, same) => {
     expect(isWorktreeRoot(root, path)).toBe(same);
+  });
+});
+
+describe("isInWorktreeRoot", () => {
+  it.each([
+    ["the root itself", "/repo", "/repo/", true],
+    ["a folder inside it", "/repo", "/repo/src", true],
+    ["a sibling sharing the name's start", "/repo", "/repository", false],
+    ["a folder of the filesystem root", "/", "/repo", true],
+    ["a folder of a Windows drive's root", "C:\\", "c:/repo", true],
+    ["a Windows folder with mixed separators", "c:/repo", "C:\\repo\\app", true],
+    ["POSIX case", "/Repo", "/repo/src", false],
+  ])("places %s", (_case, root, path, inside) => {
+    expect(isInWorktreeRoot(root, path)).toBe(inside);
   });
 });

@@ -85,4 +85,15 @@ describe("visitFolderStep", () => {
   it("doesn't restore again once the folder is chosen but its worktree is gone", () => {
     expect(step({ directory: WORKTREE, shownRoot: null })).toEqual({ kind: "none" });
   });
+
+  it("reads one folder spelled two ways as the same folder", () => {
+    expect(step({ shownRoot: `${WORKTREE}/` })).toEqual({ kind: "none" });
+    expect(step({ directory: `${WORKTREE}/`, shownRoot: null })).toEqual({ kind: "none" });
+    expect(
+      step({
+        visitRoot: "C:\\repo\\.worktrees\\feature",
+        shownRoot: "c:/repo/.worktrees/feature",
+      }),
+    ).toEqual({ kind: "none" });
+  });
 });
