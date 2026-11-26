@@ -23,7 +23,7 @@ import httpx
 import pytest
 
 from omnigent.db.account_authority import account_checks_scope
-from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities import ErrorData, ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -319,7 +319,11 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
             "_ensure_native_terminal_ready",
             AsyncMock(
                 return_value=sessions._NativeTerminalEnsureOutcome(
-                    error=RuntimeError("terminal failed")
+                    error=ErrorData(
+                        source="execution",
+                        code="native_terminal_start_failed",
+                        message="terminal failed",
+                    )
                 )
             ),
         )
