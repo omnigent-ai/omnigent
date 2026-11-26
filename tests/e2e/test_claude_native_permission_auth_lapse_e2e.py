@@ -2,7 +2,8 @@
 
 Real server (accounts auth), runner, Claude CLI, tmux, and hooks. Arranged:
 scripted Anthropic responses, a 60s runner-token TTL, and a server restart to
-cut the held poll. The runner renews the hook's bearer; nobody signs in.
+cut the held poll. The hook posts through the runner's tool relay, whose client
+renews the bearer, so the hook config holds none; nobody signs in.
 """
 
 from __future__ import annotations
@@ -407,27 +408,25 @@ def test_permission_prompt_returns_to_web_after_bearer_lapse(
             assert str(outside_file) in first["params"]["content_preview"], first
             (tmp_path / "pane-prompt.txt").write_text(screen())
 
-            # Let the bearer baked into the hook expire, then cut its held poll.
-            hook_config = json.loads((bridge_dir / "permission_hook.json").read_text())
-            assert hook_config["ap_auth_headers"].get("Authorization"), hook_config
+            # No live bearer sits on disk while the prompt waits.
+            hook_file = bridge_dir / "permission_hook.json"
+
+            def hook_bearer() -> str | None:
+                headers = json.loads(hook_file.read_text())["ap_auth_headers"]
+                return next((v for k, v in headers.items() if k.lower() == "authorization"), None)
+
+            assert hook_bearer() is None, hook_file.read_text()
+            # Let the runner's token expire, then cut the held poll. The hook
+            # re-parks through the relay, whose client mints a fresh bearer.
             time.sleep(_RUNNER_TOKEN_TTL_S + 5)
             server.stop()
             server.start()
-            # The hook reconnects with its dead bearer, which the server rejects.
-            # The user has not signed in on this machine, so it can't mint one;
-            # it takes the bearer the runner renewed in its header snapshot.
-            _wait(
-                lambda: server.access_log_has(
-                    f"/v1/sessions/{session_id}/hooks/permission-request", 401
-                ),
-                "the server to reject the hook's lapsed bearer",
-                timeout=90,
-            )
             back = _wait(
                 lambda: _read_prompts(client, session_id),
-                "the Read card to return with the runner's renewed bearer",
+                "the Read card to return through the relay",
                 timeout=90,
             )[0]
+            assert hook_bearer() is None, hook_file.read_text()
             assert not scripted.results, "Claude answered the Read without a verdict"
             assert back["elicitation_id"] == first["elicitation_id"], (first, back)
             client.post(

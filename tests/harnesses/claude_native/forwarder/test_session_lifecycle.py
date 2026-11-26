@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import itertools
 import json
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,8 +17,10 @@ import httpx
 import pytest
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    build_hook_settings,
     prepare_bridge_dir,
     read_active_session_id,
     record_hook_event,
@@ -164,6 +168,86 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             {"runner_id": "", "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_relay_auth_clear_banner_names_the_old_session_until_the_forwarder_rotates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With relay auth, SessionStart prints the current session's banner without
+    rotating; the forwarder then rotates and the bridge moves to the new session."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    (bridge_dir / "transcript_forwarder.json").write_text("{}", encoding="utf-8")
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="http://127.0.0.1:8787",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+        relay_auth=True,
+    )
+    hook_auth: list[str | None] = []
+
+    def reject_unauthenticated(request: httpx.Request) -> httpx.Response:
+        hook_auth.append(request.headers.get("Authorization"))
+        return httpx.Response(401, json={"error": {"message": "Not authenticated"}})
+
+    real_client = httpx.Client
+
+    def hook_client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(reject_unauthenticated), **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", hook_client)
+    payload = {"hook_event_name": "SessionStart", "source": "clear"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    assert claude_native_hook.main(["--bridge-dir", str(bridge_dir)]) == 0
+
+    assert json.loads(capsys.readouterr().out) == {
+        "systemMessage": "Open this session in Omnigent: http://127.0.0.1:8787/c/conv_old"
+    }
+    assert hook_auth == [], "the hook sent a rotation request it can't authenticate"
+    assert "omnigent_clear_rotated_to" not in (bridge_dir / "hooks.jsonl").read_text("utf-8")
+    monkeypatch.setattr(httpx, "Client", real_client)
+
+    def server(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_claude",
+                    "runner_id": "runner_one",
+                    "labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"},
+                    "title": "Fix login flow",
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.method == "PATCH" and path in (
+            "/v1/sessions/conv_new",
+            "/v1/sessions/conv_old",
+        ):
+            return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1]})
+        if path.endswith("/resources/terminals/terminal_claude_main/transfer"):
+            return httpx.Response(200, json={"id": "terminal_claude_main"})
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server), base_url="http://ap"
+    ) as client:
+        state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_old"
+        )
+        rotated_to = await forwarder._maybe_rotate_session_on_clear(
+            client=client, session_id="conv_old", bridge_dir=bridge_dir, state=state
+        )
+
+    assert rotated_to == "conv_new"
+    assert read_active_session_id(bridge_dir) == "conv_new"
 
 
 @pytest.mark.asyncio

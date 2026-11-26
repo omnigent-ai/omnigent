@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import functools
 import json
 import math
 import os
@@ -21,6 +22,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     CLAUDE_STARTUP_CONTEXT_FILE,
+    RELAY_UPSTREAM_UNREACHABLE_HEADER,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -190,6 +192,10 @@ _SESSION_ROTATION_TIMEOUT_S = 70.0
 # the permission long-poll. Held at one day; the server caps the real
 # wait via the deciding policy's ``ask_timeout``.
 _EVALUATE_POLICY_TIMEOUT_S = 86400.0
+# A relay_auth hook waits this long for the runner's relay, then makes the direct
+# call, which has no configured bearer and can only mint one from a local login.
+_RELAY_WAIT_S = 30.0
+_RELAY_WAIT_POLL_S = 0.25
 # A question Omnigent can't show on the web is otherwise left in Claude's
 # terminal picker, where a web-only user never sees it. Asking in chat text
 # reaches both the web transcript and the terminal.
@@ -440,6 +446,9 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     ap_server_url = config.get("ap_server_url")
     if not isinstance(ap_server_url, str) or not ap_server_url:
         return None
+    if config.get("relay_auth") is True:
+        # No bearer here to rotate with; the forwarder rotates instead.
+        return None
     raw_headers = config.get("ap_auth_headers")
     headers = (
         {str(key): str(value) for key, value in raw_headers.items()}
@@ -499,6 +508,9 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     config = read_permission_hook_config(bridge_dir)
     ap_server_url = config.get("ap_server_url")
     if not isinstance(ap_server_url, str) or not ap_server_url:
+        return None
+    if config.get("relay_auth") is True:
+        # No bearer here to rotate with; the forwarder rotates instead.
         return None
     raw_headers = config.get("ap_auth_headers")
     headers = (
@@ -773,6 +785,7 @@ def _post_hook_with_reattach(
     reauth: Callable[[], dict[str, str] | None] | None = None,
     wait_marker: Path | None = None,
     answer_window_s: float | None = None,
+    retarget: Callable[[], tuple[str, dict[str, str]] | None] | None = None,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -869,6 +882,9 @@ def _post_hook_with_reattach(
         auth lapse that can't be renewed ends retries whatever the cap, while a
         parked wait still rides out an unreachable server. ``None`` keeps the
         count-based cap alone.
+    :param retarget: Optional callable run before each attempt that returns the
+        current ``(url, headers)``, so a relay restarted on a new port or token
+        is still reached. ``None`` or a ``None`` result keeps the last target.
     :returns: The successful (2xx) response, or ``None`` when the server
         rejects the request (a 4xx, including an auth rejection that can't be
         re-minted before any held poll), or when the hard-failure cap, answer
@@ -904,6 +920,10 @@ def _post_hook_with_reattach(
     with marker_scope:
         trust_env = not is_loopback_url(url)
         while True:
+            target = retarget() if retarget is not None else None
+            if target is not None:
+                url, headers = target
+                trust_env = not is_loopback_url(url)
             attempt_started = time.monotonic()
             remaining_s = deadline - attempt_started
             if remaining_s <= 0.0:
@@ -984,8 +1004,14 @@ def _post_hook_with_reattach(
                 # after the poll was held past the floor is a gateway timing out
                 # an idle long-poll (a 504 at 300s) — a held-poll sever.
                 held_s = time.monotonic() - attempt_started
-                is_hard_failure = held_s < _PERMISSION_HELD_POLL_FLOOR_S
-                kind = "sick" if is_hard_failure else "held-poll severed by gateway"
+                # The relay flags a server it never reached; count it as a failed connect.
+                never_connected = bool(exc.response.headers.get(RELAY_UPSTREAM_UNREACHABLE_HEADER))
+                is_hard_failure = never_connected or held_s < _PERMISSION_HELD_POLL_FLOOR_S
+                kind = (
+                    "unreachable"
+                    if never_connected
+                    else ("sick" if is_hard_failure else "held-poll severed by gateway")
+                )
                 print(
                     f"omnigent {hook_label} hook: Omnigent request failed "
                     f"({kind}); retrying: {exc}",
@@ -1103,6 +1129,45 @@ def _permission_hook_reauth(
     return reauth
 
 
+def _relay_permission_target(bridge_dir: Path) -> tuple[str, dict[str, str]] | None:
+    """
+    Return the tool relay's permission-request URL and headers, if it is up.
+
+    :param bridge_dir: Bridge directory holding ``tool_relay.json``.
+    :returns: ``(url, headers)``, or ``None`` when the relay file is absent.
+    """
+    from omnigent.native.native_policy_hook import read_relay_policy_config
+
+    relay = read_relay_policy_config(bridge_dir)
+    if relay is None:
+        return None
+    relay_url, relay_token, _relay_session_id = relay
+    return (
+        f"{relay_url.rstrip('/')}/hook/claude/permission-request",
+        {"Authorization": f"Bearer {relay_token}"},
+    )
+
+
+def _wait_for_relay(bridge_dir: Path) -> bool:
+    """
+    Wait up to :data:`_RELAY_WAIT_S` for a session's tool relay to come up.
+
+    Only for a ``relay_auth`` session, whose hook config holds no bearer.
+
+    :param bridge_dir: Bridge directory holding ``tool_relay.json``.
+    :returns: Whether ``tool_relay.json`` appeared in time.
+    """
+    from omnigent.native.native_policy_hook import read_relay_policy_config
+
+    deadline = time.monotonic() + _RELAY_WAIT_S
+    while read_relay_policy_config(bridge_dir) is None:
+        if time.monotonic() >= deadline:
+            print("omnigent claude hook: tool relay did not start in time", file=sys.stderr)
+            return False
+        time.sleep(_RELAY_WAIT_POLL_S)
+    return True
+
+
 def _main_permission_request(argv: list[str]) -> int:
     """
     Forward one Claude ``PermissionRequest`` hook to the active Omnigent session.
@@ -1136,29 +1201,48 @@ def _main_permission_request(argv: list[str]) -> int:
     if not isinstance(ap_server_url, str) or not ap_server_url:
         print("omnigent claude permission hook: Omnigent server URL missing", file=sys.stderr)
         return 0
-    headers = _parse_headers(args.omnigent_auth_headers_json)
-    started_from: object = None
-    if not headers:
-        raw_headers = config.get("ap_auth_headers")
-        if isinstance(raw_headers, dict):
-            headers = {str(key): str(value) for key, value in raw_headers.items()}
-            started_from = raw_headers
-    # A permission request raises a web elicitation that parks in the pod-local
-    # registry on the replica holding this session's runner tunnel; an unkeyed
-    # POST lands elsewhere and the approval is silently lost. Key from the
-    # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
-    _merge_identity_headers(headers, ap_server_url)
-    url = (
-        f"{ap_server_url.rstrip('/')}/v1/sessions/"
-        f"{url_component(session_id)}/hooks/permission-request"
-    )
+    # A relay_auth session's runner relay authenticates with its own refresh-capable
+    # client and parks the card on the active session, so the hook holds no bearer.
+    relay_target = None
+    if config.get("relay_auth") is True:
+        relay_target = _relay_permission_target(bridge_dir)
+        if relay_target is None and _wait_for_relay(bridge_dir):
+            relay_target = _relay_permission_target(bridge_dir)
+    retarget: Callable[[], tuple[str, dict[str, str]] | None] | None = None
+    if relay_target is not None:
+        url, headers = relay_target
+        retarget = functools.partial(_relay_permission_target, bridge_dir)
+
+        def reauth() -> dict[str, str] | None:
+            fresh = _relay_permission_target(bridge_dir)
+            return fresh[1] if fresh is not None else None
+
+    else:
+        headers = _parse_headers(args.omnigent_auth_headers_json)
+        started_from: object = None
+        if not headers:
+            raw_headers = config.get("ap_auth_headers")
+            if isinstance(raw_headers, dict):
+                headers = {str(key): str(value) for key, value in raw_headers.items()}
+                started_from = raw_headers
+        # A permission request raises a web elicitation that parks in the pod-local
+        # registry on the replica holding this session's runner tunnel; an unkeyed
+        # POST lands elsewhere and the approval is silently lost. Key from the
+        # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
+        _merge_identity_headers(headers, ap_server_url)
+        url = (
+            f"{ap_server_url.rstrip('/')}/v1/sessions/"
+            f"{url_component(session_id)}/hooks/permission-request"
+        )
+        reauth = _permission_hook_reauth(bridge_dir, ap_server_url, headers, started_from)
     is_question = payload.get("tool_name") == "AskUserQuestion"
     resp = _post_hook_with_reattach(
         url,
         headers,
         payload,
         "claude permission",
-        reauth=_permission_hook_reauth(bridge_dir, ap_server_url, headers, started_from),
+        reauth=reauth,
+        retarget=retarget,
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
         answer_window_s=(
             PRE_RESOLVED_ELICITATION_TTL_S - _QUESTION_ANSWER_WINDOW_MARGIN_S
@@ -1303,6 +1387,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
 
     # Prefer the relay; fall back to direct server call when relay not yet up.
     relay = read_relay_policy_config(bridge_dir)
+    if (
+        relay is None
+        and read_permission_hook_config(bridge_dir).get("relay_auth") is True
+        and _wait_for_relay(bridge_dir)
+    ):
+        relay = read_relay_policy_config(bridge_dir)
     if relay:
         relay_url, relay_token, _sid = relay
         url = relay_policy_evaluate_url(relay_url)

@@ -9568,6 +9568,7 @@ async def _auto_create_claude_terminal(
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
     rebind_bridge: Callable[[str, str], Awaitable[None]] | None = None,
+    relay_auth: bool = False,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -9616,6 +9617,9 @@ async def _auto_create_claude_terminal(
     :param rebind_bridge: Optional runner callback, given the session id and its
         new bridge id when this launch moves the session to a different bridge
         dir. It points the runner's cached labels and harness subprocess there.
+    :param relay_auth: ``True`` when the caller starts this session's tool
+        relay. The hooks then authenticate through it, so the runner writes
+        no bearer into the hook config and doesn't refresh one there.
     :returns: The launched terminal's :class:`SessionResourceView`, so
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
@@ -10399,6 +10403,7 @@ async def _auto_create_claude_terminal(
         workspace=Path(workspace),
         ap_server_url=server_url,
         ap_auth_headers=_runner_headers,
+        relay_auth=relay_auth,
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=skills_filter,
@@ -10630,7 +10635,7 @@ async def _auto_create_claude_terminal(
                 ),
                 name=f"claude-hook-auth-{session_id}",
             )
-            if _auth_factory is not None
+            if _auth_factory is not None and not relay_auth
             else None
         )
         try:
@@ -11278,6 +11283,7 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,
         rebind_bridge=ctx.rebind_bridge,
+        relay_auth=ctx.ensure_comment_relay is not None,
     )
     _start_claude_relay_after_launch(ctx)
     return view
