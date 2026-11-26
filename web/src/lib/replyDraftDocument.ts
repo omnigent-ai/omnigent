@@ -29,9 +29,7 @@ export function quoteLine(id: string, text: string): string {
   return `\uFDD0${encode(JSON.stringify([id, text]))}\uFDD1`;
 }
 
-/** The quote a document line holds, or null for any other line, a damaged token included. */
-export function parseQuoteLine(line: string): Pick<ReplyQuote, "id" | "text"> | null {
-  if (!TOKEN_LINE.test(line)) return null;
+function decodeQuoteLine(line: string): Pick<ReplyQuote, "id" | "text"> | null {
   try {
     const parsed: unknown = JSON.parse(decode(line.slice(1, -1)));
     if (!Array.isArray(parsed) || parsed.length !== 2) return null;
@@ -40,6 +38,21 @@ export function parseQuoteLine(line: string): Pick<ReplyQuote, "id" | "text"> | 
   } catch {
     return null;
   }
+}
+
+// Decoded token lines, so reading the draft on each keystroke doesn't decode every quote again.
+const decodedQuoteLines = new Map<string, Pick<ReplyQuote, "id" | "text"> | null>();
+
+/** The quote a document line holds, or null for any other line, a damaged token included. */
+export function parseQuoteLine(line: string): Pick<ReplyQuote, "id" | "text"> | null {
+  if (!TOKEN_LINE.test(line)) return null;
+  let quote = decodedQuoteLines.get(line);
+  if (quote === undefined) {
+    if (decodedQuoteLines.size >= 100) decodedQuoteLines.clear();
+    quote = decodeQuoteLine(line);
+    decodedQuoteLines.set(line, quote);
+  }
+  return quote;
 }
 
 export function hasQuoteMark(text: string): boolean {
@@ -101,7 +114,8 @@ export function quoteTextStart(document: string): number {
 /** `document` with its tail, the text after the last card, replaced by `tail`. Every card stays. */
 export function replaceQuoteTail(document: string, tail: string): string {
   const lines = document.split("\n");
-  const lastCard = lines.findLastIndex((line) => parseQuoteLine(line) !== null);
+  // Only cards hold marks, so the last card is the last token line, found without decoding it.
+  const lastCard = lines.findLastIndex((line) => TOKEN_LINE.test(line));
   const text = stripQuoteMarks(tail.replace(/\r\n?/g, "\n"));
   return [...lines.slice(0, lastCard + 1), text].join("\n");
 }

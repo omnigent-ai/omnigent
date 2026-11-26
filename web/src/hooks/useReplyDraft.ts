@@ -40,7 +40,11 @@ export function useReplyDraft(initialSingleDocument = false) {
     setState((current) => {
       const update = (text: string) => (typeof next === "function" ? next(text) : next);
       if (typeof current === "string") {
-        if (id !== null) return current;
+        if (id !== null) {
+          if (import.meta.env.DEV)
+            console.warn(`Ignored an edit to quote ${id}'s input in one document.`);
+          return current;
+        }
         return replaceQuoteTail(current, update(unweaveReplyDraft(current).text));
       }
       return id === null

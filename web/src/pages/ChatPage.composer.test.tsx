@@ -10392,8 +10392,34 @@ describe("saved sandbox inference policy", () => {
   );
 });
 
+type ServerInfo = typeof FALLBACK_SERVER_INFO;
+const codeMirrorServerInfo: ServerInfo = {
+  ...FALLBACK_SERVER_INFO,
+  features: { chat_composer_codemirror: true },
+};
+
+/** The composer under `info`'s features, with its handle and a rerender under other features. */
+function renderComposerWith(props: ReturnType<typeof composerProps>, info: ServerInfo) {
+  const ref = createRef<ComponentRef<typeof Composer>>();
+  const ui = (serverInfo: ServerInfo) => (
+    <CapabilitiesProvider info={serverInfo}>
+      <TooltipProvider>
+        <Composer {...props} ref={ref} />
+      </TooltipProvider>
+    </CapabilitiesProvider>
+  );
+  const view = render(ui(info));
+  return { ...view, ref, switchTo: (next: ServerInfo) => view.rerender(ui(next)) };
+}
+
+/** The message box once the CodeMirror editor has taken it over. */
+async function editorReady() {
+  await waitFor(() => expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"));
+  return screen.getByLabelText("Message the agent");
+}
+
 describe("Composer with the CodeMirror release flag on", () => {
-  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  const codeMirrorInfo = codeMirrorServerInfo;
   beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
   afterEach(() => resetCodeMirrorComposerLoadForTests());
 
@@ -10422,15 +10448,8 @@ describe("Composer with the CodeMirror release flag on", () => {
       mark.className,
     ]);
   async function renderEditor(props: ReturnType<typeof composerProps>) {
-    render(
-      <CapabilitiesProvider info={codeMirrorInfo}>
-        <Composer {...props} />
-      </CapabilitiesProvider>,
-    );
-    await waitFor(() =>
-      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
-    );
-    return screen.getByLabelText("Message the agent");
+    renderComposerWith(props, codeMirrorInfo);
+    return editorReady();
   }
 
   it("tints a built-in typed in another case in the editor, as it still runs", async () => {
@@ -10521,11 +10540,7 @@ describe("Composer model and effort in ⌘K", () => {
 });
 
 describe("Composer reply quotes in the CodeMirror editor", () => {
-  type ServerInfo = typeof FALLBACK_SERVER_INFO;
-  const codeMirrorInfo: ServerInfo = {
-    ...FALLBACK_SERVER_INFO,
-    features: { chat_composer_codemirror: true },
-  };
+  const codeMirrorInfo = codeMirrorServerInfo;
   const plainInfo: ServerInfo = { ...FALLBACK_SERVER_INFO, features: {} };
   beforeEach(() => {
     clearSessionDrafts();
@@ -10551,21 +10566,13 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
   const cards = () => screen.queryAllByTestId("composer-reply-quote");
   const type = (text: string) => act(() => void insertComposerText(editor(), text));
   function renderComposer(props = composerProps(), info = codeMirrorInfo) {
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    const ui = (serverInfo: ServerInfo) => (
-      <CapabilitiesProvider info={serverInfo}>
-        <TooltipProvider>
-          <Composer {...props} ref={ref} />
-        </TooltipProvider>
-      </CapabilitiesProvider>
-    );
-    const view = render(ui(info));
-    const reply = (text: string) => act(() => ref.current?.appendReplyQuote(text));
-    return { ...view, ref, reply, switchTo: (next: ServerInfo) => view.rerender(ui(next)) };
+    const rendered = renderComposerWith(props, info);
+    const reply = (text: string) => act(() => rendered.ref.current?.appendReplyQuote(text));
+    return { ...rendered, reply };
   }
   async function renderEditor(props = composerProps()) {
     const rendered = renderComposer(props);
-    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    await editorReady();
     return rendered;
   }
   /** A loader the test finishes, so the editor takes over when the test says. */
@@ -10642,15 +10649,18 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     expect(textarea()).toHaveValue("My answer");
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
     expect(cards()).toHaveLength(1);
+    act(() => textarea().setSelectionRange(3, 3));
     await finishLoad();
     const lines = editor().value.split("\n");
     expect([lines[0], lines[2]]).toEqual(["My introduction", "My answer"]);
     expect(cards()).toHaveLength(1);
-    expect(editor().selectionStart).toBe(editor().value.length);
+    // A caret in the text after the last card keeps its place in it, on either engine.
+    expect(editor().selectionStart).toBe(editor().value.length - "answer".length);
 
     switchTo(plainInfo);
     await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
     expect(textarea()).toHaveValue("My answer");
+    expect(textarea().selectionStart).toBe(3);
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
     expect(cards()).toHaveLength(1);
   });
@@ -10660,9 +10670,7 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     ["the editor", codeMirrorInfo, plainInfo],
   ])("restores a draft saved on %s on the other engine", async (_saved, saveOn, restoreOn) => {
     const awaitEngine = async (info: ServerInfo) => {
-      if (info === codeMirrorInfo) {
-        await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
-      }
+      if (info === codeMirrorInfo) await editorReady();
     };
     const saved = renderComposer(composerProps(), saveOn);
     await awaitEngine(saveOn);

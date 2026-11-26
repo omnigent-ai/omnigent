@@ -64,13 +64,20 @@ function restore(root: HTMLElement, snapshot: HandoffSnapshot): ComposerTextTarg
   const element = inputWithId(root, snapshot.inputId) ?? composerInputs(root).at(-1);
   const target = composerTargetOf(element);
   if (!target) return null;
-  // The offsets and scroll belong to the old input's text; otherwise the caret goes to the end.
-  const same = inputIdOf(element) === snapshot.inputId && target.value === snapshot.value;
-  const end = target.value.length;
+  // The tail ends the one document, so a selection in it moves by the text before it. Any other
+  // selection indexes text the new input doesn't hold, and the caret goes to the end.
+  const found = inputIdOf(element) === snapshot.inputId;
+  const { value } = target;
+  const shift = value.length - snapshot.value.length;
+  const nested = value.endsWith(snapshot.value) || snapshot.value.endsWith(value);
+  const carried = found && nested && snapshot.selectionStart + shift >= 0;
+  const end = value.length;
   target.setSelectionRange(
-    same ? snapshot.selectionStart : end,
-    same ? snapshot.selectionEnd : end,
+    carried ? snapshot.selectionStart + shift : end,
+    carried ? snapshot.selectionEnd + shift : end,
   );
+  // Scroll belongs to the old input's text, so it carries only when that text is unchanged.
+  const same = found && value === snapshot.value;
   if (same) {
     target.scrollTop = snapshot.scrollTop;
     target.scrollLeft = snapshot.scrollLeft;

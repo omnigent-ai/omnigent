@@ -201,10 +201,14 @@ describe("readline kills beside a reply card", () => {
     expect(target().value).toBe(value);
   });
 
-  it("kills a selection across a card whole, and undo brings it all back", () => {
+  it("kills a selection across a card whole, which ⌃Y yanks back as a quote and undo restores", () => {
     const { target, press } = mount(value, 0, undefined, true);
     act(() => target().setSelectionRange(2, value.length - 2));
     press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe("Inly");
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+    expect(target().value).toBe("Intro\n> Alpha\nReply");
+    press({ key: "z", code: "KeyZ", metaKey: true });
     expect(target().value).toBe("Inly");
     press({ key: "z", code: "KeyZ", metaKey: true });
     expect(target().value).toBe(value);

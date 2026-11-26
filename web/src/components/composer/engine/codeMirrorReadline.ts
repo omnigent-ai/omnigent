@@ -86,11 +86,15 @@ function kill(boundary: Boundary): Command {
     const [from, to] = range.empty ? stopKill(state, ...covered, range.head) : covered;
     if (from === to) return true;
     const backward = range.empty && to === range.head;
+    // The ring keeps what a copy would, so a yank brings back a reply card as its `> ` quote.
+    const copied = state
+      .facet(EditorView.clipboardOutputFilter)
+      .reduce((slice, filter) => filter(slice, state), state.sliceDoc(from, to));
     view.dispatch(
       state.update({
         changes: { from, to },
         selection: { anchor: from },
-        annotations: killed.of({ text: state.sliceDoc(from, to), backward }),
+        annotations: killed.of({ text: copied, backward }),
         scrollIntoView: true,
         userEvent: backward ? "delete.backward" : "delete.forward",
       }),
