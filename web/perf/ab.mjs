@@ -162,7 +162,7 @@ async function main() {
       output,
     ];
     if (arg("--chrome")) benchArgs.push("--chrome", arg("--chrome"));
-    const bench = scope.spawn(process.execPath, benchArgs, { stdio: "inherit" });
+    const bench = scope.spawn(process.execPath, benchArgs, { stdio: "inherit" }, 15000);
     await scope.wait(bench);
     const rawFile = path.join(output, throttle === 4 ? "results-v2-4x.json" : "results-v2.json");
     const raw = JSON.parse(fs.readFileSync(rawFile, "utf8"));

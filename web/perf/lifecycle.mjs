@@ -19,18 +19,18 @@ export async function withLifecycle(work) {
       controller.abort(error);
       for (const child of children.keys()) child.kill("SIGTERM");
     },
-    spawn(command, args, options) {
+    spawn(command, args, options, graceMs = 5000) {
       controller.signal.throwIfAborted();
       const child = spawn(command, args, options);
       const exited = new Promise((resolve) => {
         child.once("error", (error) => resolve({ error }));
         child.once("exit", (code, signal) => resolve({ code, signal }));
       });
-      children.set(child, exited);
+      children.set(child, { exited, graceMs });
       return child;
     },
     async wait(child) {
-      const result = await children.get(child);
+      const result = await children.get(child).exited;
       controller.signal.throwIfAborted();
       if (result.error) throw result.error;
       if (result.code !== 0) throw new Error(`process failed: ${result.code ?? result.signal}`);
@@ -53,14 +53,14 @@ export async function withLifecycle(work) {
   } finally {
     process.off("SIGINT", onInt);
     process.off("SIGTERM", onTerm);
-    await Promise.all([...children].map(async ([child, exited]) => {
+    await Promise.all([...children].map(async ([child, { exited, graceMs }]) => {
       try {
         if (child.exitCode === null && child.signalCode === null && child.pid) {
           child.kill("SIGTERM");
           let timer;
           const done = await Promise.race([
             exited.then(() => true),
-            new Promise((resolve) => { timer = setTimeout(() => resolve(false), 5000); }),
+            new Promise((resolve) => { timer = setTimeout(() => resolve(false), graceMs); }),
           ]);
           clearTimeout(timer);
           if (!done) {
