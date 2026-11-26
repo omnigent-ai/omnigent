@@ -308,6 +308,12 @@ def test_backslash_paths_require_approval_before_posix_parsing(executable: str) 
         "export GIT_SSH_COMMAND=example",
         "GIT_NAMESPACE=example git fetch https://gitlab.com/team/sub/app",
         "GIT_AUTHOR_NAME=example git commit -m Fix",
+        "export GIT_CONFIG_COUNT",
+        "printf -v GIT_CONFIG_COUNT 1",
+        "command printf -v GIT_CONFIG_COUNT 1",
+        "declare -x GIT_CONFIG_COUNT",
+        "declare -n example=GIT_CONFIG_COUNT",
+        "unset GIT_SSH_COMMAND",
         'alias glab="another-command"',
         "GITLAB_HOST=gitlab.other.example glab issue list",
         "python -m glab",
@@ -479,6 +485,7 @@ def test_explicit_git_downloads_check_read_permissions(arguments: str) -> None:
         (f"{_URL} HEAD:refs/heads/feature", "ALLOW"),
         (f"{_URL} refs/heads/feature", "ALLOW"),
         (f"-qvu --atomic --no-recurse-submodules {_URL} main:refs/heads/feature", "ALLOW"),
+        (f"--signed=no {_URL} HEAD:refs/heads/feature", "ALLOW"),
         (f"--repo={_URL} HEAD:refs/heads/feature", "ASK"),
         (f"{_URL} HEAD:refs/heads/main", "DENY"),
         (f"{_URL} HEAD:refs/heads/Feature", "DENY"),
@@ -691,3 +698,74 @@ def test_git_transfer_shell_composition_and_host_pinning() -> None:
 )
 def test_git_project_identity_is_not_reduced_to_parent(remote: str, expected: str) -> None:
     assert _result(f"git fetch {remote}", read_all=False, read_repos=[_PROJECT]) == expected
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "printf -v GIT_CONFIG_COUNT 1; export GIT_CONFIG_COUNT;",
+        "printf -v GIT_CONFIG_COUNT 1; "
+        "printf -v GIT_CONFIG_KEY_0 url.https://git.example.com/team/.insteadOf; "
+        "printf -v GIT_CONFIG_VALUE_0 https://gitlab.com/; "
+        "export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0;",
+        "env -u GIT_CONFIG_COUNT",
+    ],
+)
+def test_protected_environment_names_keep_otherwise_permitted_transfers_pending(
+    prefix: str,
+) -> None:
+    response = _response(
+        f"{prefix} git push {_URL} HEAD:refs/heads/feature", write_repos=[_PROJECT]
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"glab issue create -R {_URL} -t HOME -d Details",
+        "git commit -m HOME",
+        'git commit -m "Document GIT_DIR"',
+        'echo "GIT"_DIR',
+    ],
+)
+def test_protected_environment_names_in_literal_text_conservatively_ask(command: str) -> None:
+    response = _response(command, write_repos=[_PROJECT])
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]
+
+
+def test_protected_environment_names_do_not_weaken_a_known_denial() -> None:
+    assert (
+        _result(
+            f"export GIT_CONFIG_COUNT; git push {_URL} HEAD:refs/heads/main",
+            write_repos=[_PROJECT],
+            write_branches=["feature"],
+        )
+        == "DENY"
+    )
+
+
+def test_protected_environment_name_matching_respects_identifier_boundaries() -> None:
+    assert _result("git add test_git_helpers.py prefix_GIT_DIR.txt HOMELAND.txt") == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "CURL_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "SSH_ASKPASS",
+    ],
+)
+def test_execution_and_transport_environment_names_require_approval(name: str) -> None:
+    response = _response(
+        f"export {name}; git push {_URL} HEAD:refs/heads/feature", write_repos=[_PROJECT]
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "CLI environment" in response["reason"]

@@ -47,7 +47,24 @@ _CLI_ENVIRONMENT = frozenset(
         "XDG_CONFIG_HOME",
         "XDG_CONFIG_DIRS",
         "PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "CURL_CA_BUNDLE",
+        "SSH_ASKPASS",
     }
+)
+_CLI_ENVIRONMENT_NAMES = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    + "|".join(sorted(_CLI_ENVIRONMENT))
+    + r"|(?:GIT|GITLAB|GLAB|LD|DYLD)_[A-Za-z0-9_]*)(?![A-Za-z0-9_])"
 )
 _LOCAL_GIT_COMMANDS = frozenset(
     {
@@ -359,6 +376,11 @@ def _evaluate_shell(
         segments = error.completed_segments
         decision = _ask("GitLab policy cannot fully inspect this shell syntax. Approve?")
     for segment in segments:
+        if _CLI_ENVIRONMENT_NAMES.search(segment):
+            decision = _worse(
+                decision,
+                _ask("Commands naming protected CLI environment variables require approval."),
+            )
         if _UNMODELLED_CONTROL.search(segment):
             continue
         if _has_unmodelled_shell_effects(segment):
@@ -373,13 +395,11 @@ def _evaluate_shell(
             if _GATED_COMMAND.search(segment):
                 decision = _worse(decision, _ask("Could not parse the git/glab command. Approve?"))
             continue
-        if any(
-            (name := token.partition("=")[0]) in _CLI_ENVIRONMENT
-            or name.startswith(("GITLAB_", "GLAB_", "GIT_"))
-            for token in raw_tokens
-            if "=" in token
-        ):
-            decision = _worse(decision, _ask("CLI environment changes require approval."))
+        if _CLI_ENVIRONMENT_NAMES.search(" ".join(raw_tokens)):
+            decision = _worse(
+                decision,
+                _ask("Commands naming protected CLI environment variables require approval."),
+            )
         tokens = real_invocation_tokens(raw_tokens)
         while tokens[:1] == ["!"]:
             tokens = real_invocation_tokens(tokens[1:])
