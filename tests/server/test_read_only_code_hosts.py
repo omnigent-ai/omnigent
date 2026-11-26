@@ -121,6 +121,8 @@ def test_a_marked_overview_offers_no_writes_and_keeps_its_reads_and_account_choi
         **dict.fromkeys(CODE_HOST_WRITE_CAPABILITIES, True),
         "commit_history": True,
         "account_switching": True,
+        # A newer host's control this server doesn't know may write to the code host.
+        "draft_toggling": True,
     }
     info = {"object": "session.github.info", "capabilities": capabilities}
 
@@ -131,6 +133,7 @@ def test_a_marked_overview_offers_no_writes_and_keeps_its_reads_and_account_choi
         **dict.fromkeys(CODE_HOST_WRITE_CAPABILITIES, False),
         "commit_history": True,
         "account_switching": True,
+        "draft_toggling": False,
     }
     assert info["capabilities"] == capabilities
     assert {"merging", "comment_posting", "attachment_uploads"} <= CODE_HOST_WRITE_CAPABILITIES
@@ -154,7 +157,9 @@ def test_the_config_lists_its_read_only_hosts() -> None:
     assert server_config.read_only_code_hosts(config) == PATTERNS
 
 
-@pytest.mark.parametrize("value", ["git.example.org", None], ids=["string", "null"])
+@pytest.mark.parametrize(
+    "value", ["git.example.org", None, ("git.example.org",)], ids=["string", "null", "tuple"]
+)
 def test_a_config_value_that_isnt_a_list_is_ignored_with_a_warning(
     caplog: pytest.LogCaptureFixture, value: object
 ) -> None:

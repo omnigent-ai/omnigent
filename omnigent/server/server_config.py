@@ -902,4 +902,5 @@ def read_only_code_hosts(config: Mapping[str, Any]) -> tuple[str, ...]:
     raw = config.get("read_only_code_hosts")
     if "read_only_code_hosts" in config and not isinstance(raw, list):
         logger.warning("server config read_only_code_hosts=%r is not a list, ignoring", raw)
+        return ()
     return parse_patterns(raw)

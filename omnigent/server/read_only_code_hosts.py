@@ -17,14 +17,17 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from omnigent.git_providers import EnvInstances, resolve_pr_url
-from omnigent.server.pull_request_viewers import OWNER_CAPABILITIES
+from omnigent.server.pull_request_viewers import OWNER_CAPABILITIES, READ_CAPABILITIES
 
 READ_ONLY_CODE_HOST_MESSAGE = "Changes to pull requests on this code host are turned off."
 # The reason a refused write carries, for clients that tell it apart.
 READ_ONLY_CODE_HOST_REASON = "read_only_code_host"
-# The owner's capabilities that write to the code host. Choosing the host's account or
-# the checkout's remote changes nothing there, so a read-only host keeps those.
-CODE_HOST_WRITE_CAPABILITIES = OWNER_CAPABILITIES - {"account_switching", "base_remote_selection"}
+# Choosing the host's account or the checkout's remote changes nothing on the code host.
+_HOST_ONLY_CAPABILITIES = frozenset({"account_switching", "base_remote_selection"})
+# What a read-only host keeps; every other capability, an unknown one included, is turned off.
+_KEPT_CAPABILITIES = READ_CAPABILITIES | _HOST_ONLY_CAPABILITIES
+# The owner's capabilities that write to the code host.
+CODE_HOST_WRITE_CAPABILITIES = OWNER_CAPABILITIES - _HOST_ONLY_CAPABILITIES
 
 
 def parse_patterns(value: object) -> tuple[str, ...]:
@@ -90,12 +93,15 @@ def _matches(host: str, pattern: str) -> bool:
 
 
 def mark_read_only(info: dict[str, Any]) -> dict[str, Any]:
-    """An overview for a read-only pull request: ``read_only``, and no write capabilities."""
+    """An overview for a read-only pull request: ``read_only``, and only reads kept.
+
+    Unknown capability names are turned off, since a newer host's may write to the code host.
+    """
     marked = {**info, "read_only": True}
     capabilities = info.get("capabilities")
     if isinstance(capabilities, dict):
         marked["capabilities"] = {
-            name: False if name in CODE_HOST_WRITE_CAPABILITIES else value
+            name: value if name in _KEPT_CAPABILITIES else False
             for name, value in capabilities.items()
         }
     return marked
