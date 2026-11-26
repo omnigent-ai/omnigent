@@ -144,7 +144,10 @@ def _env_float(name: str, default: float) -> float:
 # legitimately-parked approval behind a severing proxy is never capped, while a
 # down server can no longer re-POST for a day. Overridable for operators who
 # want more slack against a flaky upstream.
-_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 8))
+#
+# 40 failures ride out a brief outage, so the web card returns once the server
+# is back: about 17 minutes of 30s backoff, up to 40 when every connect times out.
+_PERMISSION_MAX_CONSECUTIVE_FAILURES = max(1, _env_int("OMNIGENT_HOOK_MAX_RETRIES", 40))
 
 
 def _never_connected_errors() -> tuple[type[Exception], ...]:
@@ -452,9 +455,7 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     from omnigent.native.native_policy_hook import is_loopback_url
 
     try:
@@ -514,9 +515,7 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     from omnigent.native.native_policy_hook import is_loopback_url
 
     try:
@@ -747,6 +746,23 @@ def _sleep_before_retry(backoff_s: float, retry_by: float) -> None:
         start after, e.g. the retry deadline.
     """
     time.sleep(max(0.0, min(backoff_s, retry_by - time.monotonic())))
+
+
+def _merge_identity_headers(headers: dict[str, str], server_url: str) -> None:
+    """Merge this hook's routing and identity headers into *headers*, in place.
+
+    *headers* is often a snapshot persisted by the CLI that launched Claude, whose
+    ``user-agent`` names that CLI. The hook's own User-Agent replaces it in any casing,
+    so the request carries exactly one.
+
+    :param headers: Request headers, mutated in place.
+    :param server_url: Omnigent server URL the request targets.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
+
+    headers.update(databricks_request_headers(server_url))
+    headers["User-Agent"] = pop_client_user_agent(headers)
 
 
 def _post_hook_with_reattach(
@@ -1043,6 +1059,50 @@ def _post_hook_with_reattach(
             backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
 
 
+def _permission_hook_reauth(
+    bridge_dir: Path, server_url: str, headers: dict[str, str], started_from: object
+) -> Callable[[], dict[str, str] | None]:
+    """
+    Renew the permission hook's auth from the runner's refreshed header snapshot.
+
+    The hook cannot mint a token itself (the runner keeps its credential from
+    child processes), so a prompt parked past its token's lifetime takes the
+    headers the runner last wrote to ``permission_hook.json``. It mints instead
+    when the hook did not start from that snapshot, the snapshot is for another
+    server, or it has not changed.
+
+    :param bridge_dir: Bridge directory holding ``permission_hook.json``.
+    :param server_url: Omnigent server URL the hook POSTs to.
+    :param headers: Headers the hook started with.
+    :param started_from: The snapshot those headers came from, or ``None`` when
+        they did not come from ``permission_hook.json``; ``None`` always mints.
+    :returns: A reauth callable for :func:`_post_hook_with_reattach`.
+    """
+    from omnigent.native.native_policy_hook import policy_hook_reauth
+
+    mint = policy_hook_reauth(server_url, headers)
+    seen = [started_from]
+
+    def reauth() -> dict[str, str] | None:
+        if started_from is None:
+            return mint()
+        config = read_permission_hook_config(bridge_dir)
+        snapshot = config.get("ap_auth_headers")
+        if (
+            config.get("ap_server_url") == server_url
+            and isinstance(snapshot, dict)
+            and snapshot
+            and snapshot != seen[0]
+        ):
+            seen[0] = snapshot
+            fresh = {str(key): str(value) for key, value in snapshot.items()}
+            _merge_identity_headers(fresh, server_url)
+            return fresh
+        return mint()
+
+    return reauth
+
+
 def _main_permission_request(argv: list[str]) -> int:
     """
     Forward one Claude ``PermissionRequest`` hook to the active Omnigent session.
@@ -1056,8 +1116,6 @@ def _main_permission_request(argv: list[str]) -> int:
         to its terminal prompt; an ``AskUserQuestion`` is denied instead so
         Claude asks it in chat text.
     """
-    from omnigent.native.native_policy_hook import policy_hook_reauth
-
     args = _parse_permission_args(argv)
     raw = sys.stdin.read()
     try:
@@ -1079,17 +1137,17 @@ def _main_permission_request(argv: list[str]) -> int:
         print("omnigent claude permission hook: Omnigent server URL missing", file=sys.stderr)
         return 0
     headers = _parse_headers(args.omnigent_auth_headers_json)
+    started_from: object = None
     if not headers:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(key): str(value) for key, value in raw_headers.items()}
+            started_from = raw_headers
     # A permission request raises a web elicitation that parks in the pod-local
     # registry on the replica holding this session's runner tunnel; an unkeyed
     # POST lands elsewhere and the approval is silently lost. Key from the
     # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
@@ -1100,7 +1158,7 @@ def _main_permission_request(argv: list[str]) -> int:
         headers,
         payload,
         "claude permission",
-        reauth=policy_hook_reauth(ap_server_url, headers),
+        reauth=_permission_hook_reauth(bridge_dir, ap_server_url, headers, started_from),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
         answer_window_s=(
             PRE_RESOLVED_ELICITATION_TTL_S - _QUESTION_ANSWER_WINDOW_MARGIN_S
@@ -1265,9 +1323,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # This posts to the session's policy registry on the replica holding its
         # tunnel; key from the runner-env host_id so it isn't misrouted. (The
         # relay branch above targets a relay token URL, so it needs no key.)
-        from omnigent.cli_auth import databricks_request_headers
-
-        headers.update(databricks_request_headers(ap_server_url))
+        _merge_identity_headers(headers, ap_server_url)
         session_component = url_component(session_id)
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)

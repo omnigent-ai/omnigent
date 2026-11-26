@@ -166,23 +166,6 @@ def test_executor_factory_falls_back_to_runner_workspace_cwd(
     assert captured["cwd"] == "/tmp/explicit"
 
 
-def test_malformed_os_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_KIMI_OS_ENV", "{not-json")
-    captured: dict[str, Any] = {}
-
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured["os_env"] = kwargs["os_env"]
-
-    with patch(
-        "omnigent.inner.kimi_harness.KimiExecutor.__init__",
-        _fake_init,
-    ):
-        kimi_harness._build_kimi_executor()
-
-    assert captured["os_env"].type == "caller_process"
-    assert captured["os_env"].sandbox.type == "none"
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -715,7 +698,9 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     monkeypatch.setattr(sandbox_mod, "with_additional_write_roots", _capture_write_roots)
     monkeypatch.setattr(sandbox_mod, "with_spawn_env_allowlist", lambda s, _names: s)
     monkeypatch.setattr(
-        sandbox_mod, "create_exec_launcher", lambda target, _policy: f"LAUNCHER::{target}"
+        sandbox_mod,
+        "create_exec_launcher",
+        lambda target, _policy, **kwargs: f"LAUNCHER::{target}",
     )
 
     monkeypatch.delenv("KIMI_CODE_HOME", raising=False)

@@ -2,7 +2,19 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
 const { performance } = require("node:perf_hooks");
-const { createHostThisMachineChecker, isHostThisMachine } = require("../src/hostIdentity");
+const {
+  createHostThisMachineChecker,
+  isHostThisMachine,
+  hasHostLocalAccess,
+} = require("../src/hostIdentity");
+
+it("requires an explicit local or SSH preview grant for privileged reads", () => {
+  for (const context of [null, {}, { hostIsThisMachine: false }, { hostIsSshPreview: "true" }]) {
+    assert.equal(hasHostLocalAccess(context), false);
+  }
+  assert.equal(hasHostLocalAccess({ hostIsThisMachine: true }), true);
+  assert.equal(hasHostLocalAccess({ hostIsThisMachine: false, hostIsSshPreview: true }), true);
+});
 
 it("imports browser IPC and checks injected identities without desktop js-yaml", () => {
   execFileSync(process.execPath, [

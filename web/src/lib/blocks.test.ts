@@ -4,6 +4,7 @@ import {
   attachmentLabel,
   hasPendingOwnElicitation,
   imagePreview,
+  pendingWorkflowQuestions,
   isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
@@ -58,6 +59,7 @@ describe("structuredErrorFields", () => {
     "workspace_missing",
     "connection_error",
     "context_length_exceeded",
+    "output_limit_exceeded",
     "rate_limit_exceeded",
     "codex_thread_reset",
     "internal_error",
@@ -276,6 +278,27 @@ describe("pending elicitation checks", () => {
     expect(hasPendingOwnElicitation([{ ...card, targetSessionId: "conv_child" }], "conv_1")).toBe(
       false,
     );
+  });
+
+  it("pendingWorkflowQuestions pairs each of the session's own workflow questions with its task", () => {
+    const question = { ...card, phase: "workflow_request_input", journalStep: "deploy" };
+    expect(
+      pendingWorkflowQuestions(
+        [
+          question,
+          { ...question, elicitationId: "elic_2", journalStep: "docs" },
+          // Answered, another kind of prompt, a sub-agent's mirrored question, and one with no task.
+          { ...question, elicitationId: "elic_3", journalStep: "lint", status: "responded" },
+          { ...card, elicitationId: "elic_4" },
+          { ...question, elicitationId: "elic_5", targetSessionId: "conv_child" },
+          { ...question, elicitationId: "elic_6", journalStep: undefined },
+        ],
+        "conv_1",
+      ),
+    ).toEqual([
+      ["deploy", "elic_1"],
+      ["docs", "elic_2"],
+    ]);
   });
 });
 

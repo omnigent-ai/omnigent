@@ -86,6 +86,9 @@ def managed_replicas(
         "OPENAI_API_KEY": "mock-key",
         "ANTHROPIC_API_KEY": "",
     }
+    # These replicas exercise legacy dispatch without persistent host ownership.
+    features = env.get("OMNIGENT_FEATURES", "")
+    env["OMNIGENT_FEATURES"] = ",".join(filter(None, (features, "-automations_v2")))
     set_fallback_mock_llm(mock_llm_server_url, "_policy_llm_", '{"action": "allow", "reason": ""}')
     processes: list[subprocess.Popen[bytes]] = []
     try:

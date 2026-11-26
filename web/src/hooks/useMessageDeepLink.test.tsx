@@ -98,9 +98,13 @@ describe("useMessageDeepLink", () => {
     vi.useRealTimers();
   });
 
-  it("scrolls to and flashes the message from ?message=", () => {
-    document.body.innerHTML = `<div data-message-id="msg_1">hello</div>`;
-    renderHook(() => useMessageDeepLink("conv_1"), {
+  it("scrolls to and flashes the message within its transcript from ?message=", () => {
+    document.body.innerHTML = `
+      <section id="transcript"><div data-message-id="msg_1">hello</div></section>
+      <section><div data-message-id="msg_1">another session</div></section>
+    `;
+    const root = document.querySelector("#transcript")!;
+    renderHook(() => useMessageDeepLink("conv_1", { root }), {
       wrapper: wrapperFor("/c/conv_1?message=msg_1"),
     });
 
@@ -108,6 +112,7 @@ describe("useMessageDeepLink", () => {
     expect(releaseScrollLock).toHaveBeenCalledOnce();
     const target = scrollSpy.mock.contexts[0] as Element;
     expect(target.getAttribute("data-message-id")).toBe("msg_1");
+    expect(root.contains(target)).toBe(true);
     act(() => vi.advanceTimersByTime(SETTLE_MS));
     expect(useChatStore.getState().flashItemId).toBe("msg_1");
   });
@@ -166,31 +171,54 @@ describe("useMessageDeepLink", () => {
     expect(releaseScrollLock).not.toHaveBeenCalled();
   });
 
-  it("waits for the virtualizer and mounts a loaded target before paging history", () => {
-    const loadMoreHistory = vi.fn();
-    const ensureMessageVisible = vi.fn(() => true);
-    useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
-    const { rerender } = renderHook(
-      ({ ready, rangeNonce }) =>
-        useMessageDeepLink("conv_1", { ready, rangeNonce, ensureMessageVisible }),
-      {
-        initialProps: { ready: false, rangeNonce: 0 },
-        wrapper: wrapperFor("/c/conv_1?message=response_1"),
-      },
-    );
-    expect(ensureMessageVisible).not.toHaveBeenCalled();
-    expect(loadMoreHistory).not.toHaveBeenCalled();
-    rerender({ ready: true, rangeNonce: 0 });
-    expect(ensureMessageVisible).toHaveBeenCalledWith("response_1");
-    expect(loadMoreHistory).not.toHaveBeenCalled();
-    expect(scrollSpy).not.toHaveBeenCalled();
+  it.each(["range change", "mount only", "unmount"])(
+    "waits for the virtualizer and mounts a loaded target before paging history (%s)",
+    async (notification) => {
+      document.body.innerHTML = `
+      <section id="transcript"></section>
+      <section><div data-message-id="response_1">another session</div></section>
+    `;
+      const root = document.querySelector("#transcript")!;
+      const loadMoreHistory = vi.fn();
+      const ensureMessageVisible = vi.fn(() => true);
+      useChatStore.setState({ hasMoreHistory: true, loadMoreHistory });
+      const { rerender, unmount } = renderHook(
+        ({ ready, rangeNonce }) =>
+          useMessageDeepLink("conv_1", { ready, rangeNonce, ensureMessageVisible, root }),
+        {
+          initialProps: { ready: false, rangeNonce: 0 },
+          wrapper: wrapperFor("/c/conv_1?message=response_1"),
+        },
+      );
+      expect(ensureMessageVisible).not.toHaveBeenCalled();
+      expect(loadMoreHistory).not.toHaveBeenCalled();
+      rerender({ ready: true, rangeNonce: 0 });
+      expect(ensureMessageVisible).toHaveBeenCalledWith("response_1");
+      expect(loadMoreHistory).not.toHaveBeenCalled();
+      expect(scrollSpy).not.toHaveBeenCalled();
 
-    document.body.innerHTML = '<div data-message-id="response_1">older reply</div>';
-    rerender({ ready: true, rangeNonce: 1 });
-    expect(scrollSpy).toHaveBeenCalledOnce();
-    act(() => vi.advanceTimersByTime(SETTLE_MS));
-    expect(useChatStore.getState().flashItemId).toBe("response_1");
-  });
+      if (notification === "unmount") unmount();
+      await act(async () => {
+        root.innerHTML = '<div data-message-id="response_1">older reply</div>';
+        if (notification === "range change") rerender({ ready: true, rangeNonce: 1 });
+      });
+      if (notification === "unmount") {
+        expect(scrollSpy).not.toHaveBeenCalled();
+        expect(useChatStore.getState().flashItemId).toBeNull();
+        return;
+      }
+      expect(scrollSpy).toHaveBeenCalledOnce();
+      act(() => vi.advanceTimersByTime(SETTLE_MS));
+      expect(useChatStore.getState().flashItemId).toBe("response_1");
+
+      if (notification === "mount only") {
+        await act(async () => {
+          root.append(document.createTextNode("later transcript update"));
+        });
+        expect(scrollSpy).toHaveBeenCalledOnce();
+      }
+    },
+  );
 
   it("opens Chat before resolving the message, then permits returning to Terminal", () => {
     const loadMoreHistory = vi.fn();

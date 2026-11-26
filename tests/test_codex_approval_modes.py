@@ -133,6 +133,65 @@ def test_preset_from_thread_settings_maps_each_popup_choice(settings: dict, expe
     assert codex_permission_preset_from_thread_settings(settings) == expected
 
 
+# Sandbox policies captured from codex-cli 0.158.0. ``thread/resume`` reports
+# them as ``sandbox``; ``thread/settings/updated`` as ``sandboxPolicy``.
+_WORKSPACE_WRITE_SANDBOX = {
+    "type": "workspaceWrite",
+    "writableRoots": [],
+    "networkAccess": False,
+    "excludeTmpdirEnvVar": False,
+    "excludeSlashTmp": False,
+}
+_READ_ONLY_SANDBOX = {"type": "readOnly", "networkAccess": False}
+
+
+@pytest.mark.parametrize("sandbox_key", ["sandboxPolicy", "sandbox"])
+@pytest.mark.parametrize(
+    ("approval_policy", "reviewer", "sandbox", "expected"),
+    [
+        ("never", "user", _WORKSPACE_WRITE_SANDBOX, None),
+        ("never", "auto_review", _WORKSPACE_WRITE_SANDBOX, None),
+        ("untrusted", "auto_review", _WORKSPACE_WRITE_SANDBOX, None),
+        ("never", "user", _READ_ONLY_SANDBOX, "read-only"),
+        ("never", "user", {"type": "dangerFullAccess"}, "full-access"),
+        ("on-request", "user", _READ_ONLY_SANDBOX, "read-only"),
+    ],
+)
+def test_preset_from_thread_settings_follows_the_sandbox(
+    sandbox_key: str,
+    approval_policy: str,
+    reviewer: str,
+    sandbox: dict,
+    expected: str | None,
+) -> None:
+    """Full Access follows the sandbox; only an on-request policy maps to an approval preset."""
+    settings = {
+        "approvalPolicy": approval_policy,
+        "approvalsReviewer": reviewer,
+        sandbox_key: sandbox,
+        "activePermissionProfile": None,
+    }
+
+    assert codex_permission_preset_from_thread_settings(settings) == expected
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "expected"),
+    [(":danger-full-access", "full-access"), (":read-only", "read-only"), (":workspace", None)],
+)
+def test_preset_from_thread_settings_reads_the_profile_without_a_sandbox(
+    profile_id: str, expected: str | None
+) -> None:
+    """Without a sandbox field, the permission profile decides a ``never`` policy's preset."""
+    settings = {
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "activePermissionProfile": {"id": profile_id, "extends": None},
+    }
+
+    assert codex_permission_preset_from_thread_settings(settings) == expected
+
+
 def test_preset_from_thread_settings_none_for_unmapped() -> None:
     """A non-mapping / custom payload resolves to None rather than guessing."""
     assert codex_permission_preset_from_thread_settings(None) is None

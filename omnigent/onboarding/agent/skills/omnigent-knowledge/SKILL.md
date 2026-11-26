@@ -106,7 +106,6 @@ tools:
   builtins:
     - web_search                 # auto-detects backend based on model provider
     - terminal_run               # persistent bash shell scoped to the conversation
-    - upload_file
     - search_conversations
 
   timeout: 60          # Default tool timeout in seconds
@@ -185,10 +184,14 @@ list — new tools may be added at any time.
 **Tool recommendation guide:**
 
 - "I want a research agent" → `web_search` + `web_fetch`
-- "I want a coding agent" → `terminal_run` + `upload_file`
-- "I want a data analysis agent" → `terminal_run` + `upload_file` + `download_file`
+- "I want a coding agent" → `terminal_run`
+- "I want a data analysis agent" → `terminal_run`
 - "I want a conversational assistant" → no tools needed (or `web_search` for current info)
 - "I want an agent that can access external APIs" → consider MCP servers (see below)
+
+An agent that shares files with the user sets `tool_groups.files: true` to get
+`sys_files_upload`, `sys_files_list` and `sys_files_download`; they are off by
+default and need no `tools.builtins` entry.
 
 ### MCP servers (external tool integrations)
 
@@ -310,7 +313,6 @@ executor:
 tools:
   builtins:
     - web_search
-    - upload_file
 interaction:
   modalities:
     input: [text, file]

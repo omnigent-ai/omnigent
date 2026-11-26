@@ -100,6 +100,17 @@ _log = logging.getLogger(__name__)
 _PROGRAM_CACHE_SIZE = 64
 
 
+def _bounded_cel_error_repr(self: CELEvalError) -> str:
+    """Keep nested error diagnostics independent of argument and AST size."""
+    return f"{type(self).__name__}(line={self.line}, column={self.column})"
+
+
+if celpy is not None:
+    # cel-python embeds error reprs in new errors, exponentially re-escaping them.
+    # Patch the shared type: all()/exists() bypass per-program operator overrides.
+    celpy.CELEvalError.__repr__ = _bounded_cel_error_repr
+
+
 def cel_policy(
     *,
     expression: str,

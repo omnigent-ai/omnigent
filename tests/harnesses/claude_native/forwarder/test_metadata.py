@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -17,6 +19,8 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     BtwOverlay,
     ClaudeTranscriptItem,
+    record_hook_event,
+    write_tmux_target,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 from tests.harnesses.claude_native.forwarder._support import (
@@ -1042,3 +1046,374 @@ async def test_forward_pane_signals_throttles_capture(tmp_path: Path) -> None:
 
     assert reads == 1
     assert dedupe.pane_next_read > 0.0
+
+
+_BUDGET_RETRY_ERROR = (
+    '403 Budget "example-budget" (00000000-0000-0000-0000-000000000000) has reached'
+    " its limit of $0.1. To continue, contact an admin to increase the budget."
+)
+
+
+def _claude_pane(status_row: str) -> str:
+    """Render a Claude Code pane whose row above the input box is ``status_row``."""
+    return (
+        "❯ say hi\n"
+        "\n"
+        f"{status_row}\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt\n"
+    )
+
+
+def _fake_tmux_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    failed_send_keys: int = 0,
+    on_send_keys: Callable[[], None] | None = None,
+) -> tuple[Path, list[str], list[list[str]]]:
+    """
+    Advertise a tmux pane whose capture returns the last entry of ``panes``.
+
+    :param failed_send_keys: Number of initial ``send-keys`` calls that fail.
+    :param on_send_keys: Observe each attempted keystroke before its result.
+    :returns: The bridge directory, the mutable ``panes`` list and the
+        recorded successful ``send-keys`` commands.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    panes: list[str] = []
+    sent_keys: list[list[str]] = []
+    send_keys_attempts = 0
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        """Serve the current pane and record keystrokes."""
+        nonlocal send_keys_attempts
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=panes[-1], stderr="")
+        if "send-keys" in cmd:
+            if on_send_keys is not None:
+                on_send_keys()
+            send_keys_attempts += 1
+            if send_keys_attempts <= failed_send_keys:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no client")
+            sent_keys.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
+    return bridge_dir, panes, sent_keys
+
+
+def _failed_status_posts(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the ``failed`` session-status payloads among recorded POST bodies."""
+    return [
+        call["data"]
+        for call in calls
+        if call["type"] == "external_session_status" and call["data"]["status"] == "failed"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("rejection", "status"),
+    [
+        pytest.param(_BUDGET_RETRY_ERROR, 403, id="budget-403"),
+        pytest.param(
+            '401 {"type":"error","error":{"type":"authentication_error"}}', 401, id="auth-401"
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_forward_pane_signals_fails_and_interrupts_a_rejected_api_retry(
+    rejection: str,
+    status: int,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A 401/403 retry row fails the turn with its error, then sends one Escape.
+
+    Claude Code retries a gateway budget rejection ten times while the web
+    shows only a working spinner. The row stays visible through its backoff,
+    so repeat polls must not post or interrupt again. A rejection is reported
+    afresh once the row leaves the pane, or for a newer prompt submitted
+    before any poll saw the pane without one. A rejection before any output
+    has no response id, so only the prompt tells the turns apart.
+    """
+    bridge_dir, panes, sent_keys = _fake_tmux_pane(monkeypatch, tmp_path)
+    calls, transport = _btw_recording_client_calls()
+    dedupe = forwarder._ForwardDedupeState()
+    hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+
+    async def _submit_prompt() -> None:
+        nonlocal hook_state
+        record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+        hook_state = await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv1",
+            bridge_dir=bridge_dir,
+            state=hook_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+
+    async def _poll(pane: str) -> None:
+        panes.append(pane)
+        await forwarder._forward_pane_signals(
+            client, session_id="conv1", bridge_dir=bridge_dir, dedupe=dedupe
+        )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await _submit_prompt()
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 2s · attempt 3/10"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 1s · attempt 3/10"))
+
+        (failed,) = _failed_status_posts(calls)
+        assert "response_id" not in failed
+        assert failed["failure_detail"].startswith(f"API Error: {rejection}")
+        assert "attempt 3 of 10" in failed["failure_detail"]
+        assert failed["failure_context"]["http_status"] == status
+        assert failed["failure_context"]["failure_source"] == "claude_api_retry"
+        assert len(sent_keys) == 1
+        assert sent_keys[0][-1] == "Escape"
+
+        await _poll(_claude_pane("✻ Billowing…"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 3s · attempt 3/10"))
+        assert len(_failed_status_posts(calls)) == 2
+        assert len(sent_keys) == 2
+
+        await _submit_prompt()
+        await _poll(_claude_pane("✻ API error · Retrying in 1s · attempt 2/10"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 2s · attempt 3/10"))
+        await _poll(_claude_pane(f"✻ {rejection} · Retrying in 1s · attempt 3/10"))
+
+    failure_ids = [post["failure_context"]["failure_id"] for post in _failed_status_posts(calls)]
+    assert len(failure_ids) == 3
+    assert failure_ids[0] == failure_ids[1] != failure_ids[2]
+    assert len(sent_keys) == 3
+
+
+@pytest.mark.parametrize(
+    "status_row",
+    [
+        pytest.param("✻ 429 Too many requests · Retrying in 4s · attempt 3/10", id="rate-limit"),
+        pytest.param("✻ 500 Internal server error · Retrying in 4s · attempt 3/10", id="500"),
+        pytest.param("✻ 503 Service unavailable · Retrying in 4s · attempt 3/10", id="503"),
+        pytest.param("✻ Waiting for API response · Retrying in 4s · attempt 1/10", id="no-status"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_forward_pane_signals_leaves_other_api_retries_running(
+    status_row: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Retries that can still succeed, like a rate limit, are left to Claude Code."""
+    bridge_dir, panes, sent_keys = _fake_tmux_pane(monkeypatch, tmp_path)
+    panes.append(_claude_pane(status_row))
+    calls, transport = _btw_recording_client_calls()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await forwarder._forward_pane_signals(
+            client,
+            session_id="conv1",
+            bridge_dir=bridge_dir,
+            dedupe=forwarder._ForwardDedupeState(),
+            response_id="resp_1",
+        )
+
+    assert _failed_status_posts(calls) == []
+    assert sent_keys == []
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "unchanged",
+        "stopped",
+        "followup",
+        "identical-retry",
+        "compacted",
+        "compact-during-report",
+        "restarted",
+        "restarted-followup",
+        "pending-followup",
+        "relay-followup",
+    ],
+)
+@pytest.mark.asyncio
+async def test_forward_pane_signals_interrupts_a_rejected_api_retry_only_after_reporting_it(
+    scenario: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Report before Escape, recover delivery failures, and protect replacement turns."""
+    recover_failures = scenario == "unchanged"
+    suspended_operation = "relay" if scenario == "relay-followup" else "report"
+    should_interrupt = scenario in {
+        "unchanged",
+        "compacted",
+        "compact-during-report",
+        "restarted",
+        "pending-followup",
+    }
+    timeline: list[str] = []
+    bridge_dir, panes, sent_keys = _fake_tmux_pane(
+        monkeypatch,
+        tmp_path,
+        failed_send_keys=int(recover_failures),
+        on_send_keys=lambda: timeline.append("escape"),
+    )
+    panes.append(_claude_pane(f"✻ {_BUDGET_RETRY_ERROR} · Retrying in 2s · attempt 3/10"))
+    calls: list[dict[str, Any]] = []
+    operation_started = asyncio.Event()
+    finish_operation = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Suspend the successful report; inject delivery failure only in its recovery case."""
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        is_failure = bool(_failed_status_posts([body]))
+        if is_failure:
+            if recover_failures and len(_failed_status_posts(calls)) == 1:
+                timeline.append("report_failed")
+                return httpx.Response(503, json={})
+        if is_failure or (
+            scenario == "relay-followup" and body["type"] == "external_permission_mode_change"
+        ):
+            operation = "report" if is_failure else "relay"
+            timeline.append(f"{operation}_started")
+            operation_started.set()
+            await finish_operation.wait()
+            timeline.append(f"{operation}_completed")
+        return httpx.Response(200, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    response_id = "resp_1"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def _forward_hooks(state: forwarder.HookForwardState) -> None:
+            await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv1",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+
+        record_hook_event(
+            bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"}
+        )
+        await _forward_hooks(forwarder.HookForwardState(event_cursor=0, byte_offset=0))
+        if scenario == "compacted":
+            record_hook_event(
+                bridge_dir,
+                {
+                    "hook_event_name": "SessionStart",
+                    "source": "compact",
+                    "session_id": "parent-session",
+                },
+            )
+        if scenario in {"restarted", "restarted-followup"}:
+            dedupe = forwarder._ForwardDedupeState()
+            restored = forwarder._read_hook_state(bridge_dir)
+            assert restored is not None and restored.event_cursor == 1
+            await _forward_hooks(restored)
+            assert dedupe.prompt_submit_cursor is None
+
+        async def _poll() -> None:
+            await forwarder._forward_pane_signals(
+                client,
+                session_id="conv1",
+                bridge_dir=bridge_dir,
+                dedupe=dedupe,
+                response_id=response_id,
+            )
+
+        if scenario == "pending-followup":
+            record_hook_event(
+                bridge_dir,
+                {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"},
+            )
+            finish_operation.set()
+            await _poll()
+            assert _failed_status_posts(calls) == []
+            assert sent_keys == []
+            assert dedupe.prompt_submit_cursor == 1
+            finish_operation.clear()
+            restored = forwarder._read_hook_state(bridge_dir)
+            assert restored is not None
+            await _forward_hooks(restored)
+            assert dedupe.prompt_submit_cursor == 2
+            response_id = "resp_2"
+
+        if recover_failures:
+            await _poll()
+            assert len(_failed_status_posts(calls)) == 1
+            assert sent_keys == []
+        recovery_timeline = ["report_failed"] if recover_failures else []
+
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(_poll())
+            try:
+                await asyncio.wait_for(operation_started.wait(), timeout=5.0)
+                assert timeline == [*recovery_timeline, f"{suspended_operation}_started"]
+                if scenario in {"stopped", "followup", "relay-followup"}:
+                    panes.append(_claude_pane("" if scenario == "stopped" else "✻ Billowing…"))
+                if scenario in {
+                    "followup",
+                    "identical-retry",
+                    "restarted-followup",
+                    "relay-followup",
+                }:
+                    record_hook_event(
+                        bridge_dir,
+                        {"hook_event_name": "UserPromptSubmit", "session_id": "parent-session"},
+                    )
+                    assert dedupe.prompt_submit_cursor == (
+                        None if scenario == "restarted-followup" else 1
+                    )
+                if scenario == "compact-during-report":
+                    record_hook_event(
+                        bridge_dir,
+                        {
+                            "hook_event_name": "SessionStart",
+                            "source": "compact",
+                            "session_id": "parent-session",
+                        },
+                    )
+            finally:
+                finish_operation.set()
+        report_count = 0 if scenario == "relay-followup" else 2 if recover_failures else 1
+        assert len(_failed_status_posts(calls)) == report_count
+        assert len(sent_keys) == int(should_interrupt and not recover_failures)
+
+        await _poll()
+
+    assert [post["response_id"] for post in _failed_status_posts(calls)] == [
+        response_id
+    ] * report_count
+    escape_count = (2 if recover_failures else 1) if should_interrupt else 0
+    assert timeline == [
+        *recovery_timeline,
+        f"{suspended_operation}_started",
+        f"{suspended_operation}_completed",
+        *(["escape"] * escape_count),
+    ]
+    assert len(sent_keys) == int(should_interrupt)

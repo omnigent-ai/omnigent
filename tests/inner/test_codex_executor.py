@@ -51,6 +51,7 @@ from omnigent.inner.codex_goal_command import (
 from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND, BROKERED_CODEX_ENV
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -681,6 +682,174 @@ class TestCodexExecutor(unittest.TestCase):
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
 
+    def test_prompt_for_existing_thread_sends_pending_interruption_marker(self):
+        interrupted_history = [
+            {"role": "user", "content": "The secret codeword is ZEBRA-99."},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+        ]
+
+        follow_up = [*interrupted_history, {"role": "user", "content": "Summarize instead."}]
+        prompt = _prompt_for_turn(follow_up, is_new_thread=False, after_interrupt=True)
+        self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertEqual(_prompt_for_turn(follow_up, is_new_thread=False), "Summarize instead.")
+
+        image = {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
+        prompt = _prompt_for_turn(
+            [*interrupted_history, {"role": "user", "content": [image]}],
+            is_new_thread=False,
+            after_interrupt=True,
+        )
+        self.assertEqual(prompt, [{"type": "input_text", "text": INTERRUPTION_MARKER_TEXT}, image])
+
+    def test_prompt_for_existing_thread_sends_delivered_interruption_marker_once(self):
+        messages = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead."},
+            {"role": "assistant", "content": "Summary."},
+            {"role": "user", "content": "Thanks."},
+        ]
+        self.assertEqual(
+            _prompt_for_turn(messages, is_new_thread=False, after_interrupt=True), "Thanks."
+        )
+
+    def test_resumed_thread_sends_interruption_marker_once_after_textless_reply(self):
+        """A follow-up that ends without assistant text does not re-arm the marker."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {}},
+                    {"result": {"turn": {"id": "turn-2"}}},
+                    {"result": {"turn": {"id": "turn-3"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            self.assertTrue(await session.interrupt_turn())
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            ]
+            for turn_id, text in (("turn-2", "Summarize instead."), ("turn-3", "Thanks.")):
+                history.append({"role": "user", "content": text})
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": turn_id, "status": "completed"}},
+                    }
+                )
+                async with asyncio.timeout(10):
+                    events = [
+                        event
+                        async for event in session.run_turn(
+                            messages=list(history),
+                            tools=[],
+                            system_prompt="",
+                            model="gpt-5",
+                            cwd=".",
+                            sandbox="workspace-write",
+                        )
+                    ]
+                self.assertIsInstance(events[-1], TurnComplete)
+                self.assertFalse(events[-1].response)
+
+            turn_inputs = [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+            self.assertEqual(
+                turn_inputs,
+                [
+                    [
+                        {
+                            "type": "text",
+                            "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.",
+                        }
+                    ],
+                    [{"type": "text", "text": "Thanks."}],
+                ],
+            )
+
+        _run(_t())
+
+    def _follow_up_inputs_after_failed_start(self, active_turn_id: str | None):
+        """Interrupt the thread, fail the follow-up's ``turn/start``, retry, and return inputs."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = active_turn_id
+            interrupt_responses = [{"result": {}}] if active_turn_id else []
+            session._request = AsyncMock(
+                side_effect=[
+                    *interrupt_responses,
+                    RuntimeError("turn/start failed"),
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            await session.interrupt_turn()
+            session.active_turn_id = None
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+                {"role": "user", "content": "Summarize instead."},
+            ]
+            turn_kwargs = {
+                "tools": [],
+                "system_prompt": "",
+                "model": "gpt-5",
+                "cwd": ".",
+                "sandbox": "workspace-write",
+            }
+            with self.assertRaises(RuntimeError):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            session._events.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-2", "status": "completed"}},
+                }
+            )
+            async with asyncio.timeout(10):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            return [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+
+        return _run(_t())
+
+    def test_follow_up_retried_after_failed_start_keeps_interruption_marker(self):
+        """The marker stays pending until Codex accepts a turn, even if no turn was active."""
+        with_marker = [
+            {"type": "text", "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."}
+        ]
+        for active_turn_id in ("turn-1", None):
+            with self.subTest(active_turn_id=active_turn_id):
+                self.assertEqual(
+                    self._follow_up_inputs_after_failed_start(active_turn_id),
+                    [with_marker, with_marker],
+                )
+
     def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
         # A fresh thread replaying multimodal history must keep image bytes as
         # native input_image blocks, not flatten the data URI into prompt text.
@@ -900,13 +1069,14 @@ class TestCodexExecutor(unittest.TestCase):
                     system_prompt="Be helpful.",
                     model="gpt-5.4-mini",
                     cwd=".",
-                    sandbox="workspace-write",
+                    sandbox="read-only",
                 )
             ]
             await inject_task
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
+            self.assertEqual(params["sandbox"], "read-only")
             self.assertNotIn("features.shell_tool", params["config"])
             if supports_direct_tools:
                 self.assertEqual(
@@ -1608,17 +1778,8 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupt_session_interrupts_then_drops_session(self):
-        """A user interrupt halts the turn AND drops the session.
-
-        Codex resumes the same thread on the next turn and sends only the
-        latest user message, so a retained session would bypass the
-        runner's ``[System: interrupted]`` marker and continue the
-        abandoned request. Dropping the session (close resets thread_id)
-        forces the next turn to start a fresh thread and replay full
-        history. An empty ``_session_states`` is the invariant that
-        prevents the canceled-instruction leak.
-        """
+    def test_interrupt_session_interrupts_and_keeps_session(self):
+        """A user interrupt halts the turn and keeps the thread for the next turn."""
 
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
@@ -1638,10 +1799,35 @@ class TestCodexExecutor(unittest.TestCase):
 
             interrupted = await executor.interrupt_session("s1")
             self.assertTrue(interrupted)
-            # Interrupt is attempted first to halt the in-flight turn.
             self.assertTrue(fake_session.interrupted)
-            # Then the session is closed and removed so the next turn starts a
-            # fresh thread and replays full history (marker included).
+            self.assertFalse(fake_session.closed)
+            self.assertIn("s1", executor._session_states)
+            self.assertTrue(executor.resumes_after_interrupt())
+
+        _run(_t())
+
+    def test_interrupt_session_drops_session_when_interrupt_fails(self):
+        """An unconfirmed interrupt drops the thread so the next turn replays history."""
+
+        async def _t():
+            fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+            fake_session.interrupt_turn = AsyncMock(side_effect=RuntimeError("app-server gone"))
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=lambda **kwargs: fake_session,
+            )
+
+            _ = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+            interrupted = await executor.interrupt_session("s1")
+            self.assertTrue(interrupted)
             self.assertTrue(fake_session.closed)
             self.assertEqual(executor._session_states, {})
 
@@ -1770,6 +1956,54 @@ class TestCodexExecutor(unittest.TestCase):
                     "turnId": "turn-1",
                 },
             )
+
+        _run(_t())
+
+    def test_app_server_interrupt_turn_interrupts_each_turn_once(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(
+                side_effect=[RuntimeError("socket reset"), {"result": {}}]
+            )
+
+            with self.assertRaises(RuntimeError):
+                await session.interrupt_turn()
+            self.assertTrue(await session.interrupt_turn())
+            self.assertTrue(await session.interrupt_turn())
+            self.assertEqual(session._request.await_count, 2)
+
+            session.active_turn_id = "turn-2"
+            session._reader_completed_turn = "turn-2"
+            self.assertTrue(await session.interrupt_turn())
+            self.assertEqual(session._request.await_count, 2)
+
+        _run(_t())
+
+    def test_app_server_interrupted_turn_completes_without_waiting_for_tail(self):
+        async def _t():
+            session = _session_with_scripted_turn()
+            session._drain_turn_completed_tail = AsyncMock(return_value="late text")
+
+            events = await _run_turn_with_events(
+                session,
+                [
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1", "status": "interrupted"}},
+                    }
+                ],
+            )
+
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertFalse(events[-1].response)
+            session._drain_turn_completed_tail.assert_not_awaited()
 
         _run(_t())
 
@@ -5780,6 +6014,21 @@ async def test_codex_cli_version_parses_output(
     assert await _codex_cli_version("/usr/local/bin/codex") == expected
 
 
+async def test_codex_cli_version_runs_wrapper_prefix_before_version_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured wrapper is probed with its args ahead of ``--version``."""
+    calls: list[tuple[Any, ...]] = []
+
+    async def _fake_exec(*args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        calls.append(args)
+        return _FakeVersionProcess(stdout=b"codex-cli 0.154.0\n")
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+    assert await _codex_cli_version("user-codex-wrapper", "codex", "--") == (0, 154, 0)
+    assert calls == [("user-codex-wrapper", "codex", "--", "--version")]
+
+
 async def test_codex_cli_version_returns_none_on_oserror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5839,6 +6088,45 @@ async def test_codex_cli_version_times_out_and_kills_proc(
     assert await _codex_cli_version("/usr/local/bin/codex") is None
     # The stuck process was killed, not leaked.
     assert proc.killed is True
+
+
+async def test_codex_cli_version_cancellation_reaps_and_closes_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    pending = asyncio.Event()
+
+    class _CancelledProbe(_FakeVersionProcess):
+        killed = False
+        reaped = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            started.set()
+            await pending.wait()
+            return b"", b""
+
+        def kill(self) -> None:
+            self.killed = True
+
+        async def wait(self) -> int:
+            self.reaped = True
+            return -9
+
+    proc = _CancelledProbe(stdout=b"")
+    closed: list[Any] = []
+
+    async def fake_exec(*_args: Any, **_kwargs: Any) -> _CancelledProbe:
+        return proc
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("omnigent.inner.codex_executor.close_subprocess_transport", closed.append)
+    task = asyncio.create_task(_codex_cli_version("codex-wrapper", "codex", "--"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.killed and proc.reaped
+    assert closed == [proc]
 
 
 @pytest.mark.parametrize(
@@ -6336,6 +6624,57 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
             ):
                 self._start_until_worker_spawn(_check, bundle_dir=bundle, skills_filter=["alpha"])
         self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize(
+    "os_env,expected_sandbox",
+    [
+        pytest.param(None, "read-only", id="default"),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(write_paths=[])), "read-only", id="read-only"
+        ),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(write_paths=["."])),
+            "workspace-write",
+            id="workspace-write",
+        ),
+        pytest.param(
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")),
+            "danger-full-access",
+            id="disabled",
+        ),
+    ],
+)
+def test_run_turn_tools_do_not_widen_filesystem_permissions(
+    os_env: OSEnvSpec | None, expected_sandbox: str, with_tools: bool
+) -> None:
+    async def run() -> None:
+        session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            os_env=os_env,
+            app_session_factory=lambda **kwargs: session,
+        )
+        tools = (
+            [{"name": "lookup", "parameters": {"type": "object", "properties": {}}}]
+            if with_tools
+            else []
+        )
+        try:
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}], tools, ""
+                )
+            ]
+            assert events == [TurnComplete(response="done")]
+            assert session.calls[0]["sandbox"] == expected_sandbox
+            assert session.calls[0]["tools"] == tools
+        finally:
+            await executor.close_session("s1")
+
+    _run(run())
 
 
 def test_run_turn_cli_config_passes_no_model_to_thread_create():
@@ -7028,6 +7367,103 @@ def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
         lambda **kwargs: CodexWorkerLaunch("/bin/echo", sandboxed=True),
     )
     return harness
+
+
+@pytest.mark.parametrize(
+    ("discovery_outcome", "allow_network"),
+    [("success", True), ("success", False), ("failure", True), ("cancelled", True)],
+    ids=["network-allowed", "network-denied", "failure", "cancelled"],
+)
+async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
+    disabled_mcp_session, tmp_path, monkeypatch, discovery_outcome, allow_network
+):
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+
+    harness = disabled_mcp_session
+    session = harness.session
+    session._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"))
+    session._env = {"HOST_ONLY": "parent-value"}
+    launcher = tmp_path / "sandbox-launcher"
+    launch = CodexWorkerLaunch(
+        str(launcher), sandboxed=True, allow_network=allow_network, _owned_launcher=launcher
+    )
+    discovery_started = asyncio.Event()
+    discovery_pending = asyncio.Event()
+    private_homes = []
+
+    def prepare_worker(**kwargs):
+        assert kwargs["os_env"] is session._os_env_spec
+        assert kwargs["codex_path"] == "/bin/echo"
+        kwargs["worker_env"].pop("HOST_ONLY")
+        kwargs["worker_env"]["HTTPS_PROXY"] = "http://127.0.0.1:12345"
+        launcher.touch()
+        return launch
+
+    worker_prepare = Mock(side_effect=prepare_worker)
+    monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", worker_prepare)
+
+    async def prepare_provider(codex_home, overrides, **kwargs):
+        private_homes.append(codex_home)
+        assert session._worker_launch is launch
+        assert launcher.exists()
+        assert (codex_home / "config.toml").is_file()
+        assert kwargs["codex_path"] == str(launcher)
+        assert kwargs["allow_discovery"] is allow_network
+        assert kwargs["cwd"] == tmp_path.resolve()
+        assert kwargs["env"] is worker_prepare.call_args.kwargs["worker_env"]
+        assert kwargs["env"] == {
+            "CODEX_HOME": str(codex_home),
+            "HTTPS_PROXY": "http://127.0.0.1:12345",
+        }
+        if discovery_outcome == "cancelled":
+            discovery_started.set()
+            await discovery_pending.wait()
+        if discovery_outcome == "failure":
+            raise RuntimeError("provider setup failed")
+        return [*overrides, 'model_provider="configured"']
+
+    provider_prepare = AsyncMock(side_effect=prepare_provider)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config",
+        provider_prepare,
+    )
+    try:
+        if discovery_outcome == "cancelled":
+            start_task = asyncio.create_task(session.start())
+            try:
+                await asyncio.wait_for(discovery_started.wait(), timeout=5)
+                start_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(start_task, timeout=5)
+            finally:
+                if not start_task.done():
+                    start_task.cancel()
+                await asyncio.gather(start_task, return_exceptions=True)
+            assert harness.spawns == []
+            harness.initialize.assert_not_awaited()
+            assert session.cleaned
+            assert not launcher.exists()
+            assert not private_homes[0].exists()
+        elif discovery_outcome == "failure":
+            with pytest.raises(RuntimeError, match="provider setup failed"):
+                await session.start()
+            assert harness.spawns == []
+            assert session.cleaned
+            assert not launcher.exists()
+        else:
+            await session.start()
+            assert str(launcher) in harness.spawns[0]
+            assert 'model_provider="configured"' in harness.spawns[0]
+            assert launcher.exists()
+        worker_prepare.assert_called_once()
+        provider_prepare.assert_awaited_once()
+        assert session._env == {"HOST_ONLY": "parent-value"}
+    finally:
+        await session.close()
+    assert not launcher.exists()
+    assert session._codex_home_dir is None
+    assert len(private_homes) == 1
+    assert not private_homes[0].exists()
 
 
 @pytest.mark.parametrize(

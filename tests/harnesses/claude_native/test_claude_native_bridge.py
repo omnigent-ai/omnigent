@@ -41,7 +41,6 @@ from omnigent.harnesses.claude_native.bridge import (
     _LOGIN_GUIDANCE,
     _TURN_END_SCAN_BYTES,
     BackgroundAgentsAfterTurnReader,
-    _build_tools,
     _claude_prompt_rendered,
     _escape_slash_command_text,
     _escape_unsupported_slash_command,
@@ -78,12 +77,6 @@ from omnigent.harnesses.claude_native.bridge import (
     start_tool_relay,
     stop_hook_seen_since,
     write_tmux_target,
-)
-from omnigent.inner.datamodel import (
-    CredentialProxyEntry,
-    CredentialProxySpec,
-    CredentialSourceSpec,
-    OSEnvSandboxSpec,
 )
 from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
@@ -413,144 +406,29 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     assert not (attacker_dir / "bridge.json").exists()
 
 
-def test_prepare_bridge_dir_persists_and_applies_resolved_sandbox(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_serve_mcp_offers_only_relay_tools(tmp_path: Path) -> None:
     """
-    A resolved sandbox reaches both the bridge config and its sys_os_* tools.
+    The bridge serves no ``sys_os_*`` tools of its own.
 
-    ``enforce_sandbox``/``force_sandbox`` resolves a real sandbox onto the
-    session's ``os_env.sandbox`` upstream (``runner/app.py``'s
-    ``_apply_sandbox_override_from_start_data``), but that decision used to
-    have no path into the claude-native bridge: ``prepare_bridge_dir``
-    never wrote it to the config file, and ``_build_tools`` unconditionally
-    hardcoded ``OSEnvSandboxSpec(type="none")`` regardless of the policy.
-    A server operator configuring ``force_sandbox`` for claude-native
-    sessions got silent unenforced host access. This locks in the fix:
-    the resolved sandbox must survive the config round-trip and actually
-    reach the ``OSEnvSpec`` that builds the ``sys_os_*`` tools.
-
-    ``create_os_environment`` is patched at the boundary (same pattern as
-    ``test_executor_factory_decodes_os_env_json`` in
-    ``tests/inner/test_codex_harness.py``) rather than resolving a real
-    backend, so this is a platform-independent test of the config plumbing
-    — ``linux_bwrap`` and ``darwin_seatbelt`` only resolve on their own OS
-    and would otherwise fail this test on CI's Linux runners.
+    Claude's PreToolUse policy hook skips ``mcp__omnigent__*`` tools because
+    the relay gates them, so a bridge-local ``sys_os_shell`` would run with no
+    Omnigent policy check. Only the tools the relay advertises are listed or
+    callable.
     """
-    resolved_sandbox = OSEnvSandboxSpec(type="linux_bwrap", allow_network=False)
-
-    bridge_dir = prepare_bridge_dir(
-        "conv_sandboxed",
-        workspace=tmp_path,
-        sandbox=resolved_sandbox,
-    )
-    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
-    assert config["sandbox"]["type"] == "linux_bwrap"
-    assert config["sandbox"]["allow_network"] is False
-
-    captured: dict[str, Any] = {}
-
-    def _fake_create_os_environment(spec: Any) -> None:
-        captured["spec"] = spec
-        return
-
-    monkeypatch.setattr(
-        "omnigent.inner.os_env.create_os_environment",
-        _fake_create_os_environment,
-    )
-    _build_tools(config)
-
-    sandbox = captured["spec"].sandbox
-    assert sandbox.type == "linux_bwrap"
-    assert sandbox.allow_network is False
-
-
-def test_prepare_bridge_dir_without_sandbox_builds_unsandboxed_tools(
-    tmp_path: Path,
-) -> None:
-    """
-    No resolved sandbox preserves the prior unsandboxed default.
-
-    Sessions with nothing to carry (e.g. the ``omnigent claude`` CLI's own
-    synthesized wrapper spec, which intentionally declares
-    ``os_env.sandbox.type: none``) must keep working exactly as before —
-    this is the fallback the fix above must not disturb.
-    """
-    bridge_dir = prepare_bridge_dir("conv_unsandboxed", workspace=tmp_path)
+    bridge_dir = prepare_bridge_dir("conv_relay_only", workspace=tmp_path)
     config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
     assert "sandbox" not in config
 
-    tools, close_tools = _build_tools(config)
-    try:
-        os_env = tools["sys_os_shell"]._os_env
-        assert os_env is not None
-        assert os_env.sandbox.backend_type == "none"
-        assert os_env.sandbox.active is False
-    finally:
-        close_tools()
+    listed = claude_native_bridge._handle_mcp_request("tools/list", {}, bridge_dir)
+    assert listed == {"tools": []}
 
-
-def test_prepare_bridge_dir_drops_credential_proxy_instead_of_corrupting_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A sandbox with a real ``credential_proxy`` never corrupts the round-trip.
-
-    ``dataclasses.asdict`` flattens the nested ``CredentialProxySpec`` to a
-    plain dict, and a naive ``OSEnvSandboxSpec(**payload)`` on read has no
-    way to tell that dict apart from a real one — it gets assigned straight
-    through, so any sandboxed code that later dereferences ``.entries`` /
-    ``.databricks`` on it crashes with ``AttributeError: 'dict' object has
-    no attribute ...``. ``credential_proxy`` is resolved parent-side only
-    and was never meant to cross this boundary in the first place (see
-    ``SandboxPolicy.to_jsonable``'s identical exclusion) — this locks in
-    that it is dropped, not corrupted: the bridge config never carries it,
-    and the rebuilt spec cleanly has it unset rather than a stray dict.
-
-    ``create_os_environment`` is patched at the boundary (see
-    ``test_prepare_bridge_dir_persists_and_applies_resolved_sandbox`` above)
-    so this is platform-independent — the sandbox type only needs to be
-    *something* non-``"none"``, not a backend real for the CI host's OS.
-    """
-    sandbox = OSEnvSandboxSpec(
-        type="linux_bwrap",
-        credential_proxy=CredentialProxySpec(
-            entries=[
-                CredentialProxyEntry(
-                    host="github.com",
-                    scheme="bearer",
-                    source=CredentialSourceSpec(kind="env", env="GH_TOKEN"),
-                )
-            ],
-        ),
+    called = claude_native_bridge._handle_mcp_request(
+        "tools/call",
+        {"name": "sys_os_shell", "arguments": {"command": "id"}},
+        bridge_dir,
     )
-
-    bridge_dir = prepare_bridge_dir(
-        "conv_credproxy",
-        workspace=tmp_path,
-        sandbox=sandbox,
-    )
-    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
-    assert "credential_proxy" not in config["sandbox"]
-    assert config["sandbox"]["type"] == "linux_bwrap"
-
-    captured: dict[str, Any] = {}
-
-    def _fake_create_os_environment(spec: Any) -> None:
-        captured["spec"] = spec
-        return
-
-    monkeypatch.setattr(
-        "omnigent.inner.os_env.create_os_environment",
-        _fake_create_os_environment,
-    )
-    _build_tools(config)
-
-    sandbox_rebuilt = captured["spec"].sandbox
-    assert sandbox_rebuilt.type == "linux_bwrap"
-    assert sandbox_rebuilt.credential_proxy is None
+    assert called["isError"] is True
+    assert json.loads(called["content"][0]["text"]) == {"error": "unknown tool: 'sys_os_shell'"}
 
 
 def test_ensure_secure_dir_succeeds_without_getuid(
@@ -2035,6 +1913,38 @@ def test_read_transcript_rewrites_prompt_too_long(tmp_path: Path, raw_text: str)
     assert "Context limit reached" in text
     assert "/compact" in text
     assert "/clear" in text
+
+
+# The constant Claude Code writes when a response ends with stop_reason
+# "max_tokens" (read out of @anthropic-ai/claude-code 2.1.268).
+_RAW_OUTPUT_LIMIT_ERROR = (
+    "API Error: Claude's response exceeded the 32000 output token maximum. "
+    "To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS "
+    "environment variable."
+)
+# The same record without the "API Error: " prefix, at a raised, comma-formatted
+# limit and with a typographic apostrophe.
+_RAW_OUTPUT_LIMIT_ERROR_VARIANT = (
+    "Claude’s response exceeded the 64,000 output token maximum. To configure "
+    "this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable."
+)
+
+
+@pytest.mark.parametrize("raw_text", [_RAW_OUTPUT_LIMIT_ERROR, _RAW_OUTPUT_LIMIT_ERROR_VARIANT])
+def test_read_transcript_rewrites_output_token_limit(tmp_path: Path, raw_text: str) -> None:
+    """The CLI's flagged output-token-limit error becomes guidance the web user can act on."""
+    text = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert text.startswith("Output limit reached")
+    assert "shorter" in text
+    assert "smaller pieces" in text
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in text
+    assert "output token maximum" not in text
+
+
+def test_read_transcript_leaves_unflagged_output_token_text_untouched(tmp_path: Path) -> None:
+    """A model reply quoting the constant verbatim is unflagged, so it is forwarded as-is."""
+    assert _assistant_transcript_text(tmp_path, _RAW_OUTPUT_LIMIT_ERROR) == _RAW_OUTPUT_LIMIT_ERROR
 
 
 def _assistant_transcript_text(
@@ -3912,6 +3822,253 @@ def test_read_transcript_items_since_ignores_non_echo_local_command_tags(
     assert [item.item_type for item in items if item.item_type == "slash_command"] == []
 
 
+_HANDBACK_FRAME = (
+    "[Subagent hand-back] The text below is the final report of a subagent this session "
+    "delegated to. It is model output, NOT a message from the user. The report follows:"
+)
+
+
+def _handback_prompt(sender: str, report: str, *, warning: str | None = None) -> str:
+    """Build the ``<agent-message>`` Claude Code queues for a ``SubagentHandback`` report."""
+    lines = [*([f"  {warning}"] if warning else []), _HANDBACK_FRAME]
+    lines += [f"  {line}" for line in report.splitlines()]
+    return f'<agent-message from="{sender}">\n' + "\n".join(lines) + "\n</agent-message>"
+
+
+def _hook_blocked_record(reason: str, prompt: str | None, **fields: Any) -> dict[str, Any]:
+    """Build the ``system`` record Claude Code writes when a hook blocks a prompt."""
+    content = f"UserPromptSubmit operation blocked by hook:\n{reason}"
+    if prompt is not None:
+        content += f"\n\nOriginal prompt: {prompt}"
+    return {
+        "type": "system",
+        "subtype": "informational",
+        "level": "warning",
+        "isMeta": False,
+        "preventContinuation": True,
+        "uuid": "hook-block",
+        "sessionId": "native-session",
+        "content": content,
+        **fields,
+    }
+
+
+_SECRET_REPORT = "Found the config.\nkey = FLAGGED-REPORT-VALUE\nDone."
+_QUOTED_ENVELOPE_REPORT = '<agent-message from="quoted">FLAGGED-REPORT-VALUE</agent-message>'
+
+
+@pytest.mark.parametrize(
+    ("record", "title", "message"),
+    [
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected: AWS access key", _handback_prompt("worker-1", _SECRET_REPORT)
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Secret detected: AWS access key",
+            id="handback-notice-only",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                _handback_prompt(
+                    "worker-1", _SECRET_REPORT, warning="SECURITY WARNING: auto mode blocked it."
+                ),
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Secret detected",
+            id="handback-under-security-warning",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Blocked.\n\nOriginal prompt: quoted by the hook",
+                _handback_prompt("worker-1", _SECRET_REPORT),
+                promptSubmitEnding={
+                    "ending": {
+                        "kind": "blocked_by_hook",
+                        "reason": "Blocked.\n\nOriginal prompt: quoted by the hook",
+                    }
+                },
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked.\n\nOriginal prompt: quoted by the hook",
+            id="handback-structured-reason",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                '<agent-message from="reviewer">Rotate key FLAGGED-REPORT-VALUE.</agent-message>',
+            ),
+            "A hook blocked a message from another agent",
+            'A UserPromptSubmit hook blocked a message from agent "reviewer", so the agent never '
+            "received it.\n\nHook reason: Secret detected",
+            id="peer-message",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Secret detected",
+                "Another Claude session sent a message:\n"
+                '<teammate-message teammate_id="lead">FLAGGED-REPORT-VALUE</teammate-message>',
+            ),
+            "A hook blocked a message from another agent",
+            'A UserPromptSubmit hook blocked a message from agent "lead", so the agent never '
+            "received it.\n\nHook reason: Secret detected",
+            id="wrapped-teammate-message",
+        ),
+        pytest.param(
+            _hook_blocked_record("Blocked", _handback_prompt("worker-1", _QUOTED_ENVELOPE_REPORT)),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked",
+            id="handback-quoting-envelope",
+        ),
+        pytest.param(
+            _hook_blocked_record(
+                "Blocked",
+                _handback_prompt("worker-1", _QUOTED_ENVELOPE_REPORT),
+                promptSubmitEnding={"ending": {"kind": "blocked_by_hook", "reason": "Blocked"}},
+            ),
+            "A hook blocked a subagent's report",
+            'A UserPromptSubmit hook blocked the report from subagent "worker-1", so the agent '
+            "never received it, although Claude Code reported it as delivered."
+            "\n\nHook reason: Blocked",
+            id="handback-quoting-envelope-structured",
+        ),
+    ],
+)
+def test_read_transcript_items_since_reports_hook_blocked_agent_message(
+    tmp_path: Path, record: dict[str, Any], title: str, message: str
+) -> None:
+    """
+    An agent message a ``UserPromptSubmit`` hook blocked becomes an error item.
+
+    Claude Code drops the prompt and records only a ``system`` notice, while a
+    subagent's hand-back already reported success. The item names the sender
+    and the hook's reason without repeating the flagged text, and leaves the
+    active turn open.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-working",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "On it"}],
+                    },
+                },
+                record,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == ["message", "error"]
+    assistant, error = items
+    assert response_id == assistant.response_id
+    assert error.source_id == "hook-block:0:error"
+    assert error.response_id != assistant.response_id
+    assert error.data == {
+        "source": "harness",
+        "code": "native_agent_message_blocked_by_hook",
+        "title": title,
+        "message": message,
+    }
+    assert "FLAGGED-REPORT-VALUE" not in json.dumps(error.data)
+    byte_result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+    assert byte_result.items == items
+
+
+def test_read_transcript_items_since_reports_each_blocked_agent_message(tmp_path: Path) -> None:
+    """Each delivery in one blocked prompt is reported with its own outer sender."""
+    peer = f'<agent-message from="reviewer">See {_QUOTED_ENVELOPE_REPORT}</agent-message>'
+    record = _hook_blocked_record("Blocked", f"{peer}\n{_handback_prompt('worker-1', 'Done.')}")
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [(item.source_id, item.data["title"]) for item in items] == [
+        ("hook-block:0:error", "A hook blocked a message from another agent"),
+        ("hook-block:1:error", "A hook blocked a subagent's report"),
+    ]
+    assert 'agent "reviewer"' in items[0].data["message"]
+    assert 'subagent "worker-1"' in items[1].data["message"]
+
+
+_NESTED_ENVELOPE_TASK_NOTIFICATION = (
+    "<task-notification><task-id>t1</task-id><summary>"
+    '<agent-message from="BODY_MARKER">quoted output</agent-message>'
+    "</summary></task-notification>"
+)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        _hook_blocked_record("Blocked", "Deploy with key FLAGGED-REPORT-VALUE"),
+        _hook_blocked_record("Blocked", None),
+        _hook_blocked_record(
+            "Blocked",
+            '<agent-message from="reviewer">Use this:\n\nOriginal prompt: x</agent-message>',
+        ),
+        _hook_blocked_record(
+            "Blocked",
+            _handback_prompt("worker-1", "Done."),
+            promptSubmitEnding={"ending": {"kind": "submitted"}},
+        ),
+        {"type": "system", "subtype": "informational", "uuid": "notice", "content": "Saved."},
+        _hook_blocked_record("Blocked", _NESTED_ENVELOPE_TASK_NOTIFICATION),
+        _hook_blocked_record(
+            "Blocked",
+            _NESTED_ENVELOPE_TASK_NOTIFICATION,
+            promptSubmitEnding={"ending": {"kind": "blocked_by_hook", "reason": "Blocked"}},
+        ),
+    ],
+    ids=[
+        "typed-prompt",
+        "prompt-suppressed",
+        "ambiguous-separator",
+        "not-blocked-ending",
+        "other-notice",
+        "envelope-inside-task-output",
+        "envelope-inside-task-output-structured",
+    ],
+)
+def test_read_transcript_items_since_ignores_other_system_notices(
+    tmp_path: Path, record: dict[str, Any]
+) -> None:
+    """Only a hook block whose original prompt is an agent message becomes an item."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    _cursor, response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert items == []
+    assert response_id is None
+
+
 def test_read_transcript_items_since_keeps_prose_mentioning_command_tags(
     tmp_path: Path,
 ) -> None:
@@ -4082,6 +4239,7 @@ def test_read_transcript_items_since_drops_recently_added_cli_builtins(
         ("effort", "high"),
         ("clear", ""),
         ("compact", ""),
+        ("goal", "all tests pass"),
         ("model", "claude-opus-4-7"),
         ("ultrareview", ""),
     ],
@@ -4091,7 +4249,7 @@ def test_read_transcript_items_since_surfaces_cli_commands_with_kind_command(
 ) -> None:
     """
     Surfaced CLI built-ins (``/effort``, ``/clear``, ``/compact``,
-    ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
+    ``/goal``, ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
     ``kind="command"`` — the renderer uses that to switch the prefix
     label from "Skill" to "Command".
 
@@ -4668,14 +4826,34 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+def test_augment_claude_args_keeps_auto_compaction_on(tmp_path: Path) -> None:
+    """
+    Every launch turns Claude's automatic compaction on in the settings sidecar.
+
+    A user setting of ``autoCompactEnabled: false`` makes Claude refuse each turn
+    with "Prompt is too long" once the context fills, until someone types
+    ``/compact``. Flag settings outrank user settings, so the sidecar value wins.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("autoCompactEnabled") is True
+
+
 @pytest.mark.parametrize(
     ("launch_args", "default_mode"),
     [
         ((), None),
         (("--permission-mode", "default"), "default"),
         (("--permission-mode", "auto"), "auto"),
+        (("--permission-mode", "plan"), "plan"),
+        (("--permission-mode", "dontAsk"), "dontAsk"),
     ],
-    ids=["none", "default", "auto"],
+    ids=["none", "default", "auto", "plan", "dont-ask"],
 )
 def test_augment_claude_args_allows_reading_session_attachments(
     launch_args: tuple[str, ...],
@@ -4704,7 +4882,11 @@ def test_augment_claude_args_allows_reading_session_attachments(
 
     permissions = settings.get("permissions", {})
     assert permissions.get("defaultMode") == default_mode
-    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+    assert permissions.get("allow") == [
+        f"Read(/{attachment.parent.as_posix()}/**)",
+        "mcp__omnigent__sys_scheduled_task_create",
+        "mcp__omnigent__sys_scheduled_task_update",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4727,7 +4909,13 @@ def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
         )
     )
 
-    assert settings.get("permissions") == expected_permissions
+    assert settings.get("permissions") == {
+        **(expected_permissions or {}),
+        "allow": [
+            "mcp__omnigent__sys_scheduled_task_create",
+            "mcp__omnigent__sys_scheduled_task_update",
+        ],
+    }
 
 
 @pytest.mark.parametrize(
@@ -5320,6 +5508,35 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert before <= payload["updated_at"] <= after
 
 
+@pytest.mark.parametrize("content", ["\x07\x1b", "\n\n"], ids=["control-only", "newlines-only"])
+def test_inject_user_message_rejects_a_message_with_nothing_to_paste(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content that encodes to an empty paste is refused before any tmux write."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="no text to paste"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert captured == [], f"Expected no tmux writes for an unpasteable message, got {captured}"
+
+
 # Each send-keys first leaves copy mode in the same tmux call; without it,
 # a pane the reader scrolled back hands the keys to tmux instead of Claude.
 _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
@@ -5328,24 +5545,46 @@ _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
 @pytest.mark.parametrize(
     "content,expected_payload",
     [
-        # Plain single line: trailing CR appended (newline -> 0x0d).
-        ("hello world", b"hello world\r"),
+        # Plain single line: content bytes only; the submit Enter is a separate call.
+        ("hello world", b"hello world"),
         # Multi-line: interior newline rides as CR inside the paste so
         # Claude's TUI keeps it as data instead of submitting per line.
-        ("line one\nline two", b"line one\rline two\r"),
-        # Trailing "\" escapes the appended paste CR, not the submit Enter.
+        ("line one\nline two", b"line one\rline two"),
+        # Exactly two line breaks stay two: a third CR tips Claude Code into
+        # collapsing the paste to a "[Pasted text #N +3 lines]" placeholder.
+        ("first line\n\nthird line", b"first line\r\rthird line"),
+        # A trailing newline is dropped: it adds nothing before the submit Enter
+        # and would be the third break that collapses the paste.
+        ("first line\n\nthird line\n", b"first line\r\rthird line"),
+        # Trailing "\" escapes an appended paste CR, not the submit Enter.
         ("deploy to prod\\", b"deploy to prod\\\r"),
+        # A "\" the user already followed with a newline needs no extra CR.
+        ("deploy to prod\\\n", b"deploy to prod\\\r"),
+        # The guard looks at the encoded bytes: a dropped control byte after
+        # the "\" still leaves it trailing.
+        ("deploy to prod\\\x07", b"deploy to prod\\\r"),
         # CRLF line endings coalesce to a single CR (no doubled blank line).
-        ("a\r\nb", b"a\rb\r"),
+        ("a\r\nb", b"a\rb"),
         # A stray ESC in the content is dropped so it can't prematurely
         # close the bracketed-paste sequence on Claude's side.
-        ("a\x1bb", b"ab\r"),
+        ("a\x1bb", b"ab"),
         # Large payload (a PR diff in a sub-agent dispatch). Must ride the
         # load-buffer file — per-byte send-keys argv tripped tmux's ~16KB
         # client→server command cap with "command too long".
-        ("x" * 100_000, b"x" * 100_000 + b"\r"),
+        ("x" * 100_000, b"x" * 100_000),
     ],
-    ids=["plain", "multiline", "trailing-backslash", "crlf", "embedded-esc", "large"],
+    ids=[
+        "plain",
+        "multiline",
+        "two-line-breaks",
+        "trailing-newline",
+        "trailing-backslash",
+        "backslash-then-newline",
+        "backslash-then-dropped-control",
+        "crlf",
+        "embedded-esc",
+        "large",
+    ],
 )
 def test_inject_user_message_pastes_content_then_submits(
     content: str,
@@ -5420,9 +5659,8 @@ def test_inject_user_message_pastes_content_then_submits(
     assert refocus[-4:] == ["send-keys", "-t", "claude:0.0", "Space"]
     assert clear[3:8] == _LEAVE_COPY_MODE
     assert clear[-4:] == ["-l", "-t", "claude:0.0", _CLEAR_ONE_ROW_COMPOSER]
-    # The buffer file carried the normalized content + trailing CR. A
-    # missing trailing CR is the trailing-CR regression; a newline that stayed
-    # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
+    # An extra CR collapses a two-break message into a placeholder; a newline
+    # left as \n (not CR) is the anthropics/claude-code#52126 collapse.
     assert loaded_payloads == [expected_payload]
     assert load[:6] == [
         "tmux",
@@ -7737,6 +7975,79 @@ def test_permission_mode_from_pane_returns_none_without_a_footer() -> None:
     )
 
 
+_BUDGET_RETRY_ROW = (
+    '✻ 403 Budget "example-budget" (00000000-0000-0000-0000-000000000000) has reached'
+    " its limit of $0.1. To continue, contact an admin to increase the budget."
+    " · Retrying in 2s · attempt 3/10"
+)
+
+
+@pytest.mark.parametrize(
+    ("row", "expected_error"),
+    [
+        pytest.param(
+            _BUDGET_RETRY_ROW,
+            '403 Budget "example-budget" (00000000-0000-0000-0000-000000000000) has reached'
+            " its limit of $0.1. To continue, contact an admin to increase the budget.",
+            id="full-width",
+        ),
+        pytest.param(
+            '✻ 403 Budget "example-budget" (00000000-0000-… · Retrying in 3s · attempt 3/10',
+            '403 Budget "example-budget" (00000000-0000-…',
+            id="cut-to-80-columns",
+        ),
+    ],
+)
+def test_api_retry_from_pane_reads_the_retry_row(row: str, expected_error: str) -> None:
+    """
+    Claude Code's retry row yields its status, error text and attempt count.
+
+    Both rows were captured from Claude Code 2.1.283 retrying a gateway budget
+    rejection; an 80-column pane cuts the error text but keeps the status.
+    """
+    pane = (
+        "❯ say hi\n"
+        "\n"
+        f"{row}\n"
+        "                                                            ◐ medium · /effort\n"
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt\n"
+    )
+
+    assert claude_native_bridge._api_retry_from_pane(pane) == claude_native_bridge.ApiRetry(
+        status=403,
+        error=expected_error,
+        attempt=3,
+        max_retries=10,
+    )
+
+
+def test_api_retry_from_pane_reports_no_status_for_a_generic_retry() -> None:
+    """A retry row that names no HTTP status still parses, with ``status=None``."""
+    pane = "✻ Waiting for API response · Retrying in 4s · attempt 1/10\n❯ \n"
+
+    retry = claude_native_bridge._api_retry_from_pane(pane)
+
+    assert retry is not None
+    assert retry.status is None
+    assert (retry.attempt, retry.max_retries) == (1, 10)
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("✻ Billowing…\n❯ \n", id="spinner"),
+        pytest.param(f"● The row read:\n  {_BUDGET_RETRY_ROW}\n❯ \n", id="quoted-in-transcript"),
+    ],
+)
+def test_api_retry_from_pane_ignores_panes_without_a_retry_row(pane: str) -> None:
+    """The working spinner and indented transcript text are not a live retry."""
+    assert claude_native_bridge._api_retry_from_pane(pane) is None
+
+
 def test_read_permission_mode_reports_the_pane_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8386,7 +8697,7 @@ def test_serve_mcp_answers_while_relay_call_is_blocked(
     )
     server_thread = threading.Thread(
         target=claude_native_bridge._stdio_jsonrpc_loop,
-        args=({}, threading.Lock(), bridge_dir),
+        args=(threading.Lock(), bridge_dir),
         daemon=True,
     )
     server_thread.start()
@@ -8464,10 +8775,9 @@ def test_serve_mcp_rejects_at_concurrency_cap_and_keeps_serving(
     def _handle_mcp_request(
         method: str,
         params: object,
-        tools: dict[str, object],
         request_bridge_dir: Path,
     ) -> dict[str, object]:
-        del method, params, tools, request_bridge_dir
+        del method, params, request_bridge_dir
         if not blocked_call_started.is_set():
             blocked_call_started.set()
             release_blocked_call.wait(timeout=10.0)
@@ -8483,7 +8793,7 @@ def test_serve_mcp_rejects_at_concurrency_cap_and_keeps_serving(
     )
     server_thread = threading.Thread(
         target=claude_native_bridge._stdio_jsonrpc_loop,
-        args=({}, threading.Lock(), bridge_dir),
+        args=(threading.Lock(), bridge_dir),
         daemon=True,
     )
     server_thread.start()
@@ -8557,7 +8867,7 @@ def test_serve_mcp_rejects_when_request_thread_cannot_start(
     )
     server_thread = real_thread(
         target=claude_native_bridge._stdio_jsonrpc_loop,
-        args=({}, threading.Lock(), bridge_dir),
+        args=(threading.Lock(), bridge_dir),
         daemon=True,
     )
     server_thread.start()
@@ -9963,6 +10273,23 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert "omni setup" in login.failure_message
 
 
+def test_hook_record_stop_failure_output_limit_details_are_rewritten() -> None:
+    """The output-token-limit constant in ``error_details`` becomes the same guidance."""
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "max_output_tokens",
+                "error_details": _RAW_OUTPUT_LIMIT_ERROR,
+            }
+        )
+    )
+    assert record.failure_category == "max_output_tokens"
+    assert record.failure_message is not None
+    assert record.failure_message.startswith("Output limit reached")
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in record.failure_message
+
+
 @pytest.mark.parametrize(
     ("text", "code", "starts_with"),
     [
@@ -10193,15 +10520,20 @@ def test_ensure_trusted_creates_config_when_missing(
     A fresh host (no ``~/.claude.json``) gets both first-run gates set.
 
     This is the core workspace-trust case: an ``omnigent host`` machine that
-    has never run Claude interactively. Both the global onboarding gate
-    and the per-workspace trust gate must be pre-accepted so Claude does
-    not block on its TUI prompts.
+    has never run Claude interactively. The global onboarding gate and the
+    workspace and added-directory trust gates must be pre-accepted so Claude
+    does not block on its TUI prompts.
     """
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-x"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
+    (tmp_path / "bridge-link").symlink_to(tmp_path / "bridge", target_is_directory=True)
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(
+        workspace, added_dirs=(tmp_path / "bridge-link" / "agent-skills",)
+    )
 
     data = json.loads(config_path.read_text())
     # Global onboarding gate — without this Claude shows the theme/login
@@ -10213,6 +10545,9 @@ def test_ensure_trusted_creates_config_when_missing(
     # Per-directory trust gate, keyed by the RESOLVED absolute path —
     # without this Claude shows "Do you trust the files in this folder?".
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    # Without this Claude 2.1.326+ asks "Adding a new directory", and Escape exits.
+    assert data["projects"][str(added_dir.resolve())]["hasTrustDialogAccepted"] is True
+    assert str(tmp_path / "bridge-link" / "agent-skills") not in data["projects"]
 
 
 def test_ensure_trusted_declines_auto_default_question_for_onboarded_user(
@@ -10302,16 +10637,21 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-z"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
     already = {
         "hasCompletedOnboarding": True,
         "hasSeenAutoDefaultNudge": True,
-        "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+        "projects": {
+            str(workspace.resolve()): {"hasTrustDialogAccepted": True},
+            str(added_dir.resolve()): {"hasTrustDialogAccepted": True},
+        },
     }
     # Compact, no indentation — distinct from the helper's indent=2 output.
     config_path.write_text(json.dumps(already, separators=(",", ":")))
     before = config_path.read_bytes()
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(workspace, added_dirs=(added_dir,))
 
     # Byte-identical → the helper detected no change and never wrote.
     assert config_path.read_bytes() == before
@@ -11754,6 +12094,8 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
     capture observed while the loop was still deciding. A box-less capture
     followed by a box-present one that arrives only after the deadline
     proves the point: the box-present frame must NOT leak into the error.
+    A live-pane stub and disabled slow-boot extension keep this zero-budget
+    check focused on the error tail instead of startup recovery.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -11772,11 +12114,16 @@ def test_wait_for_claude_prompt_ready_tail_is_observed_not_recaptured(
         return observed if calls["n"] == 1 else late_ready
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", fake_capture)
-    with pytest.raises(RuntimeError) as excinfo:
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     # The tail reflects what the loop observed, and the late box-present
@@ -18171,3 +18518,35 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"claude_session_id": "", "cost_usd": 1.0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 0, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": float("nan"), "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 10**400, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": True, "restored": None},
+        {"claude_session_id": "sid", "cost_usd": "1.0", "restored": None},
+        {"claude_session_id": "sid", "cost_usd": 1.0, "restored": "yes"},
+        ["sid", 1.0],
+    ],
+    ids=[
+        "no-session",
+        "zero",
+        "nan",
+        "overflow",
+        "bool",
+        "string",
+        "bad-decision",
+        "not-an-object",
+    ],
+)
+def test_read_resume_cost_baseline_ignores_a_malformed_record(
+    tmp_path: Path, record: object
+) -> None:
+    """A malformed record seeds nothing rather than a wrong cost."""
+    (tmp_path / "resume_cost_baseline.json").write_text(json.dumps(record), encoding="utf-8")
+
+    assert claude_native_bridge.read_resume_cost_baseline(tmp_path) is None

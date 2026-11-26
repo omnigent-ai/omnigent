@@ -1,4 +1,4 @@
-import { useSyncExternalStore, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { ChevronDownIcon, CheckIcon, FolderOpenIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { CursorIcon } from "@/components/icons/CursorIcon";
@@ -20,35 +20,7 @@ import {
   useHostFileTarget,
   useLocalFileTarget,
 } from "./RevealInFileManager";
-
-const APP_PREFERENCE_EVENT = "omnigent:open-in-app-changed";
-const PREFERENCE_KEY = "omnigent:default-code-editor";
-
-function readPreferredApp(): string {
-  try {
-    return localStorage.getItem(PREFERENCE_KEY) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-function rememberApp(appId: string) {
-  try {
-    localStorage.setItem(PREFERENCE_KEY, appId);
-  } catch {
-    // Opening still works if this browser cannot save preferences.
-  }
-  window.dispatchEvent(new Event(APP_PREFERENCE_EVENT));
-}
-
-function subscribeToAppPreference(listener: () => void) {
-  window.addEventListener(APP_PREFERENCE_EVENT, listener);
-  window.addEventListener("storage", listener);
-  return () => {
-    window.removeEventListener(APP_PREFERENCE_EVENT, listener);
-    window.removeEventListener("storage", listener);
-  };
-}
+import { rememberPreferredEditor, usePreferredEditor } from "./fileCommands/preferredEditor";
 
 interface OpenInAction {
   key: string;
@@ -68,7 +40,7 @@ export function useOpenInActions(path: string | null, directory = false): OpenIn
     !mobile && !localTarget ? (target?.hostId ?? null) : null,
     conversationId,
   );
-  const preferred = useSyncExternalStore(subscribeToAppPreference, readPreferredApp, () => "");
+  const preferred = usePreferredEditor();
   if (mobile || !target || (!localTarget && !sshTarget)) return [];
   const actions: OpenInAction[] = [];
   for (const editor of CODE_EDITORS) {
@@ -84,7 +56,7 @@ export function useOpenInActions(path: string | null, directory = false): OpenIn
       ),
       active: false,
       onSelect: () => {
-        rememberApp(editor.id);
+        rememberPreferredEditor(editor.id);
         launchEditorLink(url);
       },
     });

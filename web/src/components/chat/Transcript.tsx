@@ -10,6 +10,8 @@ import {
 } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
+import { TaskMarkersProvider } from "@/components/blocks/TaskActivityMessage";
+import { readTaskActivity, taskMarkerId } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -26,15 +28,13 @@ import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
-import { DbcertBanner } from "@/components/DbcertBanner";
-import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
-import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
+import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
-import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
+import { ChatTasksPreview, hasTaskPreview } from "@/shell/ChatTasksPreview";
 import {
   RunnerStartingIndicator,
   McpStartupIndicator,
@@ -65,11 +65,11 @@ import {
   userMessageOrigin,
   withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
+import { TranscriptPaletteCommands } from "@/components/chat/TranscriptPaletteCommands";
 import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
 export interface TranscriptProps {
-  hostId: string | null | undefined;
   /** Ref callback for the conversation wrapper element (SelectionPopup scope +
    *  JumpToTopButton hover ancestor). Owned by the parent, forwarded here. */
   setConversationEl: (el: HTMLDivElement | null) => void;
@@ -99,6 +99,17 @@ function isHiddenSubagentWakeBubble(bubble: Bubble): boolean {
   if (!bubble.content.every(isTextBlock)) return false;
   const parsed = parseSystemMessage(extractUserText(bubble.content));
   return parsed?.kind === "subagent_wake" && parsed.body === "";
+}
+
+/** Whether *bubble* holds the task marker *markerId*, as a notice of its own or beside its work. */
+function bubbleHasMarker(bubble: Bubble, markerId: string): boolean {
+  const matches = (data: Record<string, unknown>) => {
+    const activity = readTaskActivity(data);
+    return activity !== null && taskMarkerId(activity) === markerId;
+  };
+  if (bubble.kind === "subagent_activity") return matches(bubble.data);
+  if (bubble.kind !== "assistant") return false;
+  return bubble.items.some((item) => item.kind === "subagent_activity" && matches(item.data));
 }
 
 function isSessionMessageBubble(bubble: Bubble): boolean {
@@ -150,7 +161,6 @@ export function isNativeFindShortcut(
  * dialogs bail out via React's normal prop-equality check.
  */
 function TranscriptImpl({
-  hostId,
   setConversationEl,
   containerEl,
   scroller,
@@ -166,6 +176,7 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedUploads = useChatStore((s) => s.failedUploads);
   const failedInputs = useChatStore((s) => s.failedInputs);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
@@ -173,8 +184,19 @@ function TranscriptImpl({
   const sandboxFailed = useChatStore((s) => s.sandboxStatus?.stage === "failed");
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
-  const hasTasks = useChatStore((s) => s.todos.length > 0);
   const conversationId = useChatStore((s) => s.conversationId);
+  const tasks = useSessionTasks(conversationId ?? undefined, true);
+  const hasTasks = hasTaskPreview(tasks);
+  // Task markers link to the tasks in the Tasks tab now; keyed by their IDs so
+  // the markers re-render only when that list changes.
+  const taskIdsKey = tasks.progress.map((item) => item.step.id).join("\n");
+  const taskMarkers = useMemo(
+    () =>
+      conversationId
+        ? { conversationId, taskIds: new Set(taskIdsKey ? taskIdsKey.split("\n") : []) }
+        : null,
+    [conversationId, taskIdsKey],
+  );
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -201,12 +223,14 @@ function TranscriptImpl({
       pendingUserMessages,
       failedInputs,
       getCurrentAuthorId(),
+      failedUploads,
     );
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedUploads,
     failedInputs,
     subagentRoutingOverride,
     sessionStatus,
@@ -328,8 +352,9 @@ function TranscriptImpl({
     () => display.bubbles.filter(isUserTurnBubble).map((b) => b.itemId),
     [display.bubbles, isUserTurnBubble],
   );
-  const nav = useUserMessageNav(userMessageIds, ensureItemVisible);
+  const nav = useUserMessageNav(userMessageIds, ensureItemVisible, scroller?.el);
   useMessageDeepLink(conversationId ?? null, {
+    root: scroller?.el,
     ensureMessageVisible: ensureItemVisible,
     ready: display.conversationId === conversationId && !!scroller?.el && !!scrollToItemRef.current,
     rangeNonce: spacerMeasureNonce,
@@ -384,16 +409,19 @@ function TranscriptImpl({
 
   const showWorkingIndicator =
     !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
-  const arcaWarning = useArcaShutdownBanner();
-  const showArcaBanner = arcaWarning.showForHost(hostId);
-  const hasPinnedBanner = display.hasTasks || showArcaBanner;
+  const hasPinnedBanner = display.hasTasks;
   return (
-    <>
-      {/* Task tracker pinned above the thread. Sibling of the viewport (not an
+    <TaskMarkersProvider value={taskMarkers}>
+      {/* Task preview pinned above the thread. Sibling of the viewport (not an
       overlay) so it shrinks the scroll area rather than covering messages.
       Self-hides with no tasks. */}
-      <ChatPlanAccordion className="mt-14 md:mt-12" />
-      {showArcaBanner && <ArcaShutdownBanner warning={arcaWarning} hasTasks={display.hasTasks} />}
+      {conversationId && (
+        <ChatTasksPreview
+          conversationId={conversationId}
+          tasks={tasks}
+          className="mt-14 md:mt-12"
+        />
+      )}
       {/* Wrapper div gives us a ref to scope the SelectionPopup to the
       conversation area without requiring Conversation to forward refs. */}
       <div
@@ -412,7 +440,8 @@ function TranscriptImpl({
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6 md:px-[clamp(0px,calc((var(--chat-column-width)+3.5rem-100cqi)*0.5),1.75rem)]",
               hasPinnedBanner ? "pt-4" : "pt-20",
-              showArcaBanner && "chat-content-under-arca-banner",
+              // In a chat pane, the panes view and the pane's strip already clear the header.
+              "in-data-chat-pane-body-host:pt-4",
               CHAT_COLUMN_WIDTH,
             )}
           >
@@ -465,6 +494,7 @@ function TranscriptImpl({
                     from="assistant"
                     className="max-w-full"
                     data-testid="bottom-elicitation"
+                    data-message-id={item.elicitationId}
                   >
                     <MessageContent className="w-full">
                       <ElicitationCard
@@ -501,6 +531,10 @@ function TranscriptImpl({
           </ConversationContent>
           {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
           <ConversationScrollRefBridge onScroller={setScroller} />
+          <TranscriptPaletteCommands
+            conversationId={display.conversationId}
+            bubbles={display.streamBubbles}
+          />
           <ConversationScrollButton
             className={
               isMobileViewport
@@ -518,10 +552,9 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+        {/* Too-many-tabs and sandbox-launch warnings, siblings of Conversation. */}
         <FloatingBannerStack>
           <StreamBudgetBanner />
-          <DbcertBanner conversationId={conversationId} hostId={hostId} />
           <SandboxActionBanner />
         </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
@@ -535,7 +568,7 @@ function TranscriptImpl({
           />
         )}
       </div>
-    </>
+    </TaskMarkersProvider>
   );
 }
 
@@ -1064,11 +1097,14 @@ export function VirtualBubbleList({
   }, [conversationId, scrollEl, messageId, anchorStart]);
 
   const scrollToItem = useCallback((itemId: string): boolean => {
-    const index = bubblesRef.current.findIndex(
+    let index = bubblesRef.current.findIndex(
       (b) =>
         (b.kind === "user" && b.itemId === itemId) ||
         (b.kind === "assistant" && b.responseId === itemId),
     );
+    // A task marker, alone or in the work beside it. One of the agent's own
+    // tasks can mark the same start twice, so the newest wins.
+    if (index < 0) index = bubblesRef.current.findLastIndex((b) => bubbleHasMarker(b, itemId));
     if (index < 0) return false;
     const c = ctxRef.current;
     c.stopScroll();
@@ -1185,18 +1221,21 @@ export function VirtualBubbleList({
   }, [onGeometryChange, scrollToItem, activeTurnId, rangeNonce]);
 
   if (disableVirtualization) {
+    // Same wrapper and keyed rows as the virtualized list, so mounted rows keep
+    // their DOM nodes and the reader's selection survives into native find.
     return (
-      <div className="flex w-full flex-col gap-4">
+      <div className="flex w-full flex-col" style={{ rowGap: ROW_GAP_PX }}>
         {bubbles.map((bubble, index) => (
-          <BubbleView
-            key={rowKey(bubble)}
-            bubble={bubble}
-            isLastAssistant={index === lastAssistantIndex}
-            showsWorking={showsWorking && index === lastAssistantIndex}
-            actionsPersistent={
-              index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
-            }
-          />
+          <div key={rowKey(bubble)} className="relative">
+            <BubbleView
+              bubble={bubble}
+              isLastAssistant={index === lastAssistantIndex}
+              showsWorking={showsWorking && index === lastAssistantIndex}
+              actionsPersistent={
+                index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
+              }
+            />
+          </div>
         ))}
       </div>
     );

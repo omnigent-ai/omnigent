@@ -156,6 +156,20 @@ describe("session drafts", () => {
     expect(sessionStorage.getItem(key)).toBeNull();
   });
 
+  it("remembers a draft was written even after it is emptied", async () => {
+    const { clearSessionDrafts, sessionDraftRevision, sessionDraftWasWritten, setSessionDraft } =
+      await import("./sessionDrafts");
+    expect(sessionDraftWasWritten("conversation")).toBe(false);
+    setSessionDraft("conversation", { text: "typed", files: [] });
+    setSessionDraft("conversation", { text: "", files: [] });
+    expect(sessionDraftWasWritten("conversation")).toBe(true);
+    expect(sessionDraftRevision("conversation")).toBe(2);
+    expect(sessionDraftWasWritten("other")).toBe(false);
+    clearSessionDrafts();
+    expect(sessionDraftWasWritten("conversation")).toBe(false);
+    expect(sessionDraftRevision("conversation")).toBe(0);
+  });
+
   it("recovers a failed temporary draft and ignores its late cleanup write", async () => {
     const { getSessionDraft, recoverFailedSessionDraft, setSessionDraft } =
       await import("./sessionDrafts");
@@ -182,6 +196,15 @@ describe("session drafts", () => {
     setSessionDraft("temp:failed", temporaryDraft);
     expect(getSessionDraft("temp:failed")).toBeUndefined();
     expect(sessionStorage.getItem(key)).toBeNull();
+
+    // A file name both drafts use is kept once per file, in order, as each draft gave it.
+    setSessionDraft("temp:repeat", { text: "look", files: [new File(["b"], "a.png")] });
+    const repeated = recoverFailedSessionDraft(
+      { message: "use", files: [new File(["a"], "a.png")] },
+      "temp:repeat",
+    );
+    expect(repeated.files.map((file) => file.name)).toEqual(["a.png", "a.png"]);
+    expect(repeated.message).toBe("use\n\nlook");
   });
 
   it("keeps each recovered tag on its own target when both drafts used the same token", async () => {
@@ -202,16 +225,27 @@ describe("session drafts", () => {
       "temp:clash",
     );
 
-    const inline = composerInlineMentions(
-      recovered.mentions!.files,
-      recovered.mentions!.sessions,
-      "claude-native",
-    );
+    const inline = composerInlineMentions(recovered.mentions!, "claude-native");
     const sent = expandMentionTokens(recovered.message, inline);
     expect(sent).toBe(
       'read [Session: "Plan" id=s_aaaaaaaa subagent=no]\n\n' +
         'and also [Session: "Plan" id=s_bbbbbbbb subagent=no]',
     );
+    // A workspace tag keeps its own marker beside a tray file that repeats its name.
+    setSessionDraft("temp:file", {
+      text: "Open @README.md",
+      files: [new File(["b"], "README.md")],
+      mentions: { files: [{ token: "@README.md", path: "README.md", isDir: false }], sessions: [] },
+    });
+    const withFile = recoverFailedSessionDraft(
+      { message: "", files: [new File(["a"], "README.md")], mentions: { files: [], sessions: [] } },
+      "temp:file",
+    );
+    const fileExpanded = expandMentionTokens(
+      withFile.message,
+      composerInlineMentions(withFile.mentions!, null),
+    );
+    expect(fileExpanded).toBe("Open [Attached: README.md]");
   });
 
   it("re-renders useSessionDraftIds only when the set of draft ids changes", async () => {

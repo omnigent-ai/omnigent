@@ -286,7 +286,9 @@ fallback.
 
 Before deploying the server, make client builds containing the PKCE update
 available through your CLI, mobile, and Slack distribution channels, and
-announce that older clients must upgrade to sign in again. Test both an old
+announce that older clients must upgrade to sign in again. Confirm the live
+App Store and Play Store builds contain the PKCE client, not just the version
+number in the repository: mobile builds are released by hand and can lag main. Test both an old
 and an updated client against a staging server with your actual identity
 provider. The old client must show the upgrade page without signing in; the
 updated client must complete fresh sign-in and browser approval. Preserve
@@ -410,13 +412,32 @@ token cannot open a new connection. Renewal also extends the validity of any
 leaked copy of that token. This setting does not change sandbox lifetime or
 Mac/Arca user-login credentials.
 
+**Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
+(off by default) to stop a session's sandbox when the session is archived, after
+its runner is stopped. It is a per-provider setting: in a `providers:` list, a
+value next to `providers` is every entry's default, and an entry can override it.
+The sandbox is stopped, not deleted, so unarchiving the session and sending a
+message resumes the same sandbox. It applies only to providers that can resume
+a stopped sandbox (`capabilities.resume_stopped`) and implement `stop()`; on a
+provider whose `stop()` raises `SandboxCapabilityError`, the option has no
+effect (the server logs that at debug level). Only a sandbox no other session
+uses is stopped: another session on the same host, or a side chat or sub-agent
+of the session, keeps it running even when archived, and so does a scheduled
+task run's sandbox. Deleting the session still terminates the sandbox, and so does
+the reaper below once a stopped sandbox's host passes its offline limit; the
+next message then starts a fresh sandbox instead.
+
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and
 detaches a sandbox generation only after its host has stayed offline past
 `terminate_after_offline_days`. Provider termination failures remain recorded
 for a later sweep, while the session history and durable host binding stay
-available for a fresh sandbox generation. Both
-`terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
+available for a fresh sandbox generation. Every server process sweeps on its
+own schedule: the first sweep runs at a random point within the first
+`sweep_interval_s` after startup, and later sweeps follow every
+`sweep_interval_s` ±10%, so replicas restarted together by a rollout don't scan
+the host table at the same moment. Both `terminate_after_offline_days` and
+`sweep_interval_s` must be positive integers.
 
 **The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
 
@@ -724,8 +745,8 @@ host; it does not fall back to `app_name`.
 
 Limit and order what New Chat offers, and choose where a fresh chat starts, with
 two optional keys in the same server config as `branding:` (`omnigent server -c
-config.yaml`, or `/data/config.yaml` in the Docker stack). A plain `omnigent
-server` without `-c` does not read them. Takes effect on the next server start.
+config.yaml`, `OMNIGENT_CONFIG`, or `<data_dir>/config.yaml` — `/data/config.yaml`
+in the Docker stack). Takes effect on the next server start.
 
 ```yaml
 restrict_to_agent_names: [polly, claude-native-ui]  # New Chat offers only these, in this order

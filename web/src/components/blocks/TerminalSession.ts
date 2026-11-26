@@ -630,6 +630,15 @@ export function touchScrollPayload(
 }
 
 /**
+ * The width the fit holds back for the scrollbar, as xterm's fit addon reckons it: none without
+ * scrollback, else the overview ruler's width or 14px.
+ */
+export function terminalFitReserveWidth(term: Pick<Terminal, "options">): number {
+  if (term.options.scrollback === 0) return 0;
+  return term.options.overviewRuler?.width || 14;
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -641,6 +650,7 @@ export function touchScrollPayload(
  * close the WS, dispose the terminal.
  */
 export class TerminalSession {
+  private readonly container: HTMLElement;
   private readonly term: Terminal;
   private readonly fit: FitAddon;
   /** WebGL renderer addon, or ``null`` when WebGL is unavailable. */
@@ -717,6 +727,7 @@ export class TerminalSession {
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
   ) {
+    this.container = container;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -831,6 +842,7 @@ export class TerminalSession {
     this.ws.addEventListener(
       "close",
       (ev) => {
+        this.clearFittedSize();
         onState({ kind: "closed", reason: ev.reason || `code ${ev.code}`, code: ev.code });
       },
       { signal },
@@ -1071,6 +1083,7 @@ export class TerminalSession {
     this.disposed = true;
     this.listenerCtl.abort();
     this.resizeObserver.disconnect();
+    this.clearFittedSize();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
     this.queryReplies?.dispose();
@@ -1129,6 +1142,13 @@ export class TerminalSession {
     };
   }
 
+  /** A closed or disposed session has no fitted size to say. */
+  private clearFittedSize(): void {
+    delete this.container.dataset.terminalCols;
+    delete this.container.dataset.terminalRows;
+    delete this.container.dataset.terminalFitReserveWidth;
+  }
+
   private sendResize(): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;
     try {
@@ -1137,6 +1157,10 @@ export class TerminalSession {
       return;
     }
     const { cols, rows } = this.term;
+    // The container says its fitted size in cells, so a layout around it can measure in cells.
+    this.container.dataset.terminalCols = String(cols);
+    this.container.dataset.terminalRows = String(rows);
+    this.container.dataset.terminalFitReserveWidth = String(terminalFitReserveWidth(this.term));
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both
     // call this on mount, and a transient re-fit can land the same size. On
     // the control transport an unchanged size is a wasted round-trip (tmux

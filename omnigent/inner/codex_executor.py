@@ -32,7 +32,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -122,6 +122,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    pending_interruption_marker,
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
@@ -132,6 +133,11 @@ from .model_signer import (
     SignerReadiness,
     SignerStartError,
     SubprocessModelSigner,
+)
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,6 +185,8 @@ _TURN_EVENT_WARN_SECONDS = 600.0
 # warning cadence is unchanged.
 _TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_TURN_INTERRUPT_TIMEOUT_S = 1.5
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
@@ -597,11 +605,12 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
-async def _codex_cli_version_text(codex_path: str) -> str | None:
+async def _codex_cli_version_text(codex_path: str, *leading_args: str) -> str | None:
     """Return the exact version token reported by ``codex --version``."""
     try:
         proc = await _create_subprocess_exec(
             codex_path,
+            *leading_args,
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -612,12 +621,16 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
         )
-    except TimeoutError:
-        with suppress(ProcessLookupError):
-            proc.kill()
-        with suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=1)
-        close_subprocess_transport(proc)
+    except (TimeoutError, asyncio.CancelledError) as error:
+        try:
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=1)
+        finally:
+            close_subprocess_transport(proc)
+        if isinstance(error, asyncio.CancelledError):
+            raise
         return None
     match = re.fullmatch(
         r"\s*codex-cli\s+(\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?)\s*",
@@ -626,7 +639,7 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
     return match.group(1) if match is not None else None
 
 
-async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
+async def _codex_cli_version(codex_path: str, *leading_args: str) -> tuple[int, int, int] | None:
     """
     Return the codex CLI version as a ``(major, minor, patch)`` tuple.
 
@@ -637,12 +650,14 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
 
     :param codex_path: Path to the codex CLI, e.g.
         ``"/usr/local/bin/codex"``.
+    :param leading_args: Args placed before ``--version``, such as a
+        configured wrapper's prefix, e.g. ``("codex", "--")``.
     :returns: The parsed version, e.g. ``(0, 136, 0)``, or ``None`` if
         the command cannot be run, times out, or its output has no
         ``X.Y.Z`` token (caller treats ``None`` as "version unknown", not
         "too old").
     """
-    raw = await _codex_cli_version_text(codex_path)
+    raw = await _codex_cli_version_text(codex_path, *leading_args)
     if raw is None:
         return None
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", raw)
@@ -2710,23 +2725,34 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
+def _prompt_for_turn(
+    messages: list[Message], *, is_new_thread: bool, after_interrupt: bool = False
+) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
     A fresh Codex thread must receive the full replayable
     transcript so the harness can preserve parent history on
     sub-agent calls. Resumed threads should only receive the
-    latest user message.
+    latest user message, preceded by the runner's interruption
+    marker when the thread's previous turn was interrupted.
 
     :param messages: Conversation history.
     :param is_new_thread: ``True`` when starting a fresh Codex
         thread.
+    :param after_interrupt: ``True`` when the resumed thread's
+        previous turn was interrupted and no input has followed.
     :returns: A string prompt or a list of content block dicts.
     """
     if is_new_thread:
         return _build_initial_prompt(messages)
-    return _extract_latest_user_content(messages)
+    latest_user_content = _extract_latest_user_content(messages)
+    marker = pending_interruption_marker(messages) if after_interrupt else None
+    if marker is None:
+        return latest_user_content
+    if isinstance(latest_user_content, list):
+        return [{"type": "input_text", "text": marker}, *latest_user_content]
+    return f"{marker}\n\n{latest_user_content}"
 
 
 def _to_codex_input_items(
@@ -3071,6 +3097,9 @@ class _CodexAppServerSession:
         self._native_progress_observed = False
         self._reader_started_turn: str | None = None
         self._reader_completed_turn: str | None = None
+        self._interrupted_turn_id: str | None = None
+        # Whether the next turn's input must carry the runner's interruption marker.
+        self._interruption_marker_pending = False
         self._next_id = 1
         self._started = False
         self._starting = False
@@ -3235,6 +3264,11 @@ class _CodexAppServerSession:
             if skip_reason is not None:
                 logger.warning("%s", skip_reason)
                 router_bridge_dir = None
+        sandbox_requested = self._os_env_spec is not None and (
+            self._os_env_spec.sandbox is None or self._os_env_spec.sandbox.type != "none"
+        )
+        with harness_sandbox_preparation() if sandbox_requested else nullcontext():
+            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
         # stalled every other session sharing this event loop for that long.
@@ -3252,33 +3286,20 @@ class _CodexAppServerSession:
             required_brokered_probe=(
                 (
                     self._codex_path,
-                    Path(self._cwd or os.getcwd()).resolve(strict=False),
+                    process_cwd,
                     self._os_env_spec,
                 )
                 if (self._signer is not None or brokered_gateway) and self._os_env_spec is not None
                 else None
             ),
         )
-        if self._signer is None and not brokered_gateway:
-            from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
-
-            self._codex_config_overrides = await prepare_codex_provider_config(
-                self._codex_home_dir,
-                self._codex_config_overrides,
-                codex_path=self._codex_path,
-                cwd=Path(self._cwd or os.getcwd()),
-                env=self._env,
-                retry_policy=self._retry_policy,
-                client_surface=harness_client_surface(),
-            )
-        else:
+        if self._signer is not None or brokered_gateway:
             # The signer replaces gateway attribution from its own launch metadata.
             self._codex_config_overrides = materialize_codex_provider_config(
                 self._codex_home_dir,
                 self._codex_config_overrides,
                 retry_policy=self._retry_policy,
             )
-        if self._signer is not None or brokered_gateway:
             self._codex_config_overrides.extend(
                 [
                     f"sqlite_home={json.dumps(str(self._codex_home_dir))}",
@@ -3307,7 +3328,6 @@ class _CodexAppServerSession:
             for name in ("TMPDIR", "TMP", "TEMP"):
                 proc_env[name] = str(self._codex_home_dir)
         try:
-            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             # Active egress rules start a parent-side proxy and wait for its
             # thread readiness. Keep that bounded synchronous setup off the
             # shared executor loop, just like CODEX_HOME population above.
@@ -3332,6 +3352,21 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
+            if self._signer is None and not brokered_gateway:
+                from omnigent.harnesses.codex_native.app_server import (
+                    prepare_codex_provider_config,
+                )
+
+                self._codex_config_overrides = await prepare_codex_provider_config(
+                    self._codex_home_dir,
+                    self._codex_config_overrides,
+                    codex_path=worker_launch.launch_path,
+                    cwd=process_cwd,
+                    env=proc_env,
+                    retry_policy=self._retry_policy,
+                    client_surface=harness_client_surface(),
+                    allow_discovery=worker_launch.allow_network,
+                )
             from omnigent.mcp_disabled_servers import (
                 RELAUNCH_WITHOUT_OVERRIDES_EVENT,
                 plan_codex_launch,
@@ -4068,7 +4103,10 @@ class _CodexAppServerSession:
                 if message.get("role") == "user":
                     message["content"] = goal_objective
                     break
-        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
+        after_interrupt = self._interruption_marker_pending
+        prompt = _prompt_for_turn(
+            prompt_messages, is_new_thread=is_new_thread, after_interrupt=after_interrupt
+        )
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
@@ -4117,6 +4155,8 @@ class _CodexAppServerSession:
             "turn/start",
             turn_params,
         )
+        if after_interrupt:
+            self._interruption_marker_pending = False
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -4510,7 +4550,7 @@ class _CodexAppServerSession:
                         self._certificate_failure = None
                     if not final_response:
                         final_response = _latest_buffered_agent_message(message_buffers)
-                    if not final_response:
+                    if not final_response and _codex_turn_status(turn) != "interrupted":
                         final_response = await self._drain_turn_completed_tail(
                             active_turn_id=active_turn_id,
                             message_buffers=message_buffers,
@@ -4620,15 +4660,28 @@ class _CodexAppServerSession:
         return True
 
     async def interrupt_turn(self) -> bool:
-        if self.thread_id is None or self.active_turn_id is None:
+        turn_id = self.active_turn_id
+        if self.thread_id is None:
             return False
-        await self._request(
-            "turn/interrupt",
-            {
-                "threadId": self.thread_id,
-                "turnId": self.active_turn_id,
-            },
-        )
+        # Arming without an active turn is harmless: the marker is sent only if history holds it.
+        self._interruption_marker_pending = True
+        if turn_id is None:
+            return False
+        if turn_id in (self._interrupted_turn_id, self._reader_completed_turn):
+            return True
+        self._interrupted_turn_id = turn_id
+        try:
+            await self._request(
+                "turn/interrupt",
+                {
+                    "threadId": self.thread_id,
+                    "turnId": turn_id,
+                },
+            )
+        except BaseException:
+            if self._interrupted_turn_id == turn_id:
+                self._interrupted_turn_id = None
+            raise
         return True
 
     async def _interrupt_failed_turn(self, cause: str) -> None:
@@ -5266,16 +5319,17 @@ class CodexExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return True
 
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
         if state is None or state.app_session is None:
             return False
-        # Best-effort interrupt to halt the in-flight turn; a failure just
-        # falls through to the close below.
         try:
-            await asyncio.wait_for(
+            return await asyncio.wait_for(
                 state.app_session.interrupt_turn(),
-                timeout=0.5,
+                timeout=_TURN_INTERRUPT_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
@@ -5283,11 +5337,8 @@ class CodexExecutor(Executor):
                 session_key,
                 exc,
             )
-        # Always drop the session (resets thread_id) so the next turn starts a
-        # fresh thread and replays full history. A resumed thread sends only
-        # the latest user message, which would bypass the runner's
-        # "[System: interrupted]" marker and silently continue the abandoned
-        # request. See claude_sdk_executor.interrupt_session for the rationale.
+        # The turn may still be running, so drop the thread; the next turn starts
+        # a fresh one and replays history, including the interruption marker.
         try:
             await self.close_session(session_key)
             return True
@@ -5459,8 +5510,6 @@ class CodexExecutor(Executor):
             effective_cwd=effective_cwd,
         )
         sandbox_mode = _sandbox_mode(self._os_env_spec)
-        if tools and sandbox_mode == "read-only":
-            sandbox_mode = "workspace-write"
 
         try:
             async for event in app_session.run_turn(
@@ -5473,7 +5522,12 @@ class CodexExecutor(Executor):
                 reasoning_effort=reasoning_effort,
             ):
                 yield event
-        except (HarnessTransportClosedError, ProviderAuthRequired):
+        except (
+            HarnessTransportClosedError,
+            ProviderAuthRequired,
+            HarnessSandboxPreparationError,
+            HarnessSandboxValidationError,
+        ):
             raise
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
             yield ExecutorError(message=f"Codex executor error: {exc}")

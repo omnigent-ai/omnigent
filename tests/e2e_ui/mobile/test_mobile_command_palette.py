@@ -18,7 +18,7 @@ from __future__ import annotations
 from playwright.sync_api import Page, ViewportSize, expect
 
 # iPhone-12-class portrait viewport — below the Tailwind ``md`` breakpoint
-# (768px) so ``useIsMobileViewport`` reports mobile and the sheet layout applies.
+# (1181px) so ``useIsMobileViewport`` reports mobile and the sheet layout applies.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 
 _COMPOSER = "Send a message…"
