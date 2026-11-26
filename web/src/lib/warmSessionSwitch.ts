@@ -5,8 +5,10 @@ export function warmSwitchKeepMountedEnabled(): boolean {
   return isFeatureEnabled(getCachedServerInfo() ?? "loading", "warm_switch_keep_mounted_ui");
 }
 
-// Retain the surface only between a click's source URL and its store-first target.
-let inFlight: { target: string; fromUrlConvId: string | null; fromPathname: string } | null = null;
+// Retain the surface only between a click's source session and its store-first target.
+let inFlight: { target: string; fromConversationId: string | null; fromPathname: string } | null =
+  null;
+let inFlightTimeout: number | undefined;
 
 export function warmSwitchInFlight(
   activeConversationId: string | null,
@@ -15,30 +17,33 @@ export function warmSwitchInFlight(
   return (
     inFlight !== null &&
     inFlight.target === activeConversationId &&
-    inFlight.fromUrlConvId === (urlConvId ?? null)
+    inFlight.fromConversationId === (urlConvId ?? null)
   );
 }
 
 export function clearWarmSwitchInFlight(): void {
+  window.clearTimeout(inFlightTimeout);
+  inFlightTimeout = undefined;
   inFlight = null;
 }
 
-export function restoreWarmSwitchIfNavigationCanceled(): void {
-  if (inFlight === null || window.location.pathname !== inFlight.fromPathname) return;
-  const { fromUrlConvId } = inFlight;
-  clearWarmSwitchInFlight();
-  void useChatStore.getState().switchTo(fromUrlConvId);
-}
-
-export function switchSessionBeforeNavigate(
-  conversationId: string,
-  fromUrlConvId: string | null,
-): void {
+export function switchSessionBeforeNavigate(conversationId: string): void {
   if (!warmSwitchKeepMountedEnabled()) return;
-  if (useChatStore.getState().conversationId === conversationId) return;
-  inFlight =
-    conversationId === fromUrlConvId
-      ? null
-      : { target: conversationId, fromUrlConvId, fromPathname: window.location.pathname };
+  const fromConversationId = useChatStore.getState().conversationId;
+  if (fromConversationId === conversationId) return;
+  clearWarmSwitchInFlight();
+  const pending = {
+    target: conversationId,
+    fromConversationId,
+    fromPathname: window.location.pathname,
+  };
+  inFlight = pending;
+  inFlightTimeout = window.setTimeout(() => {
+    if (inFlight !== pending) return;
+    clearWarmSwitchInFlight();
+    if (window.location.pathname === pending.fromPathname) {
+      void useChatStore.getState().switchTo(pending.fromConversationId);
+    }
+  }, 3000);
   void useChatStore.getState().switchTo(conversationId);
 }

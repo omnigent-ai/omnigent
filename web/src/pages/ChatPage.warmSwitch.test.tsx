@@ -23,7 +23,9 @@ import {
   setPendingInitialPrompt,
   useChatStore,
 } from "@/store/chatStore";
-import { clearSessionDrafts } from "@/lib/sessionDrafts";
+import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import * as sessionsApi from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 import { ChatPage } from "./ChatPage";
 
 const initialStoreState = useChatStore.getState();
@@ -79,12 +81,11 @@ function SessionLink({
   label: string;
   cancelNavigation?: boolean;
 }) {
-  const { conversationId } = useParams<{ conversationId: string }>();
   return (
     <Link
       to={`/c/${id}`}
       onClick={(event) => {
-        switchSessionBeforeNavigate(id, conversationId ?? null);
+        switchSessionBeforeNavigate(id);
         if (cancelNavigation) event.preventDefault();
       }}
     >
@@ -96,17 +97,19 @@ function SessionLink({
 function renderPage(
   features: Record<string, boolean>,
   qc = new QueryClient(),
-  cancelBetaNavigation = false,
+  options: {
+    cancelBetaNavigation?: boolean;
+    initialConversationId?: string;
+    info?: Partial<capabilities.ServerInfo>;
+  } = {},
 ) {
-  vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
-    ...FALLBACK_SERVER_INFO,
-    features,
-  });
+  const info = { ...FALLBACK_SERVER_INFO, ...options.info, features };
+  vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue(info);
   render(
     <QueryClientProvider client={qc}>
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, features }}>
+      <CapabilitiesProvider info={info}>
         <SidebarDataProvider>
-          <MemoryRouter initialEntries={["/c/conv_a"]}>
+          <MemoryRouter initialEntries={[`/c/${options.initialConversationId ?? "conv_a"}`]}>
             <Routes>
               <Route
                 path="c/:conversationId"
@@ -117,9 +120,10 @@ function renderPage(
                     <SessionLink
                       id="conv_b"
                       label="open beta"
-                      cancelNavigation={cancelBetaNavigation}
+                      cancelNavigation={options.cancelBetaNavigation}
                     />
                     <SessionLink id="conv_c" label="open gamma" />
+                    <Link to="/c/conv_b">finish beta navigation</Link>
                     <ChatPage />
                   </>
                 }
@@ -130,6 +134,31 @@ function renderPage(
       </CapabilitiesProvider>
     </QueryClientProvider>,
   );
+}
+
+function renderWarmComposer(
+  options: {
+    session?: Partial<Session>;
+    info?: Partial<capabilities.ServerInfo>;
+  } = {},
+) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  initChatStore(qc);
+  for (const id of ["conv_a", "conv_b"]) {
+    seedLiveEntry(id, id === "conv_a" ? "alpha transcript" : "beta transcript").setState({
+      sessionHarness: options.session?.harness ?? null,
+    });
+    qc.setQueryData(["session", id], {
+      id,
+      agentId: "agent_example",
+      permissionLevel: 4,
+      status: "idle",
+      labels: {},
+      ...options.session,
+    });
+  }
+  useChatStore.setState({ boundAgentId: "agent_example" });
+  renderPage({ warm_switch_keep_mounted_ui: true }, qc, { info: options.info });
 }
 
 beforeEach(() => {
@@ -145,6 +174,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   window.history.replaceState({}, "", "/");
+  window.getSelection()?.removeAllRanges();
   useChatStore.getState().abortController?.abort();
   conversationRegistry.clear();
   clearWarmSwitchInFlight();
@@ -241,7 +271,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc, true);
+    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { cancelBetaNavigation: true });
     await screen.findByText("alpha transcript");
     const surfaceBefore = transcriptNode();
     vi.useFakeTimers();
@@ -252,7 +282,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     expect(screen.getByText("beta transcript")).toBeInTheDocument();
     expect(transcriptNode()).toBe(surfaceBefore);
     window.history.replaceState({}, "", "/c/conv_a?diff=1");
-    await act(() => vi.advanceTimersByTimeAsync(1000));
+    await act(() => vi.advanceTimersByTimeAsync(3000));
 
     expect(useChatStore.getState().conversationId).toBe("conv_a");
     expect(screen.getByText("alpha transcript")).toBeInTheDocument();
@@ -265,7 +295,7 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     initChatStore(qc);
     seedLiveEntry("conv_a", "alpha transcript");
     seedLiveEntry("conv_b", "beta transcript");
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc, true);
+    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { cancelBetaNavigation: true });
     await screen.findByText("alpha transcript");
     const surfaceBefore = transcriptNode();
     vi.useFakeTimers();
@@ -280,6 +310,10 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     expect(transcriptNode()).toBe(surfaceBefore);
     expect(screen.queryByText("Loading conversation…")).toBeNull();
     expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(true);
+    fireEvent.click(screen.getByRole("link", { name: "finish beta navigation" }));
+    expect(commitLog.at(-1)).toMatchObject({ urlConvId: "conv_b", activeConversationId: "conv_b" });
+    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
+    expect(transcriptNode()).toBe(surfaceBefore);
   });
 
   it.each([null, { name: "example-skill", args: "check" }])(
@@ -325,22 +359,8 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     },
   );
 
-  it("clears command and attachment errors on a mounted session switch", async () => {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    initChatStore(qc);
-    seedLiveEntry("conv_a", "alpha transcript");
-    seedLiveEntry("conv_b", "beta transcript");
-    for (const id of ["conv_a", "conv_b"]) {
-      qc.setQueryData(["session", id], {
-        id,
-        agentId: "agent_example",
-        permissionLevel: 4,
-        status: "idle",
-        labels: {},
-      });
-    }
-    useChatStore.setState({ boundAgentId: "agent_example" });
-    renderPage({ warm_switch_keep_mounted_ui: true }, qc);
+  it("clears command and attachment errors without remounting the transcript", async () => {
+    renderWarmComposer();
     let rejectModel!: (error: Error) => void;
     const setModel = vi.fn(
       () =>
@@ -371,5 +391,176 @@ describe("ChatPage warm switch (warm_switch_keep_mounted_ui)", () => {
     expect(screen.queryByText("alpha model update failed")).toBeNull();
     fireEvent.click(screen.getByRole("link", { name: "open alpha" }));
     expect(screen.queryByText("alpha model update failed")).toBeNull();
+  });
+
+  it("stops dictation at a warm switch so late transcripts and Escape cannot replace B's draft", () => {
+    const recognizers: Recognition[] = [];
+    class Recognition extends EventTarget {
+      lang = "en-US";
+      continuous = false;
+      interimResults = false;
+      start = vi.fn(() => this.dispatchEvent(new Event("start")));
+      stop = vi.fn();
+      constructor() {
+        super();
+        recognizers.push(this);
+      }
+    }
+    vi.stubGlobal("SpeechRecognition", Recognition);
+    setSessionDraft("conv_b", { text: "beta draft", files: [] });
+    renderWarmComposer();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "alpha draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    const recognition = recognizers[0]!;
+    const surface = transcriptNode();
+
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+
+    expect(recognition.stop).toHaveBeenCalled();
+    expect(transcriptNode()).toBe(surface);
+    act(() =>
+      recognition.dispatchEvent(
+        Object.assign(new Event("result"), {
+          resultIndex: 0,
+          results: [Object.assign([{ transcript: "late alpha words" }], { isFinal: true })],
+        }),
+      ),
+    );
+    expect(screen.getByRole("textbox")).toHaveValue("beta draft");
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Escape" });
+    expect(screen.getByRole("textbox")).toHaveValue("beta draft");
+    expect(getSessionDraft("conv_b")?.text).toBe("beta draft");
+    fireEvent.click(screen.getByRole("link", { name: "open alpha" }));
+    expect(screen.getByRole("textbox")).toHaveValue("alpha draft");
+  });
+
+  it("does not show A's deferred rewind failure in B", async () => {
+    vi.spyOn(sessionsApi, "fetchRewindPrompts").mockResolvedValue({
+      prompts: [{ itemId: "item_a", text: "alpha prompt" }],
+      olderCursor: null,
+    });
+    let rejectRewind!: (error: Error) => void;
+    const rewind = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectRewind = reject;
+        }),
+    );
+    useChatStore.setState({ rewindToPrompt: rewind });
+    renderWarmComposer({ session: { harness: "claude-sdk" }, info: { session_rewind: true } });
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "/rewind" } });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    fireEvent.click(await screen.findByTestId("rewind-prompt"));
+    expect(rewind).toHaveBeenCalledWith("item_a");
+
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+    await act(async () => rejectRewind(new Error("alpha rewind failed")));
+
+    expect(screen.getByText("beta transcript")).toBeInTheDocument();
+    expect(screen.queryByText("alpha rewind failed")).toBeNull();
+  });
+
+  it("starts B's permission and Plan controls idle while A's requests are pending", async () => {
+    const permissionRequests: (() => void)[] = [];
+    const setPermission = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          permissionRequests.push(resolve);
+        }),
+    );
+    let finishPlan!: () => void;
+    const setPlan = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishPlan = resolve;
+        }),
+    );
+    useChatStore.setState({ setCodexApprovalMode: setPermission, setCodexPlanMode: setPlan });
+    renderWarmComposer({
+      session: { harness: "codex-native", labels: { "omnigent.wrapper": "codex-native-ui" } },
+    });
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-plan-action"));
+    expect(setPlan).toHaveBeenCalledOnce();
+    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
+    fireEvent.click(await screen.findByTestId("composer-permission-option-full-access"));
+    expect(setPermission).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("composer-permission-chip")).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+
+    expect(screen.getByTestId("composer-permission-chip")).toBeEnabled();
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    expect(screen.getByTestId("composer-plan-action")).not.toHaveAttribute("aria-disabled", "true");
+    fireEvent.keyDown(screen.getByTestId("composer-plan-action"), { key: "Escape" });
+    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
+    fireEvent.click(await screen.findByTestId("composer-permission-option-full-access"));
+    expect(setPermission).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      permissionRequests[0]!();
+      finishPlan();
+    });
+    expect(screen.getByTestId("composer-permission-chip")).toBeDisabled();
+    await act(async () => permissionRequests[1]!());
+    expect(screen.getByTestId("composer-permission-chip")).toBeEnabled();
+  });
+
+  it("keeps the composer and typed draft mounted through temp-to-real promotion", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    initChatStore(qc);
+    const temporaryId = "temp:example";
+    seedLiveEntry(temporaryId, "initial transcript");
+    useChatStore.setState({ conversationId: temporaryId, boundAgentId: "agent_example" });
+    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { initialConversationId: temporaryId });
+    const input = screen.getByRole("textbox");
+    const surface = transcriptNode();
+    fireEvent.change(input, { target: { value: "typing during session creation" } });
+
+    act(() => useChatStore.setState({ conversationId: "conv_a" }));
+    fireEvent.click(screen.getByRole("link", { name: "open alpha" }));
+
+    expect(screen.getByRole("textbox")).toBe(input);
+    expect(input).toHaveValue("typing during session creation");
+    expect(transcriptNode()).toBe(surface);
+    expect(getSessionDraft("conv_a")?.text).toBe("typing during session creation");
+    expect(getSessionDraft(temporaryId)).toBeUndefined();
+  });
+
+  it("treats a sidebar click away from a temporary session as a new composer, not promotion", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    initChatStore(qc);
+    const temporaryId = "temp:example";
+    seedLiveEntry(temporaryId, "initial transcript");
+    seedLiveEntry("conv_b", "beta transcript");
+    setSessionDraft("conv_b", { text: "beta draft", files: [] });
+    useChatStore.setState({ conversationId: temporaryId, boundAgentId: "agent_example" });
+    renderPage({ warm_switch_keep_mounted_ui: true }, qc, { initialConversationId: temporaryId });
+    const input = screen.getByRole("textbox");
+    const surface = transcriptNode();
+    fireEvent.change(input, { target: { value: "temporary draft" } });
+
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+
+    expect(screen.getByRole("textbox")).not.toBe(input);
+    expect(screen.getByRole("textbox")).toHaveValue("beta draft");
+    expect(transcriptNode()).toBe(surface);
+    expect(getSessionDraft(temporaryId)?.text).toBe("temporary draft");
+  });
+
+  it("drops the outgoing session's selection popup while retaining the transcript", () => {
+    renderWarmComposer();
+    const surface = transcriptNode();
+    const range = document.createRange();
+    range.selectNodeContents(screen.getByText("alpha transcript"));
+    range.getBoundingClientRect = () => new DOMRect(10, 10, 100, 20);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    fireEvent(document, new Event("selectionchange"));
+    expect(screen.getByRole("button", { name: "Reply ↵" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("link", { name: "open beta" }));
+
+    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+    expect(transcriptNode()).toBe(surface);
   });
 });

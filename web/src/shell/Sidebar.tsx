@@ -6223,7 +6223,6 @@ function ConversationRowImpl({
   const desktopCommands = useAvailableDesktopCommands();
   const sessionShortcuts = isActive ? desktopCommands : NO_DESKTOP_COMMANDS;
   const hostsById = useContext(HostsByIdContext);
-  const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   // A client-only `temp:` row (navigate-first create window): no server session
@@ -6668,6 +6667,14 @@ function ConversationRowImpl({
     </>
   );
 
+  const rowHref = selectionMode
+    ? "#"
+    : conversation.nested_draft_source_id
+      ? `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`
+      : conversation.project_draft_name !== undefined
+        ? `/?project=${encodeURIComponent(conversation.project_draft_name)}`
+        : `/c/${conversation.id}`;
+
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
   const rowLink = (
@@ -6693,15 +6700,7 @@ function ConversationRowImpl({
         </button>
       )}
       <Link
-        to={
-          selectionMode
-            ? "#"
-            : conversation.nested_draft_source_id
-              ? `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`
-              : conversation.project_draft_name !== undefined
-                ? `/?project=${encodeURIComponent(conversation.project_draft_name)}`
-                : `/c/${conversation.id}`
-        }
+        to={rowHref}
         componentId="sidebar.conversation_switcher"
         aria-keyshortcuts={
           shortcutSlot !== undefined
@@ -6756,12 +6755,8 @@ function ConversationRowImpl({
             return;
           }
           activateRow(conversation.id, e);
-          if (
-            isPlainPrimaryClick(e) &&
-            !conversation.nested_draft_source_id &&
-            conversation.project_draft_name === undefined
-          ) {
-            switchSessionBeforeNavigate(conversation.id, urlConvId ?? null);
+          if (isPlainPrimaryClick(e) && rowHref === `/c/${conversation.id}`) {
+            switchSessionBeforeNavigate(conversation.id);
           }
           onClick(e);
         }}

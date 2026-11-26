@@ -1,10 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
-import {
-  clearWarmSwitchInFlight,
-  restoreWarmSwitchIfNavigationCanceled,
-  warmSwitchInFlight,
-} from "@/lib/warmSessionSwitch";
+import { clearWarmSwitchInFlight, warmSwitchInFlight } from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -461,6 +457,16 @@ export function ChatPage() {
   const activeConversationId = useChatStore((s) => s.conversationId);
   const warmSwitchPending = warmSwitchInFlight(activeConversationId, urlConvId);
   const effectiveConvId = warmSwitchPending ? (activeConversationId ?? undefined) : urlConvId;
+  const [sessionUi, setSessionUi] = useState({ conversationId: effectiveConvId, key: 0 });
+  if (sessionUi.conversationId !== effectiveConvId) {
+    // Session creation promotes the same draft; every other switch starts fresh local UI.
+    const promoting =
+      !warmSwitchPending &&
+      isTempConvId(sessionUi.conversationId) &&
+      effectiveConvId !== undefined &&
+      !isTempConvId(effectiveConvId);
+    setSessionUi({ conversationId: effectiveConvId, key: sessionUi.key + (promoting ? 0 : 1) });
+  }
   // Client-only temp ids must not reach server-scoped hooks before the session exists.
   const sessionConvId = isTempConvId(effectiveConvId) ? undefined : effectiveConvId;
   const navigate = useNavigate();
@@ -497,11 +503,7 @@ export function ChatPage() {
   // intentionally don't await it here. The store's `loadingConversation` flag
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
-    if (warmSwitchPending) {
-      // The browser path moves before React commits; only an unchanged path needs recovery.
-      const timeout = window.setTimeout(restoreWarmSwitchIfNavigationCanceled, 1000);
-      return () => window.clearTimeout(timeout);
-    }
+    if (warmSwitchPending) return;
     clearWarmSwitchInFlight();
     // A temporary route has no client session after a reload. Return to its
     // board or the landing page so it cannot strand a read-only phantom chat.
@@ -516,10 +518,7 @@ export function ChatPage() {
       return;
     }
     void useChatStore.getState().switchTo(urlConvId ?? null);
-    return undefined;
   }, [urlConvId, warmSwitchPending, navigate, pathname, search, rebasePath]);
-
-  useEffect(() => () => clearWarmSwitchInFlight(), []);
 
   useConversationRedirect(effectiveConvId);
 
@@ -1208,6 +1207,7 @@ export function ChatPage() {
 
   const mainAgent = (
     <MainAgentSurface
+      sessionUiKey={sessionUi.key}
       conversationId={effectiveConvId ?? null}
       status={status}
       isWorking={isWorking}
@@ -1345,6 +1345,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
+  sessionUiKey: number;
   onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
@@ -1551,6 +1552,7 @@ export function updateWarmTerminalSurfaces(
  * see ViewModeToggle) so the user can flip back to Chat.
  */
 const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+  sessionUiKey,
   conversationId,
   status,
   isWorking,
@@ -1900,6 +1902,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           structurally non-interactive session), as SideChatPane does. */}
           {!composerReadOnly && (
             <SelectionPopup
+              key={`selection:${sessionUiKey}`}
               containerRef={conversationRef}
               onReply={(text) => composerRef.current?.appendReplyQuote(text)}
               onAskInSideChat={
@@ -1911,6 +1914,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           )}
 
           <Composer
+            key={sessionUiKey}
             ref={composerRef}
             disabled={disabled}
             status={status}
@@ -2442,7 +2446,6 @@ function ComposerImpl(
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
-  const commandErrorGeneration = useRef(0);
   useDismissOnEscape(commandError !== null, () => setCommandError(null));
   const pendingSideChatSessionsRef = useRef(new Set<string>());
   const [planModeBusy, setPlanModeBusy] = useState(false);
@@ -2765,7 +2768,6 @@ function ComposerImpl(
   };
   /** Applies *mode*; resolves whether the session landed on it. */
   const changePermission = async (mode: string): Promise<boolean> => {
-    const errorGeneration = commandErrorGeneration.current;
     if (isReadOnly || unreachable || configBusyRef.current) return false;
     configBusyRef.current = true;
     setConfigBusy(true);
@@ -2780,10 +2782,7 @@ function ComposerImpl(
       if (landed) cycleCursorRef.current = null;
       return landed;
     } catch (error) {
-      if (
-        commandErrorGeneration.current === errorGeneration &&
-        useChatStore.getState().conversationId === sourceSessionId
-      )
+      if (useChatStore.getState().conversationId === sourceSessionId)
         setCommandError(error instanceof Error ? error.message : "Unable to change permissions");
       return false;
     } finally {
@@ -2907,13 +2906,6 @@ function ComposerImpl(
         : undefined,
     chipTokens: () => chipTokensRef.current(),
   });
-  useEffect(() => {
-    setCommandError(null);
-    clearError();
-    return () => {
-      commandErrorGeneration.current += 1;
-    };
-  }, [conversationId, clearError]);
   const filesRef = useRef(files);
   filesRef.current = files;
   // What a saved draft carries: the tray plus the live chips, which leave the composer as tray files.
@@ -3196,7 +3188,6 @@ function ComposerImpl(
   usePublishComposerCommands(conversationId, slashCommandNames, nativeShell);
 
   const toggleCodexPlanMode = async () => {
-    const errorGeneration = commandErrorGeneration.current;
     if (planModeBusy) return;
     setCommandError(null);
     setPlanModeBusy(true);
@@ -3204,8 +3195,7 @@ function ComposerImpl(
       await useChatStore.getState().setCodexPlanMode(!codexPlanMode);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (commandErrorGeneration.current === errorGeneration)
-        setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
+      setCommandError(`Could not ${codexPlanMode ? "exit" : "enter"} Plan mode: ${message}`);
     } finally {
       setPlanModeBusy(false);
     }
@@ -3441,7 +3431,6 @@ function ComposerImpl(
    * bad usage). Returns ``true`` when the command was recognised.
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
-    const errorGeneration = commandErrorGeneration.current;
     switch (cmd) {
       case "/goal": {
         dirtyRef.current = true;
@@ -3477,8 +3466,7 @@ function ComposerImpl(
           .getState()
           .clearContext()
           .catch((err: unknown) => {
-            if (commandErrorGeneration.current === errorGeneration)
-              setCommandError(err instanceof Error ? err.message : "Clear failed");
+            setCommandError(err instanceof Error ? err.message : "Clear failed");
           });
         return true;
       }
@@ -3550,8 +3538,7 @@ function ComposerImpl(
           .getState()
           .compact()
           .catch((err: unknown) => {
-            if (commandErrorGeneration.current === errorGeneration)
-              setCommandError(err instanceof Error ? err.message : "Compact failed");
+            setCommandError(err instanceof Error ? err.message : "Compact failed");
           });
         return true;
       }
@@ -3570,8 +3557,7 @@ function ComposerImpl(
           .getState()
           .setEffort(level)
           .catch((err: unknown) => {
-            if (commandErrorGeneration.current === errorGeneration)
-              setCommandError(err instanceof Error ? err.message : "Failed to set effort");
+            setCommandError(err instanceof Error ? err.message : "Failed to set effort");
           });
         return true;
       }
@@ -3613,8 +3599,7 @@ function ComposerImpl(
             expectConfirmation: harness === "claude-native" || harness === "codex-native",
           })
           .catch((err: unknown) => {
-            if (commandErrorGeneration.current === errorGeneration)
-              setCommandError(err instanceof Error ? err.message : "Failed to set model");
+            setCommandError(err instanceof Error ? err.message : "Failed to set model");
           });
         return true;
       }
