@@ -129,6 +129,16 @@
       "pattern": "**/**/**/x",
       "path": "x",
       "matches": true
+    },
+    {
+      "pattern": "{**/**/,a}x",
+      "path": "**/x",
+      "matches": false
+    },
+    {
+      "pattern": "{**/**/,a}x",
+      "path": "**/**/x",
+      "matches": true
     }
   ]
 }

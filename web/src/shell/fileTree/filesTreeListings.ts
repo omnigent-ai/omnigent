@@ -3,7 +3,7 @@
 // metadata its sort reads.
 
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
-import { globToRegExp, splitGlobList } from "@/lib/globList";
+import { type GlobMatcher, globMatcher, splitGlobList } from "@/lib/globList";
 import type { FolderListing } from "../folderTreeSync";
 import { activeFileTreePath } from "./activeFileTreePath";
 import type { TreeEntryMeta } from "./treeSort";
@@ -20,13 +20,13 @@ export const NO_TREE_PATTERNS: TreePatterns = { include: "", exclude: "" };
 
 /** One pattern, compiled; `folder` when it ends in `/` or `/**`, so it covers a whole folder. */
 interface PatternMatcher {
-  regex: RegExp;
+  matcher: GlobMatcher;
   folder: boolean;
 }
 
 function patternMatchers(list: string): PatternMatcher[] {
   return splitGlobList(list).map((pattern) => ({
-    regex: globToRegExp(pattern),
+    matcher: globMatcher(pattern),
     folder: /\/(?:\*\*)?$/.test(pattern),
   }));
 }
@@ -42,18 +42,17 @@ function excludedBy(
 ): boolean {
   for (let prefix = path; prefix; prefix = prefix.slice(0, Math.max(0, prefix.lastIndexOf("/")))) {
     const isFolder = prefix !== path || type === "directory";
-    for (const { regex, folder } of matchers) {
-      if (regex.test(prefix) || (isFolder && folder && regex.test(prefix + INSIDE))) return true;
+    for (const { matcher, folder } of matchers) {
+      if (matcher.test(prefix) || (isFolder && folder && matcher.test(prefix + INSIDE)))
+        return true;
     }
   }
   return false;
 }
 
 /**
- * Whether the tree shows a path, under the hidden-files setting and the patterns, which
- * read as the name search reads them (see `globToRegExp`). An exclude hides what it
- * matches, folders with their contents. An include keeps only the files it matches, and
- * every folder, since a folder's files aren't known until it opens.
+ * Whether the tree shows a path under the hidden-files setting and the globs (`globMatcher`).
+ * Excludes hide folders with their contents; includes keep every folder and matching files.
  */
 export function treePathFilter(
   showHidden: boolean,
@@ -67,7 +66,7 @@ export function treePathFilter(
     return (
       type === "directory" ||
       included.length === 0 ||
-      included.some(({ regex }) => regex.test(path))
+      included.some(({ matcher }) => matcher.test(path))
     );
   };
 }
