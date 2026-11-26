@@ -141,9 +141,23 @@ describe("ProjectRules", () => {
     expect(screen.getByRole("dialog")).toHaveTextContent("Mandate dialog");
   });
 
-  it("opens the existing stage editor", () => {
+  it("opens the existing stage editor for the owner", () => {
+    mocks.project = { ...mocks.project!, shared: false };
     renderRules();
     fireEvent.click(screen.getByTestId("project-rules-stages-edit"));
     expect(screen.getByRole("dialog")).toHaveTextContent("Stages dialog");
+  });
+
+  it("shows a shared member the stages read-only, and a product approver the editor", () => {
+    renderRules();
+    expect(screen.queryByTestId("project-rules-stages-edit")).toBeNull();
+    expect(screen.getByTestId("project-rules-stages")).toHaveTextContent(
+      "Only the owner or a product approver can change them.",
+    );
+    cleanup();
+
+    mocks.project = { ...mocks.project!, config: { product_approvers: [mocks.viewer!] } };
+    renderRules();
+    expect(screen.getByTestId("project-rules-stages-edit")).toBeTruthy();
   });
 });

@@ -93,6 +93,9 @@ export function canEditMandate(project: Project | undefined, viewerId: string | 
   return viewerId !== null && approvers.includes(viewerId);
 }
 
+/** Stages follow the mandate's rule: the owner and product approvers change them. */
+export const canEditStages = canEditMandate;
+
 /** The project's mandate and pending proposals; agents' proposals refresh it live. */
 export function useProjectMandate(projectId: string | null, enabled = true) {
   return useQuery<Project>({

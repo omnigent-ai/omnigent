@@ -2006,3 +2006,41 @@ async def test_pull_request_statuses_cover_readable_pr_outputs_only(project_clie
     assert response.status_code == 200
     assert response.json() == {"data": [{"url": readable, "state": "OPEN"}]}
     assert asked == [readable, unreadable]
+
+
+async def test_only_the_owner_or_a_product_approver_changes_the_boards_stages(
+    multi_user_client,
+):
+    client = multi_user_client
+    approver = "carol@example.com"
+    project = (
+        await client.post("/v1/projects", json={"name": "Stage rules"}, headers=_as_user(ALICE))
+    ).json()
+    for user in (BOB, approver):
+        await client.post(
+            f"/v1/projects/{project['id']}/shares", json={"user_id": user}, headers=_as_user(ALICE)
+        )
+    await client.patch(
+        f"/v1/projects/{project['id']}",
+        json={"config": {"product_approvers": [approver]}},
+        headers=_as_user(ALICE),
+    )
+    path = f"/v1/projects/{project['id']}/tickets/stages"
+    current = (await client.get(path, headers=_as_user(BOB))).json()
+    renamed = {
+        "stages": [
+            {**stage, "instructions": f"{stage['instructions']} Checked."}
+            for stage in current["stages"]
+        ]
+    }
+
+    # A shared member reads the stages but can't change them.
+    refused = await client.put(path, json=renamed, headers=_as_user(BOB))
+    assert refused.status_code == 403, refused.text
+    assert "owner or a product approver" in refused.text
+    assert (await client.get(path, headers=_as_user(BOB))).json()["stages"] == current["stages"]
+
+    # The owner and a product approver can.
+    for user in (ALICE, approver):
+        saved = await client.put(path, json=renamed, headers=_as_user(user))
+        assert saved.status_code == 200, (user, saved.text)

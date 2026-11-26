@@ -38,7 +38,12 @@ import { useProjectTicketsEnabled, useTicketStagesEnabled } from "./useProjectTi
 import { ProjectBoardActions } from "./ProjectBoardActions";
 import { ProjectDescriptionDialog } from "./ProjectDescriptionDialog";
 import { useViewerId } from "@/hooks/useViewerId";
-import { canEditMandate, ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
+import {
+  canEditMandate,
+  canEditStages,
+  ProjectMandateDialog,
+  useProjectMandate,
+} from "./ProjectMandateDialog";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 
 interface ProjectComposerState {
@@ -153,8 +158,10 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const settingsLabel = rulesPage ? "Project rules and settings" : "Project settings";
   // Members other than the owner and product approvers only read the mandate.
   const viewerId = useViewerId();
-  const mandate = useProjectMandate(projectId, mandateEnabled).data;
+  const mandate = useProjectMandate(projectId, mandateEnabled || stagesEnabled).data;
   const mandateReadOnly = !canEditMandate(mandate, viewerId);
+  // Members other than the owner and product approvers don't get the stage editor.
+  const stagesEditable = stagesEnabled && canEditStages(mandate, viewerId);
   const { actions, dialogs } = useProjectFolderMenu(
     projectName,
     projectId,
@@ -237,7 +244,7 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             </DropdownMenuItem>
           )}
           {isMobile && <DropdownMenuSeparator />}
-          {stagesEnabled && (
+          {stagesEditable && (
             <DropdownMenuItem className={itemClass} onSelect={() => setEditingStages(true)}>
               <Columns3Icon className="size-3.5" />
               Edit stages
@@ -263,7 +270,7 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
               Project description
             </DropdownMenuItem>
           )}
-          {(stagesEnabled || mandateEnabled || descriptionEnabled) && <DropdownMenuSeparator />}
+          {(stagesEditable || mandateEnabled || descriptionEnabled) && <DropdownMenuSeparator />}
           <DropdownMenuItem className={itemClass} onSelect={actions.openRename}>
             <PencilIcon className="size-3.5" />
             Rename project

@@ -67,11 +67,13 @@ from omnigent.stores.project_store.access import accessible_project_ids, project
 from omnigent.stores.project_store.sqlalchemy_store import (
     _decode_config,
     _to_entity,
+    may_edit_project_rules,
     router_session_id_for_row,
 )
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 TICKET_ACTIVITY_SESSION_MAX = 100
+STAGES_EDIT_REFUSAL = "Only the project owner or a product approver can change the board's stages"
 TICKET_SUMMARY_SCAN_MAX = 1000
 # The Inbox lists at most this many open needs-human asks per viewer.
 HUMAN_REQUEST_MAX = 100
@@ -2002,6 +2004,9 @@ class ProjectTicketStore:
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
+            role = project_role(session, project, actor.user_id)
+            if not may_edit_project_rules(project, role, actor.user_id):
+                raise OmnigentError(STAGES_EDIT_REFUSAL, code=ErrorCode.FORBIDDEN)
             before = {stage.id: stage for stage in _stages(project).stages}
             after = {stage.id: stage for stage in configuration.stages}
             removed = before.keys() - after.keys()

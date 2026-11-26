@@ -68,6 +68,7 @@ vi.mock("./ProjectCost", () => ({ ProjectCostBadge: () => null }));
 vi.mock("./ProjectMandateDialog", () => ({
   useProjectMandate: () => ({ data: { mandate_proposals: mocks.mandateProposals } }),
   canEditMandate: () => true,
+  canEditStages: () => true,
   ProjectMandateDialog: ({ projectName }: { projectName: string }) => (
     <Dialog open>
       <DialogContent aria-describedby={undefined}>

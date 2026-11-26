@@ -11,7 +11,12 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { ProjectSettingsDialog } from "@/shell/ProjectSettingsDialog";
 import { ProjectProductApproversSection, ProjectSharingSection } from "@/shell/ProjectSharing";
-import { canEditMandate, ProjectMandateDialog, useProjectMandate } from "./ProjectMandateDialog";
+import {
+  canEditMandate,
+  canEditStages,
+  ProjectMandateDialog,
+  useProjectMandate,
+} from "./ProjectMandateDialog";
 import { ProjectTicketStagesDialog } from "./ProjectTicketStagesDialog";
 import { TicketLoadError } from "./TicketControls";
 import { TicketMarkdown } from "./ticketImages";
@@ -197,6 +202,9 @@ function MandateRules({ projectName, projectId }: { projectName: string; project
 
 function StageRules({ projectName, projectId }: { projectName: string; projectId: string }) {
   const stages = useTicketStages(projectId);
+  const project = useProjectMandate(projectId);
+  const viewerId = useViewerId();
+  const canEdit = canEditStages(project.data, viewerId);
   const [open, setOpen] = useState(false);
   return (
     <RulesSection
@@ -204,7 +212,8 @@ function StageRules({ projectName, projectId }: { projectName: string; projectId
       section="stages"
       testId="project-rules-stages"
       action={
-        stages.supported && (
+        stages.supported &&
+        canEdit && (
           <Button
             variant="ghost"
             size="sm"
@@ -220,6 +229,7 @@ function StageRules({ projectName, projectId }: { projectName: string; projectId
       <p className="text-sm text-muted-foreground">
         The board's columns, in order. Tickets start in the first; the last means done. Agents
         follow each stage's instructions.
+        {!canEdit && " Only the owner or a product approver can change them."}
       </p>
       <ol className="divide-y divide-border">
         {(stages.data?.stages ?? []).map((stage, index) => (

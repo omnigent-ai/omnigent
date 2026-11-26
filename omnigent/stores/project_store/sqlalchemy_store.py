@@ -468,8 +468,8 @@ def _decode_order(raw: bytes | str | memoryview | None) -> ProjectOrderPreferenc
 MANDATE_EDIT_REFUSAL = "Only the project owner or a product approver can change the Mandate"
 
 
-def _may_edit_mandate(row: SqlProject, role: ProjectRole | None, user_id: str | None) -> bool:
-    """The owner, or a member on the project's ``product_approvers`` list, edits the mandate."""
+def may_edit_project_rules(row: SqlProject, role: ProjectRole | None, user_id: str | None) -> bool:
+    """The owner, or a member on ``product_approvers``, edits the mandate and the stages."""
     if role == "owner":
         return True
     if role is None or user_id is None:
@@ -671,7 +671,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             if (
                 mandate is not None
                 and row.mandate != stored_mandate
-                and not _may_edit_mandate(row, role, user_id)
+                and not may_edit_project_rules(row, role, user_id)
             ):
                 # Members may resend the stored mandate unchanged with a whole-form save.
                 raise OmnigentError(MANDATE_EDIT_REFUSAL, code=ErrorCode.FORBIDDEN)
@@ -865,7 +865,7 @@ class SqlAlchemyProjectStore(ProjectStore):
             role = project_role(session, row, user_id)
             if row is None or role is None:
                 return None
-            if not _may_edit_mandate(row, role, user_id):
+            if not may_edit_project_rules(row, role, user_id):
                 raise OmnigentError(
                     "Only the project owner or a product approver can accept or dismiss "
                     "a mandate proposal",
