@@ -93,6 +93,52 @@ def _user_text(request: dict) -> str:
     return "\n".join(texts)
 
 
+def _tool_result(requests: list[dict], call_id: str) -> str:
+    """The newest captured result payload for *call_id*, or a note when none exists.
+
+    Covers the Messages ``tool_result`` block and the Responses
+    ``function_call_output`` item, so every harness row reports it. Returns the
+    result's own text verbatim — the runner's JSON — not a re-encoded copy.
+    """
+    for request in reversed(requests):
+        for message in request.get("messages", []):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else []
+            for block in blocks:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") == call_id
+                ):
+                    return _result_text(block.get("content"), error=block.get("is_error"))
+        for entry in request.get("input", []):
+            if (
+                isinstance(entry, dict)
+                and entry.get("type") == "function_call_output"
+                and entry.get("call_id") == call_id
+            ):
+                return _result_text(entry.get("output"), error=None)
+    return f"no captured tool result for {call_id!r}"
+
+
+def _result_text(payload: object, *, error: object) -> str:
+    """A tool result's own text, prefixed with its error flag when set."""
+    if isinstance(payload, str):
+        text = payload
+    elif isinstance(payload, list):
+        text = "\n".join(
+            block.get("text", "")
+            for block in payload
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    else:
+        text = "" if payload is None else str(payload)
+    prefix = "is_error=True " if error else ""
+    return f"{prefix}{text}"
+
+
 def _tool_call(harness: str, name: str, arguments: dict, call_id: str) -> dict:
     """A scripted model call of Omnigent tool *name*, named as *harness* lists it."""
     call = {"name": name, "arguments": json.dumps(arguments), "call_id": call_id}
@@ -194,9 +240,6 @@ def test_nested_agent_runs_unattended_like_its_creator(
                     )
                     response.raise_for_status()
                     return json.dumps(response.json()["data"])
-
-                def requests_mentioning(text):
-                    return [r for r in get_mock_requests(mock) if text in json.dumps(r)]
 
                 def resend_until_tools_listed(session_id, marker, settled):
                     # A CLI can take a turn before its Omnigent tools are listed, and
@@ -309,7 +352,14 @@ def test_nested_agent_runs_unattended_like_its_creator(
                 assert not session(run)["pending_elicitations"]
                 rows = client.get("/v1/sessions", params={"visibility": "mine"}).json()["data"]
                 workers = [row["id"] for row in rows if row["title"] == "Review step"]
-                assert len(workers) == 1, requests_mentioning("create-worker")[-1:]
+                # Keep this a str: pytest truncates non-str assertion messages to
+                # about 240 chars, which would hide the tool result.
+                assert len(workers) == 1, (
+                    f"expected one 'Review step' worker; listed: "
+                    f"{[(row['id'], row['title']) for row in rows]}; "
+                    f"create-worker tool result: "
+                    f"{_tool_result(get_mock_requests(mock), 'create-worker')}"
+                )
                 (worker,) = workers
                 assert session(worker)["labels"]["omnigent.created_by_session_id"] == run
 
@@ -324,6 +374,14 @@ def test_nested_agent_runs_unattended_like_its_creator(
 
                 resend_until_tools_listed(worker, _WORKER_TASK, worker_settled)
                 poll_until(worker_settled, timeout_s=120)
+                if spec.mode_label is not None:
+                    # The worker's CLI reports its mode like the run's does; that
+                    # report can land after the settled turn ends.
+                    poll_until(
+                        lambda: session(worker)["labels"].get(spec.mode_label) == spec.run_mode,
+                        timeout_s=30,
+                    )
+                    latest.update(session(worker))
                 run_snapshot = session(run)
                 observed = {
                     "approval_prompts": [
