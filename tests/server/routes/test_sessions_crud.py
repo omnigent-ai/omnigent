@@ -9,23 +9,31 @@ the stores.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import signal
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import update
 
+from omnigent.db.db_models import SqlConversation
 from omnigent.db.utils import generate_agent_id, get_or_create_engine, make_managed_session_maker
-from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS, Conversation
+from omnigent.entities.pagination import PagedList
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
 from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -246,6 +254,219 @@ async def test_list_sessions_pagination(
     assert len(body["data"]) == 1
 
 
+_SIDEBAR_LIST_PARAMS = {"order": "desc", "sort_by": "updated_at", "visibility": "mine"}
+
+
+@pytest.fixture()
+def distinct_store_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each store write a later timestamp so list order never rests on tie-breaks."""
+    ticks = itertools.count(int(time.time()))
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: next(ticks)
+    )
+
+
+def _seed_sessions_behind_side_chats(
+    db_uri: str, *, visible_count: int, side_chat_count: int, labels: dict[str, str] | None = None
+) -> set[str]:
+    """Create visible sessions, then newer side chats; return the visible ids."""
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(
+        agent_id, name=f"side-chat-agent-{agent_id}", bundle_location="test:///bundle"
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    visible = {
+        conv_store.create_conversation(agent_id=agent_id, labels=labels).id
+        for _ in range(visible_count)
+    }
+    for _ in range(side_chat_count):
+        conv_store.create_conversation(
+            agent_id=agent_id, labels={**(labels or {}), SIDE_CHAT_LABEL_KEY: "1"}
+        )
+    return visible
+
+
+@pytest.mark.parametrize(
+    ("project", "limit", "visible_count", "side_chat_count"),
+    [
+        pytest.param(None, 30, 14, 17, id="sidebar"),
+        pytest.param("X", 20, 2, 20, id="project-folder"),
+    ],
+)
+@pytest.mark.usefixtures("distinct_store_clock")
+async def test_list_sessions_side_chats_do_not_take_page_slots(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    project: str | None,
+    limit: int,
+    visible_count: int,
+    side_chat_count: int,
+) -> None:
+    """Newer hidden side chats leave a full page of visible sessions and accurate has_more."""
+    visible = _seed_sessions_behind_side_chats(
+        db_uri,
+        visible_count=visible_count,
+        side_chat_count=side_chat_count,
+        labels={"omni_project": project} if project else None,
+    )
+    if project:
+        # A newer session outside the folder must stay out of the folder's page.
+        _seed_sessions_behind_side_chats(db_uri, visible_count=1, side_chat_count=0)
+    params: dict[str, str | int] = {**_SIDEBAR_LIST_PARAMS, "limit": limit}
+    if project:
+        params["project"] = project
+
+    resp = await client.get("/v1/sessions", params=params)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert {row["id"] for row in body["data"]} == visible
+    assert body["has_more"] is False
+
+
+def _spy_store_reads(
+    monkeypatch: pytest.MonkeyPatch, between_reads: Callable[[], None] | None = None
+) -> list[tuple[int, str | None]]:
+    """Record each store page read's ``(limit, after)``; run ``between_reads`` after the first."""
+    original = SqlAlchemyConversationStore.list_conversations
+    reads: list[tuple[int, str | None]] = []
+
+    def spy(self: SqlAlchemyConversationStore, *args: Any, **kwargs: Any) -> Any:
+        page = original(self, *args, **kwargs)
+        reads.append((kwargs["limit"], kwargs.get("after")))
+        if between_reads is not None and len(reads) == 1:
+            between_reads()
+        return page
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "list_conversations", spy)
+    return reads
+
+
+@pytest.mark.usefixtures("distinct_store_clock")
+async def test_list_sessions_side_chat_reread_is_bounded(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Side chats beyond the re-read budget give a short page that resumes from last_id."""
+    from omnigent.server.routes.sessions import routes_core
+
+    monkeypatch.setattr(routes_core, "_SIDE_CHAT_PAGE_REREADS", 1)
+    visible = _seed_sessions_behind_side_chats(db_uri, visible_count=2, side_chat_count=6)
+    reads = _spy_store_reads(monkeypatch)
+
+    # The first read and one wider re-read cover only four of the six side chats.
+    first = await client.get("/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "limit": 2})
+    assert first.status_code == 200, first.text
+    assert first.json()["data"] == []
+    assert first.json()["has_more"] is True
+    assert reads == [(2, None), (4, None)]
+
+    cursor = first.json()["last_id"]
+    second = await client.get(
+        "/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "limit": 2, "after": cursor}
+    )
+    assert second.status_code == 200, second.text
+    assert {row["id"] for row in second.json()["data"]} == visible
+    assert second.json()["has_more"] is False
+    assert reads[2:] == [(2, cursor), (4, cursor)]
+
+
+def test_side_chat_reread_keeps_earlier_read_when_wider_read_overfills() -> None:
+    """A wider read that writes overfilled leaves the earlier read's rows and cursor together."""
+    from omnigent.server.routes.sessions import routes_core
+
+    def conversation(conversation_id: str, *, side_chat: bool = False) -> Conversation:
+        labels = {SIDE_CHAT_LABEL_KEY: "1"} if side_chat else {}
+        return Conversation(
+            id=conversation_id,
+            created_at=1,
+            updated_at=1,
+            root_conversation_id=conversation_id,
+            labels=labels,
+        )
+
+    first = PagedList(
+        data=[conversation("kept"), conversation("hidden", side_chat=True)],
+        first_id="kept",
+        last_id="hidden",
+        has_more=True,
+    )
+    overfilled = PagedList(
+        data=[conversation("new-1"), conversation("new-2"), conversation("kept")],
+        first_id="new-1",
+        last_id="kept",
+        has_more=True,
+    )
+    limits: list[int] = []
+
+    def read_page(limit: int) -> PagedList[Conversation]:
+        limits.append(limit)
+        return first if len(limits) == 1 else overfilled
+
+    page = routes_core._list_page_without_side_chats(read_page, 2, allow_reread=True)
+    assert limits == [2, 3]
+    assert [conv.id for conv in page.data] == ["kept"]
+    assert (page.first_id, page.last_id, page.has_more) == ("kept", "hidden", True)
+
+
+@pytest.mark.usefixtures("distinct_store_clock")
+@pytest.mark.parametrize(
+    ("order", "change"),
+    [
+        pytest.param("desc", "delete", id="desc-side-chat-deleted"),
+        pytest.param("desc", "move", id="desc-side-chat-moves-first"),
+        pytest.param("asc", "move", id="asc-session-moves-last"),
+    ],
+)
+async def test_list_sessions_reread_survives_rows_changing_between_reads(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    order: str,
+    change: str,
+) -> None:
+    """A row deleted or re-sorted between reads neither fails, duplicates, nor drops sessions."""
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(
+        agent_id, name="side-chat-agent", bundle_location="test:///bundle"
+    )
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    def create(*, side_chat: bool = False) -> str:
+        labels = {SIDE_CHAT_LABEL_KEY: "1"} if side_chat else None
+        return conv_store.create_conversation(agent_id=agent_id, labels=labels).id
+
+    # Creation order puts a side chat and one session on the first two-row read
+    # and leaves the other session for the wider re-read.
+    if order == "desc":
+        older, changed, newer = create(), create(side_chat=True), create()
+        visible = {older, newer}
+    else:
+        _side_chat, changed, newer = create(side_chat=True), create(), create()
+        visible = {changed, newer}
+
+    def change_row() -> None:
+        if change == "delete":
+            asyncio.run(conv_store.delete_conversation(changed))
+            return
+        with get_or_create_engine(db_uri).begin() as conn:
+            conn.execute(
+                update(SqlConversation)
+                .where(SqlConversation.id == changed)
+                .values(updated_at=SqlConversation.updated_at + 3600)
+            )
+
+    reads = _spy_store_reads(monkeypatch, change_row)
+    resp = await client.get(
+        "/v1/sessions", params={**_SIDEBAR_LIST_PARAMS, "order": order, "limit": 2}
+    )
+    assert resp.status_code == 200, resp.text
+    ids = [row["id"] for row in resp.json()["data"]]
+    assert sorted(ids) == sorted(visible)
+    assert resp.json()["has_more"] is False
+    assert len(reads) == 2
+
+
 # ── GET /v1/sessions/{id} (get snapshot) ────────────────────────────
 
 
@@ -452,6 +673,256 @@ async def test_delete_session_survives_blob_delete_failure(
     assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 404
     assert f"Failed to delete attachment blob {file_ids[0]} for session" in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+async def test_delete_session_removes_sub_agent_files(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting a parent removes the files of every sub-agent deleted with it.
+
+    Covers two children's uploads, a child's copy of a parent file (what
+    ``sys_session_send`` with ``file_ids`` makes) and a grandchild's upload,
+    while a blob another session still shares, as a fork's row does, stays.
+    One-row batches and one-child pages make the cleanup cross both bounds.
+    """
+    from omnigent.server.routes._sessions import helpers as session_helpers
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    monkeypatch.setattr(session_helpers, "_SESSION_FILE_DELETE_BATCH_SIZE", 1)
+    monkeypatch.setattr(session_helpers, "_DESCENDANT_PAGE_SIZE", 1)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent", title="worker:notes", parent_conversation_id=session_id
+    )
+    sibling = conv_store.create_conversation(
+        kind="sub_agent", title="worker:review", parent_conversation_id=session_id
+    )
+    grandchild = conv_store.create_conversation(
+        kind="sub_agent", title="worker:deep", parent_conversation_id=child.id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, child.id, sibling.id, grandchild.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    copied = await client.post(
+        f"/v1/sessions/{child.id}/resources/files:copy",
+        json={"source_session_id": session_id, "file_ids": [uploaded[session_id]]},
+    )
+    assert copied.status_code == 200, copied.text
+    copy_id = copied.json()["mapping"][uploaded[session_id]]["new_id"]
+    other = conv_store.create_conversation(title="fork")
+    file_store.create(
+        "notes.txt", 1, "text/plain", session_id=other.id, blob_key=uploaded[session_id]
+    )
+    artifacts = tmp_path / "artifacts"
+
+    resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    owners = (session_id, child.id, sibling.id, grandchild.id)
+    assert [owner for owner in owners if file_store.list(owner).data] == []
+    blob_keys = (uploaded[child.id], uploaded[sibling.id], uploaded[grandchild.id], copy_id)
+    assert [key for key in blob_keys if (artifacts / key).exists()] == []
+    assert (artifacts / uploaded[session_id]).exists()
+
+
+async def test_delete_session_keeps_cleaning_files_after_a_sub_agent_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A store failure on one sub-agent's files is logged; the rest are still cleaned.
+
+    The failing sub-agent is listed first, so the healthy one is cleaned after it.
+    """
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    failing = conv_store.create_conversation(
+        kind="sub_agent", title="worker:a", parent_conversation_id=session_id
+    )
+    healthy = conv_store.create_conversation(
+        kind="sub_agent", title="worker:b", parent_conversation_id=session_id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, failing.id, healthy.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    original_batch = SqlAlchemyFileStore.delete_session_files_batch
+    original_page = SqlAlchemyConversationStore.list_child_conversation_ids_page
+    attempted: list[str] = []
+
+    def batch_failing_for_one_session(
+        self: SqlAlchemyFileStore, owner_id: str, *, limit: int
+    ) -> tuple[int, list[str]]:
+        attempted.append(owner_id)
+        if owner_id == failing.id:
+            raise RuntimeError("database unavailable")
+        return original_batch(self, owner_id, limit=limit)
+
+    def failing_child_first(
+        self: SqlAlchemyConversationStore, parent_id: str, **kwargs: Any
+    ) -> list[tuple[str, int]]:
+        page = original_page(self, parent_id, **kwargs)
+        return sorted(page, key=lambda row: row[0] != failing.id)
+
+    with (
+        patch.object(
+            SqlAlchemyFileStore, "delete_session_files_batch", batch_failing_for_one_session
+        ),
+        patch.object(
+            SqlAlchemyConversationStore, "list_child_conversation_ids_page", failing_child_first
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    assert attempted == [session_id, failing.id, healthy.id]
+    assert [owner for owner in (session_id, healthy.id) if file_store.list(owner).data] == []
+    artifacts = tmp_path / "artifacts"
+    assert not (artifacts / uploaded[session_id]).exists()
+    assert not (artifacts / uploaded[healthy.id]).exists()
+    assert f"Failed to delete the file rows of session {failing.id}" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+async def test_delete_session_keeps_the_session_when_its_file_rows_cannot_be_deleted(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A store failure on the session's own file rows fails the delete, keeping it to retry."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"notes", "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    file_id = resp.json()["id"]
+
+    def failing_batch(
+        self: SqlAlchemyFileStore, owner_id: str, *, limit: int
+    ) -> tuple[int, list[str]]:
+        del self, owner_id, limit
+        raise RuntimeError("database unavailable")
+
+    with (
+        patch.object(SqlAlchemyFileStore, "delete_session_files_batch", failing_batch),
+        pytest.raises(RuntimeError, match="database unavailable"),
+    ):
+        await client.delete(f"/v1/sessions/{session_id}")
+
+    assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 200
+    assert [f.id for f in SqlAlchemyFileStore(db_uri).list(session_id).data] == [file_id]
+    assert (tmp_path / "artifacts" / file_id).exists()
+
+
+async def test_delete_session_checks_blobs_only_once_its_rows_are_gone(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared-blob checks wait for the session's last batch, so none scans its own rows."""
+    from omnigent.server.routes._sessions import helpers as session_helpers
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    monkeypatch.setattr(session_helpers, "_SESSION_FILE_DELETE_BATCH_SIZE", 1)
+    file_store = SqlAlchemyFileStore(db_uri)
+    file_ids = []
+    for index in range(3):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/resources/files",
+            files={"file": (f"notes-{index}.txt", b"notes", "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        file_ids.append(resp.json()["id"])
+    original_check = SqlAlchemyFileStore.is_blob_key_orphaned
+    rows_left_at_check: list[int] = []
+
+    def recording_check(self: SqlAlchemyFileStore, blob_key: str) -> bool:
+        rows_left_at_check.append(len(file_store.list(session_id).data))
+        return original_check(self, blob_key)
+
+    with patch.object(SqlAlchemyFileStore, "is_blob_key_orphaned", recording_check):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    assert rows_left_at_check == [0, 0, 0]
+    assert [key for key in file_ids if (tmp_path / "artifacts" / key).exists()] == []
+
+
+async def test_delete_session_cleans_other_branches_when_one_cannot_be_listed(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sub-agent whose children can't be listed is still cleaned, and so are its siblings."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    file_store = SqlAlchemyFileStore(db_uri)
+    unlistable = conv_store.create_conversation(
+        kind="sub_agent", title="worker:a", parent_conversation_id=session_id
+    )
+    sibling = conv_store.create_conversation(
+        kind="sub_agent", title="worker:b", parent_conversation_id=session_id
+    )
+    uploaded: dict[str, str] = {}
+    for owner in (session_id, unlistable.id, sibling.id):
+        resp = await client.post(
+            f"/v1/sessions/{owner}/resources/files",
+            files={"file": ("notes.txt", owner.encode(), "text/plain")},
+        )
+        assert resp.status_code == 201, resp.text
+        uploaded[owner] = resp.json()["id"]
+    original_page = SqlAlchemyConversationStore.list_child_conversation_ids_page
+
+    def page_failing_for_one_parent(
+        self: SqlAlchemyConversationStore, parent_id: str, **kwargs: Any
+    ) -> list[tuple[str, int]]:
+        if parent_id == unlistable.id:
+            raise RuntimeError("database unavailable")
+        return original_page(self, parent_id, **kwargs)
+
+    with (
+        patch.object(
+            SqlAlchemyConversationStore,
+            "list_child_conversation_ids_page",
+            page_failing_for_one_parent,
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200, resp.text
+    owners = (session_id, unlistable.id, sibling.id)
+    assert [owner for owner in owners if file_store.list(owner).data] == []
+    artifacts = tmp_path / "artifacts"
+    assert [owner for owner in owners if (artifacts / uploaded[owner]).exists()] == []
+    assert f"Failed to list the sub-agents of session {unlistable.id}" in caplog.text
 
 
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
@@ -811,8 +1282,8 @@ async def test_list_projects_returns_names_sorted(
     assert resp.status_code == 200
     # Label-only projects (no first-class row) list with id=None, sorted by name.
     assert resp.json() == [
-        {"id": None, "name": "Customer X", "icon": None},
-        {"id": None, "name": "Sprint 42", "icon": None},
+        {"id": None, "name": "Customer X", "icon": None, "muted": False},
+        {"id": None, "name": "Sprint 42", "icon": None, "muted": False},
     ]
 
 
@@ -1009,27 +1480,30 @@ async def test_archiving_wins_over_a_same_request_pin(
     assert user_key not in conv.labels
 
 
+@pytest.mark.parametrize("prefix", ["omnigent.pinned", "omnigent.muted"])
 async def test_patch_rejects_client_supplied_per_user_pin_key(
     client: httpx.AsyncClient,
     session_id: str,
     db_uri: str,
+    prefix: str,
 ) -> None:
-    """A client may only write the bare canonical ``omnigent.pinned`` key. A
-    suffixed ``omnigent.pinned.<user>`` is server-derived — accepting one would
-    let a caller pin/unpin a shared session for another user. It must be
-    rejected, and nothing persisted."""
+    """A client may only write the bare canonical pin or mute key. A suffixed
+    ``<key>.<user>`` is server-derived — accepting one would let a caller
+    pin or mute a shared session for another user. It must be rejected, and
+    nothing persisted."""
     conv_store = SqlAlchemyConversationStore(db_uri)
+    suffixed = f"{prefix}.bob@example.com"
 
     for value in ("1721760000000", ""):
         resp = await client.patch(
             f"/v1/sessions/{session_id}",
-            json={"labels": {"omnigent.pinned.bob@example.com": value}},
+            json={"labels": {suffixed: value}},
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 400
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
-    assert "omnigent.pinned.bob@example.com" not in conv.labels
+    assert suffixed not in conv.labels
 
 
 async def test_patch_rejects_client_supplied_sandbox_labels(

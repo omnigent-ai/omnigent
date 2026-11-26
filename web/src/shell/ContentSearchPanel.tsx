@@ -3,30 +3,17 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
 import {
   contentSearchPattern,
+  fetchContentSearch,
   fitsContentSearchLimit,
+  type ContentMatch,
+  type ContentSearchResult,
   wholeWordRegexProblem,
 } from "@/lib/contentSearch";
-import { authenticatedFetch } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import type { OpenFileOptions } from "./FileViewerContext";
 import { cn } from "@/lib/utils";
-
-interface ContentMatch {
-  path: string;
-  line: number;
-  column: number;
-  text: string;
-  match_start: number;
-  match_end: number;
-}
-
-interface ContentSearchResult {
-  matches: ContentMatch[];
-  truncated: boolean;
-  warning: string | null;
-}
 
 interface ContentSearchInput {
   query: string;
@@ -82,25 +69,13 @@ export function ContentSearchPanel({
     retry: false,
     // Keep the latest search, including in-flight work, when its panel unmounts.
     queryFn: async (): Promise<ContentSearchResult & { query: string }> => {
-      const params = new URLSearchParams({
-        q: sent.pattern,
-        case_sensitive: String(caseSensitive),
-        regex: String(sent.regex),
+      const result = await fetchContentSearch(conversationId, sent.pattern, {
+        caseSensitive,
+        regex: sent.regex,
         include,
         exclude,
       });
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/default/content-search?${params}`,
-      );
-      const body = await response.json().catch(() => null);
-      if (!response.ok || body?.error || !Array.isArray(body?.matches)) {
-        throw new Error(
-          (typeof body?.error === "string" ? body.error : body?.error?.message) ||
-            (typeof body?.detail === "string" ? body.detail : null) ||
-            "Content search is unavailable. Check that the runner is online and up to date.",
-        );
-      }
-      return { ...body, query };
+      return { ...result, query };
     },
   });
   const files = new Map<string, ContentMatch[]>();

@@ -9,8 +9,14 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { DEFAULT_FILES_PANEL_PREFERENCES } from "@/lib/filesPanelPreferences";
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
-import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
+import {
+  revealInFileManager,
+  revealLabel,
+  useRevealTarget,
+  useSessionHostId,
+} from "./RevealInFileManager";
 import { OpenInSplitButton, useOpenInActions } from "./OpenInMenu";
 import {
   dismissFilePosition,
@@ -38,17 +44,16 @@ import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  CloudOffIcon,
   CodeIcon,
   Columns2Icon,
   DownloadIcon,
+  ExternalLinkIcon,
   EyeIcon,
   EyeOffIcon,
   FileDiffIcon,
   FolderOpenIcon,
   Link2Icon,
   ListIcon,
-  Loader2Icon,
   MessageSquareTextIcon,
   MoreHorizontalIcon,
   PencilLineIcon,
@@ -61,6 +66,7 @@ import {
 } from "lucide-react";
 import { useSearchParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   Dialog,
   DialogContent,
@@ -90,7 +96,17 @@ import {
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
+import { useHostSshTarget } from "@/hooks/useHostSshTarget";
+import { useRepositoryContext } from "@/hooks/useRepositoryContext";
+import { useSessionPullRequests } from "@/hooks/useSessionPullRequests";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { workspaceFileLink } from "./fileCommands/codeHostFileLink";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { workspaceSocketBridge } from "@/lib/nativeBridge";
 import { isVideoFile } from "@/lib/video";
+import type { ComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { useInertRef } from "@/hooks/useInertRef";
 import {
@@ -109,6 +125,11 @@ import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { SaveStatusChip } from "./SaveStatusChip";
+import {
+  WORKSPACE_SIDEBAR_LAYOUT,
+  WORKSPACE_TOOLBAR_CLASS,
+} from "./workspaceTabs/WorkspaceSidebarLayout";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { isFileComment } from "@/lib/localReviewComments";
@@ -133,6 +154,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -336,8 +358,17 @@ function useToolbarOverflow(actionsKey: string): {
 // FileViewer
 // ---------------------------------------------------------------------------
 
+/** The Unsaved changes dialog's pending choice; `answersHost` marks a host's leave question. */
+interface PendingLeave {
+  apply: () => void;
+  cancel?: () => void;
+  answersHost?: boolean;
+}
+
 interface FileViewerProps {
   syncUrl?: boolean;
+  /** A comment whose thread opens with the file, as a `?comment=` link asks for. */
+  linkedCommentId?: string;
   agentId?: string | null;
   position?: FilePosition;
   open: boolean;
@@ -359,23 +390,49 @@ interface FileViewerProps {
    */
   permissionLevel?: number | null;
   /**
+   * The file's diff under the session's chosen comparison, for a viewer that shows what the
+   * Changes review shows. Without it, the diff is against the last commit, as it always was.
+   */
+  comparisonDiff?: ComparisonFileDiff;
+  /**
    * Frameless mode: renders as a flex-1 div filling the parent instead
    * of a push-panel aside with its own width and slide animation. Used
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Shown in place of the header's path, such as the tabs sidebar's breadcrumbs. */
+  pathHeader?: ReactNode;
+  /**
+   * Inside a ``WorkspaceSidebarLayout`` page: the toolbar spans the page and the content
+   * sits beside the sidebar. Needs ``frameless``.
+   */
+  besideSidebar?: boolean;
+  /** Shown first in the toolbar, such as a sidebar's toggle. */
+  toolbarLeading?: ReactNode;
+  /**
+   * Shows the file's changes in the Changes review, as the tabs sidebar's text files do:
+   * the toolbar's diff button then reads "Show changes", and "Open file" in a diff.
+   */
+  onShowChanges?: () => void;
   /** The same frameless viewer fills the mobile viewport without remounting. */
   mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
   viewport?: "desktop" | "mobile";
   /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
+  /**
+   * Registers the question a host asks before it leaves this file, while the editor has
+   * unsaved edits. It asks this viewer's own Unsaved changes dialog; returns the unregister.
+   */
+  registerLeaveGuard?: (guard: () => Promise<"leave" | "cancel">) => () => void;
+  /** Set while the viewer fills the workspace full screen; Escape then exits full screen. */
+  onExitFullScreen?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
-   * "X/N" index won't line up with the list. Defaults to "recent".
+   * "X/N" index won't line up with the list. Defaults to the panel's default sort.
    */
   sort?: ChangedSort;
 }
@@ -402,8 +459,19 @@ export function FileViewer(props: FileViewerProps) {
   );
 }
 
+/** Beside a sidebar, the banner and content share the grid cell next to it; elsewhere, no wrapper. */
+function BesideSidebarContent({ beside, children }: { beside: boolean; children: ReactNode }) {
+  if (!beside) return children;
+  return (
+    <div className={cn("flex min-h-0 flex-1 flex-col", WORKSPACE_SIDEBAR_LAYOUT.content)}>
+      {children}
+    </div>
+  );
+}
+
 function FileViewerBody({
   syncUrl = true,
+  linkedCommentId,
   position,
   open,
   mediaActive = true,
@@ -411,15 +479,22 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
+  registerLeaveGuard,
+  onExitFullScreen,
   onNavigateTo,
   onShare,
   shareDisabledReason,
   permissionLevel,
+  comparisonDiff,
   frameless,
+  pathHeader,
+  besideSidebar = false,
+  toolbarLeading,
+  onShowChanges,
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
-  sort = "recent",
+  sort = DEFAULT_FILES_PANEL_PREFERENCES.sort,
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
@@ -437,7 +512,9 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(syncUrl && searchParams.get("diff") === "1");
   const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
-  const initialCommentIdRef = useRef(syncUrl ? searchParams.get("comment") : null);
+  const initialCommentIdRef = useRef(
+    linkedCommentId ?? (syncUrl ? searchParams.get("comment") : null),
+  );
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -463,14 +540,28 @@ function FileViewerBody({
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
   const onScreen = open && isActiveViewport && mediaActive;
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  // A chosen comparison's listing says which files changed; otherwise the last commit's does.
+  const comparisonListing = comparisonDiff?.base === "comparison" ? comparisonDiff : null;
+  // Whether the file is gone from the workspace, so there's nothing to read or open. A
+  // comparison ending at a commit can delete a file that's still here, so only one ending at
+  // the working copy answers that; otherwise the last commit's listing does.
   const isDeletedFile =
-    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+    comparisonListing?.headIsWorkingCopy === true
+      ? comparisonListing.deleted
+      : (changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false);
+  const serverInfo = useServerInfo();
+  // The host's SSH alias lets the desktop read a host on another machine directly.
+  const directReads =
+    workspaceSocketBridge() !== null && isFeatureEnabled(serverInfo, "workspace_direct_access");
+  const sessionHostId = useSessionHostId(conversationId);
+  const sshTarget = useHostSshTarget(directReads ? sessionHostId : null, conversationId);
   // Video playback reads the complete binary on demand, never the capped JSON preview.
   const fileQuery = useFileContent(
     conversationId,
     isVideoFile(path) || isDeletedFile ? null : path,
     {
       visible: onScreen,
+      ...(sshTarget ? { sshTarget } : {}),
     },
   );
 
@@ -532,10 +623,13 @@ function FileViewerBody({
   // Brief "copied" feedback for the copy-link button.
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
-  const [pendingAction, setPendingAction] = useState<{
-    apply: () => void;
-    cancel?: () => void;
-  } | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingLeave | null>(null);
+  // Mirrors the dialog's action, so a newer request can answer the one it replaces.
+  const pendingActionRef = useRef<PendingLeave | null>(null);
+  const showPendingAction = useCallback((next: PendingLeave | null) => {
+    pendingActionRef.current = next;
+    setPendingAction(next);
+  }, []);
   // TOC panel state (for markdown preview)
   const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
@@ -590,13 +684,46 @@ function FileViewerBody({
     return () => window.removeEventListener("beforeunload", handler);
   }, [isEditorDirty]);
 
-  const guardDirty = useCallback((action: () => void, cancel?: () => void) => {
-    if (isEditorDirtyRef.current) {
-      setPendingAction({ apply: action, cancel });
-      return;
-    }
-    action();
-  }, []);
+  const guardDirty = useCallback(
+    (action: () => void, cancel?: () => void, answersHost = false) => {
+      if (isEditorDirtyRef.current) {
+        const replaced = pendingActionRef.current;
+        showPendingAction({ apply: action, cancel, answersHost });
+        // A host still waiting on the dialog hears "cancel": a newer request took its place.
+        if (replaced?.answersHost) replaced.cancel?.();
+        return;
+      }
+      action();
+    },
+    [showPendingAction],
+  );
+
+  // A host leaving the file, such as a tab closing, asks the same question first.
+  useEffect(() => {
+    if (!isEditorDirty || !registerLeaveGuard) return undefined;
+    const waiting = new Set<(answer: "leave" | "cancel") => void>();
+    const unregister = registerLeaveGuard(
+      () =>
+        new Promise((resolve) => {
+          const answer = (choice: "leave" | "cancel") => {
+            waiting.delete(answer);
+            resolve(choice);
+          };
+          waiting.add(answer);
+          guardDirty(
+            () => answer("leave"),
+            () => answer("cancel"),
+            true,
+          );
+        }),
+    );
+    return () => {
+      unregister();
+      // Unmounting, or the edits going away, answers a question still open.
+      if (waiting.size > 0 && pendingActionRef.current?.answersHost) showPendingAction(null);
+      for (const answer of [...waiting]) answer("cancel");
+    };
+  }, [isEditorDirty, registerLeaveGuard, guardDirty, showPendingAction]);
 
   useEffect(
     () => () => {
@@ -786,11 +913,13 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
-  // Escape closes the active file tab (when search is not open).
+  // Escape exits full screen, keeping the tab open, or else closes the active
+  // file tab (when search is not open).
   useEffect(() => {
-    if (!open || !onCloseTab) return;
+    if (!open || (!onCloseTab && !onExitFullScreen)) return;
     const handler = (e: KeyboardEvent) => {
-      if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
+      // Full screen hides the chat, so the viewer keeps Escape wherever the user clicked last.
+      if (!syncUrl && !viewerIsActiveSurfaceRef.current && !onExitFullScreen) return;
       if (e.key !== "Escape" || e.defaultPrevented) return;
       if (searchOpen) return;
       const target = e.target;
@@ -801,11 +930,13 @@ function FileViewerBody({
         return;
       }
       e.preventDefault();
-      guardDirty(onCloseTab);
+      // Leaving full screen keeps the file and its edits, so it needs no confirmation.
+      if (onExitFullScreen) onExitFullScreen();
+      else if (onCloseTab) guardDirty(onCloseTab);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [syncUrl, open, onCloseTab, searchOpen, guardDirty]);
+  }, [syncUrl, open, onCloseTab, onExitFullScreen, searchOpen, guardDirty]);
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -851,7 +982,10 @@ function FileViewerBody({
     }
   }
   const isPreviewable =
-    (lang === "markdown" && !markdownPreviewFallback) || lang === "html" || isNotebookPath(path);
+    (lang === "markdown" && !markdownPreviewFallback) ||
+    lang === "html" ||
+    isNotebookPath(path) ||
+    isDataTablePath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -862,6 +996,8 @@ function FileViewerBody({
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
+  // Excel and Parquet open only on the table: no source, diff or line view.
+  const isSpreadsheet = isSpreadsheetPath(path);
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
   // Monaco — mirrors CodeViewer's own base64/binary-path check.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
@@ -871,9 +1007,26 @@ function FileViewerBody({
     !isPdf &&
     !isVideo &&
     !isModel &&
-    (changedFiles.data?.data.some((f) => f.path === path) ?? false);
+    !isSpreadsheet &&
+    (comparisonListing
+      ? comparisonListing.changed
+      : (changedFiles.data?.data.some((f) => f.path === path) ?? false));
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
+  const repositoryContext = useRepositoryContext(conversationId, open && !isDeletedFile);
+  const sessionPullRequests = useSessionPullRequests(conversationId);
+  const codeHostLink = useMemo(
+    () =>
+      workspaceFileLink({
+        context: repositoryContext.data,
+        path,
+        // A session PR on a host is evidence that it serves GitHub Enterprise.
+        githubHosts: sessionPullRequests.data?.prs
+          .filter((pr) => !pr.provider || pr.provider === "github")
+          .map((pr) => pr.host),
+      }),
+    [repositoryContext.data, path, sessionPullRequests.data],
+  );
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -890,7 +1043,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
-  const effectiveDiffActive = diffActive || isDeletedFile;
+  // A comment link shows the file its thread is on, this visit only; the saved preference stays.
+  const [commentLinkFileView, setCommentLinkFileView] = useState(linkedCommentId !== undefined);
+  const effectiveDiffActive = (diffActive && !commentLinkFileView) || isDeletedFile;
   const requestedDiff =
     open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
@@ -898,7 +1053,10 @@ function FileViewerBody({
     requestedDiff &&
     linkedFileRef.current?.conversationId === conversationId &&
     linkedFileRef.current?.path === path;
-  const diffQuery = useFileDiff(conversationId, isVideo ? null : path, { requested: linkedDiff });
+  const lastCommitDiff = useFileDiff(conversationId, isVideo || comparisonListing ? null : path, {
+    requested: linkedDiff,
+  });
+  const diffQuery = comparisonListing ? comparisonListing.query : lastCommitDiff;
   const prepareDiff =
     requestedDiff &&
     (isDiffAvailable || (linkedDiff && changedFiles.data === undefined && !changedFiles.isError));
@@ -938,6 +1096,14 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
+  // A data table's pull toward Source (from a picked comment) belongs to one
+  // visit: opening another file or conversation ends it, so coming back opens the
+  // table again. Other files keep their deep-link bias as before.
+  const [biasVisit, setBiasVisit] = useState({ conversationId, path });
+  if (biasVisit.conversationId !== conversationId || biasVisit.path !== path) {
+    setBiasVisit({ conversationId, path });
+    if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
+  }
 
   // Switch a markdown file to the rich-text editor — the surface where text-
   // selection commenting works. Used by the preview's "switch to edit mode"
@@ -979,6 +1145,7 @@ function FileViewerBody({
     largeMarkdown: markdownSourceFallback ?? false,
     largeMarkdownVisitMode,
     deepLinkedComment: deepLinkBiasPath === path,
+    previewHidesComments: isDataTablePath(path),
     preference: previewableViewMode,
   });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
@@ -995,7 +1162,13 @@ function FileViewerBody({
       : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+    effectiveDiffActive && isDiffAvailable
+      ? "diff"
+      : isSpreadsheet
+        ? "preview"
+        : filePosition
+          ? "source"
+          : fileViewMode;
   const diffViewActive = viewMode === "diff";
   // A citation opens large Markdown in editable source; keep source for the visit
   // so clearing the citation cannot drop unsaved edits by returning to Preview.
@@ -1080,6 +1253,7 @@ function FileViewerBody({
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
+  const ownsFindShortcut = useCallback(() => viewerIsActiveSurfaceRef.current, []);
   // Mirrors the ref for rendering, which marks the viewer as owning Escape.
   const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   useEffect(() => {
@@ -1174,7 +1348,7 @@ function FileViewerBody({
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
     if (!syncUrl || !open || !isActiveViewport) return;
-    const wantDiff = diffActive && isDiffAvailable;
+    const wantDiff = diffActive && !commentLinkFileView && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
     setSearchParams(
@@ -1189,7 +1363,16 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [
+    syncUrl,
+    diffActive,
+    commentLinkFileView,
+    isDiffAvailable,
+    open,
+    isActiveViewport,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1217,6 +1400,10 @@ function FileViewerBody({
     noActiveCheck?: boolean;
     /** Chord shown beside the item; omit when the viewer surface doesn't bind it. */
     shortcut?: readonly string[];
+    /** Shown, but not selectable, with this reason as its tooltip. */
+    disabledReason?: string;
+    /** Makes the row a link that opens `href` itself, in place of `onSelect`. */
+    link?: { href: string; follow: (event: MouseEvent) => void };
   }
   interface ToolbarAction {
     key: string;
@@ -1238,6 +1425,8 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
+    /** Called when `menu` opens, inline or in the collapsed "⋯" overflow. */
+    onMenuOpen?: () => void;
     /** Keep the default action directly available beside its app picker. */
     splitMenu?: boolean;
   }
@@ -1325,9 +1514,12 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
-    // HTML and notebooks have no rich-text editor — a single toggle flips
-    // preview ↔ source.
+  } else if (
+    (lang === "html" || isNotebookPath(path) || isDataTablePath(path)) &&
+    viewMode !== "diff"
+  ) {
+    // HTML, notebooks and data tables have no rich-text editor — a single toggle
+    // flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
       label: viewMode === "preview" ? "View source" : "View preview",
@@ -1338,11 +1530,14 @@ function FileViewerBody({
       // file) resolves to "preview" for HTML, so a functional updater keyed on
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
-      onSelect: () => {
-        dismissFilePosition(position);
-        setDismissedPosition(position);
-        setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
-      },
+      onSelect: () =>
+        guardDirty(() => {
+          dismissFilePosition(position);
+          setDismissedPosition(position);
+          // An explicit choice ends a ?comment= link's pull toward source.
+          setDeepLinkBiasPath(null);
+          setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
+        }),
     });
   }
   // HTML artifacts can be popped out into their own browser tab for full-window
@@ -1378,17 +1573,23 @@ function FileViewerBody({
     },
   });
   if (!isPdf && !isDeletedFile && isDiffAvailable) {
+    const toggleDiff = () =>
+      guardDirty(() => {
+        dismissFilePosition(position);
+        setDismissedPosition(position);
+        setCommentLinkFileView(false);
+        setDiffActive(viewMode !== "diff");
+      });
+    // Where the page has a Changes review, the file's changes open there.
+    const diffLabels = onShowChanges
+      ? { diff: "Open file", file: "Show changes" }
+      : { diff: "Exit diff view", file: "Show diff" };
     toolbarActions.push({
       key: "diff",
-      label: viewMode === "diff" ? "Exit diff view" : "Show diff",
+      label: viewMode === "diff" ? diffLabels.diff : diffLabels.file,
       icon: <FileDiffIcon className="size-4" />,
       active: viewMode === "diff",
-      onSelect: () =>
-        guardDirty(() => {
-          dismissFilePosition(position);
-          setDismissedPosition(position);
-          setDiffActive(viewMode !== "diff");
-        }),
+      onSelect: onShowChanges && viewMode !== "diff" ? () => guardDirty(onShowChanges) : toggleDiff,
     });
   }
   if (viewMode === "diff" && splitToggleAvailable) {
@@ -1404,8 +1605,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
-  // whitespace toggle to save toolbar width; toggles keep the menu open.
+  // One "⋯" menu holds Find, Download, Open in GitHub, Wrap lines (Monaco views) and
+  // the diff-only whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1434,6 +1635,24 @@ function FileViewerBody({
       icon: <DownloadIcon className="size-4" />,
       active: false,
       onSelect: downloadFile,
+    });
+  }
+  if (codeHostLink && !isDeletedFile) {
+    const { url, unavailableReason } = codeHostLink;
+    settingsMenu.push({
+      key: "open-on-code-host",
+      label: codeHostLink.label,
+      icon: <ExternalLinkIcon className="size-4" />,
+      active: false,
+      disabledReason: unavailableReason,
+      link: url
+        ? {
+            href: url,
+            follow: (event) => followLinkWithPopupFallback(event, url, conversationId),
+          }
+        : undefined,
+      // The link row opens it; a disabled row ignores selection.
+      onSelect: () => {},
     });
   }
   // One wrap preference covers the source editor and the diff. Other views
@@ -1467,6 +1686,8 @@ function FileViewerBody({
     tooltip: "View settings",
     icon: <MoreHorizontalIcon className="size-4" />,
     menu: settingsMenu,
+    // A push, commit or checkout since the last read changes where Open in GitHub goes.
+    onMenuOpen: repositoryContext.refresh,
   });
   toolbarActions.push({
     key: "copy-link",
@@ -1525,6 +1746,20 @@ function FileViewerBody({
     ].join("|"),
   );
 
+  // A link row opens with the popup fallback; a disabled row keeps its reason readable.
+  const renderLinkOrDisabledMenuItem = (item: ToolbarOption) => (
+    <SessionActionMenuItem
+      key={item.key}
+      className="whitespace-nowrap"
+      disabledReason={item.disabledReason}
+      link={item.link}
+      onSelect={item.onSelect}
+    >
+      {item.icon}
+      {item.label}
+    </SessionActionMenuItem>
+  );
+
   const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
     const button = (
       <Button
@@ -1553,7 +1788,12 @@ function FileViewerBody({
         // A settings menu: one trigger opening a list of independent items
         // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
         // as the user flips them; actions close it on select.
-        <DropdownMenu key={action.key}>
+        <DropdownMenu
+          key={action.key}
+          onOpenChange={(isOpen) => {
+            if (isOpen) action.onMenuOpen?.();
+          }}
+        >
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -1573,27 +1813,31 @@ function FileViewerBody({
             </Tooltip>
           </TooltipProvider>
           <DropdownMenuContent align="end" className="w-auto min-w-40">
-            {action.menu.map((item) => (
-              <DropdownMenuItem
-                key={item.key}
-                className="whitespace-nowrap"
-                onSelect={
-                  interactive
-                    ? (e) => {
-                        if (item.keepOpen) e.preventDefault();
-                        item.onSelect();
-                      }
-                    : undefined
-                }
-              >
-                {item.icon}
-                {item.label}
-                {item.shortcut && (
-                  <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
-                )}
-                {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
-              </DropdownMenuItem>
-            ))}
+            {action.menu.map((item) =>
+              item.link || item.disabledReason ? (
+                renderLinkOrDisabledMenuItem(item)
+              ) : (
+                <DropdownMenuItem
+                  key={item.key}
+                  className="whitespace-nowrap"
+                  onSelect={
+                    interactive
+                      ? (e) => {
+                          if (item.keepOpen) e.preventDefault();
+                          item.onSelect();
+                        }
+                      : undefined
+                  }
+                >
+                  {item.icon}
+                  {item.label}
+                  {item.shortcut && (
+                    <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
+                  )}
+                  {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
+                </DropdownMenuItem>
+              ),
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       ) : action.options ? (
@@ -1648,21 +1892,33 @@ function FileViewerBody({
     <>
       <div
         ref={toolbarHeaderRef}
-        className="flex min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-3"
+        className={
+          besideSidebar
+            ? cn(
+                WORKSPACE_TOOLBAR_CLASS,
+                "min-w-0 justify-between gap-2",
+                WORKSPACE_SIDEBAR_LAYOUT.toolbar,
+              )
+            : "flex min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-3"
+        }
       >
         <div className="flex min-w-0 flex-1 items-center gap-2">
+          {toolbarLeading}
           {/* Back button is the dismiss affordance for the mobile full-screen
               overlay only. On desktop the viewer is embedded in the tabbed
               Files rail, where tabs (and their x buttons) own open/close, so
               the back button would be a redundant "exit viewer" mode. */}
           {(!frameless || mobileOverlay) && (
             <div ref={toolbarBackRef} className="shrink-0">
-              {/* Esc runs onCloseTab unless Find is open; the hint applies only when the
-                  back button runs that same handler. */}
+              {/* Esc runs onCloseTab unless Find is open or it exits full screen; the
+                  hint applies only when the back button runs that same handler. */}
               <KeyboardShortcutTooltip
                 label="Close"
                 keys={
-                  onCloseTab !== undefined && onClose === onCloseTab && !searchOpen
+                  onCloseTab !== undefined &&
+                  onClose === onCloseTab &&
+                  !searchOpen &&
+                  onExitFullScreen === undefined
                     ? [ESC_KEY]
                     : undefined
                 }
@@ -1711,31 +1967,33 @@ function FileViewerBody({
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  aria-label={`Copy file path: ${path}`}
-                  className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => {
-                    const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
-                    if (absolutePath === null) {
-                      toast.error("Workspace path unavailable");
-                      return;
-                    }
-                    void copyText(absolutePath).then(
-                      () => toast.success("File path copied"),
-                      () => toast.error("Failed to copy file path"),
-                    );
-                  }}
-                >
-                  {path}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>Copy file path</TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+          {pathHeader ?? (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={`Copy file path: ${path}`}
+                    className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={() => {
+                      const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
+                      if (absolutePath === null) {
+                        toast.error("Workspace path unavailable");
+                        return;
+                      }
+                      void copyText(absolutePath).then(
+                        () => toast.success("File path copied"),
+                        () => toast.error("Failed to copy file path"),
+                      );
+                    }}
+                  >
+                    {path}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>Copy file path</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
         </div>
         <div
           className="relative flex min-w-0 items-center justify-end gap-1"
@@ -1744,58 +2002,18 @@ function FileViewerBody({
           {/* Auto-save status chip (replaces the editor's old Save button).
               Non-idle implies an editable Monaco buffer, so no extra gating.
               Kept outside the responsive switcher — always inline. */}
-          {saveStatus !== "idle" && (
-            <span
-              ref={toolbarChipRef}
-              aria-live="polite"
-              title={
-                saveStatus === "offline"
-                  ? "Runner offline — your changes will save when it reconnects"
-                  : undefined
-              }
-              className={cn(
-                "mr-1 flex shrink-0 items-center gap-1 whitespace-nowrap text-sm",
-                saveStatus === "error" ? "text-destructive" : "text-muted-foreground",
-              )}
-            >
-              {saveStatus === "unsaved" && (
-                <>
-                  <span className="size-1.5 rounded-full bg-muted-foreground/70" />
-                  Unsaved
-                </>
-              )}
-              {saveStatus === "saving" && (
-                <>
-                  <Loader2Icon className="size-3 animate-spin" />
-                  Saving…
-                </>
-              )}
-              {saveStatus === "saved" && (
-                <>
-                  <CheckIcon className="size-3 text-green-500" />
-                  Saved
-                </>
-              )}
-              {saveStatus === "error" && (
-                <>
-                  <AlertTriangleIcon className="size-3" />
-                  Save failed
-                </>
-              )}
-              {saveStatus === "offline" && (
-                <>
-                  <CloudOffIcon className="size-3" />
-                  Unsaved
-                </>
-              )}
-            </span>
-          )}
+          <SaveStatusChip status={saveStatus} chipRef={toolbarChipRef} />
           {/* Collapse overflowing actions into "⋯", keeping the Open in split
               button visible. The offscreen clone measures the full row. */}
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
               <>
-                <DropdownMenu>
+                <DropdownMenu
+                  onOpenChange={(isOpen) => {
+                    // The overflow shows every menu's items, so each one opening applies.
+                    if (isOpen) for (const action of toolbarActions) action.onMenuOpen?.();
+                  }}
+                >
                   <DropdownMenuTrigger asChild>
                     <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
                       <MoreHorizontalIcon className="size-4" />
@@ -1838,22 +2056,26 @@ function FileViewerBody({
                           // The settings menu's items are already independent
                           // toggles/actions, so flatten them straight into this "⋯"
                           // overflow rather than nesting a "⋯"-in-"⋯" submenu.
-                          action.menu.map((option) => (
-                            <DropdownMenuItem
-                              key={option.key}
-                              className="whitespace-nowrap"
-                              onSelect={(e) => {
-                                if (option.keepOpen) e.preventDefault();
-                                option.onSelect();
-                              }}
-                            >
-                              {option.icon}
-                              {option.label}
-                              {option.active && !option.noActiveCheck && (
-                                <CheckIcon className="ml-auto size-4" />
-                              )}
-                            </DropdownMenuItem>
-                          ))
+                          action.menu.map((option) =>
+                            option.link || option.disabledReason ? (
+                              renderLinkOrDisabledMenuItem(option)
+                            ) : (
+                              <DropdownMenuItem
+                                key={option.key}
+                                className="whitespace-nowrap"
+                                onSelect={(e) => {
+                                  if (option.keepOpen) e.preventDefault();
+                                  option.onSelect();
+                                }}
+                              >
+                                {option.icon}
+                                {option.label}
+                                {option.active && !option.noActiveCheck && (
+                                  <CheckIcon className="ml-auto size-4" />
+                                )}
+                              </DropdownMenuItem>
+                            ),
+                          )
                         ) : action.disabled ? (
                           <TooltipProvider key={action.key}>
                             <Tooltip>
@@ -1914,198 +2136,210 @@ function FileViewerBody({
         </div>
       </div>
 
-      {fileQuery.isRefetchError && !isDeletedFile && (
-        <div
-          role="status"
-          className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
-        >
-          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
-          <span>
-            Couldn&apos;t refresh this file (
-            {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
-            ). Showing the last loaded version.
-          </span>
-        </div>
-      )}
-      <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
-        <div
-          ref={contentAreaRef}
-          onScroll={handleContentScroll}
-          className="flex-1 overflow-y-auto min-w-0"
-        >
-          {isDeletedFile && viewMode !== "diff" ? (
-            <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
-              <Trash2Icon className="size-5 opacity-40" />
-              <span>This file has been deleted.</span>
-              {isDiffAvailable && (
-                <span className="text-sm">
-                  Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
-                  previous content.
-                </span>
+      <BesideSidebarContent beside={besideSidebar}>
+        {fileQuery.isRefetchError && !isDeletedFile && (
+          <div
+            role="status"
+            className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
+          >
+            <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+            <span>
+              Couldn&apos;t refresh this file (
+              {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
+              ). Showing the last loaded version.
+            </span>
+          </div>
+        )}
+        <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
+          <div
+            ref={contentAreaRef}
+            onScroll={handleContentScroll}
+            className="flex-1 overflow-y-auto min-w-0"
+          >
+            <RenderErrorBoundary
+              name="this file"
+              resetKey={JSON.stringify([conversationId, path, viewMode])}
+            >
+              {isDeletedFile && viewMode !== "diff" ? (
+                <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
+                  <Trash2Icon className="size-5 opacity-40" />
+                  <span>This file has been deleted.</span>
+                  {isDiffAvailable && (
+                    <span className="text-sm">
+                      Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view
+                      its previous content.
+                    </span>
+                  )}
+                </div>
+              ) : viewMode === "diff" ? (
+                // A failed diff fetch (e.g. the diff endpoint returned a
+                // git_status_failed 500) surfaces the server's reason instead of
+                // hanging on "Loading diff…" forever — diffQuery.data stays
+                // undefined on error, which would otherwise read as still-loading.
+                diffQuery.isError ? (
+                  <div className="flex items-center justify-center p-8 text-destructive text-ui">
+                    Failed to load:{" "}
+                    {diffQuery.error instanceof Error
+                      ? diffQuery.error.message
+                      : String(diffQuery.error)}
+                  </div>
+                ) : // Wait for the diff payload before mounting Monaco. useFileDiff uses
+                // null to mean new (before=null) / deleted (after=null) file, so
+                // collapsing the not-yet-loaded state into null would mount with the
+                // wrong content and mis-set EOL (onMount runs once). Once data is
+                // present, pass the real before/after through (legitimate nulls and all).
+                !diffQuery.data ? (
+                  <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                    Loading diff…
+                  </div>
+                ) : diffQuery.data.baseline_state === "unknown" ? (
+                  <div
+                    role="status"
+                    className="flex items-center justify-center p-8 text-muted-foreground text-ui"
+                  >
+                    Original content unavailable
+                  </div>
+                ) : (
+                  // Keep viewer state on resize without computing the CSS-hidden copy's diff.
+                  isActiveViewport && (
+                    <Suspense
+                      fallback={
+                        <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                          Loading diff…
+                        </div>
+                      }
+                    >
+                      {/* key={path} remounts per file so onMount re-runs (EOL + comment
+                    wiring re-applied) and `ready` resets while the new grammar loads. */}
+                      <MonacoDiffViewer
+                        position={filePosition}
+                        key={path}
+                        before={diffQuery.data.before}
+                        after={diffQuery.data.after}
+                        path={path}
+                        layout={diffLayout}
+                        hideWhitespace={hideWhitespace}
+                        wrapLines={wrapLines}
+                        conversationId={conversationId}
+                        comments={openComments}
+                        activeSelection={activeSelection}
+                        onSetActiveSelection={handleSetActiveSelection}
+                        pendingBodyRef={pendingBodyRef}
+                        attachToAgent={attachToAgent}
+                        commentable={comparisonListing?.headIsWorkingCopy ?? true}
+                        searchOpen={searchOpen}
+                        searchFocusNonce={searchFocusNonce}
+                        onSearchHandled={handleSearchHandled}
+                      />
+                    </Suspense>
+                  )
+                )
+              ) : (
+                <CodeViewer
+                  position={filePosition}
+                  conversationId={conversationId}
+                  path={path}
+                  fileQuery={fileQuery}
+                  onDirtyChange={handleDirtyChange}
+                  onSaveStatusChange={setSaveStatus}
+                  comments={openComments}
+                  addressedComments={addressedComments}
+                  activeSelection={activeSelection}
+                  onSetActiveSelection={handleSetActiveSelection}
+                  pendingBodyRef={pendingBodyRef}
+                  panelOpen={open}
+                  mediaActive={onScreen}
+                  searchOpen={searchOpen}
+                  setSearchOpen={setSearchOpen}
+                  ownsFindShortcut={ownsFindShortcut}
+                  searchFocusNonce={searchFocusNonce}
+                  searchInputRef={searchInputRef}
+                  viewMode={viewMode}
+                  markdownSourceFallback={markdownSourceFallback ?? false}
+                  wrapLines={wrapLines}
+                  tocOpen={tocOpen}
+                  onTocToggle={() => setTocOpen((prev) => !prev)}
+                  onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+                  attachToAgent={attachToAgent}
+                />
               )}
-            </div>
-          ) : viewMode === "diff" ? (
-            // A failed diff fetch (e.g. the diff endpoint returned a
-            // git_status_failed 500) surfaces the server's reason instead of
-            // hanging on "Loading diff…" forever — diffQuery.data stays
-            // undefined on error, which would otherwise read as still-loading.
-            diffQuery.isError ? (
-              <div className="flex items-center justify-center p-8 text-destructive text-ui">
-                Failed to load:{" "}
-                {diffQuery.error instanceof Error
-                  ? diffQuery.error.message
-                  : String(diffQuery.error)}
-              </div>
-            ) : // Wait for the diff payload before mounting Monaco. useFileDiff uses
-            // null to mean new (before=null) / deleted (after=null) file, so
-            // collapsing the not-yet-loaded state into null would mount with the
-            // wrong content and mis-set EOL (onMount runs once). Once data is
-            // present, pass the real before/after through (legitimate nulls and all).
-            !diffQuery.data ? (
-              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-                Loading diff…
-              </div>
-            ) : diffQuery.data.baseline_state === "unknown" ? (
-              <div
-                role="status"
-                className="flex items-center justify-center p-8 text-muted-foreground text-ui"
-              >
-                Original content unavailable
-              </div>
-            ) : (
-              // Keep viewer state on resize without computing the CSS-hidden copy's diff.
-              isActiveViewport && (
-                <Suspense
-                  fallback={
-                    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-                      Loading diff…
-                    </div>
-                  }
-                >
-                  {/* key={path} remounts per file so onMount re-runs (EOL + comment
-                  wiring re-applied) and `ready` resets while the new grammar loads. */}
-                  <MonacoDiffViewer
-                    position={filePosition}
-                    key={path}
-                    before={diffQuery.data.before}
-                    after={diffQuery.data.after}
-                    path={path}
-                    layout={diffLayout}
-                    hideWhitespace={hideWhitespace}
-                    wrapLines={wrapLines}
-                    conversationId={conversationId}
-                    comments={openComments}
-                    activeSelection={activeSelection}
-                    onSetActiveSelection={handleSetActiveSelection}
-                    pendingBodyRef={pendingBodyRef}
-                    attachToAgent={attachToAgent}
-                    searchOpen={searchOpen}
-                    searchFocusNonce={searchFocusNonce}
-                    onSearchHandled={handleSearchHandled}
-                  />
-                </Suspense>
-              )
-            )
-          ) : (
-            <CodeViewer
-              position={filePosition}
-              conversationId={conversationId}
-              path={path}
-              fileQuery={fileQuery}
-              onDirtyChange={handleDirtyChange}
-              onSaveStatusChange={setSaveStatus}
+            </RenderErrorBoundary>
+          </div>
+          {commentsOpen && (
+            <CommentsPanel
               comments={openComments}
               addressedComments={addressedComments}
               activeSelection={activeSelection}
-              onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
-              panelOpen={open}
-              mediaActive={onScreen}
-              searchOpen={searchOpen}
-              setSearchOpen={setSearchOpen}
-              searchFocusNonce={searchFocusNonce}
-              searchInputRef={searchInputRef}
-              viewMode={viewMode}
-              markdownSourceFallback={markdownSourceFallback ?? false}
-              wrapLines={wrapLines}
-              tocOpen={tocOpen}
-              onTocToggle={() => setTocOpen((prev) => !prev)}
-              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
-              attachToAgent={attachToAgent}
+              onCopyCommentLink={copyCommentLink}
+              onAddComment={(body) => {
+                if (activeSelection == null) return;
+                addComment.mutate(
+                  {
+                    path,
+                    start_index: activeSelection.start_index,
+                    end_index: activeSelection.end_index,
+                    body,
+                    anchor_content: activeSelection.anchor_content,
+                  },
+                  { onSuccess: () => setActiveSelection(null) },
+                );
+              }}
+              canAddress={canEdit && sender !== null}
+              addressCount={addressableCommentIds.length}
+              addressFileCount={addressableFileCount}
+              onAddressAll={() => {
+                if (!sender || addressableCommentIds.length === 0) return;
+                sender.mutate({ comment_ids: addressableCommentIds });
+              }}
+              onClickComment={(comment) => {
+                // A data table can't show comment anchors, so picking a comment
+                // opens Source as a ?comment= link does; the toggle still reaches the table.
+                if (isDataTablePath(path)) setDeepLinkBiasPath(path);
+                handleSetActiveSelection({
+                  start_index: comment.start_index,
+                  end_index: comment.end_index,
+                  anchor_content: comment.anchor_content ?? "",
+                  comment_id: comment.id,
+                });
+                // Sync the selected comment into the URL so the address bar is
+                // always shareable. AppShell clears this param when the viewer closes.
+                if (syncUrl)
+                  setSearchParams(
+                    (prev) => {
+                      const next = new URLSearchParams(prev);
+                      if (comment.status === "draft") next.set("comment", comment.id);
+                      else next.delete("comment");
+                      return next;
+                    },
+                    { replace: true },
+                  );
+              }}
+              onEditComment={(id, body) => updateComment.mutate({ commentId: id, body })}
+              onDeleteComment={(id) => {
+                deleteComment.mutate(id);
+                const deleted = [...openComments, ...addressedComments].find((c) => c.id === id);
+                if (
+                  deleted &&
+                  (activeSelection?.comment_id === deleted.id ||
+                    (activeSelection?.comment_id == null &&
+                      activeSelection?.start_index === deleted.start_index &&
+                      activeSelection?.end_index === deleted.end_index))
+                )
+                  setActiveSelection(null);
+              }}
+              addressPending={sender?.isPending ?? false}
+              canEdit={canEdit}
             />
           )}
         </div>
-        {commentsOpen && (
-          <CommentsPanel
-            comments={openComments}
-            addressedComments={addressedComments}
-            activeSelection={activeSelection}
-            pendingBodyRef={pendingBodyRef}
-            onCopyCommentLink={copyCommentLink}
-            onAddComment={(body) => {
-              if (activeSelection == null) return;
-              addComment.mutate(
-                {
-                  path,
-                  start_index: activeSelection.start_index,
-                  end_index: activeSelection.end_index,
-                  body,
-                  anchor_content: activeSelection.anchor_content,
-                },
-                { onSuccess: () => setActiveSelection(null) },
-              );
-            }}
-            canAddress={canEdit && sender !== null}
-            addressCount={addressableCommentIds.length}
-            addressFileCount={addressableFileCount}
-            onAddressAll={() => {
-              if (!sender || addressableCommentIds.length === 0) return;
-              sender.mutate({ comment_ids: addressableCommentIds });
-            }}
-            onClickComment={(comment) => {
-              handleSetActiveSelection({
-                start_index: comment.start_index,
-                end_index: comment.end_index,
-                anchor_content: comment.anchor_content ?? "",
-                comment_id: comment.id,
-              });
-              // Sync the selected comment into the URL so the address bar is
-              // always shareable. AppShell clears this param when the viewer closes.
-              if (syncUrl)
-                setSearchParams(
-                  (prev) => {
-                    const next = new URLSearchParams(prev);
-                    if (comment.status === "draft") next.set("comment", comment.id);
-                    else next.delete("comment");
-                    return next;
-                  },
-                  { replace: true },
-                );
-            }}
-            onEditComment={(id, body) => updateComment.mutate({ commentId: id, body })}
-            onDeleteComment={(id) => {
-              deleteComment.mutate(id);
-              const deleted = [...openComments, ...addressedComments].find((c) => c.id === id);
-              if (
-                deleted &&
-                (activeSelection?.comment_id === deleted.id ||
-                  (activeSelection?.comment_id == null &&
-                    activeSelection?.start_index === deleted.start_index &&
-                    activeSelection?.end_index === deleted.end_index))
-              )
-                setActiveSelection(null);
-            }}
-            addressPending={sender?.isPending ?? false}
-            canEdit={canEdit}
-          />
-        )}
-      </div>
+      </BesideSidebarContent>
       <Dialog
         open={pendingAction !== null}
         onOpenChange={(isOpen) => {
           if (!isOpen) {
             pendingAction?.cancel?.();
-            setPendingAction(null);
+            showPendingAction(null);
           }
         }}
       >
@@ -2121,7 +2355,7 @@ function FileViewerBody({
               variant="outline"
               onClick={() => {
                 pendingAction?.cancel?.();
-                setPendingAction(null);
+                showPendingAction(null);
               }}
             >
               Keep editing
@@ -2131,7 +2365,7 @@ function FileViewerBody({
               onClick={() => {
                 handleDirtyChange(false);
                 pendingAction?.apply();
-                setPendingAction(null);
+                showPendingAction(null);
               }}
             >
               Discard changes
@@ -2142,9 +2376,12 @@ function FileViewerBody({
     </>
   );
 
-  // While the viewer is the surface last used, Escape closes its Find bar, or else its
-  // tab (see above), so page-wide Escape shortcuts leave it alone.
-  const ownsEscape = open && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
+  // While the viewer is the surface last used, Escape closes its Find bar, or else exits
+  // full screen or closes its tab (see above), so page-wide Escape shortcuts leave it alone.
+  const ownsEscape =
+    open &&
+    (onExitFullScreen !== undefined ||
+      (viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined)));
 
   if (frameless) {
     return (
@@ -2154,7 +2391,9 @@ function FileViewerBody({
         data-escape-owner={ownsEscape ? "" : undefined}
         style={{ paddingBottom: keyboardInset || undefined }}
         className={cn(
-          "flex flex-col flex-1 min-h-0 overflow-hidden bg-card",
+          besideSidebar
+            ? cn("bg-background", WORKSPACE_SIDEBAR_LAYOUT.page)
+            : "flex flex-col flex-1 min-h-0 overflow-hidden bg-card",
           mobileOverlay && "fixed inset-0 z-50 shadow-lg",
         )}
       >

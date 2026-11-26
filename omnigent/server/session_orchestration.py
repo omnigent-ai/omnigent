@@ -20,6 +20,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
 )
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.session_lifecycle import is_session_closed
 
 
@@ -34,6 +35,22 @@ def _shared_with_editors(session_id: str, user_id: str, permissions: PermissionS
             return False
 
 
+def _unusable_session_error(
+    identifier: str, session: Conversation, unusable: Conversation
+) -> OmnigentError:
+    """Tell the owner that the session, or one it belongs to, is closed or archived."""
+    closed = is_session_closed(unusable.labels, unusable.title)
+    if unusable.id == session.id:
+        subject = f"Session {identifier} is {'closed' if closed else 'archived'}"
+        remedy = "use another session" if closed else "unarchive it or use another session"
+    else:
+        subject = (
+            f"Session {identifier} belongs to {'a closed' if closed else 'an archived'} session"
+        )
+        remedy = "use another session" if closed else "unarchive that session or use another one"
+    return OmnigentError(f"{subject}; {remedy}", code=ErrorCode.FORBIDDEN)
+
+
 def require_owned_session(
     identifier: str,
     user_id: str,
@@ -46,11 +63,16 @@ def require_owned_session(
     session_id = normalize_uuid(identifier)
     session = conversations.get_conversation(session_id) if session_id else None
     current, seen = session, set()
+    # Named only where the chain would otherwise be accepted, so every other refusal
+    # wins and callers who don't own the chain learn nothing new.
+    unusable: Conversation | None = None
     while current is not None:
-        if current.id in seen or len(seen) >= 32 or current.archived:
+        if current.id in seen or len(seen) >= 32:
             break
-        if is_session_closed(current.labels, current.title):
-            break
+        if unusable is None and (
+            current.archived or is_session_closed(current.labels, current.title)
+        ):
+            unusable = current
         seen.add(current.id)
         if current.parent_conversation_id is not None:
             current = conversations.get_conversation(current.parent_conversation_id)
@@ -73,6 +95,8 @@ def require_owned_session(
                 current = conversations.get_conversation(source_id) if source_id else None
                 continue
         assert session is not None
+        if unusable is not None:
+            raise _unusable_session_error(identifier, session, unusable)
         return session
     raise OmnigentError("Session is not owned or available", code=ErrorCode.FORBIDDEN)
 
@@ -187,8 +211,15 @@ def require_orchestration_source(
 
 def orchestration_message(source_id: str, message: object) -> SessionStartupInput:
     """Build a text-only task with a display label, not proof of message origin."""
-    if not isinstance(message, str) or not message.strip() or len(message) > 8000:
-        raise OmnigentError("Provide a message of 1–8000 characters", code=ErrorCode.INVALID_INPUT)
+    if (
+        not isinstance(message, str)
+        or not message.strip()
+        or len(message) > SESSION_MESSAGE_MAX_CHARS
+    ):
+        raise OmnigentError(
+            f"Provide a message of 1–{SESSION_MESSAGE_MAX_CHARS} characters",
+            code=ErrorCode.INVALID_INPUT,
+        )
     return SessionStartupInput(
         type="message",
         data={

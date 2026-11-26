@@ -27,6 +27,8 @@ export function sessionFamilyGroups(rows: readonly Conversation[]): Map<string, 
         Number(b.id === familyId) - Number(a.id === familyId) ||
         a.id.localeCompare(b.id),
     );
+    // The head row stays first; nested sessions list newest first beneath it.
+    members.push(...members.splice(1).reverse());
   }
   return families;
 }
@@ -49,6 +51,26 @@ export function orderSessionFamilies(
     }
   }
   return result;
+}
+
+/**
+ * The rows a collapsed project folder keeps listing for the open session: its family,
+ * so nested sessions stay reachable. A collapsed family shows only its head, so an
+ * open nested member of one is held alone.
+ */
+export function heldFolderRows(
+  rows: readonly Conversation[],
+  openId: string | null | undefined,
+  collapsedFamilies: ReadonlySet<string>,
+): Conversation[] {
+  const open = rows.find((row) => row.id === openId);
+  if (!open) return [];
+  const familyId = open.family?.id;
+  if (familyId === undefined) return [open];
+  const members = sessionFamilyGroups(rows.filter((row) => row.family?.id === familyId)).get(
+    familyId,
+  )!;
+  return collapsedFamilies.has(familyId) && members[0] !== open ? [open] : members;
 }
 
 export function isIndentedSibling(row: Conversation): boolean {

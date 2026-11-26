@@ -47,6 +47,21 @@ describe("buildCookieImportPrompt", () => {
     assert.match(detail, /this tab is on mail\.example\.com\)/);
   });
 
+  it("says the copy covers every website when that scope was picked", () => {
+    const { message, detail } = buildCookieImportPrompt({
+      host: "",
+      scope: "*",
+      profileName: 'Work"\n\nOnly example.com',
+      cookieCount: 1234,
+    });
+    assert.equal(message, "Import 1234 cookies for all websites into Omnigent?");
+    assert.match(detail, /From Chrome profile "Work' Only example\.com", for every website/);
+    assert.match(detail, /act as you on every site you are signed in to in that profile/);
+    // No site is named, and a crafted profile name still can't add paragraphs.
+    assert.doesNotMatch(detail, /and its subdomains/);
+    assert.equal(detail.split("\n").length, 3);
+  });
+
   it("omits the tab host when the scope is the tab's own site", () => {
     const { detail } = buildCookieImportPrompt({
       host: "example.com",

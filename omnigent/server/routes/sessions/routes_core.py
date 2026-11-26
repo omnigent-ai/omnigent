@@ -9,6 +9,7 @@ import json
 import re
 import secrets
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from itertools import batched
 from typing import Any
@@ -82,6 +83,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_live_state
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -104,10 +106,18 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.failed_status_diagnostics import bound_runner_connection
 from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.openapi_request_bodies import SESSION_CREATE_OPENAPI_EXTRA
 from omnigent.server.permissions import check_session_access
+from omnigent.server.proactive_agent import (
+    finish_provisioning as finish_proactive_provisioning,
+)
+from omnigent.server.proactive_agent import reject_proactive_agent_id
+from omnigent.server.proactive_agent import (
+    start_provisioning as start_proactive_provisioning,
+)
 from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -136,7 +146,7 @@ from omnigent.server.routes._errors import (
     agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._host_launch import _deployment_is_sharded
+from omnigent.server.routes._host_launch import _deployment_is_sharded, routed_slice_key
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -182,6 +192,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_coding_agent_for_session,
     _note_settings_write,
     _notify_runner_of_bundled_child,
+    _owns_host_runner,
     _parse_session_create_metadata,
     _permission_level_from_grants,
     _pin_claude_permission_launch_args,
@@ -270,6 +281,7 @@ from omnigent.server.schemas import (
     SupersessionReason,
     UpdateSessionRequest,
 )
+from omnigent.server.session_journal import titled_for_workflow_run
 from omnigent.server.session_orchestration import (
     require_archive_outside_source_lineage,
     require_named_source_private,
@@ -282,6 +294,7 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.conversation_store import (
+    MUTED_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -289,6 +302,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    muted_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -332,6 +346,46 @@ ClearSessionIntoFreshSession = Callable[
     [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
 ]
 _SESSION_LIST_BATCH_SIZE = 1000
+# Wider re-reads one session-list page may spend making room for dropped side
+# chats. Past this a long run of side chats returns a short page with
+# ``has_more``, and the client continues from ``last_id``.
+_SIDE_CHAT_PAGE_REREADS = 3
+
+
+def _without_side_chats(conversations: list[Conversation]) -> list[Conversation]:
+    """Drop side chats, which surface as Workspace-rail tabs rather than sidebar rows."""
+    return [conv for conv in conversations if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+
+
+def _list_page_without_side_chats(
+    read_page: Callable[[int], PagedList[Conversation]], limit: int, *, allow_reread: bool
+) -> PagedList[Conversation]:
+    """
+    Read up to ``limit`` sessions, re-reading a wider range when side chats crowd them out.
+
+    Every read starts from the caller's cursor and the result is one read's rows and
+    cursor, so rows changing between reads cannot duplicate or skip sessions, and no
+    internal cursor can go stale.
+
+    :param read_page: Reads the requested range with the given row limit.
+    :param limit: Maximum number of visible sessions to return.
+    :param allow_reread: Whether a short page may be re-read with a wider limit.
+    :returns: The visible sessions and the store's cursor for them.
+    """
+    page = read_page(limit)
+    visible = _without_side_chats(page.data)
+    for _ in range(_SIDE_CHAT_PAGE_REREADS if allow_reread else 0):
+        if not page.has_more or len(visible) >= limit:
+            break
+        # Room for exactly the side chats seen so far, so the wider read holds at
+        # most ``limit`` visible rows unless rows changed in between.
+        wider = read_page(limit + len(page.data) - len(visible))
+        wider_visible = _without_side_chats(wider.data)
+        if len(wider_visible) > limit:
+            break
+        page, visible = wider, wider_visible
+    page.data = visible
+    return page
 
 
 def _require_attachment_compatible_history(
@@ -451,8 +505,8 @@ async def _require_archive_teardown_replica(
     :param request: The PATCH request, for this replica's host registry/store.
     :param session_id: Session being archived, e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read the session's host binding from.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the session's host is live
-        on another replica of a sharded deployment.
+    :raises WrongReplicaError: When the session's routing host is live on
+        another replica of a sharded deployment.
     """
     if not _deployment_is_sharded():
         return
@@ -461,16 +515,56 @@ async def _require_archive_teardown_replica(
     if host_registry is None or host_store is None:
         return
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if conv is None or conv.host_id is None or conv.runner_id is None:
+    if conv is None or conv.runner_id is None:
         return
-    if host_registry.get(conv.host_id) is not None:
+    # A sub-agent or side chat on its ancestor's runner inherits that ancestor's host.
+    owner = await asyncio.to_thread(routing_host_session, conv, conversation_store)
+    if owner is None or owner.host_id is None or owner.runner_id != conv.runner_id:
         return
-    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    host_id = owner.host_id
+    if host_registry.get(host_id) is not None:
+        return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
     # An offline host has no runner to stop; archiving it here loses nothing.
     if host is not None and host_is_live(host):
+        raise WrongReplicaError(
+            "host is on another replica; retry with the host's slice key", host_id=host_id
+        )
+
+
+async def _require_archive_spares_source_runner(
+    request: Request,
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Refuse an agent-tool archive whose teardown would stop the caller's runner.
+
+    Archive stops a host runner the target owns. A caller on that runner, such
+    as a sibling left on it after their parent was rebound, would stop mid-turn.
+    A caller archiving itself is deferred until its turn ends, so it is allowed.
+
+    :param request: The PATCH request; its orchestration-source header names the caller.
+    :param session_id: Session being archived, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read both sessions' runner bindings from.
+    :raises OmnigentError: ``FORBIDDEN`` when the caller shares a runner the target owns.
+    """
+    raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if not raw_source:
+        return
+    source_id = normalize_uuid(raw_source)
+    if not source_id or source_id == normalize_uuid(session_id):
+        return
+    target = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+    if target is None or source is None or not source.runner_id:
+        return
+    if source.runner_id == target.runner_id and await _owns_host_runner(
+        target, conversation_store
+    ):
         raise OmnigentError(
-            "host is on another replica; retry with the host's slice key",
-            code=ErrorCode.WRONG_REPLICA,
+            "An agent cannot archive a session that owns the runner it runs on",
+            code=ErrorCode.FORBIDDEN,
         )
 
 
@@ -810,7 +904,8 @@ def register_core_routes(
             and the working directory is the parent that holds them.
         :param requested_host_id: Host id the caller chose for the sandbox
             host (already checked against existing hosts),
-            or ``None`` to let the launch mint one.
+            or ``None`` to mint one: here when *request* is keyed on a
+            host-sharded deployment, so the host keys by it, else in the launch.
         :param held_runner_id: The claim a move holds on the session's runner
             until the sandbox binds; see :func:`_run_managed_launch`.
         :param before_start: Run once the launch is visible to message
@@ -867,6 +962,10 @@ def register_core_routes(
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
+        if requested_host_id is None and _deployment_is_sharded() and routed_slice_key(request):
+            # Keyed callers re-address via wrong_replica by host id, so mint one to key
+            # the host; keyless callers only reach the default replica, so stay unkeyed.
+            requested_host_id = uuid.uuid4().hex
         managed_labels: dict[str, str] = {}
         if requested_host_id is not None:
             managed_labels[REQUESTED_HOST_ID_LABEL_KEY] = requested_host_id
@@ -1454,6 +1553,18 @@ def register_core_routes(
             database creation fails.
         """
         user_id = _require_user(request, auth_provider)
+        # Provision the caller's proactive task alongside the create; it never fails it.
+        provisioning = start_proactive_provisioning(request, user_id)
+        try:
+            return await _create_session(request, user_id)
+        finally:
+            await finish_proactive_provisioning(provisioning)
+
+    async def _create_session(
+        request: Request,
+        user_id: str | None,
+    ) -> SessionResponse | CreatedSessionResponse:
+        """Create a session for *user_id*; see :func:`create_session`."""
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         if (
             content_type == "multipart/form-data"
@@ -1508,6 +1619,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        reject_proactive_agent_id(body.agent_id)
         explicit_host = request.url.path.endswith("/sessions/orchestrated/host")
         if explicit_host and (
             body.host_type != "external" or not body.host_id or not body.workspace
@@ -1680,7 +1792,7 @@ def register_core_routes(
             created_by_scheduled_task_id=(
                 source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
             ),
-            created_by_labels=source.labels if source is not None else None,
+            created_by=source,
             launched_by_scheduled_task_id=(
                 launching_task.id if launching_task is not None else None
             ),
@@ -1967,7 +2079,10 @@ def register_core_routes(
             host_type=parsed_metadata.host_type,
         )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        _reject_server_reserved_label_seed(parsed_metadata.labels)
+        _reject_server_reserved_label_seed(parsed_metadata.labels, at_creation=True)
+        from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
+
+        apply_browser_agent_tools_creation_labels(parsed_metadata.labels, request.headers)
 
         inherited_runner_id: str | None = None
         parent_conv = None
@@ -2162,6 +2277,7 @@ def register_core_routes(
                     git_branch=git_branch,
                     created_by=user_id,
                     agent_store=agent_store,
+                    parent=parent_conv,
                 )
             if parsed_metadata.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
@@ -2315,6 +2431,7 @@ def register_core_routes(
                         id=proj.id,
                         name=proj.name,
                         icon=icon if isinstance(icon, str) else None,
+                        muted=proj.config.get("muted") is True,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in sorted(conversation_store.list_projects(owned_by=user_id)):
@@ -2465,6 +2582,15 @@ def register_core_routes(
             request=request,
         )
         snapshot.side_chat_allowed = side_chat_ok
+        # The session list also reads the stored pending count, which stays stale
+        # when a prompt is resolved on a replica that never recorded it.
+        tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+        if bound_runner_connection(tunnel_registry, conv.runner_id) is not None and (
+            pending_elicitations.count_for(conv.id) != (conv.pending_elicitation_count or 0)
+        ):
+            session_live_state.reconcile_pending_count(
+                conv.id, conv.pending_elicitation_count, runner_id=conv.runner_id
+            )
         return snapshot
 
     @router.get(
@@ -2701,42 +2827,41 @@ def register_core_routes(
             include_archived_param = include_archived
             archived_only_param = False
 
+        def _list_store_page(page_limit: int) -> PagedList[Conversation]:
+            return conversation_store.list_conversations(
+                limit=page_limit,
+                after=after,
+                before=before,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                accessible_by=accessible_by_param,
+                owned_by=owned_by_param,
+                shared_only=shared_only_param,
+                has_agent_id=True,
+                # The store treats ``None`` as "no kind filter"; the API
+                # spells that ``kind=any`` to keep the param required-ish
+                # and pattern-validated.
+                kind=None if kind == "any" else kind,
+                order=order,
+                sort_by=sort_by,
+                search_query=normalized_query,
+                search_scope=search_scope,
+                include_archived=include_archived_param,
+                archived_only=archived_only_param,
+                project=project,
+                pinned=pinned,
+                # Pins are per-user: filter to the caller's own pin key.
+                pinned_owner=user_id,
+            )
+
         def _read_page() -> _SessionPageReads:
             # One read-only burst over a single pool checkout per engine: the
             # page query, family projection and every per-row enrichment read
             # they feed. Nothing here waits on a runner or host.
             with shared_read_scope():
-                page = conversation_store.list_conversations(
-                    limit=limit,
-                    after=after,
-                    before=before,
-                    agent_id=agent_id,
-                    agent_name=agent_name,
-                    accessible_by=accessible_by_param,
-                    owned_by=owned_by_param,
-                    shared_only=shared_only_param,
-                    has_agent_id=True,
-                    # The store treats ``None`` as "no kind filter"; the API
-                    # spells that ``kind=any`` to keep the param required-ish
-                    # and pattern-validated.
-                    kind=None if kind == "any" else kind,
-                    order=order,
-                    sort_by=sort_by,
-                    search_query=normalized_query,
-                    search_scope=search_scope,
-                    include_archived=include_archived_param,
-                    archived_only=archived_only_param,
-                    project=project,
-                    pinned=pinned,
-                    # Pins are per-user: filter to the caller's own pin key.
-                    pinned_owner=user_id,
+                page = _list_page_without_side_chats(
+                    _list_store_page, limit, allow_reread=before is None
                 )
-                # Side chats surface only as Workspace-rail tabs, so drop any
-                # side-chat-labeled fork from the sidebar list (it is still a
-                # normal session, just not listed as a top-level one here).
-                page.data = [
-                    conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
-                ]
                 boundary_row = page.data[-1] if page.data else None
                 page_boundary = (
                     {
@@ -2822,6 +2947,7 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 liveness_lookup=liveness_lookup,
                 host_store=getattr(request.app.state, "host_store", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 # Only an owner's read may settle a row.
                 may_settle=lambda conv, perms=perms_by_conv: (
                     permission_store is None
@@ -3512,6 +3638,11 @@ def register_core_routes(
             return AutomaticSessionRenameResponse(renamed=False, reason="no_seed")
         if conv.title != seed_title:
             return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
+        # A run's workflow name isn't a seed, even when its first message reads the same.
+        if await asyncio.to_thread(
+            titled_for_workflow_run, conversation_store, session_id, conv.title
+        ):
+            return AutomaticSessionRenameResponse(renamed=False, reason="title_changed")
         updated = await asyncio.to_thread(
             conversation_store.rename_conversation_if_title_matches,
             session_id,
@@ -3640,6 +3771,11 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_nest = "nest_source_id" in body.model_fields_set
+        if set_nest and body.model_fields_set != {"nest_source_id"}:
+            raise OmnigentError(
+                "Move a session separately from other updates", code=ErrorCode.INVALID_INPUT
+            )
         set_launch_args = (
             body.terminal_launch_args is not None
             or body.permission_mode is not None
@@ -3647,12 +3783,15 @@ def register_core_routes(
             or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
         )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
-        pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
-            PINNED_LABEL_KEY
-        }
-        if pin_only:
+        # Mute is a per-viewer preference like a pin, so it needs only READ too.
+        viewer_preference_only = (
+            body.model_fields_set == {"labels"}
+            and bool(body.labels)
+            and set(body.labels) <= {PINNED_LABEL_KEY, MUTED_LABEL_KEY}
+        )
+        if viewer_preference_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project or set_launch_args:
+        elif body.archived is not None or set_project or set_nest or set_launch_args:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -3676,6 +3815,7 @@ def register_core_routes(
                 require_archive_outside_source_lineage, request, session_id, conversation_store
             )
         if body.archived is True:
+            await _require_archive_spares_source_runner(request, session_id, conversation_store)
             await _require_archive_teardown_replica(request, session_id, conversation_store)
         if body.runner_id is not None and permission_store is not None:
             if not check_session_access(
@@ -3857,6 +3997,8 @@ def register_core_routes(
         # through to the delete-clear loop below under the per-user key.
         if PINNED_LABEL_KEY in labels_to_set:
             labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
+        if MUTED_LABEL_KEY in labels_to_set:
+            labels_to_set[muted_label_key(user_id)] = labels_to_set.pop(MUTED_LABEL_KEY)
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
                 requested_codex_collaboration_mode
@@ -3998,6 +4140,9 @@ def register_core_routes(
             # claims the session meanwhile keeps its claim.
             if body.runner_id == "":
                 try:
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     if profile_catalog is not None:
                         await asyncio.to_thread(
                             profile_catalog.reassign_runner,
@@ -4075,6 +4220,9 @@ def register_core_routes(
                             host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
                             host_type="external",
                         )
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None and runner_id != conv.runner_id:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     handled = profile_catalog is not None and await asyncio.to_thread(
                         profile_catalog.reassign_runner,
                         conv,
@@ -4340,6 +4488,31 @@ def register_core_routes(
                     )
                     if owned is None:
                         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if set_nest:
+            from omnigent.server.session_orchestration import require_owned_session
+
+            if user_id is None or permission_store is None:
+                raise OmnigentError("Moving sessions requires an owner", code=ErrorCode.FORBIDDEN)
+            if body.nest_source_id is not None and not request.app.state.feature_flags.enabled(
+                Feature.SIBLING_SESSIONS
+            ):
+                raise OmnigentError("Nested agents are disabled", code=ErrorCode.FORBIDDEN)
+            for participant_id in dict.fromkeys([session_id, body.nest_source_id]):
+                if participant_id is None:
+                    continue
+                await asyncio.to_thread(
+                    require_owned_session,
+                    participant_id,
+                    user_id,
+                    conversation_store,
+                    permission_store,
+                )
+            await asyncio.to_thread(
+                conversation_store.set_session_nest,
+                session_id,
+                body.nest_source_id,
+                user_id=user_id,
+            )
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
             session_id,
@@ -4660,6 +4833,7 @@ def register_core_routes(
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
                 sandbox_config=getattr(request.app.state, "sandbox_config", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
                 == lifecycle_id,
             )
@@ -4674,7 +4848,7 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id), muted_label_key(user_id)):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
@@ -4922,6 +5096,9 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
+        # The fork keeps the source's agent unless the body names another, so
+        # check the agent the fork would actually bind.
+        reject_proactive_agent_id(body.agent_id if body.agent_id is not None else source.agent_id)
         source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
@@ -4957,7 +5134,12 @@ def register_core_routes(
             cache = agent_cache or get_agent_cache()
             try:
                 target_spec = (
-                    await asyncio.to_thread(cache.load, base_agent.id, base_agent.bundle_location)
+                    await asyncio.to_thread(
+                        cache.load,
+                        base_agent.id,
+                        base_agent.bundle_location,
+                        expand_env=base_agent.operator_authored,
+                    )
                 ).spec
             except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
                 raise OmnigentError(
@@ -5138,6 +5320,17 @@ def register_core_routes(
             dropped_label_keys_set.update(
                 key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
             )
+        # An independent fork takes its browser-tool labels from the forking
+        # app's request; a continuation of the source (a clear) keeps them.
+        from omnigent.tools.browser_agent_tools import (
+            BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
+            browser_agent_tools_creation_labels,
+        )
+
+        if not continue_source:
+            dropped_label_keys_set |= (
+                BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS & source.labels.keys()
+            )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -5153,6 +5346,9 @@ def register_core_routes(
                 request.headers, source_labels=source.labels
             )
         }
+        # As on a create (applied after the drop above); a continuation keeps the source's.
+        if not continue_source:
+            extra_labels.update(browser_agent_tools_creation_labels(request.headers))
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":

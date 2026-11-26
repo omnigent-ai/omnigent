@@ -223,9 +223,35 @@ local server (pass `--force` to stop them immediately); the next `omni` command
 brings the server back up on the new version. Source checkouts update with
 `git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
 
+If a `uv tool` install fails to start a sandbox with a `mutable hard-link alias`
+error, reinstall its dependencies as copies. The check depends on the installed
+runtime layout, including installations made by older releases:
+
+```bash
+uv tool upgrade --reinstall --link-mode copy omnigent
+```
+
 The check queries your configured package index — honoring `UV_INDEX_URL` /
 `PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
 mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
+
+**Nightly builds.** Every night (about 04:30 UTC) the newest commit on `main`
+with green CI is tagged as a `vX.Y.Z.devYYYYMMDD` prerelease. Nightlies are git
+tags, not PyPI releases, so installing one builds from source and needs `git`,
+Node.js 22+, and `pnpm`:
+
+```bash
+omni upgrade --nightly          # move onto the newest nightly
+omni upgrade --nightly --check  # report whether a newer nightly is out
+```
+
+A nightly install shows no release notice, and plain `omni upgrade` keeps it on
+its current tag, so rerun `omni upgrade --nightly` (or schedule
+[`scripts/update_nightly.sh`](scripts/update_nightly.sh)) to stay current. When
+the desktop app starts a local server it uses your installed `omni`, so it
+serves the nightly web UI; the desktop app itself updates only with stable
+releases. To return to the latest stable release, rerun the install script
+above (with the same `--extra` flags, if any).
 
 </details>
 
@@ -407,6 +433,12 @@ omnigent run examples/deep-research/
 omnigent run examples/polly/ --harness <harness>
 omnigent run examples/debby/ --harness <harness>
 ```
+
+Add `-p "your prompt"` to run headlessly. The CLI waits up to 30 minutes for
+first-turn recovery or additional asynchronous turns. Set
+`OMNIGENT_HEADLESS_TIMEOUT_S` to a positive finite number of seconds for that
+invocation to change this wait budget; separate process or job deadlines still
+apply.
 
 **🐙 Polly** is a multi-agent coding orchestrator who writes no code herself.
 She's the tech lead: she plans, delegates the work to coding sub-agents

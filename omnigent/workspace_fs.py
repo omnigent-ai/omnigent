@@ -39,15 +39,14 @@ import os
 import re
 import stat
 import subprocess
-from collections import deque
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias, TypedDict, cast
+from typing import NotRequired, TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import PagedList, paginate_in_memory
-from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -59,14 +58,20 @@ from omnigent.runner.environment_filesystem import (
     split_glob_list,
 )
 from omnigent.runtime.filesystem_registry import (
+    FilesystemRegistry,
     GitStatusUnavailable,
     create_filesystem_registry,
 )
+from omnigent.workspace_file_search import walk_search
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Longer than any platform's PATH_MAX, so a real link always fits.
+_MAX_LINK_TEXT_BYTES = 4096
 _REPOSITORY_BRANCH_TIMEOUT_S = 3.0
 _MAX_REPOSITORY_BRANCHES = 10
+# Chains longer than this stop early; the client lists the rest on expand.
+_MAX_DIRECTORY_CHAIN = 64
 
 _WorkspacePayload: TypeAlias = dict[str, object]
 
@@ -81,6 +86,8 @@ class ListedEntry(TypedDict):
     type: str
     bytes: int | None
     modified_at: int
+    # The deepest directory of a single-child chain, when the listing was asked to collapse them.
+    leaf_directory_path: NotRequired[str]
 
 
 def _repository_branch(url: str, checkout: Path) -> _WorkspacePayload:
@@ -155,9 +162,18 @@ class FileBytes:
     content_type: str | None
 
 
+def guess_content_type(rel: str) -> str | None:
+    """The MIME type a file read reports for ``rel``, from its name alone.
+
+    Uses this machine's MIME table, e.g. ``"text/markdown"`` for ``"notes.md"``.
+    """
+    content_type, _ = mimetypes.guess_type(rel)
+    return content_type
+
+
 def _cap_file_bytes(rel: str, raw: bytes) -> FileBytes:
     """Cap ``raw`` at the read limit and decide whether it is UTF-8 text."""
-    content_type, _ = mimetypes.guess_type(rel)
+    content_type = guess_content_type(rel)
     truncated = len(raw) > _MAX_READ_BYTES
     capped = raw[:_MAX_READ_BYTES] if truncated else raw
     try:
@@ -178,6 +194,33 @@ def is_utf8_encodable(text: str) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+def single_child_chain(directory: Path) -> list[str]:
+    """Follow ``directory`` while its only entry is a real (non-symlink) directory.
+
+    Stops at a second entry, a file, a symlink, a name that isn't UTF-8, an
+    unreadable directory, or :data:`_MAX_DIRECTORY_CHAIN` levels.
+
+    :param directory: The directory to start from, e.g. ``root / "com"``.
+    :returns: The names traversed, e.g. ``["example", "app"]``; empty when
+        ``directory`` doesn't hold exactly one directory.
+    """
+    names: list[str] = []
+    current = directory
+    while len(names) < _MAX_DIRECTORY_CHAIN:
+        try:
+            with os.scandir(current) as entries:
+                first = next(entries, None)
+                if first is None or next(entries, None) is not None:
+                    break
+                if not is_utf8_encodable(first.name) or not first.is_dir(follow_symlinks=False):
+                    break
+        except OSError:
+            break
+        names.append(first.name)
+        current = current / first.name
+    return names
 
 
 def _resolve_workspace_path(root: Path, path: str) -> Path:
@@ -218,6 +261,38 @@ def read_repository_branches(root: Path, repositories: list[dict[str, str]]) -> 
     return {"repositories": branches}
 
 
+def _describe_entry(full: Path, name: str, rel: str) -> ListedEntry | None:
+    """Describe one directory entry as the runner's ``list_dir`` does.
+
+    Classifies it by its target's type (following a symlink) and lists a
+    broken symlink as a file with no size, rather than dropping it.
+
+    :returns: The entry, or ``None`` when even ``lstat`` fails.
+    """
+    try:
+        st = full.stat()  # follows symlinks, like the runner
+        entry_type = "directory" if stat.S_ISDIR(st.st_mode) else "file"
+        size = st.st_size if entry_type == "file" else None
+        mtime = int(st.st_mtime)
+    except OSError:
+        try:
+            ls = full.lstat()
+        except OSError:
+            return None
+        entry_type = "file"
+        size = None
+        mtime = int(ls.st_mtime)
+    return {
+        "id": rel,
+        "object": "session.environment.filesystem.entry",
+        "name": name,
+        "path": rel,
+        "type": entry_type,
+        "bytes": size,
+        "modified_at": mtime,
+    }
+
+
 class WorkspaceReader:
     """Read-only view of a workspace directory, confined to its root.
 
@@ -227,11 +302,28 @@ class WorkspaceReader:
 
     def __init__(self, root: Path) -> None:
         self._root = Path(root).resolve()
-        # The change registry (git or edit-tracking) is chosen the same
-        # way the runner chooses it, so git workspaces get git-status
-        # semantics and everything else degrades to an empty list.
-        self._registry = create_filesystem_registry(self._root)
-        self._registry.start()
+        self._started_registry: FilesystemRegistry | None = None
+        self._registry_lock = threading.Lock()
+
+    @property
+    def _registry(self) -> FilesystemRegistry:
+        """The change registry, started on first use by changes, diffs or search.
+
+        Chosen the way the runner chooses it, so git workspaces get git-status
+        semantics and everything else degrades to an empty list. Starting it
+        may write the repository's config, so readers that only list or read
+        files never start it.
+        """
+        with self._registry_lock:
+            if self._started_registry is None:
+                self._started_registry = create_filesystem_registry(self._root)
+                self._started_registry.start()
+            return self._started_registry
+
+    @property
+    def root(self) -> Path:
+        """The workspace directory, resolved."""
+        return self._root
 
     # ── Path confinement ──────────────────────────────────────────
 
@@ -244,6 +336,14 @@ class WorkspaceReader:
             or is otherwise invalid.
         """
         return _resolve_workspace_path(self._root, path)
+
+    def resolve_directory(self, path: str) -> Path:
+        """The confined directory :meth:`list_directory` reads for ``path``, symlinks resolved.
+
+        :param path: Relative directory path (``""`` for the workspace root).
+        :raises WorkspaceReaderError: 400 when the path escapes the root or is invalid.
+        """
+        return self._resolve(path)
 
     # ── Directory listing / file content ──────────────────────────
 
@@ -272,7 +372,12 @@ class WorkspaceReader:
         return self._read_file(path, resolved)
 
     def list_directory(
-        self, path: str, *, limit: int, after: str | None
+        self,
+        path: str,
+        *,
+        limit: int,
+        after: str | None,
+        collapse_single_child_directories: bool = False,
     ) -> PagedList[ListedEntry]:
         """List a directory in ascending name order, like ``list_or_read``.
 
@@ -280,13 +385,25 @@ class WorkspaceReader:
         :param limit: Max entries to return.
         :param after: Return entries after this entry id. An id whose entry
             was removed since still resumes at its place in name order.
+        :param collapse_single_child_directories: Give each real (non-symlink)
+            directory whose only entry is a directory a ``leaf_directory_path``,
+            the deepest directory of that chain (see :func:`single_child_chain`).
         :returns: The page of entries.
         :raises WorkspaceReaderError: 404 when ``path`` is not a readable directory.
         """
-        entries = self._list_entries(path, self._resolve(path))
+        resolved = self._resolve(path)
+        entries = self._list_entries(path, resolved)
         # Ids sort like names (one shared parent), so the cursor needn't still exist.
         start = bisect.bisect_right([e["id"] for e in entries], after) if after else 0
         page = entries[start : start + limit]
+        if collapse_single_child_directories:
+            for entry in page:
+                child = resolved / entry["name"]
+                if entry["type"] != "directory" or child.is_symlink():
+                    continue
+                chain = single_child_chain(child)
+                if chain:
+                    entry["leaf_directory_path"] = "/".join([entry["path"], *chain])
         return PagedList(
             data=page,
             first_id=page[0]["id"] if page else None,
@@ -303,6 +420,73 @@ class WorkspaceReader:
             is not a readable regular file.
         """
         return _cap_file_bytes(path, self._read_capped(path, self._resolve(path)))
+
+    def stat_entry(self, path: str) -> tuple[ListedEntry, bool]:
+        """Describe one path exactly as listing its parent would.
+
+        The parent must stay inside the workspace; the leaf itself may be a
+        symlink, even one pointing outside, as a listing shows it.
+
+        :param path: Relative path (``""`` for the workspace root).
+        :returns: The entry, and whether the path itself is a symlink.
+        :raises WorkspaceReaderError: 400 on an invalid path or escaping
+            parent, 404 when the path doesn't exist.
+        """
+        leaf, parent = self._leaf_beneath(path)
+        if parent is None:
+            entry = _describe_entry(self._root, self._root.name, "")
+            if entry is None:
+                raise WorkspaceReaderError(404, "not_found", "The workspace is not accessible")
+            return entry, False
+        full = parent / leaf.rsplit("/", 1)[-1]
+        entry = _describe_entry(full, full.name, leaf)
+        if entry is None or not is_utf8_encodable(full.name):
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
+        return entry, full.is_symlink()
+
+    def read_link_text(self, path: str) -> bytes:
+        """Return a symlink's own text, without following it.
+
+        The link may point anywhere, even outside the workspace or nowhere;
+        only its parent must stay inside the workspace.
+
+        :param path: Relative path of the link.
+        :returns: The stored target, at most :data:`_MAX_LINK_TEXT_BYTES`.
+        :raises WorkspaceReaderError: 400 on an invalid path, escaping parent
+            or oversized link, 404 when missing, 412 when not a symlink.
+        """
+        leaf, parent = self._leaf_beneath(path)
+        if parent is None:
+            raise WorkspaceReaderError(412, "not_a_symlink", "The workspace root is not a link")
+        full = parent / leaf.rsplit("/", 1)[-1]
+        try:
+            st = full.lstat()
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc
+        if not stat.S_ISLNK(st.st_mode):
+            raise WorkspaceReaderError(412, "not_a_symlink", f"Path {path!r} is not a symlink")
+        try:
+            target = os.readlink(os.fsencode(full))
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc
+        if len(target) > _MAX_LINK_TEXT_BYTES:
+            raise WorkspaceReaderError(400, "link_too_long", f"Link {path!r} is too long")
+        return target
+
+    def _leaf_beneath(self, path: str) -> tuple[str, Path | None]:
+        """Validate *path* and resolve its parent inside the workspace.
+
+        :returns: The validated path, and its resolved parent, or ``None``
+            for the workspace root.
+        """
+        try:
+            leaf = _validate_path(path) if path else ""
+        except InvalidPath as exc:
+            raise WorkspaceReaderError(400, "invalid_path", str(exc)) from exc
+        if not leaf:
+            return "", None
+        parent_rel = leaf.rsplit("/", 1)[0] if "/" in leaf else ""
+        return leaf, self._resolve(parent_rel)
 
     def _list_dir(
         self,
@@ -350,36 +534,10 @@ class WorkspaceReader:
                 # A non-UTF-8 name comes back surrogate-escaped; no JSON or protobuf
                 # answer can carry it, so skip it rather than fail the listing.
                 continue
-            full = resolved / name
             child_rel = os.path.join(validated, name) if validated else name
-            try:
-                st = full.stat()  # follows symlinks, like the runner
-                is_dir = full.is_dir()
-                entry_type = "directory" if is_dir else "file"
-                size = st.st_size if entry_type == "file" else None
-                mtime = int(st.st_mtime)
-            except OSError:
-                # Broken symlink (target gone): fall back to lstat and list it
-                # as a file with no size, matching the runner's list_dir rather
-                # than dropping the entry.
-                try:
-                    ls = full.lstat()
-                except OSError:
-                    continue
-                entry_type = "file"
-                size = None
-                mtime = int(ls.st_mtime)
-            entries.append(
-                {
-                    "id": child_rel,
-                    "object": "session.environment.filesystem.entry",
-                    "name": name,
-                    "path": child_rel,
-                    "type": entry_type,
-                    "bytes": size,
-                    "modified_at": mtime,
-                }
-            )
+            entry = _describe_entry(resolved / name, name, child_rel)
+            if entry is not None:
+                entries.append(entry)
         return entries
 
     def _read_file(
@@ -489,122 +647,9 @@ class WorkspaceReader:
             limit=limit,
         )
 
-        results: list[FilesystemEntry] = []
-        # State the two-pass walk mutates via closures (rebound through the
-        # `nonlocal` in scan()). deferred is a FIFO of noise-dir roots to drain
-        # in pass 2.
-        deferred: deque[str] = deque()
-        scanned = 0
-        truncated = False
-        stop = False
-
-        # os.walk is handed the absolute root, so an entry's path relative to
-        # it is a slice of dirpath -- no per-entry relpath(), whose abspath()
-        # work used to dominate the walk's runtime.
-        # rstrip: a bare root ("/", "C:\\") already ends in the separator the
-        # slice skips.
-        cut = len(str(self._root).rstrip(os.sep)) + 1
-
-        def rel(dirpath: str, name: str) -> str:
-            # Entries always use '/', like the git-index paths they merge with.
-            rel_dir = dirpath[cut:]
-            if os.sep != "/":
-                rel_dir = rel_dir.replace(os.sep, "/")
-            return f"{rel_dir}/{name}" if rel_dir else name
-
-        def match(dirpath: str, name: str, *, is_dir: bool) -> None:
-            # A directory carries no byte size; a file stats for size + mtime.
-            p = rel(dirpath, name)
-            if exc and any(r.match(p) for r in exc):
-                return
-            if inc and not any(r.match(p) for r in inc):
-                return
-            if q not in name.lower() and q not in p.lower():
-                return
-            try:
-                st = (Path(dirpath) / name).stat()
-                size: int | None = None if is_dir else st.st_size
-                mtime: int | None = int(st.st_mtime)
-            except OSError:
-                size = None
-                mtime = None
-            results.append(
-                FilesystemEntry(
-                    id=p,
-                    name=name,
-                    path=p,
-                    type="directory" if is_dir else "file",
-                    bytes=size,
-                    modified_at=mtime,
-                )
-            )
-
-        def scan(root: str, defer: bool) -> None:
-            # A query matching little or nothing never fills the result cap, so
-            # the walk needs its own bound. Counted per entry: a per-directory
-            # check lets one huge directory overshoot before `truncated` trips.
-            nonlocal scanned, truncated, stop
-            for dirpath, dirnames, filenames in os.walk(root):
-                kept = []
-                for d in sorted(dirnames):
-                    if d == ".git":
-                        # Git's own store is never a search target, and in a
-                        # plain clone its reflogs alone can outnumber the tree.
-                        continue
-                    full = os.path.join(dirpath, d)
-                    dp = rel(dirpath, d)
-                    if any(r.match(dp) for r in exc):
-                        continue
-                    if defer and d in _DEFAULT_DEPRIORITIZED_DIRS:
-                        # Match the dir now, but walk its subtree later (pass 2)
-                        # so it can't starve the real tree of scan budget. Never
-                        # defer a symlinked dir: os.walk(root) follows a top-level
-                        # symlink, so a committed 'node_modules -> ..' would let
-                        # pass 2 escape the workspace. os.walk(followlinks=False)
-                        # never crosses symlinks mid-tree; deferring only real
-                        # dirs keeps that boundary intact.
-                        if not os.path.islink(full):
-                            deferred.append(full)
-                    kept.append(d)
-                dirnames[:] = [d for d in kept if not (defer and d in _DEFAULT_DEPRIORITIZED_DIRS)]
-                for dname in kept:
-                    # Count then check `> budget`, not `>= budget`: a tree of
-                    # exactly `budget` entries is fully enumerable and must not
-                    # report truncated.
-                    scanned += 1
-                    if scanned > _SEARCH_SCAN_BUDGET:
-                        truncated = True
-                        stop = True
-                        return
-                    match(dirpath, dname, is_dir=True)
-                    if len(results) >= limit:
-                        stop = True
-                        return
-                for fname in sorted(filenames):
-                    scanned += 1
-                    if scanned > _SEARCH_SCAN_BUDGET:
-                        truncated = True
-                        stop = True
-                        return
-                    match(dirpath, fname, is_dir=False)
-                    if len(results) >= limit:
-                        stop = True
-                        return
-
-        # Pass 1 walks the real tree and defers dependency/cache subtrees;
-        # reordering siblings isn't enough, because a deep node_modules nested
-        # under an earlier-sorted real dir would still swallow the whole budget
-        # before the walk reached a later top-level dir. Pass 2 drains the
-        # deferred roots only if budget remains. Mirrors the runner's walk.
-        scan(str(self._root), True)
-        while deferred and not stop:
-            scan(deferred.popleft(), False)
-        # When the walk stops early it is always because scan() tripped the
-        # budget (which sets truncated) or the result limit (signaled by
-        # has_more); the loop exits only once deferred is drained or stop is
-        # set, so no extra truncation flag is needed here.
-
-        results.sort(key=lambda entry: entry.path)
+        results, truncated = walk_search(
+            self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET
+        )
         if indexed is not None:
             results = merge_entries(indexed, results, limit)
         return self._search_payload(results, limit, truncated=truncated)

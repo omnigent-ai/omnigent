@@ -4,6 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
 
+vi.mock(import("@/lib/workspaceApi"), async (original) => ({
+  ...(await original()),
+  listDirectoryViaWorkspaceApi: vi.fn(async () => null),
+  searchFilesViaWorkspaceApi: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
@@ -21,12 +26,15 @@ import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import {
   type WorkspaceEnvironment,
+  LISTING_ENTRY_LIMIT,
   MAX_RUNNER_OFFLINE_RETRIES,
   RunnerOfflineError,
   browseLocationBase,
   browseLocationSegment,
   isRunnerUnavailable503,
+  listingCutOff,
   looksLikeWorkspaceFilePath,
+  readListingPages,
   relativizeToWorkspace,
   resolveChatFilePath,
   runnerOfflineRetryDelay,
@@ -34,15 +42,21 @@ import {
   useSessionActive,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
+  useWorkspaceDirectories,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
   useWorkspaceServeable,
+  fetchWorkspaceFolderListing,
+  IgnoredFilesSearchError,
+  listingIgnoredFiles,
+  workspaceDirectoryQuery,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
@@ -110,6 +124,13 @@ function Wrap({ children }: { children: ReactNode }) {
     defaultOptions: { queries: { retry: false, staleTime: 0 } },
   });
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
+}
+
+function stableWrapper() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+  );
 }
 
 function ChangedFilesProbe({ id }: { id: string | undefined }) {
@@ -221,24 +242,6 @@ function AllFilesPathsProbe({
   return null;
 }
 
-function DirectoryPathsProbe({
-  id,
-  path,
-  location,
-  onPaths,
-}: {
-  id: string;
-  path: string;
-  location: string;
-  onPaths: (paths: string[]) => void;
-}) {
-  const query = useWorkspaceDirectory(id, path, location);
-  useEffect(() => {
-    if (query.isSuccess) onPaths(query.data.map((f) => f.path));
-  }, [query.isSuccess, query.data, onPaths]);
-  return null;
-}
-
 function AllFilesProbeAt({ id, location }: { id: string; location: string }) {
   useWorkspaceAllFiles(id, {}, location);
   return null;
@@ -258,6 +261,9 @@ beforeEach(() => {
   stubChatStore();
   hostOnlineMock.mockReturnValue(null);
   stubSession(null);
+  // Every case starts with a workspace API that declines, whatever the last one set.
+  vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue(null);
+  vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValue(null);
 });
 
 afterEach(() => {
@@ -611,6 +617,155 @@ describe("useWorkspaceAllFiles gating", () => {
   });
 });
 
+describe("useWorkspaceAllFiles while ignored files are toggled", () => {
+  it("keeps the root's rows up, but never under another session or folder", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockImplementation(async () => environmentResponse());
+    const pending = new Promise<never>(() => {});
+    // Only the first listing answers; every later one is still on its way.
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (session, path, _max, _signal, options) =>
+        session === "conv_root" && path === "" && !options?.hideIgnored
+          ? apiListing(["README.md"])
+          : pending,
+    );
+
+    const { result, rerender } = renderHook(
+      ({ id, location, hideIgnored }: { id: string; location: string; hideIgnored: boolean }) =>
+        useWorkspaceAllFiles(id, { hideIgnored }, location),
+      {
+        wrapper: stableWrapper(),
+        initialProps: { id: "conv_root", location: "", hideIgnored: false },
+      },
+    );
+    await waitFor(() => expect(result.current.data?.data).toHaveLength(1));
+
+    rerender({ id: "conv_root", location: "", hideIgnored: true });
+    expect(result.current.data?.data.map((file) => file.path)).toEqual(["README.md"]);
+
+    rerender({ id: "conv_root", location: "docs", hideIgnored: true });
+    expect(result.current.data).toBeUndefined();
+    rerender({ id: "conv_other", location: "", hideIgnored: true });
+    expect(result.current.data).toBeUndefined();
+  });
+});
+
+describe("useWorkspaceAllFiles without what Git ignores", () => {
+  it.each([
+    ["says so when the host left ignored files out", { ignoredHidden: true as const }, true],
+    ["says nothing when the host listed everything", {}, undefined],
+  ])("%s", async (_case, reported, expected) => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValueOnce(environmentResponse());
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      ...apiListing(["README.md"]),
+      ...reported,
+    });
+
+    const { result } = renderHook(
+      () => useWorkspaceAllFiles(`conv_hidden_${expected}`, { hideIgnored: true }),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.ignoredHidden).toBe(expected);
+  });
+});
+
+describe("listingIgnoredFiles over a real listing query", () => {
+  const pending = new Promise<never>(() => {});
+  type Answer = "pending" | "error" | ReturnType<typeof apiListing>;
+  /** Render the listing for `id`, answering each request with what `answer` gives it. */
+  function listing(id: string, answer: (hideIgnored: boolean) => Answer, environment = true) {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockImplementation(async () =>
+      environment ? environmentResponse() : jsonResponse({ metadata: {} }),
+    );
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (_session, _path, _max, _signal, options) => {
+        const answered = answer(options?.hideIgnored === true);
+        if (answered === "pending") return pending;
+        if (answered === "error") throw new Error("The host stopped answering.");
+        return answered;
+      },
+    );
+    return renderHook(
+      ({ hideIgnored }: { hideIgnored: boolean }) => {
+        const query = useWorkspaceAllFiles(id, { hideIgnored });
+        return { query, ignored: listingIgnoredFiles(query) };
+      },
+      { wrapper: stableWrapper(), initialProps: { hideIgnored: true } },
+    );
+  }
+  const everything = apiListing(["README.md", "build"]);
+  const withoutIgnored = { ...apiListing(["README.md"]), ignoredHidden: true as const };
+
+  it.each([
+    {
+      state: "no listing asked for yet",
+      run: async () => {
+        const { result } = listing("conv_ignored_idle", () => everything, false);
+        await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+        await flushMicrotasks();
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "the listing on its way",
+      run: async () => {
+        const { result } = listing("conv_ignored_loading", () => "pending");
+        await waitFor(() => expect(result.current.query.fetchStatus).toBe("fetching"));
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "rows kept from the listing with ignored files on",
+      run: async () => {
+        const { result, rerender } = listing("conv_ignored_kept", (hide) =>
+          hide ? "pending" : everything,
+        );
+        rerender({ hideIgnored: false });
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        rerender({ hideIgnored: true });
+        expect(result.current.query.isPlaceholderData).toBe(true);
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "a failed listing",
+      run: async () => {
+        const { result } = listing("conv_ignored_failed", () => "error");
+        await waitFor(() => expect(result.current.query.isError).toBe(true));
+        return result.current;
+      },
+      expected: "unknown",
+    },
+    {
+      state: "a fresh listing that left ignored files out",
+      run: async () => {
+        const { result } = listing("conv_ignored_hidden", () => withoutIgnored);
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        return result.current;
+      },
+      expected: "hidden",
+    },
+    {
+      state: "a fresh listing that couldn't leave them out",
+      run: async () => {
+        const { result } = listing("conv_ignored_included", () => everything);
+        await waitFor(() => expect(result.current.query.isSuccess).toBe(true));
+        return result.current;
+      },
+      expected: "included",
+    },
+  ])("says $expected for $state", async ({ run, expected }) => {
+    expect((await run()).ignored).toBe(expected);
+  });
+});
+
 describe("useWorkspaceEnvironment gating", () => {
   it("fetches the default environment when the runner is online", async () => {
     onlineMock.mockReturnValue(true);
@@ -733,6 +888,150 @@ describe("useWorkspaceDirectory gating", () => {
     );
   });
 
+  it("lists through the workspace API when it answers, with no REST request", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        {
+          id: "src/inner/a.ts",
+          name: "a.ts",
+          path: "src/inner/a.ts",
+          type: "file",
+          bytes: 3,
+          modified_at: 1,
+        },
+        {
+          id: "src/inner/lib",
+          name: "lib",
+          path: "src/inner/lib",
+          type: "directory",
+          bytes: null,
+          modified_at: 1,
+          leaf_directory_path: "src/inner/lib/deep",
+        },
+      ],
+      hasMore: false,
+    });
+
+    const { result } = renderHook(() => useWorkspaceDirectory("conv_api", "src/inner"), {
+      wrapper: Wrap,
+    });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data?.map((file) => file.path)).toEqual([
+      "src/inner/a.ts",
+      "src/inner/lib",
+    ]);
+    // A single-child chain's end carries over; a file has none.
+    expect(result.current.data?.map((file) => file.leaf_directory_path)).toEqual([
+      undefined,
+      "src/inner/lib/deep",
+    ]);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_api",
+      "src/inner",
+      LISTING_ENTRY_LIMIT,
+      // The query's own signal, so closing the folder stops its pages.
+      expect.any(AbortSignal),
+      {
+        hideIgnored: false,
+      },
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("lists a folder without what Git ignores apart from its full listing, marking ignored entries", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (_session, _path, _max, _signal, options) => ({
+        data: [
+          ...(options?.hideIgnored
+            ? []
+            : [
+                {
+                  id: "src/build",
+                  name: "build",
+                  path: "src/build",
+                  type: "directory" as const,
+                  bytes: null,
+                  modified_at: 1,
+                  ignored: true as const,
+                },
+              ]),
+          {
+            id: "src/main.py",
+            name: "main.py",
+            path: "src/main.py",
+            type: "file" as const,
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        hasMore: false,
+      }),
+    );
+
+    const { result } = renderHook(
+      () => ({
+        all: useWorkspaceDirectories("conv_ignored", ["src"]),
+        hidden: useWorkspaceDirectories("conv_ignored", ["src"], "", 0, true),
+      }),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => {
+      expect(result.current.all.get("src")?.data).toBeDefined();
+      expect(result.current.hidden.get("src")?.data).toBeDefined();
+    });
+    expect(result.current.all.get("src")?.data).toEqual([
+      expect.objectContaining({ path: "src/build", ignored: true }),
+      expect.not.objectContaining({ ignored: expect.anything() }),
+    ]);
+    expect(result.current.hidden.get("src")?.data?.map((file) => file.path)).toEqual([
+      "src/main.py",
+    ]);
+    expect(vi.mocked(listDirectoryViaWorkspaceApi).mock.calls.map((call) => call[4])).toEqual(
+      expect.arrayContaining([{ hideIgnored: false }, { hideIgnored: true }]),
+    );
+  });
+
+  it("keeps a folder's rows up while ignored files are toggled, but not under another folder", async () => {
+    onlineMock.mockReturnValue(true);
+    const pending = new Promise<never>(() => {});
+    vi.mocked(listDirectoryViaWorkspaceApi).mockImplementation(
+      async (_session, path, _max, _signal, options) => {
+        if (options?.hideIgnored || path !== "src") return pending;
+        return {
+          data: [
+            {
+              id: "src/main.py",
+              name: "main.py",
+              path: "src/main.py",
+              type: "file" as const,
+              bytes: 1,
+              modified_at: 1,
+            },
+          ],
+          hasMore: false,
+        };
+      },
+    );
+
+    const { result, rerender } = renderHook(
+      ({ paths, hideIgnored }: { paths: string[]; hideIgnored: boolean }) =>
+        useWorkspaceDirectories("conv_toggle", paths, "", 0, hideIgnored),
+      // One client across rerenders, so the folder's first listing stays cached.
+      { wrapper: stableWrapper(), initialProps: { paths: ["src"], hideIgnored: false } },
+    );
+    await waitFor(() => expect(result.current.get("src")?.data).toBeDefined());
+
+    rerender({ paths: ["src", "docs"], hideIgnored: true });
+
+    // The hidden listing is still on its way: `src` keeps its rows, `docs` borrows nothing.
+    expect(result.current.get("src")?.data?.map((file) => file.path)).toEqual(["src/main.py"]);
+    expect(result.current.get("docs")?.data).toBeUndefined();
+  });
+
   it("does not fetch when path is null (pre-existing gate)", async () => {
     onlineMock.mockReturnValue(true);
 
@@ -744,6 +1043,321 @@ describe("useWorkspaceDirectory gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspaceDirectoryQuery", () => {
+  it("keys a listing as the directory hooks do, adding a refresh token only once set", () => {
+    expect(workspaceDirectoryQuery("conv", "src").queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "",
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src", "remote", 2).queryKey).toEqual([
+      "workspace-dir",
+      "conv",
+      "src",
+      "remote",
+      2,
+    ]);
+    expect(workspaceDirectoryQuery("conv", "src").staleTime).toBe(5_000);
+  });
+});
+
+describe("fetchWorkspaceFolderListing", () => {
+  const page = (names: string[], hasMore: boolean, lastId: string | null = names.at(-1) ?? null) =>
+    new Response(
+      JSON.stringify({
+        object: "list",
+        data: names.map((name) => ({
+          id: name,
+          name,
+          path: `src/${name}`,
+          type: "file",
+          bytes: null,
+          modified_at: null,
+        })),
+        has_more: hasMore,
+        last_id: lastId,
+      }),
+    );
+
+  it("reads each page after the last, and says more remain at the limit", async () => {
+    fetchMock.mockResolvedValueOnce(page(["a.ts", "b.ts"], true));
+    fetchMock.mockResolvedValueOnce(page(["c.ts", "d.ts"], true));
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 4);
+
+    // Paths are relative to the location the folder is read from.
+    expect(listed.entries.map((entry) => entry.path)).toEqual([
+      "src/a.ts",
+      "src/b.ts",
+      "src/c.ts",
+      "src/d.ts",
+    ]);
+    expect(listed.hasMore).toBe(true);
+    const asked = fetchMock.mock.calls.map(([input]) => new URL(String(input), "http://x"));
+    expect(asked.map((url) => url.searchParams.get("after"))).toEqual([null, "b.ts"]);
+    expect(asked.map((url) => url.searchParams.get("limit"))).toEqual(["4", "2"]);
+  });
+
+  it("stops at a cursor that doesn't move, rather than asking again", async () => {
+    fetchMock.mockResolvedValueOnce(page(["a.ts"], true));
+    fetchMock.mockResolvedValueOnce(page(["a.ts"], true));
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 10);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(listed.hasMore).toBe(true);
+  });
+
+  it("asks the workspace API for the whole limit and keeps whether more remain", async () => {
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        { id: "src/a.ts", name: "a.ts", path: "src/a.ts", type: "file", bytes: 1, modified_at: 0 },
+      ],
+      hasMore: true,
+    });
+
+    const listed = await fetchWorkspaceFolderListing("conv", "src", "", 5000);
+
+    expect(vi.mocked(listDirectoryViaWorkspaceApi).mock.calls.at(-1)?.slice(0, 3)).toEqual([
+      "conv",
+      "src",
+      5000,
+    ]);
+    expect(listed).toEqual({
+      entries: [expect.objectContaining({ path: "src/a.ts" })],
+      hasMore: true,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("folder listings past one page", () => {
+  const entry = (name: string) => ({
+    id: `experimental/${name}`,
+    name,
+    path: `experimental/${name}`,
+    type: "directory",
+    bytes: null,
+    modified_at: null,
+  });
+  const page = (names: string[], hasMore: boolean, lastId = names.at(-1)) =>
+    jsonResponse({
+      object: "list",
+      data: names.map(entry),
+      has_more: hasMore,
+      last_id: lastId === undefined ? null : `experimental/${lastId}`,
+    });
+  const listFolder = (id: string, signal = new AbortController().signal) =>
+    workspaceDirectoryQuery(id, "experimental").queryFn({ signal });
+
+  it("reads every page through the after cursor, so a late folder is listed", async () => {
+    fetchMock
+      .mockResolvedValueOnce(page(["d0000", "d0999"], true))
+      .mockResolvedValueOnce(page(["d1000", "d1999"], true))
+      .mockResolvedValueOnce(page(["late"], false));
+
+    const entries = await listFolder("conv_pages");
+
+    expect(entries.map((file) => file.name)).toEqual(["d0000", "d0999", "d1000", "d1999", "late"]);
+    const urls = fetchMock.mock.calls.map(([url]) => new URL(String(url), "http://x"));
+    expect(urls.map((url) => url.searchParams.get("after"))).toEqual([
+      null,
+      "experimental/d0999",
+      "experimental/d1999",
+    ]);
+    expect(urls.every((url) => url.searchParams.get("limit") === "1000")).toBe(true);
+  });
+
+  it("asks for no page past the first once nobody waits for the listing", async () => {
+    const controller = new AbortController();
+    fetchMock.mockImplementationOnce(async (_url, init?: RequestInit) => {
+      // The folder closes while its first page is on its way.
+      controller.abort();
+      expect(init?.signal).toBe(controller.signal);
+      return page(["d0000", "d0999"], true);
+    });
+
+    await expect(listFolder("conv_closed", controller.signal)).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("pages the browsed folder's own listing too", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(page(["d0000"], true))
+      .mockResolvedValueOnce(page(["zz"], false));
+    let names: string[] = [];
+    function Probe() {
+      const query = useWorkspaceAllFiles("conv_root_pages");
+      names = query.data?.data.map((file) => file.name) ?? [];
+      return null;
+    }
+
+    render(
+      <Wrap>
+        <Probe />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(names).toEqual(["d0000", "zz"]));
+  });
+
+  it("stops at a page that repeats its cursor, as from a server that ignores it", async () => {
+    fetchMock.mockResolvedValue(page(["d0000", "d0999"], true));
+
+    const entries = await listFolder("conv_stuck");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The resent page is left out, and the folder still reads as cut off.
+    expect(entries.map((file) => file.name)).toEqual(["d0000", "d0999"]);
+    expect(listingCutOff(entries)).toBe(true);
+  });
+
+  it("keeps each entry once when the server starts over because the cursor's entry was deleted", async () => {
+    // A server that starts from the top when the `after` entry is gone, as the hosts do.
+    let names = Array.from({ length: 1500 }, (_, i) => `f${String(i).padStart(4, "0")}`);
+    const listing = await readListingPages(async (after) => {
+      const found = names.findIndex((name) => `experimental/${name}` === after);
+      const start = found < 0 ? 0 : found + 1;
+      const slice = names.slice(start, start + 1000);
+      // Its first page's last entry is deleted before the second is asked for.
+      if (after === null) names = names.filter((name) => name !== "f0999");
+      return {
+        object: "list",
+        data: slice.map(entry),
+        has_more: start + slice.length < names.length,
+        last_id: `experimental/${slice.at(-1)}`,
+      };
+    });
+
+    const ids = listing.data.map((file) => file.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toHaveLength(1500);
+    expect(listing.has_more).toBe(false);
+  });
+
+  it("keeps has_more when a page arrives with no cursor to continue from", async () => {
+    const listing = await readListingPages(async () => ({
+      object: "list",
+      data: [entry("d0000")],
+      has_more: true,
+      last_id: null,
+    }));
+
+    expect(listing?.has_more).toBe(true);
+    expect(listing?.data).toHaveLength(1);
+  });
+
+  it("stops before asking again for a cursor it already asked for, keeping has_more", async () => {
+    // The server cycles: after b it resends the page after d0, which ends on a.
+    const pages: Record<string, string> = {
+      "": "d0",
+      "experimental/d0": "a",
+      "experimental/a": "b",
+      "experimental/b": "a",
+    };
+    const asked: string[] = [];
+    const listing = await readListingPages(async (after) => {
+      asked.push(after ?? "");
+      const name = pages[after ?? ""]!;
+      return {
+        object: "list",
+        data: [entry(name)],
+        has_more: true,
+        last_id: `experimental/${name}`,
+      };
+    });
+
+    expect(asked).toEqual(["", "experimental/d0", "experimental/a", "experimental/b"]);
+    expect(listing?.has_more).toBe(true);
+    expect(listing?.data.map((file) => file.name)).toEqual(["d0", "a", "b"]);
+  });
+
+  it("fails the browsed folder's listing when a later page is gone", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(page(["d0000"], true))
+      .mockResolvedValueOnce(jsonResponse({}, 404));
+    let state: { isError: boolean; message?: string; data?: unknown } = { isError: false };
+    function Probe() {
+      const query = useWorkspaceAllFiles("conv_root_gone");
+      state = { isError: query.isError, message: query.error?.message, data: query.data };
+      return null;
+    }
+
+    render(
+      <Wrap>
+        <Probe />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(state.isError).toBe(true));
+    expect(state.message).toBe("the folder was removed while it was being listed");
+    expect(state.data).toBeUndefined();
+  });
+
+  it("fails the listing when a later page fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(page(["d0000"], true))
+      .mockResolvedValueOnce(jsonResponse({}, 500));
+
+    await expect(listFolder("conv_fail")).rejects.toThrow("500");
+  });
+
+  it("stops at exactly the entry limit, keeping has_more, so the tree can say it's cut off", async () => {
+    let calls = 0;
+    const listing = await readListingPages(async () => {
+      const start = calls++ * 1000;
+      const names = Array.from({ length: 1000 }, (_, i) => `d${start + i}`);
+      return {
+        object: "list",
+        data: names.map(entry),
+        has_more: true,
+        last_id: `experimental/${names.at(-1)}`,
+      };
+    });
+
+    expect(calls).toBe(LISTING_ENTRY_LIMIT / 1000);
+    expect(listing?.data).toHaveLength(LISTING_ENTRY_LIMIT);
+    expect(listing?.has_more).toBe(true);
+  });
+
+  it("marks a folder cut off from has_more, not from how many entries it holds", async () => {
+    fetchMock
+      // More past the page, with no cursor to read it by.
+      .mockResolvedValueOnce(
+        jsonResponse({ object: "list", data: [entry("d0000")], has_more: true }),
+      )
+      .mockResolvedValueOnce(page(["d0000", "d0001"], false));
+
+    expect(listingCutOff(await listFolder("conv_cut"))).toBe(true);
+    expect(listingCutOff(await listFolder("conv_whole"))).toBe(false);
+  });
+
+  it("trims a last page that overshoots the limit, and marks the listing cut off", async () => {
+    let calls = 0;
+    const listing = await readListingPages(async () => {
+      calls++;
+      // Pages bigger than the endpoint's own, from a server that ignores `limit`: 51,000
+      // entries in all, the last page saying it's the end.
+      const names = Array.from({ length: 3000 }, (_, i) => `d${calls}_${i}`);
+      return {
+        object: "list",
+        data: names.map(entry),
+        has_more: calls * 3000 < 51_000,
+        last_id: `experimental/${names.at(-1)}`,
+      };
+    });
+
+    expect(listing?.data).toHaveLength(LISTING_ENTRY_LIMIT);
+    expect(listing?.has_more).toBe(true);
+    expect(listing?.last_id).toBe(listing?.data.at(-1)?.id);
   });
 });
 
@@ -780,6 +1394,182 @@ describe("useWorkspaceFileSearch gating", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/search?limit=500&q=main&include=*.ts&exclude=**%2Fnode_modules",
     );
+  });
+});
+
+describe("useWorkspaceFileSearch through the workspace API", () => {
+  function SearchPathsProbe({ location }: { location: string }) {
+    const { data } = useWorkspaceFileSearch("conv_live", " main ", " *.ts ", "", {}, location);
+    return (
+      <>
+        <output data-testid="paths">{data?.files.map((file) => file.path).join(",")}</output>
+        <output data-testid="truncated">{String(data?.truncated)}</output>
+      </>
+    );
+  }
+
+  it("uses the API's answer, relative to the searched folder, without REST", async () => {
+    onlineMock.mockReturnValue(true);
+    // src/src/util.ts in the workspace: a nested folder named like the searched one.
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        {
+          id: "src/util.ts",
+          name: "util.ts",
+          path: "src/util.ts",
+          type: "file",
+          bytes: 1,
+          modified_at: 1,
+        },
+      ],
+      hasMore: false,
+      truncated: true,
+    });
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="src" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("paths").textContent).toBe("src/util.ts"));
+    expect(screen.getByTestId("truncated")).toHaveTextContent("true");
+    expect(searchFilesViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_live",
+      "main",
+      { path: "src", include: "*.ts", exclude: "", limit: 500, includeGitIgnored: true },
+      expect.any(AbortSignal),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("doesn't fall back to REST, which can't leave ignored files out, for a search without them", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce(null);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(
+      () => useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored: true }, ""),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error).toBeInstanceOf(IgnoredFilesSearchError);
+    expect(result.current.data).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("recovers on its own once the API answers a search without ignored files again", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: "src/main.ts",
+            name: "main.ts",
+            path: "src/main.ts",
+            type: "file",
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        hasMore: false,
+        truncated: false,
+      });
+    // Retried as the app's queries are, without the wait between tries.
+    const client = new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } });
+    const { result } = renderHook(
+      () => useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored: true }, ""),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.files.map((file) => file.path)).toEqual(["src/main.ts"]);
+    expect(vi.mocked(searchFilesViaWorkspaceApi)).toHaveBeenCalledTimes(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("asks the API to leave out what Git ignores, and keeps that search apart", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValue({
+      data: [],
+      hasMore: false,
+      truncated: false,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = renderHook(
+      ({ hideIgnored }: { hideIgnored: boolean }) =>
+        useWorkspaceFileSearch("conv_live", "main", "", "", { hideIgnored }, ""),
+      {
+        initialProps: { hideIgnored: true },
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+    await waitFor(() => expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(1));
+    rerender({ hideIgnored: false });
+    await waitFor(() => expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(2));
+
+    const asked = vi.mocked(searchFilesViaWorkspaceApi).mock.calls.map(([, , options]) => options);
+    expect(asked.map((options) => options.includeGitIgnored)).toEqual([false, true]);
+  });
+
+  it("falls back to REST when the workspace API declines a folder search", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce(null);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [
+          {
+            id: "src/b.ts",
+            name: "b.ts",
+            path: "src/b.ts",
+            type: "file",
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        has_more: false,
+      }),
+    );
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="src" />
+      </Wrap>,
+    );
+
+    // REST echoes the searched folder, which the hook strips.
+    await waitFor(() => expect(screen.getByTestId("paths").textContent).toBe("b.ts"));
+    expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/search/src?"),
+      expect.anything(),
+    );
+  });
+
+  it("searches a folder outside the workspace through REST only", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="/etc" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(searchFilesViaWorkspaceApi).not.toHaveBeenCalled();
   });
 });
 
@@ -1119,6 +1909,14 @@ function dirEntry(path: string, type: "file" | "directory" = "file") {
   };
 }
 
+/** A listing the workspace API answers with, in its REST-shaped entries. */
+function apiListing(paths: string[], hasMore = false) {
+  return {
+    data: paths.map((path) => ({ ...dirEntry(path), name: path.split("/").pop() ?? path })),
+    hasMore,
+  };
+}
+
 function FileExistsProbe({
   id,
   path,
@@ -1160,6 +1958,33 @@ function FileExistenceProbe({
 describe("useWorkspaceFileExists", () => {
   beforeEach(() => {
     onlineMock.mockReturnValue(true);
+  });
+
+  it("checks the parent through the workspace API, leaving a miss open when it has more", async () => {
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce(
+      apiListing(["docs/target.md"], true),
+    );
+    const found: { exists: boolean; settled: boolean }[] = [];
+    const missing: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_api" path="docs/target.md" onResult={(r) => found.push(r)} />
+        <FileExistenceProbe id="conv_api" path="docs/unseen.md" onResult={(r) => missing.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(found.at(-1)).toEqual({ exists: true, settled: true }));
+    expect(missing.at(-1)).toEqual({ exists: false, settled: false });
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_api",
+      "docs",
+      10_000,
+      undefined,
+      {
+        hideIgnored: false,
+      },
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("lists the parent directory and reports an existing file as present", async () => {
@@ -1790,6 +2615,33 @@ describe("browse-location listings normalize to paths relative to the location",
     expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
   });
 
+  it("strips the echoed prefix from a workspace API listing too", async () => {
+    fetchMock.mockResolvedValueOnce(environmentResponse());
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce(
+      apiListing(["reports/summary.md", "reports/q3.csv"]),
+    );
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_rel_api" location="reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_rel_api",
+      "reports",
+      LISTING_ENTRY_LIMIT,
+      // The query's own signal, so closing the folder stops its pages.
+      expect.any(AbortSignal),
+      {
+        hideIgnored: false,
+      },
+    );
+  });
+
   it("leaves an absolute location's already-bare paths alone", async () => {
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
@@ -1804,27 +2656,51 @@ describe("browse-location listings normalize to paths relative to the location",
     await waitFor(() => expect(onPaths).toHaveBeenCalled());
 
     expect(onPaths).toHaveBeenLastCalledWith(["summary.md"]);
+    expect(listDirectoryViaWorkspaceApi).not.toHaveBeenCalled();
   });
 
   it.each([
-    ["reports", "reports/quarterly/q3.csv", "a relative location echoes the whole target"],
-    ["/elsewhere/reports", "q3.csv", "an absolute one lists bare"],
-  ])("roots a lazily-expanded directory's children under it (%s)", async (location, wirePath) => {
-    // Children address themselves relative to the tree's root, not to the
-    // directory that was listed -- otherwise expanding one level deeper
-    // would request the wrong path.
-    fetchMock.mockResolvedValueOnce(entries(wirePath));
-    const onPaths = vi.fn();
+    ["reports", "REST", "reports/quarterly/"],
+    ["/elsewhere/reports", "REST", ""],
+    ["reports", "the workspace API", "reports/quarterly/"],
+  ])(
+    "roots a lazily-expanded directory's children and chain ends under it (%s, through %s)",
+    async (location, route, wirePrefix) => {
+      // Children address themselves relative to the tree's root, not to the directory that
+      // was listed; a relative location echoes the whole target, an absolute one lists bare.
+      const listing = [
+        { id: "q3.csv", name: "q3.csv", type: "file" as const, bytes: 1, leaf: undefined },
+        { id: "2026", name: "2026", type: "directory" as const, bytes: null, leaf: "2026/q3" },
+      ].map(({ id, leaf, ...entry }) => ({
+        ...entry,
+        id: `${wirePrefix}${id}`,
+        path: `${wirePrefix}${id}`,
+        modified_at: null,
+        ...(leaf ? { leaf_directory_path: `${wirePrefix}${leaf}` } : {}),
+      }));
+      if (route === "REST") {
+        fetchMock.mockResolvedValueOnce(
+          jsonResponse({ object: "list", data: listing, has_more: false }),
+        );
+      } else {
+        vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+          data: listing,
+          hasMore: false,
+        });
+      }
 
-    render(
-      <Wrap>
-        <DirectoryPathsProbe id="conv_dir" path="quarterly" location={location} onPaths={onPaths} />
-      </Wrap>,
-    );
-    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+      const { result } = renderHook(
+        () => useWorkspaceDirectory("conv_dir", "quarterly", location),
+        { wrapper: Wrap },
+      );
 
-    expect(onPaths).toHaveBeenLastCalledWith(["quarterly/q3.csv"]);
-  });
+      await waitFor(() => expect(result.current.data).toBeDefined());
+      expect(result.current.data?.map((file) => [file.path, file.leaf_directory_path])).toEqual([
+        ["quarterly/q3.csv", undefined],
+        ["quarterly/2026", "quarterly/2026/q3"],
+      ]);
+    },
+  );
 });
 
 describe("browse-location wire form (survives a slash-merging proxy)", () => {

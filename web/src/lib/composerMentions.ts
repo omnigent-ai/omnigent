@@ -1,5 +1,7 @@
 import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { uniqueAttachmentName } from "@/lib/pastedAttachments";
+import { attachmentFilename } from "@/lib/attachments";
 
 /**
  * Pure ``@``-mention utilities (workspace files and other sessions) shared by the in-session composer
@@ -242,20 +244,27 @@ export interface InlineMention {
   marker: string;
 }
 
-/** Tokens and markers for everything tagged in a composer. */
+/**
+ * Tokens and markers for everything tagged in a composer. A pasted chip's marker is its own
+ * token: its file is sent with the message, so its text stays as typed and still takes part
+ * in the longest-token scan, which keeps a shorter token from splitting it.
+ */
 export function composerInlineMentions(
-  items: readonly MentionItem[],
-  sessions: readonly SessionMention[],
+  tags: LiveMentions,
   harness: string | null,
 ): InlineMention[] {
   return [
-    ...items.map((item) => ({
+    ...tags.files.map((item) => ({
       token: fileMentionToken(item),
       marker: mentionMarkerFor(harness, mentionItemPath(item)),
     })),
-    ...sessions.map((session) => ({
+    ...tags.sessions.map((session) => ({
       token: session.token ?? `@${cleanSessionTitle(session.title)}`,
       marker: sessionMentionMarker(session),
+    })),
+    ...(tags.attachments ?? []).map((attachment) => ({
+      token: attachment.token,
+      marker: attachment.token,
     })),
   ];
 }
@@ -289,6 +298,49 @@ export function findMentionTokens(text: string, tokens: readonly string[]): Ment
   return ranges.sort((a, b) => a.start - b.start);
 }
 
+/** Text landing in `[start, end)` of a draft, as a typed or pasted insert. */
+export interface ComposerInsert {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** The text to insert instead, and where the caret lands inside it. */
+export interface ComposerInsertAdjustment {
+  text: string;
+  caret: number;
+}
+
+/**
+ * The insert with a space added where it would break a token it touches: right after one, or
+ * right before one. ``caret`` stays after the inserted text. Null when no space is needed, or
+ * when one would make a touched token match a different tag; the insert then lands as typed.
+ */
+export function separateMentionEdges(
+  value: string,
+  insert: ComposerInsert,
+  tokens: readonly string[],
+): ComposerInsertAdjustment | null {
+  const { start, end, text } = insert;
+  if (text === "") return null;
+  const ranges = findMentionTokens(value, tokens);
+  const before = ranges.find((range) => range.end === start);
+  const after = ranges.find((range) => range.start === end);
+  const lead = before && !TOKEN_END_RE.test(text[0]!) ? " " : "";
+  const trail = after && !/\s/.test(text[text.length - 1]!) ? " " : "";
+  if (lead === "" && trail === "") return null;
+  const adjusted = { text: lead + text + trail, caret: lead.length + text.length };
+  // The space must not change which token a neighbour matches, e.g. a longer tag swallowing it.
+  const next = value.slice(0, start) + adjusted.text + value.slice(end);
+  const shift = adjusted.text.length - (end - start);
+  const nextRanges = findMentionTokens(next, tokens);
+  const keeps = (range: MentionTokenRange, at: number) =>
+    nextRanges.some((match) => match.start === at && match.token === range.token);
+  if (before && !keeps(before, before.start)) return null;
+  if (after && !keeps(after, after.start + shift)) return null;
+  return adjusted;
+}
+
 /** Token the caret is at the end of, or inside, so Backspace removes it whole. */
 export function mentionTokenAtCaret(
   text: string,
@@ -299,7 +351,7 @@ export function mentionTokenAtCaret(
 }
 
 /** Mentions whose token still appears in any of ``texts``; deleted tokens drop out. */
-export function presentMentions<T extends InlineMention>(
+export function presentMentions<T extends { token: string }>(
   mentions: readonly T[],
   texts: readonly string[],
 ): T[] {
@@ -308,6 +360,25 @@ export function presentMentions<T extends InlineMention>(
   const tokens = mentions.map((m) => m.token);
   const found = new Set(texts.flatMap((t) => findMentionTokens(t, tokens).map((r) => r.token)));
   return mentions.filter((m) => found.has(m.token));
+}
+
+/**
+ * The tags whose token still appears in ``texts``; a tag whose token was deleted
+ * drops out, so retyping that text later stays literal.
+ */
+export function presentTaggedMentions(
+  mentions: TaggedMentions | undefined,
+  texts: readonly string[],
+): TaggedMentions | undefined {
+  if (!mentions) return undefined;
+  const inline = composerInlineMentions(mentions, null);
+  const present = new Set(presentMentions(inline, texts).map((mention) => mention.token));
+  const fileCount = mentions.files.length;
+  const files = mentions.files.filter((_, index) => present.has(inline[index]!.token));
+  const sessions = mentions.sessions.filter((_, index) =>
+    present.has(inline[fileCount + index]!.token),
+  );
+  return files.length > 0 || sessions.length > 0 ? { files, sessions } : undefined;
 }
 
 /** Replace each token in ``text`` with its marker, in place. */
@@ -354,6 +425,31 @@ function stripTrailingHint(text: string): string | null {
   const start = end.lastIndexOf(SENT_HINT_PREFIX);
   if (start < 0 || end.indexOf("]", start) !== end.length - 1) return null;
   return end.slice(0, start).trimEnd();
+}
+
+/** A piece of a sent answer: literal text, or a session marker. */
+export type SentSessionPart = string | { id: string; title: string; isSubagent: boolean };
+
+/**
+ * A sent answer split into its text and its session markers, with the tool hint removed. Only a
+ * hint that follows at least one session marker counts, so every other character, attachment-like
+ * text included, stays as typed.
+ */
+export function splitSentSessionMentions(text: string): SentSessionPart[] {
+  const withoutHint = stripTrailingHint(text);
+  if (withoutHint === null) return [text];
+  const parts: SentSessionPart[] = [];
+  let last = 0;
+  for (const match of withoutHint.matchAll(SENT_SESSION_RE)) {
+    const [whole, title, id, subagent] = match;
+    const at = match.index;
+    if (at > last) parts.push(withoutHint.slice(last, at));
+    parts.push({ id, title, isSubagent: subagent === "yes" });
+    last = at + whole.length;
+  }
+  if (parts.length === 0) return [text];
+  if (last < withoutHint.length) parts.push(withoutHint.slice(last));
+  return parts;
 }
 
 /**
@@ -453,16 +549,77 @@ export function readableSentText(text: string): string {
   return replaceSentMentions(text, (m) => (m.kind === "session" ? `@${m.title}` : `@${m.path}`));
 }
 
-/** Everything tagged in one composer draft, saved and restored with its text. */
+/**
+ * A file pasted into the CodeMirror composer as a chip. The chip's token is the attachment's
+ * sent filename, e.g. ``@image.png``; the file is sent with the message, not referenced by path.
+ */
+export interface PastedAttachment {
+  token: string;
+  file: File;
+}
+
+/**
+ * Everything tagged in one composer draft, saved and restored with its text. Pasted chips are not
+ * tags here: a draft that leaves the live composer carries their Files as tray files.
+ */
 export interface TaggedMentions {
   files: MentionItem[];
   sessions: SessionMention[];
+}
+
+/** The tags of a live composer, including its pasted chips, which exist only while it is open. */
+export interface LiveMentions extends TaggedMentions {
+  attachments?: readonly PastedAttachment[];
 }
 
 // A tagged file's identity: the same path, kind and line range.
 function mentionItemIdentity(item: MentionItem): string {
   const range = item.lineRange ? `${item.lineRange.start}-${item.lineRange.end}` : "";
   return `${item.path}|${item.isDir}|${range}`;
+}
+
+/** The names a new attachment must avoid: tag tokens, tray filenames, and typed spellings for chips. */
+export interface AttachmentNamespace {
+  tokens: readonly string[];
+  trayNames: readonly string[];
+  text?: readonly string[];
+}
+
+// Line breaks and other control characters would not survive the editor's own normalization, so
+// a token could not match its text. Each run becomes one space; a name left empty falls back.
+// oxlint-disable-next-line no-control-regex -- the control characters are what this removes.
+const CONTROL_CHARACTERS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
+
+/** A filename as it may appear in a chip's token: no line breaks or control characters. */
+export function canonicalAttachmentName(name: string): string {
+  const cleaned = name.replace(CONTROL_CHARACTERS_RE, " ").replace(/ {2,}/g, " ").trim();
+  return cleaned || "pasted-file";
+}
+
+/**
+ * ``file`` under a name the namespace leaves free: its own name when that is free, else a
+ * suffixed one. Returns ``file`` itself when its name is kept. Every creation or rename of an
+ * attachment name goes through here.
+ */
+export function nameAttachmentFile(file: File, namespace: AttachmentNamespace): File {
+  const spelled = namespace.text?.join("\n") ?? null;
+  const name = uniqueAttachmentName(
+    canonicalAttachmentName(attachmentFilename(file)),
+    (candidate) =>
+      namespace.tokens.includes(`@${candidate}`) ||
+      namespace.trayNames.includes(candidate) ||
+      (spelled !== null && findMentionTokens(spelled, [`@${candidate}`]).length > 0),
+  );
+  return name === file.name ? file : new File([file], name, { type: file.type });
+}
+
+/** The tag tokens of ``tags``, live and released alike, for an allocation namespace. */
+export function tagTokensOf(tags: LiveMentions | undefined): string[] {
+  return [
+    ...(tags?.files ?? []).map(fileMentionToken),
+    ...(tags?.sessions ?? []).map(sessionTokenOf),
+    ...(tags?.attachments ?? []).map((it) => it.token),
+  ];
 }
 
 /**

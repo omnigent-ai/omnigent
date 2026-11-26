@@ -20,7 +20,6 @@ from playwright.sync_api import sync_playwright
 from tests._helpers.live_server import isolated_local_server, isolated_process_env
 from tests._helpers.polling import poll_until
 from tests.e2e._host_login_workspace import (
-    ACCESS_TOKEN,
     MOUNT,
     USER_EMAIL,
     WORKSPACE_ID,
@@ -46,29 +45,14 @@ def test_login_rejects_truncated_workspace_selector(tmp_path: Path) -> None:
         HostLoginWorkspace(tmp_path / "workspace", base_url) as workspace,
     ):
         home = tmp_path / "cli-home"
+        workspace.seed_login(home)
         data = home / ".omnigent"
-        data.mkdir(parents=True)
         auth_file = data / "auth_tokens.json"
-        auth_file.write_text(
-            json.dumps(
-                {
-                    workspace.server_url: {
-                        "auth_type": "databricks",
-                        "workspace_host": workspace.url,
-                        "org_id": WORKSPACE_ID,
-                        "user_id": USER_EMAIL,
-                    }
-                }
-            )
-        )
         original_auth = auth_file.read_bytes()
         config_file = data / "config.yaml"
         config_file.write_text("server: http://127.0.0.1:1\n")
         original_config = config_file.read_bytes()
         profile_file = home / ".databrickscfg"
-        profile_file.write_text(
-            f"[local-test]\nhost = {workspace.url}\nauth_type = pat\ntoken = {ACCESS_TOKEN}\n"
-        )
         env = isolated_process_env(
             home,
             {

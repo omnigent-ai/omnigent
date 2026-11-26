@@ -36,6 +36,19 @@ _TOO_SOON = (
     f"A reminder must be at least {MIN_REMINDER_DELAY.seconds // 60} minutes in the future."
 )
 
+_WORKFLOW_ID_DESC = (
+    "Optional. One of your saved workflows, by its ID from sys_workflow_list, to run on "
+    "the schedule instead of a prompt: the server writes the prompt that runs it, each "
+    "run starts as a run of that workflow with its saved steps as the new session's "
+    "plan, and the workflow's page lists the run. Leave out prompt, give this run's "
+    "specifics as workflow_details, and keep session_mode 'new'. The workflow must be "
+    "runnable by you; if it is deleted later, the next run fails and the task is paused."
+)
+_WORKFLOW_DETAILS_DESC = (
+    "Optional, with workflow_id: this run's specifics, sent after the request to run the "
+    "workflow, e.g. 'Only the upload tests'."
+)
+
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
@@ -87,7 +100,8 @@ class SysScheduledTaskCreateTool(Tool):
                         "prompt": {
                             "type": "string",
                             "description": (
-                                "The instruction dispatched to the agent on each firing."
+                                "The instruction dispatched to the agent on each firing. "
+                                "Required unless workflow_id names a saved workflow to run."
                             ),
                         },
                         "rrule": {"type": "string", "description": _RRULE_DESC},
@@ -99,10 +113,14 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                         "timezone": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "IANA timezone the rule is evaluated in, e.g. "
-                                "'America/Los_Angeles'. Defaults to 'UTC'."
+                                "'America/Los_Angeles'. Use the zone the user names; "
+                                "otherwise omit it or send JSON null. Current runners "
+                                "request their recorded browser timezone, falling back "
+                                "to UTC when unavailable or unsupported. "
+                                "Do not infer a zone from the host or environment."
                             ),
                         },
                         "model_override": {
@@ -146,9 +164,11 @@ class SysScheduledTaskCreateTool(Tool):
                         "max_cost_usd": {
                             "type": "number",
                             "description": (
-                                "Optional per-firing cost budget in USD. When set, each "
-                                "fired session is capped at this spend — all models are "
-                                "blocked once the limit is reached. Omit for no cap."
+                                "Optional per-firing cost budget in USD. Omit unless the "
+                                "user explicitly requests a cost limit; do not invent a "
+                                "budget. Reaching the limit blocks further model requests "
+                                "and tool calls and may leave the task incomplete. "
+                                "Omit for no automation-specific cap."
                             ),
                         },
                         "session_mode": {
@@ -158,7 +178,9 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional. 'new' (default) starts a new session for every "
                                 "run. 'continue' sends every run's prompt into one session, "
                                 "keeping its context: session_id when given, otherwise the "
-                                "session the first run creates."
+                                "session the first run creates. A task with workflow_id, "
+                                "or a prompt that runs a saved workflow, needs 'new': every "
+                                "workflow run gets its own session."
                             ),
                         },
                         "session_id": {
@@ -208,6 +230,11 @@ class SysScheduledTaskCreateTool(Tool):
                                 "if you have none. Do not set project_id with it."
                             ),
                         },
+                        "workflow_id": {"type": "string", "description": _WORKFLOW_ID_DESC},
+                        "workflow_details": {
+                            "type": "string",
+                            "description": _WORKFLOW_DETAILS_DESC,
+                        },
                         "project_id": {
                             "type": "string",
                             "description": (
@@ -218,7 +245,6 @@ class SysScheduledTaskCreateTool(Tool):
                     },
                     "required": [
                         "name",
-                        "prompt",
                         "rrule",
                         "agent_id",
                         "permission_mode",
@@ -240,7 +266,11 @@ class SysScheduledTaskListTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        return "List your scheduled tasks (recurring agent runs) with their schedules and state."
+        return (
+            "List your scheduled tasks (recurring agent runs) with their schedules and state. "
+            "A trigger automation, which watches a service such as Jira or Slack for new "
+            "items, is listed with rrule null when the server decides when it polls."
+        )
 
     def get_schema(self) -> dict[str, Any]:
         """:returns: The OpenAI-format tool schema."""
@@ -295,7 +325,14 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": "The task to update (from sys_scheduled_task_list).",
                         },
                         "name": {"type": "string", "description": "New task name."},
-                        "prompt": {"type": "string", "description": "New prompt."},
+                        "prompt": {
+                            "type": "string",
+                            "description": (
+                                "New prompt. For a task that runs a saved workflow the "
+                                "server writes the prompt: resend it unchanged, and change "
+                                "the run's specifics with workflow_details."
+                            ),
+                        },
                         "rrule": {"type": "string", "description": _RRULE_DESC},
                         "agent_id": {
                             "type": "string",
@@ -335,9 +372,14 @@ class SysScheduledTaskUpdateTool(Tool):
                             ),
                         },
                         "max_cost_usd": {
-                            "type": "number",
+                            "type": ["number", "null"],
                             "description": (
-                                "New per-firing cost budget in USD. Null clears the cap."
+                                "New per-firing cost budget in USD. Omit to preserve the "
+                                "current setting. Set or change a limit only when the user "
+                                "explicitly requests it; do not invent a budget. Send JSON "
+                                "null only when the user requests removing the cap. "
+                                "Reaching the limit blocks further model requests and tool "
+                                "calls and may leave the task incomplete."
                             ),
                         },
                         "session_mode": {
@@ -345,7 +387,8 @@ class SysScheduledTaskUpdateTool(Tool):
                             "enum": ["new", "continue"],
                             "description": (
                                 "'new' starts a new session for every run; 'continue' sends "
-                                "every run's prompt into one session."
+                                "every run's prompt into one session. A task that runs a "
+                                "saved workflow needs 'new'."
                             ),
                         },
                         "session_id": {
@@ -388,6 +431,22 @@ class SysScheduledTaskUpdateTool(Tool):
                             "description": (
                                 "File future fired sessions into this project, by name: "
                                 "your existing project with this name, or a new one."
+                            ),
+                        },
+                        "workflow_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Run this saved workflow, by its ID from sys_workflow_list, "
+                                "from now on; the server writes the prompt. JSON null stops "
+                                "running the task's workflow and needs a new prompt. Omit "
+                                "to keep it."
+                            ),
+                        },
+                        "workflow_details": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "New specifics for each run of the task's saved workflow; "
+                                "JSON null clears them. Omit to keep them."
                             ),
                         },
                         "project_id": {
@@ -560,8 +619,8 @@ class SysReminderSetTool(Tool):
             "reminders; sys_scheduled_task_list does. Cancel one with "
             "sys_scheduled_task_delete and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
-            "connected host, not in sub-agent sessions, side chats, managed sandboxes, or "
-            "sessions running in a permission mode that skips approval. For "
+            "connected host, not in sub-agent sessions, side chats or managed sandboxes, "
+            "and wakes the session in whatever permission mode it is in then. For "
             "a shorter wait inside an active turn, use sys_timer_set (when enabled)."
         )
 

@@ -14,12 +14,12 @@ afterEach(() => {
 describe("filesPanelPreferences", () => {
   it("defaults the sort order when nothing is stored", () => {
     expect(readFilesPanelPreferences()).toEqual(DEFAULT_FILES_PANEL_PREFERENCES);
-    expect(DEFAULT_FILES_PANEL_PREFERENCES.sort).toBe("recent");
+    expect(DEFAULT_FILES_PANEL_PREFERENCES.sort).toBe("alpha");
   });
 
   it("round-trips a written preference", () => {
-    writeFilesPanelPreferences({ sort: "alpha" });
-    expect(readFilesPanelPreferences()).toEqual({ sort: "alpha" });
+    writeFilesPanelPreferences({ sort: "recent" });
+    expect(readFilesPanelPreferences()).toEqual({ sort: "recent" });
   });
 
   it("falls back to defaults on malformed JSON", () => {
@@ -37,6 +37,6 @@ describe("filesPanelPreferences", () => {
 
   it("defaults sort when the stored value is invalid", () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ sort: "bogus" }));
-    expect(readFilesPanelPreferences()).toEqual({ sort: "recent" });
+    expect(readFilesPanelPreferences()).toEqual({ sort: "alpha" });
   });
 });

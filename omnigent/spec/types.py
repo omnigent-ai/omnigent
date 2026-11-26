@@ -417,6 +417,7 @@ class ApiKeyAuth:
     :param base_url: Optional OpenAI-compatible endpoint URL,
         e.g. ``"https://my-gateway.example.com/v1"``. When omitted,
         the default ``https://api.openai.com/v1`` is used.
+    :param source_env_names: Credential environment names retained before expansion.
     """
 
     # Required: the resolved API key value (env-var refs expanded at parse time).
@@ -424,6 +425,8 @@ class ApiKeyAuth:
     # Optional: custom endpoint; None means use the default OpenAI endpoint.
     base_url: str | None = None
     type: Literal["api_key"] = "api_key"
+    # Original credential env refs survive expansion for child-process scrubbing.
+    source_env_names: tuple[str, ...] = field(default=(), repr=False, compare=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -875,16 +878,24 @@ class ToolsConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
+# The tools behind ``ToolGroupsConfig.memory``. The runner routes calls with
+# these names to the memory server only for an agent whose memory group is on.
+MEMORY_TOOL_NAMES: frozenset[str] = frozenset(
+    {"memory_search", "memory_get", "memory_list", "memory_write", "memory_delete"}
+)
+
+
 @dataclass
 class ToolGroupsConfig:
     """
     Which framework-owned tool groups an agent advertises.
 
-    Every group defaults to ``True``: the groups register on every agent
-    unless the spec opts out under a top-level ``tool_groups:`` block (a
-    mapping of group name to boolean). Trimming a group the agent cannot
-    use keeps the advertised tool payload under a strict provider's byte
-    limit and stops a small model from picking an irrelevant tool.
+    Every group except ``files`` defaults to ``True``: groups register on every
+    agent unless the spec opts out under a top-level ``tool_groups:`` block (a
+    mapping of group name to boolean). ``files`` is off until an agent opts in
+    with ``files: true``. Trimming a group the agent cannot use keeps the
+    advertised tool payload under a strict provider's byte limit and stops a
+    small model from picking an irrelevant tool.
 
     :param browser: The ``browser_*`` embedded-browser tools (5).
     :param scheduled_tasks: The ``sys_scheduled_task_*`` tools (4) and ``sys_reminder_set``.
@@ -895,6 +906,13 @@ class ToolGroupsConfig:
         statuses and notes.
     :param projects: ``sys_project_list``, ``sys_project_update`` and
         ``sys_session_update``.
+    :param user_inbox: ``sys_user_inbox_post`` and ``sys_user_inbox_list``,
+        which write to and read the owner's Inbox. The runner also drops them
+        unless the server offers the Inbox to the session's owner.
+    :param memory: The ``memory_*`` long-term memory tools (5).
+    :param files: ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``,
+        which share workspace files through the session's file store. Off by
+        default.
     """
 
     browser: bool = True
@@ -904,6 +922,9 @@ class ToolGroupsConfig:
     agent_discovery: bool = True
     journal: bool = True
     projects: bool = True
+    user_inbox: bool = True
+    memory: bool = True
+    files: bool = False
 
 
 @dataclass
@@ -1597,6 +1618,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         an absent block changes nothing; a spec sets a group to
         ``false`` to drop tools it cannot use from the advertised
         payload. See :class:`ToolGroupsConfig` for the groups.
+    :param memory_search_available: Whether the server's memory backend can
+        search, so ``memory_search`` is offered with the other memory tools.
+        Set by the runner from the bundle download, never from YAML.
     :param agent_session_sharing: Authority for the agent to share the
         session it is running in, via ``sys_session_share``. YAML key is
         ``agent_session_sharing:`` (top-level, like ``spawn:``). This
@@ -1659,6 +1683,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
+    # Not read from YAML: the runner clears it when the server's memory backend
+    # has no search, which drops ``memory_search`` from the memory tools.
+    memory_search_available: bool = True
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
 

@@ -657,7 +657,17 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                     continue
                 failure = _terminal_failure(pod)
                 if failure:
-                    raise click.ClickException(f"Warm Sandbox startup failed: {failure[1]}")
+                    container, summary = failure
+                    raise click.ClickException(
+                        "Warm Sandbox startup failed: "
+                        + self._pod_failure_message(
+                            handle.namespace,
+                            pod.metadata.name,
+                            summary,
+                            log_container=container,
+                            pod=pod,
+                        )
+                    )
                 if activated_uid is not None and pod.metadata.uid != activated_uid:
                     raise click.ClickException(
                         "Warm Sandbox Pod changed during activation; retry the session."

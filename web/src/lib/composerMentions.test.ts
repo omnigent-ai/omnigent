@@ -11,9 +11,11 @@ import {
   mentionTokenAtCaret,
   newFileMentionToken,
   presentMentions,
+  presentTaggedMentions,
   rankSessionMentions,
   readableSentText,
   replaceSentMentions,
+  separateMentionEdges,
   SESSION_MENTION_HINT,
   sessionMentionMarker,
   sessionMentionToken,
@@ -50,6 +52,82 @@ describe("mentionTokenAtCaret", () => {
   });
 });
 
+describe("separateMentionEdges", () => {
+  const tokens = ["@readme.md", "@Alpha planning"];
+  // Inserts ``text`` at ``at`` (a collapsed caret) in ``value``.
+  const typeAt = (value: string, at: number, text: string) =>
+    separateMentionEdges(value, { start: at, end: at, text }, tokens);
+
+  it("adds a space when text is typed right after a token, keeping the neighbour's identity", () => {
+    expect(typeAt("Read @readme.md", 15, "x")).toEqual({ text: " x", caret: 2 });
+    expect(typeAt("@Alpha planning", 15, "x")).toEqual({ text: " x", caret: 2 });
+    const value = "Read @readme.md more";
+    const adjusted = typeAt(value, 15, "x");
+    const next = value.slice(0, 15) + adjusted!.text + value.slice(15);
+    expect(findMentionTokens(next, tokens)).toEqual([{ start: 5, end: 15, token: "@readme.md" }]);
+  });
+
+  it("adds a space when text is typed right before a token, keeping the caret after the text", () => {
+    expect(typeAt("Read @readme.md", 5, "x")).toEqual({ text: "x ", caret: 1 });
+  });
+
+  it("adds both spaces when text replaces the gap between two tokens", () => {
+    expect(
+      separateMentionEdges("@readme.md @Alpha planning", { start: 10, end: 11, text: "x" }, tokens),
+    ).toEqual({ text: " x ", caret: 2 });
+  });
+
+  it("leaves punctuation that a token may end with, and whitespace, untouched", () => {
+    expect(typeAt("Read @readme.md", 15, ",")).toBeNull();
+    expect(typeAt("Read @readme.md", 15, " ")).toBeNull();
+    expect(typeAt("Read @readme.md", 15, "\n")).toBeNull();
+    expect(typeAt("Read @readme.md", 5, " ")).toBeNull();
+  });
+
+  it("adds a space for punctuation a token may not end with", () => {
+    expect(typeAt("Read @readme.md", 15, "(")).toEqual({ text: " (", caret: 2 });
+    expect(typeAt("Read @readme.md", 5, "(")).toEqual({ text: "( ", caret: 1 });
+  });
+
+  it("works in the middle of text, next to a token that has words on both sides", () => {
+    expect(typeAt("Read @readme.md more", 15, "x")).toEqual({ text: " x", caret: 2 });
+    expect(typeAt("see the @readme.md file", 8, "x")).toEqual({ text: "x ", caret: 1 });
+  });
+
+  it("checks each end of a multi-character paste on its own", () => {
+    expect(typeAt("Read @readme.md", 15, "foo bar")).toEqual({ text: " foo bar", caret: 8 });
+    expect(typeAt("Read @readme.md", 5, "foo bar")).toEqual({ text: "foo bar ", caret: 7 });
+    expect(typeAt("Read @readme.md", 15, "foo ")).toEqual({ text: " foo ", caret: 5 });
+    expect(typeAt("Read @readme.md", 5, "foo ")).toBeNull();
+  });
+
+  it("adds no space when a longer tag would take over the neighbouring tag's match", () => {
+    // Typing after the first @Alpha would make "@Alpha x" match in place of "@Alpha".
+    expect(
+      separateMentionEdges("@Alpha and @Alpha x", { start: 6, end: 6, text: "x" }, [
+        "@Alpha",
+        "@Alpha x",
+      ]),
+    ).toBeNull();
+  });
+
+  it("leaves an insert that replaces the token itself alone", () => {
+    expect(
+      separateMentionEdges("Read @readme.md", { start: 5, end: 15, text: "x" }, tokens),
+    ).toBeNull();
+  });
+
+  it("does nothing without tokens or with a deletion", () => {
+    expect(typeAt("Read plain text", 15, "x")).toBeNull();
+    expect(
+      separateMentionEdges("Read @readme.md", { start: 15, end: 15, text: "" }, tokens),
+    ).toBeNull();
+    expect(
+      separateMentionEdges("Read @readme.md", { start: 15, end: 15, text: "x" }, []),
+    ).toBeNull();
+  });
+});
+
 describe("unique tokens across files and sessions", () => {
   const readmeSession: SessionMention = { id: "s_readme1", title: "README.md", isSubagent: false };
   const readmeFile = { path: "README.md", isDir: false };
@@ -63,8 +141,10 @@ describe("unique tokens across files and sessions", () => {
     const fileToken = newFileMentionToken(readmeFile, [sessionToken]);
     expect([sessionToken, fileToken]).toEqual(["@README.md", "@README.md (file)"]);
     const mentions = composerInlineMentions(
-      [{ ...readmeFile, token: fileToken }],
-      [{ ...readmeSession, token: sessionToken }],
+      {
+        files: [{ ...readmeFile, token: fileToken }],
+        sessions: [{ ...readmeSession, token: sessionToken }],
+      },
       null,
     );
     expect(targets(`compare ${sessionToken} with ${fileToken}`, mentions)).toEqual([
@@ -78,8 +158,10 @@ describe("unique tokens across files and sessions", () => {
     const sessionToken = sessionMentionToken(readmeSession, [fileToken]);
     expect([fileToken, sessionToken]).toEqual(["@README.md", "@README.md (s_read)"]);
     const mentions = composerInlineMentions(
-      [{ ...readmeFile, token: fileToken }],
-      [{ ...readmeSession, token: sessionToken }],
+      {
+        files: [{ ...readmeFile, token: fileToken }],
+        sessions: [{ ...readmeSession, token: sessionToken }],
+      },
       null,
     );
     expect(targets(`compare ${fileToken} with ${sessionToken}`, mentions)).toEqual([
@@ -101,18 +183,35 @@ describe("unique tokens across files and sessions", () => {
       return { ...session, token };
     });
     expect(taken).toEqual(["@Fix", "@Fix (abcdef)", "@Fix (abcdef111111)"]);
-    const mentions = composerInlineMentions([], tagged, null);
+    const mentions = composerInlineMentions({ files: [], sessions: tagged }, null);
     expect(targets(taken.join(" and "), mentions)).toEqual(sessions.map((s) => s.id));
+  });
+});
+
+describe("pasted chips in the token scan", () => {
+  it("keeps a pasted chip whole when a session token is a prefix of its name", () => {
+    const file = new File(["p"], "Plan.png", { type: "image/png" });
+    const tags = {
+      files: [],
+      sessions: [{ id: "s_plan", title: "Plan", isSubagent: false, token: "@Plan" }],
+      attachments: [{ token: "@Plan.png", file }],
+    };
+    const mentions = composerInlineMentions(tags, null);
+    expect(expandMentionTokens("Ask @Plan @Plan.png", mentions)).toBe(
+      'Ask [Session: "Plan" id=s_plan subagent=no] @Plan.png',
+    );
   });
 });
 
 describe("expanding composer text", () => {
   const mentions = composerInlineMentions(
-    [{ path: "src/a.ts", isDir: false }],
-    [
-      { ...child, token: "@auth" },
-      { ...alpha, token: "@Alpha planning" },
-    ],
+    {
+      files: [{ path: "src/a.ts", isDir: false }],
+      sessions: [
+        { ...child, token: "@auth" },
+        { ...alpha, token: "@Alpha planning" },
+      ],
+    },
     "codex-native",
   );
 
@@ -137,6 +236,19 @@ describe("expanding composer text", () => {
 
   it("drops mentions whose token was deleted from every segment", () => {
     expect(presentMentions(mentions, ["only @auth here"]).map((m) => m.token)).toEqual(["@auth"]);
+  });
+
+  it("keeps only the tagged files and sessions whose token is still present", () => {
+    const tagged = {
+      files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+      sessions: [{ ...alpha, token: "@Alpha planning" }],
+    };
+    expect(presentTaggedMentions(tagged, ["check @Alpha planning"])).toEqual({
+      files: [],
+      sessions: [{ ...alpha, token: "@Alpha planning" }],
+    });
+    expect(presentTaggedMentions(tagged, ["nothing tagged"])).toBeUndefined();
+    expect(presentTaggedMentions(undefined, ["@src/app.ts"])).toBeUndefined();
   });
 
   it("appends the hint once, only when a session is tagged", () => {

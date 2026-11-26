@@ -230,6 +230,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.server.session_mcp_selection import SessionMcpSelection
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import Conversation, ConversationStore
 
@@ -457,8 +458,9 @@ def host_slice_key_enabled(labels: Mapping[str, str], host_id: str) -> bool:
     """
     Whether a session's managed host routes by its own id.
 
-    Only when the create or fork chose this host id, so the caller routes by it from
-    the start; otherwise the host stays on the caller's default replica.
+    Only when the launch requested this host id: chosen by the create or fork, or
+    minted by the server for a keyed request, so callers can route by it; otherwise
+    the host stays on the caller's default replica.
 
     :param labels: The session's labels.
     :param host_id: The session's managed host.
@@ -650,7 +652,8 @@ class ManagedLaunch:
         then on the host's replica can finish the launch and deliver
         saved inputs, so a scheduled fire can hand off at this point.
     :param host_online_failure_hint: Recovery guidance from the active provider,
-        read off the event loop if a scheduled registration wait times out.
+        bound while its provisioned sandbox's host registers. Read off the event
+        loop when a scheduled registration wait or a message rendezvous times out.
     """
 
     settled: asyncio.Event
@@ -809,6 +812,11 @@ class ManagedSandboxConfig:
         provider's launcher makes the final call through
         :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.stop_when_archived`
         (see :func:`stop_archived_session_sandbox`).
+    :param mcp_selection: How sessions the server creates in this provider's
+        sandboxes record their owner's MCP services, for a provider that
+        configures MCP servers inside the sandbox rather than through the
+        server's registry. ``None`` uses the registry, as on a connected host.
+        See :mod:`omnigent.server.session_mcp_selection`.
     """
 
     server_url: str
@@ -829,6 +837,7 @@ class ManagedSandboxConfig:
     manages_profiles: bool = False
     default_profile_id: str | None = None
     stop_on_archive: bool = False
+    mcp_selection: SessionMcpSelection | None = None
 
 
 class NoReachableModels(Exception):
@@ -852,7 +861,10 @@ class ManagedSandboxReaperConfig:
     :param terminate_after_offline_days: Minimum number of days since the
         managed host's last heartbeat/disconnect before its current sandbox
         generation may be terminated.
-    :param sweep_interval_s: Seconds between complete deployment-wide sweeps.
+    :param sweep_interval_s: Average seconds between one server process's
+        complete deployment-wide sweeps. The first sweep runs at a random point
+        within the first interval and later intervals vary by up to 10%, so
+        replicas that start together do not sweep together.
     """
 
     enabled: bool = False
@@ -4032,14 +4044,16 @@ def build_owner_launcher(
     owner: str,
 ) -> SandboxHostLauncher:
     """
-    Build *entry*'s launcher, bound to *owner*'s credential when it needs one.
+    Build *entry*'s launcher, bound to *owner* and, when it needs one, to
+    *owner*'s credential.
 
     The single place a managed-host path turns a provider config into a
-    launcher. A launcher that acts as the host's owner (its
-    ``owner_credential_provider`` names a connection provider, e.g.
-    ``"databricks"``) is bound to the deployment's resolver for that provider,
-    curried with *owner*. With no resolver (the server has no connect flow for
-    that provider) the launcher stays unbound and refuses at first use with
+    launcher. The launcher is told its owner first (``bind_owner``). A launcher
+    that acts as the host's owner (its ``owner_credential_provider`` names a
+    connection provider, e.g. ``"databricks"``) is bound to the deployment's
+    resolver for that provider, curried with *owner*. With no resolver (the
+    server has no connect flow for that provider) the launcher stays unbound
+    and refuses at first use with
     :class:`~omnigent.onboarding.sandboxes.base.OwnerCredentialMissingError` —
     there is never a fallback to a shared server identity.
 
@@ -4052,6 +4066,9 @@ def build_owner_launcher(
     """
     launcher = entry.launcher_factory()
     # getattr: embedding deployments may inject duck-typed launchers.
+    bind_owner = getattr(launcher, "bind_owner", None)
+    if bind_owner is not None:
+        bind_owner(owner)
     needed = getattr(launcher, "owner_credential_provider", None)
     if needed is not None and deployment is not None:
         resolver = deployment.owner_credentials.get(needed)
@@ -4099,6 +4116,27 @@ async def _select_launch_profile(
         host_id is not None and entry.unprofiled_host_id == host_id
     ):
         raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")
+
+
+# Bounds a provider recovery-hint read; its worker thread cannot be stopped.
+PROVIDER_RECOVERY_HINT_TIMEOUT_S = 1.0
+
+
+async def read_provider_recovery_hint(hint: Callable[[], str | None] | None) -> str | None:
+    """Read a launch's provider recovery guidance off the event loop.
+
+    :param hint: The launch's bound :attr:`ManagedLaunch.host_online_failure_hint`.
+    :returns: The guidance, or ``None`` when it is absent, empty, failing, or
+        slower than :data:`PROVIDER_RECOVERY_HINT_TIMEOUT_S`.
+    """
+    if hint is None:
+        return None
+    try:
+        async with asyncio.timeout(PROVIDER_RECOVERY_HINT_TIMEOUT_S):
+            return await asyncio.to_thread(hint) or None
+    except Exception:
+        _logger.warning("Could not read the provider recovery hint", exc_info=True)
+        return None
 
 
 @contextmanager
@@ -4885,6 +4923,7 @@ async def resume_managed_host(
     on_stage: SandboxStageObserver | None = None,
     agent_name: str | None = None,
     slice_key_enabled: bool = False,
+    launch_state: ManagedLaunch | None = None,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -4931,6 +4970,9 @@ async def resume_managed_host(
         caller re-derives it through the same built-in gate a launch uses.
     :param slice_key_enabled: Whether the host routes by its own id, as at its
         first launch (see :func:`host_slice_key_enabled`).
+    :param launch_state: The session's tracker entry, which holds the
+        provider's recovery hint once the sandbox resumes and until its host
+        registers, or ``None`` when no request waits on the wake.
     :raises SandboxGoneError: When the sandbox generation definitively no
         longer exists, allowing the caller to create a fresh one.
     :raises HTTPException: 502 when the resume or host restart otherwise fails.
@@ -4974,7 +5016,9 @@ async def resume_managed_host(
         try:
             await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
             if launcher.capabilities.resume_preserves_host:
-                await _resume_preserving_host(launcher, host, host_store, sandbox_id=sandbox_id)
+                await _resume_preserving_host(
+                    launcher, host, host_store, sandbox_id=sandbox_id, launch_state=launch_state
+                )
                 return
             await asyncio.to_thread(launcher.resume, sandbox_id)
             token = secrets.token_urlsafe(32)
@@ -4989,21 +5033,22 @@ async def resume_managed_host(
             if armed is None:
                 await _settle_stale_wake(launcher, host, host_store, sandbox_id=sandbox_id)
                 return
-            await _start_sandbox_host(
-                launcher,
-                sandbox_id,
-                token=token,
-                host_id=host.host_id,
-                host_name=host.name,
-                server_url=entry.server_url,
-                repos=workspace_repos,
-                host_config=_with_host_slice_key(
-                    entry.host_config, slice_key_enabled, entry.server_url
-                ),
-                on_stage=on_stage,
-                agent_name=agent_name,
-            )
-            await _wait_for_host_online(host_store, host.host_id)
+            with _provider_recovery_hint(launch_state, launcher, sandbox_id):
+                await _start_sandbox_host(
+                    launcher,
+                    sandbox_id,
+                    token=token,
+                    host_id=host.host_id,
+                    host_name=host.name,
+                    server_url=entry.server_url,
+                    repos=workspace_repos,
+                    host_config=_with_host_slice_key(
+                        entry.host_config, slice_key_enabled, entry.server_url
+                    ),
+                    on_stage=on_stage,
+                    agent_name=agent_name,
+                )
+                await _wait_for_host_online(host_store, host.host_id)
         except SandboxGoneError:
             raise
         except Exception as exc:
@@ -5025,6 +5070,7 @@ async def _resume_preserving_host(
     host_store: HostStore,
     *,
     sandbox_id: str,
+    launch_state: ManagedLaunch | None = None,
 ) -> None:
     """Wake a sandbox whose resume brings its running host back.
 
@@ -5040,6 +5086,8 @@ async def _resume_preserving_host(
     :param host: The host row read under the resume lock.
     :param host_store: Persistent host registrations.
     :param sandbox_id: The active sandbox id to resume.
+    :param launch_state: The session's tracker entry, which holds the
+        provider's recovery hint while the resumed host registers.
     :raises ValueError: When the host row no longer exists.
     """
     claimed = await asyncio.to_thread(
@@ -5052,11 +5100,12 @@ async def _resume_preserving_host(
         await _settle_stale_wake(launcher, host, host_store, sandbox_id=sandbox_id)
         return
     await asyncio.to_thread(launcher.resume, sandbox_id)
-    await _wait_for_host_online(
-        host_store,
-        host.host_id,
-        observed_after=claimed.updated_at if claimed.status == "online" else None,
-    )
+    with _provider_recovery_hint(launch_state, launcher, sandbox_id):
+        await _wait_for_host_online(
+            host_store,
+            host.host_id,
+            observed_after=claimed.updated_at if claimed.status == "online" else None,
+        )
 
 
 async def _settle_stale_wake(

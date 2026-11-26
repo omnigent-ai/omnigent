@@ -23,6 +23,7 @@ from typing import Any
 from omnigent.entities.session_journal import (
     JOURNAL_KINDS,
     NOTE_BODY_MAX_BYTES,
+    PLAN_DESCRIPTION_MAX_CHARS,
     PLAN_MAX_STEPS,
     PLAN_NAME_MAX_CHARS,
     STEP_ID_MAX_CHARS,
@@ -168,6 +169,17 @@ class SysJournalWritePlanTool(Tool):
                         "from sys_workflow_load."
                     ),
                 },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": PLAN_DESCRIPTION_MAX_CHARS,
+                    "description": (
+                        "Only in a workflow page's planning chat: the workflow's description "
+                        "for this proposal, in the current description's wording, changed "
+                        "only where the plan needs it. The user reviews a change before Save "
+                        "plan stores it."
+                    ),
+                },
             },
             ["name", "steps"],
         )
@@ -188,7 +200,16 @@ def _steps_schema(description: str) -> dict[str, Any]:
                     "type": "string",
                     "description": "A short name, e.g. 'Profile the endpoint'.",
                 },
-                "goal": {"type": "string", "description": "What done means for this step."},
+                "goal": {
+                    "type": "string",
+                    "description": (
+                        "The step's description, in Markdown written for a person first: "
+                        "'**Inputs:**' (what it reads, and from where), '**What it does:**' "
+                        "(a few short bullets) and '**Outputs:**' (what it produces, which is "
+                        "what done means), then '**Details:**' with the exact commands, paths "
+                        "and flags the work needs. Separate the parts with blank lines."
+                    ),
+                },
                 "depends_on": {
                     "type": "array",
                     "items": {"type": "string", "pattern": _STEP_ID_PATTERN},
@@ -321,7 +342,10 @@ class SysWorkflowRequestInputTool(Tool):
             "with your first question, puts the questions in the user's Inbox with your "
             "options as buttons (they can also write their own answer), and returns the "
             "answers. Then write the task's next status: started to resume it, done for an "
-            "approval given, failed for one refused. Ask everything you need in one call. "
+            "approval given, failed for one refused. If they haven't answered within a few "
+            "minutes it returns still_open: finish the work that doesn't depend on the answer, "
+            "then end your turn; their answer arrives later as a message. Ask everything you "
+            "need in one call. "
             "In an unattended automation or its workers, this tool and needs_input are "
             "refused. Resolve within the user's authorization and record the choice. Write "
             "failed for a remaining blocker only with the same evidence; continue independent "

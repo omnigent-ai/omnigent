@@ -15,8 +15,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
+  type ComponentType,
   type CSSProperties,
   type ReactElement,
+  type Ref,
   type RefObject,
   lazy,
   memo,
@@ -31,6 +33,7 @@ import { cn } from "@/lib/utils";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   CompactShortcutKeys,
+  ESC_KEY,
   NEW_BROWSER_TAB_KEYS,
   NEW_TERMINAL_KEYS,
   workspaceTabAriaShortcut,
@@ -57,6 +60,13 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -70,13 +80,15 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { useFloatingPanesShown } from "./useFloatingPanes";
+import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "./WorkspaceRailResizeHandle";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
-import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
-import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { supportsSideChat } from "@/lib/sideChat";
+import { startSideChat, stopSideChat } from "./sideChatLifecycle";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -89,12 +101,18 @@ import {
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
-import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
+import {
+  scrollTabIntoView,
+  useCompactWorkspaceTabs,
+  WorkspaceTabsScroller,
+} from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
+import { resolveWorkspaceActiveView } from "./workspaceActiveView";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { TasksPanel } from "./TasksPanel";
+import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -121,19 +139,24 @@ function WorkspaceMenuShortcut({
   return <CompactShortcutKeys keys={keys} className={className} />;
 }
 
-function WorkspaceTabTooltip({
+export function WorkspaceTabTooltip({
   label,
   shortcut,
   className,
+  open,
+  onOpenChange,
   children,
 }: {
   label: string;
   shortcut?: string | readonly string[];
   className?: string;
+  /** Controlled open state; omitted, the tooltip manages its own. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   children: ReactElement;
 }) {
   return (
-    <Tooltip>
+    <Tooltip open={open} onOpenChange={onOpenChange}>
       <TooltipTrigger asChild>
         <span className={cn("inline-flex shrink-0", className)}>{children}</span>
       </TooltipTrigger>
@@ -144,6 +167,156 @@ function WorkspaceTabTooltip({
         <span>{label}</span>
       </TooltipContent>
     </Tooltip>
+  );
+}
+
+/** Outcome callbacks for a shell close, which first waits on the user's confirmation. */
+export interface ShellCloseCallbacks {
+  /** The user confirmed; the shells' kill requests are on their way. */
+  onConfirmed?: () => void;
+  /** The kill request for this shell's tab failed, so the tab stays. */
+  onFailed?: (key: string) => void;
+}
+
+/** Close commands for an open tab; an absent command shows disabled. */
+interface OpenTabCloseActions {
+  close?: () => void;
+  closeOthers?: () => void;
+  closeAll?: () => void;
+}
+
+const NO_CLOSING_TERMINALS: readonly string[] = [];
+
+const OPEN_TAB_ACTIVE_CLASS =
+  "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
+// Like browser tabs: labelled tabs shrink toward this floor, truncating their labels,
+// before the strip falls back to icons only.
+const OPEN_TAB_SIZE_CLASS = "min-w-16 shrink";
+const COMPACT_OPEN_TAB_SIZE_CLASS = "shrink-0";
+const OPEN_TAB_INACTIVE_CLASS =
+  "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground";
+
+/**
+ * Right-click menu for an open tab (Close / Close other tabs / Close all tabs). Icon-only
+ * tabs also get a tooltip naming them.
+ */
+function OpenTabMenu({
+  label,
+  actions,
+  children,
+}: {
+  label: string;
+  actions: OpenTabCloseActions;
+  children: ReactElement;
+}) {
+  const compact = useCompactWorkspaceTabs();
+  // An icon-only tab's name tooltip opens below the tab, over the menu's first item, and
+  // takes that item's click; it stays closed while the menu is open. A ref, since the
+  // tooltip's delayed open can call a handler from the render before the menu opened.
+  const menuOpenRef = useRef(false);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  const menu = (
+    <ContextMenu
+      onOpenChange={(open) => {
+        menuOpenRef.current = open;
+        if (open) setTooltipOpen(false);
+      }}
+    >
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      {/* Focus returning to the tab would reopen its tooltip after the menu closes. */}
+      <ContextMenuContent onCloseAutoFocus={(event) => event.preventDefault()}>
+        {/* The native browser view would otherwise paint over the menu. */}
+        <SuppressBrowserView />
+        <ContextMenuItem disabled={!actions.close} onSelect={actions.close}>
+          Close
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem disabled={!actions.closeOthers} onSelect={actions.closeOthers}>
+          Close other tabs
+        </ContextMenuItem>
+        <ContextMenuItem disabled={!actions.closeAll} onSelect={actions.closeAll}>
+          Close all tabs
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+  return compact ? (
+    <WorkspaceTabTooltip
+      label={label}
+      open={tooltipOpen}
+      onOpenChange={(open) => setTooltipOpen(open && !menuOpenRef.current)}
+    >
+      {menu}
+    </WorkspaceTabTooltip>
+  ) : (
+    menu
+  );
+}
+
+/**
+ * An open panel, browser or side-chat tab: icon, label and close button. When the strip
+ * is crowded only the icon shows, plus the close button on the active tab.
+ */
+function OpenTab({
+  label,
+  icon: Icon,
+  active,
+  tabRef,
+  labelClassName,
+  onSelect,
+  onClose,
+  closeActions,
+}: {
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+  active: boolean;
+  tabRef?: Ref<HTMLDivElement>;
+  labelClassName?: string;
+  onSelect: () => void;
+  onClose: () => void;
+  closeActions: OpenTabCloseActions;
+}) {
+  const compact = useCompactWorkspaceTabs();
+  return (
+    <OpenTabMenu label={label} actions={{ ...closeActions, close: onClose }}>
+      <div
+        ref={tabRef}
+        className={cn(
+          "flex h-[24px] items-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+          compact ? COMPACT_OPEN_TAB_SIZE_CLASS : OPEN_TAB_SIZE_CLASS,
+          active ? OPEN_TAB_ACTIVE_CLASS : OPEN_TAB_INACTIVE_CLASS,
+        )}
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-label={label}
+          aria-selected={active}
+          title={compact ? undefined : label}
+          className="flex min-w-0 flex-1 items-center gap-1"
+          onClick={onSelect}
+          onAuxClick={(event) => {
+            if (event.button === 1) {
+              event.preventDefault();
+              onClose();
+            }
+          }}
+        >
+          <Icon className="size-4 shrink-0" />
+          {!compact && <span className={cn("min-w-0 truncate", labelClassName)}>{label}</span>}
+        </button>
+        {(!compact || active) && (
+          <button
+            type="button"
+            aria-label={`Close ${label}`}
+            className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted"
+            onClick={onClose}
+          >
+            <XIcon className="size-3" />
+          </button>
+        )}
+      </div>
+    </OpenTabMenu>
   );
 }
 
@@ -421,11 +594,29 @@ function NewTabMenu({
 // or flex-1: the parent viewport scrolls the open tabs.
 // ---------------------------------------------------------------------------
 
+/** The inline close button an icon-only file or shell tab shows while active. */
+function CompactTabCloseButton({ label, onClose }: { label: string; onClose: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-label={`Close ${label}`}
+      className="flex size-4 items-center justify-center rounded hover:bg-muted"
+      onClick={(event) => {
+        event.stopPropagation();
+        onClose();
+      }}
+    >
+      <XIcon className="size-3" />
+    </button>
+  );
+}
+
 function FileTabsStrip({
   openFiles,
   activeFilePath,
   onFileSelect,
   onCloseFile,
+  closeActionsFor,
 }: {
   /** Ordered list of open file paths. */
   openFiles: string[];
@@ -435,7 +626,10 @@ function FileTabsStrip({
   onFileSelect: (path: string) => void;
   /** Close a tab by path. */
   onCloseFile: (path: string) => void;
+  /** Bulk close commands for the tab with this strip key (``file:<path>``). */
+  closeActionsFor: (key: string) => OpenTabCloseActions;
 }) {
+  const compact = useCompactWorkspaceTabs();
   // Scroll the active tab into view when it changes (e.g. a newly opened file
   // appended past the visible edge).
   const activeTabRef = useRef<HTMLDivElement | null>(null);
@@ -447,69 +641,82 @@ function FileTabsStrip({
   // phantom gap before the next element.
   if (openFiles.length === 0) return null;
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="contents">
       {openFiles.map((path) => {
         const name = path.split("/").pop() ?? path;
         const active = path === activeFilePath;
         return (
-          <div
+          <OpenTabMenu
             key={path}
-            ref={active ? activeTabRef : undefined}
-            role="button"
-            tabIndex={0}
-            aria-current={active}
-            title={path}
-            onClick={() => onFileSelect(path)}
-            onAuxClick={(e) => {
-              // Middle click (button 1) closes the tab, matching browser /
-              // editor tab conventions.
-              if (e.button === 1) {
-                e.preventDefault();
-                onCloseFile(path);
-              }
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onFileSelect(path);
-              }
-            }}
-            className={cn(
-              // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
-              // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
-              // are the same height and the active chip lines up across both
-              // sets. `group/tab` drives the hover-revealed close overlay below.
-              // `overflow-hidden` clips the hover-close gradient overlay to the
-              // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-              active
-                ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-            )}
+            label={path}
+            actions={{ ...closeActionsFor(`file:${path}`), close: () => onCloseFile(path) }}
           >
-            <FileIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate">{name}</span>
-            {/* Close button: hidden until hover, then revealed over a gradient
+            <div
+              ref={active ? activeTabRef : undefined}
+              role="button"
+              tabIndex={0}
+              aria-label={name}
+              aria-current={active}
+              title={compact ? undefined : path}
+              onClick={() => onFileSelect(path)}
+              onAuxClick={(e) => {
+                // Middle click (button 1) closes the tab, matching browser /
+                // editor tab conventions.
+                if (e.button === 1) {
+                  e.preventDefault();
+                  onCloseFile(path);
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onFileSelect(path);
+                }
+              }}
+              className={cn(
+                // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
+                // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
+                // are the same height and the active chip lines up across both
+                // sets. `group/tab` drives the hover-revealed close overlay below.
+                // `overflow-hidden` clips the hover-close gradient overlay to the
+                // pill's rounded corners so its rectangular edges can't poke out.
+                "group/tab relative flex h-[24px] max-w-[320px] cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                compact ? COMPACT_OPEN_TAB_SIZE_CLASS : OPEN_TAB_SIZE_CLASS,
+                active
+                  ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                  : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+              )}
+            >
+              <FileIcon className="size-4 shrink-0" />
+              {compact ? (
+                active && <CompactTabCloseButton label={name} onClose={() => onCloseFile(path)} />
+              ) : (
+                <span className="min-w-0 truncate">{name}</span>
+              )}
+              {/* Close button: hidden until hover, then revealed over a gradient
                 that fades the truncated filename into the tab's background so
                 the "x" never collides with the text. The overlay only shows on
                 hover, where both active and inactive tabs share the same OPAQUE
                 selection surface — fade to that exact color. (A translucent
                 fade like var(--muted) would stack over the hover background and
                 darken the right edge into a visible gradient patch.) */}
-            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
-              <button
-                type="button"
-                aria-label={`Close ${name}`}
-                className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseFile(path);
-                }}
-              >
-                <XIcon className="size-4" />
-              </button>
-            </span>
-          </div>
+              {!compact && (
+                <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+                  <button
+                    type="button"
+                    aria-label={`Close ${name}`}
+                    className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCloseFile(path);
+                    }}
+                  >
+                    <XIcon className="size-4" />
+                  </button>
+                </span>
+              )}
+            </div>
+          </OpenTabMenu>
         );
       })}
     </div>
@@ -528,18 +735,19 @@ function FileTabsStrip({
 function TerminalTabsStrip({
   openTerminals,
   activeTerminalKey,
-  closingKey,
+  closingKeys,
   canClose,
   labelFor,
   onSelect,
   onClose,
+  closeActionsFor,
 }: {
   /** Ordered list of open terminal tab keys. */
   openTerminals: string[];
   /** Currently active terminal key, or null when another tab is active. */
   activeTerminalKey: string | null;
-  /** Tab key whose close (kill) is in flight — greyed + non-interactive. */
-  closingKey: string | null;
+  /** Tab keys whose close (kill) is in flight — greyed + non-interactive. */
+  closingKeys: readonly string[];
   /** Whether the viewer may close (kill) a shell. Closing is server-gated on
    *  edit access, so a read-only viewer gets no close affordance. */
   canClose: boolean;
@@ -549,7 +757,10 @@ function TerminalTabsStrip({
   onSelect: (key: string) => void;
   /** Close a terminal tab by key. */
   onClose: (key: string) => void;
+  /** Bulk close commands for the tab with this key. */
+  closeActionsFor: (key: string) => OpenTabCloseActions;
 }) {
+  const compact = useCompactWorkspaceTabs();
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     scrollTabIntoView(activeTabRef.current);
@@ -559,62 +770,77 @@ function TerminalTabsStrip({
   // phantom gap before the next element (e.g. the trailing "+").
   if (openTerminals.length === 0) return null;
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="contents">
       {openTerminals.map((key) => {
         const name = labelFor(key);
         const active = key === activeTerminalKey;
-        const closing = key === closingKey;
+        const closing = closingKeys.includes(key);
         return (
-          <div
+          <OpenTabMenu
             key={key}
-            ref={active ? activeTabRef : undefined}
-            role="button"
-            tabIndex={closing ? -1 : 0}
-            aria-current={active}
-            aria-busy={closing}
-            title={name}
-            onClick={() => !closing && onSelect(key)}
-            onAuxClick={(e) => {
-              if (e.button === 1 && !closing && canClose) {
-                e.preventDefault();
-                onClose(key);
-              }
+            label={name}
+            actions={{
+              ...closeActionsFor(key),
+              close: canClose && !closing ? () => onClose(key) : undefined,
             }}
-            onKeyDown={(e) => {
-              if (!closing && (e.key === "Enter" || e.key === " ")) {
-                e.preventDefault();
-                onSelect(key);
-              }
-            }}
-            className={cn(
-              // Match FileTabsStrip's pill metrics (h-24 / px-8 / rounded-md)
-              // so shell and file tabs line up in the same strip.
-              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-              active
-                ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-              // Closing: kill is in flight — dim and freeze the tab until it goes.
-              closing && "pointer-events-none opacity-50",
-            )}
           >
-            <TerminalIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate text-sm">{name}</span>
-            {canClose && (
-              <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
-                <button
-                  type="button"
-                  aria-label={`Close ${name}`}
-                  className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onClose(key);
-                  }}
-                >
-                  <XIcon className="size-4" />
-                </button>
-              </span>
-            )}
-          </div>
+            <div
+              ref={active ? activeTabRef : undefined}
+              role="button"
+              tabIndex={closing ? -1 : 0}
+              aria-label={name}
+              aria-current={active}
+              aria-busy={closing}
+              title={compact ? undefined : name}
+              onClick={() => !closing && onSelect(key)}
+              onAuxClick={(e) => {
+                if (e.button === 1 && !closing && canClose) {
+                  e.preventDefault();
+                  onClose(key);
+                }
+              }}
+              onKeyDown={(e) => {
+                if (!closing && (e.key === "Enter" || e.key === " ")) {
+                  e.preventDefault();
+                  onSelect(key);
+                }
+              }}
+              className={cn(
+                // Match FileTabsStrip's pill metrics (h-24 / px-8 / rounded-md)
+                // so shell and file tabs line up in the same strip.
+                "group/tab relative flex h-[24px] max-w-[320px] cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                compact ? COMPACT_OPEN_TAB_SIZE_CLASS : OPEN_TAB_SIZE_CLASS,
+                active
+                  ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                  : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                // Closing: kill is in flight — dim and freeze the tab until it goes.
+                closing && "pointer-events-none opacity-50",
+              )}
+            >
+              <TerminalIcon className="size-4 shrink-0" />
+              {compact ? (
+                active &&
+                canClose && <CompactTabCloseButton label={name} onClose={() => onClose(key)} />
+              ) : (
+                <span className="min-w-0 truncate text-sm">{name}</span>
+              )}
+              {canClose && !compact && (
+                <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+                  <button
+                    type="button"
+                    aria-label={`Close ${name}`}
+                    className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onClose(key);
+                    }}
+                  >
+                    <XIcon className="size-4" />
+                  </button>
+                </span>
+              )}
+            </div>
+          </OpenTabMenu>
         );
       })}
     </div>
@@ -627,7 +853,7 @@ function TerminalTabsStrip({
 // id from its tab key and tracks per-terminal connection/activity status.
 // ---------------------------------------------------------------------------
 
-function RailTerminalView({
+export function RailTerminalView({
   conversationId,
   terminalKey,
   readOnly,
@@ -771,11 +997,13 @@ interface WorkspacePanelProps {
    *  False when the shell is merely restored on a session switch — then focus
    *  stays in the chat composer. */
   autoFocusSelectedTerminal?: boolean;
-  /** Tab key whose close (terminal kill) is in flight — rendered greyed and
-   *  non-interactive until it disappears. Null when no close is pending. */
-  closingTerminalKey?: string | null;
+  /** Tab keys whose close (terminal kill) is in flight — rendered greyed and
+   *  non-interactive until they disappear. */
+  closingTerminalKeys?: readonly string[];
   /** Close a single open shell tab by key. */
-  onCloseTerminal: (key: string) => void;
+  onCloseTerminal: (key: string, callbacks?: ShellCloseCallbacks) => void;
+  /** Close several shell tabs at once, behind a single confirmation. */
+  onCloseTerminals: (keys: string[], callbacks?: ShellCloseCallbacks) => void;
   /** Whether the rail is maximized (occupies the full content area). */
   maximized: boolean;
   /** Toggle the rail's maximized state. */
@@ -921,8 +1149,9 @@ function WorkspacePanelImpl({
   openTerminals,
   selectedTerminalKey,
   autoFocusSelectedTerminal = false,
-  closingTerminalKey,
+  closingTerminalKeys = NO_CLOSING_TERMINALS,
   onCloseTerminal,
+  onCloseTerminals,
   maximized,
   onToggleMaximized,
   permissionLevel,
@@ -938,13 +1167,39 @@ function WorkspacePanelImpl({
   onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
-  const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
+  const sideChats = useSideChats(conversationId);
+  const mobileViewport = useIsMobileViewport();
+  const isMobile = mobileViewport && !contained;
+  const floatingPanes = useFloatingPanesShown();
+  const activeView = resolveWorkspaceActiveView(
+    {
+      rightRailTab,
+      selectedFilePath,
+      selectedTerminalKey,
+      selectedBrowserId: browsers.selected,
+      selectedSideChatId: sideChats.selected,
+    },
+    {
+      terminalPresent: (key) => openTerminals.includes(key),
+      showBrowserTab,
+      showGithubTab,
+      showTasksTab: showTasksTab && Boolean(conversationId),
+      showContentSearch,
+      hasAgentTree: Boolean(rootSessionId),
+      mobile: isMobile,
+    },
+  );
+  const { browserSelected, sideChatSelected } = activeView;
+  const terminalShown = activeView.terminalKey !== null;
   const returnPointRef = useRef<ReturnPoint | null>(null);
+  // Tabs the user is closing, by strip key, mapped to whether the rail hides if their
+  // departure leaves no open tabs. Entries go once their tab leaves or its close fails.
+  const closeIntentsRef = useRef(new Map<string, boolean>());
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
   // Bumped when the session changes or this rail unmounts, so late work can tell it left.
@@ -964,9 +1219,11 @@ function WorkspacePanelImpl({
     target: "address" | "page";
   } | null>(null);
   const clearBrowserFocus = useCallback(() => setBrowserFocus(null), []);
-  const closeBrowserTab = async (tabId: string) => {
+  const closeBrowserTab = async (tabId: string, hideWhenLast = true) => {
     const viewId = browserViewId(conversationId, tabId);
     if (closingBrowserViews.has(viewId)) return;
+    const intentKey = `browser:${tabId}`;
+    closeIntentsRef.current.set(intentKey, hideWhenLast);
     closingBrowserViews.add(viewId);
     const order = nextCloseOrder();
     const returnPoint = returnPointRef.current?.tabId === tabId ? returnPointRef.current : null;
@@ -979,11 +1236,15 @@ function WorkspacePanelImpl({
         },
       });
       if (result === "failed") {
+        closeIntentsRef.current.delete(intentKey);
         toast.error("Couldn't close browser tab. Try again.");
         return;
       }
       // "kept": an agent navigation reused the tab, so nothing closed.
-      if (result === "kept") return;
+      if (result === "kept") {
+        closeIntentsRef.current.delete(intentKey);
+        return;
+      }
       rememberClosedTab(conversationId, { kind: "browser", url }, order);
       // Switching tabs while the close was pending forgot the point; don't undo that switch.
       if (returnPoint && returnPointRef.current === returnPoint) returnFromRef.current(returnPoint);
@@ -995,11 +1256,6 @@ function WorkspacePanelImpl({
   useEffect(() => {
     scrollTabIntoView(activeBrowserRef.current);
   }, [browsers.selected, rightRailTab]);
-  const browserSelected =
-    rightRailTab === "browser" &&
-    browsers.selected !== null &&
-    selectedFilePath === null &&
-    selectedTerminalKey === null;
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
   // The browser page that took keyboard focus from this page, if any. Clicking into
   // a page leaves this page's focus where it was, so only the shell can tell.
@@ -1099,7 +1355,6 @@ function WorkspacePanelImpl({
   );
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
-  const sideChats = useSideChats(conversationId);
   // Open tabs stay reachable even where this viewer can't start a side chat.
   const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
@@ -1152,11 +1407,6 @@ function WorkspacePanelImpl({
     onRightRailTabChange("sidechat");
     clearSideChatToOpen();
   }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
-  const sideChatSelected =
-    rightRailTab === "sidechat" &&
-    selectedFilePath === null &&
-    selectedTerminalKey === null &&
-    sideChats.selected !== null;
   // "New side chat" opens an EMPTY tab; the fork isn't created until the first
   // message is sent in it (startPendingSideChat below). Offered on every harness
   // that supports side chat.
@@ -1191,66 +1441,19 @@ function WorkspacePanelImpl({
     : undefined;
   // First message sent in a pending side-chat tab: create the fork now. The
   // pending tab stays put and is rekeyed to the real child once it arrives (via
-  // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
-  // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side and reuses
-  // the parent's live runner. Rejects so the composer re-enables and keeps
-  // the typed text for a retry.
-  const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
-    if (usesNativeSideChatFork(sideChatHarness)) {
-      if (parentAgentId === null) return Promise.reject(new Error("no agent"));
-      // The child arrives asynchronously via session_created with no id to pair
-      // on, so queue this tab to be rekeyed FIFO. The question goes to the
-      // PARENT as `/side`; the native fork seeds the child's first turn. `send`
-      // resolves after its internal catch, so a failure (e.g. the host is too
-      // old to fork — the server refuses) has set `sendFailed` by the time the
-      // await returns; reject then so the pending pane resets and drop the
-      // queued tab so it never waits for a child that isn't coming.
-      awaitingPendingIdsRef.current.push(pendingId);
-      let sendFailed = false;
-      return useChatStore
-        .getState()
-        .send(SIDE_CHAT_COMMAND_PREFIX + text, parentAgentId, undefined, {
-          pinnedConversationId: conversationId,
-          onError: (message) => {
-            sendFailed = true;
-            awaitingPendingIdsRef.current = awaitingPendingIdsRef.current.filter(
-              (id) => id !== pendingId,
-            );
-            toast.error(message);
-          },
-        })
-        .then(() => {
-          if (sendFailed) throw new Error("side chat send failed");
-        });
-    }
-    return createSideChat(
+  // the sideChatToOpen effect above), so there's no disappear/reappear.
+  const startPendingSideChat = (pendingId: string, text: string): Promise<void> =>
+    startSideChat({
       conversationId,
-      useChatStore.getState().sideChatComposers[pendingId]?.settings,
-    ).then(
-      ({ childSessionId }) => {
-        // We have the child id here, so rekey THIS pending tab directly — no
-        // shared queue, so overlapping launches can't cross-assign. Seeding the
-        // draft fires sideChatToOpen, which then just re-selects + reveals.
-        sideChats.rekey(pendingId, childSessionId);
-        // The pending id is gone; drop its composer entry (and its File refs)
-        // now that the text has moved to the real child. Only on success — a
-        // failed create keeps it so the user can retry.
-        useChatStore.getState().clearSideChatComposer(pendingId);
-        useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
-      },
-      (err) => {
-        // The rail path had no failure feedback (unlike the composer entry
-        // points); surface it. The pending tab + typed text stay for a retry.
-        toast.error("Couldn't start a side chat for this session.");
-        throw err;
-      },
-    );
-  };
+      harness: sideChatHarness,
+      parentAgentId,
+      draftKey: pendingId,
+      text,
+      awaitingDrafts: awaitingPendingIdsRef,
+      onCreated: (childId) => sideChats.rekey(pendingId, childId),
+    });
   // The selected side chat's pane, shown in the rail or the mobile drawer. A
   // `pending:` tab has no child yet; its first send creates the fork.
-  const mobileViewport = useIsMobileViewport();
-  const isMobile = mobileViewport && !contained;
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1334,58 +1537,47 @@ function WorkspacePanelImpl({
           (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
         }
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
+        pendingHarness={sideChatHarness}
       />
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
-  const closeSideChat = async (childId: string) => {
-    // Closing a sub-agent tab only hides it; the sub-agent keeps running.
-    if (subagentSessionIdFromTab(childId) !== null) {
+  const closeSideChat = (childId: string, hideWhenLast = true) =>
+    stopSideChat(childId, () => {
+      closeIntentsRef.current.set(`sidechat:${childId}`, hideWhenLast);
       sideChats.close(childId);
-      return;
-    }
-    // Take the queue first so the stop's idle status can't send it to the closing chat.
-    const queued = useChatStore.getState().clearQueuedMessages(childId);
-    if (!childId.startsWith("pending:")) {
-      try {
-        await stopSession(childId);
-      } catch {
-        useChatStore.getState().restoreQueuedMessages(queued);
-        toast.error("Couldn't close side chat. Try again.");
-        return;
-      }
-    }
-    // The tab is gone, so its unsent text/attachments, follow-ups queued during the
-    // stop, and any seeded question that never got to send have nowhere to return to.
-    useChatStore.getState().clearQueuedMessages(childId);
-    useChatStore.getState().clearSideChatComposer(childId);
-    useChatStore.getState().clearSideChatDraft(childId);
-    sideChats.close(childId);
-  };
+    });
 
   // Closing the file on screen asks its viewer first, which confirms before
   // dropping edits it hasn't saved. Other file tabs have no mounted editor.
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
+  // Closes a file tab without asking its viewer about unsaved edits.
+  const closeFileNow = useCallback(
+    (path: string, hideWhenLast = true) => {
+      closeIntentsRef.current.set(`file:${path}`, hideWhenLast);
+      rememberClosedTab(conversationId, { kind: "file", path });
+      onCloseFile(path);
+    },
+    [conversationId, onCloseFile],
+  );
   const closeFile = useCallback(
     (path: string) => {
-      const close = () => {
-        rememberClosedTab(conversationId, { kind: "file", path });
-        onCloseFile(path);
-      };
+      const close = () => closeFileNow(path);
       if (path === selectedFilePath && guardFileNavigation) {
         guardFileNavigation(null, undefined, close);
       } else {
         close();
       }
     },
-    [conversationId, guardFileNavigation, onCloseFile, selectedFilePath],
+    [closeFileNow, guardFileNavigation, selectedFilePath],
   );
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) closeFile(selectedFilePath);
   }, [closeFile, selectedFilePath]);
-  const closePanel = (tab: DefaultWorkspaceTab) => {
+  const closePanel = (tab: DefaultWorkspaceTab, hideWhenLast = true) => {
+    closeIntentsRef.current.set(tab, hideWhenLast);
     rememberClosedTab(conversationId, { kind: "panel", tab });
     onClosePanel(tab);
   };
@@ -1415,10 +1607,61 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
-  const activePanelRef = useRef<HTMLButtonElement | null>(null);
+  // Shells close only once the user confirms and their kill succeeds.
+  const shellCloseCallbacks = (keys: string[], hideWhenLast: boolean): ShellCloseCallbacks => ({
+    onConfirmed: () => {
+      for (const key of keys) closeIntentsRef.current.set(key, hideWhenLast);
+    },
+    onFailed: (key) => closeIntentsRef.current.delete(key),
+  });
+  const closeTerminal = (key: string) => onCloseTerminal(key, shellCloseCallbacks([key], true));
+  const activePanelRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     scrollTabIntoView(activePanelRef.current);
   }, [rightRailTab]);
+  const openTabKeys = [
+    ...visibleOpenPanels,
+    ...openFiles.map((path) => `file:${path}`),
+    ...openTerminals,
+    ...(showBrowserTab ? browsers.tabs : []).map((tabId) => `browser:${tabId}`),
+    ...sideChats.tabs.map((childId) => `sidechat:${childId}`),
+  ];
+  const openTabCount = openTabKeys.length;
+  const openTabsSignature = JSON.stringify(openTabKeys);
+  // Closing the last open tab hides the rail rather than falling back to a fixed page, but
+  // only when every tab that just left was closed by the user with hiding allowed. Tabs
+  // leaving any other way (a session switch, an agent closing its shell) keep the rail.
+  const previousTabsRef = useRef({ conversationId, signature: openTabsSignature });
+  // Shells whose close hid the rail. A shell closed while still launching leaves the strip
+  // before its kill is sent; if that kill fails the shell is listed again, still running,
+  // and the rail comes back to show it. Any other tab opening ends the wait.
+  const hiddenForShellsRef = useRef<string[]>([]);
+  useEffect(() => {
+    const previous = previousTabsRef.current;
+    previousTabsRef.current = { conversationId, signature: openTabsSignature };
+    const intents = closeIntentsRef.current;
+    if (previous.conversationId !== conversationId) {
+      intents.clear();
+      hiddenForShellsRef.current = [];
+      return;
+    }
+    const current: string[] = JSON.parse(openTabsSignature);
+    const before: string[] = JSON.parse(previous.signature);
+    const added = current.filter((key) => !before.includes(key));
+    if (added.length > 0) {
+      const shellReturned = added.some((key) => hiddenForShellsRef.current.includes(key));
+      hiddenForShellsRef.current = [];
+      if (shellReturned) onReveal?.();
+    }
+    const removed = before.filter((key) => !current.includes(key));
+    if (removed.length === 0) return;
+    const hide = current.length === 0 && removed.every((key) => intents.get(key) === true);
+    for (const key of removed) intents.delete(key);
+    if (hide && onHide) {
+      hiddenForShellsRef.current = removed.filter((key) => key.startsWith("terminal:"));
+      onHide();
+    }
+  }, [conversationId, openTabsSignature, onHide, onReveal]);
   const showOpenTabs =
     !pending &&
     (visibleOpenPanels.length > 0 ||
@@ -1441,15 +1684,8 @@ function WorkspacePanelImpl({
       menuAlign={menuAlign}
     />
   );
-  const effectiveHandleProps = pending
-    ? {
-        ...handleProps,
-        onMouseDown: undefined,
-        onKeyDown: undefined,
-        "aria-disabled": true,
-        tabIndex: -1,
-      }
-    : handleProps;
+  // Floating panes leave a gutter beside the rail; dragging it resizes the rail too.
+  const gutterHandle = floatingPanes && !contained && !maximized;
   const shortcutFor = (tab: RightRailTab) => {
     const index = visiblePermanentTabs.findIndex((candidate) => candidate === tab);
     return index === -1 ? undefined : String(index + 1);
@@ -1529,7 +1765,7 @@ function WorkspacePanelImpl({
       label: terminalLabelFor(key),
       active: selectedTerminalKey === key,
       select: () => openTerminalTab(key),
-      disabled: closingTerminalKey === key,
+      disabled: closingTerminalKeys.includes(key),
     })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
       key: `browser:${tabId}`,
@@ -1585,22 +1821,10 @@ function WorkspacePanelImpl({
     );
   };
   // The selected tab's view, beneath any open file or shell tab.
-  const scopeView =
-    sideChatSelected && !isMobile
-      ? "sidechat"
-      : browserSelected && showBrowserTab
-        ? "browser"
-        : rightRailTab === "github" && showGithubTab
-          ? "github"
-          : rightRailTab === "tasks" && showTasksTab && conversationId
-            ? "tasks"
-            : rightRailTab === "subagents" && rootSessionId
-              ? "subagents"
-              : rightRailTab === null
-                ? "empty"
-                : rightRailTab === "content-search" && showContentSearch
-                  ? "content-search"
-                  : "files";
+  const scopeView = activeView.scope;
+  const frontTerminalKey = activeView.terminalKey;
+  const frontFilePath = activeView.filePath;
+  const fileViewerInFront = !pending && frontTerminalKey === null && frontFilePath !== null;
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
@@ -1623,7 +1847,7 @@ function WorkspacePanelImpl({
         // Viewers can't close shells; the tab shows no close button for them either.
         if (!isEditorLevel(permissionLevel)) return true;
         // A terminal already closing gets no second request.
-        if (closingTerminalKey !== selectedTerminalKey) onCloseTerminal(selectedTerminalKey);
+        if (!closingTerminalKeys.includes(selectedTerminalKey)) closeTerminal(selectedTerminalKey);
       } else if (selectedFilePath !== null) {
         handleCloseTab();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
@@ -1696,6 +1920,78 @@ function WorkspacePanelImpl({
     if (target.key.startsWith("file:")) show();
     else leaveFileRef.current(null, show);
   };
+  // Tabs that "Close other tabs" and "Close all tabs" close, in strip order. Shells
+  // kill their processes, so they close together after one confirmation.
+  const canCloseShells = isEditorLevel(permissionLevel);
+  // `closeNow` takes whether the rail may hide once the batch leaves no open tabs.
+  const bulkClosableTabs: {
+    key: string;
+    closeNow: (hideWhenLast: boolean) => void;
+    shell?: true;
+  }[] = [
+    ...visibleOpenPanels.map((tab) => ({
+      key: tab,
+      closeNow: (hide: boolean) => closePanel(tab, hide),
+    })),
+    ...openFiles.map((path) => ({
+      key: `file:${path}`,
+      closeNow: (hide: boolean) => closeFileNow(path, hide),
+    })),
+    // A confirmed shell close stays recorded until its tab leaves, so a slow kill isn't
+    // requested again.
+    ...(canCloseShells ? openTerminals : [])
+      .filter((key) => !closingTerminalKeys.includes(key) && !closeIntentsRef.current.has(key))
+      .map((key) => ({ key, closeNow: () => {}, shell: true as const })),
+    ...(showBrowserTab ? browsers.tabs : []).map((tabId) => ({
+      key: `browser:${tabId}`,
+      closeNow: (hide: boolean) => void closeBrowserTab(tabId, hide),
+    })),
+    ...sideChats.tabs.map((childId) => ({
+      key: `sidechat:${childId}`,
+      closeNow: (hide: boolean) => void closeSideChat(childId, hide),
+    })),
+  ];
+  // The tab a bulk close keeps, selected once the closed tabs (and any file viewer among
+  // them) have left the screen, so opening it doesn't ask about the closed file again.
+  const [pendingSelectKey, setPendingSelectKey] = useState<string | null>(null);
+  const panelOptionsRef = useRef(panelOptions);
+  panelOptionsRef.current = panelOptions;
+  useEffect(() => {
+    if (pendingSelectKey === null) return;
+    setPendingSelectKey(null);
+    const option = panelOptionsRef.current.find((candidate) => candidate.key === pendingSelectKey);
+    if (option && !option.active) option.select();
+  }, [pendingSelectKey]);
+  // Closes every bulk-closable tab except `keepKey`, which is then shown. Only Close all
+  // (no keeper) may hide the rail: a kept pinned page leaves no open tab but stays shown.
+  const closeTabsExcept = (keepKey: string | null) => {
+    const closing = bulkClosableTabs.filter((tab) => tab.key !== keepKey);
+    if (closing.length === 0) return;
+    const hideWhenLast = keepKey === null;
+    const commit = () => {
+      const shellKeys: string[] = [];
+      for (const tab of closing) {
+        if (tab.shell) shellKeys.push(tab.key);
+        else tab.closeNow(hideWhenLast);
+      }
+      if (shellKeys.length > 0) {
+        onCloseTerminals(shellKeys, shellCloseCallbacks(shellKeys, hideWhenLast));
+      }
+      setPendingSelectKey(keepKey);
+    };
+    // The file on screen confirms unsaved edits once for the whole batch.
+    const closesShownFile =
+      selectedFilePath !== null && closing.some((tab) => tab.key === `file:${selectedFilePath}`);
+    if (closesShownFile) leaveFileRef.current(null, commit);
+    else commit();
+  };
+  const closeActionsFor = (key: string): OpenTabCloseActions => ({
+    closeOthers: bulkClosableTabs.some((tab) => tab.key !== key)
+      ? () => closeTabsExcept(key)
+      : undefined,
+    closeAll: bulkClosableTabs.length > 0 ? () => closeTabsExcept(null) : undefined,
+  });
+  const activeTabKey = panelOptions.find((option) => option.active)?.key ?? null;
   // The session and what its rail shows, apart from the browser tab a reopen selects itself.
   const railView = [
     conversationId,
@@ -1836,12 +2132,10 @@ function WorkspacePanelImpl({
       >
         {/* Left-edge horizontal resize handle — suppressed while maximized. */}
         {!maximized && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
+          <WorkspaceRailEdgeHandle
+            handleProps={handleProps}
+            pending={pending}
+            bare={gutterHandle}
           />
         )}
         {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
@@ -1889,50 +2183,24 @@ function WorkspacePanelImpl({
           {showOpenTabs && (
             <>
               {/* Open tabs fill the space before the pinned trailing controls. */}
-              <WorkspaceTabsScroller>
+              <WorkspaceTabsScroller tabCount={openTabCount}>
                 {visibleOpenPanels.map((tab) => {
-                  const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
+                  const { label, icon } = WORKSPACE_PANEL_TABS[tab];
                   const active =
                     rightRailTab === tab &&
                     selectedFilePath === null &&
                     selectedTerminalKey === null;
                   return (
-                    <div
+                    <OpenTab
                       key={tab}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        active
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        ref={active ? activePanelRef : null}
-                        type="button"
-                        role="tab"
-                        aria-label={label}
-                        aria-selected={active}
-                        className="flex items-center gap-1"
-                        onClick={() => selectPermanentTab(tab)}
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closePanel(tab);
-                          }
-                        }}
-                      >
-                        <Icon className="size-4" />
-                        {label}
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => closePanel(tab)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
+                      label={label}
+                      icon={icon}
+                      active={active}
+                      tabRef={active ? activePanelRef : undefined}
+                      onSelect={() => selectPermanentTab(tab)}
+                      onClose={() => closePanel(tab)}
+                      closeActions={closeActionsFor(tab)}
+                    />
                   );
                 })}
                 <FileTabsStrip
@@ -1940,102 +2208,57 @@ function WorkspacePanelImpl({
                   activeFilePath={selectedFilePath}
                   onFileSelect={openFileViewer}
                   onCloseFile={closeFile}
+                  closeActionsFor={closeActionsFor}
                 />
                 <TerminalTabsStrip
                   openTerminals={openTerminals}
                   activeTerminalKey={selectedTerminalKey}
-                  closingKey={closingTerminalKey ?? null}
+                  closingKeys={closingTerminalKeys}
                   canClose={isEditorLevel(permissionLevel)}
                   labelFor={terminalLabelFor}
                   onSelect={openTerminalTab}
-                  onClose={onCloseTerminal}
+                  onClose={closeTerminal}
+                  closeActionsFor={closeActionsFor}
                 />
                 {showBrowserTab &&
-                  browsers.tabs.map((tabId, index) => (
-                    <div
-                      key={tabId}
-                      ref={browserSelected && browsers.selected === tabId ? activeBrowserRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        browserSelected && browsers.selected === tabId
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={browserSelected && browsers.selected === tabId}
-                        title={browsers.labelFor(tabId, index)}
-                        className="flex min-w-0 items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            void closeBrowserTab(tabId);
-                          }
-                        }}
-                        onClick={() => {
+                  browsers.tabs.map((tabId, index) => {
+                    const active = browserSelected && browsers.selected === tabId;
+                    return (
+                      <OpenTab
+                        key={tabId}
+                        label={browsers.labelFor(tabId, index)}
+                        icon={GlobeIcon}
+                        active={active}
+                        tabRef={active ? activeBrowserRef : undefined}
+                        labelClassName="max-w-44"
+                        onSelect={() => {
                           browsers.select(tabId);
                           onRightRailTabChange("browser");
                         }}
-                      >
-                        <GlobeIcon className="size-4 shrink-0" />
-                        <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${browsers.labelFor(tabId, index)}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => void closeBrowserTab(tabId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  ))}
+                        onClose={() => void closeBrowserTab(tabId)}
+                        closeActions={closeActionsFor(`browser:${tabId}`)}
+                      />
+                    );
+                  })}
                 {sideChats.tabs.map((childId) => {
                   const active = sideChatSelected && sideChats.selected === childId;
-                  const label = chatTabLabels[childId] ?? childId;
-                  const TabIcon =
-                    subagentSessionIdFromTab(childId) === null ? MessagesSquareIcon : BotIcon;
                   return (
-                    <div
+                    <OpenTab
                       key={childId}
-                      ref={active ? activeSideChatRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        active
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={active}
-                        className="flex items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closeSideChat(childId);
-                          }
-                        }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
-                      >
-                        <TabIcon className="size-4 shrink-0" />
-                        <span className="max-w-[16ch] truncate">{label}</span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => closeSideChat(childId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
+                      label={chatTabLabels[childId] ?? childId}
+                      icon={
+                        subagentSessionIdFromTab(childId) === null ? MessagesSquareIcon : BotIcon
+                      }
+                      active={active}
+                      tabRef={active ? activeSideChatRef : undefined}
+                      labelClassName="max-w-[16ch]"
+                      onSelect={() => {
+                        sideChats.select(childId);
+                        onRightRailTabChange("sidechat");
+                      }}
+                      onClose={() => void closeSideChat(childId)}
+                      closeActions={closeActionsFor(`sidechat:${childId}`)}
+                    />
                   );
                 })}
               </WorkspaceTabsScroller>
@@ -2096,10 +2319,34 @@ function WorkspacePanelImpl({
                       {option.active && <CheckIcon className="size-4" aria-hidden />}
                     </DropdownMenuItem>
                   ))}
+                  {bulkClosableTabs.length > 0 && (
+                    <>
+                      <DropdownMenuSeparator />
+                      {/* With nothing shown there's no tab to keep, so "other" would mean all. */}
+                      <DropdownMenuItem
+                        disabled={
+                          activeTabKey === null ||
+                          !bulkClosableTabs.some((tab) => tab.key !== activeTabKey)
+                        }
+                        onSelect={() => {
+                          if (activeTabKey !== null) closeTabsExcept(activeTabKey);
+                        }}
+                      >
+                        Close other tabs
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => closeTabsExcept(null)}>
+                        Close all tabs
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
-            <WorkspaceTabTooltip label={maximized ? "Exit full screen" : "Full screen"}>
+            <WorkspaceTabTooltip
+              label={maximized ? "Exit full screen" : "Full screen"}
+              // Escape exits full screen only from a file; other tabs keep Escape for themselves.
+              shortcut={fileViewerInFront && maximized && !isMobile ? [ESC_KEY] : undefined}
+            >
               <Button
                 type="button"
                 variant="ghost"
@@ -2127,118 +2374,147 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
-          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
-          {showContentSearch && showFilesPanel && !pending && !isMobile && (
-            <div
-              className={cn(
-                "min-h-0 flex-1 flex-col",
-                rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
-                  ? "flex"
-                  : "hidden",
-              )}
-            >
-              <ContentSearchPanel
-                inputRef={contentSearchInputRef}
-                key={conversationId}
+          <RenderErrorBoundary
+            name="this workspace pane"
+            resetKey={JSON.stringify([
+              conversationId,
+              rightRailTab,
+              frontFilePath,
+              frontTerminalKey,
+              sideChats.selected,
+              browsers.viewId,
+            ])}
+          >
+            {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+            {showContentSearch && showFilesPanel && !pending && !isMobile && (
+              <div
+                className={cn(
+                  "min-h-0 flex-1 flex-col",
+                  rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
+                    ? "flex"
+                    : "hidden",
+                )}
+              >
+                <RenderErrorBoundary
+                  name="this workspace pane"
+                  resetKey={JSON.stringify([conversationId, rightRailTab === "content-search"])}
+                >
+                  <ContentSearchPanel
+                    inputRef={contentSearchInputRef}
+                    key={conversationId}
+                    conversationId={conversationId}
+                    onFileSelect={openFileViewer}
+                  />
+                </RenderErrorBoundary>
+              </div>
+            )}
+            {filesPanelMounted && (
+              <div
+                className={cn(
+                  "flex min-h-0 flex-1 flex-col",
+                  // Not display:none: hidden rows would measure 0px and collapse
+                  // the virtualized tree's height, losing its scroll position.
+                  !filesPanelActive && "invisible absolute inset-0",
+                )}
+              >
+                <RenderErrorBoundary
+                  name="this workspace pane"
+                  resetKey={JSON.stringify([conversationId, activeView.flat])}
+                >
+                  <FilesPanel
+                    conversationId={contained ? conversationId : undefined}
+                    frameless
+                    onFileSelect={openFileViewer}
+                    flatView={activeView.flat}
+                    showHidden={filesPanelShowHidden}
+                    onShowHiddenChange={onShowHiddenChange}
+                    sort={filesPanelSort}
+                    onSortChange={onSortChange}
+                  />
+                </RenderErrorBoundary>
+              </div>
+            )}
+            {pending ? (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+                <Spinner />
+                <span className="text-ui">Starting workspace…</span>
+              </div>
+            ) : frontTerminalKey !== null ? (
+              // Show the selected shell's xterm only while its terminal is actually
+              // present. The selection is sticky (AppShell never prunes it off the
+              // list), so during a transient terminals-list churn this falls back to
+              // the default view and the xterm reappears when the terminal returns.
+              <RailTerminalView
                 conversationId={conversationId}
-                onFileSelect={openFileViewer}
+                terminalKey={frontTerminalKey}
+                readOnly={!isOwnerLevel(permissionLevel)}
+                autoFocus={autoFocusSelectedTerminal}
               />
-            </div>
-          )}
-          {filesPanelMounted && (
-            <div
-              className={cn(
-                "flex min-h-0 flex-1 flex-col",
-                // Not display:none: hidden rows would measure 0px and collapse
-                // the virtualized tree's height, losing its scroll position.
-                !filesPanelActive && "invisible absolute inset-0",
-              )}
-            >
-              <FilesPanel
-                conversationId={contained ? conversationId : undefined}
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
+            ) : frontFilePath !== null ? (
+              <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
+                <FileViewer
+                  syncUrl={!contained}
+                  agentId={agentId}
+                  mobileOverlay={isMobile}
+                  frameless
+                  open
+                  mediaActive={isMobile ? mobileFileTarget != null : open}
+                  conversationId={conversationId}
+                  path={frontFilePath}
+                  position={filePosition}
+                  onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
+                  onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                  onExitFullScreen={maximized && !isMobile ? onToggleMaximized : undefined}
+                  onNavigateTo={openFileViewer}
+                  permissionLevel={permissionLevel}
+                  onCommentsOpenChange={onCommentsOpenChange}
+                  onShare={onShareFile}
+                  shareDisabledReason={shareDisabledReason}
+                  sort={filesPanelSort}
+                />
+              </ResponsiveViewerSlot>
+            ) : scopeView === "sidechat" ? (
+              // A side chat: a forked child conversation streamed here in its own
+              // scoped surface, beside the still-active main chat. Phones show it
+              // in the side-chats drawer instead, so it never mounts twice.
+              selectedSideChatPane
+            ) : scopeView === "browser" ? (
+              // Browser soft tab — BrowserPane self-gates and measures this rail
+              // slot to position the native view over it.
+              <BrowserPane
+                key={browsers.viewId}
+                conversationId={browsers.viewId!}
+                agentBrowser={browsers.agentBrowser}
+                active={open}
+                focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
+                onFocused={clearBrowserFocus}
+                className="min-h-0 flex-1"
               />
-            </div>
-          )}
-          {pending ? (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-              <Spinner />
-              <span className="text-ui">Starting workspace…</span>
-            </div>
-          ) : terminalShown ? (
-            // Show the selected shell's xterm only while its terminal is actually
-            // present. The selection is sticky (AppShell never prunes it off the
-            // list), so during a transient terminals-list churn this falls back to
-            // the default view and the xterm reappears when the terminal returns.
-            <RailTerminalView
-              conversationId={conversationId}
-              terminalKey={selectedTerminalKey}
-              readOnly={!isOwnerLevel(permissionLevel)}
-              autoFocus={autoFocusSelectedTerminal}
-            />
-          ) : selectedFilePath !== null ? (
-            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
-              <FileViewer
-                syncUrl={!contained}
-                agentId={agentId}
-                mobileOverlay={isMobile}
-                frameless
-                open
-                mediaActive={isMobile ? mobileFileTarget != null : open}
-                conversationId={conversationId}
-                path={selectedFilePath}
-                position={filePosition}
-                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
-                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
-                onNavigateTo={openFileViewer}
-                permissionLevel={permissionLevel}
-                onCommentsOpenChange={onCommentsOpenChange}
-                onShare={onShareFile}
-                shareDisabledReason={shareDisabledReason}
-                sort={filesPanelSort}
-              />
-            </ResponsiveViewerSlot>
-          ) : scopeView === "sidechat" ? (
-            // A side chat: a forked child conversation streamed here in its own
-            // scoped surface, beside the still-active main chat. Phones show it
-            // in the side-chats drawer instead, so it never mounts twice.
-            selectedSideChatPane
-          ) : scopeView === "browser" ? (
-            // Browser soft tab — BrowserPane self-gates and measures this rail
-            // slot to position the native view over it.
-            <BrowserPane
-              key={browsers.viewId}
-              conversationId={browsers.viewId!}
-              agentBrowser={browsers.agentBrowser}
-              active={open}
-              focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
-              onFocused={clearBrowserFocus}
-              className="min-h-0 flex-1"
-            />
-          ) : scopeView === "github" ? (
-            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
-              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
-            </RenderErrorBoundary>
-          ) : scopeView === "tasks" && conversationId ? (
-            <RenderErrorBoundary name="tasks" resetKey={conversationId}>
-              <TasksPanel conversationId={conversationId} active={open && !inert} />
-            </RenderErrorBoundary>
-          ) : scopeView === "subagents" && rootSessionId ? (
-            <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
-              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-            </SubagentPanelOpenerContext.Provider>
-          ) : scopeView === "empty" ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
-              <PlusIcon className="size-6" />
-              <p className="text-sm">Open a Workspace tab from the + menu.</p>
-            </div>
-          ) : null}
+            ) : scopeView === "github" ? (
+              <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+                <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+              </RenderErrorBoundary>
+            ) : scopeView === "tasks" && conversationId ? (
+              <RenderErrorBoundary name="tasks" resetKey={conversationId}>
+                <TasksPanel
+                  conversationId={conversationId}
+                  active={open && !inert}
+                  renderWorkflowRuns={(workflowId) => (
+                    <SessionDescendantRuns sessionId={conversationId} workflowId={workflowId} />
+                  )}
+                />
+              </RenderErrorBoundary>
+            ) : scopeView === "subagents" && rootSessionId ? (
+              <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
+                <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+              </SubagentPanelOpenerContext.Provider>
+            ) : scopeView === "empty" ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+                <PlusIcon className="size-6" />
+                <p className="text-sm">Open a Workspace tab from the + menu.</p>
+              </div>
+            ) : null}
+          </RenderErrorBoundary>
         </div>
       </div>
     </aside>
@@ -2246,6 +2522,14 @@ function WorkspacePanelImpl({
   return (
     <>
       {rail}
+      {gutterHandle && (
+        <WorkspaceRailGutterHandle
+          onMouseDown={handleProps.onMouseDown}
+          pending={pending}
+          railWidth={width}
+          shown={open}
+        />
+      )}
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
         portal to the body would escape the embed's scoped styles. */}
       {isMobile && (

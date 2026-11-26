@@ -4,11 +4,15 @@ name: CI
 # split across directory-based matrix groups (runtime-*, server-*, inner-rest,
 # tools, repl-sdk, spec-llms, runner-app, stores, db, harnesses, misc) so slow
 # files don't bottleneck one runner; the slowest groups use `--dist=worksteal`
-# to fan tests out within a file. The `misc` group is a catch-all so new
+# to fan tests out within a file. `server-integration-core` and `stores-core`
+# take the slowest files out of `server-integration` and `stores`; new files in
+# those directories stay on the original lane. The `misc` group is a catch-all so new
 # top-level tests/<dir>/ are picked up automatically (it ignores the dirs that
 # have their own group). When Python tests run, `ci-tooling` (tests/scripts) is
 # kept only if the PR touches CI, release or dev tooling or a manifest (see
 # dependency_scope.py); push, scheduled and manual runs always include it.
+# Dialect lanes run on a PR only when dependency_scope.py marks the diff
+# as database-relevant. Push, scheduled and manual runs always run them.
 # Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
@@ -117,7 +121,7 @@ jobs:
       # Tests that exercise a real harness CLI skip without it; install the
       # pinned CLI only in the lanes that run them.
       - name: Install Codex CLI
-        if: matrix.group == 'misc' || matrix.group == 'harnesses'
+        if: matrix.group == 'misc' || matrix.group == 'harnesses' || matrix.group == 'inner-rest'
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: codex
@@ -145,7 +149,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
 
       - name: Install dependencies
         # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
@@ -187,11 +191,12 @@ jobs:
         run: |
           mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           # matrix.paths is unquoted on purpose: it word-splits into pytest args.
+          # Default workers match the standard runner's 4 vCPUs.
           # shellcheck disable=SC2086
           env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
             uv run pytest ${{ matrix.paths }} \
               -m "${{ matrix.markexpr || 'not databricks' }}" \
-              -n ${{ matrix.workers || '8' }} \
+              -n ${{ matrix.workers || '4' }} \
               --dist=${{ matrix.dist || 'loadfile' }} \
               --timeout=300 \
               --junitxml=artifacts/pytest-${{ matrix.group }}.xml \
@@ -227,6 +232,148 @@ jobs:
           path: artifacts/
           retention-days: 14
           include-hidden-files: true  # the per-shard .coverage.<group> dotfile
+
+  claude-containment:
+    name: Claude CLI containment
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Install Claude CLI
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
+        with:
+          harness: claude
+
+      - name: Enable Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap ripgrep tmux
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+
+      - name: Install dependencies
+        run: uv sync --locked --extra all --group test
+
+      - name: Test real CLI skill and child execution paths
+        env:
+          OMNIGENT_CLAUDE_CLI_E2E: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          uv run --no-sync pytest -q -rs --reruns 0 --timeout=180 \
+            tests/inner/test_claude_worker_containment.py \
+            -k 'test_real_cli_bash_tool_round_trip_and_inline_skill_finish or test_sdk_real_cli_bash_policy_runs_before_execution or test_each_cli_execution_path_inherits_the_sandbox or test_bound_host_proc_does_not_expose_synthetic_parent or test_session_terminal_runs_real_cli_with_automatic_model_access or (test_omnigent_run_cli_with_contained_claude and (os-shell-roundtrip or terminal-roundtrip))' \
+            --junitxml=artifacts/claude-containment.xml
+          python - <<'PYTHON'
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse(Path("artifacts/claude-containment.xml")).getroot()
+          cases = root.findall(".//testcase")
+          skipped = root.findall(".//skipped")
+          if len(cases) != 23 or skipped:
+              raise SystemExit(
+                  f"Expected 23 Claude containment cases with no skips; "
+                  f"got {len(cases)} cases and {len(skipped)} skips"
+              )
+          PYTHON
+
+      - name: Upload Claude CLI test report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: claude-containment-${{ github.run_id }}
+          path: artifacts/claude-containment.xml
+          retention-days: 14
+
+  seatbelt-containment:
+    name: macOS Seatbelt containment
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Install Claude CLI
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
+        with:
+          harness: claude
+
+      - name: Install dependencies
+        run: uv sync --locked --extra all --group test
+
+      - name: Test Seatbelt process, CLI skill/hook, hardlink, and Keychain boundaries
+        env:
+          OMNIGENT_CLAUDE_CLI_E2E: "1"
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/sandbox-exec
+          test -x /usr/bin/security
+          mkdir -p artifacts
+          uv run --no-sync pytest -q -rs --reruns 0 --timeout=120 \
+            tests/inner/test_seatbelt_sandbox.py::test_sibling_cannot_read_process_arguments \
+            tests/inner/test_launcher_integrity.py::test_seatbelt_denies_new_hardlink_from_readonly_source \
+            tests/runner/test_claude_os_callback_isolation.py::test_real_callback_cannot_read_parent_keychain \
+            tests/inner/test_claude_worker_containment.py::test_real_cli_bash_tool_round_trip_and_inline_skill_finish \
+            tests/inner/test_claude_worker_containment.py::test_real_cli_hook_cannot_retrieve_login_keychain_canary \
+            --junitxml=artifacts/seatbelt-containment.xml
+          python - <<'PYTHON'
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse(Path("artifacts/seatbelt-containment.xml")).getroot()
+          cases = root.findall(".//testcase")
+          skipped = root.findall(".//skipped")
+          if len(cases) != 8 or skipped:
+              raise SystemExit(
+                  f"Expected 8 Seatbelt containment cases with no skips; "
+                  f"got {len(cases)} cases and {len(skipped)} skips"
+              )
+          PYTHON
+
+      - name: Upload Seatbelt test report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: seatbelt-containment-${{ github.run_id }}
+          path: artifacts/seatbelt-containment.xml
+          retention-days: 14
 
   stores-postgres:
     name: Pytest (stores-postgres)
@@ -321,6 +468,7 @@ jobs:
             -n 4 \
             --dist=loadfile \
             --timeout=300 \
+            --durations=30 \
             --junitxml=artifacts/pytest-stores-crdb-${{ matrix.crdb_version }}.xml
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -452,7 +600,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
 
       - name: Install dependencies
         run: uv sync --locked --extra all --group test
@@ -497,7 +645,7 @@ jobs:
   result:
     name: CI result
     if: always()
-    needs: [scope, pytest, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, codex-parity]
+    needs: [scope, pytest, claude-containment, seatbelt-containment, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, codex-parity]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

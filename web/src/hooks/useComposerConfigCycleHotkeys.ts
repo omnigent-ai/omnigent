@@ -51,7 +51,7 @@ export function useComposerConfigCycleHotkeys(
         event.altKey ||
         isImeCompositionKeyEvent({ nativeEvent: event }) ||
         !(event.target instanceof Element) ||
-        !event.target.closest("[data-composer-card] textarea, [data-cycle-preview]")
+        !event.target.closest("[data-composer-card] [data-composer-input], [data-cycle-preview]")
       )
         return;
       event.preventDefault();
