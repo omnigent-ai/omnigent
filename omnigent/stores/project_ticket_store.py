@@ -121,8 +121,8 @@ def search_snippet(text: str, term: str) -> str:
     return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
 
 
-def _ticket_match(row: SqlProjectTicket, terms: builtins.list[str]) -> dict[str, str] | None:
-    """Where every term hits the ticket's own fields, or None if one is missing.
+def _own_hit(row: SqlProjectTicket, term: str) -> tuple[str, str] | None:
+    """The ticket's own field holding *term*, as ``(field, text)``, or None.
 
     The ID matches a prefix, so a pasted short ID finds its ticket; labels match on
     their keys and values.
@@ -132,27 +132,19 @@ def _ticket_match(row: SqlProjectTicket, terms: builtins.list[str]) -> dict[str,
         for label in row.labels or []
         if isinstance(label, dict)
     )
-    fields = (
-        ("title", row.title),
-        ("description", row.description),
-        ("label", labels),
-    )
-    folded = [(name, text, text.casefold()) for name, text in fields]
-    ticket_id = row.id.casefold()
-    first: dict[str, str] | None = None
-    for term in terms:
-        hit = next(((name, text) for name, text, low in folded if term in low), None)
-        if hit is None and ticket_id.startswith(term):
-            hit = ("id", row.id)
-        if hit is None:
-            return None
-        if first is None:
-            name, text = hit
-            first = {
-                "field": name,
-                "snippet": "" if name == "title" else search_snippet(text, term),
-            }
-    return first
+    for name, text in (("title", row.title), ("description", row.description), ("label", labels)):
+        if term in text.casefold():
+            return name, text
+    return ("id", row.id) if row.id.casefold().startswith(term) else None
+
+
+def _ticket_match(row: SqlProjectTicket, terms: builtins.list[str]) -> dict[str, str] | None:
+    """Where the first term hits the ticket's own fields, or None if any term is missing."""
+    first = _own_hit(row, terms[0])
+    if first is None or any(_own_hit(row, term) is None for term in terms[1:]):
+        return None
+    name, text = first
+    return {"field": name, "snippet": "" if name == "title" else search_snippet(text, terms[0])}
 
 
 @dataclass(frozen=True)
@@ -1554,7 +1546,8 @@ class ProjectTicketStore:
         tickets: dict[str, SqlProjectTicket],
         terms: builtins.list[str],
     ) -> dict[str, dict[str, str]]:
-        """The tickets whose title, description and comments together hold every term.
+        """The tickets whose own fields (title, description, labels, ID) and comments
+        together hold every term.
 
         Reads comments only for tickets their own fields didn't already match, at most
         ``SEARCH_COMMENT_SCAN`` per ticket, newest first.
@@ -1589,21 +1582,21 @@ class ProjectTicketStore:
         found: dict[str, dict[str, str]] = {}
         for ticket_id, texts in comments.items():
             row = tickets[ticket_id]
-            fields = [row.title, row.description, *texts]
-            folded = [field.casefold() for field in fields]
-            if all(any(term in field for field in folded) for term in terms):
-                # Point at a comment holding a word the ticket's own fields lack.
-                for term in terms:
-                    if term in row.title.casefold() or term in row.description.casefold():
-                        continue
-                    for text in texts:
-                        if term in text.casefold():
-                            found[ticket_id] = {
-                                "field": "comment",
-                                "snippet": search_snippet(text, term),
-                            }
-                            break
+            folded = [text.casefold() for text in texts]
+            # Every term must hit the ticket's own fields or a comment; the snippet points
+            # at the comment holding the first term its own fields lack.
+            snippet: str | None = None
+            for term in terms:
+                if _own_hit(row, term) is not None:
+                    continue
+                at = next((index for index, text in enumerate(folded) if term in text), None)
+                if at is None:
                     break
+                if snippet is None:
+                    snippet = search_snippet(texts[at], term)
+            else:
+                if snippet is not None:
+                    found[ticket_id] = {"field": "comment", "snippet": snippet}
         return found
 
     def summary(

@@ -83,6 +83,19 @@ def test_search_matches_every_word_across_fields_newest_first(db_uri):
     assert [row["id"] for row in store.search(project_id, ids[1][:8], user_id=ALICE)["data"]] == [
         ids[1]
     ]
+    # A word only in a label combines with a word only in a comment.
+    labeled = store.create(
+        project_id,
+        CreateTicket(title="Quarterly report", labels=[{"key": "owner", "value": "kasey"}]),
+        TicketActor(ALICE),
+    )
+    store.comment(
+        project_id, labeled["id"], CommentOnTicket(text="Attach the PDF"), TicketActor(ALICE)
+    )
+    combined = store.search(project_id, "kasey pdf", user_id=ALICE)["data"]
+    assert [row["id"] for row in combined] == [labeled["id"]]
+    assert combined[0]["match"] == {"field": "comment", "snippet": "Attach the PDF"}
+    assert store.search(project_id, "kasey missing", user_id=ALICE)["data"] == []
     with pytest.raises(OmnigentError):
         store.search(project_id, "   ", user_id=ALICE)
 
