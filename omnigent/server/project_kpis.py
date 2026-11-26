@@ -12,6 +12,9 @@ the on-target check uses (today is still in progress, so it's left out).
 - ``time_to_merged_*`` use tickets now in the final completed stage, dated by
   their latest move there: hours from creation to that move. The median is the
   usual middle value; p90 is nearest-rank.
+- ``changes_landed`` counts distinct commits: each ticket now at or past the landed
+  stage contributes its ``verified`` (else ``approved``) SHA once, dated by its latest
+  move from before that stage to it or later. Tickets sharing a SHA count once.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import re
 import statistics
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field, replace
@@ -44,6 +48,11 @@ SeriesKind = Literal["distinct", "daily_sum", "median", "p90"]
 #: Full UTC days, ending yesterday, that the on-target check and trend cover.
 TREND_DAYS = 7
 DAY = 86_400
+#: Labels that record a ticket's landed commit, in order of preference.
+LANDED_COMMIT_LABELS = ("verified", "approved")
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+_LANDED_STAGE_NAMES = ("implemented", "landed")
+TicketLabels = dict[str, tuple[str | None, dict[str, str]]]
 
 
 @dataclass(frozen=True)
@@ -131,6 +140,8 @@ class KpiInputs:
     stages: Callable[[], list[dict[str, Any]]]
     #: The earliest time any range in the request starts; ``None`` reads all history.
     history_since: int | None = None
+    #: Each ticket's current stage and ``LANDED_COMMIT_LABELS`` values; ``None`` when unread.
+    ticket_labels: Callable[[], TicketLabels] | None = None
 
 
 def _day_start(day_utc: str) -> int:
@@ -292,6 +303,95 @@ def hours_to_final_stage(
     return items, excluded
 
 
+def landed_stage_index(config: dict[str, Any], stages: list[dict[str, Any]]) -> int | None:
+    """Where landed work starts in the stage order.
+
+    The configured ``landing.landed_stage``, an ``implemented`` stage or one named
+    Implemented or Landed; without one, the first completed stage.
+    """
+    ids = [str(stage["id"]) for stage in stages]
+    raw = config.get("landing")
+    configured = (raw if isinstance(raw, dict) else {}).get("landed_stage")
+    if isinstance(configured, str) and configured in ids:
+        return ids.index(configured)
+    if "implemented" in ids:
+        return ids.index("implemented")
+    for index, stage in enumerate(stages):
+        if str(stage.get("name") or "").strip().casefold() in _LANDED_STAGE_NAMES:
+            return index
+    return next((index for index, stage in enumerate(stages) if stage.get("is_complete")), None)
+
+
+def landed_commit(labels: dict[str, str]) -> str | None:
+    """The ticket's landed commit: its first full-SHA label in ``LANDED_COMMIT_LABELS``."""
+    for key in LANDED_COMMIT_LABELS:
+        value = labels.get(key, "").lower()
+        if _FULL_SHA.fullmatch(value):
+            return value
+    return None
+
+
+def landed_items(
+    histories: StageHistories,
+    stages: list[dict[str, Any]],
+    config: dict[str, Any],
+    ticket_labels: TicketLabels,
+    member_of: MemberOfMove = _no_member,
+) -> tuple[list[SeriesItem], list[ExcludedItem]]:
+    """Each distinct landed commit (see the module docstring), as the ticket that landed it."""
+    start = landed_stage_index(config, stages)
+    if start is None:
+        return [], []
+    rank = {str(stage["id"]): index for index, stage in enumerate(stages)}
+    landed: list[SeriesItem] = []
+    excluded: list[ExcludedItem] = []
+    for ticket_id, (stage_id, labels) in ticket_labels.items():
+        commit = landed_commit(labels)
+        history = histories.get(ticket_id)
+        if commit is None or rank.get(stage_id or "", -1) < start or not history:
+            continue
+        crossings = [
+            after
+            for before, after in itertools.pairwise(history)
+            if rank.get(before["stage_id"], -1) < start <= rank.get(after["stage_id"], -1)
+        ]
+        detail = {"commit": commit}
+        if not crossings:
+            item = SeriesItem(history[-1]["at"], ticket_id, "ticket", detail=detail)
+            excluded.append(ExcludedItem(item, "Never moved into the landed stage"))
+            continue
+        moved = crossings[-1]
+        landed.append(
+            SeriesItem(moved["at"], ticket_id, "ticket", member=member_of(moved), detail=detail)
+        )
+    items: list[SeriesItem] = []
+    seen: set[str] = set()
+    for item in sorted(landed, key=lambda entry: (entry.at or 0, entry.key)):
+        if item.detail["commit"] in seen:
+            excluded.append(ExcludedItem(item, "Same commit as an earlier ticket"))
+        else:
+            seen.add(item.detail["commit"])
+            items.append(item)
+    return items, excluded
+
+
+def changes_landed_total(inputs: KpiInputs) -> int | None:
+    """Changes landed in the window; ``None`` when the project has never landed a commit."""
+    if inputs.ticket_labels is None:
+        return None
+    labelled = inputs.ticket_labels()
+    stages = inputs.stages()
+    start = landed_stage_index(inputs.project.config or {}, stages)
+    rank = {str(stage["id"]): index for index, stage in enumerate(stages)}
+    if start is None or not any(
+        landed_commit(labels) and rank.get(stage_id or "", -1) >= start
+        for stage_id, labels in labelled.values()
+    ):
+        return None
+    value = compute_metrics(["changes_landed"], inputs)["changes_landed"]
+    return int(value.value or 0) if value.available else None
+
+
 def _call(source: Any, method: str, *args: Any) -> Any:
     try:
         return getattr(source, method)(*args)
@@ -403,6 +503,18 @@ def load_series(
             )
         else:
             series["spend_usd"] = UNAVAILABLE_SERIES
+    if "changes_landed" in wanted:
+        if inputs.ticket_labels is None:
+            series["changes_landed"] = UNAVAILABLE_SERIES
+        else:
+            items, excluded = landed_items(
+                inputs.stage_histories(),
+                inputs.stages(),
+                project.config or {},
+                inputs.ticket_labels(),
+                member_of,
+            )
+            series["changes_landed"] = MetricSeries("distinct", items=items, excluded=excluded)
     ticket_metrics = wanted & {
         "tickets_shipped",
         "rework_tickets",

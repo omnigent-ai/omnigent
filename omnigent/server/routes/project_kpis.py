@@ -24,6 +24,7 @@ from omnigent.entities.project_kpi import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.project_kpis import (
+    LANDED_COMMIT_LABELS,
     KpiInputs,
     KpiStatus,
     MetricSeries,
@@ -138,6 +139,7 @@ StatusItemMetric = Literal[
     "rework_tickets",
     "time_to_merged_median_hours",
     "time_to_merged_p90_hours",
+    "changes_landed",
     "tickets_submitted",
 ]
 
@@ -267,6 +269,16 @@ def create_project_kpis_router(
                 )
             ),
             history_since=since,
+            ticket_labels=functools.cache(
+                lambda: project_status_cache.get_or_compute(
+                    project.id,
+                    "tickets",
+                    ("ticket_labels",),
+                    lambda: ticket_store.label_values(
+                        project.id, LANDED_COMMIT_LABELS, user_id=user_id
+                    ),
+                )
+            ),
         )
 
     def build(

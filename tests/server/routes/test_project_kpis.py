@@ -20,6 +20,8 @@ from omnigent.server.project_kpis import (
     hours_to_final_stage,
     kpi_rows,
     kpi_status,
+    landed_items,
+    landed_stage_index,
     load_series,
     nearest_rank,
     rework_items,
@@ -104,6 +106,57 @@ def test_time_to_merged_uses_tickets_now_in_the_final_stage() -> None:
     assert hours_to_final_stage(histories, None) == ([], [])
     assert nearest_rank([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.9) == 9
     assert nearest_rank([4], 0.9) == 4
+
+
+SHA_A, SHA_B = "a" * 40, "b" * 40
+LANDING = ["open", "code_review", "implemented", "merged"]
+
+
+def test_changes_landed_counts_each_commit_once_when_it_reached_the_landed_stage() -> None:
+    stages = [{"id": s, "is_complete": s == "merged"} for s in LANDING]
+    recent = NOW - HOUR
+    histories = {
+        "landed": [_entry("open", OLD, created=True), _entry("implemented", recent)],
+        # Its crossing is the latest one; moving on to Merged doesn't re-date it.
+        "relanded": [
+            _entry("open", OLD, created=True),
+            _entry("implemented", OLD + 1),
+            _entry("code_review", recent - 5),
+            _entry("implemented", recent - 4),
+            _entry("merged", recent - 3, complete=True),
+        ],
+        "same-commit": [_entry("open", OLD, created=True), _entry("merged", recent + 1)],
+        "in-review": [_entry("open", OLD, created=True), _entry("code_review", recent)],
+        "created-landed": [_entry("implemented", recent, created=True)],
+        "old": [_entry("open", OLD, created=True), _entry("merged", OLD + 5, complete=True)],
+    }
+    labels = {
+        "landed": ("implemented", {"verified": SHA_A.upper(), "approved": "c" * 40}),
+        "relanded": ("merged", {"approved": SHA_B}),
+        "same-commit": ("merged", {"verified": SHA_A}),
+        "in-review": ("code_review", {"approved": "d" * 40}),
+        "created-landed": ("implemented", {"verified": "e" * 40}),
+        "old": ("merged", {"verified": "f" * 40}),
+        "not-a-sha": ("merged", {"verified": "yes"}),
+    }
+    items, excluded = landed_items(histories, stages, {}, labels)
+    assert sorted((item.key, item.detail["commit"]) for item in items) == [
+        ("landed", SHA_A),
+        ("old", "f" * 40),
+        ("relanded", SHA_B),
+    ]
+    assert sorted((entry.item.key, entry.reason) for entry in excluded) == [
+        ("created-landed", "Never moved into the landed stage"),
+        ("same-commit", "Same commit as an earlier ticket"),
+    ]
+    landed = MetricSeries("distinct", items=items)
+    assert _window(landed, status_period("7d", NOW)) == 2
+    assert _window(landed, status_period("all", NOW)) == 3
+    # Without a landing stage, landed work starts at the first completed stage.
+    default = [{"id": s, "is_complete": s == "done"} for s in ("open", "review", "done")]
+    assert landed_stage_index({}, default) == 2
+    configured = {"landing": {"landed_stage": "code_review"}}
+    assert landed_stage_index(configured, stages) == 1
 
 
 def _inputs(spend, prs, histories, stages=None) -> KpiInputs:
@@ -547,3 +600,45 @@ async def test_a_role_has_its_own_kpis_set_by_the_owner_or_lead(
     role_value = (await project_client.get(role_path)).json()["kpis"][0]["value"]
     project_value = (await project_client.get(f"{path}/kpis")).json()["kpis"][0]["value"]
     assert (role_value, project_value) == (1, 2)
+
+
+async def test_summary_and_insights_count_changes_landed_only_once_one_landed(
+    multi_user_client: httpx.AsyncClient,  # noqa: F811 - imported fixture
+) -> None:
+    owner = _as_user("owner@example.com")
+    created = (
+        await multi_user_client.post("/v1/projects", json={"name": "Landed"}, headers=owner)
+    ).json()
+    path = f"/v1/projects/{created['id']}"
+    stages = (await multi_user_client.get(f"{path}/tickets", headers=owner)).json()["stages"]
+    done = next(stage["id"] for stage in stages if stage["is_complete"])
+
+    async def landed() -> tuple:
+        summary = await multi_user_client.get(f"{path}/status/summary", headers=owner)
+        insights = await multi_user_client.get(f"{path}/telemetry", headers=owner)
+        return (
+            summary.json()["totals"]["changes_landed"],
+            insights.json()["throughput"]["changes_landed"],
+        )
+
+    first = (
+        await multi_user_client.post(f"{path}/tickets", json={"title": "No commit"}, headers=owner)
+    ).json()
+    await multi_user_client.patch(
+        f"{path}/tickets/{first['id']}", json={"stage_id": done}, headers=owner
+    )
+    assert await landed() == (None, None)
+    second = (
+        await multi_user_client.post(f"{path}/tickets", json={"title": "Landed"}, headers=owner)
+    ).json()
+    await multi_user_client.patch(
+        f"{path}/tickets/{second['id']}",
+        json={"labels": [{"key": "verified", "value": SHA_A}], "stage_id": done},
+        headers=owner,
+    )
+    assert await landed() == (1, 1)
+    items = await multi_user_client.get(
+        f"{path}/status/items", params={"metric": "changes_landed"}, headers=owner
+    )
+    [row] = items.json()["items"]
+    assert (row["title"], row["detail"]) == ("Landed", {"commit": SHA_A})

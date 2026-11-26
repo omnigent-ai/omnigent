@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -870,6 +870,32 @@ class ProjectTicketStore:
                     for label in labels or ()
                 )
             }
+
+    def label_values(
+        self, project_id: str, keys: Collection[str], *, user_id: str | None
+    ) -> builtins.dict[str, tuple[str | None, builtins.dict[str, str]]]:
+        """Each ticket carrying any of *keys*: its current stage and those labels' values."""
+        wanted = set(keys)
+        with self._session("list_ticket_label_values") as session:
+            self._project(session, project_id, user_id)
+            rows = session.execute(
+                select(
+                    SqlProjectTicket.id, SqlProjectTicket.stage_id, SqlProjectTicket.labels
+                ).where(
+                    SqlProjectTicket.workspace_id == current_workspace_id(),
+                    SqlProjectTicket.project_id == _identifier(project_id),
+                )
+            )
+            found: dict[str, tuple[str | None, dict[str, str]]] = {}
+            for ticket_id, stage_id, labels in rows:
+                values = {
+                    label["key"]: str(label.get("value") or "").strip()
+                    for label in labels or ()
+                    if isinstance(label, dict) and label.get("key") in wanted
+                }
+                if values:
+                    found[ticket_id] = (stage_id, values)
+            return found
 
     def ticket_titles(
         self, project_id: str, ticket_ids: builtins.list[str], *, user_id: str | None

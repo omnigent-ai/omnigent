@@ -200,6 +200,9 @@ export function InsightsPanels({ numbers }: { numbers: InsightsNumbers }) {
             value={formatTelemetryNumber(shipping.merged_prs)}
             note={prsMergedZeroNote(shipping.merged_prs, shipping.tickets_shipped)}
           />
+          {shipping.changes_landed != null && (
+            <Row label="Changes landed" value={formatTelemetryNumber(shipping.changes_landed)} />
+          )}
           <Row
             label="Median time to merged"
             value={formatTelemetryNumber(shipping.time_to_merged_median_hours, " h")}

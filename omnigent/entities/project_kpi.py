@@ -18,6 +18,7 @@ KpiMetricId = Literal[
     "rework_tickets",
     "time_to_merged_median_hours",
     "time_to_merged_p90_hours",
+    "changes_landed",
     "none",
 ]
 KpiDirection = Literal["at_least", "at_most"]
@@ -85,6 +86,15 @@ KPI_METRICS: tuple[KpiMetric, ...] = (
         description=(
             "90th-percentile (nearest-rank) hours from a ticket's creation to its move "
             "into the final stage, over tickets that reached it in the window."
+        ),
+    ),
+    KpiMetric(
+        id="changes_landed",
+        label="Changes landed",
+        unit="count",
+        description=(
+            "Distinct commits landed in the window: each ticket now at or past the landed "
+            "stage counts its verified (else approved) commit once, dated by its move there."
         ),
     ),
 )

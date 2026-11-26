@@ -9,6 +9,7 @@ export type KpiMetricId =
   | "rework_tickets"
   | "time_to_merged_median_hours"
   | "time_to_merged_p90_hours"
+  | "changes_landed"
   | "none";
 export type KpiDirection = "at_least" | "at_most";
 export type KpiUnit = "count" | "usd" | "hours";

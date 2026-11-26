@@ -4881,6 +4881,7 @@
               "rework_tickets",
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
+              "changes_landed",
               "none"
             ],
             "title": "Id",
@@ -7106,6 +7107,7 @@
               "rework_tickets",
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
+              "changes_landed",
               "none"
             ],
             "title": "Metric",
@@ -7377,6 +7379,7 @@
               "rework_tickets",
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
+              "changes_landed",
               "none"
             ],
             "title": "Metric",
@@ -8332,6 +8335,7 @@
               "rework_tickets",
               "time_to_merged_median_hours",
               "time_to_merged_p90_hours",
+              "changes_landed",
               "tickets_submitted"
             ],
             "title": "Metric",
@@ -8649,6 +8653,19 @@
       "ProjectStatusTotals": {
         "description": "Window totals. `None` means the metric's source isn't available.",
         "properties": {
+          "changes_landed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Distinct commits landed in the window (a ticket's verified, else approved, SHA); null when the project has never landed one.",
+            "title": "Changes Landed"
+          },
           "cost_per_merged_pr_cents": {
             "anyOf": [
               {
@@ -17686,6 +17703,19 @@
       "Throughput": {
         "description": "What the project shipped in the window; null when a source isn't on this server.",
         "properties": {
+          "changes_landed": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Distinct commits landed in the window; null if the project never landed one.",
+            "title": "Changes Landed"
+          },
           "merged_prs": {
             "anyOf": [
               {
@@ -25510,6 +25540,7 @@
                 "rework_tickets",
                 "time_to_merged_median_hours",
                 "time_to_merged_p90_hours",
+                "changes_landed",
                 "tickets_submitted"
               ],
               "title": "Metric",

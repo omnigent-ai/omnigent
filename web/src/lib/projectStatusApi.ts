@@ -16,6 +16,8 @@ export interface ProjectStatusTotals {
   /** Tickets created in the window, counted for who requested them. */
   tickets_submitted?: number;
   prs_merged: number | null;
+  /** Distinct commits landed in the window; null when the project never landed one. */
+  changes_landed?: number | null;
   spend_cents: number | null;
   cost_per_merged_pr_cents: number | null;
   members: number;

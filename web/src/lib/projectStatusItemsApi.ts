@@ -10,6 +10,7 @@ export type StatusItemMetric =
   | "rework_tickets"
   | "time_to_merged_median_hours"
   | "time_to_merged_p90_hours"
+  | "changes_landed"
   | "tickets_submitted";
 
 /** 7d / 30d / all as on the Summary, or `trend`: the KPI tiles' 7 full days plus today. */

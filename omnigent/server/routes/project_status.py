@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.project_kpis import LANDED_COMMIT_LABELS, KpiInputs, changes_landed_total
 from omnigent.server.project_status import (
     UNAVAILABLE,
     MemberKey,
@@ -50,6 +51,13 @@ class ProjectStatusTotals(BaseModel):
         default=0, description="Tickets created in the window, counted for who requested them."
     )
     prs_merged: int | None
+    changes_landed: int | None = Field(
+        default=None,
+        description=(
+            "Distinct commits landed in the window (a ticket's verified, else approved, SHA); "
+            "null when the project has never landed one."
+        ),
+    )
     spend_cents: int | None
     cost_per_merged_pr_cents: int | None
     members: int
@@ -210,6 +218,29 @@ def create_project_status_router(
             )
             return tickets_submitted_by_person(project, rows)
 
+        def count_changes_landed() -> int | None:
+            return changes_landed_total(
+                KpiInputs(
+                    project=project,
+                    period=period,
+                    sources=active,
+                    stage_histories=functools.cache(
+                        lambda: ticket_store.stage_histories(
+                            project.id, user_id=user_id, since_epoch=period.since_epoch
+                        )
+                    ),
+                    stages=functools.cache(
+                        lambda: ticket_store.stages(project.id, user_id=user_id)["stages"]
+                    ),
+                    history_since=period.since_epoch,
+                    ticket_labels=functools.cache(
+                        lambda: ticket_store.label_values(
+                            project.id, LANDED_COMMIT_LABELS, user_id=user_id
+                        )
+                    ),
+                )
+            )
+
         timings: dict[str, float] = {}
 
         async def timed(name: str, call: Callable[..., T], *args: Any) -> T:
@@ -220,7 +251,7 @@ def create_project_status_router(
                 timings[name] = round((time.perf_counter() - started) * 1000, 1)
 
         # Independent reads run side by side; each source is cached per project and window.
-        identities, shares, tickets_done, submitted, spend, prs = await asyncio.gather(
+        identities, shares, tickets_done, submitted, landed, spend, prs = await asyncio.gather(
             timed(
                 "identities",
                 functools.partial(project_store.list_identities, user_id=user_id),
@@ -245,6 +276,14 @@ def create_project_status_router(
                 ("tickets_submitted", period_key(period)),
                 count_tickets_submitted,
             ),
+            timed(
+                "changes_landed",
+                project_status_cache.get_or_compute,
+                project.id,
+                "tickets",
+                ("changes_landed", period_key(period)),
+                count_changes_landed,
+            ),
             timed("spend", _measure, active.spend, "spend", project, period),
             timed("prs_merged", _measure, active.prs_merged, "prs_merged", project, period),
         )
@@ -260,6 +299,7 @@ def create_project_status_router(
             prs_merged=prs,
             tickets_submitted=submitted,
         )
+        summary["totals"]["changes_landed"] = landed
         return {**summary, "description": project.description}
 
     return router

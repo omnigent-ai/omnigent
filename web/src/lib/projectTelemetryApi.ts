@@ -34,6 +34,8 @@ export interface TelemetryTeamBuilding {
 export interface TelemetryThroughput {
   tickets_shipped: number | null;
   merged_prs: number | null;
+  /** Distinct commits landed in the window; null when the project never landed one. */
+  changes_landed?: number | null;
   rework_tickets: number | null;
   time_to_merged_median_hours: number | null;
   spend_usd: number | null;

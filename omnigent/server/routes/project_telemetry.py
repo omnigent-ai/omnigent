@@ -12,7 +12,12 @@ from pydantic import BaseModel, Field
 from omnigent.db.utils import now_epoch
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
-from omnigent.server.project_kpis import KpiInputs, compute_metrics
+from omnigent.server.project_kpis import (
+    LANDED_COMMIT_LABELS,
+    KpiInputs,
+    changes_landed_total,
+    compute_metrics,
+)
 from omnigent.server.project_status import (
     StatusSources,
     StatusWindow,
@@ -118,6 +123,10 @@ class Throughput(BaseModel):
 
     tickets_shipped: float | None
     merged_prs: float | None
+    changes_landed: int | None = Field(
+        default=None,
+        description="Distinct commits landed in the window; null if the project never landed one.",
+    )
     rework_tickets: float | None
     time_to_merged_median_hours: float | None
     spend_usd: float | None
@@ -214,6 +223,11 @@ def create_project_telemetry_router(
             stage_histories=histories,
             stages=stages,
             history_since=period.since_epoch,
+            ticket_labels=functools.cache(
+                lambda: ticket_store.label_values(
+                    project.id, LANDED_COMMIT_LABELS, user_id=user_id
+                )
+            ),
         )
         values = compute_metrics(THROUGHPUT_METRICS, inputs)
         spend_totals = _measure(active.spend, "spend", project, period)
@@ -224,6 +238,7 @@ def create_project_telemetry_router(
                 for metric, value in values.items()
             },
             "spend_usd": spend,
+            "changes_landed": changes_landed_total(inputs),
             **review_rounds_and_stalled(
                 histories(),
                 stages(),

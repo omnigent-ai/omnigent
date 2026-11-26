@@ -233,7 +233,12 @@ function HeadlineNumbers({
 }) {
   const { totals, sources, window: range } = summary;
   return (
-    <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+    <dl
+      className={cn(
+        "grid grid-cols-2 gap-3",
+        totals.changes_landed != null ? "sm:grid-cols-3 lg:grid-cols-5" : "sm:grid-cols-4",
+      )}
+    >
       <StatTile
         label="PRs merged"
         value={totals.prs_merged === null ? "—" : String(totals.prs_merged)}
@@ -248,6 +253,13 @@ function HeadlineNumbers({
             : () => onDrill({ label: "PRs merged", metric: "merged_prs", range })
         }
       />
+      {totals.changes_landed != null && (
+        <StatTile
+          label="Changes landed"
+          value={String(totals.changes_landed)}
+          onOpen={() => onDrill({ label: "Changes landed", metric: "changes_landed", range })}
+        />
+      )}
       <StatTile
         label="Spent"
         value={formatCents(totals.spend_cents)}

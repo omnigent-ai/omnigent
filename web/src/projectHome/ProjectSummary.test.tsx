@@ -241,6 +241,29 @@ describe("ProjectSummary", () => {
     expect(within(headline).getByText("—")).toBeTruthy();
   });
 
+  it("shows changes landed only once the project has landed a commit", async () => {
+    renderSummary();
+    const headline = await screen.findByRole("region", { name: "Headline numbers" });
+    await within(headline).findByText("Tickets done");
+    expect(within(headline).queryByText("Changes landed")).toBeNull();
+    cleanup();
+    const base = summary();
+    vi.mocked(statusApi.getProjectStatusSummary).mockResolvedValue(
+      summary({
+        totals: { ...base.totals, prs_merged: 0, changes_landed: 7 },
+        sources: { spend: "available", prs_merged: "available" },
+      }),
+    );
+    renderSummary();
+    const landed = await screen.findByRole("region", { name: "Headline numbers" });
+    expect(
+      await within(landed).findByRole("button", {
+        name: "Changes landed: 7. Show the items behind it",
+      }),
+    ).toBeTruthy();
+    expect(within(landed).getByText("No finished ticket links a pull request")).toBeTruthy();
+  });
+
   it("offers the owner to add KPIs when none are set", async () => {
     renderSummary();
     expect(await screen.findByText(/No KPIs yet. Add 3 or 4/)).toBeTruthy();
