@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from omnigent.runner.github_graphql import mutate, pull_request_node
-from omnigent.runner.pull_request_errors import PullRequestChangedError
+from omnigent.runner.pull_request_errors import PullRequestChangedError, UnknownOutcomeError
 from omnigent.runner.session_prs import PullRequestRef
 
 _QUEUE_SELECTION = (
@@ -69,7 +69,11 @@ def enqueue(root: str, reference: PullRequestRef, *, expected_head_oid: str) -> 
         expected_head_oid=expected_head_oid,
         input={"pullRequestId": node["id"], "expectedHeadOid": expected_head_oid},
     )
-    return _answer(reference, node, payload.get("mergeQueueEntry"), queued=True)
+    entry = payload.get("mergeQueueEntry")
+    if not isinstance(entry, dict):
+        # GitHub answered without the entry it made, so the pull request may not be queued.
+        raise UnknownOutcomeError()
+    return _answer(reference, node, entry, queued=True)
 
 
 def dequeue(root: str, reference: PullRequestRef) -> dict[str, Any]:

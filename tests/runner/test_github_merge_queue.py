@@ -108,6 +108,23 @@ def test_enqueue_adds_the_head_the_user_saw_and_reports_its_place(fake: QueueGit
     assert (answer["queued"], answer["position"], answer["state"]) == (True, 2, "QUEUED")
 
 
+@pytest.mark.parametrize("payload", [{"mergeQueueEntry": None}, {}], ids=["null", "missing"])
+def test_an_enqueue_github_answered_without_its_entry_is_an_unknown_outcome(
+    fake: QueueGitHub, monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any]
+) -> None:
+    answer = fake._graphql
+
+    def without_entry(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        if "enqueuePullRequest(" in query:
+            return {"data": {"enqueuePullRequest": payload}}
+        return answer(query, variables)
+
+    monkeypatch.setattr(fake, "_graphql", without_entry)
+
+    with pytest.raises(UnknownOutcomeError):
+        _enqueue()
+
+
 def test_enqueue_reports_a_head_that_moved_while_github_refused_it(fake: QueueGitHub) -> None:
     fake.refuse_mutation("enqueuePullRequest", "Head sha didn't match", head_becomes=MOVED)
 
