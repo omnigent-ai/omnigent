@@ -599,7 +599,9 @@ class _TitlesByPrompt:
             return self.initial
         self.refining.set()
         await self.release_refinement.wait()
-        return "Fix flaky upload retries"
+        return (
+            "Fix flaky upload retries" if "flaky upload" in request.prompt else "Open linked issue"
+        )
 
 
 @pytest.mark.parametrize("initial", ["Review linked issue", None])
@@ -716,6 +718,39 @@ async def test_refinement_waits_for_a_settled_first_reply(
     await coordinator.wait_for_idle()
 
     assert generator.prompts[-1].endswith("Agent reply:\nThe issue is a flaky upload retry.")
+    assert store.get_conversation(session_id).title == "Fix flaky upload retries"
+
+
+async def test_refinement_follows_a_first_reply_that_changes_after_a_paused_idle(
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _first_turn_session(store)
+    generator = _TitlesByPrompt()
+    coordinator = BackgroundSessionTitleCoordinator(store, generator, turn_settle_seconds=0)
+    coordinator.schedule(
+        session_id=session_id, prompt=_FIRST_MESSAGE, expected_seed_title=_SEED_TITLE
+    )
+    await coordinator.wait_for_idle()
+
+    # A pane paused on a permission prompt looks idle with only progress text persisted.
+    _append_message(store, session_id, "assistant", "Opening the issue now.")
+    coordinator.turn_ended(session_id)
+    await coordinator.wait_for_idle()
+    assert store.get_conversation(session_id).title == "Open linked issue"
+
+    _append_message(store, session_id, "assistant", "The issue is a flaky upload retry.")
+    coordinator.turn_ended(session_id)
+    await coordinator.wait_for_idle()
+    assert store.get_conversation(session_id).title == "Fix flaky upload retries"
+
+    # Once a follow-up ends the first turn, later turn ends cost no inference.
+    _append_message(store, session_id, "user", "now draft the release notes")
+    _append_message(store, session_id, "assistant", "Release notes drafted.")
+    for _ in range(2):
+        coordinator.turn_ended(session_id)
+        await coordinator.wait_for_idle()
+    assert len(generator.prompts) == 3
     assert store.get_conversation(session_id).title == "Fix flaky upload retries"
 
 

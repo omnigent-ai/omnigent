@@ -217,6 +217,9 @@ class _PendingTitleRefinement:
     context: contextvars.Context
     workspace_id: int
     turn_end_checks: int = 0
+    #: ``(reply, title)`` from an earlier refinement, kept while the first turn
+    #: may still change, e.g. when a paused pane looked idle mid-turn.
+    refined_from: tuple[str, str] | None = None
 
     @property
     def key(self) -> tuple[int, str]:
@@ -417,7 +420,7 @@ class BackgroundSessionTitleCoordinator:
     ) -> None:
         """Schedule at most one title attempt and return without awaiting it.
 
-        The session is also registered for one refinement once its first turn
+        The session is also registered for a refinement once its first turn
         ends (see :meth:`turn_ended`).
         """
         if session_id in self._scheduled_session_ids:
@@ -454,10 +457,12 @@ class BackgroundSessionTitleCoordinator:
             )
 
     def turn_ended(self, session_id: str) -> None:
-        """Refine a session's generated title from its first reply, at most once.
+        """Refine a session's generated title from its first turn's reply.
 
-        Does nothing for sessions without a pending refinement, so later turns,
-        child sessions, and sessions titled by a user or automation are untouched.
+        A refined title is refined again only if that reply changes before a
+        later user input ends the first turn. Does nothing for sessions without
+        a pending refinement, so later turns, child sessions, and sessions titled
+        by a user or automation are untouched.
         """
         key = (current_workspace_id(), session_id)
         settling_idle_edge = self._settling_idle_edges.get(key)
@@ -488,6 +493,26 @@ class BackgroundSessionTitleCoordinator:
         while len(self._pending_refinements) > _MAX_PENDING_REFINEMENTS:
             del self._pending_refinements[next(iter(self._pending_refinements))]
 
+    def _recheck_first_turn_later(
+        self,
+        refinement: _PendingTitleRefinement,
+        first_turn: _FirstTurnReply,
+        refined_from: tuple[str, str] | None = None,
+    ) -> None:
+        """Wait for another turn end while the first turn's reply may still change."""
+        if (
+            first_turn.superseded
+            or refinement.turn_end_checks + 1 >= _MAX_REFINEMENT_TURN_END_CHECKS
+        ):
+            return
+        self._register_refinement(
+            replace(
+                refinement,
+                turn_end_checks=refinement.turn_end_checks + 1,
+                refined_from=refined_from or refinement.refined_from,
+            )
+        )
+
     async def _wait_for_settled_turn(
         self, refinement: _PendingTitleRefinement, idle_edge: asyncio.Event
     ) -> str | None:
@@ -496,7 +521,10 @@ class BackgroundSessionTitleCoordinator:
         :returns: The title the refinement may replace, or ``None`` when a rename took it.
         """
         try:
-            owned_title = await asyncio.shield(refinement.initial_title)
+            if refinement.refined_from is not None:
+                owned_title: str | None = refinement.refined_from[1]
+            else:
+                owned_title = await asyncio.shield(refinement.initial_title)
             if owned_title is None:
                 return None
             while True:
@@ -533,14 +561,10 @@ class BackgroundSessionTitleCoordinator:
             if not first_turn.superseded and _session_is_running(session_id):
                 # An idle lull mid-turn: the first reply may still change.
                 reply = None
-            if reply is None:
-                if (
-                    not first_turn.superseded
-                    and refinement.turn_end_checks + 1 < _MAX_REFINEMENT_TURN_END_CHECKS
-                ):
-                    self._register_refinement(
-                        replace(refinement, turn_end_checks=refinement.turn_end_checks + 1)
-                    )
+            if reply is None or (
+                refinement.refined_from is not None and reply == refinement.refined_from[0]
+            ):
+                self._recheck_first_turn_later(refinement, first_turn)
                 return
             request = replace(
                 refinement.request,
@@ -564,6 +588,8 @@ class BackgroundSessionTitleCoordinator:
                     (time.perf_counter() - started) * 1000,
                     extra={"session_id": session_id},
                 )
+                if title is not None:
+                    self._recheck_first_turn_later(refinement, first_turn, (reply, title))
                 return
             updated = await asyncio.to_thread(
                 self._conversation_store.rename_conversation_if_title_matches,
@@ -571,6 +597,8 @@ class BackgroundSessionTitleCoordinator:
                 owned_title,
                 title,
             )
+            if updated is not None:
+                self._recheck_first_turn_later(refinement, first_turn, (reply, title))
             _logger.info(
                 "background session title refinement completed session=%s renamed=%s "
                 "elapsed_ms=%.1f",
