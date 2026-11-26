@@ -4,8 +4,10 @@
 import { type RefObject, useEffect, useLayoutEffect, useRef } from "react";
 
 export interface StripControlsLayout {
-  /** The sidebar's width as laid out now, mid-slide or not. */
-  sidebarWidth: number;
+  /** The strip's own width, which keeps the sidebar's open width while the sidebar slides. */
+  stripWidth: number;
+  /** The sidebar's borders beside the strip. */
+  sidebarBorder: number;
   /** The width the tabs' room has now; it shrinks to 0 before the strip overflows. */
   tabsAreaWidth: number;
   /** How far the strip's content, end padding included, runs past its visible box. */
@@ -17,14 +19,19 @@ export interface StripControlsLayout {
 /** The sidebar width at which the strip's fixed controls just fit, from one layout of it. */
 export function stripControlsWidth(layout: StripControlsLayout): number {
   return Math.ceil(
-    layout.sidebarWidth - layout.tabsAreaWidth + layout.stripOverflow - layout.stripEndPadding,
+    layout.stripWidth +
+      layout.sidebarBorder -
+      layout.tabsAreaWidth +
+      layout.stripOverflow -
+      layout.stripEndPadding,
   );
 }
 
 /**
  * Report the strip's controls width whenever it changes. Its ResizeObserver measures; a commit
- * reads no layout, so a session switch's commit doesn't force a layout of the new page. A
- * sidebar laid out at no width is skipped, as its edge collapses with it.
+ * reads no layout, so a session switch's commit doesn't force a layout of the new page. It
+ * measures the strip, not the sliding sidebar, so a reopen that resizes only the sidebar can't
+ * leave an underestimate behind. A strip laid out at no width, such as a hidden one, is skipped.
  */
 export function useStripControlsWidth(
   tabsAreaRef: RefObject<HTMLElement | null>,
@@ -49,11 +56,16 @@ export function useStripControlsWidth(
     const area = tabsAreaRef.current;
     const strip = area?.parentElement;
     if (!area || !strip) return;
-    const sidebar = strip.closest("aside") ?? strip;
-    const sidebarWidth = sidebar.getBoundingClientRect().width;
-    if (sidebarWidth <= 0) return;
+    const stripWidth = strip.getBoundingClientRect().width;
+    if (stripWidth <= 0) return;
+    const sidebar = strip.closest("aside");
+    const sidebarStyle = sidebar ? getComputedStyle(sidebar) : null;
     measured.current = stripControlsWidth({
-      sidebarWidth,
+      stripWidth,
+      sidebarBorder: sidebarStyle
+        ? (Number.parseFloat(sidebarStyle.borderLeftWidth) || 0) +
+          (Number.parseFloat(sidebarStyle.borderRightWidth) || 0)
+        : 0,
       tabsAreaWidth: area.getBoundingClientRect().width,
       stripOverflow: strip.scrollWidth - strip.clientWidth,
       stripEndPadding: Number.parseFloat(getComputedStyle(strip).paddingRight) || 0,

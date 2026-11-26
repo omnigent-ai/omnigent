@@ -9,10 +9,12 @@ import {
 } from "./stripControlsWidth";
 
 // Layouts measured in Chromium: the floating strip with ‹ ›, its controls and Collapse, which
-// needs 154px. Past the tabs' room, the strip's 8px end padding is clipped first.
-const layout = (sidebarWidth: number, tabsAreaWidth: number, stripOverflow: number) =>
+// needs 154px, 1px of it the sidebar's border. Past the tabs' room, the strip's 8px end padding
+// is clipped first.
+const layout = (stripWidth: number, tabsAreaWidth: number, stripOverflow: number) =>
   ({
-    sidebarWidth,
+    stripWidth,
+    sidebarBorder: 1,
     tabsAreaWidth,
     stripOverflow,
     stripEndPadding: 8,
@@ -20,17 +22,17 @@ const layout = (sidebarWidth: number, tabsAreaWidth: number, stripOverflow: numb
 
 describe("stripControlsWidth", () => {
   it.each([
-    ["open wide", layout(420, 258, 0)],
-    ["with little room for tabs", layout(192, 30, 0)],
-    ["clipping only the end padding", layout(156, 0, 6)],
-    ["clipping controls", layout(92, 0, 70)],
-    ["squeezed to 12px mid-slide", layout(12, 0, 150)],
+    ["open wide", layout(419, 258, 0)],
+    ["with little room for tabs", layout(191, 30, 0)],
+    ["clipping only the end padding", layout(155, 0, 6)],
+    ["clipping controls", layout(91, 0, 70)],
+    ["squeezed to 11px", layout(11, 0, 150)],
   ])("needs the same width %s", (_case, measured) => {
     expect(stripControlsWidth(measured)).toBe(154);
   });
 
   it("rounds a fractional layout up, so a button cut by part of a pixel counts as hidden", () => {
-    expect(stripControlsWidth({ ...layout(420, 258, 0), tabsAreaWidth: 257.75 })).toBe(155);
+    expect(stripControlsWidth({ ...layout(419, 258, 0), tabsAreaWidth: 257.75 })).toBe(155);
   });
 });
 
@@ -77,17 +79,20 @@ describe("useStripControlsWidth", () => {
   function Strip({
     onWidth,
     areaWidth = 258,
+    sidebarWidth = 420,
     extra = false,
   }: {
     onWidth: (width: number) => void;
     areaWidth?: number;
+    /** The sidebar's own width, which its open and close slide animate; the strip keeps 419px. */
+    sidebarWidth?: number;
     extra?: boolean;
   }) {
     const areaRef = useRef<HTMLDivElement>(null);
     useStripControlsWidth(areaRef, onWidth);
     return (
-      <aside data-width="420">
-        <div>
+      <aside data-width={sidebarWidth} style={{ borderLeft: "1px solid" }}>
+        <div data-width="419">
           <div ref={areaRef} data-width={areaWidth} />
           {extra ? <button type="button" data-testid="extra" /> : null}
         </div>
@@ -129,6 +134,17 @@ describe("useStripControlsWidth", () => {
     expect(rect).not.toHaveBeenCalled();
     rerender(<Strip onWidth={second} />);
     expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it("measures the same width while the sidebar slides open, whose own width the strip doesn't watch", () => {
+    const onWidth = vi.fn();
+    // Reopened without a resize: the strip lays out while the sidebar is still 12px wide.
+    const { rerender } = render(<Strip onWidth={onWidth} sidebarWidth={12} />);
+    resize();
+    expect(onWidth).toHaveBeenCalledExactlyOnceWith(162);
+    // The slide ends without resizing the strip, so nothing measures again, and needn't.
+    rerender(<Strip onWidth={onWidth} sidebarWidth={420} />);
+    expect(onWidth).toHaveBeenCalledTimes(1);
   });
 
   it("watches a control that appears, and measures after paint once one goes", () => {
