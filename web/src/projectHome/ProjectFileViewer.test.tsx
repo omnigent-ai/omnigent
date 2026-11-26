@@ -24,6 +24,9 @@ vi.mock("@/shell/FileViewer", () => ({
     <div>
       <p>Viewing {path}</p>
       <a href={`/v1/projects/${PROJECT}/files/${APPENDIX}/content`}>appendix link</a>
+      <a href={`/v1/projects/${PROJECT}/files/${APPENDIX}/content`} download="Appendix.md">
+        download appendix
+      </a>
     </div>
   ),
 }));
@@ -50,5 +53,14 @@ describe("ProjectFileViewerHost", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Back to Weekly report" }));
     expect(await screen.findByText("Viewing Weekly report.md")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Back to/ })).not.toBeInTheDocument();
+  });
+
+  it("leaves a download link alone so the file is saved, not opened", async () => {
+    renderHost();
+    expect(await screen.findByText("Viewing Weekly report.md")).toBeInTheDocument();
+    const download = screen.getByText("download appendix");
+    // fireEvent returns false when a handler called preventDefault.
+    expect(fireEvent.click(download)).toBe(true);
+    expect(screen.getByText("Viewing Weekly report.md")).toBeInTheDocument();
   });
 });

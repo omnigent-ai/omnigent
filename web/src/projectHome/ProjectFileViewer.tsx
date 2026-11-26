@@ -63,12 +63,14 @@ export function ProjectFileViewerHost({ projectId }: { projectId: string | null 
       event.preventDefault();
       openFile(id);
     }
-    // Markdown links to a file's raw content open the viewer instead.
+    // Markdown links to a file's raw content open the viewer instead; a link
+    // marked `download` (the viewer's own Download) still saves the file.
     function onClick(event: MouseEvent) {
       if (event.defaultPrevented || event.button !== 0) return;
       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       const anchor = (event.target as Element | null)?.closest?.("a[href]");
-      const id = anchor ? ownFile(anchor.getAttribute("href")!) : null;
+      if (!anchor || anchor.hasAttribute("download")) return;
+      const id = ownFile(anchor.getAttribute("href")!);
       if (!id) return;
       event.preventDefault();
       openFile(id);
