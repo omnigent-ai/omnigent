@@ -146,6 +146,15 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     expect(parsed("omnigent://files?path=a.ts&line=5-5")).toEqual({
       place: { kind: "files", path: "a.ts", line: { start: 5 } },
     });
+    expect(
+      parsed("omnigent://changes?compare=head&compare-root=/repo/./x/../.worktrees/feature/"),
+    ).toEqual({
+      place: {
+        kind: "changes",
+        comparison: { kind: "saved", intent: "head" },
+        comparisonRoot: "/repo/.worktrees/feature",
+      },
+    });
     expect(parsed("OMNIGENT://Files")).toEqual({ place: { kind: "files" } });
     expect(parsed("omnigent://files#ignored")).toEqual({ place: { kind: "files" } });
   });
@@ -188,6 +197,7 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     ["omnigent://changes?compare=head&compare-base=main", "not both"],
     ["omnigent://changes?compare-root=/repo/wt", "needs a comparison too"],
     ["omnigent://changes?compare=head&compare-root=wt", "must be an absolute path"],
+    ["omnigent://changes?compare=head&compare-root=/repo%00/wt", "NUL character"],
     ["omnigent://terminal", "needs an ID"],
     ["omnigent://agent", "needs an ID"],
     ["omnigent://files/abc", "doesn't take an ID"],

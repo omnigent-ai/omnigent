@@ -184,8 +184,8 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
       }
       const comparison = parseComparison(params);
       if (comparison) place.comparison = comparison;
-      const comparisonRoot = params.get("compare-root");
-      if (comparisonRoot !== null) {
+      const comparisonRoot = params.path("compare-root");
+      if (comparisonRoot !== undefined) {
         if (!comparison) refuse("A compared folder needs a comparison too.");
         if (!comparisonRoot.startsWith("/")) refuse("A compared folder must be an absolute path.");
         place.comparisonRoot = comparisonRoot;
