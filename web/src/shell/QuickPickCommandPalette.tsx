@@ -36,7 +36,7 @@ import {
 import { currentPaletteCommand, paletteCommandItems } from "./paletteCommandRows";
 import type { PaletteTarget as PaletteRow } from "./paletteTarget";
 import { pageStatusSummary, useSettingChoicesPage } from "./settingChoicesPage";
-import { sessionSearchItems } from "./paletteSessionItems";
+import { sessionSearchItems, useShowMoreParking } from "./paletteSessionItems";
 import { usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 const COMMAND_HISTORY_KEY = "command-palette:commands";
@@ -123,9 +123,7 @@ export function QuickPickCommandPalette({
   /** The command `item` runs now, or null once it no longer applies. */
   const currentCommand = (item: QuickPickItem<PaletteRow>, inRegion?: CommandRegion | null) =>
     item.value.kind === "command" ? commandFor(item.id, item.value.targetKey, inRegion) : null;
-  // Show more parks the selection on its group's last row, so the next ArrowDown
-  // reaches the rows it loads, and Back makes the row that opened a page active again;
-  // the user's next move clears it.
+  // Back makes the row that opened a page active again; the user's next move clears it.
   const [parkedId, setParkedId] = useState<string | null>(null);
   // A child page has its own query; the root's stays as it was for Back.
   const [pageQuery, setPageQuery] = useState("");
@@ -224,14 +222,20 @@ export function QuickPickCommandPalette({
     pageItems || unbuiltPage
       ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems ?? [] }]
       : rootSegments;
+  // Show more parks the selection on its group's last row, until the query changes or ⌘K closes.
+  const showMore = useShowMoreParking(
+    segments.flatMap((segment) => segment.items),
+    { query, open },
+  );
 
   const accept = (item: QuickPickItem<PaletteRow>): QuickPickAcceptResult | QuickPickHandOff => {
     const row = item.value;
     if (row.kind === "more") {
-      setParkedId(row.lastRowId ?? null);
-      row.load();
+      setParkedId(null);
+      showMore.accept({ ...item, value: row });
       return "keepOpen";
     }
+    showMore.clear();
     if (row.kind === "action") {
       row.action.run();
       return undefined;
@@ -379,8 +383,11 @@ export function QuickPickCommandPalette({
         else search.setQuery(next);
       }}
       onAccept={accept}
-      activeId={parkedId}
-      onActiveIdChange={() => setParkedId(null)}
+      activeId={parkedId ?? showMore.activeId}
+      onActiveIdChange={() => {
+        setParkedId(null);
+        showMore.clear();
+      }}
       inputTestId="command-palette-input"
       emptyMessage={childPage ? (optionsPage.empty ?? pageCopy?.empty) : rootEmptyMessage()}
       status={childPage ? undefined : status}

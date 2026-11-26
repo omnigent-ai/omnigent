@@ -1,10 +1,13 @@
+import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import {
   paletteShowMoreItems,
+  parkedRowId,
   type SessionSearchGroupPaging,
   type SessionSearchRows,
   sessionSearchItems,
+  useShowMoreParking,
 } from "./paletteSessionItems";
 import type { PaletteSession } from "./usePaletteSessionSearch";
 
@@ -101,5 +104,74 @@ describe("sessionSearchItems", () => {
     });
     expect(ids(built).messages).toEqual(["more:content"]);
     expect(built.messages[0]?.group).toBe("In messages");
+  });
+});
+
+describe("parkedRowId", () => {
+  const item = (id: string, group: string) => ({ id, label: id, group, value: null });
+  const listed = [
+    item("conv_a", "Sessions"),
+    item("conv_m", "In messages"),
+    item("more:content", "In messages"),
+  ];
+
+  it("parks on the group's last row while it's listed", () => {
+    expect(parkedRowId({ lastRowId: "conv_m", group: "In messages" }, listed)).toBe("conv_m");
+  });
+
+  it("keeps a last row that's gone, so the list falls back to its first enabled row", () => {
+    const parking = { lastRowId: "conv_deleted", group: "In messages" };
+    expect(parkedRowId(parking, listed)).toBe("conv_deleted");
+  });
+
+  it("parks on the group's first row when the group had none, so its new rows come next", () => {
+    const parking = { lastRowId: undefined, group: "In messages" };
+    expect(
+      parkedRowId(parking, [item("conv_a", "Sessions"), item("more:content", "In messages")]),
+    ).toBe("more:content");
+    const loaded = [item("conv_a", "Sessions"), item("conv_new", "In messages")];
+    expect(parkedRowId(parking, loaded)).toBe("conv_new");
+  });
+});
+
+describe("useShowMoreParking", () => {
+  const item = (id: string, group: string) => ({ id, label: id, group, value: null });
+  const listed = [item("conv_a", "In messages"), item("conv_b", "In messages")];
+  const more = {
+    id: "more:content",
+    label: "Show more",
+    group: "In messages",
+    value: { kind: "more" as const, load: vi.fn(), lastRowId: "conv_b" },
+  };
+  const parking = (query: string, open = true) =>
+    renderHook((props: { query: string; open: boolean }) => useShowMoreParking(listed, props), {
+      initialProps: { query, open },
+    });
+
+  it("parks on the group's last row and loads the next page", () => {
+    const { result } = parking("a");
+    act(() => result.current.accept(more));
+    expect(result.current.activeId).toBe("conv_b");
+    expect(more.value.load).toHaveBeenCalled();
+    act(() => result.current.clear());
+    expect(result.current.activeId).toBeNull();
+  });
+
+  it("lets go once the query changes, and stays gone when the first query is typed again", () => {
+    const { result, rerender } = parking("a");
+    act(() => result.current.accept(more));
+    rerender({ query: "b", open: true });
+    expect(result.current.activeId).toBeNull();
+    rerender({ query: "a", open: true });
+    expect(result.current.activeId).toBeNull();
+  });
+
+  it("lets go once the list closes, so a reopened one starts from its top row", () => {
+    const { result, rerender } = parking("a");
+    act(() => result.current.accept(more));
+    rerender({ query: "a", open: false });
+    expect(result.current.activeId).toBeNull();
+    rerender({ query: "a", open: true });
+    expect(result.current.activeId).toBeNull();
   });
 });

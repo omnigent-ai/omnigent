@@ -1,6 +1,8 @@
 // A session search's rows, for any list of them such as ⌘K's: one per session with
 // its project or group, where the query matched, and a paging row under each server group.
 
+import { useState } from "react";
+
 import { Badge } from "@/components/ui/badge";
 import { occurrenceRanges, type QuickPickItem } from "@/components/ui/quick-pick";
 
@@ -144,5 +146,48 @@ export function sessionSearchItems(
           )
         : []),
     ],
+  };
+}
+
+/** Where Show more left the selection: its group's last row, and the group itself. */
+export interface ShowMoreParking {
+  lastRowId: string | undefined;
+  group: string | undefined;
+}
+
+/**
+ * The row to keep active after Show more: the group's last row, so the next ArrowDown reaches
+ * the rows it loads. Once that row is gone the list picks its first enabled row, as for any
+ * missing row. A group that had no rows of its own, its page's matches all listed above, parks
+ * on its first row instead: Loading… while the page loads, then the first row it brings.
+ */
+export function parkedRowId(
+  parking: ShowMoreParking,
+  items: readonly QuickPickItem<unknown>[],
+): string | null {
+  if (parking.lastRowId !== undefined) return parking.lastRowId;
+  return items.find((item) => item.group === parking.group)?.id ?? null;
+}
+
+/**
+ * Show more for a list of session rows: `accept` loads the next page and parks the selection,
+ * `activeId` is the parked row for the list's `activeId`, and `clear` ends it once the user moves.
+ * Any change to the query ends it too, and so does closing the list, so a query typed again
+ * later starts from its top row.
+ */
+export function useShowMoreParking(
+  items: readonly QuickPickItem<unknown>[],
+  { query, open }: { query: string; open: boolean },
+) {
+  const [parked, setParked] = useState<{ parking: ShowMoreParking; query: string } | null>(null);
+  const current = parked !== null && open && parked.query === query;
+  if (parked !== null && !current) setParked(null);
+  return {
+    activeId: current ? parkedRowId(parked.parking, items) : null,
+    accept: (row: QuickPickItem<MoreRowTarget>) => {
+      setParked({ parking: { lastRowId: row.value.lastRowId, group: row.group }, query });
+      row.value.load();
+    },
+    clear: () => setParked(null),
   };
 }
