@@ -7,13 +7,7 @@ vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ pathname: "/", search: "", hash: "", state: null, key: "default" }),
 }));
 
-import {
-  SHORTCUT_BINDINGS,
-  type ShortcutId,
-  shortcutKeys,
-  APP_SHORTCUT_BINDINGS,
-  QUICK_PICK_SHORTCUT_BINDINGS,
-} from "@/lib/shortcuts/registry";
+import { type ShortcutId, shortcutKeys, APP_SHORTCUT_BINDINGS } from "@/lib/shortcuts/registry";
 
 import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
 import { type OpenSessionCommandId, openSessionCommands } from "./openSessionCommands";
@@ -123,6 +117,7 @@ const SESSION_COMMANDS = openSessionCommands({
 const NOT_YET = "Not in ⌘K yet.";
 const WHERE_PRESSED = "Acts on what has focus or is on screen, so it has no ⌘K row.";
 const MENU_ITEM = "A desktop menu item, which runs it with the menu's accelerator.";
+const QUICK_PICK_HOST = "Waits for quick_pick_palette, whose ⌘K command its shortcut host runs.";
 
 /** Registry hotkeys with no ⌘K command, and why. */
 const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = {
@@ -133,6 +128,12 @@ const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = {
   "history.back": NOT_YET,
   "history.forward": NOT_YET,
   "sessions.recent": "Switches while Control is held.",
+  "message.previous": QUICK_PICK_HOST,
+  "message.next": QUICK_PICK_HOST,
+  "session.next": QUICK_PICK_HOST,
+  "session.previous": QUICK_PICK_HOST,
+  "session.recent": QUICK_PICK_HOST,
+  "session.recentReverse": QUICK_PICK_HOST,
   "session.number": "Picks a sidebar row by its position.",
   "view.mode": NOT_YET,
   "workspace.tab": "Picks a workspace tab by its position.",
@@ -189,16 +190,8 @@ describe("registry hotkeys in ⌘K", () => {
       ...Object.keys(SESSION_HOTKEY_COMMANDS),
       ...Object.keys(HOTKEYS_WITHOUT_COMMANDS),
     ];
-    // Bindings only quick_pick_palette's own shortcuts run have no command here yet.
-    const quickPickOnly = new Set<string>(
-      QUICK_PICK_SHORTCUT_BINDINGS.filter(
-        (binding) => !(binding.id in SESSION_HOTKEY_COMMANDS),
-      ).map((binding) => binding.id),
-    );
     expect(listed.toSorted()).toEqual(
-      APP_SHORTCUT_BINDINGS.map((binding) => binding.id)
-        .filter((id) => !quickPickOnly.has(id))
-        .toSorted(),
+      APP_SHORTCUT_BINDINGS.map((binding) => binding.id).toSorted(),
     );
   });
 
@@ -225,7 +218,7 @@ describe("registry hotkeys in ⌘K", () => {
 
   it("drops a gap once ⌘K gains a command for that hotkey", () => {
     for (const id of Object.keys(HOTKEYS_WITHOUT_COMMANDS) as ShortcutId[]) {
-      const binding = SHORTCUT_BINDINGS.find((candidate) => candidate.id === id)!;
+      const binding = APP_SHORTCUT_BINDINGS.find((candidate) => candidate.id === id)!;
       const keys = shortcutKeys(id);
       const match = all.find(
         (command) =>
