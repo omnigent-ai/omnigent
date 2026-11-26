@@ -31,12 +31,17 @@ def _pr(number: int, head: str, base: str, *, cross_repository: bool = False) ->
 
 
 class StackGraph:
-    """Answers ``gh pr list --head/--base`` and the current pull request's view from a graph."""
+    """Answers every ``gh`` call a stack read makes, from a graph of pull requests.
+
+    Only ``gh`` itself is faked, so the account lookup and the pull request's read run
+    as they really do and every invocation is recorded in ``calls``.
+    """
 
     def __init__(
         self, monkeypatch: pytest.MonkeyPatch, prs: list[dict[str, Any]], current: int
     ) -> None:
         self.prs = prs
+        self.calls: list[list[str]] = []
         self.lists: list[tuple[str, str]] = []
         self.tokens: list[str | None] = []
         self.token_lookups = 0
@@ -49,34 +54,31 @@ class StackGraph:
         # The real token lookup runs, for an account the workspace chose.
         monkeypatch.setattr(github, "_in_sandbox", lambda: False)
         monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: "octocat")
-        monkeypatch.setattr(github, "_gh_auth_token", self._token)
         monkeypatch.setattr(github, "_gh", self._gh)
-        monkeypatch.setattr(github, "_pr_json", self._pr_json)
-
-    def _token(self, _root: str, _login: str, _host: str) -> str:
-        self.token_lookups += 1
-        return TOKEN
-
-    def _pr_json(self, root: str, reference: PullRequestRef, _fields: str) -> dict[str, Any]:
-        self.tokens.append(github._pr_token(root, reference))  # As the real read does.
-        return self.current
 
     def _gh(
         self, argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
     ) -> tuple[int, str, str]:
+        self.calls.append(argv)
         # Every call runs under the walk's one deadline.
         deadline = github._gh_deadline.get()
         assert deadline is not None
         assert deadline <= time.monotonic() + github_stack.WALK_SECONDS
         self.deadlines.append(deadline)
+        if argv[:2] == ["auth", "token"]:
+            self.token_lookups += 1
+            return 0, TOKEN + "\n", ""
+        self.tokens.append(token)
+        if argv[:2] == ["pr", "view"]:
+            return 0, json.dumps(self.current), ""
         if argv[:2] == ["repo", "view"]:
             if self.default_branch is None:
                 return 1, "", "HTTP 502"
             return 0, json.dumps({"defaultBranchRef": {"name": self.default_branch}}), ""
+        assert argv[:2] == ["pr", "list"], argv
         flag = "--head" if "--head" in argv else "--base"
         branch = argv[argv.index(flag) + 1]
         self.lists.append((flag, branch))
-        self.tokens.append(token)
         if branch in self.timing_out:
             github._gh_timed_out.set(True)
             return 1, "", "deadline"
@@ -105,11 +107,12 @@ def _numbers(stack: dict[str, Any]) -> list[int]:
 def test_a_linear_stack_lists_every_member_once_and_is_complete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    StackGraph(monkeypatch, _chain(3), current=2)
+    graph = StackGraph(monkeypatch, _chain(4), current=2)
 
     stack = github_stack.pull_request_stack("/workspace", _reference(2))
 
-    assert _numbers(stack) == [1, 2, 3]
+    assert _numbers(stack) == [1, 2, 3, 4]
+    assert len(graph.calls) <= github_stack.MAX_GH_CALLS
     assert [m["number"] for m in stack["members"] if m["current"]] == [2]
     assert stack["truncated"] is False
     parent = next(member for member in stack["members"] if member["number"] == 1)
@@ -158,25 +161,16 @@ def test_a_stack_deeper_than_the_cap_is_truncated(monkeypatch: pytest.MonkeyPatc
     assert max(_numbers(stack)) == github_stack.MAX_DEPTH + 1
 
 
-def test_the_walk_stops_at_the_gh_call_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_whole_read_stays_within_the_gh_call_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(github_stack, "MAX_DEPTH", 50)
     graph = StackGraph(monkeypatch, _chain(github_stack.MAX_GH_CALLS + 5), current=1)
 
     stack = github_stack.pull_request_stack("/workspace", _reference(1))
 
     assert stack["truncated"] is True
-    # The default branch's read is one of the calls.
-    assert len(graph.lists) == github_stack.MAX_GH_CALLS - 1
-
-
-def test_a_stack_within_both_caps_is_not_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
-    graph = StackGraph(monkeypatch, _chain(4), current=1)
-
-    stack = github_stack.pull_request_stack("/workspace", _reference(1))
-
-    assert stack["truncated"] is False
-    assert _numbers(stack) == [1, 2, 3, 4]
-    assert len(graph.lists) <= github_stack.MAX_GH_CALLS
+    # The account lookup and the reads before the walk count too.
+    assert graph.calls[0][:2] == ["auth", "token"]
+    assert len(graph.calls) <= github_stack.MAX_GH_CALLS
 
 
 def test_a_failed_list_marks_the_stack_truncated_and_keeps_the_rest(
@@ -220,12 +214,16 @@ def test_the_walk_stops_when_its_deadline_cuts_a_list_short(
 def test_another_repositorys_branch_with_the_same_name_is_not_in_the_stack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A contributor's pull request from their own repository's ``main`` branch.
-    prs = [_pr(1, "branch-1", "main"), _pr(2, "main", "release", cross_repository=True)]
-    StackGraph(monkeypatch, prs, current=1)
+    # A contributor's pull request from their own repository's ``base-work`` branch.
+    prs = [
+        _pr(1, "branch-1", "base-work"),
+        _pr(2, "base-work", "main", cross_repository=True),
+    ]
+    graph = StackGraph(monkeypatch, prs, current=1)
 
     stack = github_stack.pull_request_stack("/workspace", _reference(1))
 
+    assert ("--head", "base-work") in graph.lists
     assert _numbers(stack) == [1]
     assert stack["truncated"] is False
 
@@ -284,13 +282,19 @@ def test_a_long_lived_branch_with_its_release_prs_is_a_base_not_a_member(
     assert stack["truncated"] is False
 
 
-def test_without_the_default_branch_the_walk_still_runs(monkeypatch: pytest.MonkeyPatch) -> None:
-    graph = StackGraph(monkeypatch, _chain(3), current=2)
+def test_without_the_default_branch_only_the_pull_request_is_listed_as_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without the default branch, a release PR from main would look like the parent.
+    prs = [_pr(1, "feature", "main"), _pr(2, "main", "release"), _pr(3, "part-2", "feature")]
+    graph = StackGraph(monkeypatch, prs, current=1)
     graph.default_branch = None
 
-    stack = github_stack.pull_request_stack("/workspace", _reference(2))
+    stack = github_stack.pull_request_stack("/workspace", _reference(1))
 
-    assert _numbers(stack) == [1, 2, 3]
+    assert _numbers(stack) == [1]
+    assert stack["truncated"] is True
+    assert graph.lists == []
 
 
 def test_a_contributors_pull_request_built_on_a_branch_here_is_in_the_stack(

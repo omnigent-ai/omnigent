@@ -11,7 +11,11 @@ from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef
 
 MAX_DEPTH = 10
+# Every ``gh`` call one stack read makes, the reads before the walk included.
 MAX_GH_CALLS = 20
+# Before the walk: the account's token, a sign-in check on a host other than github.com,
+# the pull request's read and the default branch's. Reserved whether or not each runs.
+_CALLS_BEFORE_THE_WALK = 4
 # One deadline for the whole walk, inside the server's 30 s wait for a read.
 WALK_SECONDS = 20.0
 _LIST_LIMIT = 30
@@ -91,6 +95,7 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
     of those, or a list that failed or was cut at its limit, marks the answer ``truncated``.
     It never looks past the repository's default branch, and a branch that heads more than
     one pull request, such as a long-lived ``develop``, is a base rather than a member.
+    When the default branch can't be read, the answer is the pull request alone, truncated.
     """
     with github._gh_deadline_scope(time.monotonic() + WALK_SECONDS):
         # One account for the whole walk: the pull request's read and every list.
@@ -101,7 +106,11 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
             if current is None:
                 raise ValueError(_UNLOADED)
             default_branch = _default_branch(root, reference, token)
-            members, truncated = _walk(root, reference, token, current, default_branch)
+            if default_branch is None:
+                # Without the boundary, a release PR from it would look like a parent.
+                members, truncated = [], True
+            else:
+                members, truncated = _walk(root, reference, token, current, default_branch)
         finally:
             github._bound_pr_token.reset(binding)
     members.append(_member(current, current=True))
@@ -118,14 +127,14 @@ def _walk(
     reference: PullRequestRef,
     token: str | None,
     current: dict[str, Any],
-    default_branch: str | None,
+    default_branch: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """The other members, breadth first, and whether the walk stopped before the end."""
     seen_numbers = {current.get("number")}
     seen_heads = {current.get("headRefOid")}
     members: list[dict[str, Any]] = []
     truncated = False
-    calls = 1  # The default branch's read.
+    calls = _CALLS_BEFORE_THE_WALK
     # Each entry is (pull request, depth, direction): "up" finds the PR whose head is its
     # base, "down" the PRs stacked on its head.
     queue: deque[tuple[dict[str, Any], int, str]] = deque(
