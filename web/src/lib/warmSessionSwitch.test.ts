@@ -1,12 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 import * as capabilities from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useChatStore } from "@/store/chatStore";
 import {
-  clearWarmSwitchInFlight,
+  isWarmSwitchPending,
   switchSessionBeforeNavigate,
-  warmSwitchInFlight,
   warmSwitchKeepMountedEnabled,
 } from "./warmSessionSwitch";
 
@@ -19,10 +17,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.clearAllTimers();
   useChatStore.setState(initialStoreState);
   conversationRegistry.clear();
-  clearWarmSwitchInFlight();
   window.history.replaceState({}, "", "/");
+  delete window.__OMNIGENT_BASE_PATH__;
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -32,6 +31,12 @@ function spyFeatures(features: Record<string, boolean>) {
     ...capabilities.FALLBACK_SERVER_INFO,
     features,
   });
+}
+
+function seedLive(...ids: string[]) {
+  for (const id of ids) {
+    conversationRegistry.acquire(id).setState({ abortController: new AbortController() });
+  }
 }
 
 describe("warmSwitchKeepMountedEnabled", () => {
@@ -47,146 +52,102 @@ describe("warmSwitchKeepMountedEnabled", () => {
   });
 });
 
+describe("isWarmSwitchPending", () => {
+  it.each([
+    ["conv_b", "conv_a", "/c/conv_b", "", true],
+    ["conv_b", "conv_b", "/c/conv_b", "", false],
+    [null, "conv_a", "/c/conv_b", "", false],
+    ["conv_a", "conv_b", "/c/conv_b", "", false],
+    ["conv_b", "conv_a", "/c/conv_a", "", false],
+    ["conv_b", "conv_a", "/canvas/c/conv_b", "", false],
+    ["conv_b", "conv_a", "/c/conv_b/child", "", false],
+    ["conv_b", "conv_a", "/proxy/example/c/conv_b", "/proxy/example", true],
+    ["conv_b", "conv_a", "/proxy/example/c/conv_b/", "/proxy/example", true],
+    ["conv_b", "conv_a", "/c/conv_b", "/proxy/example", false],
+    ["conv_b", "conv_a", "/proxy/example/canvas/c/conv_b", "/proxy/example", false],
+    ["conv_b", "conv_a", "/proxy/example-other/c/conv_b", "/proxy/example", false],
+  ] as const)(
+    "store %s, router %s, browser %s, base %s => %s",
+    (active, url, pathname, base, expected) => {
+      spyFeatures({ warm_switch_keep_mounted_ui: true });
+      window.__OMNIGENT_BASE_PATH__ = base;
+      window.history.replaceState({}, "", pathname);
+      expect(isWarmSwitchPending(active, url)).toBe(expected);
+    },
+  );
+
+  it("does not retain the mismatch when the flag is off", () => {
+    window.history.replaceState({}, "", "/c/conv_b");
+    expect(isWarmSwitchPending("conv_b", "conv_a")).toBe(false);
+  });
+});
+
 describe("switchSessionBeforeNavigate", () => {
-  it("switches the store to a live target during the click and marks it in flight", () => {
+  it("switches a live target synchronously and leaves successful navigation alone", () => {
     spyFeatures({ warm_switch_keep_mounted_ui: true });
+    seedLive("conv_a", "conv_b");
     useChatStore.setState({ conversationId: "conv_a" });
-    // A retained entry with an open stream — what a warm switch paints from.
-    const entry = conversationRegistry.acquire("conv_b");
-    entry.setState({ abortController: new AbortController(), blocks: [] });
+    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
 
     switchSessionBeforeNavigate("conv_b");
-
-    // The synchronous half of `switchTo` (root write + live mirror) ran before
-    // the navigation commit that follows the click.
     expect(useChatStore.getState().conversationId).toBe("conv_b");
     expect(useChatStore.getState().loadingConversation).toBe(false);
-    // The store is now one frame ahead of the URL; the gate reads this window.
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(true);
+    window.history.pushState({}, "", "/c/conv_b");
+    vi.runOnlyPendingTimers();
+
+    expect(switchTo.mock.calls).toEqual([["conv_b"]]);
+    expect(useChatStore.getState().conversationId).toBe("conv_b");
+  });
+
+  it("restores a canceled click on the next task even if search parameters changed", () => {
+    spyFeatures({ warm_switch_keep_mounted_ui: true });
+    seedLive("conv_a", "conv_b");
+    useChatStore.setState({ conversationId: "conv_a" });
+    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+
+    switchSessionBeforeNavigate("conv_b");
+    window.history.replaceState({}, "", "/c/conv_a?diff=1");
+    expect(useChatStore.getState().conversationId).toBe("conv_b");
+    vi.runOnlyPendingTimers();
+
+    expect(switchTo.mock.calls).toEqual([["conv_b"], ["conv_a"]]);
+    expect(useChatStore.getState().conversationId).toBe("conv_a");
   });
 
   it("leaves the store alone when the flag is off", () => {
     useChatStore.setState({ conversationId: "conv_a" });
-
+    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
     switchSessionBeforeNavigate("conv_b");
-
-    expect(useChatStore.getState().conversationId).toBe("conv_a");
+    expect(switchTo).not.toHaveBeenCalled();
     expect(conversationRegistry.peek("conv_b")).toBeUndefined();
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
-  });
-
-  it("does not open a window for the already-active session", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    useChatStore.setState({ conversationId: "conv_a" });
-    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
-
-    switchSessionBeforeNavigate("conv_a");
-
-    expect(switchTo).not.toHaveBeenCalled();
-    expect(warmSwitchInFlight("conv_a", "conv_a")).toBe(false);
-    expect(warmSwitchInFlight("conv_a", "conv_b")).toBe(false);
-  });
-
-  it("leaves a null source alone so a canceled settings click cannot claim the landing route", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    useChatStore.setState({ conversationId: null });
-    window.history.replaceState({}, "", "/settings");
-    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
-
-    switchSessionBeforeNavigate("conv_b");
-    window.history.pushState({}, "", "/");
-    vi.advanceTimersByTime(3000);
-
-    expect(switchTo).not.toHaveBeenCalled();
-    expect(useChatStore.getState().conversationId).toBeNull();
-    expect(warmSwitchInFlight("conv_b", undefined)).toBe(false);
-  });
-
-  it("uses the store source even when the click starts outside a chat route", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    useChatStore.setState({ conversationId: "conv_a" });
-    window.history.replaceState({}, "", "/settings");
-    const entry = conversationRegistry.acquire("conv_b");
-    entry.setState({ abortController: new AbortController(), blocks: [] });
-
-    switchSessionBeforeNavigate("conv_b");
-
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(true);
-    expect(warmSwitchInFlight("conv_b", undefined)).toBe(false);
-    window.history.pushState({}, "", "/");
-    vi.advanceTimersByTime(3000);
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
-  });
-
-  it("only reports the window for the in-flight target and source URL and clears it", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    useChatStore.setState({ conversationId: "conv_a" });
-    const entry = conversationRegistry.acquire("conv_b");
-    entry.setState({ abortController: new AbortController(), blocks: [] });
-
-    switchSessionBeforeNavigate("conv_b");
-
-    expect(warmSwitchInFlight("conv_a", "conv_a")).toBe(false);
-    expect(warmSwitchInFlight("conv_b", "conv_b")).toBe(false);
-    expect(warmSwitchInFlight("conv_b", "conv_c")).toBe(false);
-    expect(warmSwitchInFlight(null, "conv_a")).toBe(false);
-    clearWarmSwitchInFlight();
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
   });
 
   it.each([
-    ["/c/conv_a?diff=1", "conv_a"],
-    ["/c/conv_b", "conv_b"],
-  ])("expires the click window at %s and leaves the store on %s", (pathname, expected) => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    for (const id of ["conv_a", "conv_b"]) {
-      conversationRegistry.acquire(id).setState({ abortController: new AbortController() });
-    }
-    useChatStore.setState({ conversationId: "conv_a" });
-    switchSessionBeforeNavigate("conv_b");
-    window.history.replaceState({}, "", pathname);
+    { source: null, target: "conv_b", stream: "live" },
+    { source: "temp:source", target: "conv_b", stream: "live" },
+    { source: "conv_a", target: "temp:target", stream: "live" },
+    { source: "conv_a", target: "conv_a", stream: "live" },
+    { source: "conv_a", target: "conv_b", stream: "missing" },
+    { source: "conv_a", target: "conv_b", stream: "stopped" },
+    { source: "conv_a", target: "conv_b", stream: "failed" },
+  ])(
+    "does not switch first for source $source, target $target, stream $stream",
+    ({ source, target, stream }) => {
+      spyFeatures({ warm_switch_keep_mounted_ui: true });
+      if (stream !== "missing") {
+        conversationRegistry.acquire(target).setState({
+          abortController: stream === "stopped" ? null : new AbortController(),
+          conversationLoadError: stream === "failed" ? new Error("load failed") : null,
+        });
+      }
+      useChatStore.setState({ conversationId: source });
+      const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
 
-    vi.advanceTimersByTime(2999);
-    expect(useChatStore.getState().conversationId).toBe("conv_b");
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(true);
-    vi.advanceTimersByTime(1);
+      switchSessionBeforeNavigate(target);
+      vi.runOnlyPendingTimers();
 
-    expect(useChatStore.getState().conversationId).toBe(expected);
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
-  });
-
-  it("clearing the marker cancels recovery and leaves no timer work", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    useChatStore.setState({ conversationId: "conv_a" });
-    conversationRegistry.acquire("conv_b").setState({ abortController: new AbortController() });
-    switchSessionBeforeNavigate("conv_b");
-    clearWarmSwitchInFlight();
-    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
-
-    vi.advanceTimersByTime(3000);
-
-    expect(switchTo).not.toHaveBeenCalled();
-    expect(warmSwitchInFlight("conv_b", "conv_a")).toBe(false);
-  });
-
-  it("gives a second click its own source and full recovery deadline", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    for (const id of ["conv_a", "conv_b", "conv_c"]) {
-      conversationRegistry.acquire(id).setState({ abortController: new AbortController() });
-    }
-    useChatStore.setState({ conversationId: "conv_a" });
-    switchSessionBeforeNavigate("conv_b");
-    vi.advanceTimersByTime(2000);
-    switchSessionBeforeNavigate("conv_c");
-
-    vi.advanceTimersByTime(1000);
-    expect(useChatStore.getState().conversationId).toBe("conv_c");
-    expect(warmSwitchInFlight("conv_c", "conv_b")).toBe(true);
-    expect(warmSwitchInFlight("conv_c", "conv_a")).toBe(false);
-    vi.advanceTimersByTime(1999);
-    expect(useChatStore.getState().conversationId).toBe("conv_c");
-    vi.advanceTimersByTime(1);
-    expect(useChatStore.getState().conversationId).toBe("conv_b");
-    expect(warmSwitchInFlight("conv_c", "conv_b")).toBe(false);
-  });
+      expect(switchTo).not.toHaveBeenCalled();
+      expect(useChatStore.getState().conversationId).toBe(source);
+    },
+  );
 });

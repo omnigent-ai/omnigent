@@ -2,6 +2,7 @@
 // a plain click on a session row switches the chat store as it navigates; a
 // modified click (new tab) and the flag-off path never touch the store.
 import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as capabilities from "@/lib/capabilities";
@@ -12,12 +13,14 @@ import { useChatStore } from "@/store/chatStore";
 import type { Conversation } from "@/hooks/useConversations";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversation } from "@/test/sidebarMockHelpers";
-import { clearWarmSwitchInFlight, warmSwitchInFlight } from "@/lib/warmSessionSwitch";
 
 const initialStoreState = useChatStore.getState();
 
 function LocationProbe() {
   const location = useLocation();
+  useLayoutEffect(() => {
+    window.history.replaceState({}, "", location.pathname + location.search);
+  }, [location]);
   return (
     <output data-testid="location">
       {location.pathname}
@@ -35,7 +38,6 @@ afterEach(() => {
   cleanup();
   useChatStore.getState().abortController?.abort();
   conversationRegistry.clear();
-  clearWarmSwitchInFlight();
   useChatStore.setState(initialStoreState);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -51,7 +53,7 @@ function renderSessions(
     features,
   });
   useChatStore.setState({ conversationId: "conv_a" });
-  seedLive("conv_a");
+  if (!sessions.some((session) => session.id === "conv_a")) seedLive("conv_a");
   for (const session of sessions) seedLive(session.id);
   vi.stubGlobal(
     "fetch",
@@ -88,6 +90,7 @@ describe("Sidebar warm switch activation", () => {
     fireEvent.click(await screen.findByText("conv_b"));
 
     expect(useChatStore.getState().conversationId).toBe("conv_a");
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv_b");
   });
 
   it("does not call switchTo when clicking the active row", async () => {
@@ -97,7 +100,6 @@ describe("Sidebar warm switch activation", () => {
     fireEvent.click(await screen.findByText("conv_a"));
 
     expect(switchTo).not.toHaveBeenCalled();
-    expect(warmSwitchInFlight("conv_a", "conv_a")).toBe(false);
   });
 
   it.each([

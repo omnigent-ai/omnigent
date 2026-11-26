@@ -1,6 +1,6 @@
 import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
 import { buildOutgoingMessage, carriesMessageContext } from "@/lib/outgoingComposerMessage";
-import { clearWarmSwitchInFlight, warmSwitchInFlight } from "@/lib/warmSessionSwitch";
+import { isWarmSwitchPending } from "@/lib/warmSessionSwitch";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -455,13 +455,12 @@ export function BtwSidechatAnswer({ answer }: { answer: string }) {
 export function ChatPage() {
   const { conversationId: urlConvId } = useParams<{ conversationId: string }>();
   const activeConversationId = useChatStore((s) => s.conversationId);
-  const warmSwitchPending = warmSwitchInFlight(activeConversationId, urlConvId);
+  const warmSwitchPending = isWarmSwitchPending(activeConversationId, urlConvId);
   const effectiveConvId = warmSwitchPending ? (activeConversationId ?? undefined) : urlConvId;
   const [sessionUi, setSessionUi] = useState({ conversationId: effectiveConvId, key: 0 });
   if (sessionUi.conversationId !== effectiveConvId) {
     // Session creation promotes the same draft; every other switch starts fresh local UI.
     const promoting =
-      !warmSwitchPending &&
       isTempConvId(sessionUi.conversationId) &&
       effectiveConvId !== undefined &&
       !isTempConvId(effectiveConvId);
@@ -504,7 +503,6 @@ export function ChatPage() {
   // drives the loading UI below; `conversationLoadError` drives the error UI.
   useEffect(() => {
     if (warmSwitchPending) return;
-    clearWarmSwitchInFlight();
     // A temporary route has no client session after a reload. Return to its
     // board or the landing page so it cannot strand a read-only phantom chat.
     if (isStaleTempConvId(urlConvId)) {

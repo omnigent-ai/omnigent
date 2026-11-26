@@ -6667,13 +6667,13 @@ function ConversationRowImpl({
     </>
   );
 
-  const rowHref = selectionMode
-    ? "#"
-    : conversation.nested_draft_source_id
-      ? `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`
-      : conversation.project_draft_name !== undefined
-        ? `/?project=${encodeURIComponent(conversation.project_draft_name)}`
-        : `/c/${conversation.id}`;
+  let rowHref = `/c/${conversation.id}`;
+  if (selectionMode) rowHref = "#";
+  else if (conversation.nested_draft_source_id) {
+    rowHref = `/?sibling=${encodeURIComponent(conversation.nested_draft_source_id)}`;
+  } else if (conversation.project_draft_name !== undefined) {
+    rowHref = `/?project=${encodeURIComponent(conversation.project_draft_name)}`;
+  }
 
   // The clickable row surface. Extracted so it can be rendered bare (selection
   // mode) or wrapped in the right-click ContextMenuTrigger below.
