@@ -1,7 +1,6 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { FakeShell } from "./__fixtures__/browserTabsStore";
 import { useWorkspaceHistory } from "./useWorkspaceHistory";
 import { resetWorkspaceTabsSessionsForTests, workspaceTabsSession } from "./workspaceTabsSessions";
 
@@ -26,20 +25,6 @@ describe("useWorkspaceHistory", () => {
 
     expect(store.selectedTab()?.place.kind).toBe("files");
     expect(result.current.facts?.forward.target).toBe("Diffs");
-  });
-
-  it("keeps browser tabs' owners attached while mounted", async () => {
-    const shell = new FakeShell("replay");
-    const { store } = workspaceTabsSession("conv_history");
-    store.openBrowserView("w", { select: true, opener: "user" });
-    await act(() =>
-      store.open({ place: { kind: "files" } }, { opener: "user", disposition: "new" }),
-    );
-    const { result, unmount } = renderHook(() => useWorkspaceHistory("conv_history", () => shell));
-    expect(shell.listenerCount()).toBe(1);
-    expect(result.current.facts?.back.inexactPage).toBe(false);
-    unmount();
-    expect(shell.listenerCount()).toBe(0);
   });
 
   it("has nothing to step without a session", () => {

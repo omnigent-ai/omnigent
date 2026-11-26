@@ -66,9 +66,6 @@ export interface BrowserForwardedChord {
   shiftKey: boolean;
 }
 
-/** What the shell says about a view: missing, or live with its page. Null when it can't say. */
-export type BrowserViewProbeResult = { exists: false } | { exists: true; url: string };
-
 /** An app chord a focused embedded page handed over, as keydown fields. */
 export interface BrowserForwardedKeydown {
   type: "keydown";
@@ -310,14 +307,6 @@ interface ElectronDesktopApi extends NativeShellApi {
    * predating the feature — callers must optional-chain.
    */
   browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
-  /** Whether a view exists and what it shows. */
-  browserHasView?: (
-    conversationId: string,
-  ) => Promise<{ exists: boolean; url?: string; pendingUrl?: string } | null>;
-  /** A view's page URL changed: every shell with the embedded browser sends it. */
-  onBrowserUrlChanged?: (
-    callback: (payload: { conversationId: string; url: string }) => void,
-  ) => () => void;
   /** Forward the recent-session gesture from a focused embedded Browser page. */
   onBrowserRecentSessionInput?: (
     callback: (input: BrowserRecentSessionInput) => void,
@@ -950,59 +939,6 @@ export function floatingComposerBridge(): FloatingComposerBridge | undefined {
  */
 export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
-}
-
-/** Load `url` in a view, creating it if needed; null on a shell without the embedded browser. */
-export async function openBrowserViewUrl(
-  viewId: string,
-  url: string,
-  options: BrowserHostOptions & { force?: boolean },
-): Promise<BrowserNavigationResult | null> {
-  const open = electronApi()?.browserOpenOrNavigate;
-  return open ? open(viewId, url, undefined, options) : null;
-}
-
-/** Whether this shell reports views' URL changes, which a browser tab's page history replays from. */
-export function browserUrlEventsSupported(): boolean {
-  return typeof electronApi()?.onBrowserUrlChanged === "function";
-}
-
-/** Ask whether a view exists and what it shows, on any shell with the embedded browser. */
-export async function probeBrowserView(viewId: string): Promise<BrowserViewProbeResult | null> {
-  const electron = electronApi();
-  if (!electron?.browserHasView) return null;
-  try {
-    const view = await electron.browserHasView(viewId);
-    if (!view) return null;
-    if (!view.exists) return { exists: false };
-    if (typeof view.url !== "string") return null;
-    // Loading its first page, a view reports a blank URL beside the pending one: none committed.
-    const firstLoad = Boolean(view.pendingUrl) && (view.url === "" || view.url === "about:blank");
-    return { exists: true, url: firstLoad ? "" : view.url };
-  } catch (err) {
-    console.warn("[nativeBridge] browser view probe failed:", err);
-    return null;
-  }
-}
-
-function subscribeOptional<T>(
-  subscribe: ((callback: (payload: T) => void) => () => void) | undefined,
-  callback: (payload: T) => void,
-): () => void {
-  if (typeof subscribe !== "function") return () => {};
-  try {
-    return subscribe(callback);
-  } catch (err) {
-    console.warn("[nativeBridge] browser subscription failed:", err);
-    return () => {};
-  }
-}
-
-/** Subscribe to views' URL changes; a no-op on shells without the embedded browser. */
-export function onBrowserUrlChanged(
-  callback: (payload: { conversationId: string; url: string }) => void,
-): () => void {
-  return subscribeOptional(electronApi()?.onBrowserUrlChanged, callback);
 }
 
 /** Subscribe to recent-session key events forwarded from an embedded Browser page. */

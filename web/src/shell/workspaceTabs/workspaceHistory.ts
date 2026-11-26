@@ -141,18 +141,6 @@ export function removeTab(
   return { state: next, restore: cursorWasOnTab ? currentVisit(next) : null };
 }
 
-/**
- * Forget `tabId`'s page entries, such as when its view was recreated or the shell
- * can't say which entry shows: its visits become plain URLs that Back replays.
- */
-export function withoutEntries(state: WorkspaceHistoryState, tabId: TabId): WorkspaceHistoryState {
-  if (!state.visits.some((visit) => visit.tabId === tabId && visit.entry)) return state;
-  const visits = state.visits.map((visit) =>
-    visit.tabId === tabId && visit.entry ? { tabId: visit.tabId, place: visit.place } : visit,
-  );
-  return collapseRepeats({ visits, cursor: state.cursor });
-}
-
 function stepTarget(
   state: WorkspaceHistoryState,
   direction: -1 | 1,

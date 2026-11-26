@@ -20,7 +20,6 @@ import {
   swapCurrent,
   WORKSPACE_HISTORY_LIMIT,
   WorkspaceHistory,
-  withoutEntries,
   type WorkspaceHistoryState,
 } from "./workspaceHistory";
 import type { Visit, WorkspacePlace } from "./workspacePlace";
@@ -232,48 +231,6 @@ describe("visits compare places by their canonical link", () => {
       state,
     );
     expect(recordStep(state, visit("F", file("a", 2)))).not.toBe(state);
-  });
-});
-
-describe("withoutEntries", () => {
-  const web = (url: string) => ({ kind: "web" as const, url });
-
-  it("turns a tab's page entries into plain URLs, leaving other tabs' entries", () => {
-    const state: WorkspaceHistoryState = {
-      visits: [
-        { tabId: "W", place: web("https://x.test/a"), entry: { index: 0 } },
-        { tabId: "V", place: web("https://y.test/"), entry: { index: 4 } },
-        { tabId: "W", place: web("https://x.test/b"), entry: { index: 1 } },
-      ],
-      cursor: 2,
-    };
-    expect(withoutEntries(state, "W")).toEqual({
-      visits: [
-        { tabId: "W", place: web("https://x.test/a") },
-        { tabId: "V", place: web("https://y.test/"), entry: { index: 4 } },
-        { tabId: "W", place: web("https://x.test/b") },
-      ],
-      cursor: 2,
-    });
-  });
-
-  it("collapses visits that only their entries told apart", () => {
-    const state: WorkspaceHistoryState = {
-      visits: [
-        { tabId: "W", place: web("https://x.test/a"), entry: { index: 0 } },
-        { tabId: "W", place: web("https://x.test/a"), entry: { index: 1 } },
-      ],
-      cursor: 1,
-    };
-    expect(withoutEntries(state, "W")).toEqual({
-      visits: [{ tabId: "W", place: web("https://x.test/a") }],
-      cursor: 0,
-    });
-  });
-
-  it("returns the same state when the tab has no entries", () => {
-    const state = historyStartingAt(visit("W", web("https://x.test/a")));
-    expect(withoutEntries(state, "W")).toBe(state);
   });
 });
 

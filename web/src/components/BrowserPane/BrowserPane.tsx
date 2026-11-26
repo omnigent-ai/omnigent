@@ -59,12 +59,6 @@ import {
   type ChromeCookiePreviewResult,
 } from "@/lib/nativeBridge";
 import { readSavedBrowserPage } from "@/lib/browserTabPages";
-import {
-  acceptBrowserPageSubmission,
-  beginBrowserPageSubmission,
-  isBrowserPageSubmissionCurrent,
-  noteBrowserPageControl,
-} from "@/lib/browserPageControls";
 import { browserViewOwnerId } from "@/lib/browserTabs";
 import { fetchSessionHostId } from "@/lib/fetchSessionHostId";
 import { resolveIdentity, subscribeIdentity } from "@/lib/identity";
@@ -418,12 +412,7 @@ export function BrowserPane({
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
     setNavigationError(null);
-    const submission = beginBrowserPageSubmission(conversationId);
     const sequence = ++submitSequenceRef.current;
-    // A newer submission replaces this load; in a tab, so do page controls and workspace steps.
-    const stillWanted = () =>
-      sequence === submitSequenceRef.current &&
-      (submission === null || isBrowserPageSubmissionCurrent(conversationId, submission));
     void fetchSessionHostId(browserViewOwnerId(conversationId))
       .then(async (hostId) => {
         const options = await previewHostOptions(hostId, navUrl);
@@ -431,7 +420,7 @@ export function BrowserPane({
           browserViewOwnerId(conversationId),
           hostId,
           async (retryOptions) => {
-            if (!stillWanted()) return null;
+            if (sequence !== submitSequenceRef.current) return null;
             return bridge.browserOpenOrNavigate!(conversationId, navUrl, undefined, {
               force: true,
               ...options,
@@ -441,23 +430,16 @@ export function BrowserPane({
         );
       })
       .then((result) => {
-        // No result: the load was never issued. A newer submission owns the address bar.
         if (!result || sequence !== submitSequenceRef.current) return;
-        const wanted = stillWanted();
-        if (result.ok) {
-          if (wanted) setCurrentUrl(navUrl);
-          // The page loaded it even if the user acted since, so a tab's page history that hears
-          // no URL events still goes by it; a workspace step since makes the tab ignore it.
-          if (submission !== null) acceptBrowserPageSubmission(conversationId, submission, navUrl);
-        } else if (wanted) setNavigationError(result.error ?? "Unable to open this page.");
+        if (result.ok) setCurrentUrl(navUrl);
+        else setNavigationError(result.error ?? "Unable to open this page.");
       })
       .catch(() => {
-        if (stillWanted()) setNavigationError("Unable to open this page.");
+        if (sequence === submitSequenceRef.current) setNavigationError("Unable to open this page.");
       });
   }, [conversationId, currentUrl]);
 
   const handleBack = useCallback(() => {
-    noteBrowserPageControl(conversationId);
     const bridge = getBridge();
     void bridge?.browserGoBack?.(conversationId).then((r) => {
       if (r?.ok) {
@@ -468,7 +450,6 @@ export function BrowserPane({
   }, [conversationId]);
 
   const handleForward = useCallback(() => {
-    noteBrowserPageControl(conversationId);
     const bridge = getBridge();
     void bridge?.browserGoForward?.(conversationId).then((r) => {
       if (r?.ok) {
@@ -483,7 +464,6 @@ export function BrowserPane({
       submitUrl();
       return;
     }
-    noteBrowserPageControl(conversationId);
     const bridge = getBridge();
     void bridge?.browserReload?.(conversationId);
   }, [conversationId, hasView, submitUrl]);
@@ -855,8 +835,6 @@ export function BrowserPane({
           title={chord("Address bar", ADDRESS_BAR_KEYS)}
           onChange={(e) => {
             urlEditsRef.current++;
-            // Typing an address takes over the page: a workspace step still loading stops waiting.
-            noteBrowserPageControl(conversationId);
             setCurrentUrl(e.target.value);
           }}
           onFocus={() => {
