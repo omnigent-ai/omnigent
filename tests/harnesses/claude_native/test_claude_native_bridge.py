@@ -11905,9 +11905,10 @@ def test_compute_transcript_cumulative_cost_refreshes_changed_custom_pricing(
             }
         }
 
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
     active_config = provider_config(1.0)
     monkeypatch.setattr(
-        "omnigent.onboarding.provider_config.load_config",
+        "omnigent.onboarding.provider_config._load_config",
         lambda: active_config,
     )
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()

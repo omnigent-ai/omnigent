@@ -4349,11 +4349,10 @@ def compute_transcript_cumulative_cost(
         byte_offset=0,
         start_line=0,
     )
-    from omnigent.inference_config import load_runtime_inference_config
     from omnigent.llms.context_window import compute_llm_cost
     from omnigent.onboarding.provider_config import load_config
 
-    provider_config = load_runtime_inference_config(load_config())
+    provider_config = load_config()
     provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
 
     cost_by_response: dict[tuple[str, str | int], float] = {}

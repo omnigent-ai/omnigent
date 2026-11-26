@@ -543,7 +543,7 @@ async def test_forward_session_cost_prices_saved_inference_binding(
     monkeypatch.delenv("OMNI_NATIVE_PRICING_ENDPOINT", raising=False)
     monkeypatch.delenv("OMNI_NATIVE_PRICING_KEY", raising=False)
     monkeypatch.setattr(
-        "omnigent.onboarding.provider_config.load_config",
+        "omnigent.onboarding.provider_config._load_config",
         lambda: {"providers": {"ambient": provider(1.0, default=True)}},
     )
     saved_path = tmp_path / "inference.json"
