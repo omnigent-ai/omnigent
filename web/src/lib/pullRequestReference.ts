@@ -1,6 +1,8 @@
 // Turns what a user types or pastes into the pull request to link: a full
 // link, or a number such as `#123` resolved against the session's repository.
 
+import type { CodeHostProviderId } from "@/lib/codeHosts";
+
 /** A PR already associated with this session, with the identity its host reported. */
 export interface SessionPullRequestIdentity {
   url: string;
@@ -34,7 +36,7 @@ export interface PullRequestReferenceContext {
 /** A repository the session's checkout names, on a host whose PR links are known. */
 export interface ContextRepository {
   /** Null while it's still unknown whether the host serves GitHub. */
-  provider: "github" | "gitspoke" | null;
+  provider: CodeHostProviderId | null;
   host: string;
   /** `owner/repo`. */
   repository: string;
