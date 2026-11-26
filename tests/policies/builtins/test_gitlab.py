@@ -16,6 +16,7 @@ from tests.policies.builtins.helpers import tool_call_event
 _HANDLER = "omnigent.policies.builtins.gitlab.gitlab_policy"
 _PROJECT = "team/sub/app"
 _URL = f"https://gitlab.com/{_PROJECT}"
+_COMMAND_PREFIXES = ("", "/usr/bin/", "./bin/", "command /usr/bin/", "env ")
 
 
 def _result(command: str, **configuration: object) -> str:
@@ -140,6 +141,11 @@ def test_projects_can_be_pinned_to_a_server() -> None:
         (f"glab issue create -t Fix -d > -R {_URL}", "ASK"),
         (f"glab issue note 12 -m > -R {_URL}", "ASK"),
         (f"glab issue note 12 -m >-R {_URL}", "ASK"),
+        (rf"g\lab issue note 12 -m > -R {_URL}", "ASK"),
+        (rf"g\lab issue create -t Fix -d > -R {_URL}", "ASK"),
+        (f"g'lab' issue note 12 -m > -R {_URL}", "ASK"),
+        (f'"glab" issue note 12 -m > -R {_URL}', "ASK"),
+        (rf"g\lab issue create -R {_URL} -t $TITLE -d Details", "ASK"),
         ("-t Fix -d >> -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d < -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d 2> -R https://gitlab.com/team/sub/app", "ASK"),
@@ -150,7 +156,7 @@ def test_projects_can_be_pinned_to_a_server() -> None:
 )
 def test_option_values_remain_attached(arguments: str, expected: str) -> None:
     command = (
-        arguments if arguments.startswith("glab ") else f"glab issue create -R {_URL} {arguments}"
+        f"glab issue create -R {_URL} {arguments}" if arguments.startswith("-") else arguments
     )
     assert _result(command, write_repos=[_PROJECT]) == expected
 
@@ -218,18 +224,23 @@ def test_git_remote_and_configuration_handling_is_deferred(command: str) -> None
 
 
 @pytest.mark.parametrize("action", ["issue delete", "mr del", "repo rm", "project delete"])
-def test_known_deletions_are_denied(action: str) -> None:
-    assert _result(f"glab {action} 12 -R {_URL}", write_repos=[_PROJECT]) == "DENY"
+@pytest.mark.parametrize("prefix", ["", "! ", "! env ", "! ! "])
+def test_known_deletions_are_denied(action: str, prefix: str) -> None:
+    assert _result(f"{prefix}glab {action} 12 -R {_URL}", write_repos=[_PROJECT]) == "DENY"
 
 
-@pytest.mark.parametrize("prefix", ["", "/usr/bin/", "./bin/", "command /usr/bin/", "env "])
+@pytest.mark.parametrize("prefix", _COMMAND_PREFIXES)
 @pytest.mark.parametrize("spelling", ["glab", "GLAB", "GlAb", "glab.exe", "GLAB.EXE", "GlAb.ExE"])
 def test_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
     assert _result(f"{prefix}{spelling} issue view 12 -R {_URL}") == "ALLOW"
     assert _result(f"{prefix}{spelling} issue create -R {_URL} -t Fix -d Details") == "DENY"
     assert _result(f"{prefix}{spelling} mr delete 12 -R {_URL}") == "DENY"
-    git_spelling = "GIT.EXE" if spelling.endswith("EXE") else "git"
-    assert _result(f"{prefix}{git_spelling} push {_URL} main") == "ASK"
+
+
+@pytest.mark.parametrize("prefix", _COMMAND_PREFIXES)
+@pytest.mark.parametrize("spelling", ["git", "GIT", "git.exe", "GIT.EXE"])
+def test_git_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
+    assert _result(f"{prefix}{spelling} push {_URL} main") == "ASK"
 
 
 @pytest.mark.parametrize(
@@ -243,6 +254,8 @@ def test_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
         "GITLAB_HOST=gitlab.other.example glab issue list",
         "python -c 'import os; os.system(\"glab issue list\")'",
         "python -c 'import os; os.system(\"GLAB issue list\")'",
+        r"xargs g\lab issue list",
+        r"custom-wrapper g\lab issue list",
     ],
 )
 def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
@@ -254,6 +267,9 @@ def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
     [
         (f"bash -c 'glab issue list -R {_URL}'", "ALLOW"),
         (f"env -S 'glab issue list -R {_URL}'", "ALLOW"),
+        (f"! glab issue create -R {_URL} -t Fix -d Details", "DENY"),
+        (f"! env glab issue list -R {_URL}", "ALLOW"),
+        (f"! bash -c 'glab mr delete 12 -R {_URL}'", "DENY"),
         (f"bash -c 'glab issue list -R {_URL}' > output.txt", "ASK"),
         (f"bash -c 'glab issue note 12 -m > -R {_URL}'", "ASK"),
         (f"echo ready && glab mr del 12 -R {_URL}", "DENY"),
@@ -264,6 +280,8 @@ def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
         ("sh script.sh", "ASK"),
         ("git add . && git commit -m Fix && git status", "ALLOW"),
         ("echo ready", "ALLOW"),
+        ("echo ready > output.txt", "ASK"),
+        ('echo "$COMMAND"', "ASK"),
     ],
 )
 def test_shell_boundaries(command: str, expected: str) -> None:

@@ -226,20 +226,22 @@ def _evaluate_shell(
             if "=" in token
         ):
             decision = _worse(decision, _ask("CLI environment changes require approval."))
+        if _has_unmodelled_shell_effects(segment):
+            decision = _worse(
+                decision,
+                _ask("Shell expansion or redirection obscures the command arguments. Approve?"),
+            )
+            continue
         tokens = real_invocation_tokens(raw_tokens)
+        while tokens[:1] == ["!"]:
+            tokens = real_invocation_tokens(tokens[1:])
         if not tokens:
             continue
         if is_unresolved_invocation(tokens) or spawns_gated_command_as_child(tokens):
-            if _GATED_COMMAND.search(segment):
+            if _GATED_COMMAND.search(" ".join(raw_tokens)):
                 decision = _worse(
                     decision, _ask("The git/glab invocation is unresolved. Approve?")
                 )
-            continue
-        if _GATED_COMMAND.search(segment) and _has_unmodelled_shell_effects(segment):
-            decision = _worse(
-                decision,
-                _ask("Shell expansion or redirection obscures the git/glab arguments. Approve?"),
-            )
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
@@ -304,6 +306,8 @@ def gitlab_policy(
                 return None
             return _ask("Git remote operations and configuration require approval.")
         if executable != "glab":
+            if _GATED_COMMAND.search(" ".join(tokens)):
+                return _ask("This command form mentions git/glab but cannot be resolved. Approve?")
             return None
         if len(tokens) < 3:
             return _ask("Choose a supported glab action and an explicit project. Approve?")
