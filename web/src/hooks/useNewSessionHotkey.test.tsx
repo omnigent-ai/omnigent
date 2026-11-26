@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { QuickPick } from "@/components/ui/quick-pick";
@@ -200,35 +201,47 @@ describe("useNewSessionHotkey with an open pick list (native Windows/Linux)", ()
   });
 });
 
+/** The app's new-session hotkey beside a real QuickPick, as on a native Windows or Linux shell. */
+function PickerBesideHotkey(
+  props: Pick<ComponentProps<typeof QuickPick>, "label" | "presentation" | "stepsWithCtrlNP"> & {
+    rows: string[];
+  },
+) {
+  useNewSessionHotkey(true, false);
+  const { rows, ...picker } = props;
+  return (
+    <TooltipProvider>
+      <QuickPick
+        {...picker}
+        segments={[
+          {
+            sourceId: "rows",
+            ranking: "client",
+            items: rows.map((id) => ({ id, label: id, value: id })),
+          },
+        ]}
+        query=""
+        onQueryChange={vi.fn()}
+        emptyMessage="No results"
+        onAccept={vi.fn()}
+      />
+    </TooltipProvider>
+  );
+}
+
+/** Focuses the picker's field and presses Ctrl-N in it. */
+function pressCtrlNIn(label: string): HTMLElement {
+  const field = screen.getByRole("combobox", { name: label });
+  field.focus();
+  fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+  return field;
+}
+
 describe("useNewSessionHotkey with a real QuickPick (native Windows/Linux)", () => {
   it("lets Ctrl-N step a ⌘K picker without starting a session", () => {
     shell.native = true;
-    function Shell() {
-      useNewSessionHotkey(true, false);
-      return (
-        <TooltipProvider>
-          <QuickPick
-            label="Review picker"
-            stepsWithCtrlNP
-            segments={[
-              {
-                sourceId: "files",
-                ranking: "client",
-                items: ["one", "two"].map((id) => ({ id, label: id, value: id })),
-              },
-            ]}
-            query=""
-            onQueryChange={vi.fn()}
-            emptyMessage="No results"
-            onAccept={vi.fn()}
-          />
-        </TooltipProvider>
-      );
-    }
-    render(<Shell />);
-    const field = screen.getByRole("combobox", { name: "Review picker" });
-    field.focus();
-    fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+    render(<PickerBesideHotkey label="Review picker" stepsWithCtrlNP rows={["one", "two"]} />);
+    const field = pressCtrlNIn("Review picker");
     expect(document.getElementById(field.getAttribute("aria-activedescendant")!)).toHaveTextContent(
       "two",
     );
@@ -237,32 +250,8 @@ describe("useNewSessionHotkey with a real QuickPick (native Windows/Linux)", () 
 
   it("still starts a session from a sidebar search that shows no list yet", () => {
     shell.native = true;
-    function Shell() {
-      useNewSessionHotkey(true, false);
-      return (
-        <TooltipProvider>
-          <QuickPick
-            label="Search settings"
-            presentation="sidebar"
-            segments={[
-              {
-                sourceId: "settings",
-                ranking: "client",
-                items: [{ id: "theme", label: "Theme", value: "theme" }],
-              },
-            ]}
-            query=""
-            onQueryChange={vi.fn()}
-            emptyMessage="No results"
-            onAccept={vi.fn()}
-          />
-        </TooltipProvider>
-      );
-    }
-    render(<Shell />);
-    const field = screen.getByRole("combobox", { name: "Search settings" });
-    field.focus();
-    fireEvent.keyDown(field, { key: "n", code: "KeyN", ctrlKey: true });
+    render(<PickerBesideHotkey label="Search settings" presentation="sidebar" rows={["Theme"]} />);
+    pressCtrlNIn("Search settings");
     expect(navigate).toHaveBeenCalledOnce();
   });
 });
