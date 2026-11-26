@@ -32,18 +32,25 @@ import { AskUserQuestionForm } from "./AskUserQuestionForm";
 const sessionList = vi.hoisted(() => ({ loaded: [] as unknown[] }));
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => {
   // Like the app's context, the same value until the loaded list changes.
-  let cached: { list: unknown[]; value: object } | null = null;
+  let cached: {
+    list: unknown[];
+    value: { pages: { data: unknown[] }[]; pageParams: unknown[] };
+  } | null = null;
+  const useOptionalLoadedConversations = () => {
+    if (cached?.list !== sessionList.loaded) {
+      cached = {
+        list: sessionList.loaded,
+        value: { pages: [{ data: sessionList.loaded }], pageParams: [undefined] },
+      };
+    }
+    return cached.value;
+  };
   return {
     ...(await importOriginal<typeof UseSidebarDataModule>()),
-    useOptionalLoadedConversations: () => {
-      if (cached?.list !== sessionList.loaded) {
-        cached = {
-          list: sessionList.loaded,
-          value: { pages: [{ data: sessionList.loaded }], pageParams: [undefined] },
-        };
-      }
-      return cached.value;
-    },
+    useOptionalLoadedConversations,
+    ...(await import("@/test/loadedRowsMock")).loadedRowsSelectorMocks(
+      useOptionalLoadedConversations,
+    ),
   };
 });
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({

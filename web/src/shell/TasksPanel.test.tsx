@@ -80,10 +80,14 @@ vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionJournalModule>()),
   useSessionJournal: vi.fn(),
 }));
-vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
-  ...(await importOriginal<typeof SidebarDataModule>()),
-  useOptionalLoadedConversations: vi.fn(),
-}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => {
+  const loadedPages = vi.fn();
+  return {
+    ...(await importOriginal<typeof SidebarDataModule>()),
+    useOptionalLoadedConversations: loadedPages,
+    ...(await import("@/test/loadedRowsMock")).loadedRowsSelectorMocks(() => loadedPages()),
+  };
+});
 vi.mock("@/lib/CapabilitiesContext", async (importOriginal) => ({
   ...(await importOriginal<typeof CapabilitiesModule>()),
   useServerInfo: vi.fn(),

@@ -24,9 +24,12 @@ import {
   useProjects,
 } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({
+vi.mock("@/hooks/useSidebarData", async () => ({
   useLoadedConversations: () => useTestConversations(),
   useOptionalLoadedConversations: () => useTestConversations().data,
+  ...(await import("@/test/loadedRowsMock")).loadedRowsSelectorMocks(
+    () => useTestConversations().data,
+  ),
 }));
 
 vi.mock("@/hooks/useSkills", () => ({

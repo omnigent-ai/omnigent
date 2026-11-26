@@ -70,10 +70,14 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
 }));
-vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
-  ...(await importOriginal<typeof SidebarDataModule>()),
-  useOptionalLoadedConversations: vi.fn(),
-}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => {
+  const loadedPages = vi.fn();
+  return {
+    ...(await importOriginal<typeof SidebarDataModule>()),
+    useOptionalLoadedConversations: loadedPages,
+    ...(await import("@/test/loadedRowsMock")).loadedRowsSelectorMocks(() => loadedPages()),
+  };
+});
 // The graph has its own tests (React Flow runs out of memory in jsdom); here the
 // full-screen view lists where each task stands.
 vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({

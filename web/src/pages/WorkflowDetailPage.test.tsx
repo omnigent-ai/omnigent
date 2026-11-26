@@ -59,10 +59,14 @@ vi.mock("@/hooks/useSessionJournal", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: vi.fn() }));
-vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
-  ...(await importOriginal<typeof SidebarDataModule>()),
-  useOptionalLoadedConversations: vi.fn(),
-}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => {
+  const loadedPages = vi.fn();
+  return {
+    ...(await importOriginal<typeof SidebarDataModule>()),
+    useOptionalLoadedConversations: loadedPages,
+    ...(await import("@/test/loadedRowsMock")).loadedRowsSelectorMocks(() => loadedPages()),
+  };
+});
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),

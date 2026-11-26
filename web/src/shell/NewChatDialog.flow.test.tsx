@@ -20,9 +20,12 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { REVIEW_PLAN_FIRST } from "@/lib/workflow";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({
+vi.mock("@/hooks/useSidebarData", async () => ({
   useLoadedConversations: () => useTestConversations(),
   useOptionalLoadedConversations: () => useTestConversations().data,
+  ...(await import("@/test/loadedRowsMock")).loadedRowsSelectorMocks(
+    () => useTestConversations().data,
+  ),
 }));
 
 vi.mock("@/hooks/useSkills", () => ({
