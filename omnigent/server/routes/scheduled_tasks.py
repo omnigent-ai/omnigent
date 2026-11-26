@@ -2690,15 +2690,19 @@ def create_scheduled_tasks_router(
         task = await save()
         if origin is not None:
             # Point the session at the new loop; whatever the label held is the loop this
-            # one replaces, however many clients arm at once.
-            try:
-                previous_id = await asyncio.to_thread(
-                    conversation_store.swap_label, conv.id, loop_timer_label_key(user_id), task.id
-                )
-            except BaseException:
-                # A loop the session can't find could never be stopped.
-                await asyncio.to_thread(store.delete, task.id)
-                raise
+            # one replaces, however many clients arm at once. The swap and its undo run in
+            # one thread, so a request cancelled meanwhile can't undo a swap that commits.
+            def record() -> str | None:
+                try:
+                    return conversation_store.swap_label(
+                        conv.id, loop_timer_label_key(user_id), task.id
+                    )
+                except Exception:
+                    # A loop the session can't find could never be stopped.
+                    store.delete(task.id)
+                    raise
+
+            previous_id = await asyncio.to_thread(record)
             # The label names the new loop, so it is armed whatever happens next. Retiring
             # the loop it replaced is best-effort: one the label no longer names retires
             # itself at its next firing, which never sends.

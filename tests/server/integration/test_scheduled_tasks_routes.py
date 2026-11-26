@@ -8296,10 +8296,11 @@ async def test_a_loop_a_failed_replace_or_stop_leaves_behind_is_one_the_session_
         monkeypatch.setattr(SqlAlchemyConversationStore, "swap_label", swap_then_cancel)
         # The app answers a request cancelled mid-flight with 499, client closed request.
         assert (await arm("again")).status_code == 499
-        # The arm undid its loop, so the label names a timer that is gone.
+        # The swap committed, so the new loop is armed and named: the caller is not
+        # left with no loop at all, and a stop finds it.
         named = conversations.get_conversation(session_id).labels.get(label)
-        assert named not in (None, first) and store.get(named) is None
-        expected_stop = {"timer_id": None, "status": "none"}
+        assert named not in (None, first) and store.get(named).state == "active"
+        expected_stop = {"timer_id": named, "status": "cancelled"}
     elif failure == "retiring the replaced loop":
         monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "delete", refuse_delete)
         armed = await arm("again")
