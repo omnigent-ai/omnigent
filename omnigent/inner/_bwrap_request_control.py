@@ -24,6 +24,8 @@ _CREDENTIALS = struct.Struct("iII")
 
 @dataclass(frozen=True)
 class BwrapRequestResult:
+    """Command result, with empty bytes for output streams that were not captured."""
+
     stdout: bytes
     stderr: bytes
     exit_code: int | None
@@ -227,7 +229,8 @@ class BwrapRequestControl:
                     exit_code = self._read_result()
                 if outputs is None:
                     with contextlib.suppress(subprocess.TimeoutExpired):
-                        outputs = self._process.communicate(timeout=_POLL_S)
+                        stdout, stderr = self._process.communicate(timeout=_POLL_S)
+                        outputs = (stdout or b"", stderr or b"")
                 init_exited = _pidfd_exited(self._init_pidfd)
                 launcher_exited = _pidfd_exited(self._launcher_pidfd)
                 if init_exited and launcher_exited and outputs is not None:

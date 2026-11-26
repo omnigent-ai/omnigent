@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import threading
+from _thread import LockType
 from concurrent.futures import Future
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -25,6 +26,20 @@ pytestmark = pytest.mark.skipif(
 _TOKEN = b"5" * 64
 _INIT_FD = 41
 _LAUNCHER_FD = 42
+
+
+class _ContendedLock:
+    def __init__(self, lock: LockType, contention: threading.Event) -> None:
+        self._lock = lock
+        self._contention = contention
+
+    def __enter__(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            self._contention.set()
+            self._lock.acquire()
+
+    def __exit__(self, *_args: object) -> None:
+        self._lock.release()
 
 
 @pytest.fixture
@@ -363,6 +378,34 @@ def test_output_and_result_polling_can_wait_without_replaying_or_finishing_the_r
     assert case.owner.done.is_set() and not result.timed_out
 
 
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ((None, b"stderr"), (b"", b"stderr")),
+        ((b"stdout", None), (b"stdout", b"")),
+        ((None, None), (b"", b"")),
+    ],
+)
+def test_uncaptured_output_streams_return_empty_bytes(
+    request_case: _RequestCase, output, expected
+) -> None:
+    case = request_case
+    if output[0] is None:
+        case.process.stdout = None
+    if output[1] is None:
+        case.process.stderr = None
+
+    def communicate(**_kwargs: object):
+        case.exited.update({_INIT_FD: True, _LAUNCHER_FD: True})
+        return output
+
+    case.process.communicate.side_effect = communicate
+    result = case.owner.run(deadline=1.0)
+    assert (result.stdout, result.stderr) == expected
+    assert result.exit_code == 7 and case.owner.done.is_set()
+    case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
+
+
 def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay(
     monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase
 ) -> None:
@@ -373,16 +416,7 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
     cancelled = threading.Event()
     lock = threading.Lock()
 
-    class ContendedLock:
-        def __enter__(self) -> None:
-            if not lock.acquire(blocking=False):
-                contention.set()
-                lock.acquire()
-
-        def __exit__(self, *_args: object) -> None:
-            lock.release()
-
-    monkeypatch.setattr(case.owner, "_lock", ContendedLock())
+    monkeypatch.setattr(case.owner, "_lock", _ContendedLock(lock, contention))
 
     def send(payload: bytes) -> int:
         sending.set()
@@ -445,16 +479,7 @@ def test_cancellation_contends_with_retirement_and_never_signals_released_descri
     contention = threading.Event()
     lock = threading.Lock()
 
-    class ContendedLock:
-        def __enter__(self) -> None:
-            if not lock.acquire(blocking=False):
-                contention.set()
-                lock.acquire()
-
-        def __exit__(self, *_args: object) -> None:
-            lock.release()
-
-    monkeypatch.setattr(case.owner, "_lock", ContendedLock())
+    monkeypatch.setattr(case.owner, "_lock", _ContendedLock(lock, contention))
 
     def close(descriptor: int) -> None:
         case.events.append(("close", descriptor))
@@ -534,6 +559,32 @@ def test_lost_or_wrong_request_results_cannot_report_success_or_replay(
     assert case.owner.admitted and case.owner.done.is_set()
     assert case.control.send.call_count == 1
     assert ("kill", _INIT_FD) in case.events
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (b"-127", -127),
+        (b"-1", -1),
+        (b"0", 0),
+        (b"255", 255),
+        (b"+0", None),
+        (b"00", None),
+        (b"-128", None),
+        (b"256", None),
+    ],
+)
+def test_result_parser_enforces_canonical_exit_code_boundaries(
+    request_case: _RequestCase, value: bytes, expected: int | None
+) -> None:
+    case = request_case
+    case.control.recv.return_value = b"exit:" + _TOKEN + b":" + value
+    if expected is not None:
+        assert case.owner._read_result() == expected
+    else:
+        with pytest.raises(OSError, match="Request result is invalid"):
+            case.owner._read_result()
+    case.control.send.assert_not_called()
 
 
 @pytest.mark.parametrize(
