@@ -307,6 +307,7 @@ def test_backslash_paths_require_approval_before_posix_parsing(executable: str) 
         "export GIT_CONFIG_COUNT=1",
         "export GIT_SSH_COMMAND=example",
         "GIT_NAMESPACE=example git fetch https://gitlab.com/team/sub/app",
+        "GIT_AUTHOR_NAME=example git commit -m Fix",
         'alias glab="another-command"',
         "GITLAB_HOST=gitlab.other.example glab issue list",
         "python -m glab",
@@ -514,6 +515,10 @@ def test_push_checks_every_exact_destination(arguments: str, expected: str) -> N
         ),
         (f"--force-if-includes {_URL} HEAD:refs/heads/feature", "deny_force_push", "ALLOW"),
         (f"{_URL} +HEAD:refs/heads/feature", "deny_force_push", "ALLOW"),
+        ("--force", "deny_force_push", "ASK"),
+        ("--force-with-lease", "deny_force_push", "ASK"),
+        ("--tags", "deny_tag_push", "ASK"),
+        ("--delete", "allow_destructive", "ASK"),
         (f"{_URL} refs/tags/v1", "deny_tag_push", "ALLOW"),
         (f"{_URL} HEAD:refs/tags/v1", "deny_tag_push", "ALLOW"),
         (f"{_URL} tag v1", "deny_tag_push", "ASK"),
@@ -551,14 +556,15 @@ def test_opt_ins_do_not_bypass_project_or_branch_checks() -> None:
     assert _result(f"glab mr delete 12 -R {_URL}", **configuration) == "DENY"
 
 
-def test_mirror_respects_force_tag_and_deletion_guards() -> None:
+@pytest.mark.parametrize("remote", [_URL, "origin", ""])
+def test_mirror_respects_force_tag_and_deletion_guards(remote: str) -> None:
     configuration = {
         "write_repos": [_PROJECT],
         "allow_destructive": True,
         "deny_force_push": False,
         "deny_tag_push": False,
     }
-    command = f"git push --mirror {_URL}"
+    command = f"git push --mirror {remote}"
     assert _result(command, **configuration) == "ASK"
     for guard, value in [
         ("allow_destructive", False),
@@ -566,6 +572,17 @@ def test_mirror_respects_force_tag_and_deletion_guards() -> None:
         ("deny_tag_push", True),
     ]:
         assert _result(command, **(configuration | {guard: value})) == "DENY"
+
+
+@pytest.mark.parametrize("arguments", ["--force", "--tags", "--delete", "--mirror"])
+def test_push_guards_apply_only_when_https_host_is_not_known_foreign(arguments: str) -> None:
+    foreign = _response(
+        f"git push {arguments} https://git.example.com/team/app HEAD:refs/heads/feature"
+    )
+    assert foreign is not None and foreign["result"] == "ASK"
+    assert "outside configured GitLab hosts" in foreign["reason"]
+    for remote in [_URL, "origin", "", _URL + "/../other"]:
+        assert _result(f"git push {arguments} {remote}", write_repos=[_PROJECT]) == "DENY"
 
 
 @pytest.mark.parametrize("extra", ["--push-option=ci.skip", "--all", "other"])
@@ -628,6 +645,9 @@ def test_unmodelled_transfer_effects_ask(arguments: str) -> None:
         f"push --push-option --delete {_URL} HEAD:refs/heads/feature",
         f"push --receive-pack --tags {_URL} HEAD:refs/heads/feature",
         f"push --recurse-submodules --force {_URL} HEAD:refs/heads/feature",
+        "push --push-option --force",
+        "push --receive-pack --tags",
+        "push --recurse-submodules --force",
         f"push --future-option --force {_URL} HEAD:refs/heads/feature",
     ],
 )

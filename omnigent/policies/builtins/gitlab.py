@@ -141,6 +141,7 @@ class _GitTransfer:
     force: bool = False
     delete: bool = False
     unresolved: bool = False
+    foreign_host: bool = False
 
 
 def _git_transfer(tokens: list[str], hosts: frozenset[str]) -> _GitTransfer | None:
@@ -155,15 +156,23 @@ def _git_transfer(tokens: list[str], hosts: frozenset[str]) -> _GitTransfer | No
     if args is None:
         return None
     operands = list(args.operands)
-    if not operands:
+    if not operands and command != "push":
         return None
-    remote = operands.pop(0)
+    remote = operands.pop(0) if operands else ""
     # Git remote names and local paths require configuration or filesystem resolution.
     project = _project_ref(remote, hosts) if remote.startswith("https://") else None
+    authority = None
+    if remote.startswith("https://"):
+        try:
+            parsed = urlsplit(remote)
+            authority = instance_authority(f"{parsed.scheme}://{parsed.netloc}")
+        except ValueError:
+            pass
+    foreign_host = authority is not None and authority not in hosts
     if command != "push":
         if command == "clone" and len(operands) > 1:
             return None
-        return _GitTransfer(project, write=False)
+        return _GitTransfer(project, write=False, foreign_host=foreign_host)
 
     force = any(
         args.has(name) for name in ("force", "force-with-lease", "force-if-includes", "mirror")
@@ -209,7 +218,16 @@ def _git_transfer(tokens: list[str], hosts: frozenset[str]) -> _GitTransfer | No
             tag = True
         else:
             unresolved = True
-    return _GitTransfer(project, True, tuple(branches), tag, force, delete, unresolved)
+    return _GitTransfer(
+        project=project,
+        write=True,
+        branches=tuple(branches),
+        tag=tag,
+        force=force,
+        delete=delete,
+        unresolved=unresolved,
+        foreign_host=foreign_host,
+    )
 
 
 @dataclass(frozen=True)
@@ -469,13 +487,15 @@ def gitlab_policy(
             transfer = _git_transfer(tokens, owned_hosts)
             if transfer is None:
                 return _ask("Unsupported Git options or configuration require approval.")
+            if transfer.foreign_host:
+                return _ask("The explicit HTTPS destination is outside configured GitLab hosts.")
             if transfer.force and deny_force_push:
                 return _deny(f"{deny_reason} Force pushes are not permitted.")
             if transfer.tag and deny_tag_push:
                 return _deny(f"{deny_reason} Tag pushes are not permitted.")
             if transfer.delete and not allow_destructive:
                 return _deny(f"{deny_reason} Remote ref deletion is not permitted.")
-            if transfer.project is None or transfer.project[0] is None:
+            if transfer.project is None:
                 return _ask(
                     "Use an explicit HTTPS GitLab project URL; "
                     "remote resolution requires approval."
