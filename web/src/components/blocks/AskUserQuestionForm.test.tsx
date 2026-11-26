@@ -84,7 +84,12 @@ afterEach(() => {
 /** Renders the form; `beside` is rendered after it, outside the form's root. */
 function renderForm(
   questions: ClaudeQuestion[],
-  options: { keyboardActive?: boolean; beside?: ReactNode; codeMirror?: boolean } = {},
+  options: {
+    keyboardActive?: boolean;
+    beside?: ReactNode;
+    codeMirror?: boolean;
+    deliberateAnswer?: boolean;
+  } = {},
 ) {
   const onSubmit = vi.fn();
   const onReject = vi.fn();
@@ -95,6 +100,7 @@ function renderForm(
       onSubmit={onSubmit}
       onReject={onReject}
       keyboardActive={options.keyboardActive ?? true}
+      deliberateAnswer={options.deliberateAnswer}
     />
   );
   render(
@@ -1236,5 +1242,44 @@ describe("AskUserQuestionForm — prompt editor", () => {
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       framework: `Use [Session: "Fix CI" id=s_ci subagent=no]\n\n${SESSION_MENTION_HINT}`,
     });
+  });
+});
+
+describe("AskUserQuestionForm deliberate answers (workflow questions)", () => {
+  it("still preselects the first option without deliberateAnswer", () => {
+    const { onSubmit } = renderForm([framework], { beside: composerCard() });
+    expect(screen.getByLabelText("React")).toBeChecked();
+    const composer = screen.getByLabelText("Message the agent");
+    composer.focus();
+    expect(fireEvent.keyDown(composer, { key: "Enter" })).toBe(false);
+    expect(onSubmit).toHaveBeenCalledWith({ framework: "React" });
+  });
+
+  it("opens with no option selected and Submit disabled", () => {
+    renderForm([framework], { deliberateAnswer: true });
+    expect(screen.getByLabelText("React")).not.toBeChecked();
+    expect(screen.getByLabelText("Vue")).not.toBeChecked();
+    expect(screen.getByTestId("ask-user-question-submit")).toBeDisabled();
+  });
+
+  it("never submits on an Enter from the composer or the page", () => {
+    const { onSubmit } = renderForm([framework], {
+      deliberateAnswer: true,
+      beside: composerCard(),
+    });
+    fireEvent.click(screen.getByLabelText("Vue"));
+    const composer = screen.getByLabelText("Message the agent");
+    composer.focus();
+    fireEvent.keyDown(composer, { key: "Enter" });
+    pressOnPage({ key: "Enter" });
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("submits the option the user picked when Submit is clicked", () => {
+    const { onSubmit } = renderForm([framework], { deliberateAnswer: true });
+    fireEvent.click(screen.getByLabelText("Vue"));
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith({ framework: "Vue" });
   });
 });

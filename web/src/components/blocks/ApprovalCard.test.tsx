@@ -1319,6 +1319,34 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 
+  it("opens a workflow question with no option selected, even the recommended one", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elicit_journal_2"
+        message="Waiting for you on Review and approve the plan"
+        phase="workflow_request_input"
+        policyName=""
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              question: "Approve this plan?",
+              header: "Plan approval",
+              options: [{ label: "Approve (recommended)" }, { label: "Request changes" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByLabelText("Approve (recommended)")).not.toBeChecked();
+    expect(screen.getByLabelText("Request changes")).not.toBeChecked();
+  });
+
   it("labels Antigravity structured input prompts as Antigravity prompts", () => {
     // Antigravity (agy) reuses the same AskUserQuestion renderer via the
     // ``ask_user_question`` extra, so the title must reflect the producer
