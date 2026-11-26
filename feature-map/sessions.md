@@ -62,7 +62,17 @@ the header menu), and each place is a separate entry point.
   marked, so a just-archived session leads the list; Find a session by name
   (⌘⌥S / Ctrl+Alt+S) lists active sessions only. Results show project and parent
   session breadcrumbs when available, including when the parent did not match
-  the search. Desktop and mobile search use the same context.
+  the search. Desktop and mobile search use the same context. With the tabs
+  sidebar on a desktop window, ⌘K's **Search in Sessions…** opens Go to File on
+  its **Sessions** tab, with or without an open session: the same search, with a
+  preview of the matching message beside the list; a failed search or page
+  shows with Retry.
+- `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
+  sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
+  device for this server; changing one reloads the page. **Clear all flag overrides**
+  removes all choices for this server and reloads. In the old palette, search
+  **Enable feature preview: new QuickPick command palette** to opt in.
+  An amber header flag shows active overrides and opens the picker.
 - `palette-session-commands`: ⌘K lists the open session's header-menu actions
   under **Session**: Add nested agent, Pin or Unpin, Share, Fork, Export,
   Rename, Mark as unread, Create automation, Archive or Unarchive, and Delete.
@@ -95,6 +105,14 @@ the header menu), and each place is a separate entry point.
   override it on this device, and a reload keeps the choice. Settings →
   Appearance offers the same choice (`web/src/shell/settingsCommands.test.ts`,
   `tests/e2e_ui/sessions/test_floating_panes.py`).
+- `workspace-full-screen`: with the tabs sidebar (`workspace_sidebar_v2`), ⇧⌘F
+  (Ctrl+Shift+F off the Mac) and the ⌘K row **Make the workspace full screen** /
+  **Exit workspace full screen** toggle the workspace sidebar's full screen. From
+  a closed sidebar, both open it straight into full screen; a focused browser page
+  hands the chord over.
+  The classic layout, a phone and a grid route don't offer them
+  (`web/src/shell/AppShell.workspaceSidebarV2.test.tsx`,
+  `tests/e2e_ui/sessions/test_workspace_sidebar_v2.py`).
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -339,6 +357,9 @@ the header menu), and each place is a separate entry point.
   type an action such as "rename session" and press Enter. With
   `quick_pick_palette` on, type "go to session" and press Enter to switch
   sessions, or Escape to return to where you were.
+- For UI feature overrides, search ⌘K for **Override UI feature flag…** or
+  click the amber header flag. If QuickPick is off, search the old palette for
+  **Enable feature preview: new QuickPick command palette** first.
 - For the open screen's ⌘K actions, with `quick_pick_palette` on, press
   Cmd/Ctrl+K in a conversation and type "fork from latest" or "scroll to
   newest"; on a canvas with a conversation open, type "close conversation";
@@ -965,6 +986,13 @@ plain `uv run pytest`, which starts a private server for the test.
   worktree session from the row menu, bulk selection, and header menu, and
   expect the dialog each time; an idle session without a worktree archives
   silently.
+- **`palette-ui-feature-overrides`:** component coverage in
+  `web/src/shell/FeatureFlagsPicker.test.tsx`, `web/src/shell/CommandPalette.test.tsx`,
+  and `web/src/shell/ChatHeader.test.tsx`; storage and server gating are covered
+  in `web/src/lib/uiFeatureOverrides.test.ts` and `tests/server/test_ui_feature_overrides.py`.
+  Manually: enable the preview from the old palette, choose an override in
+  QuickPick, then use the amber header flag to restore Automatic. Each changed
+  choice reloads; selecting the current choice returns without reloading.
 - **`palette-session-commands`:**
   `tests/e2e_ui/sessions/test_quick_pick_palette.py::test_quick_pick_on_an_open_session`
   runs with `quick_pick_palette` on: Rename session from ⌘K opens its dialog
@@ -1530,6 +1558,10 @@ its discoverability.
 
 ## Gotchas
 
+- UI flag overrides require a known server identity and reported flags. Turning
+  QuickPick off suspends the other overrides and hides the header flag. The flag
+  is also absent where the app header is hidden, including the desktop terminal
+  push panel.
 - Family membership is owner-only navigation context, not a sharing grant.
   Siblings start private even if the source has readers. Edit-shared sources
   cannot create siblings. Shared viewers see flat rows.

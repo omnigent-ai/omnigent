@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from tests._helpers.mock_llm import captured_tool_result
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -195,9 +197,6 @@ def test_nested_agent_runs_unattended_like_its_creator(
                     response.raise_for_status()
                     return json.dumps(response.json()["data"])
 
-                def requests_mentioning(text):
-                    return [r for r in get_mock_requests(mock) if text in json.dumps(r)]
-
                 def resend_until_tools_listed(session_id, marker, settled):
                     # A CLI can take a turn before its Omnigent tools are listed, and
                     # no queue serves that turn; ask again once the session is idle.
@@ -256,11 +255,13 @@ def test_nested_agent_runs_unattended_like_its_creator(
                 send_user_text(client, session_id=run, text=probe)
                 resend_until_tools_listed(run, probe, lambda: False)
                 if spec.mode_label is not None:
-                    # The CLI itself reports the run's mode.
+                    # The CLI itself reports the run's mode; the reported value
+                    # is compared by name so a mismatch shows both values.
                     poll_until(
-                        lambda: session(run)["labels"].get(spec.mode_label) == spec.run_mode,
+                        lambda: session(run)["labels"].get(spec.mode_label) is not None,
                         timeout_s=30,
                     )
+                    assert session(run)["labels"].get(spec.mode_label) == spec.run_mode
                 run_snapshot = session(run)
 
                 # The run hands a step to a nested agent of its own agent without a
@@ -309,7 +310,14 @@ def test_nested_agent_runs_unattended_like_its_creator(
                 assert not session(run)["pending_elicitations"]
                 rows = client.get("/v1/sessions", params={"visibility": "mine"}).json()["data"]
                 workers = [row["id"] for row in rows if row["title"] == "Review step"]
-                assert len(workers) == 1, requests_mentioning("create-worker")[-1:]
+                # Keep this a str: pytest truncates non-str assertion messages to
+                # about 240 chars, which would hide the tool result.
+                assert len(workers) == 1, (
+                    f"expected one 'Review step' worker; listed: "
+                    f"{[(row['id'], row['title']) for row in rows]}; "
+                    f"create-worker tool result: "
+                    f"{captured_tool_result(get_mock_requests(mock), 'create-worker')}"
+                )
                 (worker,) = workers
                 assert session(worker)["labels"]["omnigent.created_by_session_id"] == run
 
@@ -324,6 +332,19 @@ def test_nested_agent_runs_unattended_like_its_creator(
 
                 resend_until_tools_listed(worker, _WORKER_TASK, worker_settled)
                 poll_until(worker_settled, timeout_s=120)
+                if spec.mode_label is not None:
+                    # The worker's mode report can land after its settled turn
+                    # ends. Wait only for it to appear: the observed comparison
+                    # below diagnoses a wrong or missing value with the full
+                    # worker state, so a timeout falls through.
+                    deadline = time.monotonic() + 30
+                    while (
+                        latest["labels"].get(spec.mode_label) is None
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.5)
+                        latest.update(session(worker))
+                    latest.update(session(worker))
                 run_snapshot = session(run)
                 observed = {
                     "approval_prompts": [

@@ -1371,6 +1371,11 @@ aside[aria-label="Workspace"][data-maximized] {
     left: var(--pane-gap-start, var(--pane-gap));
     right: calc(var(--workspace-panel-offset, 0px) + var(--pane-gap));
   }
+  /* The tabs strip's end inset (px-2 inside the sidebar's 1px edge), so Expand right panel takes
+   * the spot of the open sidebar's Collapse button. */
+  .app-shell[data-floating-panes] [data-main-view] > .chat-header[data-corner-toggle] {
+    padding-right: calc(0.5rem + 1px - var(--pane-gap));
+  }
   .app-shell[data-floating-panes] [data-main-view] > .chat-header.session-header-glass::before {
     display: none;
   }
@@ -1691,8 +1696,9 @@ html[data-electron-mac] .canvas-workspace {
   padding-top: var(--fullscreen-overlay-inset-top);
 }
 /* The title-bar cluster below sits above the z-50 layer to clear the sidebar,
- * so it steps aside while a full-window view covers the app. */
-html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions {
+ * so it steps aside while a full-window view covers the app. The view marks the
+ * root (useMarkFullscreenOverlayOpen); `html:has()` would restyle every keystroke. */
+html[data-electron-mac][data-fullscreen-overlay-open] .electron-sidebar-header-actions {
   display: none;
 }
 /* Align to the native lights at y=24px, regardless of the host rem size.
@@ -3100,6 +3106,16 @@ body {
   border-top: 1px solid var(--border);
   margin-top: 0.5em;
   padding-top: 0.5em;
+}
+/* Diagram view hides the source: drop the divider so the diagram sits under
+   its toolbar. */
+.tiptap-md-content .ProseMirror .tiptap-code-block pre[hidden] + .tiptap-mermaid-preview {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+}
+.tiptap-md-content .ProseMirror .tiptap-code-block pre[hidden] + .tiptap-mermaid-preview > * {
+  margin-top: 0;
 }
 .tiptap-md-content .ProseMirror a {
   color: var(--primary);

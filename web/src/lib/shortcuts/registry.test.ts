@@ -130,6 +130,23 @@ describe("shortcut registry", () => {
     ).toBe(true);
   });
 
+  it("removes selected pull requests with ⌘ or Control and Backspace on every platform", () => {
+    for (const environment of [mac, other]) {
+      for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+        expect(
+          matchesShortcut(
+            press({ key: "Backspace", ...modifier }),
+            "pullRequests.removeSelected",
+            environment,
+          ),
+        ).toBe(true);
+      }
+      expect(
+        matchesShortcut(press({ key: "Backspace" }), "pullRequests.removeSelected", environment),
+      ).toBe(false);
+    }
+  });
+
   it("renames with the physical R key, whatever character Option types", () => {
     expect(
       matchesShortcut(
@@ -186,6 +203,20 @@ describe("shortcut registry", () => {
       altGraph: true,
     });
     expect(matchesShortcut(altGraph, "session.rename", other)).toBe(false);
+  });
+
+  it("opens Search Text and Go to File off the Mac on their own keys, never on AltGr", () => {
+    const searchText = { key: "o", code: "KeyO", ctrlKey: true, altKey: true };
+    const goToFile = { key: "P", code: "KeyP", ctrlKey: true, altKey: true, shiftKey: true };
+    expect(matchesShortcut(press(searchText), "palette.text", other)).toBe(true);
+    expect(matchesShortcut(press(goToFile), "palette.files", other)).toBe(true);
+    // AltGr+O types ó on a Polish layout, and reports as Control+Alt.
+    expect(
+      matchesShortcut(press({ ...searchText, key: "ó", altGraph: true }), "palette.text", other),
+    ).toBe(false);
+    expect(matchesShortcut(press({ ...goToFile, altGraph: true }), "palette.files", other)).toBe(
+      false,
+    );
   });
 });
 

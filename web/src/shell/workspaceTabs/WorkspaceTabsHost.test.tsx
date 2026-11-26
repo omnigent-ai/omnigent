@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SharedDiffWorkersModule from "@/components/diff-review/sharedDiffWorkers";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as HotkeysModule from "@/lib/hotkeys";
+import type * as IdentityModule from "@/lib/identity";
 import type { TerminalInfo } from "@/lib/terminals";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
 
@@ -35,6 +36,22 @@ vi.mock("@/lib/hotkeys", async (importOriginal) => ({
   ...(await importOriginal<typeof HotkeysModule>()),
   isMacPlatform: () => true,
 }));
+// The runner's answer about a shell being closed; null fails the request, so the close asks.
+const shellState = vi.hoisted(() => ({ body: null as Record<string, unknown> | null }));
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return {
+    ...actual,
+    authenticatedFetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (!String(input).endsWith("/shell")) return actual.authenticatedFetch(input, init);
+      if (shellState.body === null) throw new TypeError("offline");
+      return new Response(JSON.stringify(shellState.body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  };
+});
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useDeleteTerminal: (_conversationId: string, options?: { reportsFailure?: boolean }) => {
@@ -81,6 +98,7 @@ function host(overrides: Partial<WorkspaceTabsHostProps> = {}) {
 }
 
 beforeEach(() => {
+  shellState.body = null;
   captured.panel = null;
   captured.deleteTerminal.mockClear();
 });
@@ -143,6 +161,16 @@ describe("WorkspaceTabsHost", () => {
 
     await expect(captured.panel!.endShell("terminal:t1")).resolves.toBe(true);
     expect(captured.deleteTerminal).toHaveBeenCalledWith("t1");
+  });
+
+  it("names the job a busy shell runs in the Close shell dialog", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    shellState.body = { state: "busy", foreground: "vim", background_jobs: 0 };
+    host();
+    act(() => {
+      void captured.panel!.confirmCloseShell("terminal:t1");
+    });
+    expect(await screen.findByRole("dialog")).toHaveTextContent("vim is running in zsh · s1");
   });
 
   it("leaves a shell that won't end for the sidebar to report", async () => {
@@ -213,10 +241,20 @@ describe("WorkspaceTabsHost", () => {
         store.open({ place: { kind: "changes" } }, { opener: "user", disposition: "new" }),
       );
       host();
-      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyF"]);
 
       await act(() => store.close(store.selectedTab()!.id, {}));
-      await vi.waitFor(() => expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyT"]));
+      await vi.waitFor(() =>
+        expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyT", "KeyF"]),
+      );
+    });
+
+    it("leave full screen's chord with the page where the sidebar can't fill the window", () => {
+      const bridge = desktopBridge();
+      const { rerender } = host({ placement: "drawer" });
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
+      rerender({ placement: "rail", contained: true });
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
     });
 
     it("are left with the page by a cell that doesn't bind history", () => {

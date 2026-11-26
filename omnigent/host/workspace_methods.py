@@ -49,39 +49,54 @@ def _snake_case(name: str) -> str:
 # have no host op and no server gate, so a call is refused and GetCapabilities never lists them.
 DECLARED_NOT_SERVED: frozenset[str] = frozenset(
     {
-        "AddPendingReviewComment",
-        "AddReaction",
-        "DeleteComment",
-        "DeletePendingReviewComment",
         "DequeuePullRequest",
-        "DiscardPendingReview",
-        "EditComment",
         "EnableAutoMerge",
         "EnqueuePullRequest",
         "GetMergeQueue",
         "GetMergeReadiness",
-        "GetPendingReview",
         "GetPullRequestListStats",
         "GetPullRequestStack",
         "ListBranchPullRequests",
         "LookupPullRequest",
         "PreviewReviewerPing",
         "ReadPullRequestImage",
-        "RemoveReaction",
         "SearchCompletions",
         "SearchReviewers",
         "SendReviewerPing",
         "SetPullRequestDraft",
         "SetPullRequestState",
-        "SetReviewThreadResolved",
-        "StartPendingReview",
-        "SubmitPendingReview",
-        "SubmitReview",
-        "SubmitReviewVerdict",
-        "UpdatePendingReviewComment",
-        "UploadAttachment",
     }
 )
+
+# The served methods that read the workspace, not a pull request. Any other served method
+# must name its pull request in ``pr_url``, so it is scoped to the call frame's session.
+NON_PULL_REQUEST_METHODS: frozenset[str] = frozenset(
+    {
+        "GetCapabilities",
+        "ListDirectory",
+        "ReadFile",
+        "StatPath",
+        "SearchFiles",
+        "SearchText",
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ReadLinkText",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+        "ResolveRepositoryContext",
+    }
+)
+
+
+def unclassified_methods(served: dict[str, WorkspaceMethod]) -> list[str]:
+    """Served methods that name no pull request yet aren't listed as reading the workspace."""
+    return sorted(
+        name
+        for name, method in served.items()
+        if not method.pull_request and name not in NON_PULL_REQUEST_METHODS
+    )
+
 
 WORKSPACE_METHODS: dict[str, WorkspaceMethod] = {
     method.name: WorkspaceMethod(
@@ -96,3 +111,7 @@ WORKSPACE_METHODS: dict[str, WorkspaceMethod] = {
     for method in workspace_pb2.DESCRIPTOR.services_by_name["WorkspaceService"].methods
     if method.name not in DECLARED_NOT_SERVED
 }
+
+if _unclassified := unclassified_methods(WORKSPACE_METHODS):
+    # Serving one would leave its session to chance; it must be classified first.
+    raise RuntimeError(f"Unclassified workspace methods: {', '.join(_unclassified)}")

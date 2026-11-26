@@ -72,6 +72,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -91,12 +92,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -228,6 +236,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -247,12 +256,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -384,6 +400,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -403,12 +420,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -540,6 +564,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -559,12 +584,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -696,6 +728,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -715,12 +748,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -852,6 +892,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -871,12 +912,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1008,6 +1056,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1027,12 +1076,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1164,6 +1220,7 @@ palette.files | Go to a file in the open session | group=workspace | chords=mod+
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=⌘ ⇧ E | aria=Meta+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=⌘ F | aria=Meta+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF | keys=⌘ ⌥ ⇧ F | aria=Meta+Alt+Shift+F | editor=Mod-Alt-Shift-f | matches=true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=⌘ ⌥ L | aria=Meta+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=⌃ G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=⌘ / | aria=Meta+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=⌥ ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1183,12 +1240,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=⌘ D | aria=Meta+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=⌘ ⇧ L | aria=Meta+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=⌘ L | aria=Meta+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=⌘ ⇧ \ | aria=Meta+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=⌃ ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=⌃ ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1315,11 +1379,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1339,12 +1404,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1471,11 +1543,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1495,12 +1568,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1627,11 +1707,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1651,12 +1732,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1783,11 +1871,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1807,12 +1896,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -1939,11 +2035,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -1963,12 +2060,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -2095,11 +2199,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -2119,12 +2224,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -2251,11 +2363,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -2275,12 +2388,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands
@@ -2407,11 +2527,12 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
+file.findInSelection | Find in selection | group=files | chords=mod+alt+code:KeyL | keys=Ctrl Alt L | aria=Control+Alt+L | editor=Mod-Alt-l | matches=true
 file.goToLine | Go to line | group=files | chords=ctrl+code:KeyG | keys=Ctrl G | aria=Control+G | editor=Ctrl-g | matches=true
 file.toggleLineComment | Toggle line comment | group=files | chords=mod+key:/ | keys=Ctrl / | aria=Control+/ | editor=Mod-/ | matches=true
 file.toggleBlockComment | Toggle block comment | group=files | chords=alt+shift+code:KeyA | keys=Alt ⇧ A | aria=Alt+Shift+A | editor=Alt-Shift-a | matches=true
@@ -2431,12 +2552,19 @@ file.addCursorBelow | Add cursor below | group=files | chords=mod+alt+key:ArrowD
 file.selectNextOccurrence | Select next occurrence | group=files | chords=mod+key:d | keys=Ctrl D | aria=Control+D | editor=Mod-d | matches=true
 file.selectAllOccurrences | Select all occurrences | group=files | chords=mod+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Mod-Shift-l | matches=true
 file.expandLineSelection | Expand selection to line | group=files | chords=mod+code:KeyL | keys=Ctrl L | aria=Control+L | editor=Mod-l | matches=true
+file.columnSelectUp | Column select up | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectDown | Column select down | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectLeft | Column select left | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
+file.columnSelectRight | Column select right | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.goToBracket | Go to matching bracket | group=files | chords=mod+shift+code:Backslash | keys=Ctrl ⇧ \ | aria=Control+Shift+\ | editor=Mod-Shift-\ | matches=true
 file.fold | Fold | group=files | chords=ctrl+shift+code:BracketLeft | keys=Ctrl ⇧ [ | aria=Control+Shift+[ | editor=Ctrl-Shift-[ | matches=true
 file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=Ctrl ⇧ ] | aria=Control+Shift+] | editor=Ctrl-Shift-] | matches=true
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
+pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
 session.addSibling | search=session.addSibling
 palette.commands | search=palette.commands palette.commands

@@ -4111,7 +4111,7 @@ def test_pr_attachments_fit_one_tunnel_frame() -> None:
     from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
     largest = routes_resources._MAX_PR_ATTACHMENT_BYTES
-    assert largest == pr_resource._MAX_VIDEO_ATTACHMENT_BYTES
+    assert largest == pr_resource.MAX_VIDEO_ATTACHMENT_BYTES
     encoded_length = 4 * -(-largest // 3)  # base64's exact output length
     assert encoded_length < RUNNER_TUNNEL_MAX_MESSAGE_BYTES * 0.95
 
@@ -12266,3 +12266,259 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
         )
     else:
         assert response.json()["error"]["code"] == "runner_unavailable"
+
+
+# ── Terminal shell inspection ────────────────────────────────────
+
+_SHELL_SESSION = "79b22ebd2309e48fdeb450c65611d51b"
+_SHELL_PATH = f"/v1/sessions/{_SHELL_SESSION}/resources/terminals/terminal_bash_s1/shell"
+_TERMINAL_NOT_FOUND = {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_rebuilds_the_runners_answer_from_expected_fields(
+    client: httpx.AsyncClient,
+) -> None:
+    """Extra fields are dropped and the name is cleaned again before it reaches the client."""
+    fake_runner = _FakeRunnerClient(
+        payload={
+            "state": "busy",
+            "foreground": "\x1b[31m/usr/bin/vim",
+            "background_jobs": 2,
+            "pids": [123],
+            "rows": "900 1 900 900 S+ secret-tool",
+        }
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "busy", "foreground": "vim", "background_jobs": 2}
+    assert fake_runner.calls == [("GET", _SHELL_PATH)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_id",
+    [
+        "terminal_bash_s1%3Fpid%3D1",
+        "bash_s1",
+        "terminal_",
+        "terminal_a%20b",
+        "terminal_%E2%80%AEx",
+        "terminal_" + "a" * 201,
+    ],
+    ids=["query", "no prefix", "empty name", "space", "bidi", "too long"],
+)
+async def test_terminal_shell_validates_the_terminal_id_before_calling_the_runner(
+    client: httpx.AsyncClient, terminal_id: str
+) -> None:
+    fake_runner = _FakeRunnerClient(payload={"state": "idle"})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"/v1/sessions/{_SHELL_SESSION}/resources/terminals/{terminal_id}/shell"
+    )
+
+    assert resp.status_code == 404
+    assert resp.json() == _TERMINAL_NOT_FOUND
+    assert not fake_runner.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "runner_body"),
+    [
+        (_SHELL_PATH, {"error": {"code": "not_found", "message": "Terminal 'x' of conv_y gone"}}),
+        (_SHELL_PATH, {"error": {"code": "not_found", "message": "Terminal not found"}}),
+        (
+            "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/terminals/terminal_bash_s1/shell",
+            None,
+        ),
+    ],
+    ids=["runner miss with detail", "runner miss", "unknown session"],
+)
+async def test_terminal_shell_answers_every_miss_with_the_same_404(
+    client: httpx.AsyncClient, path: str, runner_body: dict[str, Any] | None
+) -> None:
+    responses = {path: (404, runner_body)} if runner_body is not None else None
+    fake_runner = _FakeRunnerClient(responses=responses)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path)
+
+    assert resp.status_code == 404
+    assert resp.json() == _TERMINAL_NOT_FOUND
+
+
+_INSPECT_FAILED = '{"detail":"Couldn\'t inspect the terminal."}'
+_CANT_INSPECT = (
+    '{"error":{"code":"runner_unavailable",'
+    '"message":"This session\'s runner can\'t inspect terminals."}}'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner", "status", "body"),
+    [
+        (
+            _FakeRunnerClient(status_code=500, payload={"error": {"message": "ps: 900 secret"}}),
+            502,
+            _INSPECT_FAILED,
+        ),
+        (
+            _FakeRunnerClient(responses={_SHELL_PATH: (404, {"detail": "Not Found"})}),
+            503,
+            _CANT_INSPECT,
+        ),
+        (
+            _FakeRunnerClient(exc=httpx.ConnectError("runner at 10.0.0.9 refused")),
+            502,
+            _INSPECT_FAILED,
+        ),
+    ],
+    ids=["runner error", "older runner", "unreachable"],
+)
+async def test_terminal_shell_turns_runner_failures_into_fixed_messages(
+    client: httpx.AsyncClient, runner: _FakeRunnerClient, status: int, body: str
+) -> None:
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    assert (resp.status_code, resp.text) == (status, body)
+
+
+class _SilentRunnerClient(_FakeRunnerClient):
+    """A runner whose GET never answers and ignores its timeout, as over the runner tunnel."""
+
+    async def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del params, timeout
+        self.calls.append(("GET", url))
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_the_fixed_502_when_the_runner_never_answers(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(routes_resources, "_SHELL_PROXY_TIMEOUT_S", 0.05)
+    runner = _SilentRunnerClient()
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+
+    resp = await asyncio.wait_for(client.get(_SHELL_PATH), timeout=5)
+
+    assert (resp.status_code, resp.text) == (502, _INSPECT_FAILED)
+    assert runner.calls == [("GET", _SHELL_PATH)]
+
+
+class _UnroutableRunnerRouter(_FakeRunnerRouter):
+    """A control route that fails before any runner is called, with ``error``."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(_FakeRunnerClient(exc=AssertionError("runner called")))
+        self.error = error
+
+    def client_for_session_control(
+        self, conversation_id: str, *, conversation: Conversation | None = None
+    ) -> _RoutedRunner:
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_keeps_the_wrong_replica_signal_for_the_client_to_resend(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    from omnigent.errors import WrongReplicaError
+
+    host_id = uuid.uuid4().hex
+    wrong_replica = WrongReplicaError("host is on another replica", host_id=host_id)
+    reached: list[WrongReplicaError] = []
+
+    async def _handle_wrong_replica(request: Request, exc: Exception) -> JSONResponse:
+        del request
+        assert isinstance(exc, WrongReplicaError)
+        reached.append(exc)
+        return JSONResponse(status_code=exc.http_status, content={"host_id": exc.host_id})
+
+    app.add_exception_handler(WrongReplicaError, _handle_wrong_replica)
+    set_runner_router(_UnroutableRunnerRouter(wrong_replica))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    # The very error, with its host, reaches the handler that tells the client where to resend.
+    assert reached == [wrong_replica]
+    assert resp.status_code == wrong_replica.http_status != 502
+    assert resp.json() == {"host_id": wrong_replica.host_id}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_tells_an_offline_runner_from_an_older_one(
+    client: httpx.AsyncClient,
+) -> None:
+    offline = OmnigentError("runner 'laptop' is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+    set_runner_router(_UnroutableRunnerRouter(offline))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "error": {
+            "code": "runner_unavailable",
+            "message": "This session's runner isn't available right now.",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_a_malformed_runner_error_with_the_fixed_502(
+    client: httpx.AsyncClient,
+) -> None:
+    runner = _FakeRunnerClient(status_code=500, payload={"error": "ps failed at pid 900"})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+
+    resp = await client.get(_SHELL_PATH)
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "Couldn't inspect the terminal."}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("level", "status"),
+    [(None, 404), (LEVEL_READ, 403), (LEVEL_EDIT, 200), (LEVEL_OWNER, 200)],
+    ids=["no access", "read only", "edit", "owner"],
+)
+async def test_terminal_shell_needs_the_access_that_closing_the_terminal_needs(
+    runner_globals_reset: None, level: int | None, status: int
+) -> None:
+    del runner_globals_reset
+    permissions = _StubPermissionStore()
+    if level is not None:
+        permissions.add_grant("alice@example.com", _SHELL_SESSION, level)
+    application = _sessions_app(
+        _ConversationStore(),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=permissions,
+    )
+    runner = _FakeRunnerClient(payload={"state": "idle"})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://server"
+    ) as client:
+        resp = await client.get(_SHELL_PATH, headers={"X-Forwarded-Email": "alice@example.com"})
+
+    assert resp.status_code == status, resp.text
+    # A caller who can't close the terminal never reaches the runner.
+    assert bool(runner.calls) == (status == 200)

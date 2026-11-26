@@ -6,6 +6,7 @@ import { currentChoiceLabel, listedChoices, matchedChoice } from "@/store/palett
 import {
   appearanceModeSetting,
   paneCornersSetting,
+  stickyScrollSetting,
   terminalThemeSetting,
 } from "./settingsCommands";
 import type { PaneCornersState } from "./useFloatingPanes";
@@ -82,5 +83,16 @@ describe("settings rows", () => {
     });
     expect(isCommandListed(setting.availability)).toBe(false);
     expect(isCommandListed(paneCornersSetting(FLOATING_BY_POLICY).availability)).toBe(true);
+  });
+
+  it("turns sticky scroll on or off, and shows only where the tabs sidebar's viewer does", () => {
+    const write = vi.fn();
+    const setting = stickyScrollSetting(true, true, write);
+    expect(setting.label).toBe("Sticky scroll");
+    expect(currentChoiceLabel(setting)).toBe("On");
+    expect(isCommandListed(setting.availability)).toBe(true);
+    setting.choose(matchedChoice(setting, "off")!);
+    expect(write).toHaveBeenCalledExactlyOnceWith(false);
+    expect(isCommandListed(stickyScrollSetting(true, false).availability)).toBe(false);
   });
 });

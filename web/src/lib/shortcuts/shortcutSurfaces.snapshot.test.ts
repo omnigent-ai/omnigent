@@ -56,7 +56,7 @@ function pressFor(chord: Chord, mac: boolean): KeyChordInput {
 
 const chordText = (chord: Chord) =>
   [
-    chord.mod && "mod",
+    chord.mod && (chord.eitherCommandKey ? "mod(either)" : "mod"),
     chord.ctrl && "ctrl",
     chord.alt && "alt",
     chord.shift && "shift",

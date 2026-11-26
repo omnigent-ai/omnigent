@@ -670,16 +670,18 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     assert captured_args[0] == f"--gemini_dir={iso_gemini}"
     # HOME must stay real: relocating it breaks keyring-backed auth on macOS.
     assert "HOME" not in captured_env
-    # The relay config + token exist, so the wrapped agy can reach the sys_* tools.
+    # The relay config + token exist without enabledTools so agy exposes every
+    # dynamically advertised relay tool; permissions.allow auto-approves them.
     relay_config = iso_gemini / "config" / "mcp_config.json"
     payload = json.loads(relay_config.read_text(encoding="utf-8"))
-    assert "sys_session_create" in payload["mcpServers"]["omnigent"]["enabledTools"]
+    assert "enabledTools" not in payload["mcpServers"]["omnigent"]
     assert (bridge_dir / "bridge.json").is_file()
-    # The survey/trust seeds landed in the isolated dir, never the user's own file.
+    # The survey/trust/permission seeds landed in the isolated dir, never the user's own file.
     iso_settings = json.loads(
         (iso_gemini / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
     )
     assert iso_settings["showFeedbackSurvey"] is False
+    assert "mcp(omnigent/*)" in iso_settings["permissions"]["allow"]
     assert user_settings.read_text(encoding="utf-8") == '{"model":"gemini-3-pro"}'
 
 

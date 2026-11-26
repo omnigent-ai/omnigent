@@ -18,9 +18,11 @@ lists its shell, then shows its terminal.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -59,6 +61,7 @@ _TABS_CODE_MARKERS = (
     "Workspace history",
     "Open an app in this tab",
 )
+_PINNED_PAGES_KEY = "omnigent:pinned-workspace-tabs"
 _FILE = "tabs_sidebar_notes.py"
 _EDIT = "# saved from the tabs sidebar"
 _PR_TITLE = "Add the GitHub tab"
@@ -75,8 +78,19 @@ def workspace_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, st
         _cleanup_session_workdir(session_id)
 
 
-def _set_flag(page: Page, enabled: bool) -> None:
-    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``."""
+def _start_with_no_pinned_pages(page: Page) -> None:
+    """Start the session's strips with nothing pinned, for a journey that opens its own tabs."""
+    page.add_init_script(f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))")
+
+
+def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None:
+    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``.
+
+    With the flag on, a journey opens the tabs it needs, so its strips start with nothing
+    pinned unless ``settings_pins`` keeps Settings as shipped.
+    """
+    if enabled and not settings_pins:
+        _start_with_no_pinned_pages(page)
 
     def answer(route: Route) -> None:
         response = route.fetch()
@@ -302,6 +316,58 @@ def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
     expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
 
 
+def test_a_new_strip_starts_on_the_settings_pinned_pages(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """With Settings as shipped, a session's first strip shows its pinned pages, on Files."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True, settings_pins=True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    files_tab = sidebar.get_by_role("tab", name=re.compile(r"^Files"))
+    expect(files_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    # Pull Requests and Tasks join only where the session offers them.
+    for page_name in ("Diffs", "Agents"):
+        expect(sidebar.get_by_role("tab", name=re.compile(rf"^{page_name}"))).to_have_count(1)
+    expect(sidebar.get_by_role("tab", name="New tab", exact=True)).to_have_count(0)
+
+
+def test_full_screen_chord_opens_the_sidebar_full_screen_and_leaves_it(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """⇧⌘F opens a closed sidebar straight into full screen, and leaves it again."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    collapse = sidebar.get_by_role("button", name="Collapse right panel")
+    expect(collapse).to_be_visible(timeout=60_000)
+    collapse.click()
+    expect(sidebar).to_have_count(0)
+    # The session remembers the closed rail, so it reloads without the sidebar ever showing.
+    page.reload()
+    expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=60_000)
+    expect(sidebar).to_have_count(0)
+
+    maximized = page.locator("[data-maximized]")
+    # The chord binds once its code loads, which the closed rail doesn't wait for.
+    deadline = time.monotonic() + 60
+    while maximized.count() == 0:
+        assert time.monotonic() < deadline, "⇧⌘F never opened the sidebar"
+        page.keyboard.press("ControlOrMeta+Shift+F")
+        with contextlib.suppress(AssertionError):
+            expect(maximized).to_have_count(1, timeout=1_000)
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    full_screen = page.get_by_role("button", name=re.compile(r"full screen", re.IGNORECASE))
+    expect(full_screen).to_have_attribute("aria-pressed", "true")
+
+    page.keyboard.press("ControlOrMeta+Shift+F")
+    expect(full_screen).to_have_attribute("aria-pressed", "false")
+    expect(maximized).to_have_count(0)
+
+
 def test_files_menu_copies_the_path_and_a_link_to_the_file(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
@@ -333,7 +399,11 @@ def test_files_menu_copies_the_path_and_a_link_to_the_file(
 def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
-    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen."""
+    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen.
+
+    Settings stay as shipped, so the strip takes its pinned pages as the link opens; the
+    linked file keeps the selection.
+    """
     base_url, session_id = workspace_session
     anchor = "hello"
     response = httpx.post(
@@ -349,7 +419,7 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     )
     response.raise_for_status()
     comment_id = response.json()["id"]
-    _set_flag(page, True)
+    _set_flag(page, True, settings_pins=True)
     page.set_viewport_size(_VIEWPORTS["desktop"])
     page.goto(f"{base_url}/c/{session_id}?file={_FILE}&comment={comment_id}&fullscreen=1")
 
@@ -359,6 +429,10 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     expect(page.locator("[data-maximized]")).to_have_count(1)
     # The link is handed to the tab, so a reload doesn't open it again.
     expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+    expect(sidebar.get_by_role("tab", name=re.compile(r"^Agents"))).to_have_count(1)
+    file_tab = sidebar.get_by_role("tab", name=re.compile(rf"^{re.escape(_FILE)}"))
+    expect(file_tab).to_have_attribute("aria-selected", "true")
+    expect(viewer).to_contain_text("Say goodbye too")
 
 
 def test_tabs_sidebar_shell_tab_connects_then_shows_its_terminal(
@@ -761,7 +835,7 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
     sidebar = page.get_by_role("complementary", name="Workspace")
     expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
     _open_app(page, sidebar, "Files")
-    # A full-screen workspace docks the tree, with its options beside the toggle.
+    # A full-screen workspace docks the tree, with its options in the tree's header.
     page.get_by_role("button", name="Full screen", exact=True).click()
     build = sidebar.get_by_role("treeitem", name=re.compile(r"^build\b"))
     expect(sidebar.get_by_role("treeitem", name="base.txt", exact=True)).to_be_visible(
@@ -770,7 +844,9 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
     expect(build).to_have_count(0)
 
     def switch_ignored_files() -> None:
-        sidebar.get_by_role("button", name="Files tree options", exact=True).click()
+        sidebar.get_by_test_id("files-page-tree-header").get_by_role(
+            "button", name="Tree options", exact=True
+        ).click()
         page.get_by_role("menuitemcheckbox", name="Show git-ignored files").click()
 
     switch_ignored_files()

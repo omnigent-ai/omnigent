@@ -2,8 +2,8 @@
 // evidence: github.com by name, a GitHub Enterprise host only when the caller
 // already knows it serves GitHub.
 
-/** A code host the workspace links pull requests and files to. */
-export type CodeHostProviderId = "github";
+/** A code host the desktop shell can read from: GitHub, or a registered named host's id. */
+export type CodeHostProviderId = "github" | (string & {});
 
 const GITHUB_DOT_COM = "github.com";
 const PULL_PATH = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/;
@@ -33,6 +33,8 @@ export interface CodeHostPullRequest {
   number: number;
   /** The link without query, fragment, or trailing path. */
   url: string;
+  /** A login to read this pull request as, when the desktop shell supplies one. */
+  readAs?: string;
 }
 
 /**

@@ -102,6 +102,10 @@ _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
 # The host the current panel step's ``gh`` calls are for, set by the provider facet.
 _gh_target_host: ContextVar[str | None] = ContextVar("gh_target_host", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
+# The token one pull request action resolved up front, by the PR's URL (see _one_pr_account).
+_bound_pr_token: ContextVar[tuple[str, str | None] | None] = ContextVar(
+    "bound_pr_token", default=None
+)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
 # reviews, labels, and the merge fields feed the Summary and Comments tabs.
@@ -416,6 +420,14 @@ def _workspace_key(root: str) -> str | None:
 def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
     """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
     rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _gh_active_token(root: str, host: str = "github.com") -> str | None:
+    """Return the token of ``gh``'s active account on *host* (never logged)."""
+    rc, out, _ = _gh(["auth", "token", "-h", host], cwd=root)
     if rc != 0:
         return None
     return out.strip() or None
@@ -1169,12 +1181,20 @@ def _repo_argument(ref: PullRequestRef) -> str:
 
 
 def _pr_token(root: str, reference: PullRequestRef) -> str | None:
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        return bound[1]
     if _in_sandbox():
         return None
     login = _config.github_account_preference(_repo_argument(reference))
     if login:
         return _gh_auth_token(root, login, reference.host)
     return None
+
+
+_ACTIVE_ACCOUNT_UNREADABLE = (
+    "Couldn't read the host's GitHub sign-in. Nothing was sent; sign in with gh and try again."
+)
 
 
 def _signed_out_account(login: str) -> str:
@@ -1198,6 +1218,35 @@ def _write_token(root: str, reference: PullRequestRef, *, timed_out: str) -> str
     if login and token is None:
         raise ValueError(_signed_out_account(login))
     return token
+
+
+@contextmanager
+def _one_pr_account(root: str, reference: PullRequestRef, *, timed_out: str) -> Iterator[None]:
+    """Run every read and write in the block as one account: the one chosen at its start.
+
+    The token is looked up once, and a chosen login without one refuses before anything is
+    read, so a check can't run as one account and the write it guards as another. With no
+    login chosen, the active account's token is bound, so switching it mid-action can't
+    split one either. Only a sandbox, which has a single identity, runs without a token.
+    """
+    bound = _bound_pr_token.get()
+    if bound is not None and bound[0] == reference.url:
+        yield
+        return
+    sandbox = _in_sandbox()
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        token = _write_token(root, reference, timed_out=timed_out)
+        if token is None and not sandbox:
+            token = _gh_active_token(root, reference.host)
+            if _gh_timed_out.get():
+                raise ValueError(timed_out)
+            if token is None:
+                raise ValueError(_ACTIVE_ACCOUNT_UNREADABLE)
+    binding = _bound_pr_token.set((reference.url, token))
+    try:
+        yield
+    finally:
+        _bound_pr_token.reset(binding)
 
 
 def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:

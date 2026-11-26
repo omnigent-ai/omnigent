@@ -29,6 +29,8 @@ session, while session-linked failures keep their existing session Inbox entry.
   All and Unread, and do not appear in Awaiting response or, where the server
   offers Omni Advisor, in its Omni Advisor filter, which lists only that agent's
   suggestions.
+- **Inbox header:** on All or Unread, Mark all as read dismisses every listed
+  failure along with the tab's other unread items.
 - **Command palette:** open Search or press Cmd+K (Mac) / Ctrl+K (Linux/Windows),
   then choose Go to Inbox or Go to Automations.
 - **Narrow screens / embedded UI:** the same Automations and Inbox pages are
@@ -52,6 +54,9 @@ no connected host so Run now fails naturally without touching a real host.
 - **Legacy detail-disabled cards and navigation:** component checks in
   `web/src/components/scheduled/ScheduledTaskRow.test.tsx` and
   `web/src/pages/InboxPage.test.tsx` verify the warning and Open automation fallback.
+- **Inbox header:** `web/src/pages/InboxPage.test.tsx` checks that Mark all as
+  read dismisses a listed failure with the other unread kinds and is hidden on
+  Awaiting response.
 - **Embedded layouts:** on an isolated embedding, verify Open automation stays
   within its mount path; report separately when no managed deployment is available.
 - **Ownership and duplicate suppression:**

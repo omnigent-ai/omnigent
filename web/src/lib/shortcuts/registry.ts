@@ -619,17 +619,20 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
     chords: () => [modAlt({ code: "KeyB" })],
   },
   // Physical keys, since Option rewrites letters; ⌃⌘F is the system's full screen on macOS.
+  // Elsewhere Ctrl+Alt+F and Ctrl+Alt+P are the Session menu's Fork and Pin.
   "palette.text": {
     group: "workspace",
     label: "Search text in the open session's files",
     chords: (environment) =>
-      environment.mac ? [{ ctrl: true, mod: true, code: "KeyO" }] : [modAlt({ code: "KeyF" })],
+      environment.mac ? [{ ctrl: true, mod: true, code: "KeyO" }] : [modAlt({ code: "KeyO" })],
   },
   "palette.files": {
     group: "workspace",
     label: "Go to a file in the open session",
     chords: (environment) =>
-      environment.mac ? [{ ctrl: true, mod: true, code: "KeyP" }] : [modAlt({ code: "KeyP" })],
+      environment.mac
+        ? [{ ctrl: true, mod: true, code: "KeyP" }]
+        : [modAlt({ shift: true, code: "KeyP" })],
   },
   // The Explorer chord editors use.
   "files.toggleTree": {
@@ -646,6 +649,11 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
       modAlt({ shift: true, code: "KeyF" }),
       ...(environment.mac ? [] : [{ ctrl: true, code: "KeyH" }]),
     ],
+  },
+  "file.findInSelection": {
+    group: "files",
+    label: "Find in selection",
+    chords: () => [modAlt({ code: "KeyL" })],
   },
   "file.goToLine": {
     group: "files",
@@ -743,6 +751,11 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
     label: "Expand selection to line",
     chords: () => [mod({ code: "KeyL" })],
   },
+  // ⇧⌥⌘ and an arrow belong to workspace history and line moves, so these stay unbound.
+  "file.columnSelectUp": { group: "files", label: "Column select up", chords: () => [] },
+  "file.columnSelectDown": { group: "files", label: "Column select down", chords: () => [] },
+  "file.columnSelectLeft": { group: "files", label: "Column select left", chords: () => [] },
+  "file.columnSelectRight": { group: "files", label: "Column select right", chords: () => [] },
   "file.goToBracket": {
     group: "files",
     label: "Go to matching bracket",
@@ -766,6 +779,23 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
     group: "workspace",
     label: "Open the focused row in a new tab (⇧ to switch to it)",
     chords: () => [mod({ key: "Enter" }), mod({ shift: true, key: "Enter" })],
+  },
+  // The new pull request page's: delete the selected rows from its list, and step down and up a
+  // PR's stack as on github.com. Text fields and menus keep these keys.
+  "pullRequests.removeSelected": {
+    group: "workspace",
+    label: "Remove selected pull requests",
+    chords: () => [mod({ eitherCommandKey: true, key: "Backspace" })],
+  },
+  "pullRequestStack.next": {
+    group: "workspace",
+    label: "Next in stack",
+    chords: () => [{ shift: true, code: "KeyJ" }],
+  },
+  "pullRequestStack.previous": {
+    group: "workspace",
+    label: "Previous in stack",
+    chords: () => [{ shift: true, code: "KeyK" }],
   },
 } satisfies Record<string, ShortcutBindingDefinition>;
 

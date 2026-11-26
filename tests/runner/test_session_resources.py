@@ -41,6 +41,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from omnigent.terminals.shell_inspection import ShellInspection, ShellState
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
@@ -964,6 +965,154 @@ async def test_get_terminal_by_id_returns_404_when_tmux_exited(
     # claude-native. A 200 here would preserve the reconnect loop bug.
     assert resp.status_code == 404
     assert instance.running is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_reads_only_the_named_terminal_of_that_session(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shell route inspects the session's own terminal and answers no pids."""
+    inspected: list[str] = []
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        inspected.append(self.name)
+        return ShellInspection(ShellState.BUSY, "vim", 1)
+
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await client.get(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell",
+        params={"socket": "/tmp/elsewhere.sock", "pid": "1"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "busy", "foreground": "vim", "background_jobs": 1}
+    assert inspected == ["bash"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Another session's terminal, in the same runner and workspace.
+        "/v1/sessions/conv_abc/resources/terminals/terminal_other_s1/shell",
+        "/v1/sessions/conv_abc/resources/terminals/terminal_nope_s1/shell",
+        # A terminal whose tmux has exited.
+        "/v1/sessions/conv_abc/resources/terminals/terminal_stale_s3/shell",
+        "/v1/sessions/conv_unknown/resources/terminals/terminal_bash_s1/shell",
+    ],
+    ids=["other session", "unknown", "not running", "unknown session"],
+)
+async def test_terminal_shell_answers_every_miss_with_the_same_404(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A foreign terminal can't be told apart from a missing one, and none is inspected."""
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await client.get(path)
+
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_the_same_404_when_tmux_exited_under_a_stale_flag(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal still flagged running whose tmux is gone is a miss, not an "unknown" answer."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+
+    async def dead_tmux() -> bool:
+        return False
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    instance.is_alive = dead_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    assert instance.running is True
+    resp = await client.get("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell")
+
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"code": "not_found", "message": "Terminal not found"}}
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_unknown_in_time_when_its_liveness_check_stalls(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux liveness probe that never answers is cut off with the read, not waited out."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    gave_up = asyncio.Event()
+
+    async def stalled_tmux() -> bool:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            gave_up.set()
+        raise AssertionError("unreachable")
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        raise AssertionError(f"inspected {self.name}")
+
+    instance.is_alive = stalled_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    resp = await asyncio.wait_for(
+        client.get("/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"), 5
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"state": "unknown", "foreground": None, "background_jobs": None}
+    assert gave_up.is_set()
+
+
+@pytest.mark.asyncio
+async def test_repeated_terminal_shell_requests_share_one_liveness_check_and_read(
+    client: httpx.AsyncClient, registry: TerminalRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several close paths asking at once start one tmux probe and one read between them.
+
+    Busy, since only a read begun after a request may answer it idle.
+    """
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    probes = 0
+    reads = 0
+    release = asyncio.Event()
+
+    async def live_tmux() -> bool:
+        nonlocal probes
+        probes += 1
+        await release.wait()
+        return True
+
+    async def inspect_shell(self: TerminalInstance) -> ShellInspection:
+        nonlocal reads
+        reads += 1
+        return ShellInspection(ShellState.BUSY, "vim", 0)
+
+    instance.is_alive = live_tmux  # type: ignore[method-assign]
+    monkeypatch.setattr(TerminalInstance, "inspect_shell", inspect_shell)
+    path = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/shell"
+    requests = [asyncio.create_task(client.get(path)) for _ in range(3)]
+
+    async def probe_started() -> None:
+        while probes == 0:
+            await asyncio.sleep(0)
+
+    # Bounded, so a request that never probes fails here instead of hanging.
+    await asyncio.wait_for(probe_started(), timeout=5)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    responses = await asyncio.gather(*requests)
+
+    assert [resp.json()["state"] for resp in responses] == ["busy"] * 3
+    assert (probes, reads) == (1, 1)
 
 
 @pytest.mark.asyncio

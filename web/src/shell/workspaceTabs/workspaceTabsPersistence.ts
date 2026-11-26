@@ -13,6 +13,7 @@ import type {
   Visit,
   WorkspacePlace,
 } from "./workspacePlace";
+import { type AppliedTabSettings, parseAppliedTabSettings } from "./workspaceTabSettings";
 import type {
   ClosedTab,
   TabBinding,
@@ -36,6 +37,8 @@ export interface WorkspaceTabsSessionState {
   timeline: Visit[];
   cursor: number;
   closed: ClosedTab[];
+  /** The Workspace settings the strip last took; missing on strips that never took them. */
+  tabSettings?: AppliedTabSettings;
 }
 
 interface StoredSession {
@@ -270,6 +273,8 @@ export function parseSessionState(value: unknown): WorkspaceTabsSessionState | n
     cursor,
     closed,
   };
+  const tabSettings = parseAppliedTabSettings(value.tabSettings);
+  if (tabSettings) state.tabSettings = tabSettings;
   return state;
 }
 
@@ -320,6 +325,7 @@ export function serializeSessionState(state: WorkspaceTabsSessionState): Record<
     timeline: state.timeline,
     cursor: state.cursor,
     closed: state.closed,
+    ...(state.tabSettings ? { tabSettings: state.tabSettings } : {}),
   };
 }
 

@@ -1087,10 +1087,12 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
     await scheduler.poll_once()
     await _drain(scheduler)
     if deleted:
-        assert store.get(task.id) is None
-        assert store.list_runs(task.id)[0] == []
+        await poll_until_async(
+            lambda: store.get(task.id) is None and store.list_runs(task.id)[0] == []
+        )
     else:
-        assert store.list_runs(task.id)[0][0].status == "failed"
+        # The last sweep can time out while its transition still commits in a thread.
+        await poll_until_async(lambda: store.list_runs(task.id)[0][0].status == "failed")
     assert recover.await_count == 3
     assert recover.await_args.args == (run,)
     fire.assert_not_awaited()

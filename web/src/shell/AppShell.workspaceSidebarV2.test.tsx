@@ -10,6 +10,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type * as TabStoreModule from "@/components/BrowserPane/agentTools/tabStore";
 import type { WorkspaceTabsHostProps } from "./workspaceTabs/WorkspaceTabsHost";
+import type { GoToFileHostProps } from "./goToFile/GoToFileHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext } from "react";
@@ -24,6 +25,8 @@ import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { registeredPaletteCommands } from "@/test/paletteCommands";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { TabsRecord } from "@/components/BrowserPane/agentTools/tabStore";
 import { type BrowserActionOutcome, emitBrowserActionSettled } from "@/lib/browserActionBus";
 import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
@@ -77,6 +80,15 @@ vi.mock("./fileCommands/FileActionHost", () => ({
   FileActionHost: () => {
     if (fileActionHost.throws) throw new Error("file action host broke");
     return <div data-testid="file-action-host" />;
+  },
+}));
+
+// Go to File has its own suites; these tests check where it mounts and what it's handed.
+const goToFile = vi.hoisted(() => ({ props: null as GoToFileHostProps | null }));
+vi.mock("./goToFile/GoToFileHost", () => ({
+  GoToFileHost: (props: GoToFileHostProps) => {
+    goToFile.props = props;
+    return <div data-testid="go-to-file-host" />;
   },
 }));
 
@@ -188,6 +200,10 @@ vi.mock("./InlineTerminalsSection", () => ({ InlineTerminalsSection: () => null 
 vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useSession } from "@/hooks/useSession";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
+import { LEVEL_READ } from "@/lib/permissionsApi";
+import { readRecentWorkspaceFiles } from "@/lib/recentWorkspaceFiles";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
@@ -367,6 +383,7 @@ function agentTabs(request: AgentBrowserTabRequest) {
 
 beforeEach(() => {
   localStorage.clear();
+  goToFile.props = null;
   sessionStorage.clear();
   writeWorkspacePanelDefault("open");
   tabs.host = null;
@@ -427,6 +444,93 @@ describe("workspace_sidebar_v2", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
+  });
+
+  it("mounts Go to File for the session with the flag on", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws", textSearch: false });
+  });
+
+  it.each([
+    [
+      "a read-only viewer the session doesn't share its files with",
+      () => {
+        const session = vi.mocked(useSession);
+        const original = session.getMockImplementation()!;
+        session.mockImplementation(
+          () =>
+            ({
+              session: { id: "conv_ws", permissionLevel: LEVEL_READ, shareWorkspaceFiles: false },
+              isLoading: false,
+              error: null,
+            }) as never,
+        );
+        onTestFinished(() => {
+          session.mockImplementation(original);
+        });
+      },
+    ],
+    [
+      "a session whose environment has no filesystem",
+      () => {
+        const environment = vi.mocked(useWorkspaceEnvironment);
+        const original = environment.getMockImplementation()!;
+        environment.mockImplementation(
+          () => ({ data: { available: false, root: null }, isLoading: false }) as never,
+        );
+        onTestFinished(() => {
+          environment.mockImplementation(original);
+        });
+      },
+    ],
+  ])("keeps Go to File's Sessions but searches no files for %s", async (_, arrange) => {
+    arrange();
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props).toMatchObject({ sessionId: null, textSearch: false });
+  });
+
+  it("offers Go to File's text search when the session has content search", async () => {
+    setViewport(DESKTOP);
+    const info = withFlag(true);
+    renderShell({ ...info, features: { ...info.features, workspace_content_search: true } });
+
+    expect(await screen.findByTestId("go-to-file-host")).toBeInTheDocument();
+    expect(goToFile.props?.textSearch).toBe(true);
+    act(() => goToFile.props?.showTextSearch());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith(
+        "conv_ws",
+        "content-search",
+      ),
+    );
+  });
+
+  it.each([
+    ["off", withFlag(false)],
+    ["omitted", WITHOUT_FLAG],
+  ])("leaves Go to File out, and lists no recent files, when the flag is %s", async (_, info) => {
+    setViewport(DESKTOP);
+    renderShell(info);
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
+    expect(readRecentWorkspaceFiles("conv_ws")).toEqual([]);
+  });
+
+  it("leaves Go to File out on a phone", async () => {
+    setViewport(390, "coarse");
+    renderShell(withFlag(true));
+    await settleRoutes();
+
+    expect(screen.queryByTestId("go-to-file-host")).toBeNull();
   });
 
   it("offers ⌘K's Show all pull requests with the flag on, which opens the session's list", async () => {
@@ -581,6 +685,16 @@ describe("workspace_sidebar_v2", () => {
     expect(tabs.host!.onHide).toBeUndefined();
     fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
     expect(drawer).toHaveAttribute("data-state", "closed");
+
+    // Go to File serves the drawer's tabs too, and a resize keeps an open finder mounted.
+    const finder = screen.getByTestId("go-to-file-host");
+    expect(goToFile.props).toMatchObject({ sessionId: "conv_ws" });
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
+    resizeTo(NARROW_DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "drawer" }));
+    expect(screen.getByTestId("go-to-file-host")).toBe(finder);
   });
 
   it("opens the Workspace drawer on a page from the session's menu in a narrow window", async () => {
@@ -699,7 +813,6 @@ describe("workspace_sidebar_v2", () => {
   );
 
   it("doesn't reopen a file the classic sidebar remembered when the tabs sidebar reopens", async () => {
-    const { writeSessionWorkspaceState } = await import("@/lib/sessionWorkspaceState");
     writeSessionWorkspaceState("conv_ws", { selectedFilePath: "old.ts", open: true });
     setViewport(DESKTOP);
     renderShell(withFlag(true));
@@ -958,5 +1071,63 @@ describe("workspace_sidebar_v2", () => {
     } finally {
       delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
     }
+  });
+});
+
+describe("⇧⌘F and ⌘K's full screen row", () => {
+  const pressFullScreen = () => {
+    const mac = isMacPlatform();
+    const event = new KeyboardEvent("keydown", {
+      key: "F",
+      code: "KeyF",
+      metaKey: mac,
+      ctrlKey: !mac,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    return event;
+  };
+  const fullScreenRow = () =>
+    registeredPaletteCommands().find(
+      (command) => command.shortcut === "workspace.toggleFullScreen",
+    );
+
+  it("fills the window from the chord, and leaves it on a second press", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    await screen.findByTestId("tabs-host");
+    // The row and the chord load with the tabs sidebar's code.
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    expect(pressFullScreen().defaultPrevented).toBe(true);
+    expect(tabs.host).toMatchObject({ maximized: true });
+    expect(fullScreenRow()?.label).toBe("Exit workspace full screen");
+    pressFullScreen();
+    expect(tabs.host).toMatchObject({ maximized: false });
+    expect(fullScreenRow()?.label).toBe("Make the workspace full screen");
+  });
+
+  it("opens a closed sidebar straight into full screen from ⌘K", async () => {
+    setViewport(DESKTOP);
+    writeSessionWorkspaceState("conv_ws", { open: false });
+    renderShell(withFlag(true));
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    act(() => fullScreenRow()!.run());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+  });
+
+  it("leaves the chord alone and offers no row in the classic sidebar", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(false));
+    await screen.findByRole("complementary", { name: "Workspace" });
+    // A row registered late, once some lazy code loads, would still count.
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
+    expect(pressFullScreen().defaultPrevented).toBe(false);
+    expect(fullScreenRow()).toBeUndefined();
   });
 });

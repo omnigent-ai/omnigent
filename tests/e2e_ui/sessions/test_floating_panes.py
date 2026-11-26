@@ -510,6 +510,119 @@ def test_the_workspace_sidebar_resizes_from_the_gutter_beside_the_chat(
     assert abs(_workspace_width(page) - narrowed) <= 1
 
 
+def _center(locator: Locator) -> tuple[float, float]:
+    box = locator.bounding_box()
+    assert box is not None
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+def test_one_collapse_right_icon_in_the_corner_opens_and_closes_the_workspace_sidebar(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """The open sidebar collapses from its own collapse-right icon, the header shows no second
+    toggle, and the header's Expand right panel takes the same corner while it's collapsed."""
+    base_url, session_id = seeded_session
+    _open(page, base_url, session_id, scheme="light", floating=True)
+    open_right_rail(page)
+    header_toggles = page.locator(
+        'header.chat-header button[aria-label="Collapse right panel"], '
+        'header.chat-header button[aria-label="Expand right panel"]'
+    )
+    collapse = page.locator(_WORKSPACE).get_by_role("button", name="Collapse right panel")
+    expect(collapse).to_be_visible()
+    expect(header_toggles).to_have_count(0)
+    expect(collapse.locator("svg.lucide-panel-right-close")).to_have_count(1)
+    expect(collapse.locator("svg.lucide-x")).to_have_count(0)
+    if target := os.environ.get("OMNIGENT_E2E_CAPTURES"):
+        clip = {"x": _VIEWPORT["width"] - 420, "y": 0, "width": 420, "height": 90}
+        for scheme in ("light", "dark"):
+            page.emulate_media(color_scheme=scheme)
+            page.wait_for_timeout(200)  # custom-lint: disable=sleep-then-assert -- theme repaint
+            page.screenshot(
+                path=str(Path(target, f"sidebar-collapse-open-{scheme}.png")),
+                clip=clip,
+                animations="disabled",
+            )
+        page.emulate_media(color_scheme="light")
+    open_at = _center(collapse)
+
+    collapse.click()
+    expand = page.locator("header.chat-header").get_by_role("button", name="Expand right panel")
+    expect(expand).to_be_visible()
+    expect(header_toggles).to_have_count(1)
+    expect(collapse).not_to_be_visible()
+    page.wait_for_timeout(600)  # custom-lint: disable=sleep-then-assert -- the slide's length
+    closed_at = _center(expand)
+    if target := os.environ.get("OMNIGENT_E2E_CAPTURES"):
+        clip = {"x": _VIEWPORT["width"] - 420, "y": 0, "width": 420, "height": 90}
+        page.screenshot(
+            path=str(Path(target, "sidebar-collapse-closed-light.png")),
+            clip=clip,
+            animations="disabled",
+        )
+    print(f"corner toggle open={open_at} closed={closed_at}")
+    # Both take one spot in the window's top-right corner, so the pointer opens what it closed.
+    assert abs(open_at[0] - closed_at[0]) <= 1, (open_at, closed_at)
+    assert abs(open_at[1] - closed_at[1]) <= 1, (open_at, closed_at)
+
+    expand.click()
+    expect(collapse).to_be_visible()
+    expect(header_toggles).to_have_count(0)
+
+
+_CORNER_CONTROLS_JS = """(sidebar) => {
+  const header = document.querySelectorAll(
+    'header.chat-header button[aria-label$="right panel"]');
+  const collapse = document.querySelector(
+    `${sidebar} button[aria-label="Collapse right panel"]`);
+  const rail = document.querySelector(sidebar)?.getBoundingClientRect();
+  let shown = false;
+  if (collapse && rail) {
+    const box = collapse.getBoundingClientRect();
+    const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+    shown = box.width > 0 && box.left >= rail.left && box.right <= rail.right + 0.5
+      && box.right <= window.innerWidth && !!hit && collapse.contains(hit);
+  }
+  return { header: header.length, collapseShown: shown, rail: rail ? rail.width : 0 };
+}"""
+
+
+def test_a_narrow_desktop_window_always_shows_one_way_to_collapse_the_sidebar(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """The desktop app keeps both sidebars open in a narrow window, which squeezes the workspace
+    sidebar. At every width either its own Collapse shows whole or the header keeps its toggle."""
+    base_url, session_id = seeded_session
+    page.add_init_script(MAC_SHELL_INIT_SCRIPT)
+    _open(page, base_url, session_id, scheme="light", floating=True)
+    open_right_rail(page)
+    _workspace_width(page)
+    readings: dict[int, dict[str, Any]] = {}
+
+    def read(width: int) -> dict[str, Any]:
+        page.set_viewport_size({"width": width, "height": 900})
+        page.wait_for_timeout(120)  # custom-lint: disable=sleep-then-assert -- a resize's layout
+        reading = page.evaluate(_CORNER_CONTROLS_JS, _WORKSPACE)
+        readings[width] = reading
+        # At least one: the sidebar's own button whole, or the header's toggle.
+        assert reading["header"] == 1 or reading["collapseShown"], (width, reading)
+        return reading
+
+    handed_off = [width for width in range(800, 1201, 4) if read(width)["header"] == 0]
+    assert handed_off, readings
+    # The narrowest windows squeeze the sidebar past its button, so the header's toggle is needed.
+    assert readings[800]["header"] == 1, readings[800]
+    # Around the first width the sidebar takes over, pixel by pixel.
+    for width in range(handed_off[0] - 6, handed_off[0] + 2):
+        read(width)
+    # Tolerated: up to 4px below the handoff both may show, as the measured need runs 1px high.
+    band = range(handed_off[0] - 4, handed_off[0])
+    for width, reading in readings.items():
+        if width not in band:
+            assert (reading["header"] == 1) != reading["collapseShown"], (width, reading)
+    print("narrow corner readings", {w: readings[w] for w in sorted(readings) if w < 1000})
+
+
 def _open_terminal_first(page: Page, base_url: str, session_id: str, **open_args: Any) -> None:
     """Open the session as ``omnigent claude`` sessions are: terminal-first, with the agent's
     terminal listed (no live PTY is needed to place the switch)."""

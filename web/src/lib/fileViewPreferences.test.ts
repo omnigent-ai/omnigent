@@ -1,8 +1,11 @@
+import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_FILE_VIEW_PREFERENCES,
   readFileViewPreferences,
+  useStickyScroll,
   writeFileViewPreferences,
+  writeStickyScroll,
 } from "./fileViewPreferences";
 
 const STORAGE_KEY = "omnigent:file-view-preferences";
@@ -25,6 +28,7 @@ describe("fileViewPreferences", () => {
       previewableViewMode: "source",
       hideWhitespace: true,
       wrapLines: true,
+      stickyScroll: false,
     });
     // The exact object written must come back — proves both the write
     // serialized and the read parsed/validated every field correctly.
@@ -34,6 +38,7 @@ describe("fileViewPreferences", () => {
       previewableViewMode: "source",
       hideWhitespace: true,
       wrapLines: true,
+      stickyScroll: false,
     });
   });
 
@@ -56,13 +61,38 @@ describe("fileViewPreferences", () => {
     // (defaults to "unified"); previewableViewMode is missing (defaults to
     // "editor"). Proves a partial/garbage record still yields sane values for
     // the fields that are valid instead of being discarded entirely.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ diffActive: true, diffLayout: "sideways" }));
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ diffActive: true, diffLayout: "sideways", stickyScroll: "off" }),
+    );
     expect(readFileViewPreferences()).toEqual({
       diffActive: true,
       diffLayout: "unified",
       previewableViewMode: "editor",
       hideWhitespace: false,
       wrapLines: false,
+      // A record saved before sticky scroll existed, or a bad value, keeps it on.
+      stickyScroll: true,
     });
+  });
+});
+
+describe("useStickyScroll", () => {
+  it("follows a write on screen and keeps the other preferences", () => {
+    writeFileViewPreferences({ ...DEFAULT_FILE_VIEW_PREFERENCES, wrapLines: true });
+    const { result } = renderHook(() => useStickyScroll());
+    expect(result.current).toBe(true);
+    act(() => writeStickyScroll(false));
+    expect(result.current).toBe(false);
+    expect(readFileViewPreferences()).toMatchObject({ wrapLines: true, stickyScroll: false });
+  });
+
+  it("follows another window's change", () => {
+    const { result } = renderHook(() => useStickyScroll());
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ stickyScroll: false }));
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY }));
+    });
+    expect(result.current).toBe(false);
   });
 });

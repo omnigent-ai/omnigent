@@ -59,10 +59,13 @@ export function BrowseLocationBar({
   error,
 }: BrowseLocationBarProps) {
   const [open, setOpen] = useState(false);
-  const canRoam = canBrowseOutside && (reach?.unconfined ?? false) && hostId !== null;
-  const parent = parentPath(current);
-  const navigableParent =
-    parent !== null && (canRoam || pathIsWithin(parent, workspace)) ? parent : null;
+  const { canRoam, parent: navigableParent } = browseNavigation({
+    current,
+    workspace,
+    hostId,
+    canBrowseOutside,
+    reach,
+  });
 
   if (!canRoam) {
     return (
@@ -178,6 +181,33 @@ function ParentFolderButton({
   );
 }
 
+/** A path as `/`-separated, without a trailing `/`, so two spellings of one folder compare equal. */
+const normalizePath = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/, "");
+
+/**
+ * Where the files header can step from ``current``: its parent, while moving up stays
+ * inside the workspace or this viewer may roam the host, and back to the workspace root.
+ */
+export function browseNavigation({
+  current,
+  workspace,
+  hostId,
+  canBrowseOutside,
+  reach,
+}: Pick<
+  BrowseLocationBarProps,
+  "current" | "workspace" | "hostId" | "canBrowseOutside" | "reach"
+>): { canRoam: boolean; parent: string | null; workspaceRoot: string | null } {
+  const canRoam = canBrowseOutside && (reach?.unconfined ?? false) && hostId !== null;
+  const parent = parentPath(current);
+  return {
+    canRoam,
+    parent: parent !== null && (canRoam || pathIsWithin(parent, workspace)) ? parent : null,
+    // "/repo/" and "C:\repo" name the same folder as "/repo" and "C:/repo".
+    workspaceRoot: normalizePath(current) === normalizePath(workspace) ? null : workspace,
+  };
+}
+
 /**
  * Render an absolute path, truncating the *start* when it doesn't fit.
  *
@@ -220,8 +250,7 @@ function parentPath(absolutePath: string): string | null {
 }
 
 function pathIsWithin(path: string, root: string): boolean {
-  const normalize = (value: string) => value.replaceAll("\\", "/").replace(/\/+$/, "");
-  const normalizedPath = normalize(path);
-  const normalizedRoot = normalize(root);
+  const normalizedPath = normalizePath(path);
+  const normalizedRoot = normalizePath(root);
   return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
 }

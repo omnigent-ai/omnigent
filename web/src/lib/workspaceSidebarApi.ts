@@ -275,16 +275,22 @@ export interface WorkspaceSidebarApi {
     sessionId: string,
     comparison: ComparisonInit,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<WorkingCopyBase | null>;
   listWorkingCopyChanges: (
     sessionId: string,
     comparison: ComparisonInit,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListWorkingCopyChangesResponse | null>;
   readBaseFile: (
     sessionId: string,
     file: { commit: string; path: string; object: string },
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<FileContentResponse | null>;
   readLinkText: (
     sessionId: string,
@@ -294,11 +300,15 @@ export interface WorkspaceSidebarApi {
   listRepositoryRefs: (
     sessionId: string,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListRepositoryRefsResponse | null>;
   listBranchCommits: (
     sessionId: string,
     range: RevisionSpec,
     signal?: AbortSignal,
+    /** A folder relative to the workspace, such as a worktree; empty for the workspace. */
+    repository?: string,
   ) => Promise<ListBranchCommitsResponse | null>;
   resolveRepositoryContext: (
     sessionId: string,

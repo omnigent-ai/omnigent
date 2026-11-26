@@ -10,7 +10,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from itertools import batched
 from typing import Any
 
@@ -50,6 +50,7 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
+    ScheduledTask,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -264,6 +265,8 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SessionCreateInput,
+    SessionCreateMetadata,
     SessionCreateRequest,
     SessionEventInput,
     SessionFamily,
@@ -657,6 +660,32 @@ class _SessionPageReads:
     family_info: dict[str, SessionFamily] = dataclasses.field(default_factory=dict)
     user_is_admin: bool = False
     batches: list[_SessionBatchReads] = dataclasses.field(default_factory=list)
+
+
+# Request work running on after its request was cancelled.
+# custom-lint: disable-next=workspace-scoped-cache -- holds globally unique task objects
+_unattended_work: set[asyncio.Task[Any]] = set()
+
+
+def _forget_unattended(done: asyncio.Task[Any]) -> None:
+    """Drop finished work, logging a failure no request is left to report."""
+    _unattended_work.discard(done)
+    if not done.cancelled() and (error := done.exception()) is not None:
+        _logger.warning(
+            "%s failed after its request was cancelled", done.get_name(), exc_info=error
+        )
+
+
+async def _finish_despite_cancellation[T](work: Coroutine[Any, Any, T], *, name: str) -> T:
+    """Await *work*, letting it run to its end if the request is cancelled."""
+    task = asyncio.create_task(work, name=name)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Work that failed just before the cancellation landed still needs its failure logged.
+        _unattended_work.add(task)
+        task.add_done_callback(_forget_unattended)
+        raise
 
 
 def register_core_routes(
@@ -1573,6 +1602,8 @@ def register_core_routes(
             raise OmnigentError(
                 "Independent sessions require agent_id", code=ErrorCode.INVALID_INPUT
             )
+        # Form/File parameters or an async form context would close uploads when
+        # the request ends, before an outliving create can finish reading them.
         form = await request.form(max_files=21) if content_type == "multipart/form-data" else None
         if form is not None and (form.get("bundle") is not None or "initial_files" not in form):
             result = await _create_bundled_session_from_multipart(request, user_id)
@@ -1772,6 +1803,32 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 scheduled_task_store=getattr(request.app.state, "scheduled_task_store", None),
             )
+        create = _create_validated_session(
+            request,
+            user_id,
+            body,
+            source=source,
+            orchestration_source=orchestration_source,
+            launching_task=launching_task,
+        )
+        if body.parent_session_id is not None:
+            # A runner reconciles and retries its own timed-out child create, so
+            # finishing an abandoned one would leave a duplicate child.
+            return await create
+        # A stored session gets its first input and launch even if the client
+        # gives up, so a cancelled request never strands it half-made.
+        return await _finish_despite_cancellation(create, name="create-session")
+
+    async def _create_validated_session(
+        request: Request,
+        user_id: str | None,
+        body: SessionCreateInput,
+        *,
+        source: Conversation | None,
+        orchestration_source: str | None,
+        launching_task: ScheduledTask | None,
+    ) -> SessionResponse:
+        """Store, grant, and launch a session from a validated JSON create *body*."""
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv, resolved_body = await _create_session_from_existing_agent(
             conversation_store,
@@ -2226,169 +2283,184 @@ def register_core_routes(
             host_registry=getattr(request.app.state, "host_registry", None),
         )
         git_options = parsed_metadata.git
-        git_branch: str | None = None
-        created_worktree_path: str | None = None
-        if git_options is not None:
-            if git_options.existing_worktree:
-                from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+        if git_options is not None and git_options.existing_worktree:
+            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
-                try:
-                    validate_branch_name(git_options.branch_name)
-                except WorktreeError as exc:
-                    raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
-                git_branch = git_options.branch_name
-            else:
-                created_worktree = await _create_session_worktree(
-                    host_id=parsed_metadata.host_id,
-                    source_repo=parsed_metadata.workspace,
-                    git=git_options,
-                    request=request,
-                )
-                created_worktree_path = created_worktree.worktree_path
-                git_branch = created_worktree.branch
-                from omnigent.server.routes._host_worktree import (
-                    WORKTREE_ROOT_LABEL_KEY,
-                    worktree_root_fingerprint,
-                )
+            try:
+                validate_branch_name(git_options.branch_name)
+            except WorktreeError as exc:
+                raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
 
-                parsed_metadata = parsed_metadata.model_copy(
-                    update={
-                        "workspace": created_worktree.workspace or created_worktree.worktree_path,
-                        "labels": {
-                            **parsed_metadata.labels,
-                            WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(
-                                created_worktree.worktree_path
-                            ),
-                        },
-                    }
-                )
-        try:
-            with creation_stage("create_persistence_ms"):
-                result = await asyncio.to_thread(
-                    _create_session_from_bundle,
-                    conversation_store,
-                    artifact_store,
-                    parsed_metadata,
-                    bundle_bytes,
-                    inherited_runner_id,
-                    spec,
-                    inference_snapshot,
-                    inference_model,
-                    git_branch=git_branch,
-                    created_by=user_id,
-                    agent_store=agent_store,
-                    parent=parent_conv,
-                )
-            if parsed_metadata.sibling_source_id is not None:
-                from omnigent.server.session_families import complete_sibling_creation
+        async def create(parsed_metadata: SessionCreateMetadata) -> CreatedSessionResponse:
+            git_branch: str | None = None
+            created_worktree_path: str | None = None
+            if git_options is not None:
+                if git_options.existing_worktree:
+                    git_branch = git_options.branch_name
+                else:
+                    created_worktree = await _create_session_worktree(
+                        host_id=parsed_metadata.host_id,
+                        source_repo=parsed_metadata.workspace,
+                        git=git_options,
+                        request=request,
+                    )
+                    created_worktree_path = created_worktree.worktree_path
+                    git_branch = created_worktree.branch
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        worktree_root_fingerprint,
+                    )
 
-                await complete_sibling_creation(
-                    conversation_store,
-                    parsed_metadata.sibling_source_id,
-                    result.session_id,
-                    user_id=user_id,
+                    parsed_metadata = parsed_metadata.model_copy(
+                        update={
+                            "workspace": created_worktree.workspace
+                            or created_worktree.worktree_path,
+                            "labels": {
+                                **parsed_metadata.labels,
+                                WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(
+                                    created_worktree.worktree_path
+                                ),
+                            },
+                        }
+                    )
+            try:
+                with creation_stage("create_persistence_ms"):
+                    result = await asyncio.to_thread(
+                        _create_session_from_bundle,
+                        conversation_store,
+                        artifact_store,
+                        parsed_metadata,
+                        bundle_bytes,
+                        inherited_runner_id,
+                        spec,
+                        inference_snapshot,
+                        inference_model,
+                        git_branch=git_branch,
+                        created_by=user_id,
+                        agent_store=agent_store,
+                        parent=parent_conv,
+                    )
+                if parsed_metadata.sibling_source_id is not None:
+                    from omnigent.server.session_families import complete_sibling_creation
+
+                    await complete_sibling_creation(
+                        conversation_store,
+                        parsed_metadata.sibling_source_id,
+                        result.session_id,
+                        user_id=user_id,
+                    )
+                await record_profile(
+                    request, result.session_id, sandbox_profile, conversation_store
                 )
-            await record_profile(request, result.session_id, sandbox_profile, conversation_store)
-        except Exception:
-            if (
-                created_worktree_path is not None
-                and parsed_metadata.host_id is not None
-                and git_branch is not None
-            ):
-                await _remove_session_worktree_best_effort(
-                    host_id=parsed_metadata.host_id,
-                    worktree_path=created_worktree_path,
-                    branch=git_branch,
-                    delete_branch=git_options is None or not git_options.existing_branch,
-                    host_registry=getattr(request.app.state, "host_registry", None),
-                    reason="create-rollback",
-                )
-            raise
-        session_created(
-            result.session_id,
-            inherited_runner_id,
-            parent_session_id=parsed_metadata.parent_session_id,
-            agent_id=result.agent_id,
-            harness=spec_harness(spec),
-        )
-        # Top-level creates (no inherited runner) skip the notify —
-        # their runner registers itself later.
-        if inherited_runner_id is not None:
-            await _notify_runner_of_bundled_child(
+            except Exception:
+                if (
+                    created_worktree_path is not None
+                    and parsed_metadata.host_id is not None
+                    and git_branch is not None
+                ):
+                    await _remove_session_worktree_best_effort(
+                        host_id=parsed_metadata.host_id,
+                        worktree_path=created_worktree_path,
+                        branch=git_branch,
+                        delete_branch=git_options is None or not git_options.existing_branch,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        reason="create-rollback",
+                    )
+                raise
+            session_created(
                 result.session_id,
-                result.agent_id,
-                runner_router,
-                conversation_store=conversation_store,
-            )
-        # Grant the creator ownership BEFORE scheduling the managed
-        # launch, mirroring the JSON path: a managed-guard failure
-        # (misconfigured server, unconfigured provider) must not leave
-        # the just-persisted session unowned and thus invisible to the
-        # caller. Push to the caller's other open tabs, too.
-        if permission_store is not None and user_id is not None:
-            with creation_stage("create_identity_ms"):
-                await asyncio.to_thread(permission_store.ensure_user, user_id)
-            with creation_stage("create_acl_ms"):
-                await asyncio.to_thread(
-                    permission_store.grant, user_id, result.session_id, LEVEL_OWNER
-                )
-        await _accept_initial_input(
-            request, result.session_id, parsed_metadata.initial_input, user_id
-        )
-        _announce_session_added(user_id, result.session_id)
-        # Managed bundle create: provision a sandbox host for the
-        # just-uploaded session-scoped agent (same background launch as
-        # the JSON path). The managed runner fetches the uploaded bundle
-        # over its tunnel like any session-scoped agent, so no separate
-        # bundle delivery is needed. A sub-agent child (inherited runner)
-        # is never itself managed — it co-locates on the parent's runner.
-        if parsed_metadata.host_type == "managed" and inherited_runner_id is None:
-            await _schedule_managed_launch(
-                request,
-                session_id=result.session_id,
+                inherited_runner_id,
+                parent_session_id=parsed_metadata.parent_session_id,
                 agent_id=result.agent_id,
-                user_id=user_id,
-                sandbox_provider=parsed_metadata.sandbox_provider,
-                workspaces=parsed_metadata.managed_repo_workspaces(),
-                requested_host_id=parsed_metadata.requested_host_id,
+                harness=spec_harness(spec),
             )
-        # Caller-supplied external host: bind + launch a runner on it,
-        # exactly like the JSON create form (same authorization, atomic
-        # bind, and lenient launch-failure semantics — the ownership
-        # grant above is what resolve_host_launch's session-owner check
-        # sees). A sub-agent child (inherited runner) is never launched
-        # here — it co-locates on the parent's runner.
-        if parsed_metadata.host_id is not None and inherited_runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
-            from omnigent.models.model_catalog import spec_harness
-
-            raw_harness = spec_harness(spec)
-            with creation_stage("create_host_launch_ms"):
-                await _bind_and_launch_on_caller_host(
-                    request,
-                    user_id=user_id,
-                    session_id=result.session_id,
-                    host_id=parsed_metadata.host_id,
-                    workspace=parsed_metadata.workspace,
-                    harness=canonicalize_harness(raw_harness) or raw_harness,
+            # Top-level creates (no inherited runner) skip the notify —
+            # their runner registers itself later.
+            if inherited_runner_id is not None:
+                await _notify_runner_of_bundled_child(
+                    result.session_id,
+                    result.agent_id,
+                    runner_router,
+                    conversation_store=conversation_store,
                 )
-        # Default-public grant only after the launch steps were accepted (see the
-        # JSON path). Sub-agent children follow their parent's grants, whether or
-        # not they inherited its runner.
-        if (
-            user_id is not None
-            and parsed_metadata.parent_session_id is None
-            and parsed_metadata.sibling_source_id is None
-        ):
-            await _grant_default_public(
-                request.app.state,
-                permission_store,
-                result.session_id,
-                managed=parsed_metadata.host_type == "managed",
-                workspace=parsed_metadata.workspace,
-                host_id=parsed_metadata.host_id,
+            # Grant the creator ownership BEFORE scheduling the managed
+            # launch, mirroring the JSON path: a managed-guard failure
+            # (misconfigured server, unconfigured provider) must not leave
+            # the just-persisted session unowned and thus invisible to the
+            # caller. Push to the caller's other open tabs, too.
+            if permission_store is not None and user_id is not None:
+                with creation_stage("create_identity_ms"):
+                    await asyncio.to_thread(permission_store.ensure_user, user_id)
+                with creation_stage("create_acl_ms"):
+                    await asyncio.to_thread(
+                        permission_store.grant, user_id, result.session_id, LEVEL_OWNER
+                    )
+            await _accept_initial_input(
+                request, result.session_id, parsed_metadata.initial_input, user_id
             )
-        return result
+            _announce_session_added(user_id, result.session_id)
+            # Managed bundle create: provision a sandbox host for the
+            # just-uploaded session-scoped agent (same background launch as
+            # the JSON path). The managed runner fetches the uploaded bundle
+            # over its tunnel like any session-scoped agent, so no separate
+            # bundle delivery is needed. A sub-agent child (inherited runner)
+            # is never itself managed — it co-locates on the parent's runner.
+            if parsed_metadata.host_type == "managed" and inherited_runner_id is None:
+                await _schedule_managed_launch(
+                    request,
+                    session_id=result.session_id,
+                    agent_id=result.agent_id,
+                    user_id=user_id,
+                    sandbox_provider=parsed_metadata.sandbox_provider,
+                    workspaces=parsed_metadata.managed_repo_workspaces(),
+                    requested_host_id=parsed_metadata.requested_host_id,
+                )
+            # Caller-supplied external host: bind + launch a runner on it,
+            # exactly like the JSON create form (same authorization, atomic
+            # bind, and lenient launch-failure semantics — the ownership
+            # grant above is what resolve_host_launch's session-owner check
+            # sees). A sub-agent child (inherited runner) is never launched
+            # here — it co-locates on the parent's runner.
+            if parsed_metadata.host_id is not None and inherited_runner_id is None:
+                from omnigent.harness_aliases import canonicalize_harness
+
+                raw_harness = spec_harness(spec)
+                with creation_stage("create_host_launch_ms"):
+                    await _bind_and_launch_on_caller_host(
+                        request,
+                        user_id=user_id,
+                        session_id=result.session_id,
+                        host_id=parsed_metadata.host_id,
+                        workspace=parsed_metadata.workspace,
+                        harness=canonicalize_harness(raw_harness) or raw_harness,
+                    )
+            # Default-public grant only after the launch steps were accepted (see the
+            # JSON path). Sub-agent children follow their parent's grants, whether or
+            # not they inherited its runner.
+            if (
+                user_id is not None
+                and parsed_metadata.parent_session_id is None
+                and parsed_metadata.sibling_source_id is None
+            ):
+                await _grant_default_public(
+                    request.app.state,
+                    permission_store,
+                    result.session_id,
+                    managed=parsed_metadata.host_type == "managed",
+                    workspace=parsed_metadata.workspace,
+                    host_id=parsed_metadata.host_id,
+                )
+            return result
+
+        if parsed_metadata.parent_session_id is not None:
+            # Like JSON creates, children stay cancellable: finishing one after a
+            # timeout could duplicate it if the caller retries.
+            return await create(parsed_metadata)
+        # Bundle and worktree writes can't be stopped by a cancelled await,
+        # so finish everything from the first write on.
+        return await _finish_despite_cancellation(
+            create(parsed_metadata), name="create-bundled-session"
+        )
 
     # ── GET /sessions/projects ────────────────────────────────────
     #
@@ -6013,15 +6085,6 @@ def register_core_routes(
 
     # ── Continuing a session's work in another session ──────────
 
-    # Moves into a continuation still running after their request was cancelled.
-    _continuation_tasks: set[asyncio.Task[str]] = set()
-
-    def _forget_continuation(done: asyncio.Task[str]) -> None:
-        """Drop a finished move; its failure was reported to a waiting request."""
-        _continuation_tasks.discard(done)
-        if not done.cancelled():
-            done.exception()  # Retrieved, so an abandoned request's failure is not re-logged.
-
     async def _continue_session_in_fork(
         request: Request,
         source: Conversation,
@@ -6323,10 +6386,7 @@ def register_core_routes(
         # back) even if the request is cancelled, e.g. by a client disconnect,
         # so a cancellation never strands a half-made successor; meanwhile the
         # move guard refuses a retry.
-        task = asyncio.create_task(move(), name=f"continue-{source.id}")
-        _continuation_tasks.add(task)
-        task.add_done_callback(_forget_continuation)
-        return await asyncio.shield(task)
+        return await _finish_despite_cancellation(move(), name=f"continue-{source.id}")
 
     async def clear_session_into_fresh_session(
         request: Request,

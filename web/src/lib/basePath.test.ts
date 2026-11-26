@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { getBasePath, stripBasePath, withBasePath } from "./basePath";
+import { getApiBasePath, getBasePath, stripBasePath, withBasePath } from "./basePath";
 
 function setBase(value: string | undefined): void {
   if (value === undefined) {
@@ -12,6 +12,7 @@ function setBase(value: string | undefined): void {
 
 afterEach(() => {
   delete window.__OMNIGENT_BASE_PATH__;
+  delete window.__OMNIGENT_API_BASE_PATH__;
 });
 
 describe("getBasePath", () => {
@@ -45,6 +46,21 @@ describe("getBasePath", () => {
   it("trims surrounding whitespace", () => {
     setBase("  /proxy/6767  ");
     expect(getBasePath()).toBe("/proxy/6767");
+  });
+});
+
+describe("getApiBasePath", () => {
+  it("is the app's base path when no API base is injected", () => {
+    setBase("/proxy/6767");
+    expect(getApiBasePath()).toBe("/proxy/6767");
+  });
+
+  it("normalizes an injected API base the same way, even under another base path", () => {
+    setBase("/proxy/6767");
+    window.__OMNIGENT_API_BASE_PATH__ = "api/v2/";
+    expect(getApiBasePath()).toBe("/api/v2");
+    window.__OMNIGENT_API_BASE_PATH__ = "/";
+    expect(getApiBasePath()).toBe("");
   });
 });
 

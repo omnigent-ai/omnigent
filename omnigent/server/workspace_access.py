@@ -61,6 +61,22 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "MergePullRequest": WorkspaceGate.SESSION_OWNER,
     "MergePullRequestAsAccount": WorkspaceGate.SESSION_OWNER,
     "DisableAutoMerge": WorkspaceGate.SESSION_OWNER,
+    # Reviews act as the host's account, and its pending review holds unsubmitted drafts.
+    "GetPendingReview": WorkspaceGate.SESSION_OWNER,
+    "StartPendingReview": WorkspaceGate.SESSION_OWNER,
+    "AddPendingReviewComment": WorkspaceGate.SESSION_OWNER,
+    "UpdatePendingReviewComment": WorkspaceGate.SESSION_OWNER,
+    "DeletePendingReviewComment": WorkspaceGate.SESSION_OWNER,
+    "SubmitPendingReview": WorkspaceGate.SESSION_OWNER,
+    "DiscardPendingReview": WorkspaceGate.SESSION_OWNER,
+    "SubmitReview": WorkspaceGate.SESSION_OWNER,
+    "SubmitReviewVerdict": WorkspaceGate.SESSION_OWNER,
+    "SetReviewThreadResolved": WorkspaceGate.SESSION_OWNER,
+    "EditComment": WorkspaceGate.SESSION_OWNER,
+    "DeleteComment": WorkspaceGate.SESSION_OWNER,
+    "AddReaction": WorkspaceGate.SESSION_OWNER,
+    "RemoveReaction": WorkspaceGate.SESSION_OWNER,
+    "UploadAttachment": WorkspaceGate.SESSION_OWNER,
 }
 
 

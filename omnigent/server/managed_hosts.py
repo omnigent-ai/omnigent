@@ -861,7 +861,10 @@ class ManagedSandboxReaperConfig:
     :param terminate_after_offline_days: Minimum number of days since the
         managed host's last heartbeat/disconnect before its current sandbox
         generation may be terminated.
-    :param sweep_interval_s: Seconds between complete deployment-wide sweeps.
+    :param sweep_interval_s: Average seconds between one server process's
+        complete deployment-wide sweeps. The first sweep runs at a random point
+        within the first interval and later intervals vary by up to 10%, so
+        replicas that start together do not sweep together.
     """
 
     enabled: bool = False

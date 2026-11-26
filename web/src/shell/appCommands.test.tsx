@@ -59,6 +59,20 @@ describe("filterAppCommands", () => {
     expect(filterAppCommands(all, "  ")).toBe(all);
   });
 
+  it("lists search-only commands only for a matching nonblank query", () => {
+    const preview = {
+      ...all[0]!,
+      id: "preview",
+      label: "Try something new",
+      keywords: ["feature preview"],
+      searchOnly: true,
+    };
+    const withPreview = [...all, preview];
+    expect(filterAppCommands(withPreview, "  ")).toEqual(all);
+    expect(filterAppCommands(withPreview, "preview")).toEqual([preview]);
+    expect(filterAppCommands(withPreview, "unmatched")).toEqual([]);
+  });
+
   it("matches the label or a keyword, ignoring case and outer spaces", () => {
     expect(filterAppCommands(all, " SETT ").map((command) => command.id)).toEqual([
       "go-settings",
