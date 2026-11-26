@@ -661,6 +661,32 @@ class _SessionPageReads:
     batches: list[_SessionBatchReads] = dataclasses.field(default_factory=list)
 
 
+# Request work running on after its request was cancelled.
+# custom-lint: disable-next=workspace-scoped-cache -- holds globally unique task objects
+_unattended_work: set[asyncio.Task[Any]] = set()
+
+
+def _forget_unattended(done: asyncio.Task[Any]) -> None:
+    """Drop finished work, logging a failure no request is left to report."""
+    _unattended_work.discard(done)
+    if not done.cancelled() and (error := done.exception()) is not None:
+        _logger.warning(
+            "%s failed after its request was cancelled", done.get_name(), exc_info=error
+        )
+
+
+async def _finish_despite_cancellation[T](work: Coroutine[Any, Any, T], *, name: str) -> T:
+    """Await *work*, letting it run to its end if the request is cancelled."""
+    task = asyncio.create_task(work, name=name)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Work that failed just before the cancellation landed still needs its failure logged.
+        _unattended_work.add(task)
+        task.add_done_callback(_forget_unattended)
+        raise
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -1154,27 +1180,6 @@ def register_core_routes(
     _move_writes: dict[str, set[asyncio.Future[Any]]] = {}
     # Rollbacks finishing after their request was cancelled.
     _detached_rollbacks: set[asyncio.Task[None]] = set()
-    # Request work running on after its request was cancelled.
-    _unattended_work: set[asyncio.Task[Any]] = set()
-
-    def _forget_unattended(done: asyncio.Task[Any]) -> None:
-        """Drop finished work, logging a failure no request is left to report."""
-        _unattended_work.discard(done)
-        if not done.cancelled() and (error := done.exception()) is not None:
-            _logger.warning(
-                "%s failed after its request was cancelled", done.get_name(), exc_info=error
-            )
-
-    async def _finish_despite_cancellation[T](work: Coroutine[Any, Any, T], *, name: str) -> T:
-        """Await *work*, letting it run to its end if the request is cancelled."""
-        task = asyncio.create_task(work, name=name)
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if not task.done():
-                _unattended_work.add(task)
-                task.add_done_callback(_forget_unattended)
-            raise
 
     async def _settled_write(
         session_id: str, call: Callable[..., Any], *args: Any, **kwargs: Any
