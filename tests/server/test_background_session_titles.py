@@ -587,11 +587,16 @@ class _TitlesByPrompt:
     def __init__(self, initial: str | None = "Review linked issue") -> None:
         self.initial = initial
         self.prompts: list[str] = []
+        self.refining = asyncio.Event()
+        self.release_refinement = asyncio.Event()
+        self.release_refinement.set()
 
     async def __call__(self, request: BackgroundTitleRequest) -> str | None:
         self.prompts.append(request.prompt)
         if request.prompt == _FIRST_MESSAGE:
             return self.initial
+        self.refining.set()
+        await self.release_refinement.wait()
         return "Fix flaky upload retries"
 
 
@@ -618,29 +623,37 @@ async def test_first_reply_refines_the_generated_title(db_uri: str, initial: str
     )
 
 
-@pytest.mark.parametrize("rename_before_initial_title", [False, True])
+@pytest.mark.parametrize(
+    ("rename_at", "inferences"),
+    [("before_initial_title", 0), ("after_initial_title", 1), ("during_refinement", 2)],
+)
 async def test_refinement_keeps_a_rename_from_the_first_turn(
-    db_uri: str, rename_before_initial_title: bool
+    db_uri: str, rename_at: str, inferences: int
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     session_id = _first_turn_session(store)
     generator = _TitlesByPrompt()
+    generator.release_refinement.clear()
     coordinator = BackgroundSessionTitleCoordinator(store, generator, turn_settle_seconds=0)
 
-    if rename_before_initial_title:
+    if rename_at == "before_initial_title":
         store.update_conversation(session_id, title="Renamed by agent")
     coordinator.schedule(
         session_id=session_id, prompt=_FIRST_MESSAGE, expected_seed_title=_SEED_TITLE
     )
     await coordinator.wait_for_idle()
-    if not rename_before_initial_title:
+    if rename_at == "after_initial_title":
         store.update_conversation(session_id, title="Renamed by agent")
     _append_message(store, session_id, "assistant", "The issue is a flaky upload retry.")
     coordinator.turn_ended(session_id)
+    if rename_at == "during_refinement":
+        await generator.refining.wait()
+        store.update_conversation(session_id, title="Renamed by agent")
+    generator.release_refinement.set()
     await coordinator.wait_for_idle()
 
     assert store.get_conversation(session_id).title == "Renamed by agent"
-    assert len(generator.prompts) == (0 if rename_before_initial_title else 1)
+    assert len(generator.prompts) == inferences
 
 
 async def test_refinement_runs_once_per_session(db_uri: str) -> None:
@@ -687,13 +700,35 @@ async def test_refinement_waits_for_a_settled_first_reply(
     assert generator.prompts == [_FIRST_MESSAGE]
     assert store.get_conversation(session_id).title == "Review linked issue"
 
-    monkeypatch.setitem(_session_status_cache, session_id, "idle")
+    # A follow-up sent during the settle delay ends the first turn; its own reply
+    # must not be paired with the first request.
     _append_message(store, session_id, "assistant", "The issue is a flaky upload retry.")
+    _append_message(store, session_id, "user", "now draft the release notes")
+    _append_message(store, session_id, "assistant", "Release notes drafted.")
     coordinator.turn_ended(session_id)
     await coordinator.wait_for_idle()
 
     assert generator.prompts[-1].endswith("Agent reply:\nThe issue is a flaky upload retry.")
     assert store.get_conversation(session_id).title == "Fix flaky upload retries"
+
+
+async def test_refinement_is_dropped_when_the_first_turn_left_no_reply(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = _first_turn_session(store)
+    generator = _TitlesByPrompt()
+    coordinator = BackgroundSessionTitleCoordinator(store, generator, turn_settle_seconds=0)
+    coordinator.schedule(
+        session_id=session_id, prompt=_FIRST_MESSAGE, expected_seed_title=_SEED_TITLE
+    )
+    _append_message(store, session_id, "user", "now draft the release notes")
+    _append_message(store, session_id, "assistant", "Release notes drafted.")
+
+    for _ in range(2):
+        coordinator.turn_ended(session_id)
+        await coordinator.wait_for_idle()
+
+    assert generator.prompts == [_FIRST_MESSAGE]
+    assert store.get_conversation(session_id).title == "Review linked issue"
 
 
 async def test_refined_title_prompt_fits_the_runner_prompt_limit() -> None:

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    MessageData,
+    SlashCommandData,
 )
 from omnigent.entities.workflow import WORKFLOW_NAME_MAX_CHARS
 from omnigent.harness_aliases import canonicalize_harness
@@ -28,7 +30,7 @@ from omnigent.server.scheduled.workflow_automations import saved_workflow_run_na
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
-    from omnigent.entities.conversation import Conversation
+    from omnigent.entities.conversation import Conversation, ConversationItem
     from omnigent.runner.routing import RunnerRouter
     from omnigent.server.schemas import SessionEventInput
 
@@ -128,6 +130,8 @@ REFINED_TITLE_MESSAGE_MAX_CHARS = 1_500
 _MAX_REFINEMENT_TURN_END_CHECKS = 5
 #: Bounds memory for sessions whose first turn never ends.
 _MAX_PENDING_REFINEMENTS = 1_000
+#: Bounds the item scan for the first turn's reply (pages of 100 items).
+_FIRST_TURN_SCAN_PAGES = 10
 
 
 def refined_title_prompt(first_message: str, reply: str) -> str:
@@ -141,14 +145,51 @@ def refined_title_prompt(first_message: str, reply: str) -> str:
     return head + reply.strip()[: BACKGROUND_TITLE_MAX_PROMPT_CHARS - len(head)]
 
 
-def _first_reply_text(conversation_store: ConversationStore, session_id: str) -> str | None:
-    """Read the latest assistant reply that follows the latest user message."""
-    # Imported lazily: the sessions helpers import this module.
-    from omnigent.server.routes._sessions.helpers import _latest_assistant_text_from_store
+@dataclass(frozen=True)
+class _FirstTurnReply:
+    """The agent's last reply to a session's first input, as persisted so far."""
 
-    return _latest_assistant_text_from_store(
-        conversation_store, session_id, stop_at_user_message=True
+    text: str | None
+    #: A later user input exists, so the first turn's reply can no longer change.
+    superseded: bool
+
+
+def _is_user_input(item: ConversationItem) -> bool:
+    if isinstance(item.data, SlashCommandData):
+        return item.data.kind == "skill"
+    return (
+        isinstance(item.data, MessageData) and item.data.role == "user" and not item.data.is_meta
     )
+
+
+def _first_turn_reply(conversation_store: ConversationStore, session_id: str) -> _FirstTurnReply:
+    """Read the last assistant text between the session's first and second user inputs."""
+    # Imported lazily: the sessions helpers import this module.
+    from omnigent.server.routes._sessions.helpers import _message_text
+
+    reply: str | None = None
+    in_first_turn = False
+    after: str | None = None
+    for _ in range(_FIRST_TURN_SCAN_PAGES):
+        page = conversation_store.list_items(session_id, limit=100, after=after, order="asc")
+        for item in page.data:
+            if _is_user_input(item):
+                if in_first_turn:
+                    return _FirstTurnReply(text=reply, superseded=True)
+                in_first_turn = True
+            elif (
+                in_first_turn
+                and isinstance(item.data, MessageData)
+                and item.data.role == "assistant"
+                and not item.data.is_meta
+            ):
+                text = _message_text(item.data.content)
+                if text and text.strip():
+                    reply = text
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    return _FirstTurnReply(text=reply, superseded=False)
 
 
 def _session_is_running(session_id: str) -> bool:
@@ -433,13 +474,18 @@ class BackgroundSessionTitleCoordinator:
             if owned_title is None:
                 return
             await asyncio.sleep(self._turn_settle_seconds)
-            reply = None
-            if not _session_is_running(session_id):
-                reply = await asyncio.to_thread(
-                    _first_reply_text, self._conversation_store, session_id
-                )
-            if reply is None or not reply.strip():
-                if refinement.turn_end_checks + 1 < _MAX_REFINEMENT_TURN_END_CHECKS:
+            first_turn = await asyncio.to_thread(
+                _first_turn_reply, self._conversation_store, session_id
+            )
+            reply = first_turn.text
+            if not first_turn.superseded and _session_is_running(session_id):
+                # An idle lull mid-turn: the first reply may still change.
+                reply = None
+            if reply is None:
+                if (
+                    not first_turn.superseded
+                    and refinement.turn_end_checks + 1 < _MAX_REFINEMENT_TURN_END_CHECKS
+                ):
                     self._register_refinement(
                         replace(refinement, turn_end_checks=refinement.turn_end_checks + 1)
                     )
