@@ -4802,6 +4802,8 @@ _FAMILY_NESTED_WORKER_ID = "9b4e27d1c06a43f58e1d7a2c6b39f0e4"
 _FAMILY_OTHER_HOST_TWIN_ID = "c27e5b0a9d3f4c1e8b6a5d4f3e2c1b0a"
 _FAMILY_OTHER_HOST_ID = "e8a1d4c7b2f5469e93c0a7b6d5e4f3a2"
 _FAMILY_ROOT_WORKSPACE_ID = "5a6b7c8d9e0f41a2b3c4d5e6f7a8b9c0"
+_FAMILY_SAME_ROOT_ID = "0d1e2f3a4b5c46d7e8f9a0b1c2d3e4f5"
+_FAMILY_ENCLOSING_ID = "f6e5d4c3b2a1409f8e7d6c5b4a392817"
 
 
 class _FamilyConversationStore(_ConversationStore):
@@ -4814,7 +4816,7 @@ class _FamilyConversationStore(_ConversationStore):
         Two workers on that host have their own worktrees, one nested in the
         other. Another host records the nested worktree's path for different
         files and holds a workspace of its own, and one member's workspace is
-        ``/``.
+        ``/``. Two more members share the displayed workspace or enclose it.
 
         :returns: None.
         """
@@ -4823,7 +4825,7 @@ class _FamilyConversationStore(_ConversationStore):
         self._conversations[_FAMILY_SOURCE_ID] = dataclasses.replace(
             source,
             family_id=_FAMILY_SOURCE_ID,
-            workspace="/workspace/project",
+            workspace="/workspace/project/app",
             host_id="host-main",
         )
         for conversation_id, workspace, host_id in (
@@ -4836,6 +4838,8 @@ class _FamilyConversationStore(_ConversationStore):
             (_FAMILY_NESTED_WORKER_ID, "/workspace/project-worktrees/worker/nested", "host-main"),
             (_FAMILY_OTHER_HOST_ID, "/workspace/remote", "host-other"),
             (_FAMILY_ROOT_WORKSPACE_ID, "/", "host-main"),
+            (_FAMILY_SAME_ROOT_ID, "/workspace/project/app", "host-main"),
+            (_FAMILY_ENCLOSING_ID, "/workspace/project", "host-main"),
         ):
             self._conversations[conversation_id] = Conversation(
                 id=conversation_id,
@@ -4889,6 +4893,7 @@ async def family_client(runner_globals_reset: None) -> AsyncIterator[httpx.Async
             _FAMILY_NESTED_WORKER_ID,
             "shot.png",
         ),
+        ("/workspace/project/notes/shot.png", _FAMILY_ENCLOSING_ID, "notes/shot.png"),
     ],
 )
 async def test_filesystem_family_scope_reads_the_member_workspace(
@@ -4932,8 +4937,9 @@ async def test_filesystem_family_scope_reads_the_member_workspace(
 @pytest.mark.parametrize(
     ("path", "query", "status"),
     [
-        # The displayed session's own workspace is read with a relative path instead.
-        ("/workspace/project/shot.png", {"scope": "family", "base": "host"}, 404),
+        # The displayed session's own workspace is read with a relative path instead,
+        # even though members share or enclose it.
+        ("/workspace/project/app/shot.png", {"scope": "family", "base": "host"}, 404),
         # Held only by the "/" workspace, which never matches.
         ("/workspace/elsewhere/shot.png", {"scope": "family", "base": "host"}, 404),
         # Held only by a member on another host.
@@ -4944,6 +4950,12 @@ async def test_filesystem_family_scope_reads_the_member_workspace(
             400,
         ),
         ("/shot.png", {"scope": "family"}, 400),
+        # Extra leading slashes that browse normalization would otherwise collapse.
+        (
+            "/%2F%2Fworkspace/project-worktrees/worker/shot.png",
+            {"scope": "family", "base": "host"},
+            400,
+        ),
         (
             "/workspace/project-worktrees/worker/shot.png",
             {"scope": "family", "base": "host", "download": "true"},
@@ -4972,16 +4984,19 @@ async def test_filesystem_family_scope_rejects_reads_outside_member_workspaces(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("granted_ids", "status"),
+    ("granted_ids", "path", "status"),
     [
-        ((_FAMILY_SOURCE_ID,), 404),
-        ((_FAMILY_WORKER_ID,), 404),
-        ((_FAMILY_SOURCE_ID, _FAMILY_WORKER_ID), 200),
+        ((_FAMILY_SOURCE_ID,), "worker/shot.png", 404),
+        ((_FAMILY_WORKER_ID,), "worker/shot.png", 404),
+        ((_FAMILY_SOURCE_ID, _FAMILY_WORKER_ID), "worker/shot.png", 200),
+        # The deepest member is denied; the authorized enclosing worker is not a fallback.
+        ((_FAMILY_SOURCE_ID, _FAMILY_WORKER_ID), "worker/nested/shot.png", 404),
     ],
 )
 async def test_filesystem_family_scope_requires_browse_access_to_both_sessions(
     runner_globals_reset: None,
     granted_ids: tuple[str, ...],
+    path: str,
     status: int,
 ) -> None:
     del runner_globals_reset
@@ -5000,7 +5015,7 @@ async def test_filesystem_family_scope_requires_browse_access_to_both_sessions(
     ) as client:
         response = await client.get(
             f"/v1/sessions/{_FAMILY_SOURCE_ID}/resources/environments/default"
-            "/filesystem/workspace/project-worktrees/worker/shot.png",
+            f"/filesystem/workspace/project-worktrees/{path}",
             params={"scope": "family", "base": "host"},
             headers={"X-Forwarded-Email": "alice@example.com"},
         )

@@ -1065,7 +1065,15 @@ def register_resources_routes(
             family = conversation_store.get_session_family(source.id)
         except NotImplementedError:
             return None
-        source_host_id = routing_host_id(source, conversation_store)
+        host_owner = routing_host_session(source, conversation_store)
+        source_host_id = host_owner.host_id if host_owner is not None else None
+        # The displayed session reads its own workspace with ``scope=workspace``,
+        # so a member rooted at the same or an enclosing directory never serves it.
+        source_root = (
+            source.workspace or (host_owner.workspace if host_owner else None) or ""
+        ).rstrip("/")
+        if source_root.startswith("/") and absolute_path.startswith(f"{source_root}/"):
+            return None
         match: tuple[str, str] | None = None
         matched_root_length = -1
         for member in family:
@@ -3487,10 +3495,13 @@ def register_resources_routes(
         # shared context, everything past it is the owner's own machine. See
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
+        requested_path = relative_path
         absolute, relative_path = _resolve_browse_path(request, relative_path)
         family_scope = scope == "family"
         if family_scope:
-            if not absolute or download:
+            # ``base=host`` with the path's leading slash dropped, as the client sends
+            # it; checked before browse normalization collapses extra leading slashes.
+            if not absolute or download or requested_path.startswith("/"):
                 raise HTTPException(
                     status_code=400, detail="Family scope reads an absolute file path"
                 )

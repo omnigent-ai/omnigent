@@ -226,6 +226,7 @@ describe("assistant workspace markdown images", () => {
 
   it("opens an outside-workspace image whose family read failed only when clicked", async () => {
     VIEWER.openFile.mockClear();
+    fetchMock.mockResolvedValue(new Response("missing", { status: 404 }));
     renderMarkdown("![Screenshot](/workspace/project-worktrees/worker/shot.png)");
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
