@@ -40,9 +40,24 @@ export function isAbsoluteHostPath(path: string): boolean {
   return path.startsWith("/") || WINDOWS_ABS_PATH.test(path);
 }
 
-/** ``path`` without trailing separators, where ``\`` is one only on Windows; a root keeps one. */
+/** Whether ``path`` is a Windows absolute path, read as {@link matchWorktree} reads one. */
+export function isWindowsHostPath(path: string): boolean {
+  return WINDOWS_ABS_PATH.test(path);
+}
+
+/**
+ * ``path`` without trailing separators, where ``\`` is one only on Windows. A root keeps one:
+ * ``/`` stays ``/``, and ``C:\`` stays ``C:\``.
+ */
 export function trimHostPath(path: string): string {
-  return path.replace(WINDOWS_ABS_PATH.test(path) ? /(.)[/\\]+$/ : /(.)\/+$/, "$1");
+  if (!WINDOWS_ABS_PATH.test(path)) return path.replace(/(.)\/+$/, "$1");
+  const trimmed = path.replace(/[/\\]+$/, "");
+  return /^[A-Za-z]:$/.test(trimmed) ? path.slice(0, 3) : trimmed;
+}
+
+/** Whether ``path``, already trimmed, is a filesystem root: ``/`` or a drive such as ``C:\``. */
+export function isHostRoot(path: string): boolean {
+  return path === "/" || /^[A-Za-z]:[/\\]$/.test(path);
 }
 
 /**

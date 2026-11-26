@@ -193,6 +193,9 @@ describe("isAbsoluteHostPath and trimHostPath", () => {
     ["/", "/"],
     ["/repo/worktree\\", "/repo/worktree\\"],
     ["C:\\repo\\", "C:\\repo"],
+    ["C:\\", "C:\\"],
+    ["C:/", "C:/"],
+    ["C:\\\\", "C:\\"],
   ])("trims %s to %s", (path, trimmed) => {
     expect(trimHostPath(path)).toBe(trimmed);
   });

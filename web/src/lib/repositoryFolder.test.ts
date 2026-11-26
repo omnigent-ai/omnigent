@@ -86,41 +86,23 @@ describe("diffRootFor", () => {
     expect(diffRootFor(directory, "/repo", WORKTREES)).toBe(expected);
   });
 
+  it("keeps a drive root's separator for a worktree at the root of a drive", () => {
+    const drives = [worktree("C:\\repo", true), worktree("D:\\")];
+    expect(diffRootFor("D:\\src", "C:\\repo", drives)).toBe("D:\\");
+  });
+
   it("keeps the workspace while the worktrees are unknown", () => {
     expect(diffRootFor("/repo/.worktrees/feature", "/repo", [])).toBe("/repo");
   });
 });
 
 describe("repositoryFolderOf", () => {
+  // Containment boundaries live in `pathInWorktree`'s matrix; these check the arguments' order.
   it.each([
-    ["the workspace", "/repo", "/repo", ""],
-    ["the workspace with a trailing slash", "/repo/", "/repo", ""],
+    ["the workspace", "/repo/", "/repo", ""],
     ["a nested worktree", "/repo/.worktrees/feature", "/repo", ".worktrees/feature"],
-    [
-      "a nested worktree, workspace with a slash",
-      "/repo/.worktrees/feature/",
-      "/repo/",
-      ".worktrees/feature",
-    ],
-    ["a sibling sharing the name's start", "/repository/x", "/repo", null],
-    ["a folder outside", "/elsewhere/sibling", "/repo", null],
-    ["a POSIX sibling whose name holds a backslash", "/repo\\other", "/repo", null],
-    ["a folder of a workspace at the filesystem root", "/repo/src", "/", "repo/src"],
-    ["the filesystem root itself", "/", "/", ""],
-    [
-      "a Windows worktree listed with the other separator",
-      "C:\\repo\\.worktrees\\feature",
-      "C:/repo",
-      ".worktrees/feature",
-    ],
-    [
-      "a Windows worktree, the drive in another case",
-      "c:/repo/.worktrees/feature",
-      "C:\\repo",
-      ".worktrees/feature",
-    ],
-    ["the Windows workspace with a trailing separator", "C:\\repo\\", "c:/repo", ""],
-    ["a folder of a Windows drive's root", "C:\\repo", "C:\\", "repo"],
+    ["the workspace's parent, outside it", "/", "/repo", null],
+    ["a Windows worktree", "c:\\repo\\.worktrees\\feature", "C:/repo", ".worktrees/feature"],
   ])("names %s as the host does", (_case, root, workspace, expected) => {
     expect(repositoryFolderOf(root, workspace)).toBe(expected);
   });
@@ -150,6 +132,12 @@ describe("paths between a worktree's review and its session", () => {
     expect(repositoryPathOf("/src/a.ts", "", "/")).toBe("src/a.ts");
     // A workspace at a filesystem root, or written with a trailing separator.
     expect(repositoryPathOf("/worktree/a.ts", "worktree", "/")).toBe("a.ts");
+    // On a POSIX workspace a drive-like name is a file, however the path reaches it.
+    expect(repositoryPathOf("C:\\a.ts", "", "/repo")).toBe("C:\\a.ts");
+    expect(repositoryPathOf("/repo/C:\\a.ts", "", "/repo")).toBe("C:\\a.ts");
+    expect(workspacePathInRepository("C:\\a.ts", "")).toBe("C:\\a.ts");
+    expect(repositoryPathOf(".worktrees/feature/C:\\a.ts", FOLDER, "/repo")).toBe("C:\\a.ts");
+    expect(repositoryPathOf("/repo/.worktrees/feature/C:\\a.ts", FOLDER, "/repo")).toBe("C:\\a.ts");
     expect(repositoryPathOf("worktree/a.ts", "worktree", "/")).toBe("a.ts");
     expect(repositoryPathOf("C:\\worktree\\a.ts", "worktree", "C:\\")).toBe("a.ts");
     expect(repositoryPathOf("worktree/a.ts", "worktree", "C:\\")).toBe("a.ts");

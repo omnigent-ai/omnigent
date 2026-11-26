@@ -4,6 +4,8 @@
 import {
   type HostWorktree,
   isAbsoluteHostPath,
+  isHostRoot,
+  isWindowsHostPath,
   isWorktreeRoot,
   matchWorktree,
   pathInWorktree,
@@ -54,7 +56,7 @@ export function workspacePathInRepository(path: string, repository: string): str
 /** `relative` under `workspace`, adding no second separator after a root such as `/` or `C:\`. */
 function inWorkspace(workspace: string, relative: string): string {
   const base = trimHostPath(workspace);
-  return base.endsWith("/") ? `${base}${relative}` : `${base}/${relative}`;
+  return isHostRoot(base) ? `${base}${relative}` : `${base}/${relative}`;
 }
 
 /**
@@ -66,7 +68,9 @@ export function repositoryPathOf(
   repository: string,
   workspace: string | null,
 ): string | null {
-  const absolute = isAbsoluteHostPath(path);
+  // On a POSIX workspace `C:\a.ts` is a file name, so only a known Windows workspace reads drives.
+  const absolute =
+    workspace && !isWindowsHostPath(workspace) ? path.startsWith("/") : isAbsoluteHostPath(path);
   if (!absolute && !repository) return path;
   if (!workspace) {
     if (absolute) return null;

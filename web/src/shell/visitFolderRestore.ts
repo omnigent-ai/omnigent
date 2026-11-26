@@ -15,7 +15,7 @@ export interface VisitLanding {
 export function landingStands(
   landing: VisitLanding | undefined,
   now: { choices: number; folders: number },
-): landing is VisitLanding {
+): boolean {
   return (
     landing !== undefined &&
     !landing.settled &&
