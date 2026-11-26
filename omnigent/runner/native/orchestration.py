@@ -73,7 +73,11 @@ from omnigent.errors import (
     OmnigentError,
 )
 from omnigent.harness_plugins import native_provider_for_key
-from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.host.harness_startup import (
+    env_wrapper_chdir,
+    env_wrapper_command,
+    env_wrapper_environment,
+)
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
@@ -10479,12 +10483,15 @@ async def _auto_create_claude_terminal(
         launch_env = _claude_terminal_launch_env(
             env_spec, require_resolved=not resolve_mcp_inheritance("claude-native").inherit
         )
+        wrapped_command = env_wrapper_command(
+            env_spec.command or "", list(env_spec.args), _claude_terminal_pre_wrapper_env(env_spec)
+        )
         apply_claude_launch_mcp_policy(
             bridge_dir,
             cwd=launch_cwd,
             env=launch_env,
             active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
-            claude_args=claude_args,
+            claude_args=wrapped_command[1] if wrapped_command is not None else env_spec.args,
         )
         ensure_claude_workspace_trusted(launch_cwd, env=launch_env, added_dirs=trusted_added_dirs)
     except BaseException as seed_error:

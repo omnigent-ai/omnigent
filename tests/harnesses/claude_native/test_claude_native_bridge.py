@@ -18487,6 +18487,7 @@ def test_disabled_mcp_settings_launch_hook(
         "env": None,
         "discover_inherited": not deferred,
         "setting_sources": [] if skills_filter == "none" else None,
+        "claude_args": ("--model", "test-model"),
     }
     if deferred:
         assert hook.call_args_list[1].kwargs == {
@@ -18496,6 +18497,7 @@ def test_disabled_mcp_settings_launch_hook(
             "env": launch_env,
             "discover_inherited": True,
             "setting_sources": [] if skills_filter == "none" else None,
+            "claude_args": args,
         }
     assert hook.call_count == 1 + deferred
     assert args == original_args

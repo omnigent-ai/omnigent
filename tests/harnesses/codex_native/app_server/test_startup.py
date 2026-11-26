@@ -1556,11 +1556,15 @@ async def test_disabled_mcp_early_exit_retries_once(
         await harness.server.close()
 
 
-@pytest.mark.parametrize("last_attempt", ["ready", "silent", "exited"])
+@pytest.mark.parametrize(
+    ("last_attempt", "mixed_switch"),
+    [("ready", False), ("silent", False), ("exited", False), ("ready", True)],
+)
 async def test_disabled_mcp_retry_then_silent_respawn_keeps_fallback(
-    tmp_path, monkeypatch, caplog, last_attempt
+    tmp_path, monkeypatch, caplog, last_attempt, mixed_switch
 ):
     from omnigent import mcp_disabled_servers as disabled
+    from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
@@ -1578,7 +1582,10 @@ async def test_disabled_mcp_retry_then_silent_respawn_keeps_fallback(
     harness = _respawn_harness(tmp_path, monkeypatch, ready)
     (tmp_path / "source-codex-home/config.toml").write_text(
         '[mcp_servers.fixture]\ncommand="true"\n'
+        + ('[mcp_servers.strict_fixture]\ncommand="true"\n' if mixed_switch else "")
     )
+    if mixed_switch:
+        write_mcp_inheritance({"inherit": False, "allow": ["fixture"]})
     harness.server.active_harnesses = ["codex"]
     try:
         if last_attempt == "ready":
@@ -1589,6 +1596,9 @@ async def test_disabled_mcp_retry_then_silent_respawn_keeps_fallback(
         assert len(attempts) == len(harness.spawn_calls) == 3
         assert attempts[0] == (*attempts[1], "mcp_servers.fixture.enabled=false")
         assert attempts[1] == attempts[2]
+        if mixed_switch:
+            assert "mcp_servers.strict_fixture.enabled=false" in attempts[1]
+            assert "mcp_servers.fixture.enabled=false" not in attempts[1]
         assert caplog.text.count(disabled.RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
     finally:
         await harness.server.close()

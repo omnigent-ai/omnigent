@@ -1674,8 +1674,14 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
 
 
 @pytest.mark.parametrize(
-    "config_dir,legacy_in_cwd,expected",
-    [("relcfg", False, "sub/relcfg/.claude.json"), ("", True, "sub/.config.json")],
+    "config_dir,legacy_in_cwd,expected,wrapped,user_only",
+    [
+        ("relcfg", False, "sub/relcfg/.claude.json", True, False),
+        ("", True, "sub/.config.json", True, False),
+        ("relcfg", False, "sub/relcfg/.claude.json", True, True),
+        ("relcfg", False, "relcfg/.claude.json", False, True),
+    ],
+    ids=["relative-config", "empty-config", "wrapped-user-scopes", "direct-user-scopes"],
 )
 async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_dir(
     bridge_dir: Path,
@@ -1684,6 +1690,8 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     config_dir: str,
     legacy_in_cwd: bool,
     expected: str,
+    wrapped: bool,
+    user_only: bool,
 ) -> None:
     """
     ``env -C`` and a relative or empty ``CLAUDE_CONFIG_DIR`` compose in auto-create.
@@ -1710,30 +1718,49 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     if legacy_in_cwd:
         (workspace / "sub" / ".config.json").write_text("{}")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    if wrapped:
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", config_dir)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
     write_mcp_inheritance({"inherit": False})
     inherited = {
         workspace / "sub/.claude/settings.json": "launch_project",
-        workspace / f"sub/{config_dir}/settings.json": "launch_user",
+        (workspace / "sub" if wrapped else workspace)
+        / config_dir
+        / "settings.json": "launch_user",
         workspace / ".claude/settings.json": "workspace_project",
     }
     for path, name in inherited.items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"allowedMcpServers": [{"serverName": name}]}))
+        path.write_text(
+            "{invalid project JSON"
+            if user_only and name != "launch_user"
+            else json.dumps({"allowedMcpServers": [{"serverName": name}]})
+        )
     monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
     monkeypatch.setattr(
-        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+        "omnigent.harness_startup_config.resolve_harness_command",
+        lambda *_a, **_k: "env" if wrapped else "claude",
     )
-    monkeypatch.setattr(
-        "omnigent.harness_startup_config.resolve_harness_args",
-        lambda _harness, cli_args, cfg=None: [
+
+    def launch_args(_harness, cli_args, cfg=None):
+        scopes = ["--setting-sources", "project", "--setting-sources=user"] if user_only else []
+        if not wrapped:
+            return [*scopes, *cli_args]
+        return [
             "-C",
             "sub",
+            *(["--"] if user_only else []),
             f"CLAUDE_CONFIG_DIR={config_dir}",
             "claude",
+            *scopes,
             *cli_args,
-        ],
+        ]
+
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        launch_args,
     )
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
@@ -1745,12 +1772,15 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
         )
 
     data = json.loads((workspace / expected).read_text())
-    assert data["projects"][str((workspace / "sub").resolve())]["hasTrustDialogAccepted"] is True
+    launch_cwd = workspace / "sub" if wrapped else workspace
+    assert data["projects"][str(launch_cwd.resolve())]["hasTrustDialogAccepted"] is True
     assert not (tmp_path / "home" / ".claude.json").exists()
     launch_args = registry.launch_required_terminal.call_args.kwargs["spec"].args
     settings = json.loads(Path(launch_args[launch_args.index("--settings") + 1]).read_text())
     # ``workspace`` is the launch cwd's Git root, which Claude also reads.
-    denied = ["launch_user", "launch_project", "workspace_project"]
+    denied = (
+        ["launch_user"] if user_only else ["launch_user", "launch_project", "workspace_project"]
+    )
     assert settings["deniedMcpServers"] == [{"serverName": name} for name in denied]
 
 

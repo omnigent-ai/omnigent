@@ -281,6 +281,7 @@ def _claude_allowlisted_servers(
     inheritance: McpInheritance,
     env: Mapping[str, str] | None,
     managed_settings: Sequence[Mapping[str, object]],
+    claude_args: Sequence[str],
 ) -> list[tuple[str, Mapping[str, object]]]:
     """Return the readable configs of strict-allowlisted servers Claude may load from *cwd*."""
     from omnigent.harnesses.claude_native.bridge import claude_global_config_path
@@ -290,7 +291,7 @@ def _claude_allowlisted_servers(
         servers = data.get("mcpServers") if isinstance(data, Mapping) else None
         return servers if isinstance(servers, Mapping) else {}
 
-    def read(path: Path) -> Mapping[str, object]:
+    def read(path: Path, *, diagnostic_path: Path | None = None) -> Mapping[str, object]:
         # Unreadable configs hide allowlisted transports, so a matching entry is denied.
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -298,7 +299,9 @@ def _claude_allowlisted_servers(
             return {}
         except (OSError, UnicodeError, ValueError, RecursionError) as error:
             _log_read_failure(
-                path, type(error).__name__, event="mcp_strict_claude_config_read_failed"
+                diagnostic_path or path,
+                type(error).__name__,
+                event="mcp_strict_claude_config_read_failed",
             )
             return {}
         return payload if isinstance(payload, dict) else {}
@@ -315,6 +318,26 @@ def _claude_allowlisted_servers(
                 project = projects.get(key) if isinstance(projects, dict) else None
                 tables.append(servers_in(project))
             tables.append(servers_in(read(directory / ".mcp.json")))
+    configs: list[str] = []
+    collecting = False
+    for arg in claude_args:
+        if arg == "--":
+            break
+        if arg == "--mcp-config":
+            collecting = True
+        elif arg.startswith("--mcp-config="):
+            configs.append(arg.partition("=")[2])
+            collecting = True
+        elif arg.startswith("-"):
+            collecting = False
+        elif collecting:
+            configs.append(arg)
+    for config in configs:
+        try:
+            payload = json.loads(config)
+        except (ValueError, RecursionError):
+            payload = read(cwd / config, diagnostic_path=Path("--mcp-config"))
+        tables.append(servers_in(payload))
     return [
         (name, config)
         for table in tables
@@ -329,6 +352,7 @@ def _claude_inherited_denials(
     executor: str,
     env: Mapping[str, str] | None,
     setting_sources: Collection[str] | None,
+    claude_args: Sequence[str],
 ) -> list[dict[str, object]]:
     """Deny inherited MCP admissions outside the strict allowlist.
 
@@ -389,7 +413,7 @@ def _claude_inherited_denials(
                 elif field == "serverUrl" and isinstance(value, str):
                     if allowlisted is None:
                         allowlisted = _claude_allowlisted_servers(
-                            cwd, inheritance, env, managed_settings
+                            cwd, inheritance, env, managed_settings, claude_args
                         )
                     remote = next(
                         (
@@ -434,6 +458,7 @@ def apply_claude_settings(
     env: Mapping[str, str] | None = None,
     discover_inherited: bool = True,
     setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
 ) -> dict[str, object]: ...
 
 
@@ -447,6 +472,7 @@ def apply_claude_settings(
     env: Mapping[str, str] | None = None,
     discover_inherited: bool = True,
     setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
 ) -> str | None: ...
 
 
@@ -459,6 +485,7 @@ def apply_claude_settings(
     env: Mapping[str, str] | None = None,
     discover_inherited: bool = True,
     setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
 ) -> dict[str, object] | str | None:
     """Add Claude deny and strict-mode allow entries without modifying the caller's settings.
 
@@ -469,7 +496,8 @@ def apply_claude_settings(
     ``discover_inherited=False`` skips that reading, for a caller that applies these
     settings again once the launch context is known.
     ``setting_sources`` narrows ordinary files to the CLI's effective scopes;
-    managed policy always applies.
+    managed policy always applies. ``claude_args`` supplies additional native
+    ``--mcp-config`` definitions for remote admission checks.
 
     :raises McpStrictModeError: In strict mode, when the caller's settings or an
         inherited settings file cannot be read as a JSON object.
@@ -500,7 +528,7 @@ def apply_claude_settings(
             launch_cwd = Path(cwd) if cwd is not None else Path.cwd()
             wanted.extend(
                 _claude_inherited_denials(
-                    launch_cwd.absolute(), inheritance, executor, env, setting_sources
+                    launch_cwd.absolute(), inheritance, executor, env, setting_sources, claude_args
                 )
             )
         additions: list[dict[str, object]] = []

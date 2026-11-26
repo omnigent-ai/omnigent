@@ -1,6 +1,7 @@
 """Public contract for host-owned MCP disable state and launch planning."""
 
 import json
+import os
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
@@ -435,17 +436,32 @@ def test_claude_strict_refuses_inherited_command_entries(claude_project, executo
         ("https://mcp.example.com/*", "managed_drop_in", "http"),
         ("https://other.example.com/mcp", "user", "http"),
         ("https://other.example.com/mcp", "user", "sse"),
+        ("https://other.example.com/mcp", "cli_file", "http"),
+        ("https://other.example.com/mcp", "cli_inline", "sse"),
+        ("https://other.example.com/mcp", "cli_equals", "http"),
+        ("https://other.example.com/mcp", "cli_variadic", "http"),
     ],
 )
 def test_claude_strict_refuses_url_admissions_with_allowlisted_remote_servers(
-    claude_project, caplog, pattern, source, transport
+    claude_project, caplog, pattern, source, transport, monkeypatch
 ):
     """URL admissions override name-based admission even when their patterns differ."""
     from omnigent.onboarding import ambient
 
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     servers = {"mcpServers": {"kept": {"type": transport, "url": "https://mcp.example.com/kept"}}}
-    if source == "mcp_json":
+    cli_args: list[str] = []
+    if source.startswith("cli_"):
+        _write_json(claude_project / "cli-mcp.json", servers)
+        if source == "cli_inline":
+            cli_args = ["--mcp-config", json.dumps(servers)]
+        elif source == "cli_equals":
+            cli_args = ["--mcp-config=" + json.dumps(servers)]
+        elif source == "cli_variadic":
+            cli_args = ["--mcp-config", '{"mcpServers":{}}', "cli-mcp.json"]
+        else:
+            cli_args = ["--mcp-config", "cli-mcp.json"]
+    elif source == "mcp_json":
         _write_json(claude_project / ".mcp.json", servers)
     elif source.startswith("managed_"):
         managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
@@ -466,17 +482,39 @@ def test_claude_strict_refuses_url_admissions_with_allowlisted_remote_servers(
     _write_json(settings, {"allowedMcpServers": [{"serverUrl": pattern}]})
     launch = claude_project.parent / "linked-project"
     launch.symlink_to(claude_project, target_is_directory=True)
+
+    def apply():
+        if not cli_args:
+            return apply_claude_settings(
+                {}, executor="claude-native", active_harnesses=None, cwd=launch
+            )
+        from omnigent.harnesses.claude_native import bridge
+
+        root = claude_project / "bridge-root"
+        monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
+        directory = root / "case"
+        invocation = directory / bridge._INVOCATION_SETTINGS_FILE
+        _write_json(invocation, {})
+        bridge.apply_claude_launch_mcp_policy(
+            directory,
+            cwd=launch,
+            env=os.environ,
+            active_harnesses=None,
+            claude_args=cli_args,
+        )
+        return json.loads(invocation.read_text())
+
     with pytest.raises(
         McpStrictModeError,
         match=r"serverUrl.*allowlisted remote server kept",
     ) as raised:
-        apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
+        apply()
     assert raised.value.path == launch / ".claude/settings.json"
     assert pattern not in str(raised.value)
     assert pattern not in "".join(traceback.format_exception(raised.value))
     assert pattern not in caplog.text
     _write_json(settings, {"allowedMcpServers": [{"serverName": "kept"}]})
-    result = apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
+    result = apply()
     assert result["allowedMcpServers"] == [{"serverName": "omnigent"}, {"serverName": "kept"}]
     assert "deniedMcpServers" not in result
 

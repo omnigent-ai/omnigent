@@ -3195,6 +3195,7 @@ def augment_claude_args(
         env=None,
         discover_inherited=not defer_inherited_mcp_discovery,
         setting_sources=[] if skills_filter == "none" else _claude_setting_sources(claude_args),
+        claude_args=claude_args,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -3261,6 +3262,7 @@ def apply_claude_launch_mcp_policy(
         env=env,
         discover_inherited=True,
         setting_sources=_claude_setting_sources(claude_args),
+        claude_args=claude_args,
     )
     if updated is not settings:
         _write_json_file(settings_path, updated)
@@ -3274,6 +3276,7 @@ def _apply_native_mcp_settings(
     env: Mapping[str, str] | None,
     discover_inherited: bool,
     setting_sources: Collection[str] | None = None,
+    claude_args: Sequence[str] = (),
 ) -> dict[str, object]:
     """The single claude-native MCP launch hook, shared by both settings passes."""
     from omnigent.mcp_disabled_servers import apply_claude_settings
@@ -3286,6 +3289,7 @@ def _apply_native_mcp_settings(
         env=env,
         discover_inherited=discover_inherited,
         setting_sources=setting_sources,
+        claude_args=claude_args,
     )
 
 
