@@ -3016,17 +3016,23 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-@pytest.mark.parametrize("runner_survived", [False, True], ids=["restarted", "kept_runner"])
+@pytest.mark.parametrize(
+    ("runner_survived", "row_online_first"),
+    [(False, False), (True, False), (False, True)],
+    ids=["restarted", "kept_runner", "restarted_after_row_online"],
+)
 async def test_host_reconnect_ends_offline_hold_by_its_runner_list(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
     runner_survived: bool,
+    row_online_first: bool,
 ) -> None:
     """A host reconnecting here wakes the offline hold instead of waiting for a re-check.
 
     A restarted host's hello no longer lists the held runner, so the turn settles
-    after the short grace and its runner is relaunched. A host that kept the
-    runner gives it the full grace to reconnect.
+    after the short grace and its runner is relaunched, even when the hold already
+    saw the host's row online before its hello. A host that kept the runner gives
+    it the full grace to reconnect.
     """
     from omnigent.host.frames import HostHelloFrame
     from omnigent.runtime import get_conversation_store
@@ -3037,14 +3043,16 @@ async def test_host_reconnect_ends_offline_hold_by_its_runner_list(
     grace = 2.0
     monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
     monkeypatch.setattr(sessions_module, "HOST_BACK_WITHOUT_RUNNER_S", 0.05)
-    # Longer than the test, so only the host's reconnect can end the wait early.
-    monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 3600.0)
+    # Without a quick re-check to read the row online, only the host's reconnect ends the wait.
+    recheck_s = 0.05 if row_online_first else 3600.0
+    monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", recheck_s)
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
-    host_checks: list[str] = []
+    host_checks: list[bool] = []
+    row_offline = True
 
     async def host_row_offline(host_store: object, host_id: str) -> bool:
-        host_checks.append(host_id)
-        return True
+        host_checks.append(row_offline)
+        return row_offline
 
     monkeypatch.setattr(sessions_module, "_host_row_offline", host_row_offline)
     launch = AsyncMock()
@@ -3071,12 +3079,27 @@ async def test_host_reconnect_ends_offline_hold_by_its_runner_list(
     try:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         await communicator.wait(timeout=budget(2.0))
+        if row_online_first:
+            lookup = store.list_conversations_by_runner_id
+
+            def lookup_after_disconnect_grace(lookup_runner_id: str) -> list[Any]:
+                # Past the disconnect grace, so only the hold gets a grace outlasting the test.
+                monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", 3600.0)
+                return lookup(lookup_runner_id)
+
+            monkeypatch.setattr(
+                store, "list_conversations_by_runner_id", lookup_after_disconnect_grace
+            )
         await poll_until_async(lambda: bool(host_checks), timeout_s=budget(grace + 5.0))
         hold_task = next(
             task
             for task in asyncio.all_tasks()
             if task.get_name() == f"runner-disconnect-grace-{runner_id}"
         )
+        if row_online_first:
+            # The tunnel persists the host online before registering its connection.
+            row_offline = False
+            await poll_until_async(lambda: not host_checks[-1], timeout_s=budget(5.0))
         host_conn = ap_app.state.host_registry.register(
             host_id,
             AsyncMock(),

@@ -5046,6 +5046,7 @@ def create_app(
             and not _held_session_owner_changed(session_id, owners[session_id])
         )
         host_back_deadline: float | None = None
+        host_hello_read = False
         outcome = "cancelled"
         for conv in held:
             _logger.info(
@@ -5071,8 +5072,8 @@ def create_app(
                     remaining = min(remaining, max(0.0, host_back_deadline - now))
                 if await _wait_for_held_runner(
                     runner_id,
-                    # Until the host is back, its reconnect here ends the wait early.
-                    host_id if host_back_deadline is None else None,
+                    # Until this replica reads the host's hello, its reconnect ends the wait early.
+                    None if host_hello_read else host_id,
                     timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining),
                 ):
                     outcome = "runner_reconnected"
@@ -5084,20 +5085,22 @@ def create_app(
                 if await _host_offline(host_id) is False:
                     now = loop.time()
                     if host_back_deadline is None:
-                        host_conn = host_registry.get(host_id) if host_id is not None else None
+                        host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
+                    host_conn = host_registry.get(host_id) if host_id is not None else None
+                    if host_conn is not None and not host_hello_read:
+                        host_hello_read = True
                         # A host's hello lists its surviving runners; a restart lists none.
-                        grace_s = (
-                            HOST_BACK_WITHOUT_RUNNER_S
-                            if host_conn is not None and runner_id not in host_conn.hello.runners
-                            else RUNNER_DISCONNECT_GRACE_S
-                        )
-                        host_back_deadline = min(deadline, now + grace_s)
+                        if runner_id not in host_conn.hello.runners:
+                            host_back_deadline = min(
+                                host_back_deadline, now + HOST_BACK_WITHOUT_RUNNER_S
+                            )
                     if now >= host_back_deadline:
                         outcome = "host_back_without_runner"
                         break
                 else:
                     # A brief host return cannot end a sleeping host's absolute hold.
                     host_back_deadline = None
+                    host_hello_read = False
         finally:
             for conv in held:
                 _logger.info(

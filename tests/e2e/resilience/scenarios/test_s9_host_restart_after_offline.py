@@ -68,15 +68,17 @@ def test_s9_host_restart_after_offline(
             faults = contract.host_offline(lab)
             try:
                 time.sleep(contract.GRACE_S + 5)
-                label = working.inner_text() if working.is_visible() else ""
+                shown = working.is_visible()
+                label = working.inner_text() if shown else ""
+                marked = shown and working.get_attribute("data-host-offline") == "true"
                 hints = page.get_by_text(_OFFLINE_HINT).count()
                 interrupt = page.get_by_role("button", name=re.compile("Interrupt|Stop")).count()
                 page.screenshot(path=str(shots / "S9-offline-chat.png"))
                 report.check(
                     "chat_says_host_offline_not_working",
-                    bool(_OFFLINE_HINT.search(label)) if label else hints > 0,
-                    f"working row {label!r}, {interrupt} stop control(s), "
-                    f"{hints} offline hint(s), "
+                    marked and bool(_OFFLINE_HINT.search(label)),
+                    f"working row {label!r} (host-offline row: {marked}), "
+                    f"{interrupt} stop control(s), {hints} offline hint(s), "
                     f"status={lab.snapshot(session_id).get('status')}",
                 )
                 time.sleep(max(0.0, started + _OUTAGE_S - time.time()))
@@ -94,6 +96,13 @@ def test_s9_host_restart_after_offline(
 
             show_view(page, "terminal")
             surface = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+            sync_api.expect(surface).to_be_visible(timeout=_UI_TIMEOUT_MS)
+
+            def terminal_text(limit: int) -> str:
+                try:
+                    return surface.inner_text(timeout=2_000)[:limit]
+                except sync_api.Error:
+                    return ""
 
             def moved_on() -> float | None:
                 starting = surface.get_by_test_id("terminal-starting-up").is_visible()
@@ -103,7 +112,7 @@ def test_s9_host_restart_after_offline(
                     "terminal_sample",
                     status=status,
                     starting_up=starting,
-                    text=surface.inner_text()[:200],
+                    text=terminal_text(200),
                 )
                 return time.time() - host_back if not starting and status != "running" else None
 
@@ -114,8 +123,7 @@ def test_s9_host_restart_after_offline(
                 left_at is not None and float(left_at) <= _HOST_RETURN_S,
                 f"moved on after {left_at:.0f}s"
                 if isinstance(left_at, float)
-                else f"still waiting after {_TERMINAL_WATCH_S:.0f}s: "
-                f"{surface.inner_text()[:120]!r}",
+                else f"still waiting after {_TERMINAL_WATCH_S:.0f}s: {terminal_text(120)!r}",
             )
             lab.events.emit("lab", "terminal_moved_on", after_s=left_at)
 
