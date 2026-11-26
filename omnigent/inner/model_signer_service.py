@@ -306,6 +306,19 @@ class _SignerRelay(EgressProxy):
         _, length = _parse_strict_request_headers(headers_raw)
         return length
 
+    async def _handle_http(
+        self,
+        writer: asyncio.StreamWriter,
+        reader: asyncio.StreamReader,
+        method: str,
+        url: str,
+        request_line: bytes,
+        headers_raw: bytes,
+    ) -> None:
+        """Refuse plain HTTP, whether absolute-form or inside a CONNECT tunnel."""
+        del reader, method, url, request_line, headers_raw
+        await self._send_forbidden(writer, "")
+
     async def _assert_destination_allowed(self, host: str, port: int) -> str | None:
         if host.lower() != self._route.host or port != 443:
             raise PermissionError("destination is outside the signer route")

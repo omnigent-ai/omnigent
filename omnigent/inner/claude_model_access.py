@@ -889,7 +889,9 @@ class _ClaudeRelay(_SignerRelay):
         if urlsplit(url).hostname == self._access.host:
             await self._send_forbidden(writer, "")
             return
-        await super()._handle_http(writer, reader, method, url, request_line, headers_raw)
+        await EgressProxy._handle_http(
+            self, writer, reader, method, url, request_line, headers_raw
+        )
 
 
 def resolve_claude_model_access(

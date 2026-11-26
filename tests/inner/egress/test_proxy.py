@@ -543,10 +543,11 @@ async def test_connect_tunnel_forwards_plain_http_to_allowed_host(
     ("listener", "request_target", "expected_response", "expected_requests"),
     [
         ("unix", "GET /probe?x=1", b"HTTP/1.1 200", [("GET", "/probe?x=1")]),
+        ("tcp", "GET /probe;v=1?x=1", b"HTTP/1.1 200", [("GET", "/probe;v=1?x=1")]),
         ("tcp", "POST /probe", b"HTTP/1.1 403 Forbidden\r\n", []),
         ("tcp", "GET http://other.example.com/probe", b"HTTP/1.1 403 Forbidden\r\n", []),
     ],
-    ids=["unix-listener", "denied-method", "absolute-form-authority"],
+    ids=["unix-listener", "path-params", "denied-method", "absolute-form-authority"],
 )
 async def test_connect_tunnel_plain_http_keeps_request_policy(
     ca_paths: tuple[Path, Path, Path],
@@ -2140,6 +2141,91 @@ def test_tunnel_parser_defaults_preserve_frozen_signer_framing(
         proxy._parse_tunnel_content_length(
             host, b"Content-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("relay", "connect_authority", "request_target", "expected_response", "expected_requests"),
+    [
+        ("signer", "model.example.com:443", "POST /v1/responses", b"HTTP/1.1 403", []),
+        ("signer", None, "POST http://model.example.com:443/v1/responses", b"HTTP/1.1 403", []),
+        ("claude", "model.example.com:443", "POST /v1/messages", b"HTTP/1.1 403", []),
+        ("claude", "upstream", "GET /probe", b"HTTP/1.1 200", [("GET", "/probe")]),
+    ],
+    ids=["signer-tunnel", "signer-absolute-form", "claude-model-host", "claude-ordinary-host"],
+)
+async def test_model_relays_forward_plain_http_only_to_ordinary_hosts(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    relay: str,
+    connect_authority: str | None,
+    request_target: str,
+    expected_response: bytes,
+    expected_requests: list[tuple[str, str]],
+) -> None:
+    """Plain HTTP never reaches a model route, but the Claude relay keeps ordinary egress."""
+    import omnigent.inner.egress.proxy as proxy_module
+    from omnigent.inner.model_egress import FrozenModelRoute
+    from omnigent.inner.model_signer_service import _SignerRelay
+
+    cert_path, key_path, bundle_path = ca_paths
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    if relay == "signer":
+        proxy: EgressProxy = _SignerRelay(
+            route=FrozenModelRoute("POST", "model.example.com", "/v1/responses"),
+            placeholder="session-placeholder",
+            bearer_token="parent-secret",
+            ca_cert_path=cert_path,
+            ca_key_path=key_path,
+            ca_bundle_path=bundle_path,
+            provider_port=upstream_port,
+        )
+    else:
+        access = ClaudeModelAccess("https://model.example.com", "x-api-key", lambda: "secret")
+        proxy = access.create_proxy(
+            parse_rules(["GET 127.0.0.1/**"]),
+            cert_path,
+            key_path,
+            upstream_ca_bundle=bundle_path,
+            block_private_destinations=False,
+        )
+    credential = AsyncMock(side_effect=AssertionError("plain HTTP must not resolve credentials"))
+    monkeypatch.setattr(proxy._credential_source, "token_for_request", credential)
+    open_upstream = AsyncMock(wraps=proxy_module._open_upstream)
+    monkeypatch.setattr(proxy_module, "_open_upstream", open_upstream)
+    if connect_authority == "upstream":
+        connect_authority = f"127.0.0.1:{upstream_port}"
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", await proxy.start_tcp())
+        if connect_authority is not None:
+            writer.write(
+                f"CONNECT {connect_authority} HTTP/1.1\r\n"
+                f"Host: {connect_authority}\r\n\r\n".encode()
+            )
+            await writer.drain()
+            established = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+            assert b" 200 " in established.split(b"\r\n", 1)[0]
+        host = (connect_authority or "model.example.com").rsplit(":", 1)[0]
+        writer.write(
+            f"{request_target} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n".encode()
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=5)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert response.startswith(expected_response), response[:200]
+    assert open_upstream.await_count == len(expected_requests)
+    assert [(request.method, request.path) for request in captured] == expected_requests
+    credential.assert_not_awaited()
 
 
 @pytest.mark.asyncio

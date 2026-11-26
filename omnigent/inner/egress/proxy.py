@@ -40,7 +40,7 @@ from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
@@ -1081,7 +1081,7 @@ class EgressProxy:
         headers_raw: bytes,
     ) -> None:
         """Handle plain HTTP proxy request."""
-        # S5 (security): ``urlparse`` raises ``ValueError`` on a few
+        # S5 (security): ``urlsplit`` raises ``ValueError`` on a few
         # malformed-authority shapes (notably unbalanced brackets, e.g.
         # ``http://attacker.example.com[evil].allowed.com/``). Without
         # this catch the exception escapes ``_handle_http`` and the
@@ -1091,9 +1091,9 @@ class EgressProxy:
         # from a hard proxy block. Treat the same as any other
         # invalid-host case and reply with the canonical 403.
         try:
-            parsed = urlparse(url)
+            parsed = urlsplit(url)
         except ValueError as exc:
-            logger.warning("REJECT-MALFORMED-URL %s %r — urlparse: %s", method, url, exc)
+            logger.warning("REJECT-MALFORMED-URL %s %r — urlsplit: %s", method, url, exc)
             await self._send_forbidden(writer, "host contains forbidden character")
             return
         host = parsed.hostname or ""
@@ -1105,7 +1105,7 @@ class EgressProxy:
         # S5 (security): same hostname canonicalization defense as
         # ``_handle_connect`` — see the comment there for the full
         # list of parser-differential vectors a strict DNS-grammar
-        # allowlist forecloses. ``urlparse`` preserves embedded NULs
+        # allowlist forecloses. ``urlsplit`` preserves embedded NULs
         # and percent characters in ``.hostname``, so the check must
         # run BEFORE ``check_request`` (whose wildcard branch uses
         # ``str.endswith``) and BEFORE ``_assert_destination_allowed``
