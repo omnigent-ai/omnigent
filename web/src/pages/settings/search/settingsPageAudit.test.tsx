@@ -66,7 +66,7 @@ const SERVER_INFO: ServerInfo = {
   session_title_instructions: true,
   agent_install: true,
   agent_detail: true,
-  features: { custom_agents_settings_ui: true },
+  features: { custom_agents_settings_ui: true, tiles_view: true },
 } as ServerInfo;
 
 const MANAGED_AGENT = {
