@@ -1,5 +1,6 @@
 import type * as UseSessionModule from "@/hooks/useSession";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -41,9 +42,13 @@ import { WorkingCopyComparisonOwner } from "@/lib/workingCopyComparisonOwner";
 import {
   invalidateWorkingCopyChanges,
   setWorkingCopyComparisonsForTests,
+  sessionChoiceCount,
+  workingCopyComparisonsAt,
+  workspaceKeyOf,
 } from "@/lib/workingCopyComparisons";
 
-import { useWorkingCopyChanges } from "./useWorkingCopyChanges";
+import { ComparisonOwnerContext } from "./useComparisonOwner";
+import { useWorkingCopyBaseCommands, useWorkingCopyChanges } from "./useWorkingCopyChanges";
 
 const SESSION = "conv_hook";
 
@@ -237,5 +242,106 @@ describe("useWorkingCopyChanges", () => {
     );
     invalidateWorkingCopyChanges(queryClient, SESSION);
     await waitFor(() => expect(listings).toHaveLength(2));
+  });
+});
+
+describe("a base chosen in a repository folder's review", () => {
+  it("keeps the workspace's saved base, comparison and count", async () => {
+    const client = new QueryClient();
+    const plain = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const folder = workingCopyComparisonsAt(".worktrees/feature");
+    const inFolder = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>
+        <ComparisonOwnerContext.Provider value={folder}>{children}</ComparisonOwnerContext.Provider>
+      </QueryClientProvider>
+    );
+    // The sidebar's count: Automatic shows the workspace's branch point.
+    const count = renderHook(() => useWorkingCopyChanges(SESSION, { kind: "count" }), {
+      wrapper: plain,
+    });
+    await waitFor(() => expect(listings).toHaveLength(1));
+    answerListing(["branch_only.ts"]);
+    await waitFor(() => expect(count.result.current.comparison.base).toBe("branch-point"));
+
+    const folderCommands = renderHook(() => useWorkingCopyBaseCommands(SESSION), {
+      wrapper: inFolder,
+    });
+    act(() =>
+      folderCommands.result.current.find((command) => command.id === "compare-head")!.run(),
+    );
+
+    const checked = (commands: { id: string; checked?: boolean }[]) =>
+      commands.find((command) => command.checked)?.id;
+    expect(checked(folderCommands.result.current)).toBe("compare-head");
+    expect(readWorkingCopyBaseIntent()).toBe("automatic");
+    const workspaceCommands = renderHook(() => useWorkingCopyBaseCommands(SESSION), {
+      wrapper: plain,
+    });
+    expect(checked(workspaceCommands.result.current)).toBe("compare-automatic");
+    expect(count.result.current.comparison.base).toBe("branch-point");
+    expect(count.result.current.data?.data.map((entry) => entry.path)).toEqual(["branch_only.ts"]);
+  });
+
+  it("stays apart from a folder of the same name in another workspace or host", () => {
+    const client = new QueryClient();
+    const inFolderAt = (owner: WorkingCopyComparisonOwner) =>
+      function InFolder({ children }: { children: ReactNode }) {
+        return (
+          <QueryClientProvider client={client}>
+            <ComparisonOwnerContext.Provider value={owner}>
+              {children}
+            </ComparisonOwnerContext.Provider>
+          </QueryClientProvider>
+        );
+      };
+    const at = (hostId: string, root: string) =>
+      workingCopyComparisonsAt(".worktrees/feature", workspaceKeyOf(hostId, root));
+    const alpha = at("host-alpha", "/projects/alpha");
+    const beta = at("host-beta", "/projects/beta");
+    const sameHostOtherRoot = at("host-alpha", "/projects/other");
+    const render = (owner: WorkingCopyComparisonOwner) =>
+      renderHook(() => useWorkingCopyBaseCommands(SESSION), { wrapper: inFolderAt(owner) });
+    const checked = (commands: { id: string; checked?: boolean }[]) =>
+      commands.find((command) => command.checked)?.id;
+    const inAlpha = render(alpha);
+    const inBeta = render(beta);
+    const inOther = render(sameHostOtherRoot);
+
+    act(() => inAlpha.result.current.find((command) => command.id === "compare-head")!.run());
+
+    expect(checked(inAlpha.result.current)).toBe("compare-head");
+    expect(checked(inBeta.result.current)).toBe("compare-automatic");
+    expect(checked(inOther.result.current)).toBe("compare-automatic");
+  });
+
+  it("counts a choice there as the session's, so a tab's landing knows it is older", () => {
+    const client = new QueryClient();
+    const folder = workingCopyComparisonsAt(".worktrees/feature");
+    const inFolder = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>
+        <ComparisonOwnerContext.Provider value={folder}>{children}</ComparisonOwnerContext.Provider>
+      </QueryClientProvider>
+    );
+    const commands = renderHook(() => useWorkingCopyBaseCommands(SESSION), { wrapper: inFolder });
+    const before = sessionChoiceCount(SESSION);
+    act(() => commands.result.current.find((command) => command.id === "compare-head")!.run());
+    expect(sessionChoiceCount(SESSION)).toBe(before + 1);
+  });
+
+  it("follows the workspace's saved base until a base is chosen there", () => {
+    const client = new QueryClient();
+    const folder = workingCopyComparisonsAt(".worktrees/feature");
+    const inFolder = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>
+        <ComparisonOwnerContext.Provider value={folder}>{children}</ComparisonOwnerContext.Provider>
+      </QueryClientProvider>
+    );
+    const commands = renderHook(() => useWorkingCopyBaseCommands(SESSION), { wrapper: inFolder });
+    const checked = () => commands.result.current.find((command) => command.checked)?.id;
+    expect(checked()).toBe("compare-automatic");
+    act(() => void writeWorkingCopyBaseIntent("branch-point"));
+    expect(checked()).toBe("compare-branch-point");
   });
 });

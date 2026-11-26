@@ -5,6 +5,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 
+import { useComparisonRepository } from "@/hooks/useComparisonOwner";
 import {
   BRANCH_COMMITS_KEY,
   BRANCH_RANGE,
@@ -35,6 +36,8 @@ export function useBranchCommits(
   const lastRange = useRef<{ owner: string; range: RevisionSpec }>({ owner, range: BRANCH_RANGE });
   const previous = lastRange.current.owner === owner ? lastRange.current.range : BRANCH_RANGE;
   const range = commitsRange(custom, previous);
+  // A review of a repository folder lists that repository's commits.
+  const repository = useComparisonRepository();
   useEffect(() => {
     lastRange.current = { owner, range };
   }, [owner, range]);
@@ -46,8 +49,9 @@ export function useBranchCommits(
       workspace?.root ?? null,
       range.base,
       range.head,
+      repository,
     ],
-    queryFn: ({ signal }) => fetchBranchCommits(sessionId, range, signal),
+    queryFn: ({ signal }) => fetchBranchCommits(sessionId, range, signal, repository),
     enabled: enabled && workspace !== null,
     staleTime: COMMITS_STALE_MS,
     retry: false,

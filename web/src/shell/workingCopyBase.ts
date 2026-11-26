@@ -3,6 +3,7 @@
 // review names HEAD only when the workspace is known to be a Git worktree.
 
 import type { DiffReviewBase } from "@/components/diff-review/DiffReviewBaseMenu";
+import { useComparisonRepository } from "@/hooks/useComparisonOwner";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { branchPointLabel, type EffectiveComparison } from "@/lib/workingCopyComparison";
 import type { WorkingCopyBaseCommand } from "@/lib/workingCopyBaseCommands";
@@ -39,7 +40,10 @@ export function useWorkingCopyBase(conversationId: string): WorkingCopyBase | nu
   const hostId = useSessionHostId();
   const { root } = useWorkspacePaths();
   const worktrees = useSessionWorktrees(conversationId, hostId, root);
-  return workingCopyBase(worktrees.data, root);
+  // A review of a worktree inside the workspace names that worktree's branch.
+  const repository = useComparisonRepository();
+  const reviewed = root && repository ? `${root.replace(/\/+$/, "")}/${repository}` : root;
+  return workingCopyBase(worktrees.data, reviewed);
 }
 
 /** The last commit, named without a worktree probe. */

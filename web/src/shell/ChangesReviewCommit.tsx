@@ -6,7 +6,12 @@ import { ArrowLeftIcon, ChevronDownIcon, ChevronUpIcon, Loader2Icon } from "luci
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ComparisonOwnerContext, useComparisonOwner } from "@/hooks/useComparisonOwner";
+import {
+  ComparisonOwnerContext,
+  useComparisonOwner,
+  useComparisonRepository,
+  useComparisonWorkspaceKey,
+} from "@/hooks/useComparisonOwner";
 import { type WorkingCopyChanges, useWorkingCopyChanges } from "@/hooks/useWorkingCopyChanges";
 import type { BranchCommit } from "@/lib/branchCommits";
 import { type CommitComparisons, createCommitComparisons } from "@/lib/commitComparisons";
@@ -34,7 +39,11 @@ export interface CommitStepFocus {
  * The owner that reads `spec`, made once a commit is first opened and kept for the
  * review's life, so stepping only changes what it compares.
  */
-export function useCommitComparisons(spec: RevisionSpec | null): WorkingCopyComparisonOwner | null {
+export function useCommitComparisons(
+  spec: RevisionSpec | null,
+  repository = "",
+  workspaceKey = "",
+): WorkingCopyComparisonOwner | null {
   const instance = useRef<CommitComparisons | null>(null);
   const [owner, setOwner] = useState<WorkingCopyComparisonOwner | null>(null);
   const base = spec?.base;
@@ -47,11 +56,12 @@ export function useCommitComparisons(spec: RevisionSpec | null): WorkingCopyComp
       return;
     }
     const created = createCommitComparisons(next, (customComparisons) =>
-      createComparisonOwner({ customComparisons, onlyTyped: true }),
+      createComparisonOwner({ customComparisons, onlyTyped: true, repository, workspaceKey }),
     );
     instance.current = created;
     setOwner(created.owner);
-  }, [base, head]);
+    // A review keys itself by its folder, so one owner keeps the folder it was made with.
+  }, [base, head, repository, workspaceKey]);
   useEffect(
     () => () => {
       instance.current?.dispose();
@@ -81,7 +91,8 @@ export function OpenBranchCommit({
   renderChanges: (changes: WorkingCopyChanges) => React.ReactNode;
 }) {
   const spec = commitRevisions(commit.oid, { root: commit.root });
-  const owner = useCommitComparisons(spec);
+  // A commit of a repository folder's review is listed from that folder.
+  const owner = useCommitComparisons(spec, useComparisonRepository(), useComparisonWorkspaceKey());
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="changes-review-open-commit">
       <BranchCommitToolbar
