@@ -40,6 +40,7 @@ from omnigent.git_providers import (
     providers,
     resolve_remote,
 )
+from omnigent.runner import github_review_fields as review_fields
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
@@ -89,7 +90,7 @@ _MAX_BODY_CHARS = 65536
 # GitHub's image limit. Videos may be 100 MB there, but the server and host
 # tunnels each carry the file base64-encoded (a third larger) in one 100 MB frame.
 _MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
-_MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
+MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
 # Leading bytes of each media type GitHub accepts as an attachment, with its extension.
 _ATTACHMENT_SIGNATURES: tuple[tuple[int, bytes, str, str], ...] = (
     (0, b"\x89PNG\r\n\x1a\n", "image/png", "png"),
@@ -1245,18 +1246,25 @@ def pr_review_threads(
     after: str = "",
     head_sha: str = "",
     base_sha: str = "",
+    account_rights: bool = False,
 ) -> dict[str, Any]:
-    """Read published conversations, requiring pinned revisions for pagination."""
+    """Read published conversations, requiring pinned revisions for pagination.
+
+    :param account_rights: Whether to include what the host's account may do and did, which
+        a server asks for only for the session's owner. An older server never asks, and shows
+        the page to anyone.
+    """
     facet, reference = _review_target(session_id, pr_url)
     if after and (not _COMMIT_SHA.fullmatch(head_sha) or not _COMMIT_SHA.fullmatch(base_sha)):
         raise ValueError("Expected full head and base commit SHAs")
-    return facet.review_threads(
+    page = facet.review_threads(
         root,
         reference,
         after=_review_identifier(after) if after else "",
         head_sha=head_sha,
         base_sha=base_sha,
     )
+    return page if account_rights else review_fields.threads_without_account_rights(page)
 
 
 def pr_review_thread_comments(
@@ -1266,12 +1274,14 @@ def pr_review_thread_comments(
     pr_url: str | None = None,
     thread_id: str,
     after: str,
+    account_rights: bool = False,
 ) -> dict[str, Any]:
-    """Read additional replies from a conversation on the selected PR."""
+    """Read additional replies from a conversation on the selected PR; see above."""
     facet, reference = _review_target(session_id, pr_url)
-    return facet.review_thread_comments(
+    page = facet.review_thread_comments(
         root, reference, thread_id=_review_identifier(thread_id), after=_review_identifier(after)
     )
+    return page if account_rights else review_fields.comments_without_account_rights(page)
 
 
 @_invalidates_panel_reads
@@ -1453,7 +1463,7 @@ def upload_pr_attachment(
         raise ValueError("Attach a PNG, JPEG, GIF, or WebP image, or an MP4, MOV, or WebM video")
     content_type, extension = media
     limit = (
-        _MAX_VIDEO_ATTACHMENT_BYTES
+        MAX_VIDEO_ATTACHMENT_BYTES
         if content_type.startswith("video/")
         else _MAX_IMAGE_ATTACHMENT_BYTES
     )

@@ -2,7 +2,7 @@
 // the search state; this component renders it and maps keys to commands. An
 // editor can add a replace row.
 
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { type CSSProperties, useEffect, useId, useRef, type ReactNode } from "react";
 import {
   ChevronDownIcon,
@@ -11,6 +11,7 @@ import {
   ReplaceAllIcon,
   ReplaceIcon,
   SearchIcon,
+  TextSelectIcon,
   XIcon,
 } from "lucide-react";
 import {
@@ -68,6 +69,21 @@ export interface FindBarReplace {
   /** Replaces the selected match and moves to the next one. */
   onReplace: () => void;
   onReplaceAll: () => void;
+  /** Shows a Preserve case toggle when set: each replacement takes its match's case. */
+  preserveCase?: boolean;
+  onPreserveCaseChange?: (preserveCase: boolean) => void;
+}
+
+/** Find in selection, for a bar over text with a selection to limit find to. */
+export interface FindBarInSelection {
+  pressed: boolean;
+  /** False while there's no selection to limit find to and the toggle is off. */
+  available: boolean;
+  /** Why it's unavailable, in its tooltip. */
+  unavailableReason: string;
+  onToggle: () => void;
+  /** The toggle's shortcut, shown in its tooltip. */
+  keys?: string[];
 }
 
 export interface FindBarProps {
@@ -92,6 +108,8 @@ export interface FindBarProps {
   /** Shows the case, whole-word, and regular-expression toggles when set. */
   options?: FindOptions;
   onOptionsChange?: (options: FindOptions) => void;
+  /** Adds a Find in selection toggle after the option toggles. */
+  inSelection?: FindBarInSelection;
   /** Prefix for `-input` and `-status` test ids, e.g. "thread-find". */
   testIdPrefix: string;
   className?: string;
@@ -132,6 +150,7 @@ export function FindBar({
   replace,
   options,
   onOptionsChange,
+  inSelection,
   testIdPrefix,
   className,
   rootProps,
@@ -264,6 +283,34 @@ export function FindBar({
                   )}
                 />
               ))}
+              {inSelection && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <InputGroupButton
+                      size="icon-xs"
+                      aria-label="Find in selection"
+                      aria-pressed={inSelection.pressed}
+                      // Not `disabled`, so the tooltip can still say why it's off.
+                      aria-disabled={!inSelection.available}
+                      onClick={refocus(() => {
+                        if (inSelection.available) inSelection.onToggle();
+                      })}
+                      className={cn(
+                        "aria-disabled:opacity-50",
+                        inSelection.pressed && "bg-accent text-accent-foreground",
+                      )}
+                    >
+                      <TextSelectIcon />
+                    </InputGroupButton>
+                  </TooltipTrigger>
+                  <KeyboardShortcutTooltipContent
+                    label={
+                      inSelection.available ? "Find in selection" : inSelection.unavailableReason
+                    }
+                    keys={inSelection.keys ?? []}
+                  />
+                </Tooltip>
+              )}
             </InputGroupAddon>
           )}
         </InputGroup>
@@ -330,6 +377,18 @@ export function FindBar({
                 else replace.onReplace();
               }}
             />
+            {replace.preserveCase !== undefined && replace.onPreserveCaseChange && (
+              <InputGroupAddon align="inline-end" className="gap-0">
+                <FindOptionToggle
+                  label="Preserve case"
+                  glyph="AB"
+                  pressed={replace.preserveCase}
+                  onToggle={refocusReplace(() =>
+                    replace.onPreserveCaseChange?.(!replace.preserveCase),
+                  )}
+                />
+              </InputGroupAddon>
+            )}
           </InputGroup>
           <span className="flex shrink-0 items-center">
             <FindBarButton

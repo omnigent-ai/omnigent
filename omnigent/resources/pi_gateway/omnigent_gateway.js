@@ -43,6 +43,73 @@ function restoreSignatures(payload, signatures) {
   };
 }
 
+function geminiSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema))
+    return schema;
+  const result = {};
+  for (const [key, value] of Object.entries(schema)) {
+    // Gemini's OpenAPI Schema does not accept these JSON Schema constraints.
+    if (["exclusiveMinimum", "exclusiveMaximum", "multipleOf"].includes(key))
+      continue;
+    if (key === "properties" && value && typeof value === "object") {
+      result[key] = Object.fromEntries(
+        Object.entries(value).map(([name, property]) => [
+          name,
+          geminiSchema(property),
+        ]),
+      );
+    } else if (["items", "additionalProperties"].includes(key)) {
+      result[key] = geminiSchema(value);
+    } else if (
+      ["anyOf", "oneOf", "allOf"].includes(key) &&
+      Array.isArray(value)
+    ) {
+      result[key] = value.map(geminiSchema);
+    } else {
+      result[key] = value;
+    }
+  }
+  if (
+    Array.isArray(schema.type) &&
+    schema.type.every((type) => typeof type === "string")
+  ) {
+    const types = schema.type.filter((type) => type !== "null");
+    delete result.type;
+    if (schema.type.includes("null")) result.nullable = true;
+    if (types.length === 1) result.type = types[0];
+    else if (types.length > 1) {
+      const existingUnion = result.anyOf;
+      result.anyOf = types.map((type) => ({
+        type,
+        ...(existingUnion ? { anyOf: existingUnion } : {}),
+      }));
+    }
+  }
+  return result;
+}
+
+function geminiTools(payload, model) {
+  if (
+    !model.id.toLowerCase().includes("gemini") ||
+    !Array.isArray(payload.tools)
+  )
+    return payload;
+  return {
+    ...payload,
+    tools: payload.tools.map((tool) =>
+      tool.type === "function" && tool.function?.parameters
+        ? {
+            ...tool,
+            function: {
+              ...tool.function,
+              parameters: geminiSchema(tool.function.parameters),
+            },
+          }
+        : tool,
+    ),
+  };
+}
+
 function normalizeEvent(frame, state) {
   const lines = frame.split(/\r?\n/);
   const data = lines
@@ -142,7 +209,7 @@ export function createStream(streamSimple) {
       fetch: async (...args) => normalizeResponse(await fetchProvider(...args), state),
       onPayload: async (payload, ...args) => {
         const replacement = await options.onPayload?.(payload, ...args);
-        return restoreSignatures(replacement ?? payload, signatures);
+        return restoreSignatures(geminiTools(replacement ?? payload, model), signatures);
       },
     });
     return {

@@ -73,6 +73,23 @@ describe("syncFolderListings against a real tree", () => {
     expect(tree.holds("pkg/inner/a.ts")).toBe(true);
   });
 
+  it("drops what a filter hides from the tree it holds, with no listing to say so", () => {
+    const tree = liveTree([{ folder: "", entries: [folder("com", "com/app/generated/v1")] }]);
+    expect(tree.holds("com/app/generated/v1/")).toBe(true);
+    // The hint now stops before `generated`, as a filter cuts it; no deeper listing answers.
+    const shows = (path: string) => path.split("/").at(-1) !== "generated";
+    const listings = [{ folder: "", entries: [folder("com", "com/app")] }];
+    const present = tree.first.present;
+    const sync = syncFolderListings(present, listings, shows);
+    expect(sync.operations).toEqual([
+      { type: "remove", path: "com/app/generated/", recursive: true },
+    ]);
+    expect(sync.removedFolders).toEqual(["com/app/generated"]);
+    expect([...sync.present].sort()).toEqual(["com/", "com/app/"]);
+    // Without a filter, a shortened hint leaves the folders it no longer names.
+    expect(syncFolderListings(present, listings).operations).toEqual([]);
+  });
+
   it("removes a deleted chain once, with everything below it", () => {
     const tree = liveTree([ROOT_WITH_CHAIN, INNER]);
 

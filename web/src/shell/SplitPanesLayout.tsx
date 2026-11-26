@@ -50,6 +50,7 @@ import { PaneTitleStrip } from "./paneStrip/PaneTitleStrip";
 import { usePaneMoveDrag } from "./paneStrip/usePaneMoveDrag";
 import { type PaneStripSource, usePaneStrips } from "./paneStrip/usePaneStrips";
 import { usePendingAppPaneDrop } from "./appPanes";
+import { PaneDropPreview } from "./PaneDropPreview";
 
 /** A row along the window's top, as tall as index.css makes it: the Mac title bar there. */
 export const WINDOW_TOP_ROW_HEIGHT = `var(--pane-window-top-row, ${PANE_ROW_PX}px)`;
@@ -102,6 +103,16 @@ export interface SplitPanesLayoutProps {
    * background; the focused card's edge brightens instead of its row carrying an accent line.
    */
   cards?: boolean;
+  /**
+   * Whether a workspace tab dragged over the session's panes lands here, so this view marks itself
+   * for that drop and shows where the tab would open. Floating panes leave it to the main split.
+   */
+  tabDropTarget?: boolean;
+  /**
+   * Whether this view draws the tab drop's preview itself; off while it waits hidden under a chat
+   * shown alone, which draws the preview over itself instead.
+   */
+  tabDropPreview?: boolean;
   className?: string;
 }
 
@@ -136,6 +147,8 @@ export function SplitPanesLayout({
   refocusPane,
   paneDragOutside,
   cards = false,
+  tabDropTarget = false,
+  tabDropPreview = true,
   className,
 }: SplitPanesLayoutProps) {
   // The pointer drag on a divider or corner, from press to release: its sizes show over the latest
@@ -265,13 +278,13 @@ export function SplitPanesLayout({
   });
 
   // A sidebar tab dragged over the panes shows where it would open, as a dragged pane does.
-  const tabDrop = usePendingAppPaneDrop(conversationId);
+  const tabDrop = usePendingAppPaneDrop(tabDropTarget && tabDropPreview ? conversationId : null);
   const shownDrop = paneDrag.drop ?? tabDrop;
 
   return (
     <div
       ref={panesRef}
-      data-split-panes={conversationId}
+      data-split-panes={tabDropTarget ? conversationId : undefined}
       className={cn("relative min-h-0 flex-1", className)}
     >
       {paneKeys.map((key) => {
@@ -446,34 +459,10 @@ export function SplitPanesLayout({
             onAbort={abortDrag}
           />
         ))}
-      {shownDrop ? (
-        // The half the dragged pane or tab would take, edged in the accent on the side it meets.
-        <div
-          aria-hidden
-          data-pane-drop={`${shownDrop.targetKey}:${shownDrop.side}`}
-          className={cn(
-            "pointer-events-none absolute z-20 border-primary bg-primary/15",
-            DROP_EDGE[shownDrop.side],
-          )}
-          style={{
-            left: `${shownDrop.area.left}%`,
-            top: `${shownDrop.area.top}%`,
-            width: `${shownDrop.area.width}%`,
-            height: `${shownDrop.area.height}%`,
-          }}
-        />
-      ) : null}
+      {shownDrop ? <PaneDropPreview drop={shownDrop} /> : null}
     </div>
   );
 }
-
-/** The drop half's edge against the rest of its target, where the two panes will meet. */
-const DROP_EDGE: Record<TerminalPaneSide, string> = {
-  left: "border-r-2",
-  right: "border-l-2",
-  top: "border-b-2",
-  bottom: "border-t-2",
-};
 
 /**
  * When a pane may take keyboard focus on its own. A pane split off may take it once, as it

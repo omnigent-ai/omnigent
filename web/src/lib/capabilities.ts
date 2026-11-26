@@ -16,6 +16,7 @@
  */
 
 import { hostFetch } from "./host";
+import { effectiveQuickPickEnabled, readUiFeatureOverrides } from "./uiFeatureOverrides";
 
 /**
  * Server session-sharing policy (mirrors the backend ``SharingMode``):
@@ -81,6 +82,7 @@ export type FeatureKey =
   | "sidebar_saved_views"
   | "floating_panes"
   | "gadgets"
+  | "pull_requests_v2"
   | "shared_session_updates_socket";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -623,7 +625,15 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
-  return info !== "loading" && info.features?.[feature] === true;
+  if (info === "loading") return false;
+  if (info.features && Object.hasOwn(info.features, feature)) {
+    const overrides = readUiFeatureOverrides();
+    if (feature === "quick_pick_palette" || effectiveQuickPickEnabled(info, overrides)) {
+      const override = overrides[feature];
+      if (override !== undefined) return override;
+    }
+  }
+  return info.features?.[feature] === true;
 }
 
 export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {

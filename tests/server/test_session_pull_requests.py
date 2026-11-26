@@ -308,7 +308,9 @@ def test_refreshes_are_noops_outside_an_event_loop() -> None:
 
 def test_only_a_completed_turn_notifies_the_refresher(monkeypatch: pytest.MonkeyPatch) -> None:
     notified: list[str] = []
+    titled: list[str] = []
     monkeypatch.setattr(server_prs, "notify_turn_end", notified.append)
+    monkeypatch.setattr(helpers.background_session_titles, "notify_turn_end", titled.append)
     monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *_: None)
     session = "c0ffee00c0ffee00c0ffee00c0ffee00"
     monkeypatch.delitem(helpers._session_status_cache, session, raising=False)
@@ -324,6 +326,7 @@ def test_only_a_completed_turn_notifies_the_refresher(monkeypatch: pytest.Monkey
     helpers._publish_status(session, "waiting")
     helpers._publish_status(session, "idle", persist_live_status=False)
     assert notified == [session]
+    assert titled == [session]
 
 
 def _stored(url: str, **overrides: Any) -> StoredPullRequest:

@@ -100,6 +100,192 @@ describe("QuickPickCommandPalette", () => {
   });
 });
 
+interface SearchRow {
+  id: string;
+  title: string;
+  agent_name: null;
+  search_snippet?: string;
+}
+
+/** Each scope's server search: its pages so far, one more per Show more, up to `total`. */
+/**
+ * Each scope's server search: its pages so far, one more per Show more, up to `total`. With
+ * `deferred`, a page stays loading until the returned `release` answers it.
+ */
+function pagedSessionSearch(
+  scopes: Record<string, { total: number; page: (n: number) => SearchRow[] }>,
+  { deferred = false }: { deferred?: boolean } = {},
+) {
+  const pending = { release: () => {} };
+  useSessionSearch.mockImplementation((_query: unknown, scope: unknown) => {
+    const [pages, setPages] = useState(1);
+    const [loading, setLoading] = useState(false);
+    const group = scopes[scope as string];
+    if (!group) return { isFetching: false };
+    const nextPage = () => setPages((count) => count + 1);
+    return {
+      isFetching: false,
+      data: {
+        pages: Array.from({ length: pages }, (_, index) => ({ data: group.page(index + 1) })),
+      },
+      hasNextPage: pages < group.total,
+      isFetchingNextPage: loading,
+      isFetchNextPageError: false,
+      fetchNextPage: () => {
+        if (!deferred) return nextPage();
+        setLoading(true);
+        pending.release = () => {
+          setLoading(false);
+          nextPage();
+        };
+      },
+    };
+  });
+  return { release: () => act(() => pending.release()) };
+}
+
+const messageMatch = (n: number): SearchRow => ({
+  id: `m${n}`,
+  title: `Message match ${n}`,
+  agent_name: null,
+  search_snippet: "…the kestrel nests…",
+});
+
+describe("QuickPickCommandPalette's Show more", () => {
+  const activeLabel = (input: HTMLElement) =>
+    document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+  const press = (input: HTMLElement, key: string) => fireEvent.keyDown(input, { key });
+
+  it("keeps the keyboard on the last row through a middle page and the last one", async () => {
+    pagedSessionSearch({ content: { total: 3, page: (n) => [messageMatch(n)] } });
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "kestrel" } });
+    await screen.findByRole("option", { name: /Show more/ });
+    expect(activeLabel(input)).toContain("Message match 1");
+
+    press(input, "ArrowDown");
+    expect(activeLabel(input)).toContain("Show more");
+    press(input, "Enter");
+    await screen.findByRole("option", { name: /Message match 2/ });
+    expect(activeLabel(input)).toContain("Message match 1");
+    press(input, "ArrowDown");
+    expect(activeLabel(input)).toContain("Message match 2");
+
+    // The last page takes Show more away, and the keyboard stays where it was.
+    press(input, "ArrowDown");
+    press(input, "Enter");
+    await screen.findByRole("option", { name: /Message match 3/ });
+    expect(screen.queryByRole("option", { name: /Show more/ })).toBeNull();
+    expect(activeLabel(input)).toContain("Message match 2");
+    press(input, "ArrowDown");
+    expect(activeLabel(input)).toContain("Message match 3");
+  });
+  /** Searches "kestrel" and takes Show more twice, which parks the keyboard on match 2. */
+  async function parkOnSecondPage(input: HTMLElement) {
+    fireEvent.change(input, { target: { value: "kestrel" } });
+    await screen.findByRole("option", { name: /Show more/ });
+    press(input, "ArrowDown");
+    press(input, "Enter");
+    await screen.findByRole("option", { name: /Message match 2/ });
+    press(input, "ArrowDown");
+    press(input, "ArrowDown");
+    press(input, "Enter");
+    await screen.findByRole("option", { name: /Message match 3/ });
+    expect(activeLabel(input)).toContain("Message match 2");
+  }
+
+  it("keeps a row the user moved to while the page loads, once it arrives", async () => {
+    const search = pagedSessionSearch(
+      {
+        title: { total: 1, page: () => [{ id: "t1", title: "Kestrel plan", agent_name: null }] },
+        content: { total: 2, page: (n) => [messageMatch(n)] },
+      },
+      { deferred: true },
+    );
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "kestrel" } });
+    await screen.findByRole("option", { name: /Show more/ });
+    press(input, "ArrowDown");
+    press(input, "ArrowDown");
+    press(input, "Enter");
+    await screen.findByRole("option", { name: /Loading/ });
+    expect(activeLabel(input)).toContain("Message match 1");
+
+    // The user moves up while the page is still loading; its rows don't take that back.
+    press(input, "ArrowUp");
+    expect(activeLabel(input)).toContain("Kestrel plan");
+    search.release();
+    await screen.findByRole("option", { name: /Message match 2/ });
+    expect(activeLabel(input)).toContain("Kestrel plan");
+  });
+
+  it("goes to the first row of all once the parked row is gone, not the group's first", async () => {
+    let firstMatchDeleted = false;
+    pagedSessionSearch({
+      title: { total: 1, page: () => [{ id: "t1", title: "Kestrel plan", agent_name: null }] },
+      content: {
+        total: 2,
+        page: (n) => (n === 1 ? (firstMatchDeleted ? [] : [messageMatch(1)]) : [messageMatch(2)]),
+      },
+    });
+    const { input } = renderPalette();
+    fireEvent.change(input, { target: { value: "kestrel" } });
+    await screen.findByRole("option", { name: /Show more/ });
+    press(input, "ArrowDown");
+    press(input, "ArrowDown");
+    expect(activeLabel(input)).toContain("Show more");
+    // The parked row's session goes away while the next page loads.
+    firstMatchDeleted = true;
+    press(input, "Enter");
+    await screen.findByRole("option", { name: /Message match 2/ });
+    expect(screen.queryByRole("option", { name: /Message match 1/ })).toBeNull();
+    expect(activeLabel(input)).toContain("Kestrel plan");
+  });
+
+  it("starts a query typed again from its top row, so Enter opens that row", async () => {
+    pagedSessionSearch({ content: { total: 3, page: (n) => [messageMatch(n)] } });
+    const { input } = renderPalette();
+    await parkOnSecondPage(input);
+    fireEvent.change(input, { target: { value: "kestrels" } });
+    fireEvent.change(input, { target: { value: "kestrel" } });
+    await waitFor(() => expect(activeLabel(input)).toContain("Message match 1"));
+    press(input, "Enter");
+    expect(navigate).toHaveBeenLastCalledWith("/c/m1");
+  });
+
+  it("starts from the top row after a close and reopen", async () => {
+    pagedSessionSearch({ content: { total: 3, page: (n) => [messageMatch(n)] } });
+    const props = {
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const client = new QueryClient();
+    const view = render(
+      <QueryClientProvider client={client}>
+        <QuickPickCommandPalette open {...props} />
+      </QueryClientProvider>,
+    );
+    await parkOnSecondPage(screen.getByTestId("command-palette-input"));
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <QuickPickCommandPalette open={false} {...props} />
+      </QueryClientProvider>,
+    );
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <QuickPickCommandPalette open {...props} />
+      </QueryClientProvider>,
+    );
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "kestrel" } });
+    await screen.findByRole("option", { name: /Message match 1/ });
+    await waitFor(() => expect(activeLabel(input)).toContain("Message match 1"));
+    press(input, "Enter");
+    expect(navigate).toHaveBeenLastCalledWith("/c/m1");
+  });
+});
+
 describe("QuickPickCommandPalette ordering", () => {
   const groupNames = () =>
     screen

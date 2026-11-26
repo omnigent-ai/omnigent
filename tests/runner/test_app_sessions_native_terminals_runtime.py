@@ -680,6 +680,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                 request=httpx.Request("GET", url),
             )
 
+    relay_ready = False
+
+    async def _ensure_relay(sid: str, **kwargs: Any) -> None:
+        nonlocal relay_ready
+        assert sid == session_id
+        assert kwargs == {"explicit_bridge_dir": bridge_dir, "await_notify": False}
+        relay_ready = True
+
     class _FakeCodexAppServer:
         """Minimal app-server object used by ``codex_terminal_env``."""
 
@@ -704,6 +712,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                 "Codex resume rollout must be synthesized in app-server CODEX_HOME "
                 "before app-server start"
             )
+            assert relay_ready, "MCP relay must precede app-server startup"
             self.started = True
 
         async def close(self) -> None:
@@ -859,6 +868,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
+        assert relay_ready, "MCP relay must precede thread resume"
         assert codex_native_bridge.read_bridge_state(bridge_dir) is None, (
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
@@ -951,6 +961,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     agent_spec=agent_spec,
                     server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
                     session_init=session_init,
+                    ensure_comment_relay=_ensure_relay,
                 )
             assert retained_client.closed is retain_subscription
             assert app_server.closed
@@ -973,6 +984,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
             session_init=session_init,
+            ensure_comment_relay=_ensure_relay,
         )
         await asyncio.sleep(0)
         remembered_dir = orchestration._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
@@ -2247,7 +2259,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     rotated: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The tool relay is started at session creation, non-blocking.
+    """The first MCP tool list sees the relay without waiting for a notification.
 
     Root-cause fix for the ~30s first-turn stall: the relay (which writes
     ``tool_relay.json`` codex reads via serve-mcp) must be started when the
@@ -2257,6 +2269,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     on codex's MCP bridge ``server.json`` — a file that only appears once
     codex runs the turn — until ``post_tools_changed``'s 30s timeout.
 
+    The app-server can list tools as soon as it starts.
     Asserts ``_auto_create_codex_terminal`` invokes the injected
     ``ensure_comment_relay`` exactly once, for this session's bridge dir,
     with ``await_notify=False``. If the call regressed to the first-turn
@@ -2332,6 +2345,8 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
 
         async def start(self) -> None:
             """:returns: None."""
+            tools = claude_native_bridge._read_relay_tool_specs(bridge_dir)
+            assert "sys_session_get_info" in {tool["name"] for tool in tools}
 
         async def close(self) -> None:
             """:returns: None."""
@@ -2415,10 +2430,21 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         )
 
     relay_calls: list[dict[str, Any]] = []
+    relays: list[claude_native_bridge.ClaudeNativeToolRelay] = []
 
     async def _spy_ensure_relay(sid: str, **kwargs: Any) -> None:
         """Record the relay-start invocation."""
+        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+
         relay_calls.append({"session_id": sid, **kwargs})
+        relays.append(
+            claude_native_bridge.start_tool_relay(
+                bridge_dir=kwargs["explicit_bridge_dir"],
+                tools=build_native_relay_tool_schemas(agent_spec),
+                tool_executor=AsyncMock(return_value={}),
+                loop=asyncio.get_running_loop(),
+            )
+        )
 
     agent_spec = AgentSpec(
         spec_version=1,
@@ -2440,6 +2466,8 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         )
         await asyncio.sleep(0)
     finally:
+        for relay in relays:
+            relay.close()
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         orchestration._AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
 

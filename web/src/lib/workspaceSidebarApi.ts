@@ -3,6 +3,7 @@
 
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type { ContentSearchResult } from "@/lib/contentSearch";
+import type { RevisionSpec } from "@/lib/customComparison";
 import {
   type FileSearchOptions,
   type FoundEntries,
@@ -238,6 +239,8 @@ export interface ResolveRepositoryContextResponse {
   remotes: RepositoryRemote[];
   unsupportedRemoteCount: number;
   truncatedRemotes: boolean;
+  /** The workspace below the repository's root, such as `packages/app/`; absent from older hosts. */
+  workspacePrefix?: string;
 }
 
 // ── The API ───────────────────────────────────────────────────────────────────
@@ -294,7 +297,7 @@ export interface WorkspaceSidebarApi {
   ) => Promise<ListRepositoryRefsResponse | null>;
   listBranchCommits: (
     sessionId: string,
-    baseRevision: string,
+    range: RevisionSpec,
     signal?: AbortSignal,
   ) => Promise<ListBranchCommitsResponse | null>;
   resolveRepositoryContext: (

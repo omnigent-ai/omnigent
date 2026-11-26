@@ -12,6 +12,7 @@ import { createPaneDividerDrag } from "@/shell/paneDividerDrag";
 import { SplitPanesLayout } from "@/shell/SplitPanesLayout";
 
 import { resetAppPanes, setPendingAppPaneDrop } from "../appPanes";
+import { PANE_GRIP_BAND_PX, PANE_GRIP_MIN_ROW_PX } from "./paneStripGrip";
 import { PANE_DRAG_THRESHOLD_PX, type PaneDragOutside } from "./usePaneMoveDrag";
 
 const SPLIT: TerminalSplitState = {
@@ -33,11 +34,18 @@ vi.mock("@/shell/paneDividerDrag", async (importOriginal) => {
   };
 });
 
+// Floating panes split a wide row into a move band and the rest; off, the whole row does both.
+const floating = vi.hoisted(() => ({ on: false }));
+vi.mock("../useFloatingPanes", () => ({ useFloatingPanes: () => floating.on }));
+
 function setup({
   single = false,
   zoomedKey = null as string | null,
   movable = true,
   outside = undefined as PaneDragOutside | undefined,
+  toggleZoom = undefined as (() => void) | undefined,
+  tabDropTarget = true,
+  tabDropPreview = true,
 } = {}) {
   const onMovePane = vi.fn();
   const refocusPane = vi.fn();
@@ -59,13 +67,15 @@ function setup({
         strip={{
           paneOf: (key) => ({
             name: `shell ${key}`,
-            commands: null,
+            commands: toggleZoom ? { toggleZoom } : null,
             focus: focus[key as "a" | "b"],
           }),
         }}
         onMovePane={movable ? onMovePane : undefined}
         refocusPane={refocusPane}
         paneDragOutside={outside}
+        tabDropTarget={tabDropTarget}
+        tabDropPreview={tabDropPreview}
       />
     </TooltipProvider>
   );
@@ -99,6 +109,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  floating.on = false;
   resetAppPanes();
   cleanup();
   // A title bar a failed case left would shift every later case's rows.
@@ -120,9 +131,11 @@ describe("SplitPanesLayout: dragging a pane by its row", () => {
     expect(handle("a")!.className).toMatch(/(^|\s)opacity-0(\s|$)/);
     expect(handle("a")!.className).toMatch(/group-hover\/pane-strip:opacity-100/);
     expect(row("a").className).toMatch(/group\/pane-strip/);
-    // Movable, it looks and points as any row: no grip dots, no grab cursor.
+    // Movable, it looks and points as any row: no grip dots, and the grab cursor only over the
+    // band around the handle.
     expect(row("a").querySelector("[data-pane-strip-grip]")).toBeNull();
-    expect(row("a").className).not.toMatch(/cursor-grab/);
+    expect(row("a").className).not.toMatch(/(^|\s)cursor-grab(\s|$)/);
+    expect(row("a").className).toMatch(/data-\[pane-strip-over-grip\]:cursor-grab/);
     // A lone pane, a maximized one, and a shell that can't move panes: the row as it was.
     for (const options of [{ single: true }, { zoomedKey: "a" }, { movable: false }]) {
       cleanup();
@@ -629,5 +642,131 @@ describe("SplitPanesLayout: off the split", () => {
     expect(dropShown()).toBe("b:bottom");
     act(() => setPendingAppPaneDrop("c1", null));
     expect(dropShown()).toBeUndefined();
+  });
+  it("stays the drop's target while hidden, leaving its preview to the chat shown over it", () => {
+    setup({ tabDropPreview: false });
+    expect(document.querySelector('[data-split-panes="c1"]')).not.toBeNull();
+    act(() =>
+      setPendingAppPaneDrop("c1", {
+        targetKey: "b",
+        side: "bottom",
+        area: { left: 50, top: 50, width: 50, height: 50 },
+      }),
+    );
+    expect(dropShown()).toBeUndefined();
+  });
+
+  it("leaves a sidebar tab's drop to the main split, showing none in the sidebar's panes", () => {
+    setup({ tabDropTarget: false });
+    expect(document.querySelector("[data-split-panes]")).toBeNull();
+    act(() =>
+      setPendingAppPaneDrop("c1", {
+        targetKey: "b",
+        side: "bottom",
+        area: { left: 50, top: 50, width: 50, height: 50 },
+      }),
+    );
+    expect(dropShown()).toBeUndefined();
+  });
+});
+
+describe("SplitPanesLayout: a wide row's move band", () => {
+  // A 600 px row: the band is the 120 px around its centre, x 240–360.
+  const WIDE = 600;
+  const CENTRE = WIDE / 2;
+  const held = (key: string) => row(key).hasAttribute("data-pane-strip-held");
+  let rowWidth = WIDE;
+
+  beforeEach(() => {
+    floating.on = true;
+    rowWidth = WIDE;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      const box = this.hasAttribute("data-pane-strip")
+        ? { left: 0, top: 0, width: rowWidth, height: 28 }
+        : VIEW;
+      return {
+        ...box,
+        right: box.left + box.width,
+        bottom: box.top + box.height,
+        x: box.left,
+        y: box.top,
+        toJSON: () => ({}),
+      } as DOMRect;
+    });
+  });
+
+  it("lifts and drags the pane from a press in the band around the handle", () => {
+    const { onMovePane } = setup();
+    press("a", CENTRE);
+    expect(held("a")).toBe(true);
+    moveTo(CENTRE + PANE_DRAG_THRESHOLD_PX + 1, 10);
+    moveTo(700, 300);
+    release(700, 300);
+    expect(onMovePane).toHaveBeenCalledOnce();
+  });
+
+  it("only focuses the pane from a press outside the band, never lifting or dragging it", () => {
+    const { onMovePane, focus } = setup();
+    const outside = CENTRE - PANE_GRIP_BAND_PX / 2 - 1;
+    press("a", outside);
+    fireEvent.mouseDown(row("a"), { button: 0, clientX: outside, clientY: 10 });
+    expect(held("a")).toBe(false);
+    moveTo(700, 300);
+    release(700, 300);
+    expect(onMovePane).not.toHaveBeenCalled();
+    expect(dropShown()).toBeUndefined();
+    expect(focus.a).toHaveBeenCalled();
+  });
+
+  it("maximizes on a double-click outside the band, and not in it", () => {
+    const toggleZoom = vi.fn();
+    setup({ toggleZoom });
+    fireEvent.doubleClick(row("a"), { button: 0, clientX: CENTRE, clientY: 10 });
+    expect(toggleZoom).not.toHaveBeenCalled();
+    fireEvent.doubleClick(row("a"), { button: 0, clientX: 20, clientY: 10 });
+    expect(toggleZoom).toHaveBeenCalledOnce();
+  });
+
+  it("moves from anywhere and maximizes from anywhere on a row too narrow for the band", () => {
+    rowWidth = PANE_GRIP_MIN_ROW_PX - 1;
+    const toggleZoom = vi.fn();
+    setup({ toggleZoom });
+    press("a", 20);
+    expect(held("a")).toBe(true);
+    release(20, 10);
+    fireEvent.doubleClick(row("a"), { button: 0, clientX: rowWidth / 2, clientY: 10 });
+    expect(toggleZoom).toHaveBeenCalledOnce();
+  });
+
+  it("shows the grab cursor over the band's blank space only", () => {
+    setup();
+    fireEvent.pointerMove(row("a"), { pointerId: 1, clientX: CENTRE, clientY: 10 });
+    expect(row("a").hasAttribute("data-pane-strip-over-grip")).toBe(true);
+    fireEvent.pointerMove(row("a"), { pointerId: 1, clientX: 20, clientY: 10 });
+    expect(row("a").hasAttribute("data-pane-strip-over-grip")).toBe(false);
+    fireEvent.pointerMove(row("a"), { pointerId: 1, clientX: CENTRE, clientY: 10 });
+    fireEvent.pointerLeave(row("a"), { pointerId: 1 });
+    expect(row("a").hasAttribute("data-pane-strip-over-grip")).toBe(false);
+  });
+
+  it("keeps the whole row for moving and maximizing without floating panes", () => {
+    floating.on = false;
+    const toggleZoom = vi.fn();
+    const { onMovePane } = setup({ toggleZoom });
+    // Without floating panes there is no band: no grab cursor over its centre.
+    fireEvent.pointerMove(row("a"), { pointerId: 1, clientX: CENTRE, clientY: 10 });
+    expect(row("a").hasAttribute("data-pane-strip-over-grip")).toBe(false);
+    // A press away from the centre still lifts and drags the pane.
+    press("a", 20);
+    expect(held("a")).toBe(true);
+    moveTo(20 + PANE_DRAG_THRESHOLD_PX + 1, 10);
+    moveTo(700, 300);
+    release(700, 300);
+    expect(onMovePane).toHaveBeenCalledOnce();
+    // And a double-click where the band would be still maximizes.
+    fireEvent.doubleClick(row("a"), { button: 0, clientX: CENTRE, clientY: 10 });
+    expect(toggleZoom).toHaveBeenCalledOnce();
   });
 });

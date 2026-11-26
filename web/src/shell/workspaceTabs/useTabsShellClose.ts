@@ -1,11 +1,13 @@
-// The tabs sidebar asks before a shell's tab closes, then ends the shell itself. Each
-// request settles only itself: a newer one cancels the older, and the dialog answers only
-// the request it shows.
+// The tabs sidebar asks before a shell's tab closes, then ends the shell itself; an idle shell
+// closes without asking. Each request settles only itself: a newer one cancels the older, and
+// the dialog answers only the request it shows.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { terminalDisplayLabel, terminalTabKey } from "@/hooks/useTerminals";
 import type { TerminalInfo } from "@/lib/terminals";
+
+import { type ShellBusy, useShellCloseCheck } from "../shellCloseCheck";
 
 type Answer = (closed: boolean) => void;
 
@@ -20,6 +22,8 @@ export interface TabsShellCloseQuestion {
   label: string;
   /** How many shells closing ends; more than one for a split's close. */
   count: number;
+  /** What the one shell runs, when its runner said, for the dialog to name. */
+  busy: ShellBusy | null;
   answer: Answer;
 }
 
@@ -37,9 +41,12 @@ export interface TabsShellClose {
 }
 
 export function useTabsShellClose({
+  sessionId,
   terminals,
   deleteTerminal,
 }: {
+  /** The session whose shells these are, for asking its runner whether they're idle; none asks. */
+  sessionId: string | null;
   terminals: readonly TerminalInfo[];
   /** Ends a terminal; rejects when it couldn't, leaving the sidebar to tell the user. */
   deleteTerminal: (terminalId: string) => Promise<unknown>;
@@ -48,6 +55,7 @@ export function useTabsShellClose({
   latestTerminals.current = terminals;
   const pending = useRef<Answer | null>(null);
   const [question, setQuestion] = useState<TabsShellCloseQuestion | null>(null);
+  const checkShellClose = useShellCloseCheck(sessionId);
 
   const settle = useCallback((answer: Answer, closed: boolean) => {
     if (pending.current !== answer) return;
@@ -66,18 +74,31 @@ export function useTabsShellClose({
       // A newer close supersedes the one still asking, which keeps its shell.
       if (pending.current) settle(pending.current, false);
       // A shell that's already gone has nothing left to end.
-      const labels = keys.flatMap((key) => {
+      const closing = keys.flatMap((key) => {
         const terminal = findTerminal(key);
-        return terminal ? [terminalDisplayLabel(terminal)] : [];
+        return terminal ? [terminal] : [];
       });
-      if (labels.length === 0) return Promise.resolve(true);
+      if (closing.length === 0) return Promise.resolve(true);
+      const labels = closing.map(terminalDisplayLabel);
       const label = shellLabelList(labels);
+      const trigger = closing.length > 1 ? "sidebar_split_close" : "sidebar_tab_close";
       return new Promise<boolean>((resolve) => {
+        // Pending while the check runs, so a newer close still supersedes this one.
         pending.current = resolve;
-        setQuestion({ label, count: labels.length, answer: resolve });
+        checkShellClose(
+          closing.map((terminal) => terminal.id),
+          trigger,
+          (check) => {
+            if (pending.current !== resolve) return;
+            if (check.close === "now") settle(resolve, true);
+            else setQuestion({ label, count: labels.length, busy: check.busy, answer: resolve });
+          },
+          // The sidebar moved to another session while checking: keep the shell.
+          () => settle(resolve, false),
+        );
       });
     },
-    [settle, findTerminal],
+    [settle, findTerminal, checkShellClose],
   );
   const confirmCloseShell = useCallback(
     (key: string) => confirmCloseShells([key]),

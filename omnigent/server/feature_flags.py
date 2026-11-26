@@ -67,6 +67,7 @@ class Feature(StrEnum):
     FLOATING_PANES = "floating_panes"
     GADGETS = "gadgets"
     SHARED_SESSION_UPDATES_SOCKET = "shared_session_updates_socket"
+    PULL_REQUESTS_V2 = "pull_requests_v2"
 
 
 class FeatureIntent(StrEnum):
@@ -393,6 +394,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Share one session-updates WebSocket between a browser's tabs",
         owner="web",
         review_by_release="0.28.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PULL_REQUESTS_V2,
+        description="Show pull requests on the new page and list in the tabs sidebar",
+        owner="web",
+        review_by_release="0.29.0",
     ),
 )
 

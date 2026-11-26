@@ -54,10 +54,13 @@ together in Comments.
   A compact **Loading review threads** spinner beside the layout toggle indicates
   an in-flight read. Conversation navigation shares the diff toolbar.
 - `chat-references`: `#1234` and `owner/repo#12` in agent replies, user messages
-  and /btw answers link to the github.com PR. Bare references use the session's
-  own repo, including in a side chat. They stay text in tool output, code, existing
-  links, after an escaped `#`, and in Enterprise, other-forge or unrecognized-remote
-  checkouts, and while the runner hasn't reported the workspace repo.
+  and /btw answers link to the PR. A bare `#1234` links only to a PR the session
+  (or the side chat) links with that number, at its stored URL, on any host. It
+  stays text when no linked PR has it, when linked PRs in two repos share it, and
+  for providers where `#N` isn't a pull request (GitLab and Azure DevOps use `!N`).
+  `owner/repo#12` links to github.com in a github.com checkout. All of them stay
+  text in tool output, code, existing links and after an escaped `#`. Full PR URLs
+  link as before.
 - `render-recovery`: A panel render failure shows **Try again** while chat,
   Workspace tabs and mobile Close remain usable.
 
@@ -174,13 +177,14 @@ Chat references have component coverage in
 `web/src/components/ai-elements/pullRequestRefs.test.ts`; the runner's workspace
 repo choice is in `tests/runner/test_pr_resource.py`. Manually, in a github.com
 checkout, send `See #4242 and acme/lib#7` and have the agent repeat it; both link
-to github.com. Repeat in a side chat and through /btw. In a checkout whose origin
-is an Enterprise host, references stay text.
+to github.com when the session links #4242. A number the session doesn't link
+stays text. Repeat in a side chat and through /btw.
 
 ## Gotchas
 
-- Chat references link only to github.com. A tracked PR's repo doesn't decide the
-  workspace: an Enterprise origin with a github.com upstream stays text.
+- A bare chat reference follows the session's linked PRs, not the workspace's
+  repo, so a number the agent mentions without linking its PR stays text.
+  `owner/repo#N` links only to github.com.
 
 - Browser stubs prove UI behavior; runner/host tests prove provider transport.
   They do not constitute a live GitHub write test.

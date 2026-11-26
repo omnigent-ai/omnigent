@@ -694,6 +694,9 @@ function loadNavigationHarness({
               setRecentSessionSwitchSupported: () => {},
               setOpenTabSupported: (supported) =>
                 browserRegistryCalls.setOpenTabSupported.push(supported),
+              setForwardedChords: () => {},
+              holdForwardedChords: () => {},
+              releaseForwardedChords: () => {},
               activeConversationId: () => null,
             };
           },
@@ -3603,6 +3606,119 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
     assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, [false]);
     harness.cleanup();
   });
+
+  const HOST_URL = "https://host.example/ml/omnigents";
+  const reload = (h) => h.emit("did-start-navigation", HOST_URL, false, true);
+  const chord = (key) => ({ key, metaKey: true, ctrlKey: false, altKey: false, shiftKey: false });
+  // The outgoing renderer can still send its list while the window loads the next document.
+  const updateMidReload = (h, registry) => (reload(h), registry.setForwardedChords([chord("j")]));
+  // Each case ends with the keys the window still takes from the page: none, its first list,
+  // or the list it sent mid-reload.
+  for (const [scenario, navigate, forwardedKeys] of [
+    [
+      "an update mid-reload, then a new document",
+      (h, registry) => (updateMidReload(h, registry), h.emit("did-navigate")),
+      [],
+    ],
+    [
+      "an update mid-reload, then an error page",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -105, "", HOST_URL, true)
+      ),
+      [],
+    ],
+    [
+      "an update mid-reload, then a cancelled reload",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      ["j"],
+    ],
+    ["a reload into a bundle that never asks", (h) => (reload(h), h.emit("did-navigate")), []],
+    [
+      "an error page replacing the shell",
+      (h) => (reload(h), h.emit("did-fail-load", -105, "", HOST_URL, true)),
+      [],
+    ],
+    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" }), []],
+    [
+      "a cancelled reload",
+      (h) => (
+        reload(h),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      ["k"],
+    ],
+    [
+      "a reload that stopped without a new document",
+      (h) => (reload(h), h.emit("did-stop-loading")),
+      ["k"],
+    ],
+    [
+      "an in-page or subframe navigation",
+      (h) => (
+        h.emit("did-start-navigation", `${HOST_URL}#c/1`, true, true),
+        h.emit("did-start-navigation", "https://frame.example/", false, false)
+      ),
+      ["k"],
+    ],
+  ]) {
+    it(`${forwardedKeys.length ? "keeps forwarding keys" : "leaves a page its keys"} after ${scenario}`, () => {
+      const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+      try {
+        Object.assign(h.webContents, { focus() {} });
+        h.electron.session.fromPartition = () => ({
+          setPermissionRequestHandler() {},
+          setPermissionCheckHandler() {},
+          webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+        });
+        h.electron.createWebContentsView = () => {
+          const wc = Object.assign(new EventEmitter(), {
+            ipc: new EventEmitter(),
+            setWindowOpenHandler() {},
+            loadURL() {},
+          });
+          return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+        };
+        const registry = h.api.createBrowserRegistryForWindow(h.win);
+        const page = registry.openOrNavigate("browser-tab:conv:t1", "https://page.example/").entry
+          .view.webContents;
+        const press = (key) => {
+          let prevented = false;
+          const before = h.calls.progress.length;
+          page.emit(
+            "before-input-event",
+            { preventDefault: () => (prevented = true) },
+            { type: "keyDown", key, code: `Key${key.toUpperCase()}`, meta: true },
+          );
+          const forwarded = h.calls.progress
+            .slice(before)
+            .filter(({ channel }) => channel === "browser-forwarded-input");
+          return { prevented, forwarded: forwarded.length };
+        };
+
+        registry.setForwardedChords([chord("k")]);
+        assert.deepEqual(press("k"), { prevented: true, forwarded: 1 });
+        navigate(h, registry);
+        // A finished load that follows never hands back keys a new document didn't ask for.
+        h.emit("did-stop-loading");
+        for (const key of ["k", "j"]) {
+          const forwarded = forwardedKeys.includes(key);
+          assert.deepEqual(
+            press(key),
+            { prevented: forwarded, forwarded: forwarded ? 1 : 0 },
+            `⌘${key.toUpperCase()}`,
+          );
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
 });
 
 // Wiring guards for the window-open policy (src/popupPolicy.js decides,

@@ -21,9 +21,10 @@ import type {
 /**
  * With a query: `source` keeps each group together, in the order the items list
  * them; `match` ranks rows across groups, each naming its group, so a group
- * never holds a better match below weaker ones.
+ * never holds a better match below weaker ones; `bestMatch` keeps each group
+ * together under its heading, led by the group with the best match.
  */
-export type QuickPickGroupOrder = "source" | "match";
+export type QuickPickGroupOrder = "source" | "match" | "bestMatch";
 
 /** One run of items that rank together, such as commands or one group of search results. */
 export interface QuickPickSegment<Value> {
@@ -164,11 +165,15 @@ function rankSegment<Value>(
   const rowsByItem = new Map(
     ranked.map(({ item, match }) => [item, itemRow(item, match.candidate.ranges)]),
   );
+  const rankedItems = ranked.map(({ item }) => item);
   return groupedRows(
     segment.sourceId,
-    segment.items,
+    // Groups appear as their best shown rows rank, so an exact match's group comes first.
+    segment.groupOrder === "bestMatch"
+      ? rankedItems.filter((item) => !seen.has(item.id))
+      : segment.items,
     rowsByItem,
-    ranked.map(({ item }) => item),
+    rankedItems,
     seen,
   );
 }

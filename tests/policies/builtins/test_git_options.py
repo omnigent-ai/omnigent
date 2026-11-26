@@ -2,6 +2,7 @@
 
 import pytest
 
+from omnigent.policies.builtins._git import parse_git_arguments
 from omnigent.policies.builtins.github import (
     _classify_git,
     _parse_git_push_args,
@@ -9,6 +10,39 @@ from omnigent.policies.builtins.github import (
 )
 from omnigent.policies.builtins.working_dir import _classify_git as _classify_directory
 from tests.policies.builtins.helpers import tool_call_event
+
+
+@pytest.mark.parametrize(
+    ("arguments", "options", "operands"),
+    [
+        (
+            ["--push-option", "--force", "origin"],
+            (("push-option", "--force"),),
+            ("origin",),
+        ),
+        (
+            ["--push-option=first", "--push-option", "second", "origin"],
+            (("push-option", "first"), ("push-option", "second")),
+            ("origin",),
+        ),
+        (["-ovalue", "origin"], (("push-option", "value"),), ("origin",)),
+        (["origin", "--", "--force", "-ovalue"], (), ("origin", "--force", "-ovalue")),
+    ],
+)
+def test_git_argument_parser_preserves_option_and_operand_ownership(
+    arguments: list[str], options: tuple[tuple[str, str], ...], operands: tuple[str, ...]
+) -> None:
+    parsed = parse_git_arguments(
+        arguments,
+        {
+            "--push-option": ("push-option", True),
+            "-o": ("push-option", True),
+            "--force": ("force", False),
+        },
+    )
+    assert parsed is not None
+    assert parsed.options == options
+    assert parsed.operands == operands
 
 
 @pytest.mark.parametrize(
