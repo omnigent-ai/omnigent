@@ -13261,7 +13261,22 @@ def _migration_gadget_location(
             )
         return gadget_dir
     if config_path is not None:
-        return _gadget_location(_load_config(config_path), config_path)
+        cfg = _load_config(config_path)
+        if cfg.get("gadget_location"):
+            location = _gadget_location(cfg, config_path)
+            if not Path(location).is_dir():
+                raise click.BadParameter(
+                    f"the config's gadget_location {location!r} is not a directory",
+                    param_hint="'--config'",
+                )
+            return location
+        # The default is under the data directory, which this process can't see the
+        # server's value of, so a guess could skip the check.
+        raise click.UsageError(
+            "the config doesn't set gadget_location, so where the server keeps gadgets "
+            "depends on its data directory: pass --gadget-dir with the server's gadget "
+            "directory, or --no-gadgets if it never kept any"
+        )
     raise click.UsageError(
         "can't tell where the server keeps gadgets: pass --config with the server's config "
         "file, --gadget-dir with its gadget directory, or --no-gadgets if it never kept any"
@@ -13307,8 +13322,8 @@ def _migration_gadget_location(
     type=click.Path(exists=True, dir_okay=False),
     default=None,
     help="The config file the server runs with (`omnigent server --config`). Its "
-    "gadget_location, or the default <data dir>/gadgets without one, is where the server's "
-    "gadgets are checked, so users with gadgets are refused rather than cut off from them.",
+    "gadget_location is where the server's gadgets are checked, so users with gadgets are "
+    "refused rather than cut off from them. Without one, pass --gadget-dir or --no-gadgets.",
 )
 @click.option(
     "--gadget-dir",
@@ -13320,8 +13335,7 @@ def _migration_gadget_location(
     "--no-gadgets",
     is_flag=True,
     default=False,
-    help="The server never kept gadgets, so there is no gadget directory to check. "
-    "Gadget grants in the database are still checked.",
+    help="The server never kept gadgets, so there is no gadget directory to check.",
 )
 def debug_migrate_accounts_to_oidc(
     url: str,
@@ -13358,12 +13372,12 @@ def debug_migrate_accounts_to_oidc(
       omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --map alice=alice@corp.com \\
         --config /data/config.yaml
 
-    Gadgets are not moved: a user who owns gadgets, has pinned ones, or has
-    been granted access to someone's is refused, and their rows stay as
-    they are. Delete or hand off those gadgets first, then run it again.
-    Say where the server keeps them with --config (or --gadget-dir), or
-    pass --no-gadgets for a server that never kept any; with none of
-    these the command stops before changing anything.
+    Gadgets are not moved: a user who owns gadgets or has pinned ones is
+    refused, and their rows stay as they are. Delete or hand off those
+    gadgets first, then run it again. Say where the server keeps them
+    with --config (when it sets gadget_location) or --gadget-dir, or pass
+    --no-gadgets for a server that never kept any; with none of these the
+    command stops before changing anything.
 
     \b
     IMPORTANT: always back up your database before running with
@@ -13393,7 +13407,7 @@ def debug_migrate_accounts_to_oidc(
 
         gadget_location = _migration_gadget_location(gadget_dir, config_path, no_gadgets)
         gadget_store = None
-        if gadget_location is not None and Path(gadget_location).is_dir():
+        if gadget_location is not None:
             from omnigent.stores.gadget_store.local import LocalGadgetStore
 
             # Read only: no cleanup step, no directories made and no index repairs.

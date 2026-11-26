@@ -282,6 +282,15 @@ export function GadgetOpenSessionButton({
     return () => window.removeEventListener("blur", onBlur);
   }, [changeOpen, open]);
 
+  const dimming = open && modal;
+  useEffect(() => {
+    if (!dimming) return;
+    // index.css drops the sidebar under the dimming while this is set.
+    const root = document.documentElement;
+    root.setAttribute("data-gadget-session-scrim", "");
+    return () => root.removeAttribute("data-gadget-session-scrim");
+  }, [dimming]);
+
   const creating = sessionId === null;
   return (
     <Popover open={open} onOpenChange={changeOpen}>
@@ -292,14 +301,11 @@ export function GadgetOpenSessionButton({
       )}
       {/* Below the menu (z-50), above the gadget and everything else, the sidebar included. A
       press on it is a press outside the menu, which closes it. */}
-      {open &&
-        modal &&
+      {dimming &&
         createPortal(
           <div
             aria-hidden
             data-testid="gadget-open-session-scrim"
-            // index.css drops the sidebar under this while it shows, so only the menu stands out.
-            data-gadget-session-scrim=""
             className="fixed inset-0 z-[49] bg-black/40 duration-150 animate-in fade-in-0"
           />,
           getEmbedRoot() ?? document.body,

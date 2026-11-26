@@ -106,6 +106,39 @@ describe("watchEveryPage", () => {
     await settle();
     expect(reads[kit.MAX_EXTRA_PAGES + 1]).toBe("c1");
   });
+
+  it("finishes a walk slower than the poll, and delivers it with the newest first page", async () => {
+    // Each page answers only when the test lets it, so polls arrive while the walk is reading.
+    const { collection, poll, reads } = pagedCollection(3);
+    const held: (() => void)[] = [];
+    const list = collection.list.bind(collection);
+    collection.list = (args: { cursor?: string }) =>
+      new Promise<Page>((resolve) => {
+        held.push(() => resolve(list(args)));
+      });
+    const calls: { ids: string[]; complete: boolean }[] = [];
+    kit.watchEveryPage(
+      collection,
+      (items, complete) => calls.push({ ids: items.map((item) => item.id), complete }),
+      { limit: 1 },
+    );
+
+    poll();
+    await settle();
+    expect(held).toHaveLength(1);
+    // Newer snapshots during the walk neither restart it nor are lost.
+    poll();
+    poll();
+    held.shift()!();
+    await settle();
+    poll();
+    poll();
+    held.shift()!();
+    await settle();
+
+    expect(reads).toEqual(["c1", "c2"]);
+    expect(calls).toEqual([{ ids: ["r0", "r1", "r2"], complete: true }]);
+  });
 });
 
 describe("keyed", () => {

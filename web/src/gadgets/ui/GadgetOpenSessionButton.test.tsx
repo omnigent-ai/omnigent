@@ -378,6 +378,8 @@ describe("GadgetOpenSessionButton", () => {
     expect(scrim).toHaveClass("fixed", "inset-0", "z-[49]");
     expect(scrim.parentElement).toBe(document.body);
     expect(scrim).toBeEmptyDOMElement();
+    // Marks the root, which index.css uses to drop the sidebar under the dimming.
+    expect(document.documentElement).toHaveAttribute("data-gadget-session-scrim");
     // The menu's own controls stay usable over it.
     fireEvent.click(within(popover).getByRole("button", { name: "Permission: Ask" }));
     expect(screen.getByTestId("gadget-open-session-scrim")).toBeInTheDocument();
@@ -390,6 +392,7 @@ describe("GadgetOpenSessionButton", () => {
 
     expect(screen.queryByTestId("gadget-open-session-popover")).toBeNull();
     expect(screen.queryByTestId("gadget-open-session-scrim")).toBeNull();
+    expect(document.documentElement).not.toHaveAttribute("data-gadget-session-scrim");
     // Dismissing creates nothing and keeps New session's draft for later.
     expect(onOpenSession).not.toHaveBeenCalled();
     expect(screen.getByTestId("composer")).toHaveTextContent("Permission: Auto");

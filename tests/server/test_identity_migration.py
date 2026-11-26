@@ -584,6 +584,46 @@ def test_cli_finds_the_gadgets_where_the_servers_config_keeps_them(db_uri: str, 
     assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
 
 
+@pytest.mark.parametrize("config_text", ["port: 8000\n", "gadget_location: missing\n"])
+def test_cli_stops_when_the_config_does_not_name_an_existing_gadget_directory(
+    db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch, config_text: str
+) -> None:
+    """A config without gadget_location leaves the location to the server's data
+    directory, which this process can't see, and a named one must exist: either way the
+    command changes nothing rather than skip the check."""
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    # The server's data directory differs from the migration's.
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "migration-data"))
+    store = LocalGadgetStore(str(tmp_path / "server-data" / "gadgets"))
+    config = tmp_path / "server" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text(config_text)
+    account_store = SqlAlchemyAccountStore(db_uri)
+    account_store.create_user_with_password("alice", hash_password("password123"))
+    gadget = _gadget_service(db_uri, store, "alice").create("Synthetic board")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "debug",
+            "migrate-accounts-to-oidc",
+            db_uri,
+            "--domain",
+            "example.com",
+            "--config",
+            str(config),
+            "--commit",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "gadget" in result.output
+    assert account_store.get_user("alice") is not None
+    assert account_store.get_user("alice@example.com") is None
+    assert _gadget_service(db_uri, store, "alice").get(gadget["id"])["id"] == gadget["id"]
+
+
 def test_cli_stops_when_it_cant_tell_where_the_server_keeps_gadgets(
     db_uri: str, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1907,29 +1907,23 @@ describe("gadget Create session dimming", () => {
     candidate.selector.includes("[data-gadget-session-scrim]"),
   );
 
-  it("drops the sidebar under the dimming while a gadget's Create session menu is open", () => {
+  it("drops the sidebar under the dimming only while the root is marked", () => {
     // The sidebar carries z-50 on desktop, above the menu's z-49 scrim; without this it stays
-    // bright while everything else dims.
-    expect(rule?.selector.replace(/\s+/g, " ")).toBe(
-      ":root:has([data-gadget-session-scrim]) .conversations-sidebar",
-    );
-    expect(rule?.body).toMatch(/z-index:\s*auto/);
-  });
-
-  it("applies only while the scrim is in the page", () => {
+    // bright while everything else dims. A :has() over the page would restyle it on every
+    // DOM change, so the menu marks the root instead.
+    expect(rule?.selector).not.toContain(":has(");
     const sidebar = document.createElement("aside");
     sidebar.className = "conversations-sidebar";
     sidebar.style.position = "relative";
     document.body.appendChild(sidebar);
+    const root = document.documentElement;
     withStyle(
       `.conversations-sidebar { z-index: 50; }\n${rule?.selector} { ${rule?.body} }`,
       () => {
         expect(getComputedStyle(sidebar).zIndex).toBe("50");
-        const scrim = document.createElement("div");
-        scrim.setAttribute("data-gadget-session-scrim", "");
-        document.body.appendChild(scrim);
+        root.setAttribute("data-gadget-session-scrim", "");
         expect(getComputedStyle(sidebar).zIndex).toBe("auto");
-        scrim.remove();
+        root.removeAttribute("data-gadget-session-scrim");
         expect(getComputedStyle(sidebar).zIndex).toBe("50");
       },
     );

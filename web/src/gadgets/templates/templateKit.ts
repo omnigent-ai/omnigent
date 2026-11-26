@@ -300,15 +300,19 @@ export const GADGET_KIT_HELPERS = `
   }
   // A watch sees one page. For a collection the page looks records up in, watchEveryPage
   // follows its continuation pages before calling handler(items, complete), so a record on a
-  // later page never reads as deleted, and drops a page set a newer snapshot replaced. Each poll
+  // later page never reads as deleted; a snapshot during a walk waits for it. Each poll
   // reads at most MAX_EXTRA_PAGES more pages; a longer collection is walked over several polls,
   // each resuming where the last stopped (complete false until the walk reaches the end, and
   // mergeKnown keeps the records already known meanwhile). A failed page keeps what is known.
   var MAX_EXTRA_PAGES = 9;
   function watchEveryPage(collection, handler, options) {
-    var latest = 0;
     // An unfinished walk: where it stopped and the later pages it has read so far.
     var walk = null;
+    // One walk at a time: a slower walk than the poll would otherwise be dropped and
+    // started again from the same cursor by every snapshot. A snapshot that arrives
+    // meanwhile waits here, and the walk's result goes out with its first page.
+    var walking = false;
+    var waiting = null;
     function combined(first, later) {
       var out = first.slice();
       var have = dict();
@@ -316,27 +320,39 @@ export const GADGET_KIT_HELPERS = `
       later.forEach(function (doc) { if (!have[doc.id]) { have[doc.id] = true; out.push(doc); } });
       return out;
     }
-    return collection.watch(function (snapshot) {
-      if (snapshot.status === 'loading') return;
-      var mine = ++latest;
-      var first = snapshot.items || [];
-      if (!snapshot.nextCursor) { walk = null; handler(first, true); return; }
+    function settle(first, later, complete) {
+      walking = false;
+      var newer = waiting;
+      waiting = null;
+      if (newer && !newer.nextCursor) { walk = null; handler(newer.items, true); return; }
+      handler(combined(newer ? newer.items : first, later), complete);
+    }
+    function start(first, firstCursor) {
+      walking = true;
       var carried = walk ? walk.items : [];
       var gathered = [];
       var pages = 0;
       (function more(cursor) {
         collection.list({ limit: options.limit, cursor: cursor }).then(function (page) {
-          if (mine !== latest) return;
           gathered = gathered.concat(page.items || []);
           pages += 1;
           if (page.nextCursor && pages < MAX_EXTRA_PAGES) { more(page.nextCursor); return; }
           var later = carried.concat(gathered);
           walk = page.nextCursor ? { cursor: page.nextCursor, items: later } : null;
-          handler(combined(first, later), !page.nextCursor);
+          settle(first, later, !page.nextCursor);
         }, function () {
           // Keep what is known; the next poll goes on from the same place.
+          walking = false;
+          waiting = null;
         });
-      })(walk ? walk.cursor : snapshot.nextCursor);
+      })(walk ? walk.cursor : firstCursor);
+    }
+    return collection.watch(function (snapshot) {
+      if (snapshot.status === 'loading') return;
+      var first = snapshot.items || [];
+      if (walking) { waiting = { items: first, nextCursor: snapshot.nextCursor }; return; }
+      if (!snapshot.nextCursor) { walk = null; handler(first, true); return; }
+      start(first, snapshot.nextCursor);
     }, options);
   }
   function mergeKnown(known, items, complete) {

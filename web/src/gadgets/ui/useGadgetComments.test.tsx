@@ -131,6 +131,49 @@ describe("gadget comments", () => {
     expect(result.current.error).toBeUndefined();
   });
 
+  it("saves text edited after a failed save that may have committed, without a second comment", async () => {
+    vi.mocked(listGadgetComments).mockResolvedValue({ items: [], canComment: true });
+    // The server replays an operation only with the payload it first saw.
+    const saved = new Map<string, string>();
+    let calls = 0;
+    vi.mocked(createGadgetComment).mockImplementation(async (_id, { body, operationId }) => {
+      calls += 1;
+      const first = saved.get(operationId);
+      if (first !== undefined && first !== body) throw new Error("operation_reuse");
+      saved.set(operationId, body);
+      // The first save commits, but its response never arrives.
+      if (calls === 1) throw new Error("response lost");
+      return comment("c3", { body });
+    });
+    vi.mocked(updateGadgetComment).mockImplementation(async (_id, commentId, { body }) =>
+      comment(commentId, { body: body ?? "" }),
+    );
+    const { result } = renderHook(() => useGadgetComments(BOARD, undefined), { wrapper });
+    await waitFor(() => expect(result.current.canComment).toBe(true));
+    act(() =>
+      result.current.startComment({
+        text: "Ship it",
+        occurrence: 1,
+        rect: { x: 0, y: 0, width: 1, height: 1 },
+      }),
+    );
+
+    await act(async () => {
+      expect(await result.current.panel.onAddComment("Move it")).toBe(false);
+    });
+    await act(async () => {
+      expect(await result.current.panel.onAddComment("Move it to Friday")).toBe(true);
+    });
+
+    expect(saved.size).toBe(1);
+    expect(vi.mocked(updateGadgetComment)).toHaveBeenCalledWith(BOARD.id, "c3", {
+      body: "Move it to Friday",
+    });
+    expect(result.current.panel.activeSelection).toBeNull();
+    vi.mocked(createGadgetComment).mockReset();
+    vi.mocked(updateGadgetComment).mockReset();
+  });
+
   it.each([
     ["the session is still being started", "starting" as const, false],
     ["the session has them", "sent" as const, true],

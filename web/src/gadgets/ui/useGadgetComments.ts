@@ -1,7 +1,7 @@
 // Comments on a gadget, in the shape of the comments panel that files use. They live with the
 // gadget, so everyone it is shared with sees them; Address all sends the open ones to the session
 // that works on the gadget and moves them to Sent once that session has them.
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { Comment } from "@/hooks/useComments";
@@ -159,6 +159,10 @@ export function useGadgetComments(
   const toPanel = (item: GadgetComment) =>
     toPanelComment(gadget, item, positions.get(item.id) ?? 0);
 
+  // The body last sent under the pending operation ID. A failed create may still have
+  // committed, so a retry repeats it unchanged and then applies any edit separately.
+  const sentBody = useRef<{ operationId: string; body: string } | null>(null);
+
   const startComment = useCallback((selection: GadgetSelection) => {
     pendingPositions += 1;
     setPendingPosition(-pendingPositions);
@@ -205,13 +209,18 @@ export function useGadgetComments(
       addressedComments: items.filter((item) => item.status === "addressed").map(toPanel),
       activeSelection,
       // Keeps the selection, the typed text and the operation ID until the comment is saved,
-      // so a failed request can be sent again as it was.
+      // so a failed request can be sent again as it was, with any later edit applied after.
       onAddComment: async (body) => {
         const anchor = pending;
         if (anchor === null) return false;
         let saved = false;
+        const operationId = pendingOperationId;
+        const sent = sentBody.current?.operationId === operationId ? sentBody.current.body : body;
+        sentBody.current = { operationId, body: sent };
         await run(async () => {
-          await createGadgetComment(gadgetId, { body, anchor, operationId: pendingOperationId });
+          const created = await createGadgetComment(gadgetId, { body: sent, anchor, operationId });
+          if (sent !== body) await updateGadgetComment(gadgetId, created.id, { body });
+          if (sentBody.current?.operationId === operationId) sentBody.current = null;
           saved = true;
           // A selection made while this saved is the viewer's next comment; it stays.
           setPending((current) => (current === anchor ? null : current));
