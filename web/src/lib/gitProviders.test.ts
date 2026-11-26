@@ -1,7 +1,25 @@
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { GitPullRequestIcon } from "lucide-react";
-import { describe, expect, it } from "vitest";
-import { GIT_PROVIDERS, gitProviderCopy } from "@/lib/gitProviders";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { GIT_PROVIDERS, gitProviderCopy, hostedOnGitHub } from "@/lib/gitProviders";
+import {
+  type NamedCodeHost,
+  type PullRequestIntegrations,
+  pullRequestIntegrations,
+  registerPullRequestIntegrations,
+  restorePullRequestIntegrations,
+} from "@/lib/pullRequestIntegrations";
+
+// A named host whose pull requests GitHub hosts, under its own name.
+const EXAMPLE_NAMED_HOST: NamedCodeHost = {
+  provider: "named-host",
+  matchesHost: (host) => host.endsWith(".host.example.com"),
+  copy: { ...GIT_PROVIDERS.github, id: "named-host", label: "Example Host" },
+  hostedOnGitHub: true,
+  readsAsDevice: true,
+  readOnly: true,
+  linksOnDevice: true,
+};
 
 describe("gitProviderCopy", () => {
   it("serves GitHub to a host that predates the provider field", () => {
@@ -87,5 +105,22 @@ describe("gitProviderCopy", () => {
 
   it("does not resolve inherited object keys as providers", () => {
     expect(gitProviderCopy("toString").label).toBe("toString");
+  });
+});
+
+describe("gitProviderCopy for a registered named host", () => {
+  let saved: PullRequestIntegrations;
+  beforeEach(() => {
+    saved = pullRequestIntegrations();
+  });
+  afterEach(() => restorePullRequestIntegrations(saved));
+
+  it("serves the host's own copy and says whether GitHub hosts its pull requests", () => {
+    expect(hostedOnGitHub("named-host")).toBe(false);
+    registerPullRequestIntegrations({ namedCodeHosts: [EXAMPLE_NAMED_HOST] });
+    expect(gitProviderCopy("named-host")).toBe(EXAMPLE_NAMED_HOST.copy);
+    expect(hostedOnGitHub("named-host")).toBe(true);
+    expect(hostedOnGitHub("github")).toBe(true);
+    expect(hostedOnGitHub(undefined)).toBe(true);
   });
 });

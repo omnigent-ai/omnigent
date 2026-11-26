@@ -1,6 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { codeHostProvider, parseCodeHostPullRequestUrl } from "./codeHosts";
+import { GIT_PROVIDERS } from "@/lib/gitProviders";
+import {
+  type NamedCodeHost,
+  type PullRequestIntegrations,
+  pullRequestIntegrations,
+  registerPullRequestIntegrations,
+  restorePullRequestIntegrations,
+} from "@/lib/pullRequestIntegrations";
+
+import { codeHostProvider, isDeviceReadHost, parseCodeHostPullRequestUrl } from "./codeHosts";
+
+// A named host serving numbered servers under host.example.com.
+const EXAMPLE_NAMED_HOST: NamedCodeHost = {
+  provider: "named-host",
+  matchesHost: (host) => /^[1-9][0-9]*\.host\.example\.com$/.test(host),
+  copy: { ...GIT_PROVIDERS.github, id: "named-host", label: "Example Host" },
+  hostedOnGitHub: true,
+  readsAsDevice: true,
+  readOnly: true,
+  linksOnDevice: true,
+};
 
 const PULL_REQUEST = "https://github.com/example-org/app/pull/1234";
 
@@ -54,5 +74,25 @@ describe("parseCodeHostPullRequestUrl", () => {
     ["no number", "https://github.com/o/r/pull/x"],
   ])("reads nothing from %s", (_case, url) => {
     expect(parseCodeHostPullRequestUrl(url)).toBeNull();
+  });
+});
+
+describe("codeHostProvider with a registered named host", () => {
+  let saved: PullRequestIntegrations;
+  beforeEach(() => {
+    saved = pullRequestIntegrations();
+  });
+  afterEach(() => restorePullRequestIntegrations(saved));
+
+  it("names only github.com while no named host is registered", () => {
+    expect(codeHostProvider("1.host.example.com")).toBeNull();
+    expect(isDeviceReadHost("1.host.example.com")).toBe(false);
+  });
+
+  it("names a registered host's provider, in any case, ahead of GitHub Enterprise", () => {
+    registerPullRequestIntegrations({ namedCodeHosts: [EXAMPLE_NAMED_HOST] });
+    expect(codeHostProvider("1.Host.example.com", ["1.host.example.com"])).toBe("named-host");
+    expect(isDeviceReadHost("1.host.example.com")).toBe(true);
+    expect(codeHostProvider("github.com")).toBe("github");
   });
 });
