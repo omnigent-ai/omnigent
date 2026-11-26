@@ -7436,6 +7436,7 @@ async def test_post_external_session_status_rejects_unknown_status(
 
 async def test_post_external_session_usage_publishes_session_usage(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -7453,6 +7454,17 @@ async def test_post_external_session_usage_publishes_session_usage(
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    # What an earlier in-process harness left must not resurface after this
+    # native report, e.g. once the session switches back.
+    store = SqlAlchemyConversationStore(db_uri)
+    store.merge_context_breakdown(
+        session["id"],
+        {
+            "reported": {"history_tokens": 30000},
+            "context_tokens": 44568,
+            "failed_attempt": {"history_tokens": 990000},
+        },
+    )
 
     resp = await client.post(
         f"/v1/sessions/{session['id']}/events",
@@ -7470,6 +7482,7 @@ async def test_post_external_session_usage_publishes_session_usage(
 
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert snapshot["last_total_tokens"] == 44568
+    assert store.get_context_breakdown(session["id"]) is None
 
 
 async def test_external_session_usage_broadcasts_parent_subtree_cost_not_own(

@@ -19,8 +19,10 @@ from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
     attachment_cache_dir,
+    attachment_is_inlined,
     attachment_reference_line,
     codex_resize_metadata_path,
+    decode_data_uri,
     filesystem_attachment_capability,
     has_unresolved_file_id,
     inline_filesystem_attachment_name,
@@ -85,6 +87,24 @@ def test_parse_data_uri_without_comma_raises() -> None:
     """
     with pytest.raises(ValueError, match="no comma separator"):
         parse_data_uri("data:image/png;base64")
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        (_PNG_DATA_URI, (base64.b64decode(_PNG_B64), "image/png")),
+        # No payload after the comma.
+        ("data:image/png;base64,", None),
+        # Not valid base64.
+        ("data:image/png;base64,A", None),
+        ("data:image/png;base64", None),
+    ],
+)
+def test_decode_data_uri_returns_bytes_or_none(
+    uri: str, expected: tuple[bytes, str] | None
+) -> None:
+    """decode_data_uri decodes a usable payload and reports an unusable one as None."""
+    assert decode_data_uri(uri) == expected
 
 
 def test_materialize_attachment_writes_decoded_bytes(tmp_path: Path) -> None:
@@ -541,6 +561,24 @@ async def test_native_file_delivery(key: str, tmp_path: Path) -> None:
 def test_uses_filesystem_delivery(filename: str, metadata: object, expected: bool) -> None:
     """A recorded decision wins; without one the default extensions decide."""
     assert uses_filesystem_delivery(filename, metadata) is expected
+
+
+@pytest.mark.parametrize(
+    ("filename", "metadata", "native", "expected"),
+    [
+        ("chart.png", {}, False, True),
+        ("notes.txt", {"delivery": "inline"}, False, True),
+        ("trace.gz", {"delivery": "filesystem"}, False, False),
+        ("report.zip", None, False, False),
+        # A native harness hands every attachment to its CLI as a path.
+        ("chart.png", {"delivery": "inline"}, True, False),
+    ],
+)
+def test_attachment_is_inlined(
+    filename: str, metadata: object, native: bool, expected: bool
+) -> None:
+    """Only a non-native, inline-delivered upload reaches the prompt as bytes."""
+    assert attachment_is_inlined(filename, metadata, native=native) is expected
 
 
 @pytest.mark.parametrize(

@@ -304,6 +304,40 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   arriving (the highlighted row stays put), a file and a session with the same
   name (the later one gets a suffix such as `@README.md (file)`), Attach to
   agent from the file viewer (adds a token at the end).
+- `context-breakdown`: the context ring in the in-session workspace bar shows
+  the measured share of the window on hover; clicking it opens a breakdown of
+  what fills the window. The server resolves every row against the last turn's
+  reported usage it reads in the same request, and the popover only renders
+  them: the header and Free space are measured; the system prompt, attachments
+  and conversation history are size-based estimates; Other is the measured
+  total minus those estimates (tool schemas, harness-added content, the last
+  reply) and says so when the estimates exceed the total. The system prompt
+  follows how the harness receives instructions: no figure and "Not delivered
+  by this harness" where it has no channel for them. Tool definitions list the
+  agent's MCP servers and tool counts without a size. Each attachment shows its
+  size and whether it was sent inline (with an estimate, or "Size only" for
+  PDFs and other binary files), saved to the workspace, or not delivered (file
+  removed, or a native harness could not write it to disk); a native harness
+  receives each attachment it can decode as a file path. History notes how
+  many earlier items a compaction summary replaced, and has no figure for a
+  native harness that keeps its own history (all but Claude Code). An open
+  breakdown refreshes when a turn starts, when it ends, and when the measured
+  total or the context window changes. A server without the breakdown route
+  still shows the measured header.
+  When the runner reports the request it sent (in-process harnesses that build
+  the model request: claude-sdk, openai-agents, pi and codex), the server uses
+  those figures for the rows instead of its own: System prompt, Tool
+  definitions (with a size and tool count), Attachments, Conversation history
+  and Current message, still labelled estimates. History counts the tool calls
+  the harness holds and, after a claude-sdk restart that replayed only the
+  newest history, says how many earlier messages were omitted. Native terminal
+  harnesses keep the server's rows. A later request rejected as too long for
+  the window adds a "Last request was too long" section with what it
+  attempted; the next completed turn that reports usage clears it, and a fork
+  starts without either. `/context` opens the same breakdown when the ring is
+  shown (otherwise it prints the text summary), the REPL `/context` prints the
+  same rows under its usage tree, and `omnigent session context --id <id>`
+  prints them in a terminal (`--json` for the raw response).
 - `review-context`: submitting an Agent comment in PR Changes attaches a chip
   to the session composer. Hover previews the comment, click reveals it in
   Changes, and X deletes the saved comment. Failed deletion retains the chip.
@@ -623,6 +657,12 @@ and opens the composer with its prompt`).
   "attach", "side chat", "goal" or "plan mode", then press Enter to run the
   Add menu's action. A row that can't run stays listed with the reason.
 
+**Context breakdown** (open a session with at least one finished turn): hover
+the context ring at the right end of the workspace bar above the composer for
+the measured summary, then click it to open the breakdown. Typing `/context`
+in the composer opens the same breakdown. In a terminal, run `/context` in the
+REPL or `omnigent session context --id <session id>`.
+
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
 pickers, seeded from the source session when its harness family is kept.
@@ -707,6 +747,32 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
 composer with its prompt`).
 
+- **`context-breakdown`:** in a session with a finished turn and an attached
+  image or text file, click the context ring. Check that the header matches the
+  hover tooltip, that each row is labelled measured or estimate, and that the
+  attachment rows name the files with their sizes. Cross-check the rows with
+  `measured` and `categories` from `GET /v1/sessions/<id>/context-breakdown`;
+  on a harness without an instruction channel (e.g. Cursor's terminal agent)
+  the System prompt row reads "Not delivered by this harness". Component coverage:
+  `web/src/components/composer/ComposerContextBreakdown.test.tsx` and
+  `web/src/components/composer/ComposerContextRing.test.tsx`; server
+  rows: `tests/server/test_context_breakdown.py`; instruction delivery:
+  `tests/runtime/test_prompt.py`; read access and measured total:
+  `tests/server/integration/test_sessions_permissions.py::test_context_breakdown_requires_read_access`.
+  Runner report: on a claude-sdk session, check that Tool definitions shows a
+  size and tool count and that the rows of
+  `GET /v1/sessions/<id>/context-breakdown` have `origin: "runner"`. For an
+  overflow, script the mock model to reject a turn as too long and check the
+  "Last request was too long" section and `failed_attempt`. Coverage:
+  `tests/runtime/test_context_breakdown.py`,
+  `tests/inner/test_claude_sdk_executor.py::test_context_breakdown_follows_a_restarted_then_resumed_session`,
+  `tests/inner/test_claude_sdk_executor.py::test_prompt_too_long_failure_records_the_attempted_breakdown`,
+  `tests/runtime/harnesses/test_executor_adapter.py::test_executor_error_usage_reaches_response_failed`,
+  `tests/runner/test_failure_event_contract.py::test_context_overflow_preserves_a_valid_queued_failure`,
+  `tests/server/routes/test_sessions_runner_relay.py::test_relay_persists_context_window_labels_for_inprocess_turn`,
+  `tests/repl/test_context_command.py`, `tests/cli/test_session_context.py` and,
+  for `/context` in the composer,
+  `tests/browser_ui/chat/test_composer_context_breakdown.py`.
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
   away: its tooltip should stay visible. Check dismissal by outside click,
@@ -1205,6 +1271,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
 
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
+- The context breakdown needs a finished turn: before one, the ring is hidden.
+  Its estimates come from stored content, so they can exceed the measured total
+  (Other then reads ~0) and do not track the harness's own trimming.
 
 - The launch action banner appears only on deployments whose launch code
   reports it; Omnigent's own sandbox providers never do. Its text comes from the

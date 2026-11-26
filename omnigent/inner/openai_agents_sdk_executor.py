@@ -1418,6 +1418,9 @@ class OpenAIAgentsSDKExecutor(Executor):
     def handles_tools_internally(self) -> bool:
         return True
 
+    def sends_turn_request_to_model(self) -> bool:
+        return True
+
     def replays_tool_history(self) -> bool:
         return True
 

@@ -94,6 +94,21 @@ def parse_data_uri(uri: str) -> DataUri:
     return DataUri(mime_type=mime_part, base64_payload=payload)
 
 
+def decode_data_uri(uri: str) -> tuple[bytes, str] | None:
+    """
+    Decode a ``data:`` URI's payload, as materializing an attachment does.
+
+    :param uri: Data URI string, e.g. ``"data:image/png;base64,iVBOR..."``.
+    :returns: ``(raw_bytes, mime_type)``, or ``None`` when the URI has no
+        payload or the payload is not valid base64.
+    """
+    try:
+        parsed = parse_data_uri(uri)
+        return base64.b64decode(parsed.base64_payload), parsed.mime_type
+    except (ValueError, binascii.Error):
+        return None
+
+
 # Upload limits for files that the harness opens with filesystem tools.
 # The server enforces these per session, including copies between sessions.
 MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
@@ -188,6 +203,21 @@ def uses_filesystem_delivery(filename: str | None, metadata: object) -> bool:
     if delivery in (FILESYSTEM_DELIVERY, INLINE_DELIVERY):
         return delivery == FILESYSTEM_DELIVERY
     return requires_filesystem(filename)
+
+
+def attachment_is_inlined(filename: str | None, metadata: object, *, native: bool = False) -> bool:
+    """
+    Whether an attachment's bytes go into the model prompt rather than a workspace file.
+
+    A native harness hands every attachment to its CLI as a file path; other
+    harnesses inline each upload unless it is delivered as a file.
+
+    :param filename: The stored filename, e.g. ``"chart.png"``.
+    :param metadata: The file's ``source_metadata`` or its content block.
+    :param native: The session runs a native (terminal) harness.
+    :returns: True when the payload is sent inline to the model.
+    """
+    return not native and not uses_filesystem_delivery(filename, metadata)
 
 
 def filesystem_attachment_capability(filenames: Iterable[str | None]) -> str:
@@ -366,14 +396,13 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
             )
         return None
 
-    try:
-        parsed = parse_data_uri(data_uri)
-        raw_bytes = base64.b64decode(parsed.base64_payload)
-    except (ValueError, binascii.Error):
-        _logger.warning("Failed to decode data URI for attachment", exc_info=True)
+    decoded = decode_data_uri(data_uri)
+    if decoded is None:
+        _logger.warning("Failed to decode data URI for attachment")
         return None
+    raw_bytes, mime_type = decoded
 
-    ext = MIME_TO_EXT.get(parsed.mime_type, "")
+    ext = MIME_TO_EXT.get(mime_type, "")
     filename = block.get("filename")
     if not isinstance(filename, str) or not filename:
         filename = f"attachment_{uuid.uuid4().hex[:8]}{ext}"

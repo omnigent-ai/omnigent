@@ -6513,8 +6513,14 @@ def test_fork_conversation_drops_instance_scoped_labels(
         },
     )
 
+    # The runner's context breakdown describes the source's own turns.
+    conversation_store.merge_context_breakdown(
+        source.id, {"reported": {"history_tokens": 30000}, "context_tokens": 39903}
+    )
+
     fork = conversation_store.fork_conversation(source.id)
 
+    assert conversation_store.get_context_breakdown(fork.id) is None
     # The clone keeps the harness identity (wrapper) but none of the
     # source's per-instance state. A bridge-id here would re-introduce
     # the cross-bridge bug; the metrics would show the source's stale
@@ -7117,6 +7123,34 @@ def test_fork_clone_agent_failure_leaves_no_orphan(
     assert agent_store.get("77511ca47f5b6c6085061ccf10622eb5") is None
     after = {a.id for a in agent_store.list(limit=100).data}
     assert after == before
+
+
+def test_context_breakdown_document_merges_and_clears_keys(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Keys are set and removed independently; an emptied document reads as none."""
+    conv = conversation_store.create_conversation()
+    assert conversation_store.get_context_breakdown(conv.id) is None
+    # A document well past a session label's size limit.
+    reported = {"history_tokens": 30000, "method": "content_size", "padding": "x" * 2000}
+
+    conversation_store.merge_context_breakdown(
+        conv.id, {"reported": reported, "context_tokens": 39903}
+    )
+    conversation_store.merge_context_breakdown(conv.id, {"failed_attempt": {"history_tokens": 9}})
+    assert conversation_store.get_context_breakdown(conv.id) == {
+        "reported": reported,
+        "context_tokens": 39903,
+        "failed_attempt": {"history_tokens": 9},
+    }
+
+    conversation_store.merge_context_breakdown(
+        conv.id, {"reported": None, "context_tokens": None, "failed_attempt": None}
+    )
+    assert conversation_store.get_context_breakdown(conv.id) is None
+    # A conversation that does not exist is a no-op, not an error.
+    conversation_store.merge_context_breakdown("0" * 32, {"reported": {}})
+    assert conversation_store.get_context_breakdown("0" * 32) is None
 
 
 def test_instance_scoped_label_keys_match_harness_constants() -> None:

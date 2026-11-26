@@ -2677,6 +2677,9 @@ class ClaudeSDKExecutor(Executor):
         self._pending_framework_context: dict[str, str] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
+        # Per session: prior messages its client was launched without (trimmed
+        # replay), and how many messages the history had on its latest turn.
+        self._omitted_history: dict[str, tuple[int, int]] = {}
         # Force-close tasks for clients evicted on turn cancellation, kept
         # referenced so they are not GC'd mid-close.
         self._cancel_close_tasks: set[asyncio.Task[None]] = set()
@@ -3183,6 +3186,7 @@ class ClaudeSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
+        self._omitted_history.pop(session_key, None)
         await self._close_live_client(session_key)
 
     async def _close_live_client(self, session_key: str) -> None:
@@ -3443,6 +3447,9 @@ class ClaudeSDKExecutor(Executor):
         return True
 
     def handles_tools_internally(self) -> bool:
+        return True
+
+    def sends_turn_request_to_model(self) -> bool:
         return True
 
     def replays_tool_history(self) -> bool:
@@ -4072,6 +4079,15 @@ class ClaudeSDKExecutor(Executor):
             return
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
+        if resume_session and session_key in self._omitted_history:
+            omitted_at_launch, last_seen = self._omitted_history[session_key]
+            if len(messages) < last_seen:
+                # The history was rebuilt shorter than at the last turn's start (a
+                # compaction), so the messages the launch left out are no longer
+                # at its head.
+                del self._omitted_history[session_key]
+            else:
+                self._omitted_history[session_key] = (omitted_at_launch, len(messages))
         prompt = (
             self._build_prompt(
                 messages,
@@ -4079,7 +4095,7 @@ class ClaudeSDKExecutor(Executor):
                 after_interrupt=self._clients[session_key].interruption_marker_pending,
             )
             if resume_session
-            else await self._fresh_session_prompt(messages, cfg)
+            else await self._fresh_session_prompt(messages, cfg, session_key)
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -4106,7 +4122,7 @@ class ClaudeSDKExecutor(Executor):
             if rebuild:
                 await self._close_live_client(session_key)
                 resume_session = False
-                prompt = await self._fresh_session_prompt(messages, cfg)
+                prompt = await self._fresh_session_prompt(messages, cfg, session_key)
 
         from omnigent.harnesses.claude_native.bridge import (
             MANAGED_MCP_RELAY_MISSING_WARNING,
@@ -4505,6 +4521,7 @@ class ClaudeSDKExecutor(Executor):
                 )
                 return None
 
+            self._retire_omitted_history_after_compaction(session_key)
             return CompactionComplete(
                 summary="[Claude Code compaction — context was automatically compacted]",
                 token_count=compaction_tokens,
@@ -5111,8 +5128,24 @@ class ClaudeSDKExecutor(Executor):
             return self._resolved_default_model
         return self._model_override
 
+    def omitted_history_messages(self, session_key: str) -> int:
+        return self._omitted_history.get(session_key, (0, 0))[0]
+
+    def _retire_omitted_history_after_compaction(self, session_key: str) -> None:
+        """Drop the session's omitted count from its next turn on.
+
+        The compacted context replaces the history the launch trimmed, but the
+        turn that compacted was still sent the trimmed history, so its own
+        breakdown keeps the count.
+        """
+        if session_key in self._omitted_history:
+            self._omitted_history[session_key] = (
+                self._omitted_history[session_key][0],
+                sys.maxsize,
+            )
+
     async def _fresh_session_prompt(
-        self, messages: list[Message], cfg: ExecutorConfig
+        self, messages: list[Message], cfg: ExecutorConfig, session_key: str
     ) -> str | list[_JsonObject]:
         """
         Build the first prompt for a newly launched client.
@@ -5122,6 +5155,8 @@ class ClaudeSDKExecutor(Executor):
 
         :param messages: Conversation history as inner :class:`Message` dicts.
         :param cfg: The turn's executor config, carrying any model override.
+        :param session_key: The session whose client is being launched; how
+            many prior messages its replay left out is recorded for it.
         :returns: The prompt from :meth:`_build_prompt`.
         """
         budget = None
@@ -5135,7 +5170,13 @@ class ClaudeSDKExecutor(Executor):
                 cfg.model,
             )
             budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
-        return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
+        omitted: list[int] = []
+        prompt = self._build_prompt(
+            messages, resume_session=False, history_token_budget=budget, omitted_out=omitted
+        )
+        # The new client never sees the omitted messages, on this turn or later ones.
+        self._omitted_history[session_key] = (sum(omitted), len(messages))
+        return prompt
 
     @staticmethod
     def _build_prompt(
@@ -5144,6 +5185,7 @@ class ClaudeSDKExecutor(Executor):
         resume_session: bool,
         history_token_budget: int | None = None,
         after_interrupt: bool = False,
+        omitted_out: list[int] | None = None,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -5170,6 +5212,8 @@ class ClaudeSDKExecutor(Executor):
             ``None`` replays every prior message.
         :param after_interrupt: ``True`` when the resumed session's
             interruption marker has not been delivered yet.
+        :param omitted_out: When given, receives the number of prior
+            messages a fresh session's replay left out of its budget.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
@@ -5203,6 +5247,8 @@ class ClaudeSDKExecutor(Executor):
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         omitted = len(prior) - len(kept)
+        if omitted_out is not None:
+            omitted_out.append(omitted)
         if omitted:
             logger.info(
                 "ClaudeSDKExecutor: replaying %d of %d prior messages within %d tokens",

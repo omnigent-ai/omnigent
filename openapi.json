@@ -2154,6 +2154,225 @@
         "title": "CompletedEvent",
         "type": "object"
       },
+      "ContextBreakdownAttachment": {
+        "description": "One attachment still in a session's live conversation history.",
+        "properties": {
+          "bytes": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stored or inline-decoded size in bytes; `None` when unknown (the file is gone or the block is a remote URL).",
+            "title": "Bytes"
+          },
+          "content_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stored MIME type, e.g. `\"image/png\"`.",
+            "title": "Content Type"
+          },
+          "delivery": {
+            "description": "`\"inline\"` (sent to the model), `\"workspace\"` (saved to disk, as a native harness does with each attachment it can decode; only its path reaches the model) or `\"missing\"` (not delivered: the file record is gone, or a native harness could not write the block to disk).",
+            "enum": [
+              "inline",
+              "workspace",
+              "missing"
+            ],
+            "title": "Delivery",
+            "type": "string"
+          },
+          "estimated_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Estimated prompt tokens for an inline attachment; `None` when its type has no reliable estimate (e.g. a PDF) or it is not inline.",
+            "title": "Estimated Tokens"
+          },
+          "file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Uploaded file id, e.g. `\"file_abc123\"`; `None` for bytes sent inline in the message.",
+            "title": "File Id"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Display name, e.g. `\"report.pdf\"`; `None` when unknown.",
+            "title": "Filename"
+          }
+        },
+        "required": [
+          "delivery"
+        ],
+        "title": "ContextBreakdownAttachment",
+        "type": "object"
+      },
+      "ContextBreakdownCategory": {
+        "description": "One row of a context breakdown.",
+        "properties": {
+          "count": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Items the row covers, e.g. `2` attachments; `None` when a count does not apply.",
+            "title": "Count"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A short explanation to show under the row, e.g. `\"12 messages and tool calls\"`.",
+            "title": "Detail"
+          },
+          "kind": {
+            "description": "What the row covers: `\"system_prompt\"` (instructions Omnigent composes), `\"skills\"` (the skill listing inside them), `\"tools\"` (tool schemas), `\"attachments\"` (inline attachments), `\"history\"` (earlier messages and tool calls/results), `\"message\"` (the current message, itemized only by a runner), `\"other\"` (the measured total minus the itemized rows) or `\"free\"` (the window minus the measured total).",
+            "enum": [
+              "system_prompt",
+              "skills",
+              "tools",
+              "attachments",
+              "history",
+              "message",
+              "other",
+              "free"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "origin": {
+            "default": "server",
+            "description": "Who produced the row: the `\"server\"` from stored content, or the `\"runner\"` from the request it sent.",
+            "enum": [
+              "runner",
+              "server"
+            ],
+            "title": "Origin",
+            "type": "string"
+          },
+          "source": {
+            "description": "`\"measured\"` (from the provider's report), `\"estimated\"` (from content size, or derived from an estimate) or `\"unknown\"` (no figure).",
+            "enum": [
+              "measured",
+              "estimated",
+              "unknown"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The row's size in tokens; `None` when it has no figure.",
+            "title": "Tokens"
+          }
+        },
+        "required": [
+          "kind",
+          "source"
+        ],
+        "title": "ContextBreakdownCategory",
+        "type": "object"
+      },
+      "ContextBreakdownFailedAttempt": {
+        "description": "What a request rejected as too long for the context window carried.",
+        "properties": {
+          "categories": {
+            "description": "The runner's rows for the rejected request, in display order; categories without content are left out.",
+            "items": {
+              "$ref": "#/components/schemas/ContextBreakdownCategory"
+            },
+            "title": "Categories",
+            "type": "array"
+          },
+          "total_tokens": {
+            "description": "Sum of the rows' estimates, e.g. `208655`.",
+            "format": "int64",
+            "title": "Total Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_tokens"
+        ],
+        "title": "ContextBreakdownFailedAttempt",
+        "type": "object"
+      },
+      "ContextBreakdownMeasured": {
+        "description": "The provider-reported usage a breakdown is relative to.",
+        "properties": {
+          "context_window": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The model's window in tokens, e.g. `200000`; `None` when it is not known.",
+            "title": "Context Window"
+          },
+          "total_tokens": {
+            "description": "Tokens the last turn's request used, e.g. `48200`.",
+            "format": "int64",
+            "title": "Total Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_tokens"
+        ],
+        "title": "ContextBreakdownMeasured",
+        "type": "object"
+      },
       "ConversationDeleted": {
         "description": "Confirmation payload returned after deleting a conversation.",
         "properties": {
@@ -3152,6 +3371,17 @@
             "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`.",
             "title": "Code",
             "type": "string"
+          },
+          "context_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Estimated split of the request a failed turn attempted, so a \"prompt too long\" failure shows what overflowed; absent when the runner did not build one."
           },
           "message": {
             "description": "Human-readable error description. Always populated; older clients render this verbatim.",
@@ -9198,6 +9428,72 @@
           "type"
         ],
         "title": "SessionContentBlock",
+        "type": "object"
+      },
+      "SessionContextBreakdown": {
+        "description": "Response for `GET /v1/sessions/{session_id}/context-breakdown`.\n\nOne resolved view: the server picks each row's figure (the runner's\nreport of the request it sent where there is one, else its own estimate)\nand computes the remainder, so clients only render `categories` in order. Content a\nharness adds itself (its own system prompt, tool schemas, project\ninstructions) is only visible as part of the `\"other\"` row.",
+        "properties": {
+          "attachments": {
+            "description": "Attachments in the live history, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/ContextBreakdownAttachment"
+            },
+            "title": "Attachments",
+            "type": "array"
+          },
+          "bytes_per_token": {
+            "description": "Ratio behind the text estimates, e.g. `4`.",
+            "format": "int64",
+            "title": "Bytes Per Token",
+            "type": "integer"
+          },
+          "categories": {
+            "description": "The rows, in display order.",
+            "items": {
+              "$ref": "#/components/schemas/ContextBreakdownCategory"
+            },
+            "title": "Categories",
+            "type": "array"
+          },
+          "estimates_exceed_measured": {
+            "default": false,
+            "description": "The itemized estimates add up to more than the measured total, so they run high and `\"other\"` is `0`.",
+            "title": "Estimates Exceed Measured",
+            "type": "boolean"
+          },
+          "failed_attempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContextBreakdownFailedAttempt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What a later request that was rejected as too long for the context window attempted; `None` otherwise."
+          },
+          "measured": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContextBreakdownMeasured"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The provider-reported usage read with this breakdown; `None` when the harness has reported none, in which case there is no `\"other\"` or `\"free\"` row."
+          },
+          "session_id": {
+            "description": "The session, e.g. `\"conv_abc123\"`.",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "bytes_per_token"
+        ],
+        "title": "SessionContextBreakdown",
         "type": "object"
       },
       "SessionCreateMetadata": {
@@ -15564,6 +15860,100 @@
         "title": "TurnCompletedEvent",
         "type": "object"
       },
+      "TurnContextBreakdown": {
+        "description": "What one turn's request carried, split by source.\n\nFigures are estimated from the content the runner handed the harness\n(`method`); the provider-reported `context_tokens` stays the measured\ntotal. Content a harness adds itself (its own system prompt, project\ninstructions) is not included.",
+        "properties": {
+          "attachment_count": {
+            "default": 0,
+            "description": "Attachments sent inline, e.g. `2`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Attachment Count",
+            "type": "integer"
+          },
+          "attachment_tokens": {
+            "default": 0,
+            "description": "Attachments sent inline, in every message.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Attachment Tokens",
+            "type": "integer"
+          },
+          "history_item_count": {
+            "default": 0,
+            "description": "Earlier messages and tool calls/results.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "History Item Count",
+            "type": "integer"
+          },
+          "history_tokens": {
+            "default": 0,
+            "description": "Earlier messages and tool calls/results, without their attachments.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "History Tokens",
+            "type": "integer"
+          },
+          "message_tokens": {
+            "default": 0,
+            "description": "The current message's text.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Message Tokens",
+            "type": "integer"
+          },
+          "method": {
+            "default": "content_size",
+            "description": "How the figures were derived, e.g. `\"content_size\"` (UTF-8 bytes per token, with a fixed estimate per image).",
+            "maxLength": 32,
+            "title": "Method",
+            "type": "string"
+          },
+          "omitted_history_count": {
+            "default": 0,
+            "description": "Older messages and tool calls/results a restarted session left out to fit its window; not in the counts above.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Omitted History Count",
+            "type": "integer"
+          },
+          "system_tokens": {
+            "default": 0,
+            "description": "Composed instructions, e.g. `1200`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "System Tokens",
+            "type": "integer"
+          },
+          "tool_count": {
+            "default": 0,
+            "description": "Tools listed, e.g. `18`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Tool Count",
+            "type": "integer"
+          },
+          "tool_tokens": {
+            "default": 0,
+            "description": "Tool schemas listed for the turn, e.g. `5400`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Tool Tokens",
+            "type": "integer"
+          },
+          "unestimated_attachment_count": {
+            "default": 0,
+            "description": "Inline attachments with no reliable estimate (e.g. a PDF); their size is not in `attachment_tokens`.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Unestimated Attachment Count",
+            "type": "integer"
+          }
+        },
+        "title": "TurnContextBreakdown",
+        "type": "object"
+      },
       "TurnFailedEvent": {
         "description": "Emitted when a turn fails due to an LLM error, timeout, or crash.",
         "properties": {
@@ -16571,6 +16961,18 @@
             "format": "int64",
             "title": "Cache Read Input Tokens",
             "type": "integer"
+          },
+          "context_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnContextBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Estimated split of the request the runner sent for this turn (instructions, tools, history, attachments, current message); `None` when the harness does not report one."
           },
           "context_tokens": {
             "anyOf": [
@@ -24295,6 +24697,50 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/context-breakdown": {
+      "get": {
+        "description": "Resolve what fills the session's context window into display rows.\n\nReturns the provider-reported total with the rows it splits into: the\nagent's system prompt, declared tool sources, attachments and\nconversation history as size-based estimates, then the remainder and\nthe free space.\n\n**Returns:** The resolved `SessionContextBreakdown`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if the session does not exist or the caller cannot read it.",
+        "operationId": "get_session_context_breakdown_v1_sessions__session_id__context_breakdown_get",
+        "parameters": [
+          {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionContextBreakdown"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Context Breakdown",
+        "tags": [
+          "sessions"
         ]
       }
     },

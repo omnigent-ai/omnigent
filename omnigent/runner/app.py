@@ -76,7 +76,11 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.inner.executor import NativeTurnAcceptance
-from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.llms.errors import (
+    CONTEXT_EXCEEDED_CODES,
+    detect_request_size_overflow,
+    is_context_overflow_message,
+)
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
@@ -225,6 +229,7 @@ from omnigent.runner.subagent_work import (
 from omnigent.runtime import routing_stamp, set_remote_routing_available
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    GATED_COMPOSED_INSTRUCTION_HARNESSES,
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
@@ -920,15 +925,6 @@ class InstructionComposition:
     composed: str | None
 
 
-# Harnesses whose executor reads the wire ``instructions`` field itself and
-# needs the gated ``InstructionComposition.composed`` value there instead of
-# the default fallback-including composed-per-turn string — opencode-native
-# via its NativePrompt.system_prompt; hermes via HermesExecutor.run_turn's
-# system_prompt param. See the harness-conditional swap in
-# _stream_message_to_harness.
-_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
-
-
 def _history_message_from_body(body: _JsonObject) -> _JsonObject:
     """Preserve the persisted initiating item when recording an incoming message."""
     return {
@@ -980,6 +976,8 @@ class _ContextWindowOverflow(Exception):
     :param detail_message: Original rejection text to surface verbatim in the
         error detail (e.g. a deployment byte-cap message carrying its byte
         sizes), kept instead of the token-count approximation when present.
+    :param context_breakdown: The harness's estimate of the rejected request,
+        e.g. ``{"history_tokens": 190000, ...}``, or ``None``.
     """
 
     def __init__(
@@ -988,19 +986,13 @@ class _ContextWindowOverflow(Exception):
         actual_tokens: int,
         *,
         detail_message: str | None = None,
+        context_breakdown: _JsonObject | None = None,
     ) -> None:
         self.max_tokens = max_tokens
         self.actual_tokens = actual_tokens
         self.detail_message = detail_message
+        self.context_breakdown = context_breakdown
         super().__init__(f"context window exceeded: {actual_tokens} > {max_tokens}")
-
-
-_CONTEXT_OVERFLOW_PATTERNS = (
-    "context_length_exceeded",
-    "context window",
-    "maximum context length",
-    "prompt is too long",
-)
 
 
 def _is_context_overflow_error(
@@ -1029,7 +1021,7 @@ def _is_context_overflow_error(
             size_overflow.approx_request_tokens,
             raw,
         )
-    if not any(pat in msg for pat in _CONTEXT_OVERFLOW_PATTERNS):
+    if not is_context_overflow_message(msg):
         return None
     actual_gt_max = re.search(r"(\d{4,})\D*>\D*(\d{4,})", msg)
     if actual_gt_max is not None:
@@ -1041,6 +1033,38 @@ def _is_context_overflow_error(
     if len(numbers) == 1:
         return int(numbers[0]), int(numbers[0]) + 1, None
     return 128000, 128001, None
+
+
+def _failed_event_context_breakdown(event: _JsonObject) -> _JsonObject | None:
+    """
+    The attempted-request breakdown an overflow ``response.failed`` event carries.
+
+    The overflow check also matches text that merely mentions a context
+    window (kept for its recovery behaviour), so the breakdown is passed on
+    only when the failure's code or message names an overflow outright.
+
+    :param event: The parsed SSE event dict.
+    :returns: The ``error.context_breakdown`` object, or ``None``.
+    """
+    response = event.get("response")
+    errors = [
+        error
+        for error in (
+            response.get("error") if isinstance(response, dict) else None,
+            event.get("error"),
+        )
+        if isinstance(error, dict)
+    ]
+    if not any(
+        error.get("code") in CONTEXT_EXCEEDED_CODES
+        or is_context_overflow_message(str(error.get("message", "")), specific_only=True)
+        for error in errors
+    ):
+        return None
+    for error in errors:
+        if isinstance(error.get("context_breakdown"), dict):
+            return cast(_JsonObject, error["context_breakdown"])
+    return None
 
 
 def _response_failed_payload(
@@ -6484,7 +6508,7 @@ def create_runner_app(
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
-            if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+            if harness_name in GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
                     cached_spec, _raw_per_request_instructions, []
                 )
@@ -7283,7 +7307,7 @@ def create_runner_app(
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
-                        if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+                        if harness_name in GATED_COMPOSED_INSTRUCTION_HARNESSES:
                             _instr_val = _ic_ds.composed
                             if _instr_val is not None:
                                 _instr_body = {**body, "instructions": _instr_val}
@@ -7555,6 +7579,7 @@ def create_runner_app(
                                         _max_tokens,
                                         _actual_tokens,
                                         detail_message=_ov_detail,
+                                        context_breakdown=_failed_event_context_breakdown(event),
                                     )
 
                                 _evt_type = event.get("type")
@@ -7961,7 +7986,7 @@ def create_runner_app(
                     _report_held_refusal()
                     return
                 _report_held_refusal()
-                _error = {
+                _error: dict[str, object] = {
                     "code": "context_length_exceeded",
                     "message": overflow.detail_message
                     or (
@@ -7970,6 +7995,8 @@ def create_runner_app(
                     ),
                     "type": "_ContextWindowOverflow",
                 }
+                if overflow.context_breakdown is not None:
+                    _error["context_breakdown"] = overflow.context_breakdown
                 _overflow_fail = _response_failed_payload(
                     _error,
                     source="llm",

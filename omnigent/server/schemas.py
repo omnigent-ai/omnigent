@@ -41,6 +41,7 @@ from omnigent.entities import (
     SlashCommandData,
     TerminalCommandData,
 )
+from omnigent.entities.context_breakdown import TurnContextBreakdown
 from omnigent.entities.conversation import StartupInputOptions
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
@@ -1103,6 +1104,9 @@ class Usage(BaseModel):
         it in preference to the catalog token-price estimate; ``None``
         when the harness doesn't report a cost (the common case, where
         cost is computed from token counts x catalog pricing).
+    :param context_breakdown: Estimated split of the request the runner sent
+        for this turn (instructions, tools, history, attachments, current
+        message); ``None`` when the harness does not report one.
     """
 
     input_tokens: int = 0
@@ -1114,6 +1118,7 @@ class Usage(BaseModel):
     cache_creation_input_tokens: int = 0
     model: str | None = None
     cost_usd: float | None = None
+    context_breakdown: TurnContextBreakdown | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -1135,6 +1140,9 @@ class ErrorDetail(BaseModel):
     :param undelivered: ``True`` when the harness reports it never received the
         message this turn carried (it failed before delivery), so the sender's
         queued copy is the only record of it; absent otherwise.
+    :param context_breakdown: Estimated split of the request a failed turn
+        attempted, so a "prompt too long" failure shows what overflowed;
+        absent when the runner did not build one.
     """
 
     code: str
@@ -1143,6 +1151,7 @@ class ErrorDetail(BaseModel):
     cause: str | None = None
     remediation: str | None = None
     undelivered: bool | None = None
+    context_breakdown: TurnContextBreakdown | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -3299,6 +3308,125 @@ class SessionRewindResponse(BaseModel):
     prompt: str
     attachments: list[SessionRewindAttachment] = Field(default_factory=list)
     attachments_incomplete: bool = False
+
+
+class ContextBreakdownAttachment(BaseModel):
+    """
+    One attachment still in a session's live conversation history.
+
+    :param file_id: Uploaded file id, e.g. ``"file_abc123"``; ``None`` for
+        bytes sent inline in the message.
+    :param filename: Display name, e.g. ``"report.pdf"``; ``None`` when unknown.
+    :param content_type: Stored MIME type, e.g. ``"image/png"``.
+    :param bytes: Stored or inline-decoded size in bytes; ``None`` when
+        unknown (the file is gone or the block is a remote URL).
+    :param delivery: ``"inline"`` (sent to the model), ``"workspace"``
+        (saved to disk, as a native harness does with each attachment it can
+        decode; only its path reaches the model) or ``"missing"`` (not
+        delivered: the file record is gone, or a native harness could not
+        write the block to disk).
+    :param estimated_tokens: Estimated prompt tokens for an inline
+        attachment; ``None`` when its type has no reliable estimate (e.g. a
+        PDF) or it is not inline.
+    """
+
+    file_id: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+    bytes: int | None = None
+    delivery: Literal["inline", "workspace", "missing"]
+    estimated_tokens: int | None = None
+
+
+class ContextBreakdownMeasured(BaseModel):
+    """
+    The provider-reported usage a breakdown is relative to.
+
+    :param total_tokens: Tokens the last turn's request used, e.g. ``48200``.
+    :param context_window: The model's window in tokens, e.g. ``200000``;
+        ``None`` when it is not known.
+    """
+
+    total_tokens: int
+    context_window: int | None = None
+
+
+class ContextBreakdownCategory(BaseModel):
+    """
+    One row of a context breakdown.
+
+    :param kind: What the row covers: ``"system_prompt"`` (instructions
+        Omnigent composes), ``"skills"`` (the skill listing inside them),
+        ``"tools"`` (tool schemas), ``"attachments"`` (inline attachments),
+        ``"history"`` (earlier messages and tool calls/results),
+        ``"message"`` (the current message, itemized only by a runner),
+        ``"other"`` (the measured total minus the itemized rows) or
+        ``"free"`` (the window minus the measured total).
+    :param tokens: The row's size in tokens; ``None`` when it has no figure.
+    :param source: ``"measured"`` (from the provider's report),
+        ``"estimated"`` (from content size, or derived from an estimate) or
+        ``"unknown"`` (no figure).
+    :param origin: Who produced the row: the ``"server"`` from stored
+        content, or the ``"runner"`` from the request it sent.
+    :param count: Items the row covers, e.g. ``2`` attachments; ``None``
+        when a count does not apply.
+    :param detail: A short explanation to show under the row, e.g.
+        ``"12 messages and tool calls"``.
+    """
+
+    kind: Literal[
+        "system_prompt", "skills", "tools", "attachments", "history", "message", "other", "free"
+    ]
+    tokens: int | None = None
+    source: Literal["measured", "estimated", "unknown"]
+    origin: Literal["runner", "server"] = "server"
+    count: int | None = None
+    detail: str | None = None
+
+
+class ContextBreakdownFailedAttempt(BaseModel):
+    """
+    What a request rejected as too long for the context window carried.
+
+    :param total_tokens: Sum of the rows' estimates, e.g. ``208655``.
+    :param categories: The runner's rows for the rejected request, in
+        display order; categories without content are left out.
+    """
+
+    total_tokens: int
+    categories: list[ContextBreakdownCategory] = Field(default_factory=list)
+
+
+class SessionContextBreakdown(BaseModel):
+    """
+    Response for ``GET /v1/sessions/{session_id}/context-breakdown``.
+
+    One resolved view: the server picks each row's figure (the runner's
+    report of the request it sent where there is one, else its own estimate)
+    and computes the remainder, so clients only render ``categories`` in order. Content a
+    harness adds itself (its own system prompt, tool schemas, project
+    instructions) is only visible as part of the ``"other"`` row.
+
+    :param session_id: The session, e.g. ``"conv_abc123"``.
+    :param measured: The provider-reported usage read with this breakdown;
+        ``None`` when the harness has reported none, in which case there is
+        no ``"other"`` or ``"free"`` row.
+    :param categories: The rows, in display order.
+    :param estimates_exceed_measured: The itemized estimates add up to more
+        than the measured total, so they run high and ``"other"`` is ``0``.
+    :param attachments: Attachments in the live history, oldest first.
+    :param bytes_per_token: Ratio behind the text estimates, e.g. ``4``.
+    :param failed_attempt: What a later request that was rejected as too
+        long for the context window attempted; ``None`` otherwise.
+    """
+
+    session_id: str
+    measured: ContextBreakdownMeasured | None = None
+    categories: list[ContextBreakdownCategory] = Field(default_factory=list)
+    estimates_exceed_measured: bool = False
+    attachments: list[ContextBreakdownAttachment] = Field(default_factory=list)
+    bytes_per_token: int
+    failed_attempt: ContextBreakdownFailedAttempt | None = None
 
 
 class ReadStatePutRequest(BaseModel):

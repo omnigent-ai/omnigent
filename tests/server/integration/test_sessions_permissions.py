@@ -622,6 +622,98 @@ async def test_read_grant_allows_get_but_blocks_post_events(
     )
 
 
+async def test_context_breakdown_requires_read_access(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The context breakdown is readable with a read grant and hidden otherwise."""
+    from omnigent.entities import NewConversationItem
+    from omnigent.entities.conversation import MessageData
+    from omnigent.server.routes.sessions import routes_context
+
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    path = f"/v1/sessions/{session_id}/context-breakdown"
+    # Three items over two-item pages exercise the newest-first paging.
+    monkeypatch.setattr(routes_context, "_SCAN_PAGE_SIZE", 2)
+    SqlAlchemyConversationStore(db_uri).append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "abcd"}]),
+            )
+            for _ in range(3)
+        ],
+    )
+
+    resp = await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})
+    assert resp.status_code == 404
+
+    resp = await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="user-b", level=LEVEL_READ
+    )
+    assert resp.status_code == 200
+    resp = await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["session_id"] == session_id
+    rows = {row["kind"]: row for row in body["categories"]}
+    # The spec loaded through the real agent cache, so the prompt row is filled.
+    assert rows["system_prompt"]["tokens"] > 0
+    assert rows["history"] == {
+        "kind": "history",
+        "tokens": 3,
+        "source": "estimated",
+        "origin": "server",
+        "count": 3,
+        "detail": "3 messages and tool calls",
+    }
+    # No turn has reported usage, so there is no total to take a remainder from.
+    assert body["measured"] is None
+    assert "other" not in rows
+
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id,
+        {"omnigent.last_context_tokens": "9000", "omnigent.last_context_window": "200000"},
+    )
+    body = (await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})).json()
+    assert body["measured"] == {"total_tokens": 9000, "context_window": 200000}
+    rows = {row["kind"]: row for row in body["categories"]}
+    assert rows["other"]["tokens"] == 9000 - rows["system_prompt"]["tokens"] - 3
+    assert rows["free"]["tokens"] == 191000
+
+    # A runner report stored for that measured turn replaces the server's rows,
+    # and a rejected request's attempt is listed beside them.
+    SqlAlchemyConversationStore(db_uri).merge_context_breakdown(
+        session_id,
+        {
+            "reported": {"tool_tokens": 5400, "tool_count": 18, "history_tokens": 2000},
+            "context_tokens": 9000,
+            "failed_attempt": {"history_tokens": 190000, "history_item_count": 300},
+        },
+    )
+    body = (await auth_client.get(path, headers={"X-Forwarded-Email": "user-b"})).json()
+    rows = {row["kind"]: row for row in body["categories"]}
+    assert (rows["tools"]["tokens"], rows["tools"]["origin"]) == (5400, "runner")
+    assert rows["other"]["tokens"] == 9000 - 5400 - 2000
+    assert body["failed_attempt"] == {
+        "total_tokens": 190000,
+        "categories": [
+            {
+                "kind": "history",
+                "tokens": 190000,
+                "source": "estimated",
+                "origin": "runner",
+                "count": 300,
+                "detail": "300 messages and tool calls",
+            }
+        ],
+    }
+
+
 async def test_edit_grant_blocked_from_stop_session_requires_owner(
     auth_client: httpx.AsyncClient,
 ) -> None:

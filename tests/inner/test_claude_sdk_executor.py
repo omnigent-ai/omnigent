@@ -8711,3 +8711,243 @@ async def test_disabled_mcp_sdk_init_reports_loaded_server(tmp_path, monkeypatch
         finally:
             await executor.close()
     assert ("mcp_disabled_server_not_applied server=fixture" in caplog.text) == bool(active)
+
+
+# ---------------------------------------------------------------------------
+# Tests: context breakdown reported through the executor adapter
+# ---------------------------------------------------------------------------
+
+
+def _breakdown_turn_context(response_id: str):
+    import asyncio
+
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    return TurnContext(
+        response_id=response_id, event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+
+def _breakdown_adapter(executor):
+    """An adapter around *executor* whose policy checks are answered at once."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    executor._policy_evaluator = AsyncMock(
+        return_value=SimpleNamespace(action="POLICY_ACTION_ALLOW", reason="")
+    )
+    return ExecutorAdapter(executor_factory=lambda: executor)
+
+
+def _history_input(messages: list[dict[str, str]]) -> list[dict[str, object]]:
+    return [{"type": "message", **message} for message in messages]
+
+
+@pytest.mark.asyncio
+async def test_context_breakdown_follows_a_restarted_then_resumed_session() -> None:
+    """A trimmed replay leaves the omitted history out; a resumed turn still counts the rest."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.server.schemas import CreateResponseRequest
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=4_200)
+    adapter = _breakdown_adapter(executor)
+    history = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        restarted = _breakdown_turn_context("resp_restarted")
+        await adapter.run_turn(
+            CreateResponseRequest(
+                model="agent", input=_history_input(history), instructions="i" * 400
+            ),
+            restarted,
+        )
+        history += [
+            {"role": "assistant", "content": "recovered"},
+            {"role": "user", "content": "and then? " + "y" * 390},
+        ]
+        resumed = _breakdown_turn_context("resp_resumed")
+        await adapter.run_turn(
+            CreateResponseRequest(
+                model="agent", input=_history_input(history), instructions="i" * 400
+            ),
+            resumed,
+        )
+
+    [client] = fake_sdk.created_clients
+    assert "[Earlier messages omitted to fit the model's context window: 2.]" in client.prompts[0]
+    first = restarted.context_breakdown
+    assert first is not None
+    # Two of the four prior messages were replayed, at about 750 tokens each.
+    assert (first.history_item_count, first.omitted_history_count) == (2, 2)
+    assert 1_400 < first.history_tokens < 1_600
+    assert first.system_tokens == 100
+
+    # The live client is sent only the new message, but its window still holds
+    # the replayed history, the earlier question and its answer.
+    assert client.prompts[1].startswith("and then?")
+    second = resumed.context_breakdown
+    assert second is not None
+    assert (second.history_item_count, second.omitted_history_count) == (4, 2)
+    assert second.message_tokens == 100
+
+    # Once the history is rebuilt shorter (a compaction), the messages the
+    # restart left out are no longer at its head, so nothing is skipped.
+    compacted = _breakdown_turn_context("resp_compacted")
+    summary = [
+        {"role": "user", "content": "summary of the conversation so far"},
+        {"role": "user", "content": "carry on"},
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        await adapter.run_turn(
+            CreateResponseRequest(model="agent", input=_history_input(summary)), compacted
+        )
+    third = compacted.context_breakdown
+    assert third is not None
+    assert (third.history_item_count, third.omitted_history_count) == (1, 0)
+
+
+async def _terminal_event(adapter, request, response_id: str) -> dict:
+    """Run one turn through the scaffold's stream and return its terminal SSE event."""
+    import json
+
+    frames = [
+        frame.decode()
+        async for frame in adapter._stream_turn(
+            request, _breakdown_turn_context(response_id), "agent"
+        )
+    ]
+    [data] = [line for line in frames[-1].splitlines() if line.startswith("data:")]
+    return json.loads(data.removeprefix("data:"))
+
+
+@pytest.mark.asyncio
+async def test_prompt_too_long_failure_records_the_attempted_breakdown() -> None:
+    """Claude's "Prompt is too long" result reaches the server as an overflow with its attempt.
+
+    The session restarts with a trimmed replay first, so the attempt leaves
+    out the history that restart did not send.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runner.app import _is_context_overflow_error
+    from omnigent.server.context_breakdown import failed_turn_updates
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=4_200)
+    adapter = _breakdown_adapter(executor)
+    history = [*_long_prior_messages(), {"role": "user", "content": "x" * 400}]
+    with patch(
+        "omnigent.inner.claude_sdk_executor._ensure_sdk",
+        return_value=_failed_result_sdk("Prompt is too long"),
+    ):
+        event = await _terminal_event(
+            adapter,
+            CreateResponseRequest(model="agent", input=_history_input(history)),
+            "resp_overflow",
+        )
+
+    assert event["type"] == "response.failed"
+    error = event["response"]["error"]
+    assert "Prompt is too long" in error["message"]
+    # The scaffold's failure has no top-level error, so the runner relays it
+    # unchanged and the server classifies it from the message.
+    assert _is_context_overflow_error(event) is None
+    stored = failed_turn_updates(error)["failed_attempt"]
+    assert (stored["history_item_count"], stored["omitted_history_count"]) == (2, 2)
+    assert stored["message_tokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_a_failure_that_only_mentions_a_context_window_records_no_attempt() -> None:
+    """A Claude failure whose text mentions the window in passing is not an overflow."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.server.context_breakdown import failed_turn_updates
+    from omnigent.server.schemas import CreateResponseRequest
+
+    adapter = _breakdown_adapter(ClaudeSDKExecutor())
+    with patch(
+        "omnigent.inner.claude_sdk_executor._ensure_sdk",
+        return_value=_failed_result_sdk("CLI crashed while resizing its context window buffer"),
+    ):
+        event = await _terminal_event(
+            adapter, CreateResponseRequest(model="agent", input="hello"), "resp_crash"
+        )
+
+    error = event["response"]["error"]
+    assert error["context_breakdown"] is not None
+    assert failed_turn_updates(error) == {}
+
+
+@pytest.mark.asyncio
+async def test_omitted_history_is_retired_when_a_grown_session_compacts() -> None:
+    """A session that grew after its trimmed restart, then compacted, omits nothing."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.server.schemas import CreateResponseRequest
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=4_200)
+    adapter = _breakdown_adapter(executor)
+
+    async def run(history: list[dict[str, str]], response_id: str):
+        ctx = _breakdown_turn_context(response_id)
+        await adapter.run_turn(
+            CreateResponseRequest(model="agent", input=_history_input(history)), ctx
+        )
+        assert ctx.context_breakdown is not None
+        return ctx.context_breakdown
+
+    # Restart with 5 messages, 2 of them omitted.
+    history = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        assert (await run(history, "resp_1")).omitted_history_count == 2
+        # The session grows to 11 messages.
+        for index in range(3):
+            history += [
+                {"role": "assistant", "content": f"answer {index}"},
+                {"role": "user", "content": f"question {index}"},
+            ]
+        assert (await run(history, "resp_2")).omitted_history_count == 2
+        # A compaction rebuilds it as 7 messages, longer than at the restart.
+        compacted = [
+            {"role": "user", "content": "summary " + "s" * 4_000},
+            *[{"role": "assistant", "content": f"kept {index}"} for index in range(5)],
+            {"role": "user", "content": "carry on"},
+        ]
+        rebuilt = await run(compacted, "resp_3")
+
+    assert (rebuilt.history_item_count, rebuilt.omitted_history_count) == (6, 0)
+    # The summary is counted as history, not left to the remainder.
+    assert rebuilt.history_tokens > 1_000
+
+
+@pytest.mark.asyncio
+async def test_omitted_history_survives_the_turn_that_compacts_then_is_retired() -> None:
+    """An in-turn compaction keeps the count for that turn and drops it from the next."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.server.schemas import CreateResponseRequest
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=4_200)
+    adapter = _breakdown_adapter(executor)
+    history = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
+
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        restarted = _breakdown_turn_context("resp_1")
+        await adapter.run_turn(
+            CreateResponseRequest(model="agent", input=_history_input(history)), restarted
+        )
+        executor._retire_omitted_history_after_compaction(adapter._session_key)
+        # The compacting turn was still sent the trimmed history.
+        assert executor.omitted_history_messages(adapter._session_key) == 2
+        # The next turn's history is not shorter, yet nothing is skipped any more.
+        history += [
+            {"role": "assistant", "content": "recovered"},
+            {"role": "user", "content": "and then?"},
+        ]
+        following = _breakdown_turn_context("resp_2")
+        await adapter.run_turn(
+            CreateResponseRequest(model="agent", input=_history_input(history)), following
+        )
+
+    assert following.context_breakdown is not None
+    assert following.context_breakdown.omitted_history_count == 0
+    assert following.context_breakdown.history_item_count == 6

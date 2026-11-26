@@ -72,9 +72,9 @@ REQUEST_SIZE_OVERFLOW_GUIDANCE = (
     "request size limit. Compact the conversation or start a new session to continue."
 )
 
-# Rough bytes-per-token ratio for expressing a byte-cap rejection in the
-# token units the context-overflow plumbing carries.
-_APPROX_BYTES_PER_TOKEN = 4
+# Rough bytes-per-token ratio for expressing byte sizes in token units, e.g.
+# a byte-cap rejection or a context-window estimate.
+APPROX_BYTES_PER_TOKEN = 4
 
 
 @dataclass(frozen=True)
@@ -93,12 +93,12 @@ class RequestSizeOverflow:
     @property
     def approx_request_tokens(self) -> int:
         """The request size expressed as an approximate token count."""
-        return max(self.request_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+        return max(self.request_bytes // APPROX_BYTES_PER_TOKEN, 1)
 
     @property
     def approx_limit_tokens(self) -> int:
         """The byte cap expressed as an approximate token count."""
-        return max(self.limit_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+        return max(self.limit_bytes // APPROX_BYTES_PER_TOKEN, 1)
 
 
 def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
@@ -128,6 +128,37 @@ def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
         # Python caps int(str) at 4300 digits; a malformed oversized field must
         # not crash classification, so treat it as an unrecognized message.
         return None
+
+
+# Phrases a provider or harness only uses when a request is too long for the window.
+_SPECIFIC_OVERFLOW_PHRASES = (
+    "context_length_exceeded",
+    "maximum context length",
+    "prompt is too long",
+    "exceeds the context window",
+    "exceed context limit",
+    "ran out of room in the model's context window",
+)
+# Also said about other things, e.g. in diagnostics a crash report embeds.
+_GENERIC_OVERFLOW_PHRASES = ("context window",)
+
+
+def is_context_overflow_message(message: str, *, specific_only: bool = False) -> bool:
+    """
+    Whether a turn's error text says the request was too long for the model.
+
+    :param message: Error text, e.g. ``"prompt is too long: 210000 tokens"``.
+    :param specific_only: Ignore the loose ``"context window"`` phrase, for
+        callers that act on a failure they did not already classify.
+    :returns: ``True`` for a context-overflow phrase or a byte-cap rejection.
+    """
+    lowered = message.lower()
+    phrases = _SPECIFIC_OVERFLOW_PHRASES
+    if not specific_only:
+        phrases += _GENERIC_OVERFLOW_PHRASES
+    return any(phrase in lowered for phrase in phrases) or (
+        detect_request_size_overflow(lowered) is not None
+    )
 
 
 def is_request_size_rejection(message: str) -> bool:

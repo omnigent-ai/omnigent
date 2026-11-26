@@ -192,6 +192,17 @@ _RUNNER_BINDING_LIMIT = 200
 _RUNNER_HOST_LOOKUP_LIMIT = 10_000
 
 
+def _decode_context_breakdown(raw: str | None) -> dict[str, Any] | None:
+    """Decode a stored context-breakdown document; ``None`` when absent or malformed."""
+    if not raw:
+        return None
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
 def _decode_session_state(
     value: str | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1915,6 +1926,47 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.session_state = _encode_session_state(state, todos)
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
+
+    def get_context_breakdown(self, conversation_id: str) -> dict[str, Any] | None:
+        """Read the runner's stored context-breakdown document, or ``None``."""
+        with self._session("get_context_breakdown") as session:
+            raw = session.execute(
+                select(SqlConversationMetadata.context_breakdown).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+            ).scalar_one_or_none()
+        return _decode_context_breakdown(raw)
+
+    def merge_context_breakdown(
+        self, conversation_id: str, updates: Mapping[str, Any | None]
+    ) -> None:
+        """Atomically set or remove keys of the context-breakdown document."""
+        current = self.get_context_breakdown(conversation_id) or {}
+        if all(current.get(key) == value for key, value in updates.items()):
+            # Most turns change nothing (no report before or after); skip the lock.
+            return
+
+        def write(session: Session) -> None:
+            where = (
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            raw = session.execute(
+                select(SqlConversationMetadata.context_breakdown).where(*where).with_for_update()
+            ).scalar_one_or_none()
+            current = _decode_context_breakdown(raw) or {}
+            merged = {key: value for key, value in current.items() if key not in updates}
+            merged.update({key: value for key, value in updates.items() if value is not None})
+            if merged == current:
+                return
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(*where)
+                .values(context_breakdown=json.dumps(merged) if merged else None)
+            )
+
+        run_write_transaction(self._session_immediate, "merge_context_breakdown", write)
 
     def set_session_usage(
         self,

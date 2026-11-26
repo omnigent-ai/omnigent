@@ -720,6 +720,8 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     expected_window = get_model_context_window("claude-sonnet-5")
 
     response_id = "resp_ctx_ring_1"
+    reported = {"system_tokens": 1200, "tool_tokens": 5400, "tool_count": 18}
+    attempted = {"history_tokens": 190000, "history_item_count": 300}
     # The observed model (a full id, not a bare alias) is what the SDK reports.
     turn_events: list[dict[str, Any]] = [
         {"type": "response.in_progress", "response": {"id": response_id, "model": "jarvis"}},
@@ -734,6 +736,22 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
                     "total_tokens": 1200,
                     "context_tokens": 45678,
                     "model": "claude-sonnet-5",
+                    "context_breakdown": reported,
+                },
+            },
+        },
+        # A later turn rejected as too long records what it attempted.
+        {"type": "response.in_progress", "response": {"id": "resp_ctx_ring_2", "model": "jarvis"}},
+        {
+            "type": "response.failed",
+            "source": "llm",
+            "response": {
+                "id": "resp_ctx_ring_2",
+                "status": "failed",
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Context window exceeded: 210000 tokens > 200000 max",
+                    "context_breakdown": attempted,
                 },
             },
         },
@@ -769,6 +787,27 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
         assert refreshed is not None
         assert refreshed.labels.get("omnigent.last_context_tokens") == "45678"
         assert refreshed.labels.get("omnigent.last_context_window") == str(expected_window)
+        assert store.get_context_breakdown(session_id) == {
+            "reported": reported,
+            "context_tokens": 45678,
+        }
+
+        # The overflow's attempted request is kept beside the last good turn's.
+        for _ in range(50):
+            event = await collector.next_event()
+            if event["type"] == "response.failed":
+                break
+        stored: dict[str, Any] = {}
+        for _ in range(50):
+            stored = store.get_context_breakdown(session_id) or {}
+            if "failed_attempt" in stored:
+                break
+            await asyncio.sleep(0.02)
+        assert stored == {
+            "reported": reported,
+            "context_tokens": 45678,
+            "failed_attempt": attempted,
+        }
     finally:
         release.set()
         if collector is not None:

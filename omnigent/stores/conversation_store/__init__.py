@@ -1601,6 +1601,31 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_context_breakdown(self, conversation_id: str) -> dict[str, Any] | None:
+        """
+        Read the runner's stored context-breakdown document for a conversation.
+
+        :param conversation_id: The conversation, e.g. ``"conv_abc123"``.
+        :returns: The document, e.g. ``{"reported": {...}, "context_tokens":
+            48200}``, or ``None`` when nothing is stored.
+        """
+        ...
+
+    @abstractmethod
+    def merge_context_breakdown(
+        self, conversation_id: str, updates: Mapping[str, Any | None]
+    ) -> None:
+        """
+        Atomically update keys of a conversation's context-breakdown document.
+
+        :param conversation_id: The conversation, e.g. ``"conv_abc123"``.
+        :param updates: Keys to set; a ``None`` value removes its key, e.g.
+            ``{"reported": {...}, "failed_attempt": None}``. An emptied
+            document is stored as ``NULL``.
+        """
+        ...
+
+    @abstractmethod
     def set_session_usage(
         self,
         conversation_id: str,

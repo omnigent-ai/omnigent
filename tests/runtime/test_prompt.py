@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
+from omnigent.harness_capabilities import InstructionDelivery
 from omnigent.runner.subagent_work import (
     _format_subagent_wake_notice,
 )
@@ -20,10 +21,12 @@ from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
     build_native_startup_instructions,
+    compose_delivered_instructions,
     history_to_input_items,
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
+from omnigent.spec.types import SkillSpec
 from tests._image_fixtures import _TINY_PNG_BASE64
 
 _DEFAULT_FRAMEWORK_INSTRUCTIONS = (
@@ -469,3 +472,89 @@ def test_native_startup_instructions_keep_only_stable_image_guidance() -> None:
     assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
     assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in result
     assert build_native_startup_instructions(None) == WORKSPACE_IMAGE_INSTRUCTION
+
+
+@pytest.mark.parametrize(
+    ("harness", "delivery", "text"),
+    [
+        (
+            "openai-agents",
+            InstructionDelivery.COMPOSED_PER_TURN,
+            f"Agent prompt\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}",
+        ),
+        (
+            "claude-sdk",
+            InstructionDelivery.COMPOSED_SESSION_SNAPSHOT,
+            f"Agent prompt\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}",
+        ),
+        (
+            "cursor",
+            InstructionDelivery.FIRST_USER_PREFIX,
+            f"Agent prompt\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}",
+        ),
+        (
+            "claude-native",
+            InstructionDelivery.AGENT_STARTUP_ADDITIVE,
+            f"Agent prompt\n\n{WORKSPACE_IMAGE_INSTRUCTION}",
+        ),
+        ("cursor-native", InstructionDelivery.NOT_DELIVERED, None),
+        # An in-process harness that declares no mode is still handed the instructions.
+        (
+            "agents_sdk",
+            InstructionDelivery.UNKNOWN,
+            f"Agent prompt\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}",
+        ),
+    ],
+)
+def test_delivered_instructions_follow_the_harness_delivery_mode(
+    harness: str | None, delivery: InstructionDelivery, text: str | None
+) -> None:
+    delivered = compose_delivered_instructions(_spec("Agent prompt"), harness)
+
+    assert (delivered.delivery, delivered.text, delivered.skill_listing) == (delivery, text, None)
+
+
+def test_delivered_instructions_are_absent_for_an_undeclared_native_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal harness with no declared channel is not assumed to receive any."""
+    monkeypatch.setattr(
+        "omnigent.runtime.prompt.is_native_harness", lambda harness: harness == "new-native"
+    )
+
+    delivered = compose_delivered_instructions(_spec("Agent prompt"), "new-native")
+
+    assert (delivered.delivery, delivered.text) == (InstructionDelivery.UNKNOWN, None)
+
+
+def test_delivered_instructions_gate_the_fallback_line_per_harness() -> None:
+    """A gated harness gets nothing fabricated; the others get the fallback seed."""
+    spec = _spec(None)
+
+    assert compose_delivered_instructions(spec, "opencode-native").text == (
+        _DEFAULT_FRAMEWORK_INSTRUCTIONS
+    )
+    assert compose_delivered_instructions(spec, "hermes").text == _DEFAULT_FRAMEWORK_INSTRUCTIONS
+    assert compose_delivered_instructions(spec, "openai-agents").text == (
+        f"You are a helpful assistant.\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}"
+    )
+
+
+def test_delivered_instructions_report_the_skill_listing_only_when_injected() -> None:
+    spec = _spec("Agent prompt")
+    spec.skills = [SkillSpec(name="triage", description="Sort issues.", content="body")]
+    load_skill = [{"type": "function", "function": {"name": "load_skill"}}]
+    listing = "Available skills (use the load_skill tool to load one):\n- triage: Sort issues."
+
+    # The runner composes without tool schemas, so the prompt names no skills.
+    assert compose_delivered_instructions(spec, "openai-agents").skill_listing is None
+    injected = compose_delivered_instructions(
+        spec, "openai-agents", per_request_instructions="Request prompt", tool_schemas=load_skill
+    )
+    assert injected.skill_listing == listing
+    assert injected.text == (
+        f"Agent prompt\n\nRequest prompt\n\n{listing}\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}"
+    )
+    # A startup channel carries no listing whatever the turn's tools.
+    startup = compose_delivered_instructions(spec, "claude-native", tool_schemas=load_skill)
+    assert startup.skill_listing is None
