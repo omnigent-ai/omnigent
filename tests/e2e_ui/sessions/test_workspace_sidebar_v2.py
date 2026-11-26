@@ -835,7 +835,7 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
     sidebar = page.get_by_role("complementary", name="Workspace")
     expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
     _open_app(page, sidebar, "Files")
-    # A full-screen workspace docks the tree, with its options beside the toggle.
+    # A full-screen workspace docks the tree, with its options in the tree's header.
     page.get_by_role("button", name="Full screen", exact=True).click()
     build = sidebar.get_by_role("treeitem", name=re.compile(r"^build\b"))
     expect(sidebar.get_by_role("treeitem", name="base.txt", exact=True)).to_be_visible(
@@ -844,7 +844,9 @@ def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
     expect(build).to_have_count(0)
 
     def switch_ignored_files() -> None:
-        sidebar.get_by_role("button", name="Files tree options", exact=True).click()
+        sidebar.get_by_test_id("files-page-tree-header").get_by_role(
+            "button", name="Tree options", exact=True
+        ).click()
         page.get_by_role("menuitemcheckbox", name="Show git-ignored files").click()
 
     switch_ignored_files()

@@ -46,6 +46,8 @@ Filename search remains in Files.
   Text in Workspace…** to search for the selection's first non-blank line. The
   row shows only where the session's file finder is available and that line is
   at most 4,096 characters.
+- Tabs sidebar's Files tab: with a text file open, choose **File actions (⋯) →
+  Search Text in Workspace…**, shown while the session can search.
 
 ## Driving it with the repro environment
 
