@@ -1613,11 +1613,14 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
         )
     boundaries: dict[sa.Connection, int] = {}
     pages: list[tuple[sa.Connection, int]] = []
+    ddl_statements: list[str] = []
 
     def boundary(connection: sa.Connection) -> None:
         boundaries[connection] = boundaries.get(connection, 0) + 1
 
     def observe(connection, _cursor, statement, _parameters, _context, _many) -> None:
+        if _context.isddl:
+            ddl_statements.append(statement)
         if (
             "scheduled_tasks.rrule" in statement
             and "ORDER BY scheduled_tasks.workspace_id, scheduled_tasks.id" in statement
@@ -1630,12 +1633,21 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
     try:
         with pytest.raises(RuntimeError, match="no rrule"):
             command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
+        assert len(pages) == 2
+        assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
+        with engine.begin() as conn:
+            conn.execute(tasks.update().where(tasks.c.rrule.is_(None)).values(rrule="FREQ=DAILY"))
+            conn.execute(tasks.insert().values(workspace_id=7, id=bytes(16), rrule=None, **values))
+        pages.clear()
+        with pytest.raises(RuntimeError, match="no rrule"):
+            command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
     finally:
         sa.event.remove(sa.engine.Engine, "commit", boundary)
         sa.event.remove(sa.engine.Engine, "rollback", boundary)
         sa.event.remove(sa.engine.Engine, "before_cursor_execute", observe)
     assert len(pages) == 2
     assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
+    assert not ddl_statements, "The guard changed the schema before finding a ruleless task"
     with engine.begin() as conn:
         conn.execute(tasks.delete().where(tasks.c.id != b"a" * 16))
     command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
