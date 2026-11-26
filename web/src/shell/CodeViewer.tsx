@@ -412,16 +412,16 @@ function PreviewWithSearch({
     () => setTableRowsVersion((version) => version + 1),
     [],
   );
+  let searchVersion: unknown = content;
+  if (kind === "markdown") {
+    searchVersion = markdownSearchVersion;
+  } else if (kind === "table" || kind === "spreadsheet") {
+    searchVersion = tableSearchVersion;
+  }
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
-      contentVersion={
-        kind === "markdown"
-          ? markdownSearchVersion
-          : kind === "table" || kind === "spreadsheet"
-            ? tableSearchVersion
-            : content
-      }
+      contentVersion={searchVersion}
       open={searchOpen}
       onClose={onSearchHandled}
       inputRef={searchInputRef}
