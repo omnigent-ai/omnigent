@@ -645,7 +645,7 @@ def seed_isolated_agy_home(
             os.chmod(dst, 0o600)
 
     _seed_isolated_agy_settings(real_home, iso_gemini)
-    _seed_isolated_agy_mcp_permissions(iso_gemini)
+    _seed_isolated_agy_mcp_permissions(bridge_dir)
     _seed_isolated_agy_onboarding_marker(real_home, iso_gemini)
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
@@ -684,15 +684,25 @@ def _seed_isolated_agy_settings(real_home: Path, iso_gemini: Path) -> None:
             os.chmod(iso_settings, 0o600)
 
 
-def _seed_isolated_agy_mcp_permissions(iso_gemini: Path) -> None:
+def _seed_isolated_agy_mcp_permissions(bridge_dir: Path) -> None:
     """Ensure ``permissions.allow`` in isolated ``settings.json`` permits the Omnigent relay.
 
     Merges :data:`_AGY_MCP_ALLOW_RULE` without disturbing existing permission
     rules or other keys. Malformed or non-object files are left untouched.
 
-    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    :param bridge_dir: The session-owned bridge directory.
     """
+    iso_gemini = agy_gemini_dir(bridge_dir)
     settings_path = iso_gemini / "antigravity-cli" / "settings.json"
+    try:
+        contained = iso_gemini.resolve().is_relative_to(bridge_dir.resolve()) and (
+            settings_path.parent.resolve().is_relative_to(iso_gemini.resolve())
+        )
+    except (OSError, RuntimeError):
+        contained = False
+    if not contained:
+        _logger.warning("Skipping agy relay permissions outside the isolated session")
+        return
     data: dict[str, object] = {}
     if settings_path.is_file():
         try:
