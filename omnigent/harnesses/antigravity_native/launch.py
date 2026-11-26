@@ -46,14 +46,9 @@ from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 
 _logger = logging.getLogger(__name__)
 
-# agy's coarse permission control. agy honors exactly one pre-emptive flag,
-# ``--dangerously-skip-permissions`` ("Auto-approve all tool permission requests
-# without prompting"); without it agy defaults to ``toolPermission=request-review``
-# and prompts in the TUI for each tool. This is the ONLY pre-emptive control agy
-# exposes — its ``hooks.json`` PreToolUse hook does not fire on tool execution in
-# 1.0.8 (verified; see docs/claude/antigravity-native-governance-design.md §2.3),
-# so there is no per-tool / web-routed gate. Omnigent therefore maps its
-# ``permission_mode`` onto this single flag.
+# agy's only pre-emptive permission flag; without it agy prompts in the TUI for each
+# tool. Session policies are enforced separately by the isolated ``hooks.json``
+# PreToolUse hook, which agy runs even when this flag is set.
 _SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 # Omnigent permission mode that maps to agy's all-or-nothing bypass.
 _BYPASS_PERMISSION_MODE = "bypassPermissions"
@@ -168,9 +163,8 @@ def should_skip_permissions(
     attached TTY (CLI) or, on the host-spawned web path, surfaced as a real-time
     Omnigent elicitation by the RPC read driver's interaction bridge (see
     :mod:`omnigent.harnesses.antigravity_native.reader` /
-    :mod:`omnigent.harnesses.antigravity_native.interactions`). agy exposes no firing
-    pre-tool hook, so Omnigent cannot pre-empt a tool before it runs; the
-    elicitation card is the honest gate.
+    :mod:`omnigent.harnesses.antigravity_native.interactions`). Omnigent session
+    policies are evaluated before each tool runs by the PreToolUse hook either way.
 
     .. warning:: The ``headless`` argument is currently derived from the
        launching process's TTY (``_launch_is_headless`` in
@@ -226,10 +220,10 @@ def build_agy_launch(
     (no interactive client will attach to answer agy's ``request-review``
     prompt, which would otherwise hang an unattended turn). Otherwise it is
     omitted so agy's default ``request-review`` prompts the attached user. This
-    is the *only* pre-emptive control agy honors; it is all-or-nothing and
-    cannot be routed to the web UI or made per-tool (the genuine Omnigent policy
-    gate for this harness is post-hoc/audit-only). The flag is not duplicated
-    when *extra_args* already carries it.
+    flag only controls agy's own all-or-nothing prompts; Omnigent session
+    policies are enforced per tool by the PreToolUse hook seeded into the
+    isolated ``hooks.json``. The flag is not duplicated when *extra_args*
+    already carries it.
 
     Both launch paths resolve setup credentials here and pass the resulting
     environment to the child. The terminal spec supplies the workspace cwd.

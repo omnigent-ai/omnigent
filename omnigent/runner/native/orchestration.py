@@ -7309,6 +7309,7 @@ async def _auto_create_antigravity_terminal(
         seed_isolated_agy_home,
         write_bridge_state,
         write_mcp_config,
+        write_policy_hook_config,
         write_tmux_target,
     )
     from omnigent.harnesses.antigravity_native.launch import build_agy_launch
@@ -7415,6 +7416,7 @@ async def _auto_create_antigravity_terminal(
             seed_isolated_agy_home,
             bridge_dir,
             trusted_workspace=workspace,
+            enforce_policy=True,
         ),
     }
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
@@ -7474,6 +7476,17 @@ async def _auto_create_antigravity_terminal(
     auth_factory = await asyncio.to_thread(_make_auth_token_factory)
     auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
     runner_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+    from omnigent.cli_auth import databricks_request_headers
+
+    # The policy hook uses these one-shot headers when the session has no tool relay.
+    await _write_native_policy_hook(
+        lambda: write_policy_hook_config(
+            bridge_dir,
+            server_url=server_url,
+            session_id=session_id,
+            auth_headers=databricks_request_headers(server_url, bearer_token=auth_token),
+        )
+    )
 
     # Seed bridge state with the id known so far (the real id on resume; on a
     # fresh launch a placeholder the cold-start below replaces with agy's real

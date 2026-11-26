@@ -1331,15 +1331,19 @@ def test_policy_hook_wrapper_script_omits_auth_when_unauthenticated(
     assert "X-Databricks-Org-Id" not in line
 
 
+@pytest.mark.parametrize("saved_authorization_name", ["Authorization", "authorization"])
 def test_policy_hook_reauth_remints_and_preserves_routing_header(
     monkeypatch: pytest.MonkeyPatch,
+    saved_authorization_name: str,
 ) -> None:
     """The shared reauth re-mints the bearer and keeps the routing header.
 
     When a baked one-shot token lapses, the four hooks (codex/kimi/cursor/
     hermes) that wire this builder must mint a fresh bearer through the same
     factory the refresh-capable runtime auth uses — without dropping the
-    workspace-routing header that travels alongside it.
+    workspace-routing header that travels alongside it. Headers saved from
+    ``dict(httpx.Client.headers)`` are lowercase, so the stale bearer must not
+    survive beside the fresh one.
     """
     monkeypatch.setattr(
         "omnigent.runner._entry._make_auth_token_factory",
@@ -1347,9 +1351,12 @@ def test_policy_hook_reauth_remints_and_preserves_routing_header(
     )
     reauth = native_policy_hook.policy_hook_reauth(
         "https://acme.databricks.com/api/2.0/omnigent",
-        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
+        {saved_authorization_name: "Bearer stale", "X-Databricks-Org-Id": "o9"},
     )
-    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
+    refreshed = reauth()
+    assert refreshed == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
+    request = httpx.Request("POST", "https://example.com/evaluate", headers=refreshed)
+    assert request.headers.get_list("authorization") == ["Bearer fresh-token"]
 
 
 def test_policy_hook_reauth_returns_none_without_factory(

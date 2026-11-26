@@ -35,6 +35,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
 )
 from tests.e2e_ui.shells.test_antigravity_tmux_recovery import (
     AntigravitySession,
+    GeminiMock,
     _antigravity_stack,
     _wait_until,
     antigravity_model,  # noqa: F401 - fixture reused by name
@@ -84,7 +85,7 @@ def slow_agy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 def stack_data_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    antigravity_model: list[str] | None,  # noqa: F811
+    antigravity_model: GeminiMock | None,  # noqa: F811
 ) -> Path:
     """Give the spawned server and runner a data dir whose logs stay with the test."""
     data_dir = tmp_path / "data"
@@ -101,7 +102,7 @@ def stack_data_dir(
 def antigravity_session(
     request: pytest.FixtureRequest,
     tmp_path: Path,
-    antigravity_model: list[str] | None,  # noqa: F811
+    antigravity_model: GeminiMock | None,  # noqa: F811
     slow_agy: Path,
     stack_data_dir: Path,
 ) -> Iterator[AntigravitySession]:
@@ -171,7 +172,7 @@ def _snapshot(session: AntigravitySession, name: str, **facts: object) -> None:
 def test_turn_is_mirrored_after_cold_start_misses_catalog_deadline(
     request: pytest.FixtureRequest,
     antigravity_session: AntigravitySession,
-    antigravity_model: list[str] | None,  # noqa: F811
+    antigravity_model: GeminiMock | None,  # noqa: F811
 ) -> None:
     session = antigravity_session
     _wait_until(
@@ -186,9 +187,7 @@ def test_turn_is_mirrored_after_cold_start_misses_catalog_deadline(
         page.context.close()
 
 
-def _drive_journey(
-    page: Page, session: AntigravitySession, model_replies: list[str] | None
-) -> None:
+def _drive_journey(page: Page, session: AntigravitySession, model: GeminiMock | None) -> None:
     page.add_init_script(_BLOCK_LOOPBACK_DIALS)
     page.goto(f"{session.base_url}/c/{session.session_id}?view=terminal")
     terminal = page.get_by_test_id("main-terminal-view").get_by_test_id("terminal-view")
@@ -217,7 +216,7 @@ def _drive_journey(
     # agy processes the typed turn in its own TUI: the prompt echo plus the reply
     # show the token twice in the pane, and the mock model saw the request.
     def agy_answered() -> bool:
-        if model_replies is not None and token not in model_replies:
+        if model is not None and token not in model.replies:
             return False
         return len(re.findall(re.escape(token), _pane_text(session))) >= 2
 

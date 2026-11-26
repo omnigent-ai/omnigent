@@ -681,6 +681,13 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     )
     assert iso_settings["showFeedbackSurvey"] is False
     assert user_settings.read_text(encoding="utf-8") == '{"model":"gemini-3-pro"}'
+    # The policy hook is registered and can route to this session's server.
+    iso_hooks = json.loads((iso_gemini / "config" / "hooks.json").read_text(encoding="utf-8"))
+    assert iso_hooks[bridge_mod.AGY_POLICY_HOOK_NAME] == bridge_mod.build_policy_hook_entry(
+        bridge_dir
+    )
+    server_url, session_id, _headers = bridge_mod.read_policy_hook_config(bridge_dir)
+    assert (server_url, session_id) == ("http://127.0.0.1:0", "conv_abc123")
 
 
 # ---------------------------------------------------------------------------

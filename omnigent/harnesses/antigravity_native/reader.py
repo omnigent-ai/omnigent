@@ -2934,16 +2934,9 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
 
 # ── Shared reader wiring (elicitation bridge + supervise_reader spawn) ────────
 #
-# The runner's host-spawned web path and the CLI's ``omnigent antigravity``
-# attach fallback both run the SAME thing once agy is live: an Omnigent HTTP
-# client, a ``supervise_reader`` loop, and an ``on_pending_interaction`` callback
-# wired to the Task 8 interaction bridge (real-time elicitation over the Task 9
-# hook + RPC step reads + the default deliver). This wiring lives here so the two
-# callers share one definition instead of duplicating the bridge/elicitation
-# plumbing. (The retired transcript forwarder used a post-hoc policy audit instead
-# of real-time elicitation; that audit is gone — agy exposes no firing PreToolUse
-# hook, so a tool cannot be blocked before it runs, and the live elicitation card
-# is the honest enforcement surface.)
+# The runner's web path and the CLI's ``omnigent antigravity`` attach fallback share
+# this client, reader loop and elicitation wiring. Session policies are enforced
+# separately, before each tool runs, by the PreToolUse hook (:mod:`.hook`).
 
 
 async def _agy_elicitation_retry_sleep(seconds: float) -> None:

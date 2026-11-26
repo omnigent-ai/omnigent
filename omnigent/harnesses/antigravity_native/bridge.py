@@ -437,6 +437,13 @@ _AGY_IMPORT_MANIFEST = "import_manifest.json"
 
 
 _AGY_HOOKS_FILE = "hooks.json"
+# Omnigent's PreToolUse policy hook, registered after the user's hooks. agy runs
+# hooks in file order and blocks the tool when any of them denies.
+AGY_POLICY_HOOK_NAME = "omnigent-policy"
+# agy kills a hook at this many seconds and blocks the tool; a parked policy ASK
+# can wait up to a day for its approver.
+_AGY_POLICY_HOOK_TIMEOUT_S = 86400
+_POLICY_HOOK_CONFIG_FILE = "policy_hook.json"
 
 
 # agy's non-plugin skill trees, relative to the Gemini dir — the "Global" and
@@ -630,10 +637,99 @@ def _load_user_mcp_servers(real_home: Path) -> dict[str, object]:
     return servers
 
 
+def build_policy_hook_entry(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+) -> dict[str, object]:
+    """Build the ``hooks.json`` entry that runs Omnigent's agy policy hook.
+
+    :param bridge_dir: Native Antigravity bridge directory the hook reads its
+        server routing from.
+    :param python_executable: Python interpreter for the hook command;
+        defaults to the current interpreter (``sys.executable``).
+    :returns: A ``{"PreToolUse": [...]}`` entry matching every tool.
+    """
+    command = shlex.join(
+        [
+            python_executable or sys.executable,
+            "-I",
+            "-m",
+            "omnigent.harnesses.antigravity_native.hook",
+            "evaluate-policy",
+            "--bridge-dir",
+            str(bridge_dir),
+        ]
+    )
+    return {
+        "PreToolUse": [
+            {
+                "matcher": "*",
+                "hooks": [{"command": command, "timeout": _AGY_POLICY_HOOK_TIMEOUT_S}],
+            }
+        ]
+    }
+
+
+def write_policy_hook_config(
+    bridge_dir: Path,
+    *,
+    server_url: str,
+    session_id: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """Record the server routing the agy policy hook uses when the relay is unavailable.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param server_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param session_id: Omnigent session whose policies gate this agy.
+    :param auth_headers: Auth and workspace-routing headers for the hook's POST.
+        They can hold a bearer token, so the file is written owner-only.
+    :returns: None.
+    """
+    atomic_write_json(
+        bridge_dir / _POLICY_HOOK_CONFIG_FILE,
+        {
+            "ap_server_url": server_url,
+            "ap_auth_headers": dict(auth_headers),
+            "session_id": session_id,
+        },
+    )
+
+
+def read_policy_hook_config(bridge_dir: Path) -> tuple[str, str, dict[str, str]] | None:
+    """Read the routing written by :func:`write_policy_hook_config`.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: ``(server_url, session_id, auth_headers)``, or ``None`` when the
+        file is absent, malformed, or lacks a server URL or session id.
+    """
+    try:
+        data = json.loads((bridge_dir / _POLICY_HOOK_CONFIG_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    server_url = data.get("ap_server_url")
+    session_id = data.get("session_id")
+    if not isinstance(server_url, str) or not server_url:
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    raw_headers = data.get("ap_auth_headers")
+    headers = (
+        {str(key): str(value) for key, value in raw_headers.items()}
+        if isinstance(raw_headers, dict)
+        else {}
+    )
+    return server_url, session_id, headers
+
+
 def seed_isolated_agy_home(
     bridge_dir: Path,
     *,
     trusted_workspace: Path | str | None = None,
+    enforce_policy: bool = False,
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
@@ -655,8 +751,12 @@ def seed_isolated_agy_home(
         "Do you trust this project?" TUI gate for host-spawned sessions, mirroring
         ``ensure_claude_workspace_trusted`` while keeping trust scoped to this
         bridge-owned ``--gemini_dir``.
+    :param enforce_policy: Also register Omnigent's ``PreToolUse`` policy hook
+        (:func:`build_policy_hook_entry`) after the user's hooks. The caller must
+        write :func:`write_policy_hook_config` before agy runs a tool.
     :returns: Env overrides to layer onto the agy launch environment. Currently
         empty because ``HOME`` must stay real for platform auth.
+    :raises OSError: If *enforce_policy* is set and the hook cannot be written.
     """
     real_home = Path.home()
     iso_gemini = agy_gemini_dir(bridge_dir)
@@ -685,7 +785,11 @@ def seed_isolated_agy_home(
 
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
-    _seed_isolated_agy_hooks(real_home, iso_gemini)
+    _seed_isolated_agy_hooks(
+        real_home,
+        iso_gemini,
+        policy_hook=build_policy_hook_entry(bridge_dir) if enforce_policy else None,
+    )
 
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
@@ -795,8 +899,17 @@ def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
         _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
 
 
-def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
-    """Refresh session hooks while preserving each command's original working directory."""
+def _seed_isolated_agy_hooks(
+    real_home: Path,
+    iso_gemini: Path,
+    *,
+    policy_hook: dict[str, object] | None = None,
+) -> None:
+    """Refresh session hooks while preserving each command's original working directory.
+
+    A *policy_hook* is registered even when the user's hooks are missing or
+    unreadable, and failing to write it raises instead of launching ungoverned.
+    """
     real_hooks = real_home / ".gemini" / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
     iso_hooks = iso_gemini / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
 
@@ -810,12 +923,22 @@ def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
         return value
 
     try:
-        try:
-            content = real_hooks.read_text(encoding="utf-8")
-        except FileNotFoundError:
+        hooks: object = json.loads(
+            real_hooks.read_text(encoding="utf-8"), object_hook=preserve_cwd
+        )
+    except FileNotFoundError:
+        hooks = None
+    except (OSError, ValueError):
+        _logger.warning("Could not refresh Antigravity hooks at %s", iso_hooks, exc_info=True)
+        if policy_hook is None:
+            return
+        hooks = None
+    if policy_hook is not None:
+        hooks = {**(hooks if isinstance(hooks, dict) else {}), AGY_POLICY_HOOK_NAME: policy_hook}
+    try:
+        if hooks is None:
             iso_hooks.unlink(missing_ok=True)
             return
-        hooks = json.loads(content, object_hook=preserve_cwd)
         iso_hooks.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix="hooks.json.", dir=iso_hooks.parent)
         try:
@@ -825,7 +948,9 @@ def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
             os.replace(tmp_name, iso_hooks)
         finally:
             Path(tmp_name).unlink(missing_ok=True)
-    except (OSError, ValueError):
+    except OSError:
+        if policy_hook is not None:
+            raise
         _logger.warning("Could not refresh Antigravity hooks at %s", iso_hooks, exc_info=True)
 
 
