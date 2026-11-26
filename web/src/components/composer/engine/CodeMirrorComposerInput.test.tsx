@@ -713,13 +713,17 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     expect(removeButtons()[0]).toBeDisabled();
   });
 
-  it("steps the caret over a card with ← and →", () => {
-    const { content, editor, caretAt } = mountQuotes(lines("Intro", a, "Reply"));
-    caretAt("Intro".length);
-    fireEvent.keyDown(content, { key: "ArrowRight" });
-    expect(editor.state.selection.main.head).toBe(lines("Intro", a, "").length);
+  it("keeps the caret off cards, stepping over one with ← and →", () => {
+    const { content, editor, caretAt } = mountQuotes(lines(a, "Intro", b, "Reply"));
+    const head = () => editor.state.selection.main.head;
+    expect(head()).toBe(a.length + 1);
     fireEvent.keyDown(content, { key: "ArrowLeft" });
-    expect(editor.state.selection.main.head).toBe("Intro".length);
+    expect(head()).toBe(a.length + 1);
+    caretAt(lines(a, "Intro").length);
+    fireEvent.keyDown(content, { key: "ArrowRight" });
+    expect(head()).toBe(lines(a, "Intro", b, "").length);
+    fireEvent.keyDown(content, { key: "ArrowLeft" });
+    expect(head()).toBe(lines(a, "Intro").length);
   });
 
   it.each([
