@@ -149,13 +149,13 @@ def test_projects_can_be_pinned_to_a_server() -> None:
         (f"glab issue note 12 -m hi\r-R\r{_URL}", "ASK"),
         (f"glab issue create -t Fix -d b\r-R\r{_URL}", "ASK"),
         (f"glab issue note 12 -m Details -R {_URL}\r", "ASK"),
-        (r"-t Fix -d 'literal\rtext'", "ALLOW"),
+        (r"-t Fix -d 'literal\rtext'", "ASK"),
         ("-t Fix -d >> -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d < -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d 2> -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d 'literal <input> and > output'", "ALLOW"),
         ('-t Fix -d "literal <input> and > output"', "ALLOW"),
-        (r"-t Fix -d literal\<input\>", "ALLOW"),
+        (r"-t Fix -d literal\<input\>", "ASK"),
     ],
 )
 def test_option_values_remain_attached(arguments: str, expected: str) -> None:
@@ -248,6 +248,27 @@ def test_git_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "executable",
+    [
+        r"C:\tools\glab.exe",
+        r"c:\tools\GLAB.EXE",
+        r'"C:\Program Files\glab.exe"',
+        r"'C:\tools\glab.exe'",
+        r"\\server\tools\glab.exe",
+        r"\tools\glab.exe",
+        r".\tools\glab.exe",
+        r"tools\glab.exe",
+        r"env C:\tools\glab.exe",
+        r"cmd /c C:\tools\glab.exe",
+        r"bash -c 'C:\tools\glab.exe issue list'",
+    ],
+)
+def test_backslash_paths_require_approval_before_posix_parsing(executable: str) -> None:
+    assert _result(f"{executable} issue create -R {_URL} -t Fix -d Details") == "ASK"
+    assert _result(f"{executable} issue delete 12 -R {_URL}") == "ASK"
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "glab config set api_host gitlab.other.example",
@@ -287,6 +308,7 @@ def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
         ("echo ready > output.txt", "ASK"),
         ('echo "$COMMAND"', "ASK"),
         (f"glab mr delete 12 -R {_URL}; echo '\r'", "DENY"),
+        (rf"C:\tools\glab.exe issue list && glab mr delete 12 -R {_URL}", "DENY"),
         (f"glab issue\tlist -R {_URL}", "ALLOW"),
     ],
 )

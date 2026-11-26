@@ -183,14 +183,12 @@ def _project_ref(value: str, hosts: frozenset[str]) -> _Project | None:
 
 def _has_unmodelled_shell_effects(command: str) -> bool:
     """Expansion and redirection can change the arguments delivered to a command."""
+    # Windows path separators must not become POSIX escapes before recognition.
+    if "\\" in command:
+        return True
     quote = ""
-    escaped = False
     for char in command:
-        if escaped:
-            escaped = False
-        elif char == "\\" and quote != "'":
-            escaped = True
-        elif char == quote:
+        if char == quote:
             quote = ""
         elif char in {"'", '"'} and not quote:
             quote = char
@@ -220,6 +218,12 @@ def _evaluate_shell(
     for segment in segments:
         if _UNMODELLED_CONTROL.search(segment):
             continue
+        if _has_unmodelled_shell_effects(segment):
+            decision = _worse(
+                decision,
+                _ask("Shell escapes, expansion or redirection require approval."),
+            )
+            continue
         try:
             raw_tokens = shlex.split(segment)
         except ValueError:
@@ -233,12 +237,6 @@ def _evaluate_shell(
             if "=" in token
         ):
             decision = _worse(decision, _ask("CLI environment changes require approval."))
-        if _has_unmodelled_shell_effects(segment):
-            decision = _worse(
-                decision,
-                _ask("Shell expansion or redirection obscures the command arguments. Approve?"),
-            )
-            continue
         tokens = real_invocation_tokens(raw_tokens)
         while tokens[:1] == ["!"]:
             tokens = real_invocation_tokens(tokens[1:])
