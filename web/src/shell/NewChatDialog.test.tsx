@@ -36,9 +36,12 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({
+vi.mock("@/hooks/useSidebarData", async () => ({
   useLoadedConversations: () => useTestConversations(),
   useOptionalLoadedConversations: () => useTestConversations().data,
+  ...(await import("@/test/loadedRowsMock")).loadedRowsSelectorMocks(
+    () => useTestConversations().data,
+  ),
 }));
 import { useSkills } from "@/hooks/useSkills";
 

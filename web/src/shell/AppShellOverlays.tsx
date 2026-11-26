@@ -2,7 +2,7 @@ import { lazy, Suspense } from "react";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { Toaster } from "@/components/ui/sonner";
-import type { Conversation } from "@/hooks/useConversations";
+import { useLoadedConversationsSelector } from "@/hooks/useSidebarData";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
@@ -40,7 +40,6 @@ export interface AppShellOverlaysProps {
   /** Switches the open palette to searching sessions only. */
   goToSession: () => void;
   gridRoute: boolean;
-  allConversations: Conversation[] | undefined;
   serverConversationId: string | undefined;
   updateOverlayHeight: number;
 }
@@ -60,7 +59,6 @@ export function AppShellOverlays({
   toggleRightPanel,
   goToSession,
   gridRoute,
-  allConversations,
   serverConversationId,
   updateOverlayHeight,
 }: AppShellOverlaysProps) {
@@ -103,8 +101,7 @@ export function AppShellOverlays({
           <FeatureFlagsPicker />
         </Suspense>
       )}
-      <RecentSessionsSwitcher
-        conversations={allConversations}
+      <LoadedRecentSessionsSwitcher
         activeSessionId={serverConversationId ?? null}
         enabled={isElectronShell()}
       />
@@ -127,5 +124,28 @@ export function AppShellOverlays({
         }}
       />
     </>
+  );
+}
+
+/**
+ * Reads the rows itself, so a row update re-renders the switcher but not the
+ * overlays. Disabled (outside the desktop app), it reads none.
+ */
+function LoadedRecentSessionsSwitcher({
+  activeSessionId,
+  enabled,
+}: {
+  activeSessionId: string | null;
+  enabled: boolean;
+}) {
+  const conversations = useLoadedConversationsSelector((loaded) =>
+    enabled ? loaded.rows : undefined,
+  );
+  return (
+    <RecentSessionsSwitcher
+      conversations={conversations}
+      activeSessionId={activeSessionId}
+      enabled={enabled}
+    />
   );
 }

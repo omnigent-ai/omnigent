@@ -30,6 +30,7 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
@@ -50,6 +51,25 @@ const HostVersionContext = createContext<Map<string, string | null>>(new Map());
 // each other). Passing `null` unregisters the key.
 type RegisterRunnerHealth = (key: string, sessions: RunnerHealthInput[] | null) => void;
 const RunnerHealthRegistryContext = createContext<RegisterRunnerHealth>(() => {});
+
+/**
+ * Keep the previous map while a rebuild holds the same entries. The maps are
+ * rebuilt whenever any sidebar row changes (a turn edge, a title), and a new
+ * map would re-render every liveness consumer, including each sidebar row,
+ * though no session's liveness moved.
+ */
+function useStableMap<K, V>(next: Map<K, V>): Map<K, V> {
+  const ref = useRef(next);
+  const previous = ref.current;
+  if (
+    previous !== next &&
+    (previous.size !== next.size ||
+      [...next].some(([key, value]) => !previous.has(key) || previous.get(key) !== value))
+  ) {
+    ref.current = next;
+  }
+  return ref.current;
+}
 
 export function RunnerHealthProvider({ children }: { children: ReactNode }) {
   const { data } = useLoadedConversations();
@@ -147,18 +167,22 @@ export function RunnerHealthProvider({ children }: { children: ReactNode }) {
   // stream online for the open session. (Runner liveness is poll-driven: the
   // former real-time `session.runner_status` push was removed upstream, so a
   // stop/relaunch reflects within the poll interval, not instantly.)
-  const runnerHealth = useMemo(() => {
-    const merged = new Map<string, boolean>();
-    for (const [id, online] of streamRunner) merged.set(id, online);
-    for (const [id, liveness] of polledHealth) merged.set(id, liveness.runner_online);
-    return merged;
-  }, [polledHealth, streamRunner]);
-  const hostHealth = useMemo(() => {
-    const merged = new Map<string, boolean | null>();
-    for (const [id, online] of streamHost) merged.set(id, online);
-    for (const [id, liveness] of polledHealth) merged.set(id, liveness.host_online);
-    return merged;
-  }, [polledHealth, streamHost]);
+  const runnerHealth = useStableMap(
+    useMemo(() => {
+      const merged = new Map<string, boolean>();
+      for (const [id, online] of streamRunner) merged.set(id, online);
+      for (const [id, liveness] of polledHealth) merged.set(id, liveness.runner_online);
+      return merged;
+    }, [polledHealth, streamRunner]),
+  );
+  const hostHealth = useStableMap(
+    useMemo(() => {
+      const merged = new Map<string, boolean | null>();
+      for (const [id, online] of streamHost) merged.set(id, online);
+      for (const [id, liveness] of polledHealth) merged.set(id, liveness.host_online);
+      return merged;
+    }, [polledHealth, streamHost]),
+  );
   // Host version is poll-only: the version doesn't ride the sidebar stream,
   // and the popover that reads it only ever shows the open session, which is
   // always in the fallback poll set above.

@@ -2,7 +2,7 @@
 // empty, then grouped server-side title and content search. Rendering stays in the palette.
 
 import { defaultFilter } from "cmdk";
-import { useContext, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   type Conversation,
@@ -13,7 +13,8 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
-import { SidebarDataContext, useOptionalLoadedConversations } from "@/hooks/useSidebarData";
+import { useLoadedConversationsSelector } from "@/hooks/useSidebarData";
+import { sessionRowsPage } from "@/lib/sidebarData";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -138,7 +139,9 @@ export function usePaletteSessionSearch({
   matchLoaded?: boolean;
 }) {
   const { data: projects = EMPTY_PROJECTS } = useProjects({ enabled: open });
-  const sidebarRows = useContext(SidebarDataContext)?.loadedRows;
+  // The sidebar's loaded rows, read only while open, so other sessions' row updates
+  // (a background turn edge) skip the closed palette.
+  const sidebarRows = useLoadedConversationsSelector((loaded) => (open ? loaded.rows : undefined));
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
@@ -174,9 +177,11 @@ export function usePaletteSessionSearch({
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", recentIncludesArchived, { enabled: open });
   // The sidebar's loaded sessions fill the recent rows until that list loads.
-  const sidebarSessions = useOptionalLoadedConversations();
-  const recentPages =
-    data?.pages ?? (sessionsOnly ? undefined : sidebarSessions?.pages) ?? EMPTY_PAGES;
+  const sidebarPages = useMemo(
+    () => (sidebarRows ? [sessionRowsPage([...sidebarRows])] : undefined),
+    [sidebarRows],
+  );
+  const recentPages = data?.pages ?? (sessionsOnly ? undefined : sidebarPages) ?? EMPTY_PAGES;
   const serverInfo = useServerInfo();
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;

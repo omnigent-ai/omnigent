@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, memo, useEffect, useRef, useState } from "react";
 import {
   ChevronRightIcon,
   FolderIcon,
@@ -183,8 +183,11 @@ function friendlyCloneError(error: unknown): string {
  * "Run on" target: a connected host (a folder, or a repository cloned onto it
  * before the project is saved) or a sandbox provider (the repository is saved
  * and cloned when a session starts).
+ *
+ * Memoized: the Projects header re-renders on every row update (a background
+ * turn edge), which never changes this button.
  */
-export function NewProjectButton({
+export const NewProjectButton = memo(function NewProjectButton({
   onCreated,
   hostId,
   hosts,
@@ -838,4 +841,4 @@ export function NewProjectButton({
       {dialog}
     </>
   );
-}
+});

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { CheckIcon, LogOutIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import { toast } from "sonner";
 import { signOutOfBrowserSession } from "@/lib/accountsApi";
@@ -105,7 +105,9 @@ function currentOriginPicker(): ServerPickerInfo {
   return { currentOrigin: window.location.origin, recentServers: [] };
 }
 
-export function SidebarServerPicker() {
+// Memoized: it takes no props, so the sidebar's re-renders on each row update
+// (a background turn edge) never reach the footer.
+export const SidebarServerPicker = memo(function SidebarServerPicker() {
   const nativeServerPicker = supportsNativeServerPicker();
   const [info, setInfo] = useState<ServerPickerInfo | null>(() =>
     nativeServerPicker ? null : currentOriginPicker(),
@@ -367,4 +369,4 @@ export function SidebarServerPicker() {
       />
     </div>
   );
-}
+});

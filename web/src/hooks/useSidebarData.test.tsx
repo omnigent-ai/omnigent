@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { type InfiniteData, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -12,8 +12,13 @@ import {
   resetLocalElicitationResolutionsForTests,
   useLocalElicitationResolutions,
 } from "@/lib/localElicitationResolutions";
-import type { Conversation } from "./useConversations";
-import { SidebarDataProvider, useLoadedConversations, useSidebarData } from "./useSidebarData";
+import type { Conversation, ConversationsPage } from "./useConversations";
+import {
+  SidebarDataProvider,
+  useLoadedConversation,
+  useLoadedConversations,
+  useSidebarData,
+} from "./useSidebarData";
 import { useArchivedSessions } from "./useScopeCache";
 
 vi.mock("./useViewerId", () => ({ useViewerId: () => null }));
@@ -254,4 +259,49 @@ it("restores the count when the POST for an answer in flight fails", async () =>
   expect(result.current.inboxCount).toBe(2);
   act(() => cancelLocalElicitationResolution("elicit_1", holdToken));
   expect(result.current.inboxCount).toBe(3);
+});
+
+it("re-renders a by-id reader only when its own row changes", async () => {
+  fetchMock.mockImplementation((url: string) => {
+    const params = new URL(url, "http://localhost").searchParams;
+    const listed = params.get("visibility") !== "shared" && params.get("pinned") !== "true";
+    const rows = listed ? [row("open"), row("other")] : [];
+    return Promise.resolve({ ok: true, json: async () => sessionRowsPage(rows) });
+  });
+  let renders = 0;
+  const { result } = renderHook(
+    () => {
+      renders++;
+      return useLoadedConversation("open");
+    },
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current?.id).toBe("open"));
+  const setStatus = (id: string, status: Conversation["status"]) =>
+    act(() => {
+      client.setQueriesData<InfiniteData<ConversationsPage>>(
+        { queryKey: ["conversations"] },
+        (data) =>
+          data && {
+            ...data,
+            pages: data.pages.map((page) => ({
+              ...page,
+              data: page.data.map((conversation) =>
+                conversation.id === id ? { ...conversation, status } : conversation,
+              ),
+            })),
+          },
+      );
+    });
+  // A second reader on the same cache shows when the list update has landed.
+  const other = renderHook(() => useLoadedConversation("other"), { wrapper });
+  await waitFor(() => expect(other.result.current?.id).toBe("other"));
+  const before = { renders, row: result.current };
+  // Another session's turn edge leaves this reader alone.
+  setStatus("other", "running");
+  await waitFor(() => expect(other.result.current?.status).toBe("running"));
+  expect(renders).toBe(before.renders);
+  expect(result.current).toBe(before.row);
+  setStatus("open", "running");
+  await waitFor(() => expect(result.current?.status).toBe("running"));
 });

@@ -8,6 +8,8 @@ import {
   SettingsIcon,
 } from "lucide-react";
 
+import { memo } from "react";
+
 import {
   ARIA_MOD_KEY,
   BACK_KEYS,
@@ -48,7 +50,9 @@ import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButto
  * opens a closed or peeking one, so the caller passes `expanded` and the icon
  * and label follow from it.
  */
-export function SidebarHeaderActions({
+// Memoized: the sidebar re-renders on every row update (a background turn edge),
+// and none of that reaches these buttons.
+export const SidebarHeaderActions = memo(function SidebarHeaderActions({
   expanded,
   onToggle,
   onOpenSearch,
@@ -194,7 +198,7 @@ export function SidebarHeaderActions({
       </div>
     </div>
   );
-}
+});
 
 /**
  * Sidebar glass controls take the page header's 20px icons over the sidebar's 16px glyphs,

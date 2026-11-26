@@ -504,6 +504,20 @@ function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...a
   return useCallback((...args: A) => ref.current(...args), []);
 }
 
+// Keep the previous array while a recompute holds the same elements, so a
+// context value derived from it doesn't change on unrelated row updates.
+function useStableArray<T>(next: T[]): T[] {
+  const ref = useRef(next);
+  const previous = ref.current;
+  if (
+    previous !== next &&
+    (previous.length !== next.length || next.some((item, index) => item !== previous[index]))
+  ) {
+    ref.current = next;
+  }
+  return ref.current;
+}
+
 function SidebarRowDataProvider({
   projectNamesById,
   projectIconsById,
@@ -983,6 +997,10 @@ function SidebarImpl({
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
   });
+  // onOpen is optional (the sidebar renders standalone in tests), so fall back to
+  // a no-op rather than widening the child's contract. Stable so the memoized
+  // header actions skip the sidebar's re-renders.
+  const toggleSidebar = useStableCallback(() => (peek ? onOpen?.() : onClose()));
   // A search result that opens its row closes the phone's menu, as a section link does.
   const onSearchNavigate = useStableCallback(() => {
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
@@ -1450,9 +1468,7 @@ function SidebarImpl({
                 // Side by side, the chat stays in view with no dismiss strip,
                 // so the collapse toggle is the tap-to-close affordance.
                 showMobileToggle={sideBySide}
-                // onOpen is optional (the sidebar renders standalone in tests), so
-                // fall back to a no-op rather than widening the child's contract.
-                onToggle={peek ? () => onOpen?.() : onClose}
+                onToggle={toggleSidebar}
                 onOpenSearch={onOpenSearch}
                 showSettings={false}
               />
@@ -3093,19 +3109,28 @@ function ConversationList({
     moveToNest.mutate({ id, destination });
   });
   const canJoinNests = serverInfo !== "loading" && serverInfo.sibling_sessions === true;
+  // Every row reads this context, so it must not change when an unrelated row
+  // does (a background turn edge): keep the destinations array while its rows are the same.
+  const nestDestinations = useStableArray(
+    useMemo(
+      () =>
+        allConversations.filter(
+          (row) => row.family && !row.archived && isOwnedByViewer(row, viewerId),
+        ),
+      [allConversations, viewerId],
+    ),
+  );
   const nestMoveValue = useMemo(
     () =>
       nestMovesSupported
         ? {
-            destinations: allConversations.filter(
-              (row) => row.family && !row.archived && isOwnedByViewer(row, viewerId),
-            ),
+            destinations: nestDestinations,
             move: moveNest,
             canJoin: canJoinNests,
             saving: moveToNest.isPending,
           }
         : null,
-    [nestMovesSupported, allConversations, viewerId, moveNest, canJoinNests, moveToNest.isPending],
+    [nestMovesSupported, nestDestinations, moveNest, canJoinNests, moveToNest.isPending],
   );
   // The session currently being dragged (id + source project + pinned state), or
   // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
@@ -3548,60 +3573,69 @@ function ConversationList({
     ) : undefined;
   // The filter stays reachable while bulk-selecting; switching scope just exits
   // selection. Only the "select" entry point hides, being already active.
-  const selectSessionsButton = (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Select sessions"
-          data-testid="toggle-selection-mode"
-          className="text-muted-foreground mobile-touch-target"
-          onClick={(event) => {
-            event.stopPropagation();
-            onEnterSelectionMode("sessions");
-          }}
-        >
-          <ListChecksIcon className="size-3.5" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">Select sessions</TooltipContent>
-    </Tooltip>
-  );
-  // A unified selection puts "Select sessions" on the Projects header instead.
-  const sessionsHeaderActions = !selectionMode ? (
-    <div className="flex items-center gap-0.5">
+  // Memoized, as is the header below: the list re-renders on every row update (a
+  // background turn edge), and the same element lets React skip these buttons.
+  const selectSessionsButton = useMemo(
+    () => (
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
-            asChild
+            type="button"
             variant="ghost"
             size="icon-xs"
-            aria-label="New session"
-            data-testid="sessions-new-session"
+            aria-label="Select sessions"
+            data-testid="toggle-selection-mode"
             className="text-muted-foreground mobile-touch-target"
+            onClick={(event) => {
+              event.stopPropagation();
+              onEnterSelectionMode("sessions");
+            }}
           >
-            <Link
-              to="/"
-              componentId="sidebar.sessions_new_chat"
-              onClick={(event) => {
-                event.stopPropagation();
-                onActiveTabChange("mine");
-                onRowClick(event);
-              }}
-            >
-              <MessageCirclePlusIcon className="size-3.5" />
-            </Link>
+            <ListChecksIcon className="size-3.5" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" shortcut={newSessionShortcutKeys()}>
-          New session
-        </TooltipContent>
+        <TooltipContent side="bottom">Select sessions</TooltipContent>
       </Tooltip>
-      {!unifiedSelection && selectSessionsButton}
-    </div>
-  ) : undefined;
+    ),
+    [onEnterSelectionMode],
+  );
+  // A unified selection puts "Select sessions" on the Projects header instead.
+  const sessionsHeaderActions = useMemo(
+    () =>
+      !selectionMode ? (
+        <div className="flex items-center gap-0.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                asChild
+                variant="ghost"
+                size="icon-xs"
+                aria-label="New session"
+                data-testid="sessions-new-session"
+                className="text-muted-foreground mobile-touch-target"
+              >
+                <Link
+                  to="/"
+                  componentId="sidebar.sessions_new_chat"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onActiveTabChange("mine");
+                    onRowClick(event);
+                  }}
+                >
+                  <MessageCirclePlusIcon className="size-3.5" />
+                </Link>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" shortcut={newSessionShortcutKeys()}>
+              New session
+            </TooltipContent>
+          </Tooltip>
+          {!unifiedSelection && selectSessionsButton}
+        </div>
+      ) : undefined,
+    [selectionMode, onActiveTabChange, onRowClick, unifiedSelection, selectSessionsButton],
+  );
   const sessionsFilterMenu = (
     <SessionFilterMenu
       value={activeTab}
@@ -4542,7 +4576,8 @@ function FilterMenuSub({
   );
 }
 
-function SessionFilterMenu({
+// Memoized: the list owner re-renders on every row update, which never changes the menu.
+const SessionFilterMenu = memo(function SessionFilterMenu({
   value,
   onChange,
   multiUser,
@@ -4695,7 +4730,7 @@ function SessionFilterMenu({
       )}
     </DropdownMenu>
   );
-}
+});
 
 function ProjectHeaderActions({
   hostId,
