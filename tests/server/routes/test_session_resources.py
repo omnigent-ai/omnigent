@@ -12391,6 +12391,38 @@ async def test_terminal_shell_turns_runner_failures_into_fixed_messages(
     assert (resp.status_code, resp.text) == (status, body)
 
 
+class _SilentRunnerClient(_FakeRunnerClient):
+    """A runner whose GET never answers and ignores its timeout, as over the runner tunnel."""
+
+    async def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del params, timeout
+        self.calls.append(("GET", url))
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_terminal_shell_answers_the_fixed_502_when_the_runner_never_answers(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(routes_resources, "_SHELL_PROXY_TIMEOUT_S", 0.05)
+    runner = _SilentRunnerClient()
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+
+    resp = await asyncio.wait_for(client.get(_SHELL_PATH), timeout=5)
+
+    assert (resp.status_code, resp.text) == (502, _INSPECT_FAILED)
+    assert runner.calls == [("GET", _SHELL_PATH)]
+
+
 class _UnroutableRunnerRouter(_FakeRunnerRouter):
     """A control route that fails before any runner is called, with ``error``."""
 

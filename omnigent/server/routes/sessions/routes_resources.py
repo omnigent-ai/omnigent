@@ -205,6 +205,8 @@ _PR_EDIT_PROXY_TIMEOUT_S = 20.0
 _TERMINAL_RESOURCE_ID_RE = re.compile(r"terminal_[A-Za-z0-9_.-]{1,200}")
 # The shell route's answer when the session's runner is offline or unreachable.
 _SHELL_RUNNER_OFFLINE = "This session's runner isn't available right now."
+# The whole runner call, since a tunneled runner's transport doesn't enforce httpx's timeout.
+_SHELL_PROXY_TIMEOUT_S = 1.0
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
@@ -1853,14 +1855,18 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell"
         older_runner = "This session's runner can't inspect terminals."
         try:
-            payload = await _proxy_get_to_runner(
-                session_id,
-                path,
-                conv,
-                timeout=1.0,
-                unsupported_endpoint_message=older_runner,
-                for_control=True,
-            )
+            async with asyncio.timeout(_SHELL_PROXY_TIMEOUT_S):
+                payload = await _proxy_get_to_runner(
+                    session_id,
+                    path,
+                    conv,
+                    timeout=_SHELL_PROXY_TIMEOUT_S,
+                    unsupported_endpoint_message=older_runner,
+                    for_control=True,
+                )
+        except TimeoutError:
+            # A runner that stops answering fails the same way as one that answers badly.
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
         except WrongReplicaError:
             # Its host id tells the client where to resend; it carries no runner text.
             raise
