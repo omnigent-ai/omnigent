@@ -228,6 +228,7 @@ if TYPE_CHECKING:
     from omnigent.entities import Agent, Conversation
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
     from omnigent.onboarding.acp_auth import AcpAgentEntry
+    from omnigent.server.host_registry import HostConnection
 
 _logger = logging.getLogger(__name__)
 
@@ -5046,7 +5047,7 @@ def create_app(
             and not _held_session_owner_changed(session_id, owners[session_id])
         )
         host_back_deadline: float | None = None
-        host_hello_read = False
+        hello_read: HostConnection | None = None
         outcome = "cancelled"
         for conv in held:
             _logger.info(
@@ -5072,9 +5073,9 @@ def create_app(
                     remaining = min(remaining, max(0.0, host_back_deadline - now))
                 if await _wait_for_held_runner(
                     runner_id,
-                    # Until this replica reads the host's hello, its reconnect ends the wait early.
-                    None if host_hello_read else host_id,
+                    host_id,
                     timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining),
+                    hello_read=hello_read,
                 ):
                     outcome = "runner_reconnected"
                     break
@@ -5087,8 +5088,8 @@ def create_app(
                     if host_back_deadline is None:
                         host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
                     host_conn = host_registry.get(host_id) if host_id is not None else None
-                    if host_conn is not None and not host_hello_read:
-                        host_hello_read = True
+                    if host_conn is not None and host_conn is not hello_read:
+                        hello_read = host_conn
                         # A host's hello lists its surviving runners; a restart lists none.
                         if runner_id not in host_conn.hello.runners:
                             host_back_deadline = min(
@@ -5100,7 +5101,6 @@ def create_app(
                 else:
                     # A brief host return cannot end a sleeping host's absolute hold.
                     host_back_deadline = None
-                    host_hello_read = False
         finally:
             for conv in held:
                 _logger.info(
@@ -5119,10 +5119,16 @@ def create_app(
         return _HostOfflineHold(outcome, mid_turn_sessions, owners)
 
     async def _wait_for_held_runner(
-        runner_id: str, host_id: str | None, *, timeout_s: float
+        runner_id: str,
+        host_id: str | None,
+        *,
+        timeout_s: float,
+        hello_read: "HostConnection | None" = None,
     ) -> bool:
         """Wait for a held runner to reconnect, ending early when *host_id* registers here.
 
+        :param hello_read: The host connection whose hello the hold already
+            read; only a newer registration ends the wait early.
         :returns: Whether the runner reconnected.
         """
         if host_id is None:
@@ -5133,7 +5139,7 @@ def create_app(
             tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
         )
         host_wait = asyncio.ensure_future(
-            host_registry.wait_for_host(host_id, timeout_s=timeout_s)
+            host_registry.wait_for_host(host_id, timeout_s=timeout_s, replacing=hello_read)
         )
         try:
             await asyncio.wait((runner_wait, host_wait), return_when=asyncio.FIRST_COMPLETED)

@@ -830,7 +830,12 @@ class HostRegistry:
         return conn
 
     async def wait_for_host(
-        self, host_id: str, *, timeout_s: float, workspace_id: int | None = None
+        self,
+        host_id: str,
+        *,
+        timeout_s: float,
+        workspace_id: int | None = None,
+        replacing: HostConnection | None = None,
     ) -> HostConnection | None:
         """Wait until a host registers on this replica or the timeout expires.
 
@@ -839,6 +844,8 @@ class HostRegistry:
         :param timeout_s: Maximum seconds to wait, e.g. ``60.0``.
         :param workspace_id: Tenant partition; defaults to
             :func:`current_workspace_id`.
+        :param replacing: A connection the caller already handled; while it
+            is still registered, wait for the next registration instead.
         :returns: The registered :class:`HostConnection`, or ``None`` if the
             host did not connect here before the timeout.
         """
@@ -847,7 +854,7 @@ class HostRegistry:
         waiter: asyncio.Future[HostConnection] = asyncio.get_running_loop().create_future()
         with self._lock:
             current = self._hosts.get(key)
-            if current is not None:
+            if current is not None and current is not replacing:
                 return current
             self._host_waits.setdefault(key, set()).add(waiter)
         try:

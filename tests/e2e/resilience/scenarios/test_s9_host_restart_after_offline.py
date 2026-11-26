@@ -69,8 +69,14 @@ def test_s9_host_restart_after_offline(
             try:
                 time.sleep(contract.GRACE_S + 5)
                 shown = working.is_visible()
-                label = working.inner_text() if shown else ""
-                marked = shown and working.get_attribute("data-host-offline") == "true"
+                label, marked = "", False
+                if shown:
+                    try:
+                        label = working.inner_text(timeout=2_000)
+                        offline_attr = working.get_attribute("data-host-offline", timeout=2_000)
+                        marked = offline_attr == "true"
+                    except sync_api.Error:
+                        label, marked = "", False
                 hints = page.get_by_text(_OFFLINE_HINT).count()
                 interrupt = page.get_by_role("button", name=re.compile("Interrupt|Stop")).count()
                 page.screenshot(path=str(shots / "S9-offline-chat.png"))
