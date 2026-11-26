@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { type RefObject, useEffect, useLayoutEffect, useRef } from "react";
 import { create } from "zustand";
 import type { OpenFileOptions } from "@/shell/FileViewerContext";
 
@@ -36,9 +36,13 @@ export interface FileFinderPane {
 interface FileFinderState {
   /** The session whose workspace the finder can search, or null when there's none. */
   availableSessionId: string | null;
+  /** Whether that session's host also searches its files' text. */
+  textSearchAvailable: boolean;
   request: FileFinderRequest | null;
+  /** A shown Search page should take the keyboard, once its field is on screen. */
+  textSearchFocus: { sessionId: string; id: number } | null;
   pane: FileFinderPane | null;
-  setAvailableSession: (sessionId: string | null) => void;
+  setAvailableSession: (sessionId: string | null, options?: { textSearch?: boolean }) => void;
   /** Clears `id` once shown; a newer request is kept. */
   finishRequest: (id: number) => void;
 }
@@ -47,9 +51,15 @@ let nextRequestId = 1;
 
 export const useFileFinderStore = create<FileFinderState>((set) => ({
   availableSessionId: null,
+  textSearchAvailable: false,
   request: null,
+  textSearchFocus: null,
   pane: null,
-  setAvailableSession: (sessionId) => set({ availableSessionId: sessionId }),
+  setAvailableSession: (sessionId, options = {}) =>
+    set({
+      availableSessionId: sessionId,
+      textSearchAvailable: sessionId !== null && options.textSearch === true,
+    }),
   finishRequest: (id) => set((state) => (state.request?.id === id ? { request: null } : state)),
 }));
 
@@ -72,11 +82,58 @@ export function requestFileFinder(sessionId: string, options: FileFinderOptions 
  */
 export function requestTextSearch(sessionId: string, options: FileFinderOptions = {}): boolean {
   const store = useFileFinderStore.getState();
-  if (store.availableSessionId !== sessionId) return false;
+  if (store.availableSessionId !== sessionId || !store.textSearchAvailable) return false;
   useFileFinderStore.setState({
     request: { id: nextRequestId++, sessionId, ...options, kind: "text" },
   });
   return true;
+}
+
+/** Asks `sessionId`'s Search page to take the keyboard once it shows, as a text search wants. */
+export function requestTextSearchFocus(sessionId: string): void {
+  useFileFinderStore.setState({ textSearchFocus: { sessionId, id: nextRequestId++ } });
+}
+
+/** How many frames a focus request waits for its hidden Search page to show, about a second. */
+const TEXT_SEARCH_FOCUS_FRAMES = 60;
+
+/**
+ * Focuses `input` when a text search asked `sessionId`'s Search page for the keyboard. A page
+ * kept mounted while hidden can't take focus until it's selected, so the request is kept, and
+ * tried again each frame, until the field has focus or the wait ends.
+ */
+export function useTextSearchFocus(
+  sessionId: string,
+  input: RefObject<HTMLInputElement | null>,
+): void {
+  const focus = useFileFinderStore((state) => state.textSearchFocus);
+  useEffect(() => {
+    if (!focus || focus.sessionId !== sessionId) return;
+    const settle = () =>
+      useFileFinderStore.setState((state) =>
+        state.textSearchFocus?.id === focus.id ? { textSearchFocus: null } : state,
+      );
+    let frame = 0;
+    let frames = 0;
+    const attempt = () => {
+      const field = input.current;
+      field?.focus();
+      if ((field && document.activeElement === field) || ++frames >= TEXT_SEARCH_FOCUS_FRAMES) {
+        settle();
+        return;
+      }
+      frame = requestAnimationFrame(attempt);
+    };
+    attempt();
+    return () => cancelAnimationFrame(frame);
+  }, [focus, sessionId, input]);
+}
+
+/** Whether a text search can open on `sessionId`'s files. */
+export function useTextSearchAvailable(sessionId: string | undefined): boolean {
+  return useFileFinderStore(
+    (state) => !!sessionId && state.availableSessionId === sessionId && state.textSearchAvailable,
+  );
 }
 
 /** Whether the finder can search `sessionId`'s workspace. */
@@ -91,14 +148,23 @@ export function useFileFinderAvailable(sessionId: string | undefined): boolean {
 export function useFileFinderHost(
   sessionId: string | null,
   show: (request: FileFinderRequest) => void,
+  { textSearch = false }: { textSearch?: boolean } = {},
 ): void {
   const showRef = useRef(show);
   useLayoutEffect(() => {
     showRef.current = show;
   });
   useEffect(() => {
-    useFileFinderStore.getState().setAvailableSession(sessionId);
-  }, [sessionId]);
+    useFileFinderStore.getState().setAvailableSession(sessionId, { textSearch });
+  }, [sessionId, textSearch]);
+  // A host that goes away withdraws its session, unless a newer host already offers another.
+  useEffect(
+    () => () => {
+      const store = useFileFinderStore.getState();
+      if (store.availableSessionId === sessionId) store.setAvailableSession(null);
+    },
+    [sessionId],
+  );
   const request = useFileFinderStore((state) => state.request);
   useEffect(() => {
     if (!request) return;

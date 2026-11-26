@@ -36,18 +36,22 @@ Filename search remains in Files.
   Windows/Linux, except in a terminal) from anywhere in the app.
 - Tabs sidebar: with `workspace_sidebar_v2` on, in a desktop app or desktop
   browser (not a touch client), the sidebar shows tabs instead of the Workspace
-  panel, in the Workspace drawer when the window is narrower than 1181px. Choose
-  **New tab → Search text** to search in a tab of its own, and move between tabs
-  from the strip or tab search. The Workspace panel's **Cmd+Shift+F** isn't
-  bound while the tabs show.
-  **Ctrl+Cmd+O** on macOS (**Ctrl+Alt+O** on Windows/Linux) opens the same search.
+  panel, in the Workspace drawer when the window is narrower than 1181px.
+  **New tab → Search text**, **Ctrl+Cmd+O** on macOS (**Ctrl+Alt+O** on
+  Windows/Linux) and ⌘K's **Search Text in Workspace…** all open Go to File on
+  its **Text** tab: it lists matching lines under their files with a preview,
+  and Enter opens the file at the line. **Open in Search** (Cmd/Ctrl+Enter)
+  hands the search and its results to the Search page, a tab of its own in the
+  strip, ready to type into; move between tabs from the strip or tab search. The
+  Workspace panel's **Cmd+Shift+F** isn't bound while the tabs show.
 - File viewer menu: in the tabs sidebar's file viewer, select text and
   right-click it (or press **Shift+F10** or the Menu key), then choose **Search
   Text in Workspace…** to search for the selection's first non-blank line. The
-  row shows only where the session's file finder is available and that line is
-  at most 4,096 characters.
+  row shows only where the session can search text and that line is at most 4,096
+  characters.
 - Tabs sidebar's Files tab: with a text file open, choose **File actions (⋯) →
-  Search Text in Workspace…**, shown while the session can search.
+  Search Text in Workspace…**, shown while the session can search text. **Go to
+  File in Workspace…** beside it needs only the session's file finder.
 
 ## Driving it with the repro environment
 
@@ -69,11 +73,13 @@ Click Filter files, include `src/**` and exclude `**/tests/**`, then submit.
 Confirm results respect both filters, including after collapsing the filters or
 switching conversations. Clear both fields and submit to restore the full search.
 With `workspace_sidebar_v2` on, open that file in the tabs sidebar's Files
-viewer, select the phrase and right-click it. Where a shell serves the session's
-file finder (Go to File), choose **Search Text in Workspace…** and confirm a
-search tab opens with the phrase as its query and its line among the results.
-Select only blank lines and confirm the row is gone. Where no shell serves the
-finder, confirm the menu leaves the row out and keeps its other rows.
+viewer, select the phrase and right-click it. Where the session can search text,
+choose **Search Text in Workspace…** and confirm Go to File opens on its **Text**
+tab with the phrase as its query and its line among the results, even when Go to
+File was already open on another query. Press **Open in Search** (Cmd/Ctrl+Enter)
+and confirm the sidebar's Search page shows the same search. Select only blank
+lines and confirm the row is gone. Where the session can't search text, confirm
+the menu leaves the row out and keeps its other rows.
 Restart the test server with `OMNIGENT_FEATURES=-workspace_content_search` and
 reload: the tab, picker entry and shortcut should be unavailable.
 
