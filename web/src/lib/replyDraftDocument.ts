@@ -102,7 +102,8 @@ export function quoteTextStart(document: string): number {
 export function replaceQuoteTail(document: string, tail: string): string {
   const lines = document.split("\n");
   const lastCard = lines.findLastIndex((line) => parseQuoteLine(line) !== null);
-  return [...lines.slice(0, lastCard + 1), stripQuoteMarks(tail)].join("\n");
+  const text = stripQuoteMarks(tail.replace(/\r\n?/g, "\n"));
+  return [...lines.slice(0, lastCard + 1), text].join("\n");
 }
 
 /** `document` with a new quote after it: the tail becomes the quote's text before it. */

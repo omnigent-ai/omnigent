@@ -2545,8 +2545,12 @@ function ComposerImpl(
   ) => {
     const target = textareaRef.current;
     if (replyDocument === null) return setValue(next);
-    // No editor to apply the card rules, so the document is settled here.
-    if (!target || isComposerTextarea(target)) return setReplyDocument(settleQuoteLines(next));
+    if (!target || isComposerTextarea(target)) {
+      // No editor to apply the card rules, so the document is settled here.
+      const settled = settleQuoteLines(next);
+      setReplyDocument(settled);
+      return settled;
+    }
     const take = voiceTakeRef.current;
     if (take && target.value !== take.last) take.clean = false;
     target.insertText(change.insert, change.from, change.to, { history: final });

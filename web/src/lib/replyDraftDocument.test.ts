@@ -101,6 +101,9 @@ describe("document edits", () => {
   it("replaces only the tail, keeping every card", () => {
     expect(replaceQuoteTail(doc("X", a, "old", "lines"), `new${b}`)).toBe(doc("X", a, "new"));
     expect(replaceQuoteTail("plain", "next")).toBe("next");
+    expect(replaceQuoteTail(doc("X", a, ""), "one\r\ntwo\rthree")).toBe(
+      doc("X", a, "one", "two", "three"),
+    );
   });
 
   it("appends a quote after the tail and ends on an empty tail line", () => {

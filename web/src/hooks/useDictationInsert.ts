@@ -228,8 +228,9 @@ export function useDictationInsert(
         return;
       }
       const body = written.slice(head.length, end);
-      // The caret stays as far before the region's end as the splice put it.
-      const caret = end - (spliced.region.start + spliced.region.text.length - spliced.caret);
+      // The caret stays as far before the region's end as the splice put it, within the region.
+      const gap = spliced.region.start + spliced.region.text.length - spliced.caret;
+      const caret = Math.min(Math.max(end - gap, head.length), end);
       const owned = settled.region && body ? { start: head.length, text: body } : null;
       producedRef.current = { value: written, region: owned, tail: caret };
       wantCaretRef.current = caret;

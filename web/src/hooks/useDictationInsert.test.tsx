@@ -401,6 +401,43 @@ describe("useDictationInsert with a setter that writes through its input", () =>
   });
 });
 
+describe("useDictationInsert's setter arguments and offsets", () => {
+  it("tells the setter each change, and whether it pins an utterance", () => {
+    const calls: unknown[][] = [];
+    const { result } = renderHook(() => {
+      const [value, setValue] = useState("Intro");
+      const dictation = useDictationInsert(value, (next, change, final) => {
+        calls.push([change, final]);
+        setValue(next);
+      });
+      return { value, ...dictation };
+    });
+    act(() => result.current.replaceInterim("hel"));
+    act(() => result.current.appendFinal("hello"));
+    expect(result.current.value).toBe("Intro hello");
+    expect(calls).toEqual([
+      [{ from: 5, to: 5, insert: " hel" }, false],
+      [{ from: 5, to: 9, insert: " hello" }, true],
+    ]);
+  });
+
+  it("owns nothing once the input rewrites the text around its write", () => {
+    const { result } = renderHook(() => {
+      const [value, setValue] = useState("Intro");
+      const dictation = useDictationInsert(value, (next) => {
+        const written = next.replace("Intro", "INTRO");
+        setValue(written);
+        return written;
+      });
+      return { value, ...dictation };
+    });
+    act(() => result.current.replaceInterim("hel"));
+    expect([result.current.value, result.current.hasInterim]).toEqual(["INTRO hel", false]);
+    act(() => result.current.replaceInterim("hello"));
+    expect(result.current.value).toBe("INTRO hel hello");
+  });
+});
+
 describe("useDictationInsert on a non-textarea composer surface", () => {
   const mountedSurfaces: FakeComposerSurface[] = [];
   afterEach(() => {
