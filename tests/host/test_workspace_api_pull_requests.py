@@ -315,8 +315,8 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         ),
         (
             "ListLabels",
-            pb.ListLabelsRequest(pr_url=_PR, text="bug"),
-            "Label search isn't available on this host",
+            pb.ListLabelsRequest(pr_url=_PR, text="a" * 257),
+            "The label search is longer than 256 characters",
         ),
         (
             "UploadAttachment",
@@ -343,7 +343,7 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         "account-without-pr",
         "account-with-remote",
         "merge-as-no-account",
-        "label-search",
+        "label-search-too-long",
         "upload-no-name",
         "upload-long-name",
         "upload-long-url",

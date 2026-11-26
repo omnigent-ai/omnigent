@@ -668,6 +668,8 @@ def _timeline_payload(raw: Any) -> dict[str, Any]:
 _LABEL_COLOR = re.compile(r"[0-9a-fA-F]{6}")
 # The label picker lists at most this many of the repository's labels.
 _MAX_REPO_LABELS = 1000
+# A label search answers its best matches, enough for one picker page.
+_MAX_LABEL_MATCHES = 50
 # Every ``gh`` call of one label, reviewer, or merge request shares this budget,
 # under the 20-second waits of the server and the host tunnel.
 _PR_EDIT_REQUEST_SECONDS = 15.0
@@ -2031,11 +2033,15 @@ def _pr_file_contents(
     }
 
 
-def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
-    """List the PR repository's labels by name for the label picker.
+def _repo_labels(root: str, reference: PullRequestRef, *, text: str = "") -> dict[str, Any]:
+    """List the PR repository's labels for the label picker, by name or by best match.
 
+    :param text: Words to match in a label's name or description; empty lists them all.
     :raises ValueError: When ``gh`` cannot list them within :data:`_PR_EDIT_REQUEST_SECONDS`.
     """
+    limit = _MAX_LABEL_MATCHES if text else _MAX_REPO_LABELS
+    # ``--search=`` keeps text that starts with a dash from reading as a flag.
+    search = [f"--search={text}"] if text else []
     with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         _host_args(root, reference)
         rc, out, _ = _gh(
@@ -2044,11 +2050,12 @@ def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
                 "list",
                 "-R",
                 _repo_argument(reference),
+                *search,
                 "--json",
                 "name,color,description",
                 "--limit",
                 # One past the cap tells a full list from a truncated one.
-                str(_MAX_REPO_LABELS + 1),
+                str(limit + 1),
             ],
             cwd=root,
             token=_pr_token(root, reference),
@@ -2060,10 +2067,11 @@ def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
     except ValueError as exc:
         raise ValueError("GitHub returned an unexpected label list") from exc
     raw = raw if isinstance(raw, list) else []
-    labels = sorted(
-        _shape_labels(raw[:_MAX_REPO_LABELS]), key=lambda label: str(label["name"]).casefold()
-    )
-    return {"object": "list", "data": labels, "has_more": len(raw) > _MAX_REPO_LABELS}
+    labels = _shape_labels(raw[:limit])
+    if not text:
+        labels.sort(key=lambda label: str(label["name"]).casefold())
+    # A search keeps gh's best-match order.
+    return {"object": "list", "data": labels, "has_more": len(raw) > limit}
 
 
 def _labels_api(

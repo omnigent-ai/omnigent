@@ -235,7 +235,7 @@ PULL_REQUEST_OPS: dict[str, PullRequestOp] = {
     ),
     # The session owner's: what the edit controls offer, and the changes themselves.
     "ListLabels": lambda reader, call, request: reader.github_labels(
-        call.session_id, _url(request)
+        call.session_id, _url(request), request.text
     ),
     "ListReviewerCandidates": lambda reader, call, request: reader.github_reviewers(
         call.session_id, _url(request)
