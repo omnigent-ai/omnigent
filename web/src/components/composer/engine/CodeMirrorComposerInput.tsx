@@ -274,7 +274,7 @@ class QuoteCardWidget extends WidgetType {
 
   override toDOM(view: EditorView): HTMLElement {
     const row = document.createElement("div");
-    row.className = "flex w-full min-w-0 max-w-full items-start gap-2 py-1.5";
+    row.className = "flex w-full min-w-0 max-w-full select-none items-start gap-2 py-1.5";
     row.setAttribute("data-testid", "composer-reply-quote");
     const card = document.createElement("blockquote");
     card.className =
@@ -304,6 +304,14 @@ class QuoteCardWidget extends WidgetType {
     remove.addEventListener("click", () => {
       const range = quoteRemovalRange(view.state.doc.toString(), id);
       if (range && !view.state.readOnly) view.dispatch({ changes: range, userEvent: "delete" });
+    });
+    // A click on the card puts the caret on the line after it, never in the card's own text.
+    row.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      if (remove.contains(event.target as Node)) return;
+      const line = view.state.doc.lineAt(view.posAtDOM(row));
+      view.dispatch({ selection: { anchor: Math.min(line.to + 1, view.state.doc.length) } });
+      view.focus();
     });
     row.append(card, remove);
     return row;

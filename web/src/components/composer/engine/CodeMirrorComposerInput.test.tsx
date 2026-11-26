@@ -726,6 +726,17 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     expect(head()).toBe(lines(a, "Intro").length);
   });
 
+  it("puts the caret on the line after a card when the card is clicked", () => {
+    const { container, editor, target, caretAt } = mountQuotes(lines("Intro", a, "Reply"));
+    caretAt(0);
+    const quote = container.querySelector("[data-testid='composer-reply-quote'] blockquote span")!;
+    expect(fireEvent.mouseDown(quote)).toBe(false);
+    expect(editor.state.selection.main.head).toBe(lines("Intro", a, "").length);
+    expect(editor.hasFocus).toBe(true);
+    act(() => insertComposerText(target(), "#"));
+    expect(target().value).toBe(lines("Intro", a, "#Reply"));
+  });
+
   it.each([
     ["at the start of the document", 0, lines("#", a, "Mid", b, "")],
     ["at a card's end", a.length, lines(a, "#", "Mid", b, "")],
