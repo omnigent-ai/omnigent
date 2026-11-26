@@ -71,7 +71,8 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
-from omnigent.git_providers import host_of
+from omnigent.git_providers import EnvInstances, host_of
+from omnigent.git_providers.github import GitHubProvider
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
@@ -390,6 +391,17 @@ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
     # Older gh (no --json hosts): fall back to the plain status exit code.
     rc, _, _ = _gh(["auth", "status"], cwd=root)
     return rc == 0, []
+
+
+def _known_github_host(host: str) -> bool:
+    """Whether the user set ``host`` up for GitHub: github.com, ``GH_HOST``, a configured
+    GitHub instance, or a host with a stored ``gh`` login.
+
+    It never runs ``gh``. A pull request URL can name any host, and with an enterprise token
+    in the environment ``gh`` treats every host but github.com as signed in, so a command or
+    check naming an unknown host would send that token there.
+    """
+    return GitHubProvider().matches_host(host, EnvInstances())
 
 
 def _gh_signed_in_to_host(root: str, host: str) -> bool:
