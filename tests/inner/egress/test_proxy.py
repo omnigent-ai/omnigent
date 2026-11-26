@@ -540,9 +540,9 @@ async def test_connect_tunnel_forwards_plain_http_to_allowed_host(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("listener", "request_target", "expected_response", "expected_methods"),
+    ("listener", "request_target", "expected_response", "expected_requests"),
     [
-        ("unix", "GET /probe", b"HTTP/1.1 200", ["GET"]),
+        ("unix", "GET /probe?x=1", b"HTTP/1.1 200", [("GET", "/probe?x=1")]),
         ("tcp", "POST /probe", b"HTTP/1.1 403 Forbidden\r\n", []),
         ("tcp", "GET http://other.example.com/probe", b"HTTP/1.1 403 Forbidden\r\n", []),
     ],
@@ -554,7 +554,7 @@ async def test_connect_tunnel_plain_http_keeps_request_policy(
     listener: str,
     request_target: str,
     expected_response: bytes,
-    expected_methods: list[str],
+    expected_requests: list[tuple[str, str]],
 ) -> None:
     """Plain HTTP inside a CONNECT tunnel is still checked per request on each listener."""
     cert_path, key_path, _ = ca_paths
@@ -562,7 +562,7 @@ async def test_connect_tunnel_plain_http_keeps_request_policy(
     upstream = await _start_capturing_upstream(captured)
     upstream_port = upstream.sockets[0].getsockname()[1]
     proxy = EgressProxy(
-        parse_rules(["GET 127.0.0.1/probe", "GET other.example.com/**"]),
+        parse_rules(["GET 127.0.0.1/probe*", "GET other.example.com/**"]),
         cert_path,
         key_path,
         block_private_destinations=False,
@@ -592,7 +592,7 @@ async def test_connect_tunnel_plain_http_keeps_request_policy(
         await upstream.wait_closed()
 
     assert response.startswith(expected_response), response[:200]
-    assert [request.method for request in captured] == expected_methods
+    assert [(request.method, request.path) for request in captured] == expected_requests
 
 
 # ---------------------------------------------------------------------------
@@ -2495,12 +2495,16 @@ class _CapturedRequest:
     :param method: The request method the upstream received, e.g.
         ``"GET"`` or ``"TRACE"``, or ``None`` when the request line could
         not be parsed.
+    :param path: The request-line target the upstream received, e.g.
+        ``"/probe?x=1"``, or ``None`` when the request line could not be
+        parsed.
     """
 
     authorization: str | None
     connection: list[str] = field(default_factory=list)
     max_forwards: str | None = None
     method: str | None = None
+    path: str | None = None
 
 
 async def _start_capturing_upstream(
@@ -2524,8 +2528,12 @@ async def _start_capturing_upstream(
         max_forwards: str | None = None
         lines = head.split(b"\r\n")
         method: str | None = None
+        path: str | None = None
         if lines and lines[0]:
-            method = lines[0].split(b" ", 1)[0].decode("latin-1")
+            request_line = lines[0].split(b" ")
+            method = request_line[0].decode("latin-1")
+            if len(request_line) > 1:
+                path = request_line[1].decode("latin-1")
         for line in lines:
             if line[:14].lower() == b"authorization:":
                 auth = line.partition(b":")[2].strip().decode("latin-1")
@@ -2539,6 +2547,7 @@ async def _start_capturing_upstream(
                 connection=connection,
                 max_forwards=max_forwards,
                 method=method,
+                path=path,
             )
         )
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
