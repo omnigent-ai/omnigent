@@ -300,6 +300,23 @@ def _dry_run_event(phase: Phase) -> PolicyEvent:
     )
 
 
+def _contains_eval_error(value: object) -> bool:
+    """
+    Whether an evaluation result holds an error that CEL returned instead of raising.
+
+    :param value: A value returned by ``Runner.evaluate``, e.g. the map from
+        ``{"result": event.data.name == "x" ? "DENY" : "ALLOW"}`` on a request.
+    :returns: ``True`` when the value, or a value nested in it, is a ``CELEvalError``.
+    """
+    if isinstance(value, CELEvalError):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_eval_error(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_eval_error(item) for item in value)
+    return False
+
+
 def validate_cel_policy_params(factory_params: dict[str, object]) -> str | None:
     """
     Explain why CEL policy arguments would not enforce, before they are stored.
@@ -320,13 +337,17 @@ def validate_cel_policy_params(factory_params: dict[str, object]) -> str | None:
     except CELParseError as exc:
         return f"CEL policy: compile error in expression: {exc}"
     for phase in _DRY_RUN_CONTENT:
+        activation = {"event": json_to_cel(_cel_event(_dry_run_event(phase)))}
         try:
-            program.evaluate({"event": json_to_cel(_cel_event(_dry_run_event(phase)))})
+            failed = _contains_eval_error(program.evaluate(activation))
         except RecursionError:
             return (
                 f"CEL policy: expression is nested too deeply to evaluate a {phase.value} event."
             )
-        except (CELEvalError, ValueError, TypeError):
+        # cel-python raises some failures as plain Python errors, e.g. OverflowError from int().
+        except Exception:  # noqa: BLE001
+            failed = True
+        if failed:
             return (
                 f"CEL policy: expression fails to evaluate a {phase.value} event, and a failed "
                 "evaluation abstains. Guard fields that some events lack, e.g. "

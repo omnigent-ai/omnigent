@@ -202,6 +202,8 @@ def test_validate_skips_unknown_handler() -> None:
         ('event.type == "response" && event.data.missing == "x"', "response"),
         ('event.type == "llm_request" && event.data.missing == "x"', "llm_request"),
         ('event.type == "llm_response" && event.data.missing == "x"', "llm_response"),
+        ('{"result": event.data.name == "sys_os_shell" ? "DENY" : "ALLOW"}', "request"),
+        ('int(1e309) > 0 ? {"result": "DENY"} : null', "request"),
     ],
     ids=[
         "unguarded-tool-name-chain",
@@ -210,6 +212,8 @@ def test_validate_skips_unknown_handler() -> None:
         "response",
         "llm-request",
         "llm-response",
+        "error-inside-result-map",
+        "numeric-overflow",
     ],
 )
 def test_validate_cel_rejects_expression_failing_on_a_phase(
