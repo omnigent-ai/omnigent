@@ -406,8 +406,9 @@ def test_uncaptured_output_streams_return_empty_bytes(
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
 
 
+@pytest.mark.parametrize("cancel_during", ["admission", "result-read"])
 def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay(
-    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase
+    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase, cancel_during: str
 ) -> None:
     case = request_case
     sending = threading.Event()
@@ -423,7 +424,15 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
         assert release_send.wait(5)
         return len(payload)
 
-    case.control.send.side_effect = send
+    def receive(_size: int) -> bytes:
+        sending.set()
+        assert release_send.wait(5)
+        return b""
+
+    if cancel_during == "admission":
+        case.control.send.side_effect = send
+    else:
+        case.control.recv.side_effect = receive
 
     def communicate(**_kwargs: object) -> tuple[bytes, bytes]:
         assert cancelled.wait(5)
@@ -451,8 +460,11 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
         canceller = threading.Thread(target=cancel)
         canceller.start()
         workers.append(canceller)
-        assert contention.wait(5)
-        assert not cancelled.is_set()
+        if cancel_during == "admission":
+            assert contention.wait(5)
+            assert not cancelled.is_set()
+        else:
+            assert cancelled.wait(5)
         release_send.set()
         assert cancelled.wait(5)
     finally:
@@ -466,6 +478,7 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
         result.result(timeout=1)
     assert case.owner.admitted and case.owner.done.is_set()
     assert ("kill", _INIT_FD) in case.events and ("kill", _LAUNCHER_FD) in case.events
+    assert ("close", _INIT_FD) in case.events and ("close", _LAUNCHER_FD) in case.events
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
 
 

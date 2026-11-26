@@ -134,7 +134,9 @@ def test_request_launch_preserves_existing_mounts_and_the_exact_active_filter_ru
         assert len(mounted) == 2 and "--as-pid-1" in mounted[-1]
 
 
-@pytest.mark.parametrize("failure", ["baseline", "hardening"])
+@pytest.mark.parametrize(
+    ("failure", "expected_exports"), [("baseline", 1), ("hardening", 2), ("rewind", 2)]
+)
 def test_filter_export_failure_cannot_return_a_partially_hardened_launcher(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -142,22 +144,34 @@ def test_filter_export_failure_cannot_return_a_partially_hardened_launcher(
     request_fds: bwrap_sandbox.BwrapRequestFds,
     exporter: MagicMock,
     failure: str,
+    expected_exports: int,
 ) -> None:
-    failure_fd = getattr(request_fds, failure + "_fd")
+    if failure == "rewind":
+        seek = os.lseek
 
-    def export(_rules: object, descriptor: int) -> None:
-        if descriptor == failure_fd:
-            raise OSError("Filter export failed")
+        def rewind(descriptor: int, offset: int, whence: int) -> int:
+            if descriptor == request_fds.hardening_fd and whence == os.SEEK_SET:
+                raise OSError("Program rewind failed")
+            return seek(descriptor, offset, whence)
 
-    exporter.side_effect = export
+        monkeypatch.setattr(bwrap_sandbox.os, "lseek", rewind)
+    else:
+        failure_fd = getattr(request_fds, failure + "_fd")
+
+        def export(_rules: object, descriptor: int) -> None:
+            if descriptor == failure_fd:
+                raise OSError("Filter export failed")
+
+        exporter.side_effect = export
     shared = MagicMock()
     monkeypatch.setattr(copy_on_write, "wrap_shared_namespace", shared)
     request_policy.copy_on_write_roots = [tmp_path]
-    with pytest.raises(OSError, match="Filter export failed"):
+    message = "Program rewind failed" if failure == "rewind" else "Filter export failed"
+    with pytest.raises(OSError, match=message):
         bwrap_sandbox.BwrapSandboxBackend().wrap_launcher_argv(
             [sys.executable, "-c", "pass"], request_policy, tmp_path, _request_fds=request_fds
         )
-    assert exporter.call_count == (1 if failure == "baseline" else 2)
+    assert exporter.call_count == expected_exports
     shared.assert_not_called()
 
 
@@ -205,28 +219,6 @@ def test_program_files_must_be_empty_and_independently_owned(
                 [sys.executable, "-c", "pass"], request_policy, tmp_path, _request_fds=request_fds
             )
     exporter.assert_not_called()
-
-
-def test_program_rewind_failure_cannot_return_a_launcher(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    request_policy: SandboxPolicy,
-    request_fds: bwrap_sandbox.BwrapRequestFds,
-    exporter: MagicMock,
-) -> None:
-    seek = os.lseek
-
-    def rewind(descriptor: int, offset: int, whence: int) -> int:
-        if descriptor == request_fds.hardening_fd and whence == os.SEEK_SET:
-            raise OSError("Program rewind failed")
-        return seek(descriptor, offset, whence)
-
-    monkeypatch.setattr(bwrap_sandbox.os, "lseek", rewind)
-    with pytest.raises(OSError, match="Program rewind failed"):
-        bwrap_sandbox.BwrapSandboxBackend().wrap_launcher_argv(
-            [sys.executable, "-c", "pass"], request_policy, tmp_path, _request_fds=request_fds
-        )
-    assert exporter.call_count == 2
 
 
 @pytest.mark.parametrize(

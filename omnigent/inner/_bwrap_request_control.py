@@ -212,8 +212,22 @@ class BwrapRequestControl:
             raise OSError("Request result is invalid")
         return code
 
+    def _read_pending_result(self) -> int | None:
+        try:
+            return self._read_result()
+        except OSError:
+            # Stopping the init can close its channel before a result arrives.
+            with self._lock:
+                if self._stop_reason is None:
+                    raise
+            return None
+
     def run(self, *, deadline: float) -> BwrapRequestResult:
-        """Admit once, then require namespace exit and launcher/output cleanup."""
+        """Admit once, then require namespace exit and launcher/output cleanup.
+
+        The deadline is observed between 50 ms polls; completion during the
+        current poll wins over expiry within that poll.
+        """
         with self._lock:
             if self._started:
                 raise RuntimeError("A shell request can only run once")
@@ -226,7 +240,7 @@ class BwrapRequestControl:
                 if monotonic() >= deadline:
                     self._stop("timeout")
                 if exit_code is None and self._stop_reason is None:
-                    exit_code = self._read_result()
+                    exit_code = self._read_pending_result()
                 if outputs is None:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         stdout, stderr = self._process.communicate(timeout=_POLL_S)
@@ -238,15 +252,16 @@ class BwrapRequestControl:
                 if outputs is not None:
                     pending = self._launcher_pidfd if init_exited else self._init_pidfd
                     _pidfd_exited(pending, round(_POLL_S * 1000))
-            if self._stop_reason == "cancelled":
-                raise RequestCancelled("Request was cancelled; it must not be replayed")
-            timed_out = self._stop_reason == "timeout"
-            if not timed_out and exit_code is None:
-                # The final frame may have arrived between the last read and init exit.
-                exit_code = self._read_result()
-                if exit_code is None:
-                    raise OSError("Request result was lost; the command must not be replayed")
-            return BwrapRequestResult(*outputs, None if timed_out else exit_code, timed_out)
+            with self._lock:
+                if self._stop_reason == "cancelled":
+                    raise RequestCancelled("Request was cancelled; it must not be replayed")
+                timed_out = self._stop_reason == "timeout"
+                if not timed_out and exit_code is None:
+                    # The final frame may arrive between the last read and init exit.
+                    exit_code = self._read_result()
+                    if exit_code is None:
+                        raise OSError("Request result was lost; the command must not be replayed")
+                return BwrapRequestResult(*outputs, None if timed_out else exit_code, timed_out)
         finally:
             self._finish()
 
