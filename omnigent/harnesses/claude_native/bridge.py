@@ -4291,11 +4291,16 @@ def _transcript_model_pricing(
     from omnigent.inference_config import resolve_bound_provider
     from omnigent.llms.context_window import fetch_model_pricing_with_provider
 
+    try:
+        provider_entry = resolve_bound_provider(provider_config, "claude-native", allow_empty=True)
+    except Exception:  # noqa: BLE001 — pricing must not interrupt usage forwarding.
+        _logger.warning("Could not resolve transcript pricing provider; using legacy pricing")
+        provider_entry = None
     pricing = fetch_model_pricing_with_provider(
         model,
         provider_config=provider_config,
         harness="claude-native",
-        provider_entry=resolve_bound_provider(provider_config, "claude-native", allow_empty=True),
+        provider_entry=provider_entry,
     )
     if pricing is not None:
         _TRANSCRIPT_PRICING_CACHE[model] = (provider_config_fingerprint, pricing)

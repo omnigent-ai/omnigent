@@ -527,7 +527,8 @@ async def test_forward_session_cost_splits_display_and_policy(
 async def test_forward_session_cost_prices_saved_inference_binding(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The posted parent budget includes child spend at its saved provider's rate."""
+    """Saved bindings price child spend; invalid bindings still forward known cost."""
+    from omnigent.llms.context_window import ModelPricing
 
     def provider(rate: float, *, default: bool) -> dict[str, Any]:
         return {
@@ -542,9 +543,10 @@ async def test_forward_session_cost_prices_saved_inference_binding(
 
     monkeypatch.delenv("OMNI_NATIVE_PRICING_ENDPOINT", raising=False)
     monkeypatch.delenv("OMNI_NATIVE_PRICING_KEY", raising=False)
+    ambient_config: dict[str, Any] = {"providers": {"ambient": provider(1.0, default=True)}}
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config._load_config",
-        lambda: {"providers": {"ambient": provider(1.0, default=True)}},
+        lambda: ambient_config,
     )
     saved_path = tmp_path / "inference.json"
     saved_path.write_text(
@@ -596,27 +598,46 @@ async def test_forward_session_cost_prices_saved_inference_binding(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://ap"
     ) as client:
-        await forwarder._forward_session_cost(
-            client=client,
-            session_id="conv_parent",
-            bridge_dir=bridge_dir,
-            parent_transcript_path=parent,
-            subagent_state=forwarder.SubagentForwardState(
-                subagents={
-                    "aaa": forwarder.SubagentEntry(
-                        subagent_id="aaa", child_conversation_id="conv_child"
-                    )
-                }
-            ),
-            dedupe=forwarder._ForwardDedupeState(),
-            cost_cache={},
+
+        async def poll() -> None:
+            await forwarder._forward_session_cost(
+                client=client,
+                session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                parent_transcript_path=parent,
+                subagent_state=forwarder.SubagentForwardState(
+                    subagents={
+                        "aaa": forwarder.SubagentEntry(
+                            subagent_id="aaa", child_conversation_id="conv_child"
+                        )
+                    }
+                ),
+                dedupe=forwarder._ForwardDedupeState(),
+                cost_cache={},
+            )
+
+        await poll()
+        monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG")
+        ambient_config.clear()
+        ambient_config["inference"] = {
+            "harnesses": {"claude-native": {"provider": "removed-provider"}}
+        }
+        monkeypatch.setattr(
+            "omnigent.llms.context_window.fetch_model_pricing",
+            lambda _: ModelPricing(input_per_token=3.0 / 1_000_000, output_per_token=0.0),
         )
+        await poll()
     assert posted == [
         {
             "cumulative_cost_usd": pytest.approx(0.01),
             "policy_cost_usd": pytest.approx(2.1),
             "subagent_costs_usd": {"conv_child": pytest.approx(1.4)},
-        }
+        },
+        {
+            "cumulative_cost_usd": pytest.approx(0.01),
+            "policy_cost_usd": pytest.approx(0.9),
+            "subagent_costs_usd": {"conv_child": pytest.approx(0.6)},
+        },
     ]
 
 
