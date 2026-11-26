@@ -18,6 +18,16 @@ const known = (
 ) => ({ kind: "known", readiness: { status, reasons }, headSha: "abc123" }) as const;
 
 describe("presentMergeReadinessView", () => {
+  it.each(["checks_failing", "ci_failing", "policy_failing"] as const)(
+    "gives %s the source's own reason when its reasons name nothing",
+    (status) => {
+      const own = wording({ [status]: "Something blocking failed." });
+      expect(presentMergeReadinessView(known(status), own).detail).toBe(
+        "Something blocking failed.",
+      );
+    },
+  );
+
   it("keeps the shared reasons for a source that adds none of its own", () => {
     expect(presentMergeReadinessView(known("conflicts"), wording({})).detail).toBe(
       MERGE_READINESS_DETAILS.conflicts,

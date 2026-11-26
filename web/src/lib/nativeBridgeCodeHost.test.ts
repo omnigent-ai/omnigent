@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  authorizeDesktopCodeHostRun,
   desktopCodeHostQuery,
   desktopCodeHostWrite,
   githubFastTrackQuery,
@@ -10,6 +11,7 @@ import {
   reportPullRequestTiming,
   type WorkspaceFastTrackRequest,
   workspaceFastTrackRequest,
+  workspaceHostKeyReview,
 } from "./nativeBridgeCodeHost";
 
 function installShell(bridge: Record<string, unknown> | undefined) {
@@ -218,6 +220,104 @@ describe("desktopCodeHostWrite", () => {
       data: null,
       actor: { login: "octo" },
     });
+  });
+});
+
+describe("desktopCodeHostWrite's failures", () => {
+  const write = {
+    requestId: "write_1",
+    provider: "github",
+    host: "github.com",
+    actor: { login: "octo", generation: 1 },
+    operation: "merge",
+    params: {},
+  };
+
+  it("answers unsupported, sending nothing, from a shell without the bridge", async () => {
+    installShell({});
+    expect(await desktopCodeHostWrite(write)).toMatchObject({
+      ok: false,
+      error: { code: "unsupported" },
+    });
+  });
+
+  // Once sent, GitHub may have made the change, so the page must check before trying again.
+  it.each([
+    ["a throw", () => Promise.reject(new Error("gone"))],
+    ["no answer", async () => null],
+    ["a success without its actor", async () => ({ ok: true, data: null })],
+    ["a failure without its code", async () => ({ ok: false, error: { message: "x" } })],
+  ])("reads %s from a sent write as an unknown outcome", async (_name, codeHostWrite) => {
+    installShell({ codeHostWrite: vi.fn(codeHostWrite) });
+    expect(await desktopCodeHostWrite(write)).toMatchObject({
+      ok: false,
+      error: { code: "outcome_unknown" },
+    });
+  });
+});
+
+describe("authorizeDesktopCodeHostRun", () => {
+  const run = {
+    requestId: "run_1",
+    provider: "github",
+    host: "github.com",
+    actor: { login: "octo", generation: 1 },
+    entries: [{ operation: "merge", params: {} }],
+  };
+
+  it("passes a grant the shell gives, and refuses an empty or missing one", async () => {
+    const authorize = vi.fn(async () => ({ ok: true, grantId: "grant_1" }));
+    installShell({ codeHostWriteAuthorizeRun: authorize });
+    expect(await authorizeDesktopCodeHostRun(run)).toEqual({ ok: true, grantId: "grant_1" });
+    for (const answer of [{ ok: true, grantId: "" }, { ok: true }, null]) {
+      authorize.mockResolvedValueOnce(answer as never);
+      // oxlint-disable-next-line no-await-in-loop -- each answer in turn
+      expect(await authorizeDesktopCodeHostRun(run)).toEqual({ ok: false, code: "unsupported" });
+    }
+  });
+
+  it("never authorizes a named login's run as the default account", async () => {
+    const asDefault = vi.fn(async () => ({ ok: true, grantId: "grant_default" }));
+    installShell({ codeHostWriteAuthorizeRun: asDefault });
+    expect(await authorizeDesktopCodeHostRun({ ...run, macLogin: "bob" })).toEqual({
+      ok: false,
+      code: "unsupported",
+    });
+    expect(asDefault).not.toHaveBeenCalled();
+  });
+});
+
+describe("workspaceHostKeyReview", () => {
+  const OLD = `SHA256:${"a".repeat(43)}`;
+  const NEW = `SHA256:${"b".repeat(43)}`;
+  const review = {
+    ok: true,
+    kind: "changed",
+    token: "t",
+    oldFingerprint: OLD,
+    newFingerprint: NEW,
+    machine: "builder",
+    server: "build.example.com",
+  };
+
+  it("returns a well-formed review, including one with no old key", async () => {
+    installShell({ workspaceHostKeyReview: vi.fn(async () => review) });
+    expect(await workspaceHostKeyReview("conv_1")).toEqual(review);
+    const first = { ...review, kind: "store_invalid", oldFingerprint: null };
+    installShell({ workspaceHostKeyReview: vi.fn(async () => first) });
+    expect(await workspaceHostKeyReview("conv_1")).toEqual(first);
+  });
+
+  it.each([
+    ["a new fingerprint of the wrong shape", { newFingerprint: "SHA256:short" }],
+    ["an MD5 new fingerprint", { newFingerprint: `MD5:${"b".repeat(43)}` }],
+    ["a missing new fingerprint", { newFingerprint: undefined }],
+    ["an old fingerprint of the wrong shape", { oldFingerprint: "SHA256:short" }],
+    ["an empty machine", { machine: "" }],
+    ["an unknown kind", { kind: "added" }],
+  ])("refuses a review with %s", async (_name, change) => {
+    installShell({ workspaceHostKeyReview: vi.fn(async () => ({ ...review, ...change })) });
+    expect(await workspaceHostKeyReview("conv_1")).toEqual({ ok: false, reason: "unsupported" });
   });
 });
 

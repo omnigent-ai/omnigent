@@ -184,15 +184,17 @@ export function presentMergeReadinessView(
     reasons.failingRequirements.length > 0
       ? names("Requirements failing", reasons.failingRequirements)
       : "";
+  // Where the reasons name nothing, the source's wording, then the shared one, says why.
+  const fallback = wording.details[status] ?? MERGE_READINESS_DETAILS[status];
   switch (status) {
     case "checks_failing":
-      return { ...base, detail: `${failingJobs} ${failingRequirements}`.trim() || undefined };
+      return { ...base, detail: `${failingJobs} ${failingRequirements}`.trim() || fallback };
     case "ci_failing":
-      return { ...base, detail: failingJobs || undefined };
+      return { ...base, detail: failingJobs || fallback };
     case "policy_failing":
-      return { ...base, detail: failingRequirements || undefined };
+      return { ...base, detail: failingRequirements || fallback };
     default:
-      return { ...base, detail: wording.details[status] ?? MERGE_READINESS_DETAILS[status] };
+      return { ...base, detail: fallback };
   }
 }
 

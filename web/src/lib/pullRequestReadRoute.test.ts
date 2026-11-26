@@ -5,7 +5,8 @@ import {
   registerPullRequestIntegrations,
   restorePullRequestIntegrations,
 } from "@/lib/pullRequestIntegrations";
-import { readChoiceKey } from "@/lib/pullRequestReadRoute";
+import type { CodeHostPullRequest } from "@/lib/codeHosts";
+import { decideReadRoute, type ReadChoice, readChoiceKey } from "@/lib/pullRequestReadRoute";
 
 const saved = pullRequestIntegrations();
 afterEach(() => restorePullRequestIntegrations(saved));
@@ -16,6 +17,29 @@ const namedHost = (hostedOnGitHub: boolean): NamedCodeHost =>
     matchesHost: (host: string) => host === "code.example.com",
     hostedOnGitHub,
   }) as unknown as NamedCodeHost;
+
+const target = (repository: string): CodeHostPullRequest => ({
+  provider: "github",
+  host: "github.com",
+  repository,
+  number: 7,
+  url: `https://github.com/${repository}/pull/7`,
+});
+const AUTOMATIC = target("octo/automatic");
+const FORCED = target("octo/forced");
+
+describe("decideReadRoute", () => {
+  it.each<[ReadChoice, CodeHostPullRequest | null, CodeHostPullRequest | null, unknown]>([
+    ["session", AUTOMATIC, FORCED, { kind: "host" }],
+    ["mac", AUTOMATIC, FORCED, { kind: "mac", target: FORCED }],
+    // An explicit "This Mac" that can't read the PR is refused, never sent to the host.
+    ["mac", AUTOMATIC, null, { kind: "blocked", reason: "mac_unsupported" }],
+    ["automatic", AUTOMATIC, FORCED, { kind: "mac", target: AUTOMATIC }],
+    ["automatic", null, FORCED, { kind: "host" }],
+  ])("reads %s (automatic %o, forced %o) at %o", (choice, automatic, forced, route) => {
+    expect(decideReadRoute(choice, { automatic, forced })).toEqual(route);
+  });
+});
 
 describe("readChoiceKey", () => {
   it("keeps one choice for every spelling of a GitHub pull request", () => {
