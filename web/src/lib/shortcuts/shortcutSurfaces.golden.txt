@@ -102,7 +102,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -266,7 +266,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -430,7 +430,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -594,7 +594,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -758,7 +758,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -922,7 +922,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -1086,7 +1086,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -1250,7 +1250,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=⌘ ↵ | aria=Meta+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=⌘ ⌫ | aria=Meta+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -1414,7 +1414,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -1578,7 +1578,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -1742,7 +1742,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -1906,7 +1906,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -2070,7 +2070,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -2234,7 +2234,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -2398,7 +2398,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
@@ -2562,7 +2562,7 @@ file.unfold | Unfold | group=files | chords=ctrl+shift+code:BracketRight | keys=
 file.foldAll | Fold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 file.unfoldAll | Unfold all | group=files | chords=- | keys=- | aria=- | editor=- | matches=-
 rows.openInNewTab | Open the focused row in a new tab (⇧ to switch to it) | group=workspace | chords=mod+key:Enter mod+shift+key:Enter | keys=Ctrl ↵ | aria=Control+Enter | editor=Mod-Enter Mod-Shift-Enter | matches=true true
-pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
+pullRequests.removeSelected | Remove selected pull requests | group=workspace | chords=mod(either)+key:Backspace | keys=Ctrl ⌫ | aria=Control+Backspace | editor=Mod-Backspace | matches=true
 pullRequestStack.next | Next in stack | group=workspace | chords=shift+code:KeyJ | keys=⇧ J | aria=Shift+J | editor=Shift-j | matches=true
 pullRequestStack.previous | Previous in stack | group=workspace | chords=shift+code:KeyK | keys=⇧ K | aria=Shift+K | editor=Shift-k | matches=true
 session.new | search=session.new
