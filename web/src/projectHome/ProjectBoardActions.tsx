@@ -1,4 +1,4 @@
-import { useLayoutEffect, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { create } from "zustand";
 import { ChevronDownIcon, MessageCirclePlusIcon, PlusIcon } from "lucide-react";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
@@ -14,12 +14,14 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link, useNavigate, useSearchParams } from "@/lib/routing";
 import { ProjectCostBadge } from "./ProjectCost";
 import { ProjectFiles } from "./ProjectFiles";
+import { PROJECT_FILE_PARAM } from "./ProjectFileViewer";
 import { ProjectIdentityRoster } from "./ProjectIdentityRoster";
 import { ProjectTicketSources } from "./ProjectTicketSources";
 import { projectOrchestratorPath, ticketPanelSearch } from "./projectHomeNavigation";
 import { useProjectRecord } from "./useProjectAgentSession";
 import { useProjectIdentities } from "./useProjectIdentities";
 import { useTicketProject } from "./useProjectTickets";
+import { useClickThroughDialog } from "./useClickThroughDialog";
 
 /**
  * The top bar's project actions. Desktop shows the team and a New ticket button
@@ -46,7 +48,16 @@ export function ProjectBoardActions({
   // The Lead is drawn like every other persona, by its own name.
   const leadName =
     useProjectIdentities(projectId).data?.find((identity) => identity.builtin)?.name ?? "Lead";
-  const newTicket = ticketPanelSearch("new", search);
+  // New ticket also closes an open project file.
+  const newTicketSearch = new URLSearchParams(search);
+  newTicketSearch.delete(PROJECT_FILE_PARAM);
+  const newTicket = ticketPanelSearch("new", newTicketSearch);
+  // A modal dialog's overlay covers these buttons; pressing one closes it, then acts.
+  const newTicketRef = useRef<HTMLAnchorElement>(null);
+  const createMenuRef = useRef<HTMLButtonElement>(null);
+  const [createMenuOpen, setCreateMenuOpen] = useState(false);
+  useClickThroughDialog(newTicketRef, () => navigate(newTicket));
+  useClickThroughDialog(createMenuRef, () => setCreateMenuOpen(true));
   const toolsElsewhere = useViewToolsHostStore((state) => state.hosts > 0);
   return (
     <div
@@ -80,7 +91,7 @@ export function ProjectBoardActions({
           )}
           {children}
           <Button asChild size="icon">
-            <Link to={newTicket} aria-label="New ticket">
+            <Link ref={newTicketRef} to={newTicket} aria-label="New ticket">
               <PlusIcon />
             </Link>
           </Button>
@@ -90,14 +101,15 @@ export function ProjectBoardActions({
           {!toolsElsewhere && <ProjectViewTools projectName={projectName} host={false} />}
           <ButtonGroup aria-label="Create">
             <Button asChild>
-              <Link to={newTicket}>
+              <Link ref={newTicketRef} to={newTicket}>
                 <PlusIcon />
                 New ticket
               </Link>
             </Button>
-            <DropdownMenu>
+            <DropdownMenu open={createMenuOpen} onOpenChange={setCreateMenuOpen}>
               <DropdownMenuTrigger asChild>
                 <Button
+                  ref={createMenuRef}
                   size="icon"
                   aria-label="More ways to start"
                   data-testid="project-create-menu"

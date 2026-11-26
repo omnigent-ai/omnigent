@@ -87,6 +87,8 @@ export function ticketBatchSearch(ticketIds: readonly string[]): string {
 export function ticketPanelSearch(ticketId: string, search = new URLSearchParams()): string {
   const next = new URLSearchParams(search);
   next.set("ticket", ticketId);
+  // The panel lives on the Board, so a ticket opened from Summary or Rules shows the Board.
+  next.delete(PROJECT_TAB_PARAM);
   // A scroll target belongs to the ticket it was opened for.
   next.delete(TICKET_ASK_PARAM);
   next.delete(PROJECT_PANEL_SESSION_PARAM);

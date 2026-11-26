@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, within } from "@testing-librar
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
+import { useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -143,6 +144,8 @@ function renderNavigation(
   stages = true,
   summary = false,
   viewToolbar = true,
+  search = `?view=${view}`,
+  extra: ReactNode = null,
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   clients.push(client);
@@ -156,13 +159,14 @@ function renderNavigation(
           project_ticket_summary: summary,
         }}
       >
-        <MemoryRouter initialEntries={[`/projects/Billing%20%26%20Payments?view=${view}`]}>
+        <MemoryRouter initialEntries={[`/projects/Billing%20%26%20Payments${search}`]}>
           <TooltipProvider>
             <header>
               <ProjectHomeTitle projectName="Billing & Payments" />
               <ProjectHomeHeaderActions projectName="Billing & Payments" />
             </header>
             {viewToolbar && <ProjectViewTools projectName="Billing & Payments" />}
+            {extra}
           </TooltipProvider>
           <LocationProbe />
         </MemoryRouter>
@@ -473,5 +477,78 @@ describe("ProjectNewSessionButton", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "New session" }));
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/\?project=Payments$/);
+  });
+});
+
+describe("New ticket from anywhere on the project page", () => {
+  it.each(["summary", "rules"])("opens the form on the Board from the %s tab", (tab) => {
+    renderNavigation("board", true, false, true, `?tab=${tab}`);
+    expect(screen.getByRole("link", { name: "New ticket" })).toHaveAttribute(
+      "href",
+      "/projects/Billing%20%26%20Payments?ticket=new",
+    );
+  });
+
+  it("closes an open project file", () => {
+    renderNavigation("board", true, false, true, "?artifact=file-1");
+    expect(screen.getByRole("link", { name: "New ticket" })).toHaveAttribute(
+      "href",
+      "/projects/Billing%20%26%20Payments?ticket=new",
+    );
+  });
+
+  function OpenDialog({ closes }: { closes: boolean }) {
+    const [open, setOpen] = useState(true);
+    return (
+      <Dialog open={open} onOpenChange={(next) => closes && setOpen(next)}>
+        <DialogContent aria-describedby={undefined}>
+          <DialogTitle>Project description</DialogTitle>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
+  async function pressOverlayOver(name: string, role: "link" | "button") {
+    const target = screen.getByRole(role, { name, hidden: true });
+    target.getBoundingClientRect = () => new DOMRect(100, 10, 120, 32);
+    // Radix starts listening for outside presses a tick after opening.
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    const overlay = document.querySelector('[data-slot="dialog-overlay"]')!;
+    fireEvent.pointerDown(overlay, { button: 0, clientX: 150, clientY: 20 });
+    fireEvent.pointerUp(overlay, { button: 0, clientX: 150, clientY: 20 });
+    fireEvent.click(overlay, { button: 0, clientX: 150, clientY: 20 });
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+  }
+
+  it("closes a dialog covering New ticket and opens the form in one click", async () => {
+    renderNavigation("board", true, false, true, "?tab=summary", <OpenDialog closes />);
+    await pressOverlayOver("New ticket", "link");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      /^\/projects\/Billing%20%26%20Payments\?ticket=new$/,
+    );
+  });
+
+  it("opens New ticket's menu through a covering dialog", async () => {
+    renderNavigation("board", true, false, true, undefined, <OpenDialog closes />);
+    await pressOverlayOver("More ways to start", "button");
+    expect(screen.getByRole("menuitem", { name: "New session" })).toBeVisible();
+  });
+
+  it("leaves a dialog that stays open, such as one with unsaved edits", async () => {
+    renderNavigation("board", true, false, true, undefined, <OpenDialog closes={false} />);
+    await pressOverlayOver("New ticket", "link");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      /^\/projects\/Billing%20%26%20Payments\?view=board$/,
+    );
   });
 });
