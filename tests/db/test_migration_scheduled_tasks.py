@@ -1409,8 +1409,9 @@ def test_event_receipts_table(db_engine: Engine) -> None:
 
 
 @pytest.mark.parametrize("db_engine", ["migration", "metadata"], indirect=True)
-def test_receipt_keys_are_bounded_on_sqlite(db_engine: Engine) -> None:
-    """SQLite ignores VARCHAR lengths, so a CHECK bounds the key at 1,024 bytes."""
+@pytest.mark.parametrize("invalid_column", ["trigger_key", "workspace_id", "created_at"])
+def test_receipt_keys_are_bounded_on_sqlite(db_engine: Engine, invalid_column: str) -> None:
+    """Receipt values retain bounded string and integer storage on SQLite."""
     receipts = sa.Table("scheduled_task_event_receipts", sa.MetaData(), autoload_with=db_engine)
     values = {
         "workspace_id": 0,
@@ -1423,11 +1424,17 @@ def test_receipt_keys_are_bounded_on_sqlite(db_engine: Engine) -> None:
         conn.execute(
             receipts.insert().values(id=b"a" * 16, trigger_key="\U0001f600" * 256, **values)
         )
+        assert conn.execute(sa.select(receipts.c.workspace_id, receipts.c.created_at)).one() == (
+            0,
+            1,
+        )
+    invalid = {"id": b"b" * 16, "trigger_key": "safe", **values}
+    invalid[invalid_column] = (
+        "\U0001f600" * 257 if invalid_column == "trigger_key" else "x" * 16_384
+    )
     with pytest.raises(IntegrityError):
         with db_engine.begin() as conn:
-            conn.execute(
-                receipts.insert().values(id=b"b" * 16, trigger_key="\U0001f600" * 257, **values)
-            )
+            conn.execute(receipts.insert().values(**invalid))
 
 
 def test_downgrade_guard_seeks_to_its_cursor_on_sqlite(db_engine: Engine) -> None:
@@ -1491,15 +1498,6 @@ def test_trigger_config_downgrade_requires_live_connection() -> None:
     assert "DROP TABLE" not in config.output_buffer.getvalue()
 
 
-def test_json_columns_cap_stored_bytes() -> None:
-    """Both JSON documents stay below the 16,384-byte column bound."""
-    for column in (
-        SqlScheduledTask.__table__.c.trigger_config,
-        SqlScheduledTaskRun.__table__.c.event,
-    ):
-        assert column.type.max_stored_bytes == 16_383
-
-
 def test_json_columns_are_bounded_varbinary_on_mysql() -> None:
     """MySQL declares both JSON columns VARBINARY(16383), through migration and metadata."""
     from sqlalchemy.dialects import mysql
@@ -1509,6 +1507,7 @@ def test_json_columns_are_bounded_varbinary_on_mysql() -> None:
         (SqlScheduledTask.__table__, "trigger_config"),
         (SqlScheduledTaskRun.__table__, "event"),
     ):
+        assert table.c[column].type.max_stored_bytes == 16_383
         ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
         assert f"{column} VARBINARY(16383)" in ddl
     config = _build_alembic_config("mysql://")
@@ -1520,13 +1519,13 @@ def test_json_columns_are_bounded_varbinary_on_mysql() -> None:
     assert "BLOB" not in sql
 
 
+@pytest.mark.parametrize("dispatch_migration_engine", [_TRIGGER_CONFIG_PREVIOUS], indirect=True)
 def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
     dispatch_migration_engine: Engine,
 ) -> None:
     """Existing tasks keep their rule; downgrade waits until no task lacks one."""
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
-    command.upgrade(config, _TRIGGER_CONFIG_PREVIOUS)
     values = {
         "name": "nightly",
         "prompt": b"p",

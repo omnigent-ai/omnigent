@@ -73,8 +73,20 @@ def upgrade() -> None:
             )
         )
     # SQLite ignores VARCHAR lengths: 256 characters at up to four bytes each.
-    key_check = (
-        [sa.CheckConstraint("length(CAST(trigger_key AS BLOB)) <= 1024", name=_RECEIPT_KEY_CHECK)]
+    receipt_checks = (
+        [
+            sa.CheckConstraint(
+                "length(CAST(trigger_key AS BLOB)) <= 1024", name=_RECEIPT_KEY_CHECK
+            ),
+            sa.CheckConstraint(
+                "typeof(workspace_id) = 'integer'",
+                name="ck_scheduled_task_event_receipts_workspace_id_integer",
+            ),
+            sa.CheckConstraint(
+                "typeof(created_at) = 'integer'",
+                name="ck_scheduled_task_event_receipts_created_at_integer",
+            ),
+        ]
         if op.get_bind().dialect.name in _SQLITE_FAMILY
         else []
     )
@@ -99,7 +111,7 @@ def upgrade() -> None:
             "trigger_key",
             name="uq_scheduled_task_event_receipts_occurrence",
         ),
-        *key_check,
+        *receipt_checks,
     )
     op.create_index(
         "ix_scheduled_task_event_receipts_age",

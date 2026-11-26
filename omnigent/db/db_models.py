@@ -2003,6 +2003,14 @@ class SqlScheduledTaskEventReceipt(OmnigentBase):
             "length(CAST(trigger_key AS BLOB)) <= 1024",
             name="ck_scheduled_task_event_receipts_key_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'",
+            name="ck_scheduled_task_event_receipts_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(created_at) = 'integer'",
+            name="ck_scheduled_task_event_receipts_created_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
         Index(
             "ix_scheduled_task_event_receipts_age",
             "workspace_id",

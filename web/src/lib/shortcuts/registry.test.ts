@@ -130,6 +130,23 @@ describe("shortcut registry", () => {
     ).toBe(true);
   });
 
+  it("removes selected pull requests with ⌘ or Control and Backspace on every platform", () => {
+    for (const environment of [mac, other]) {
+      for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+        expect(
+          matchesShortcut(
+            press({ key: "Backspace", ...modifier }),
+            "pullRequests.removeSelected",
+            environment,
+          ),
+        ).toBe(true);
+      }
+      expect(
+        matchesShortcut(press({ key: "Backspace" }), "pullRequests.removeSelected", environment),
+      ).toBe(false);
+    }
+  });
+
   it("renames with the physical R key, whatever character Option types", () => {
     expect(
       matchesShortcut(
