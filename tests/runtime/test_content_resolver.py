@@ -1088,7 +1088,7 @@ def test_attachment_upload_limit_allowed_types(content_type: str, expected_mb: i
     ],
 )
 def test_attachment_upload_limit_rejects_unsupported_types(content_type: str) -> None:
-    """Office/binary/media types are not uploadable (None ⇒ caller 415s)."""
+    """Binary/media types cannot be inlined; supported extensions use filesystem delivery."""
     from omnigent.runtime.content_resolver import attachment_upload_limit
 
     assert attachment_upload_limit(content_type) is None

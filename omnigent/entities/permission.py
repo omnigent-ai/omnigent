@@ -1,4 +1,4 @@
-"""Session permission entity."""
+"""Session, scheduled task and workflow permission entities."""
 
 from __future__ import annotations
 
@@ -19,6 +19,39 @@ class SessionPermission:
 
     user_id: str
     conversation_id: str
+    level: int
+
+
+@dataclasses.dataclass
+class ScheduledTaskPermission:
+    """A single permission grant on a scheduled task (an automation).
+
+    The task's owner holds no grant; ownership is ``ScheduledTask.user_id``.
+
+    :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
+    :param scheduled_task_id: The scheduled task this grant applies to.
+    :param level: Numeric permission level: ``1`` = read, ``2`` = edit,
+        ``3`` = manage. Comparison is ``>=``.
+    """
+
+    user_id: str
+    scheduled_task_id: str
+    level: int
+
+
+@dataclasses.dataclass
+class WorkflowPermission:
+    """A single permission grant on a saved workflow.
+
+    The workflow's owner holds no grant; ownership is ``Workflow.user_id``.
+
+    :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
+    :param workflow_id: The workflow this grant applies to.
+    :param level: Numeric permission level; workflows grant ``1`` (read) only.
+    """
+
+    user_id: str
+    workflow_id: str
     level: int
 
 

@@ -9,7 +9,10 @@ import {
   reviewSuggestionSource,
   type ReviewThread,
 } from "@/lib/pullRequestReviewThreads";
-import { PULL_REQUEST_MARKDOWN_COMPONENTS } from "./PullRequestDetails";
+import {
+  PULL_REQUEST_MARKDOWN_COMPONENTS,
+  PULL_REQUEST_MARKDOWN_REMARK_PLUGINS,
+} from "./PullRequestDetails";
 
 interface ReviewCodeContext {
   thread: ReviewThread;
@@ -95,6 +98,7 @@ export function PullRequestReviewBody({
         mode="static"
         allowGitHubAttachmentImages
         components={REVIEW_MARKDOWN_COMPONENTS}
+        remarkPlugins={PULL_REQUEST_MARKDOWN_REMARK_PLUGINS}
       >
         {body}
       </MessageResponse>

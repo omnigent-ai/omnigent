@@ -1,4 +1,4 @@
-"""Unit tests for the runner-side ``upload_file`` dispatch containment.
+"""Unit tests for the runner-side ``sys_files_upload`` dispatch containment.
 
 These cover the upload-containment fix: the runner's ``_execute_file_tool``
 upload branch must resolve the agent-supplied ``path`` against the
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,8 +25,20 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.runner import subagent_work
-from omnigent.runner.tool_dispatch import _execute_file_tool, execute_tool
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.runner import resource_registry, subagent_work
+from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.tool_dispatch import (
+    UNKNOWN_SESSION_WORKSPACE,
+    UnknownSessionWorkspace,
+    _execute_file_tool,
+    execute_tool,
+    should_dispatch_locally,
+)
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ToolGroupsConfig
+
+# The session file tools are off by default; these tests exercise them, so opt in.
+_FILE_TOOLS_ON = ToolGroupsConfig(files=True)
 
 _CONVERSATION_ID = "conv_sec20870"
 
@@ -65,7 +78,7 @@ async def test_upload_rejects_paths_outside_workspace(
     tmp_path: Path,
 ) -> None:
     """
-    An ``upload_file`` path that escapes the workspace is rejected and
+    A ``sys_files_upload`` path that escapes the workspace is rejected and
     no upload POST is made.
 
     :param evil_path: An agent-supplied path that resolves outside the
@@ -84,12 +97,12 @@ async def test_upload_rejects_paths_outside_workspace(
     client = _recording_client(captured)
     try:
         result = await _execute_file_tool(
-            "upload_file",
+            "sys_files_upload",
             {"path": evil_path},
             client,
             conversation_id=_CONVERSATION_ID,
             agent_spec=None,
-            runner_workspace=tmp_path,
+            session_workspace=tmp_path,
         )
     finally:
         await client.aclose()
@@ -97,7 +110,7 @@ async def test_upload_rejects_paths_outside_workspace(
     # Rejection surfaces as an error string from safe_resolve's
     # ValueError. If this were a success JSON ({"file_id": ...}) the
     # containment check failed open and the file was exfiltrated.
-    assert result.startswith("Error: sys_upload_file failed:"), (
+    assert result.startswith("Error: sys_files_upload failed:"), (
         f"Expected a containment rejection for {evil_path!r}, got: {result!r}"
     )
     assert "escapes" in result, (
@@ -107,7 +120,7 @@ async def test_upload_rejects_paths_outside_workspace(
     # file was never read into the session store. A non-empty list here
     # means the runner read and uploaded an out-of-workspace file.
     assert captured == [], (
-        f"upload_file POSTed despite an out-of-workspace path {evil_path!r}; "
+        f"sys_files_upload POSTed despite an out-of-workspace path {evil_path!r}; "
         f"the host file would have been exfiltrated"
     )
 
@@ -135,12 +148,12 @@ async def test_upload_rejects_symlink_escaping_workspace(tmp_path: Path) -> None
     client = _recording_client(captured)
     try:
         result = await _execute_file_tool(
-            "upload_file",
+            "sys_files_upload",
             {"path": "looks_innocent.txt"},
             client,
             conversation_id=_CONVERSATION_ID,
             agent_spec=None,
-            runner_workspace=tmp_path,
+            session_workspace=tmp_path,
         )
     finally:
         await client.aclose()
@@ -148,13 +161,13 @@ async def test_upload_rejects_symlink_escaping_workspace(tmp_path: Path) -> None
     # The resolved symlink target escapes the workspace, so the upload
     # is rejected before any read. A success envelope here would mean
     # the host secret was followed and exfiltrated via the symlink.
-    assert result.startswith("Error: sys_upload_file failed:"), (
+    assert result.startswith("Error: sys_files_upload failed:"), (
         f"Expected a containment rejection for the escaping symlink, got: {result!r}"
     )
     assert "escapes" in result, f"Expected a workspace-escape reason, got: {result!r}"
     # Decisive: nothing POSTed, so the symlinked host file was never read.
     assert captured == [], (
-        "upload_file POSTed despite a symlink whose target escapes the "
+        "sys_files_upload POSTed despite a symlink whose target escapes the "
         "workspace; the host secret would have been exfiltrated"
     )
 
@@ -162,7 +175,7 @@ async def test_upload_rejects_symlink_escaping_workspace(tmp_path: Path) -> None
 @pytest.mark.asyncio
 async def test_upload_in_workspace_succeeds(tmp_path: Path) -> None:
     """
-    An ``upload_file`` path inside the workspace uploads the file's raw
+    A ``sys_files_upload`` path inside the workspace uploads the file's raw
     bytes and returns the store-issued ``file_id``.
 
     :param tmp_path: Pytest-provided workspace root for the session.
@@ -180,12 +193,12 @@ async def test_upload_in_workspace_succeeds(tmp_path: Path) -> None:
     client = _recording_client(captured)
     try:
         result = await _execute_file_tool(
-            "upload_file",
+            "sys_files_upload",
             {"path": "output/chart.png"},
             client,
             conversation_id=_CONVERSATION_ID,
             agent_spec=None,
-            runner_workspace=tmp_path,
+            session_workspace=tmp_path,
         )
     finally:
         await client.aclose()
@@ -206,6 +219,426 @@ async def test_upload_in_workspace_succeeds(tmp_path: Path) -> None:
     assert payload in request.content, (
         "Uploaded multipart body did not contain the workspace file's raw bytes"
     )
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+@pytest.mark.asyncio
+async def test_native_relay_upload_keeps_workspace_containment(
+    harness: str,
+    tmp_path: Path,
+) -> None:
+    """
+    A native harness's relayed ``sys_files_upload`` is granted to a spec that
+    turns the file tools on, yet a path outside the session workspace is still
+    rejected unread.
+
+    The relay reaches ``execute_tool`` with the session's spec, harness, runtime
+    cwd and own workspace, as the runner's ``/mcp/execute`` route passes them.
+
+    :param harness: Native harness the session runs, e.g. ``"claude-native"``.
+    :param tmp_path: Pytest-provided workspace root for the session.
+    """
+    (tmp_path.parent / "secrets.txt").write_text("TOP SECRET")
+    spec = AgentSpec(
+        spec_version=1,
+        skills_filter="none",
+        executor=ExecutorSpec(config={"harness": harness}),
+        tool_groups=_FILE_TOOLS_ON,
+    )
+
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        result = await execute_tool(
+            tool_name="sys_files_upload",
+            arguments=json.dumps({"path": "../secrets.txt"}),
+            server_client=client,
+            agent_spec=spec,
+            conversation_id=_CONVERSATION_ID,
+            runner_workspace=tmp_path,
+            session_workspace=tmp_path,
+            effective_harness=harness,
+        )
+    finally:
+        await client.aclose()
+
+    # The containment error (not a grant refusal) proves the opted-in surface
+    # admitted the call and the workspace check still ran.
+    assert result.startswith("Error: sys_files_upload failed:"), result
+    assert "escapes" in result, result
+    assert captured == [], "a relayed upload read and posted a file outside the workspace"
+
+
+def _placeholder_cwd_spec() -> AgentSpec:
+    """A spec whose ``os_env`` leaves the workspace to the runner, like ``cwd: .``."""
+    return AgentSpec(
+        spec_version=1,
+        skills_filter="none",
+        os_env=OSEnvSpec(type="caller_process", cwd=".", sandbox=OSEnvSandboxSpec(type="none")),
+        tool_groups=_FILE_TOOLS_ON,
+    )
+
+
+async def _upload(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    agent_spec: AgentSpec,
+    resource_registry: SessionResourceRegistry | None,
+    runner_workspace: Path | None = None,
+    session_workspace: Path | UnknownSessionWorkspace | None = None,
+) -> str:
+    """Call ``sys_files_upload`` the way the runner's ``/mcp/execute`` route does."""
+    return await execute_tool(
+        tool_name="sys_files_upload",
+        arguments=json.dumps({"path": path}),
+        server_client=client,
+        resource_registry=resource_registry,
+        agent_spec=agent_spec,
+        conversation_id=_CONVERSATION_ID,
+        runner_workspace=runner_workspace,
+        session_workspace=session_workspace,
+    )
+
+
+def _default_temp_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """
+    Point the runner's default temp roots at a fresh directory, with no override.
+
+    The agent's tools default under ``tempfile.gettempdir()`` and the session's
+    filesystem routes under the registry's workspace parent; both move here.
+
+    :param monkeypatch: Patches the two defaults and unsets the root override.
+    :param tmp_path: Pytest-provided parent for the controlled root.
+    :returns: The controlled temp root.
+    """
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    monkeypatch.delenv("OMNIGENT_RUNNER_OS_ENV_ROOT", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+    monkeypatch.setattr(resource_registry, "_DEFAULT_WORKSPACE_PARENT", str(temp_root))
+    return temp_root
+
+
+@pytest.mark.asyncio
+async def test_upload_without_any_workspace_reads_both_default_directories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    With no session or runner workspace, uploads read what the agent's tools
+    wrote in their directory and what the session's filesystem routes hold in
+    theirs: two separate per-session directories under the default temp roots.
+
+    :param monkeypatch: Controls the default temp roots.
+    :param tmp_path: Pytest-provided parent for the controlled roots.
+    """
+    temp_root = _default_temp_root(monkeypatch, tmp_path)
+    registry = SessionResourceRegistry()
+    spec = _placeholder_cwd_spec()
+    written = await execute_tool(
+        tool_name="sys_os_write",
+        arguments=json.dumps({"path": "out/report.md", "content": "agent report"}),
+        agent_spec=spec,
+        conversation_id=_CONVERSATION_ID,
+    )
+    tools_dir = temp_root / "omnigent-runner-os-envs" / _CONVERSATION_ID / "workspace"
+    session_dir = temp_root / "omnigent-sessions" / _CONVERSATION_ID / "workspace"
+    assert registry.compute_default_env_root(_CONVERSATION_ID, spec) == str(session_dir.resolve())
+    session_dir.mkdir(parents=True)
+    (session_dir / "notes.txt").write_text("user notes")
+
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        agent_file = await _upload(
+            client, "out/report.md", agent_spec=spec, resource_registry=registry
+        )
+        user_file = await _upload(client, "notes.txt", agent_spec=spec, resource_registry=registry)
+    finally:
+        await client.aclose()
+
+    assert json.loads(written)["created"] is True
+    assert (tools_dir / "out" / "report.md").read_text() == "agent report"
+    assert json.loads(agent_file)["filename"] == "report.md", agent_file
+    assert json.loads(user_file)["filename"] == "notes.txt", user_file
+    assert len(captured) == 2
+    assert b"agent report" in captured[0].content
+    assert b"user notes" in captured[1].content
+
+
+@pytest.mark.asyncio
+async def test_upload_leaves_existing_no_workspace_directories_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A session from before this runner, with files in both default directories,
+    keeps them all: its tools still read their directory, uploads reach both,
+    the tools' copy of a name in both wins, and nothing is moved or rewritten.
+
+    :param monkeypatch: Controls the default temp roots.
+    :param tmp_path: Pytest-provided parent for the controlled roots.
+    """
+    temp_root = _default_temp_root(monkeypatch, tmp_path)
+    tools_dir = temp_root / "omnigent-runner-os-envs" / _CONVERSATION_ID / "workspace"
+    session_dir = temp_root / "omnigent-sessions" / _CONVERSATION_ID / "workspace"
+    before = {
+        tools_dir / "old.txt": "written before the upgrade",
+        tools_dir / "shared.txt": "tools copy",
+        session_dir / "notes.txt": "panel note",
+        session_dir / "shared.txt": "panel copy",
+    }
+    for file, content in before.items():
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(content)
+    registry = SessionResourceRegistry()
+    spec = _placeholder_cwd_spec()
+
+    read = await execute_tool(
+        tool_name="sys_os_read",
+        arguments=json.dumps({"path": "old.txt"}),
+        agent_spec=spec,
+        conversation_id=_CONVERSATION_ID,
+    )
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        uploads = [
+            await _upload(client, name, agent_spec=spec, resource_registry=registry)
+            for name in ("old.txt", "notes.txt", "shared.txt")
+        ]
+    finally:
+        await client.aclose()
+
+    assert "written before the upgrade" in read, read
+    assert [json.loads(result)["filename"] for result in uploads] == [
+        "old.txt",
+        "notes.txt",
+        "shared.txt",
+    ]
+    assert len(captured) == 3
+    assert b"written before the upgrade" in captured[0].content
+    assert b"panel note" in captured[1].content
+    assert b"tools copy" in captured[2].content and b"panel copy" not in captured[2].content
+    assert {file: file.read_text() for file in before} == before
+    assert sorted(p.name for p in tools_dir.iterdir()) == ["old.txt", "shared.txt"]
+    assert sorted(p.name for p in session_dir.iterdir()) == ["notes.txt", "shared.txt"]
+
+
+@pytest.mark.parametrize("path_form", ["inside-runner-root", "parent-traversal", "absolute"])
+@pytest.mark.asyncio
+async def test_upload_on_an_isolating_runner_refuses_a_sibling_session_file(
+    path_form: str,
+    tmp_path: Path,
+) -> None:
+    """
+    On a runner that gives each session its own subdirectory, a session without
+    its own workspace uploads from that subdirectory, never a sibling's file.
+
+    ``runner_workspace`` is the shared root, as the runtime cwd falls back to it.
+
+    :param path_form: How the agent names the sibling's file.
+    :param tmp_path: Pytest-provided parent of the runner workspace.
+    """
+    runner_root = tmp_path / "runner"
+    registry = SessionResourceRegistry(runner_workspace=runner_root, per_session_workspace=True)
+    spec = _placeholder_cwd_spec()
+    own_root = registry.compute_default_env_root(_CONVERSATION_ID, spec)
+    sibling_root = registry.compute_default_env_root("conv_sibling", spec)
+    assert own_root is not None and sibling_root is not None
+    Path(own_root).mkdir(parents=True)
+    Path(own_root, "own.txt").write_text("mine")
+    Path(sibling_root).mkdir(parents=True)
+    secret = Path(sibling_root, "secret.txt")
+    secret.write_text("SIBLING SECRET")
+    sibling_path = {
+        # Relative to the shared runner root, which holds the sibling's directory.
+        "inside-runner-root": f"{secret.parent.name}/secret.txt",
+        "parent-traversal": f"../{secret.parent.name}/secret.txt",
+        "absolute": str(secret),
+    }[path_form]
+
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        refused = await _upload(
+            client,
+            sibling_path,
+            agent_spec=spec,
+            resource_registry=registry,
+            runner_workspace=runner_root,
+        )
+        posted_before_own_upload = list(captured)
+        own = await _upload(
+            client,
+            "own.txt",
+            agent_spec=spec,
+            resource_registry=registry,
+            runner_workspace=runner_root,
+        )
+    finally:
+        await client.aclose()
+
+    assert refused.startswith("Error: sys_files_upload failed:"), refused
+    assert posted_before_own_upload == [], "the sibling session's file was uploaded"
+    assert json.loads(own)["filename"] == "own.txt", own
+    assert len(captured) == 1
+    assert b"mine" in captured[0].content
+
+
+@pytest.mark.asyncio
+async def test_upload_reads_the_explicit_session_workspace_on_an_isolating_runner(
+    tmp_path: Path,
+) -> None:
+    """
+    A session's own workspace stays its boundary on a runner that isolates
+    sessions, as for the CLI's native wrappers, which use the launch directory.
+
+    :param tmp_path: Pytest-provided parent of the launch directory.
+    """
+    launch_dir = tmp_path / "project"
+    launch_dir.mkdir()
+    (launch_dir / "report.txt").write_text("project report")
+    registry = SessionResourceRegistry(runner_workspace=launch_dir, per_session_workspace=True)
+    spec = AgentSpec(
+        spec_version=1,
+        skills_filter="none",
+        executor=ExecutorSpec(config={"harness": "claude-native"}),
+        tool_groups=_FILE_TOOLS_ON,
+    )
+
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        result = await _upload(
+            client,
+            "report.txt",
+            agent_spec=spec,
+            resource_registry=registry,
+            runner_workspace=launch_dir,
+            session_workspace=launch_dir,
+        )
+    finally:
+        await client.aclose()
+
+    assert json.loads(result)["filename"] == "report.txt", result
+    assert len(captured) == 1
+    assert b"project report" in captured[0].content
+
+
+@pytest.mark.parametrize("unreadable", [False, True], ids=["no-registry", "unreadable-session"])
+@pytest.mark.asyncio
+async def test_upload_without_a_known_workspace_is_refused(
+    tmp_path: Path, unreadable: bool
+) -> None:
+    """
+    The runtime cwd alone is not trusted as a boundary: without the runner's
+    registry, or when the session's workspace could not be read, nothing is read
+    or posted, even though the registry's default root would hold the file.
+
+    :param tmp_path: Pytest-provided runtime cwd holding the requested file.
+    :param unreadable: Whether the session's workspace lookup failed, with a
+        registry rooted at the runtime cwd, rather than no registry at all.
+    """
+    (tmp_path / "notes.txt").write_text("notes")
+
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        result = await _upload(
+            client,
+            "notes.txt",
+            agent_spec=_placeholder_cwd_spec(),
+            resource_registry=(
+                SessionResourceRegistry(runner_workspace=tmp_path) if unreadable else None
+            ),
+            runner_workspace=tmp_path,
+            session_workspace=UNKNOWN_SESSION_WORKSPACE if unreadable else None,
+        )
+    finally:
+        await client.aclose()
+
+    assert result == "Error: sys_files_upload failed: the session workspace is unknown"
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_async_upload_keeps_the_session_workspace(tmp_path: Path) -> None:
+    """
+    ``sys_call_async`` hands the session's own workspace to its upload target, so a
+    background upload reads the same files as a direct one.
+
+    :param tmp_path: Pytest-provided session workspace.
+    """
+    (tmp_path / "report.txt").write_text("async report")
+    posted: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/policies/evaluate"):
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+        posted.append(request)
+        return httpx.Response(201, json={"id": "file_async"})
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://ap-server"
+    ) as client:
+        handle = await execute_tool(
+            tool_name="sys_call_async",
+            arguments=json.dumps(
+                {"tool": "sys_files_upload", "args": json.dumps({"path": "report.txt"})}
+            ),
+            server_client=client,
+            agent_spec=AgentSpec(spec_version=1, skills_filter="none", tool_groups=_FILE_TOOLS_ON),
+            conversation_id=_CONVERSATION_ID,
+            session_workspace=tmp_path,
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+        )
+        await tasks[json.loads(handle)["handle_id"]][0]
+        completion = await inbox.get()
+
+    assert completion["status"] == "completed", completion
+    assert json.loads(completion["output"])["file_id"] == "file_async"
+    assert len(posted) == 1
+    assert b"async report" in posted[0].content
+
+
+@pytest.mark.parametrize("old_name", ["upload_file", "list_files", "download_file"])
+@pytest.mark.asyncio
+async def test_unprefixed_file_tool_names_are_not_dispatched(
+    old_name: str,
+    tmp_path: Path,
+) -> None:
+    """
+    The file tools' former names are not runner tools and are not granted even
+    with the files group on, so a model calling one is refused without any
+    request to the session file store.
+
+    :param old_name: A pre-``sys_`` file tool name, e.g. ``"upload_file"``.
+    :param tmp_path: Pytest-provided workspace root for the session.
+    """
+    (tmp_path / "notes.txt").write_text("notes")
+
+    captured: list[httpx.Request] = []
+    client = _recording_client(captured)
+    try:
+        result = await execute_tool(
+            tool_name=old_name,
+            arguments=json.dumps({"path": "notes.txt", "file_id": "file_abc123"}),
+            server_client=client,
+            agent_spec=AgentSpec(spec_version=1, skills_filter="none", tool_groups=_FILE_TOOLS_ON),
+            conversation_id=_CONVERSATION_ID,
+            runner_workspace=tmp_path,
+        )
+    finally:
+        await client.aclose()
+
+    assert not should_dispatch_locally(old_name)
+    assert "not enabled for this agent" in json.loads(result)["error"]
+    assert captured == []
 
 
 # ── sys_session_send file_ids forwarding (parent → child at spawn) ──

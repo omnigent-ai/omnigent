@@ -13,14 +13,46 @@ export interface PanelSizePreferences {
   sidebarWidthPx?: number;
   /** Width for the comments panel inside the file viewer. */
   commentsPanelWidthPx?: number;
+  /** Width for the session panel beside every project's board. */
+  projectSessionPanelWidthPx?: number;
+  /** Width for the Files tree docked beside a file in the workspace. */
+  filesTreeWidthPx?: number;
+  /** The Files tree's share of the page it's docked in, between 0 and 1. */
+  filesTreeShare?: number;
+  /** The share of a session's Changes review that its file tree takes. */
+  changesReviewTreeShare?: number;
+  /** The share of a pull request's Changes review that its file tree takes. */
+  pullRequestReviewTreeShare?: number;
 }
 
-export type PanelSizePreferenceKey = keyof PanelSizePreferences;
+const WIDTH_KEYS = [
+  "pushPanelWidthPx",
+  "inlinePanelWidthPx",
+  "sidebarWidthPx",
+  "commentsPanelWidthPx",
+  "projectSessionPanelWidthPx",
+  "filesTreeWidthPx",
+] as const satisfies readonly (keyof PanelSizePreferences)[];
+
+const SHARE_KEYS = [
+  "filesTreeShare",
+  "changesReviewTreeShare",
+  "pullRequestReviewTreeShare",
+] as const satisfies readonly (keyof PanelSizePreferences)[];
+
+/** A panel remembered as a pixel width. */
+export type PanelSizePreferenceKey = (typeof WIDTH_KEYS)[number];
+/** A panel remembered as its share of the container it's in. */
+export type PanelSharePreferenceKey = (typeof SHARE_KEYS)[number];
 
 const STORAGE_KEY = "omnigent:panel-size-preferences";
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function isValidShare(value: unknown): value is number {
+  return isValidWidth(value) && value < 1;
 }
 
 /**
@@ -39,12 +71,14 @@ export function readPanelSizePreferences(): PanelSizePreferences {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
     const record = parsed as Record<string, unknown>;
     const prefs: PanelSizePreferences = {};
-    if (isValidWidth(record.pushPanelWidthPx)) prefs.pushPanelWidthPx = record.pushPanelWidthPx;
-    if (isValidWidth(record.inlinePanelWidthPx))
-      prefs.inlinePanelWidthPx = record.inlinePanelWidthPx;
-    if (isValidWidth(record.sidebarWidthPx)) prefs.sidebarWidthPx = record.sidebarWidthPx;
-    if (isValidWidth(record.commentsPanelWidthPx))
-      prefs.commentsPanelWidthPx = record.commentsPanelWidthPx;
+    for (const key of WIDTH_KEYS) {
+      const value = record[key];
+      if (isValidWidth(value)) prefs[key] = value;
+    }
+    for (const key of SHARE_KEYS) {
+      const value = record[key];
+      if (isValidShare(value)) prefs[key] = value;
+    }
     return prefs;
   } catch {
     return {};
@@ -87,5 +121,26 @@ export function writePanelSizePreference(key: PanelSizePreferenceKey, width: num
   } else {
     return;
   }
+  writePanelSizePreferences(prefs);
+}
+
+/** One panel's remembered share of its container, or null when absent or invalid. */
+export function readPanelSharePreference(key: PanelSharePreferenceKey): number | null {
+  return readPanelSizePreferences()[key] ?? null;
+}
+
+/** Remember one panel's share of its container, between 0 and 1; null removes it. */
+export function writePanelSharePreference(
+  key: PanelSharePreferenceKey,
+  share: number | null,
+): void {
+  const prefs = readPanelSizePreferences();
+  if (share === null) {
+    const { [key]: _removedPreference, ...remainingPreferences } = prefs;
+    writePanelSizePreferences(remainingPreferences);
+    return;
+  }
+  if (!isValidShare(share)) return;
+  prefs[key] = share;
   writePanelSizePreferences(prefs);
 }

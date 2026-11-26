@@ -13,8 +13,9 @@ interrupted by a crash is still resolved instead of staying in `starting` foreve
 For what automations do from a user's point of view, with worked examples, see
 [EXAMPLES.md](EXAMPLES.md).
 
-The `automations_v2` feature flag turns this scheduler on. It is off by default,
-and the server then uses the older in-memory timers ("legacy timers").
+The `automations_v2` feature flag turns this scheduler on. It is on by default;
+with `OMNIGENT_FEATURES=-automations_v2` the server uses the older in-memory
+timers ("legacy timers") instead.
 
 Terms used below:
 
@@ -190,6 +191,29 @@ A task that continues a session replaces steps 2 to 4 once it has a
 `session_id`: it checks the session, wakes its runner the way a user message
 would, and sends the prompt, also while the session is busy with an earlier turn.
 It records `succeeded` once the prompt is delivered, without waiting for the turn.
+Trigger automations are the exception. A trigger automation is such a task whose
+prompt starts with the opening sentence of a Jira, Slack, GitHub, Linear or
+PagerDuty trigger template, the same check the web form uses. The database scheduler
+checks a trigger again two minutes after each poll (`TRIGGER_POLL_SECONDS`)
+instead of on its saved schedule, though never past the schedule's next
+occurrence: a schedule that ends (`COUNT` or `UNTIL`) still ends the trigger,
+and its last occurrence is sent even while the session is busy. It also
+configures the store so that a trigger
+that is created or resumed, or edited into a trigger, is first checked two
+minutes later; after an upgrade, an existing trigger switches over at its next
+saved poll. Before claiming a poll, the scheduler asks the check built by
+`build_busy_until` when the session can be polled. A session that shows as
+running (a turn in progress, or waiting on an approval or question) is checked
+again two minutes later. An idle one is polled once it has been quiet for two
+minutes after its last change (`updated_at`), since an agent can pause between
+steps. Either way, a poll goes out once the latest run went out (`fired_at`) ten
+minutes ago, so a stale status cannot stall the trigger. A skip only moves
+`next_run_at` to the next check: it writes no run row and logs
+`scheduled_run_skipped_busy`. The
+status is read from session activity, which needs no caller access check, so the
+poll does not act as the owner. A failed check sends the prompt. Other continued
+tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
+check) follow the saved schedule and never skip, and neither does Run now.
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
@@ -229,7 +253,7 @@ fires. If `fire_identity` is set, it enters that first:
 | When entering the identity… | Result |
 | --- | --- |
 | Raises `FireIdentityRevoked` | The run fails with `reauthorization_required`, and no session is created. If the owner was deleted, the task is disabled with `owner_deleted` instead. |
-| Raises any other error | Treated as temporary: the run fails with `owner_identity_unavailable`, and the next occurrence tries again. |
+| Raises any other error | Treated as temporary: the run fails with `owner_identity_unavailable`, and the next occurrence tries again. A one-time (`COUNT=1`) task has no next occurrence, so its error says to set it again. |
 
 Recovery enters the same identity before inspecting a session. A temporary error
 leaves the run for a later pass. `FireIdentityRevoked` records `failed` without
@@ -421,6 +445,46 @@ deployment:
 - Each poll reads one page of pending Run now requests, so on a server with many
   pending requests for other replicas' hosts, a request can wait a few polls.
 
+## Agent timers
+
+`sys_timer_set` saves a timer of at least 120 seconds (`DURABLE_TIMER_MIN_SECONDS`) in
+a top-level session as one hidden `kind="timer"` task whose ID is the `timer_id`,
+through `POST /v1/sessions/{id}/timers`. `sys_timer_cancel` deletes it through
+`DELETE /v1/sessions/{id}/timers/{timer_id}`. Both authorize the caller as a message
+to the session would, and a cancel must come from the timer's own session and owner.
+Saving needs the database scheduler and the default-off `session_timers` release
+feature, which `/v1/info` reports; the automations gate doesn't hide these routes.
+The runner keeps every other timer in its own memory and says so in the tool's
+result: a shorter one, one on a server that doesn't save timers, and one in a
+sub-agent's session or a side chat, which the route answers with `durable: false`
+instead of saving.
+
+- **Schedule.** `FREQ=SECONDLY;INTERVAL=<n>`, plus `COUNT=1` for a one-shot, with `n`
+  the delay rounded up to whole seconds. Firings fall at `created_at + k * n`
+  (`next_timer_time`), skipping missed ones, and timers are exempt from the automation
+  minimum interval. A firing comes up to one poll (15 seconds by default) late.
+- **Delivery.** The executor skips budgets, sharing and run labels, and sends the
+  hidden (`is_meta`) wake through the continued-session dispatch, in the session's
+  current permission mode. A session that was deleted, archived or closed, or that
+  the owner can no longer send to, stops the timer (`timer_session_unavailable`).
+  The wake meets the session's REQUEST-phase input policies first: a deny, or an ASK
+  no one can answer, skips that firing (`timer_policy_denied`). A runner that can't
+  be reached or declines the wake fails the firing (`launch_failed`), which is not
+  retried.
+- **Hosts.** The replica that owns a timer's saved host claims its firings. When the
+  session has since moved to another host, or got one after the timer was saved, that
+  replica records the firing `skipped` (`timer_host_moved`) without sending it, saves
+  the session's host on the timer and makes it due a second later, so the replica
+  that owns the new host claims it at its next poll. A one-shot reopens for that.
+- **History.** A timer claims one firing at a time and keeps only its newest run. It
+  never stamps `last_run_at`, and a spent one-shot is deleted. The automations list
+  (unless `kind=all`) and the Inbox leave timers out, and PATCH, Run now, clone and
+  sharing refuse them.
+- **Limits.** A cancel can't stop a firing already claimed, and recovery marks an
+  expired startup `failed` without resending. Every server on the database must read
+  timer rows before the feature is turned on; turning it off stops new timers, while
+  existing ones keep firing and can still be cancelled.
+
 ## Custom callbacks
 
 A deployment can replace parts of the scheduler by passing
@@ -529,7 +593,7 @@ These are the defaults, set in the server YAML configuration:
 ```yaml
 scheduled_task_scheduler:
   startup_retry_seconds: 30  # Wait before retrying a failed scheduler start, in either mode
-  poll_seconds: 30       # Time between checks for due tasks and expired startups
+  poll_seconds: 15       # Time between checks for due tasks and expired startups
   renewal_seconds: 30    # Time between startup heartbeats
   lease_seconds: 120     # How long a lease lasts after each renewal
   recovery_seconds: 30   # Time limit for inspecting and recovering one run
@@ -585,11 +649,14 @@ binary does not automatically resume tasks paused by an old scheduler.
 
 ## Switching schedulers
 
-**Turning it on.** Set `OMNIGENT_FEATURES=automations_v2` and restart all
-scheduler replicas together. The app needs a store that supports persistent
-dispatch. Without `scheduled_task_dispatch`, it uses the built-in executor and owns
-every host, which suits a single replica. A deployment with several replicas passes
-its own `owned_hosts`.
+**Turning it on.** It is on by default, so upgrading from a release where it was
+off switches schedulers; elsewhere, remove `-automations_v2` from
+`OMNIGENT_FEATURES` (or add `automations_v2`). Either way, restart all scheduler
+replicas together. The app needs a store that supports persistent dispatch.
+Without `scheduled_task_dispatch`, it uses the built-in executor and owns every
+host, which suits a single replica. A deployment with several replicas passes its
+own `owned_hosts`. A deployment that can't do this yet, such as one on Cloudflare
+D1 (below), sets `OMNIGENT_FEATURES=-automations_v2` before upgrading.
 
 **Turning it off.**
 
@@ -773,7 +840,10 @@ competing-worker scenarios live in `test_managed_startup_inputs.py`.
 for UI, API, and agent-tool creates. Its top-level `user_id` is the authenticated
 owner (`local` for auth-disabled servers); attributes are `task_id`,
 `task_workspace_id`, `creation_source` (`ui`, `agent`, or `api`), `template_id`,
-`target`, and `session_mode`. Rejected creates emit no creation event. As with
+`kind` (`automation` or `reminder`), `target`, `session_mode`, and `mcp_services`
+(the sorted, comma-joined registry service IDs every run starts with; empty for
+none, and `other` for a value outside the registry ID format). `template_id` is `none` for agent and API creates, which have no
+template, and `unknown` for an unrecognized or missing UI template. Rejected creates emit no creation event. As with
 run logs, delivery is best-effort; reconcile current inventory against the store.
 
 Requests without a recognized source header are classified as `api`, including
@@ -785,7 +855,7 @@ UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 | Metric | Measurement |
 | --- | --- |
 | Feature visitors | Distinct host-identified users on `page_view` with `pageId=tasks`, `tasks.templates`, or `tasks.detail`. |
-| Users creating automations | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` in the reporting window. |
+| Users creating automations | Distinct `(task_workspace_id, user_id)` on `scheduled_task_created` with `kind=automation` in the reporting window; `sys_reminder_set` reminders log `kind=reminder`. |
 | Automations created per person | Distinct `task_id` per owner on `scheduled_task_created`, including tasks later deleted while events remain retained. |
 | Active tasks and active owners | Use `scheduled_tasks` filtered to `state=active`; group by workspace and owner. This is a current snapshot, not historical daily activity. |
 | Template selections | `click` with `componentId=tasks.template.<id>`, from both the empty-state preview and Templates tab. |
@@ -793,9 +863,9 @@ UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 | UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
 | UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
 
-Template IDs are bounded: `custom`, `jira`, `slack`, `github`, `linear`,
+Template IDs are bounded: `custom`, `jira`, `slack`, `github`, `linear`, `pagerduty`,
 `follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
-unattributed/older clients. The current gallery offers Jira, Slack, GitHub, and Linear;
+unattributed/older clients. The current gallery offers Jira, Slack, GitHub, Linear, and PagerDuty;
 the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
 its prompt is edited. No task name, prompt, Jira query, channel, or repository
 text is recorded in these events. Attribution headers are diagnostic client claims;

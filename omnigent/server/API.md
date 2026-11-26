@@ -398,7 +398,10 @@ idle -> running -> idle
   for an external signal (background tools, sub-agent completion,
   client tool result). Surfaced as a `session.status` event with
   `status: "waiting"`. The loop resumes (back to `running`) when
-  the signal arrives.
+  the signal arrives. A claude-native session also reports `waiting`
+  when its turn has ended but a background agent it started is still
+  running. That edge names the agents in `background_agents`, and the
+  session takes a new message right away.
 - **failed**: An unrecoverable error occurred during processing.
   The session cannot accept new events.
 
@@ -445,7 +448,15 @@ Fields:
 
   status (string, required)
     Current lifecycle state: `"idle"`, `"running"`, `"waiting"`, or
-    `"failed"`.
+    `"failed"`. A live `waiting` reads `"running"` here, which headless
+    clients treat as unfinished.
+
+  background_agents (array, optional)
+    Background agents a claude-native turn left running after it ended,
+    while the session waits on them. `status` still reads `"running"`
+    then, so older clients keep waiting; clients that know this field
+    show the session as waiting, with its composer free. Each entry has
+    the same shape as a `background_tasks` entry. Omitted otherwise.
 
   created_at (integer, required)
     Unix timestamp (seconds) when the session was created.
@@ -657,12 +668,14 @@ already uploaded or registered an agent. The response is the full
     `request_managed_sandbox_host_id`, so the caller can route the
     session's requests by it before the host connects. It is recorded
     in the `omnigent.sandbox.requested_host_id` label until the host
-    binds; null lets the server mint one. A malformed id, or one on a
-    child (`parent_session_id`) create, is a 422; an id that names an
+    binds; null lets the server mint one, which a host-sharded server
+    also records there when the create carries a slice key. A
+    malformed id, or one on a child (`parent_session_id`) create, is
+    a 422; an id that names an
     existing host, or whose `managed-<first 8 hex>` name one of the
     caller's hosts already uses, is a 409 `already_exists`, raised
-    before the session is created. JSON creates only: the multipart
-    bundle create does not take it.
+    before the session is created. The multipart bundle create takes
+    it in `metadata` the same way.
     Provisioning runs in the BACKGROUND: the create returns
     immediately with `host_id` / `workspace` null, and they appear
     on `GET /v1/sessions/{id}` once the sandbox host registers. A
@@ -827,8 +840,8 @@ usage remain `null`. The response is `Cache-Control: no-store`; read failures
 return an error, never a zero total.
 
 This request runs independently of initial snapshot and transcript loading.
-Display clients consume only `total_cost_usd` and `usage_by_model` from its
-response, keep usage unknown until it arrives, and must not overwrite newer
+Display clients consume only `total_cost_usd`, `cost_hidden` and `usage_by_model`
+from its response, keep usage unknown until it arrives, and must not overwrite newer
 streamed usage with an older in-flight response. Keep this fetch outside the
 shared session-metadata query/cache so it cannot delay metadata reads or
 replace newer metadata. The request performs its own authorization; the initial
@@ -943,6 +956,9 @@ Request body:
 is used on a non-Codex-native session; or `external_session_id` would
 overwrite a different existing value
 404 Not Found - no session with that id
+409 Conflict - `runner_id` was sent while a move onto a new sandbox holds
+the session (see "Move Session to a New Sandbox"), or the session's
+runner changed while the request was being handled
 
 This is the mutable affinity primitive for Alpha. The same endpoint
 serves create-bind, resume-bind, and recover-bind: the client starts a
@@ -1114,7 +1130,10 @@ Request body matches `SessionEventInput`:
                                   spend, USD) when the session is priced; it is
                                   omitted when unpriced. The same value is seeded
                                   on the session snapshot as `total_cost_usd`
-                                  (`null` when unpriced).
+                                  (`null` when unpriced). With
+                                  `OMNIGENT_HIDE_COST=1` both omit the cost and
+                                  carry `cost_hidden: true`, so clients clear a
+                                  cached cost.
       - "external_reasoning_effort_change"
                                 — internal terminal-observed thinking-level
                                   update from a native forwarder. Persists
@@ -1368,6 +1387,135 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+### Move Session to a New Sandbox
+
+```
+POST /v1/sessions/{session_id}/managed-host
+Content-Type: application/json
+
+{
+  "sandbox_provider": "modal",                          // optional
+  "host_id": "0123456789abcdef0123456789abcdef",        // optional
+  "workspace": "https://github.com/org/repo#main"       // optional
+}
+
+Request body matches `SessionManagedHostRequest`. Each field means what
+it does on a `host_type: "managed"` fork:
+
+  sandbox_provider (string | null, optional)
+    Which configured sandbox provider to provision; null takes the
+    server's first.
+
+  host_id (string | null, optional)
+    Id for the new sandbox host: 32 lowercase hex characters, sent
+    only when `GET /v1/info` reports `request_managed_sandbox_host_id`.
+    Recorded in the `omnigent.sandbox.requested_host_id` label until
+    the host binds; null lets the server mint one.
+
+  workspace (string | null, optional)
+    Git repository URL, optionally `#<branch>`, cloned into the
+    sandbox as the session's working directory; null gives the
+    session an empty sandbox.
+
+202 Accepted — body matches `SessionResponse`, with `host_id` and
+  `workspace` null and `sandbox_status` reporting the launch.
+
+400 Bad Request — the session is a sub-agent or side chat, has no
+  agent binding, already runs in a sandbox, or asks for a sandbox
+  this server has not configured or whose provider manages sandbox
+  profiles
+403 / 404 — the caller does not own the session, or (403) the server's
+  nested-agent destination policy keeps this session off new sandboxes
+409 Conflict — a runner is still bound, the session has no host to
+  move from (it may already be moving), its host or runner changed
+  while the move ran, or host_id names a host already in use
+422 Unprocessable Entity — a malformed host_id, or a workspace that is
+  not a repository URL
+```
+
+Servers that support this route report `move_to_managed_sandbox` on
+`GET /v1/info`; clients should not release a session's runner for a
+move on a server that doesn't. A provider takes a moved session only if
+its `sandbox_provider_capabilities` entry reports `accepts_session_move`
+(one that manages sandbox profiles doesn't); treat a provider that
+doesn't say as one that can't.
+
+Moves an existing session onto a new server-provisioned sandbox — the
+sandbox counterpart of `POST /v1/hosts/{host_id}/runners`. Release the
+session's runner first with `PATCH /v1/sessions/{id}` and
+`{"runner_id": ""}`. The call then claims the session against the
+binding it checked, so a runner bound or a host changed in the
+meantime, or a concurrent move, makes it fail with 409. The claim stays
+on the session until the sandbox's runner replaces it; meanwhile a host
+launch is refused, a message is held for the sandbox, and
+`PATCH /v1/sessions/{id}` with a `runner_id` returns 409, on every
+replica. Only the move releases its claim, after it has settled the
+session; a claim over an hour old is left by a server that stopped
+mid-move, and `PATCH` may clear it, marking messages held for that move
+not sent. The call clears the session's host,
+workspace and branch, drops any earlier sandbox's
+`omnigent.sandbox.repo*` and `omnigent.sandbox.requested_host_id`
+labels, and registers the sandbox to the caller. Like a managed fork,
+the request should be routed by the new sandbox's `host_id`, where the
+launch connects. A failed launch leaves the session unbound with the
+reason in `sandbox_status`, and held messages are reported as not
+delivered, before the claim is released. When the sandbox's host
+connects to another replica, the claim is handed over for that replica
+to start the runner; if another host binds the session then, that
+binding wins: the sandbox is torn down without failing the session, and
+held messages are marked not sent. A request the server refuses
+restores the previous binding and labels, and releases the claim. Files
+don't move with the session; the transcript does.
+
+### Rewind Session
+
+```
+POST /v1/sessions/{session_id}/rewind
+Content-Type: application/json
+
+{"item_id": "msg_abc123"}
+
+200 OK — {"session_id": "conv_new", "prompt": "<the prompt's text>",
+  "attachments": [{"type": "input_image", "file_id": "file_new",
+  "filename": "diagram.png"}]}
+
+400 Bad Request — the session's harness is not claude-sdk or
+  claude-native, item_id is not one of its user prompts, it is a
+  sub-agent or side-chat session, a turn is running or a message is
+  still reaching its runner, or the kept history has a file the
+  session's harness cannot open
+400 Bad Request, code `wrong_replica` — its runner is connected to
+  another server replica; retry so the request reaches that replica
+403/404 — the caller does not own the session
+409 Conflict — the session is already moving to a new session (a
+  /clear or /rewind in progress), or its host went away during the
+  rewind; retry once it settles
+503 Service Unavailable — neither its runner nor its host can take
+  the new session
+```
+
+Continues a Claude session from just before one of its prompts. The
+server forks the session with only the items positioned before
+`item_id` (rewinding to the first prompt keeps none), binds the fork to
+the source's host, workspace and live runner (host only when the runner
+is offline, so the next message relaunches it there), and keeps the
+source's title, labels, model, effort and launch arguments. A
+claude-native fork rebuilds Claude's transcript from the kept items.
+The source keeps its full history and gets a notice linking to the fork;
+live viewers follow via `session.superseded` with `reason: "rewind"`.
+Clients put `prompt` back in the composer, with `attachments`: the
+prompt's files as the fork's own copies (a fork copies every source
+file), readable from the fork's `resources/files/{file_id}/content`. An
+image or document the prompt carried inline (no stored file, e.g. after
+an import) comes back as its `image_url` or `file_data` data URI
+instead, with `file_id: null`, for the client to upload on send.
+`attachments_incomplete: true` means some attachments could not be restored,
+including missing files or failed lookups. Clients should warn the user to
+attach them again before sending; the new session is still usable.
+Rewinding never rolls back files on disk. `GET /v1/info` reports
+`session_rewind: true`, which also means
+`GET /v1/sessions/{id}/items?type=message` filters items by type.
+
 ### Read Fork Repository Branch Suggestions
 
 `GET /v1/sessions/{session_id}/resources/repository-branches` requires session
@@ -1450,7 +1598,7 @@ stream and surface queue/interrupt semantics.
 
 | Event | Pydantic class | Wire shape (illustrative) |
 |---|---|---|
-| `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
+| `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed", background_agents?: BackgroundTaskInfo[]}` |
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |
@@ -1527,10 +1675,39 @@ against the snapshot to reconcile accepted inputs.
 Native shell-mode inputs (`!cmd`) settle when the matching `terminal_command`
 input is persisted. Its output does not acknowledge an input, and no
 `session.input.consumed` event is emitted for the shell command. Clients should
-remove only the sent bubble matching that command. During a mixed-version
+remove only the submission named by the input's server-owned `submission`:
+`{"pending_id": "...", "stable_id": "..."}`. `pending_id` names the queued entry;
+`stable_id`, when supplied by the sender, also correlates an optimistic bubble
+before the POST response arrives. This identity is persisted with the item and
+included in live events and history, so reconnect can acknowledge a missed input.
+Forwarded shell submissions retain correlation beyond the pending-entry cleanup
+timeout while awaiting their mirror, under the existing queue cap. Active-pending
+eligibility still expires after ten minutes and ends on an identity-linked failure,
+rejection or cancellation. A runner turn completing after typing into the native CLI
+does not establish shell execution. Retained correlation alone does not keep a
+session working or replay a bubble.
+A sufficiently delayed command can therefore disappear from a reload's pending list
+while its later terminal record still acknowledges the original submission.
+An empty `submission: {}` means no web submission was correlated to the record. Missing
+`submission` means a legacy record; clients must not infer history acknowledgements
+from command text. Output items carry no submission identity. During a mixed-version
 rollout, an older client can retain that bubble until refreshing its snapshot;
 an older server can still report the command as `native_prompt_not_recorded`.
 Updated clients preserve later bubbles when that older server's receipt arrives.
+
+Reconnect settlement covers the fetched history window. The fresh-window fallback
+loads only the newest 100 items; a terminal input older than that window cannot
+acknowledge an outstanding bubble through this recovery path. Paging older history
+currently renders those records without repeating shell settlement. Correlation
+before terminal persistence uses command text. Non-retired identical shell
+submissions take precedence over retired ones, including a match held for
+persistence. Retired entries remain fallback correlation when no non-retired
+match exists. Queue and interruption ordering apply within the non-retired
+group; retired entries do not count as intervening inputs. Age alone does not
+prove command loss. A silently lost command and a delayed one are
+indistinguishable by text, as are a retired command's late
+mirror and a newer identical submission. Persisted identity records that
+matching decision; it does not prove that the named submission executed.
 
 ### Sessions Typical Flow
 

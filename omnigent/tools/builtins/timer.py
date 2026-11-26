@@ -12,12 +12,17 @@ Both tools are gated on the agent spec's top-level ``timers:`` flag
 (see :attr:`AgentSpec.timers`, defaulting to ``False``).
 
 These classes own the LLM-facing schema and argument validation.
-The firing itself runs in the runner: ``execute_tool`` intercepts
-``sys_timer_set`` / ``sys_timer_cancel`` and dispatches to
+The runner's ``execute_tool`` intercepts ``sys_timer_set`` /
+``sys_timer_cancel`` and dispatches to
 :func:`omnigent.runner.tool_dispatch._execute_timer_set` /
-``_execute_timer_cancel``, which run the sleep-and-wake loop and own
-the per-session timer registry. The shared :func:`validate_timer_set_args`
-helper keeps both surfaces rejecting the same inputs.
+``_execute_timer_cancel``. A timer of at least
+:data:`DURABLE_TIMER_MIN_SECONDS` in a top-level session is saved on the
+server as one scheduled task (``kind="timer"``) that the database scheduler
+fires, so it survives runner exits and restarts. Any other timer runs in
+the runner's sleep-and-wake loop and per-session registry, and the result
+warns that it is not durable. The shared :func:`validate_timer_set_args`
+helper keeps the tools, the runner and the server route rejecting the
+same inputs.
 
 The tools are **synchronous** (``is_async() == False``): the LLM
 gets the ``timer_id`` back immediately so it can later cancel by ID.
@@ -50,7 +55,10 @@ _logger = logging.getLogger(__name__)
 # indefinitely. If a real use case exceeds this, the cap gets
 # revisited together with the design tradeoffs of long-lived
 # timer workflows.
-_MAX_TIMER_SECONDS = 1_000_000.0
+MAX_TIMER_SECONDS = 1_000_000
+# A timer this long or longer in a top-level session is saved on the server, which fires
+# it at most one scheduler poll late. A shorter one stays in the runner's memory.
+DURABLE_TIMER_MIN_SECONDS = 120
 
 
 def validate_timer_set_args(
@@ -81,8 +89,8 @@ def validate_timer_set_args(
         return "seconds must be a finite number"
     if seconds < 0:
         return "seconds must be non-negative"
-    if seconds > _MAX_TIMER_SECONDS:
-        return f"seconds must be <= {_MAX_TIMER_SECONDS}"
+    if seconds > MAX_TIMER_SECONDS:
+        return f"seconds must be <= {MAX_TIMER_SECONDS}"
     repeat = args.get("repeat", False)
     if not isinstance(repeat, bool):
         return "repeat must be a boolean"
@@ -102,11 +110,11 @@ class SysTimerSetTool(Tool):
 
     The LLM passes ``seconds`` (delay), optional ``repeat`` (default
     ``False``), and optional ``note`` (echoed back in each firing). On
-    the runner dispatch path the timer is assigned a fresh ``timer_id``
-    of the form ``"timer_<32-char hex>"`` and the id is returned
-    immediately; the firing arrives later as a hidden ``[System: timer X
-    fired]`` meta message that wakes the session. Repeating timers
-    continue until ``sys_timer_cancel`` is called.
+    the runner dispatch path the ``timer_id`` is returned immediately:
+    a server-saved timer's scheduled-task ID, or ``"timer_<32-char hex>"``
+    for one kept in the runner. The firing arrives later as a hidden
+    ``[System: timer X fired]`` meta message that wakes the session.
+    Repeating timers continue until ``sys_timer_cancel`` is called.
     """
 
     @classmethod
@@ -124,8 +132,14 @@ class SysTimerSetTool(Tool):
             "appears as a [System: timer X fired] message in the "
             "conversation; you can include an optional note that's "
             "echoed back in the firing. Set repeat=true for a "
-            "recurring timer (cancel via sys_timer_cancel). The "
-            "tool returns immediately with the timer_id."
+            "recurring timer (cancel via sys_timer_cancel). A timer "
+            "of 2 minutes or more in a top-level session is saved on "
+            "the server: it survives the runner going idle or "
+            "restarting, and can fire up to about 15 seconds late, never early. "
+            "Shorter timers, and timers in sub-agents or side chats, "
+            "stay in this runner's memory; the result then has "
+            "durable=false and a warning saying when the timer would "
+            "be lost. The tool returns immediately with the timer_id."
         )
 
     def get_schema(self) -> dict[str, Any]:

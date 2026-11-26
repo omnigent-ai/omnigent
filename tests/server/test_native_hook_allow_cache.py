@@ -84,6 +84,31 @@ def test_cache_window_counts_from_the_policy_list_reads(db_uri: str) -> None:
     _SESSION_POLICY_SPECS_CACHE.clear()
 
 
+def test_sub_agent_window_counts_from_the_root_policy_list(db_uri: str) -> None:
+    """A sub-agent's window also shrinks by the age of its root's inherited list.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+    store = SqlAlchemyPolicyStore(db_uri)
+    root_id = "9a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    assert _load_default_policy_specs(store) == []
+    assert _load_session_policy_specs(_SESSION_ID, store) == []
+    assert _load_session_policy_specs(root_id, store) == []
+    specs, loaded_at = _SESSION_POLICY_SPECS_CACHE[root_id]
+    _SESSION_POLICY_SPECS_CACHE[root_id] = (specs, loaded_at - 25.0)
+    caps = RuntimeCaps(native_hook_allow_cache_seconds=lambda: 60.0)
+
+    body = _no_policy_allow_body(caps, _SESSION_ID, store, root_id)
+
+    assert 34.0 < body["allow_cache_seconds"] <= 35.0
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [(None, None), (60, 60.0), (2.5, 2.5)],

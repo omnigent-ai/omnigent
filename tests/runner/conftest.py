@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -331,6 +331,10 @@ class _FakeProcessManager:
         """Check if a session was registered via :meth:`get_client`."""
         return conversation_id in self._sessions
 
+    def registered_client(self, conversation_id: str) -> _ScriptedHarnessClient | None:
+        """Return the existing scripted client without creating a session."""
+        return self._client if conversation_id in self._sessions else None
+
     def has_active_turn(self, conversation_id: str) -> bool:
         """Check if a turn is marked active for this conversation."""
         return conversation_id in self._active_turns
@@ -359,7 +363,12 @@ class _FakeProcessManager:
         return True
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        expected_client: object = ...,
+        can_release: Callable[[], bool] | None = None,
     ) -> None:
         """Record a release and remove the session.
 
@@ -371,6 +380,13 @@ class _FakeProcessManager:
             conversation with an active turn is not torn down.
         """
         self.release_calls.append((conversation_id, only_if_idle_cutoff))
+        if can_release is not None and not can_release():
+            return
+        if (
+            expected_client is not ...
+            and self.registered_client(conversation_id) is not expected_client
+        ):
+            return
         if only_if_idle_cutoff is not None and conversation_id in self._active_turns:
             return
         self.released.append(conversation_id)
@@ -797,6 +813,7 @@ class _BlockingHarnessClient(_ScriptedHarnessClient):
 
 def _build_interrupt_app(
     gate: asyncio.Event,
+    sse_frames: list[str] | None = None,
 ) -> tuple[FastAPI, _FakeProcessManager, _BlockingHarnessClient]:
     """Build a runner app whose harness emits dangling function_calls.
 
@@ -807,6 +824,8 @@ def _build_interrupt_app(
 
     :param gate: Event that unblocks the harness after the
         function_call frames.
+    :param sse_frames: Frames to stream instead; the gate blocks
+        before the second one.
     :returns: ``(app, process_manager, harness_client)`` tuple.
     """
     # Use the test-only harness so _build_spawn_env_from_spec returns None
@@ -817,7 +836,7 @@ def _build_interrupt_app(
         name="t",
         executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
     )
-    sse_frames = [
+    default_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_int"}}),
         _sse(
             {
@@ -844,7 +863,9 @@ def _build_interrupt_app(
         ),
         _sse({"type": "response.completed", "response": {"id": "resp_int"}}),
     ]
-    harness_client = _BlockingHarnessClient(sse_frames, gate)
+    harness_client = _BlockingHarnessClient(
+        default_frames if sse_frames is None else sse_frames, gate
+    )
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:

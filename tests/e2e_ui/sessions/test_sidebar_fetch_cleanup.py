@@ -104,8 +104,16 @@ def test_scope_requests_and_bounded_automatic_pagination(
         page.wait_for_load_state("networkidle")
     page.clock.run_for(100)
     start_count = len(requests)
-    page.clock.fast_forward(60_000)
-    page.wait_for_load_state("networkidle")
+    # An earlier networkidle event does not wait for this intercepted refresh.
+    with page.expect_response(
+        lambda response: (
+            urlparse(response.url).path == "/v1/sessions"
+            and parse_qs(urlparse(response.url).query).get("visibility") == ["mine"]
+            and "after" not in parse_qs(urlparse(response.url).query)
+            and "pinned" not in parse_qs(urlparse(response.url).query)
+        )
+    ):
+        page.clock.fast_forward(60_000)
     assert len(requests[start_count:]) == 1
     assert requests[-1]["limit"] == ["100"]
     load_more.click()
@@ -245,7 +253,9 @@ def test_shared_loading_keeps_pins_and_projects_mounted(
     page.goto(base_url, wait_until="domcontentloaded")
     pin = page.get_by_text("Stable pinned session", exact=True)
     expect(pin).to_be_visible()
-    page.get_by_role("button", name="Stable project", exact=True).click()
+    page.get_by_role("button", name="Stable project", exact=True).locator(
+        "[data-section-toggle]"
+    ).first.click()
     folder_row = page.get_by_text("Stable project session", exact=True)
     expect(folder_row).to_be_visible()
     pin_element = pin.element_handle()

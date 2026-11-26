@@ -261,7 +261,7 @@ def test_login_account_host_inherits_cli_selected_workspace(
 ) -> None:
     """An account-acting host without ?o= inherits the workspace the CLI recorded.
 
-    Discovery metadata identifies ``isaac.databricks.com`` as account-acting (an
+    Discovery metadata identifies an account-level login host as account-acting (an
     ``account_id`` but no ``workspace_id``). The ``databricks auth login`` flow
     still resolves a workspace and records its id in the profile; the login reads
     it back and routes the account token to it (``params o=…``), succeeding
@@ -284,16 +284,16 @@ def test_login_account_host_inherits_cli_selected_workspace(
         monkeypatch,
         fake_httpx=fake,
         host_needs_selector=True,
-        default_workspace_id="1965859176160743",
+        default_workspace_id="4242424242424242",
     )
 
     result = CliRunner().invoke(cli_group, ["login", _WORKSPACE_API_URL])
 
     assert result.exit_code == 0, result.output
     # The inherited workspace routed the verify probe and was recorded.
-    assert fake.requests[-1]["params"] == {"o": "1965859176160743"}
-    assert "1965859176160743" in result.output
-    assert load_databricks_org_id(_WORKSPACE_API_URL) == "1965859176160743"
+    assert fake.requests[-1]["params"] == {"o": "4242424242424242"}
+    assert "4242424242424242" in result.output
+    assert load_databricks_org_id(_WORKSPACE_API_URL) == "4242424242424242"
     assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
 
 
@@ -317,14 +317,14 @@ def test_login_workspace_hosted_uses_cli_workspace_id_without_metadata(
         monkeypatch,
         fake_httpx=fake,
         host_needs_selector=False,
-        default_workspace_id="1965859176160743",
+        default_workspace_id="4242424242424242",
     )
 
     result = CliRunner().invoke(cli_group, ["login", _WORKSPACE_API_URL])
 
     assert result.exit_code == 0, result.output
-    assert fake.requests[-1]["params"] == {"o": "1965859176160743"}
-    assert load_databricks_org_id(_WORKSPACE_API_URL) == "1965859176160743"
+    assert fake.requests[-1]["params"] == {"o": "4242424242424242"}
+    assert load_databricks_org_id(_WORKSPACE_API_URL) == "4242424242424242"
     assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
 
 
@@ -332,7 +332,7 @@ def test_login_workspace_hosted_uses_cli_workspace_id_without_metadata(
     ("account_id", "workspace_id", "expected"),
     [
         ("acc-1", None, True),  # account-acting host fronting many workspaces
-        ("acc-1", "1965859176160743", False),  # single workspace names its own id
+        ("acc-1", "4242424242424242", False),  # single workspace names its own id
         (None, None, False),  # older regional host: inconclusive, don't block
     ],
 )
@@ -401,16 +401,16 @@ def test_login_workspace_hosted_with_selector_binds_and_succeeds(
     # identity, which would leave the query on the record key.
     monkeypatch.setattr(cli_mod, "_workspace_api_server_url", lambda server: server.split("?")[0])
 
-    result = CliRunner().invoke(cli_group, ["login", f"{_WORKSPACE_API_URL}?o=1965859176160743"])
+    result = CliRunner().invoke(cli_group, ["login", f"{_WORKSPACE_API_URL}?o=4242424242424242"])
 
     assert result.exit_code == 0, result.output
     # Selector bound at login (--host …?o=…) and routed at verify (params o=…).
     assert login_calls == [
-        f"auth login --host {_WORKSPACE}/?o=1965859176160743 --profile {_PROFILE}"
+        f"auth login --host {_WORKSPACE}/?o=4242424242424242 --profile {_PROFILE}"
     ]
-    assert fake.requests[-1]["params"] == {"o": "1965859176160743"}
+    assert fake.requests[-1]["params"] == {"o": "4242424242424242"}
     # Recorded (keyed by the query-less mount) for later request routing.
-    assert load_databricks_org_id(_WORKSPACE_API_URL) == "1965859176160743"
+    assert load_databricks_org_id(_WORKSPACE_API_URL) == "4242424242424242"
     assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
 
 
@@ -1495,7 +1495,7 @@ def test_workspace_url_skips_authed_probe_without_databricks_extra(
     assert [r["authorization"] for r in fake.requests] == [None, None]
 
 
-# ── schemeless input + web-UI URL acceptance (internal user guide) ──
+# ── schemeless input + web-UI URL acceptance (user guide) ──
 
 
 @pytest.mark.parametrize(
@@ -1503,8 +1503,8 @@ def test_workspace_url_skips_authed_probe_without_databricks_extra(
     [
         # The guide hands out the web URL without a scheme; default https.
         (
-            "dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
-            "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
+            "dbc-12345678-abcd.cloud.databricks.com/omnigent",
+            "https://dbc-12345678-abcd.cloud.databricks.com/omnigent",
         ),
         ("example.cloud.databricks.com", "https://example.cloud.databricks.com"),
         # Loopback hosts stay http — local dev servers are plain http.
@@ -1520,7 +1520,7 @@ def test_workspace_url_skips_authed_probe_without_databricks_extra(
 def test_with_default_scheme(raw: str, expected: str) -> None:
     """A schemeless server URL defaults to https (http for loopback).
 
-    The internal user guide hands out the web URL without a scheme
+    The user guide hands out the web URL without a scheme
     (``<ws>/omnigent``); defaulting to https lets it be pasted verbatim,
     while loopback hosts stay http so local dev still connects.
     """
@@ -1664,7 +1664,7 @@ def test_workspace_url_expands_web_ui_path_to_api_mount(
 ) -> None:
     """The guide's web-UI URL (``<ws>/omnigent``) expands to the API mount.
 
-    The internal user guide hands out ``<ws>/omnigent`` for the browser;
+    The user guide hands out ``<ws>/omnigent`` for the browser;
     a user who pastes it into ``omnigent login`` must reach the API mount
     (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe. The
     desktop passes this URL to ``host status --json`` and parses its
@@ -1715,7 +1715,7 @@ def test_workspace_url_web_ui_path_left_alone_off_workspace(
 def test_login_defaults_scheme_to_https(monkeypatch: pytest.MonkeyPatch, token_dir: Path) -> None:
     """A schemeless workspace URL logs in over https.
 
-    The internal user guide's URLs omit the scheme; ``login`` defaults it
+    The user guide's URLs omit the scheme; ``login`` defaults it
     to https so the probe reaches the workspace API proxy and the stored
     record keys on the https URL.
     """

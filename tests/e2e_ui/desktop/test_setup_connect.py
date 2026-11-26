@@ -199,10 +199,10 @@ def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
     assert (
         page.evaluate(
             """() => window.omnigentUrl.normalizeUrl(
-              'dbc-x.cloud.databricks.com/omnigent?ignored=yes&o=1965859176160743#page'
+              'dbc-x.cloud.databricks.com/omnigent?ignored=yes&o=4242424242424242#page'
             )"""
         )
-        == "https://dbc-x.cloud.databricks.com/?o=1965859176160743"
+        == "https://dbc-x.cloud.databricks.com/?o=4242424242424242"
     )
     # Loopback stays http for local dev.
     assert (

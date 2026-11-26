@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { useMarkFullscreenOverlayOpen } from "@/hooks/useMarkFullscreenOverlayOpen";
 import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import type { ComponentProps, ReactNode, RefObject } from "react";
@@ -32,6 +33,7 @@ export function isMermaidPre(children: ReactNode): boolean {
 function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | null> }) {
   const [svgMarkup, setSvgMarkup] = useState<string | null>(null);
   const close = useCallback(() => setSvgMarkup(null), []);
+  useMarkFullscreenOverlayOpen(svgMarkup != null);
 
   const openFullscreen = useCallback(() => {
     // The rendered diagram is Mermaid's own <svg id="mermaid-…"> — scope to it so
@@ -64,7 +66,8 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
           >
             <Button
               aria-label="Exit fullscreen"
-              className="absolute top-4 right-4"
+              className="absolute right-4"
+              style={{ top: "calc(var(--fullscreen-overlay-inset-top, 0px) + 1rem)" }}
               onClick={close}
               size="icon-sm"
               title="Exit fullscreen"

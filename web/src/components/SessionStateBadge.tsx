@@ -9,10 +9,12 @@ import type { SessionState } from "@/hooks/useSessionState";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
-import { CircleAlertIcon } from "lucide-react";
+import { CircleAlertIcon, SquareTerminalIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
+  /** In the sidebar, the tag takes the row highlight's color instead of clashing with it. */
+  inSidebar?: boolean;
 }
 
 interface Visual {
@@ -30,7 +32,7 @@ function awaitingTooltip(count: number, terminalReason: string | undefined): str
   return count === 1 ? "1 approval prompt waiting" : `${count} approval prompts waiting`;
 }
 
-function describe(state: SessionState): Visual {
+function describe(state: SessionState, inSidebar: boolean): Visual {
   switch (state.kind) {
     case "awaiting": {
       const tooltip = awaitingTooltip(state.count, state.terminalReason);
@@ -42,16 +44,40 @@ function describe(state: SessionState): Visual {
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">{label}</Badge>
+          <Badge
+            className={cn(
+              "border-transparent",
+              inSidebar
+                ? "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]"
+                : "bg-warning/15 text-warning",
+            )}
+          >
+            {label}
+          </Badge>
         ),
       };
     }
     case "running": {
-      const tooltip = state.background ? "Working in the background" : "Session running";
+      if (state.background) {
+        // Static terminal glyph (as on the composer's background-task pill): a
+        // dev server left running between turns must not read as a busy turn.
+        return {
+          kind: state.kind,
+          ariaLabel: "Working in the background",
+          tooltip: "Working in the background",
+          render: () => (
+            <SquareTerminalIcon
+              aria-hidden
+              strokeWidth={1.5}
+              className="size-3.5 shrink-0 text-muted-foreground"
+            />
+          ),
+        };
+      }
       return {
         kind: state.kind,
-        ariaLabel: tooltip,
-        tooltip,
+        ariaLabel: "Session running",
+        tooltip: "Session running",
         render: () => <RunningDot className="size-3" />,
       };
     }
@@ -100,8 +126,8 @@ function Dot({ tone }: { tone: string }) {
   return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
 }
 
-export function SessionStateBadge({ state }: SessionStateBadgeProps) {
-  const visual = describe(state);
+export function SessionStateBadge({ state, inSidebar = false }: SessionStateBadgeProps) {
+  const visual = describe(state, inSidebar);
   return (
     <Tooltip>
       <TooltipTrigger asChild>

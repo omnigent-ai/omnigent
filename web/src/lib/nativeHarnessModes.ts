@@ -261,11 +261,10 @@ export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
 };
 
 /**
- * Modes automations cannot use: a scheduled run has nobody to answer a prompt,
- * so it needs an approval gate. Mirrors UNATTENDED_DISALLOWED_PERMISSION_MODES
- * in omnigent/native/permission_modes.py.
+ * Modes that skip the approval prompt. Automations offer them only on servers that
+ * advertise scheduled_task_approval_skipping_modes. Mirrors omnigent/native/permission_modes.py.
  */
-export const UNATTENDED_DISALLOWED_PERMISSION_MODES: ReadonlySet<string> = new Set([
+export const APPROVAL_SKIPPING_PERMISSION_MODES: ReadonlySet<string> = new Set([
   "bypassPermissions",
   "dontAsk",
   "full-access",
@@ -299,5 +298,23 @@ export function nativePermissionOptions(harness: string | null | undefined) {
       return DEVIN_NATIVE_PERMISSION_MODES;
     default:
       return [];
+  }
+}
+
+/** The named mode each harness starts in by default, e.g. Codex's "default". */
+export function nativeDefaultPermissionMode(harness: string | null | undefined): string | null {
+  switch (harness) {
+    case "claude-native":
+      return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
+    case "codex-native":
+      return CODEX_NATIVE_DEFAULT_APPROVAL_MODE;
+    case "cursor-native":
+      return CURSOR_NATIVE_DEFAULT_EXEC_MODE;
+    case "antigravity-native":
+      return AGY_NATIVE_DEFAULT_SKIP_MODE;
+    case "devin-native":
+      return DEVIN_NATIVE_DEFAULT_PERMISSION_MODE;
+    default:
+      return null;
   }
 }

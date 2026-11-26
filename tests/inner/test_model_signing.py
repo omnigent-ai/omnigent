@@ -194,14 +194,15 @@ def test_ambiguous_routing_and_framing_headers_are_rejected(
 
 
 def test_placeholder_literal_in_other_header_or_target_is_rejected() -> None:
-    with pytest.raises(SigningRejected):
-        _reconstruct(
-            headers=[
-                ("Authorization", f"Bearer {_PLACEHOLDER}"),
-                ("Content-Type", "application/json"),
-                ("User-Agent", _PLACEHOLDER),
-            ]
-        )
+    for header_name in ("User-Agent", "x-api-key"):
+        with pytest.raises(SigningRejected, match="placeholder"):
+            _reconstruct(
+                headers=[
+                    ("Authorization", f"Bearer {_PLACEHOLDER}"),
+                    ("Content-Type", "application/json"),
+                    (header_name, _PLACEHOLDER),
+                ]
+            )
     with pytest.raises(SigningRejected):
         _reconstruct(target=f"{_PATH}/{_PLACEHOLDER}")
 

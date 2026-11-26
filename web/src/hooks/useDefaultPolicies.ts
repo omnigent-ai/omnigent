@@ -19,10 +19,20 @@ export interface DefaultPolicy {
 
 // ── Query helpers ────────────────────────────────────────────────────────────
 
-const QUERY_KEY = ["default-policies"];
+export const DEFAULT_POLICIES_QUERY_KEY = ["default-policies"];
+
+/**
+ * Thrown when the server forbids listing global policies (HTTP 403). A backend
+ * may restrict the surface to an allowlist, so the caller can distinguish "not
+ * permitted" from a transient error and hide the section instead of erroring.
+ */
+export class PoliciesForbiddenError extends Error {}
 
 async function fetchDefaultPolicies(): Promise<DefaultPolicy[]> {
   const res = await authenticatedFetch("/v1/policies");
+  if (res.status === 403) {
+    throw new PoliciesForbiddenError("Not permitted to list default policies");
+  }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { object: string; data: DefaultPolicy[] };
   return body.data;
@@ -31,10 +41,11 @@ async function fetchDefaultPolicies(): Promise<DefaultPolicy[]> {
 // ── Hooks ────────────────────────────────────────────────────────────────────
 
 /** Fetch all server-wide default policies. */
-export function useDefaultPolicies() {
+export function useDefaultPolicies(enabled = true) {
   return useQuery({
-    queryKey: QUERY_KEY,
+    queryKey: DEFAULT_POLICIES_QUERY_KEY,
     queryFn: fetchDefaultPolicies,
+    enabled,
     staleTime: 5_000,
   });
 }
@@ -58,7 +69,7 @@ export function useAddDefaultPolicy() {
       return (await res.json()) as DefaultPolicy;
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: DEFAULT_POLICIES_QUERY_KEY });
     },
   });
 }
@@ -77,7 +88,7 @@ export function useUpdateDefaultPolicy() {
       return (await res.json()) as DefaultPolicy;
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: DEFAULT_POLICIES_QUERY_KEY });
     },
   });
 }
@@ -93,7 +104,7 @@ export function useDeleteDefaultPolicy() {
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     },
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: DEFAULT_POLICIES_QUERY_KEY });
     },
   });
 }
