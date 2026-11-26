@@ -1657,9 +1657,6 @@ function refusalBody(code: string, reason: string) {
     details: [{ type: "omnigent.api.workspace.v1alpha1.PullRequestFailure", value }],
   };
 }
-/** A refusal as the server route sends it. */
-const refusal = (code: string, status: number, reason: string): Response =>
-  Response.json(refusalBody(code, reason), { status });
 /** The direct host's refusal of a pull request the token doesn't list. */
 const notGrantedFromSocket = (): WorkspaceSocketResponse =>
   fromSocket(
@@ -1720,18 +1717,22 @@ describe("callPullRequestMethod", () => {
 
   it("throws a refusal with its reason, and tries no other route", async () => {
     enable("workspace_direct_access", "workspace_api_server_access");
-    socket.mockResolvedValue(unaryFromSocket(capabilitiesBody("ListDirectory")));
+    socket.mockImplementation(async (request) =>
+      methodOf((request as { path: string }).path) === "GetCapabilities"
+        ? unaryFromSocket(capabilitiesBody("GetPullRequest"))
+        : fromSocket(
+            new TextEncoder().encode(
+              JSON.stringify(refusalBody("failed_precondition", "pull_request_changed")),
+            ),
+            400,
+          ),
+    );
     serveMethods({
-      "direct-access": () =>
-        Response.json({
-          host_id: "host-1",
-          socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
-          token: "tok",
-          expires_at: Date.now() / 1000 + 300,
-        }),
+      "direct-access": directGrantResponse,
       GetCapabilities: () =>
         new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
-      GetPullRequest: () => refusal("failed_precondition", 400, "pull_request_changed"),
+      GetPullRequest: () =>
+        new Response(prPayload({ available: true }), { headers: PROTO_HEADERS }),
     });
 
     const refused = await getPullRequest("s-pr-refused").catch((error: unknown) => error);
@@ -1739,7 +1740,7 @@ describe("callPullRequestMethod", () => {
     expect(refused).toBeInstanceOf(ConnectError);
     expect((refused as ConnectError).code).toBe(Code.FailedPrecondition);
     expect(pullRequestFailureReason(refused)).toBe("pull_request_changed");
-    expect(methodCalls("GetPullRequest")).toHaveLength(1);
+    expect(methodCalls("GetPullRequest")).toHaveLength(0);
   });
 
   it("reads through the next route when the first one is away", async () => {
@@ -1750,13 +1751,7 @@ describe("callPullRequestMethod", () => {
         : fromSocket(new TextEncoder().encode('{"code":"unavailable"}'), 503),
     );
     serveMethods({
-      "direct-access": () =>
-        Response.json({
-          host_id: "host-1",
-          socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
-          token: "tok",
-          expires_at: Date.now() / 1000 + 300,
-        }),
+      "direct-access": directGrantResponse,
       GetCapabilities: () =>
         new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
       GetPullRequest: () =>
@@ -1811,18 +1806,19 @@ describe("callPullRequestMethod", () => {
 });
 
 describe("callPullRequestWrite", () => {
-  const comment = (sessionId: string) =>
-    callPullRequestWrite(sessionId, "createComment", async (client) => {
-      const response = await client.createComment({ prUrl: PR_URL, body: "Looks good" });
-      return response.payload;
-    });
-  const grant = () =>
-    Response.json({
-      host_id: "host-1",
-      socket_path: "/tmp/omnigent-workspace-x/workspace.sock",
-      token: "tok",
-      expires_at: Date.now() / 1000 + 300,
-    });
+  const comment = (sessionId: string, signal?: AbortSignal) =>
+    callPullRequestWrite(
+      sessionId,
+      "createComment",
+      async (client) => {
+        const response = await client.createComment(
+          { prUrl: PR_URL, body: "Looks good" },
+          { signal },
+        );
+        return response.payload;
+      },
+      { signal },
+    );
 
   it("doesn't send a comment again when the connection drops after the host posted it", async () => {
     enable("workspace_direct_access", "workspace_api_server_access");
@@ -1835,7 +1831,7 @@ describe("callPullRequestWrite", () => {
       throw new Error("socket hang up");
     });
     serveMethods({
-      "direct-access": grant,
+      "direct-access": directGrantResponse,
       GetCapabilities: () =>
         new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
       CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
@@ -1864,8 +1860,10 @@ describe("callPullRequestWrite", () => {
   it("gets one fresh grant for a refused token and posts once on the same route", async () => {
     enable("workspace_direct_access", "workspace_api_server_access");
     let refusedOnce = false;
+    let capabilityChecks = 0;
     socket.mockImplementation(async (request) => {
       if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        capabilityChecks += 1;
         return unaryFromSocket(capabilitiesBody("CreateComment"));
       }
       if (!refusedOnce) {
@@ -1875,7 +1873,7 @@ describe("callPullRequestWrite", () => {
       return unaryFromSocket(commentPosted());
     });
     serveMethods({
-      "direct-access": grant,
+      "direct-access": directGrantResponse,
       GetCapabilities: () =>
         new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
     });
@@ -1883,6 +1881,9 @@ describe("callPullRequestWrite", () => {
     expect(await comment("s-pr-expired")).toEqual({ id: "c-1" });
     expect(grantRequests()).toBe(2);
     expect(methodCalls("CreateComment")).toHaveLength(0);
+    // A restarted host may serve other methods, so the next write asks it again.
+    expect(await comment("s-pr-expired")).toEqual({ id: "c-1" });
+    expect(capabilityChecks).toBe(2);
   });
 
   it("gets one fresh grant for a pull request the token doesn't list, then posts once", async () => {
@@ -1895,7 +1896,7 @@ describe("callPullRequestWrite", () => {
       sends += 1; // the host checks the token's pull requests before it posts
       return sends === 1 ? notGrantedFromSocket() : unaryFromSocket(commentPosted());
     });
-    serveMethods({ "direct-access": grant });
+    serveMethods({ "direct-access": directGrantResponse });
 
     expect(await comment("s-pr-write-newly-linked")).toEqual({ id: "c-1" });
     expect(sends).toBe(2);
@@ -1914,7 +1915,7 @@ describe("callPullRequestWrite", () => {
       return notGrantedFromSocket();
     });
     serveMethods({
-      "direct-access": grant,
+      "direct-access": directGrantResponse,
       GetCapabilities: () =>
         new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
     });
@@ -1947,7 +1948,7 @@ describe("callPullRequestWrite", () => {
     enable("workspace_direct_access", "workspace_api_server_access");
     socket.mockRejectedValue(new Error("not a workspace socket on this machine"));
     serveMethods({
-      "direct-access": grant,
+      "direct-access": directGrantResponse,
       GetCapabilities: () =>
         new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
       CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
@@ -1958,18 +1959,99 @@ describe("callPullRequestWrite", () => {
   });
 
   it("throws a refusal and sends nothing anywhere else", async () => {
-    enable("workspace_api_server_access");
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let sends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      sends += 1;
+      return fromSocket(
+        new TextEncoder().encode(
+          JSON.stringify(refusalBody("permission_denied", "read_only_code_host")),
+        ),
+        403,
+      );
+    });
     serveMethods({
+      "direct-access": directGrantResponse,
       GetCapabilities: () =>
         new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
-      CreateComment: () => refusal("permission_denied", 403, "read_only_code_host"),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
     });
 
     const refused = await comment("s-pr-denied").catch((error: unknown) => error);
 
     expect((refused as ConnectError).code).toBe(Code.PermissionDenied);
     expect(pullRequestFailureReason(refused)).toBe("read_only_code_host");
-    expect(methodCalls("CreateComment")).toHaveLength(1);
+    expect(sends).toBe(1);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("posts once on the next route when a host lists the write but doesn't serve it", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let directSends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      directSends += 1; // the host answers without acting
+      return fromSocket(new TextEncoder().encode('{"code":"unimplemented"}'), 501);
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    expect(await comment("s-pr-unimplemented")).toEqual({ id: "c-1" });
+    expect(await comment("s-pr-unimplemented")).toEqual({ id: "c-1" });
+    expect(directSends).toBe(1);
+    expect(methodCalls("CreateComment")).toHaveLength(2);
+  });
+
+  it("counts a write cancelled after it left as maybe sent, and doesn't send it again", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    const controller = new AbortController();
+    let posted = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      posted += 1;
+      controller.abort(); // the reader leaves while the host is posting
+      return new Promise<never>(() => {});
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    const failed = await comment("s-pr-cancelled", controller.signal).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failed).toBeInstanceOf(PullRequestMaybeSentError);
+    expect(posted).toBe(1);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
+  it("stops without sending when it's cancelled before the request leaves", async () => {
+    enable("workspace_api_server_access");
+    const controller = new AbortController();
+    controller.abort();
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+    });
+
+    await expect(comment("s-pr-cancelled-early", controller.signal)).rejects.not.toBeInstanceOf(
+      PullRequestMaybeSentError,
+    );
+    expect(methodCalls("CreateComment")).toHaveLength(0);
   });
 
   it("leaves the write to REST only when no route lists it", async () => {

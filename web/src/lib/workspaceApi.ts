@@ -95,13 +95,7 @@ function routeKey(route: Route, sessionId: string, sshTarget?: string | null): s
 }
 
 function routesFor(sessionId: string, sshTarget?: string | null): Route[] {
-  const info = getCachedServerInfo() ?? "loading";
-  const routes: Route[] = [];
-  if (workspaceSocketBridge() && isFeatureEnabled(info, "workspace_direct_access")) {
-    routes.push("direct");
-  }
-  if (isFeatureEnabled(info, "workspace_api_server_access")) routes.push("server");
-  return routes.filter(
+  return enabledWorkspaceRoutes().filter(
     (route) => (failedUntil.get(routeKey(route, sessionId, sshTarget)) ?? 0) <= Date.now(),
   );
 }
@@ -1019,7 +1013,7 @@ export async function callPullRequestMethod<T>(
 /** A route of the session whose host answered its capability check. */
 export interface ServingRoute {
   route: Route;
-  /** Changes with the host key or a flag that drops the route; a decision holds while it doesn't. */
+  /** Names this route for the session; it stays the same when the session moves to another host. */
   key: string;
   served: ReadonlySet<string>;
 }
@@ -1076,7 +1070,8 @@ export class PullRequestMaybeSentError extends Error {
  * next route. The same goes for an answer that the host didn't act on: `UNIMPLEMENTED`,
  * or a direct token the host refused before dispatch (expired, or not listing the pull
  * request), which gets one fresh grant on the same route. A refusal is thrown as is.
- * Any other failure is thrown as {@link PullRequestMaybeSentError}, and the write isn't
+ * Any other failure, a cancel after the request left included, is thrown as
+ * {@link PullRequestMaybeSentError}, and the write isn't
  * retried anywhere, REST included, since many writes (comments, reactions) would land
  * twice. That includes a connection refused after the capability check: neither route
  * tells it apart from one dropped mid-call, so it stays on the safe side.
@@ -1104,18 +1099,21 @@ export async function callPullRequestWrite<T>(
     }
     if (!served.has(capabilityName(method))) continue;
     for (let attempt = 0; ; attempt++) {
-      if (route === "direct") {
-        try {
-          await abortable(directGrant(sessionId), signal);
-        } catch {
-          signal?.throwIfAborted();
-          break; // no grant, so nothing was sent
-        }
-      }
+      // Set once the request is handed to the route; before that, nothing was sent.
+      let sent = false;
+      const send = (client: WorkspaceClient) => {
+        sent = true;
+        return call(client);
+      };
       try {
-        return await callOn(route, sessionId, call, signal, null, PULL_REQUEST_ANSWER_CODES);
+        return await callOn(route, sessionId, send, signal, null, PULL_REQUEST_ANSWER_CODES);
       } catch (error) {
-        signal?.throwIfAborted();
+        if (!sent) {
+          signal?.throwIfAborted();
+          break; // no grant or no shell, so nothing was sent
+        }
+        // Cancelling stops the wait, not the host, which may still act on the request.
+        if (signal?.aborted) throw new PullRequestMaybeSentError(error);
         const code = error instanceof ConnectError ? error.code : null;
         // Refused before dispatch, and the refusal dropped the token: one fresh one.
         if (route === "direct" && pullRequestNotGranted(error) && attempt === 0) continue;
@@ -1125,7 +1123,11 @@ export async function callPullRequestWrite<T>(
           break; // the host answered without acting
         }
         // The host checks a direct token before it dispatches, so a refused one sent nothing.
-        if (route === "direct" && code === Code.Unauthenticated && attempt === 0) continue;
+        if (route === "direct" && code === Code.Unauthenticated && attempt === 0) {
+          // A restarted host may serve other methods, so its capabilities are read again.
+          capabilities.delete(key);
+          continue;
+        }
         if (code === Code.Unauthenticated) throw error;
         throw new PullRequestMaybeSentError(error);
       }
