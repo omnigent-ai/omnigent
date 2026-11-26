@@ -33,10 +33,7 @@ export interface CodeHostPullRequest {
   number: number;
   /** The link without query, fragment, or trailing path. */
   url: string;
-  /**
-   * GitHub, read on this Mac: one of its logins the Pull Requests page reads as by name,
-   * for the reads main allows that way; absent everywhere else.
-   */
+  /** A login to read this pull request as, when the desktop shell supplies one. */
   readAs?: string;
 }
 
