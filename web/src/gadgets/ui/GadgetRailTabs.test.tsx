@@ -558,6 +558,71 @@ describe("New gadget tab", () => {
     },
   );
 
+  it("deletes a gadget whose create finishes after Cancel in a pane remounted meanwhile", async () => {
+    const created = gadgetFixture({ id: "3", name: "Incident tracker", published_revision: null });
+    let finishCreate: (gadget: Gadget) => void = () => {};
+    vi.mocked(createGadget).mockReturnValue(
+      new Promise<Gadget>((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    const { rerender } = renderWithGadgets(<Rail conversationId="conv_b" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    await screen.findByRole("textbox", { name: "Describe the gadget" });
+    rerender(<Rail conversationId="conv_a" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    let content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "An incident tracker for my team" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    await waitFor(() => expect(createGadget).toHaveBeenCalled());
+
+    // Away and back: the pane is a new one, but Cancel still ends the build it started.
+    rerender(<Rail conversationId="conv_b" />);
+    await screen.findByRole("textbox", { name: "Describe the gadget" });
+    rerender(<Rail conversationId="conv_a" />);
+    content = await screen.findByRole("region", { name: "content" });
+    fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+    finishCreate(created);
+
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("3"));
+    expect(linkGadgetToSession).not.toHaveBeenCalled();
+    expect(openGadgetSession).not.toHaveBeenCalled();
+  });
+
+  it("deletes the gadget when its build message, on its way at Cancel, is refused", async () => {
+    const created = gadgetFixture({ id: "3", name: "Incident tracker", published_revision: null });
+    vi.mocked(createGadget).mockResolvedValue(created);
+    vi.mocked(deleteGadget).mockResolvedValue(undefined);
+    vi.mocked(linkGadgetToSession).mockResolvedValue([BOARD, REPORT, created]);
+    const { DeliveryFailed } = await vi.importActual<typeof GadgetSessionModule>(
+      "@/gadgets/host/gadgetSession",
+    );
+    let refuse: (error: unknown) => void = () => {};
+    vi.mocked(openGadgetSession).mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        refuse = reject;
+      }),
+    );
+    renderWithGadgets(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));
+    const content = await screen.findByRole("region", { name: "content" });
+    fireEvent.change(within(content).getByRole("textbox", { name: "Describe the gadget" }), {
+      target: { value: "An incident tracker for my team" },
+    });
+    fireEvent.click(within(content).getByRole("button", { name: "Build" }));
+    await waitFor(() => expect(openGadgetSession).toHaveBeenCalled());
+    fireEvent.click(within(content).getByRole("button", { name: "Cancel" }));
+    // On its way: Cancel can't take it back yet.
+    expect(deleteGadget).not.toHaveBeenCalled();
+
+    refuse(new DeliveryFailed("UNAVAILABLE", "This session did not get the request", true));
+
+    await waitFor(() => expect(deleteGadget).toHaveBeenCalledWith("3"));
+  });
+
   it("closes without building on Cancel", async () => {
     renderWithGadgets(<Rail conversationId="conv_1" />);
     fireEvent.click(await screen.findByRole("button", { name: "Gadget" }));

@@ -251,6 +251,42 @@ describe("gadget comments", () => {
     expect(address.mock.calls[0][0]).not.toContain("Body of c2");
   });
 
+  it("after a delivery whose marking failed, retries only the marking, not the send", async () => {
+    // The server's comments: marking one addressed commits unless it fails first.
+    const addressed = new Set<string>();
+    vi.mocked(listGadgetComments).mockImplementation(async () => ({
+      items: ["c1", "c2"].map((id) =>
+        comment(id, { status: addressed.has(id) ? "addressed" : "draft" }),
+      ),
+      canComment: true,
+    }));
+    // c2's first mark fails before it commits; c1's succeeds.
+    let c2Marks = 0;
+    vi.mocked(updateGadgetComment).mockImplementation(async (_id, commentId) => {
+      if (commentId === "c2" && (c2Marks += 1) === 1) throw new Error("offline");
+      addressed.add(commentId);
+      return comment(commentId, { status: "addressed" });
+    });
+    const address = vi.fn(
+      async (_message: string, _onDelivered: (id: string) => void) => "sent" as const,
+    );
+    const { result } = renderHook(() => useGadgetComments(BOARD, address), { wrapper });
+    await waitFor(() => expect(result.current.draftCount).toBe(2));
+
+    act(() => result.current.panel.onAddressAll());
+    await waitFor(() => expect(result.current.draftCount).toBe(1));
+    await waitFor(() => expect(result.current.panel.addressPending).toBe(false));
+    expect(result.current.error).toBeInstanceOf(Error);
+
+    act(() => result.current.panel.onAddressAll());
+    await waitFor(() => expect(result.current.draftCount).toBe(0));
+    // Sent once: the retry marked c2 without handing the session the same work again.
+    expect(address).toHaveBeenCalledTimes(1);
+    expect(result.current.error).toBeUndefined();
+    vi.mocked(updateGadgetComment).mockReset();
+    vi.mocked(listGadgetComments).mockReset();
+  });
+
   it("leaves the viewer's own comments theirs to edit or delete, as in single-user mode", async () => {
     const local = gadgetFixture({ id: "board", owner_id: "local", viewer_id: "local" });
     vi.mocked(listGadgetComments).mockResolvedValue({

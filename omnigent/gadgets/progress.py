@@ -21,8 +21,9 @@ as offline, not as running in-process. Sessions are matched by creation time, so
 attribution without a recorded session can include an unrelated child and keep the
 action running longer, never shorter, and when an action's own session tree or family
 is too large to read whole (so a worker may be missing) it is not called finished. An
-independent session that is in no family, wasn't recorded on the action and isn't among
-the workspace's newest sessions is not found; the skill asks the agent to record it.
+independent session that is in no family and wasn't recorded on the action is not found:
+finding it would mean scanning the workspace's sessions, so the skill asks the agent to
+record it.
 """
 
 from __future__ import annotations
@@ -46,11 +47,8 @@ SILENT_RUNNING_LIMIT_S = 60 * 60
 # A message to a stopped gadget session marks it working before its runner is back; for this long
 # after the delivery that session is starting, not interrupted. Sandboxes can take minutes to wake.
 RUNNER_START_GRACE_S = 10 * 60
-# Child sessions considered per gadget session tree (one bounded spawn-tree read), and the
-# workspace's newest sessions searched for independent ones a gadget session started outside
-# its family.
+# Child sessions considered per gadget session tree (one bounded spawn-tree read).
 MAX_CHILD_SESSIONS = 100
-MAX_RECENT_SESSIONS = 50
 
 REPORTED_TERMINAL = ("done", "failed", "cancelled")
 # Reported states that say the gadget session took the action up.
@@ -413,9 +411,9 @@ class SessionStateReader:
         for conversation in list(conversations.values()):
             read_tree(conversation)
         # Independent sessions have no parent link, only a label naming the session that started
-        # them. Sessions a session starts join its family, which is one bounded read; ones
-        # started outside a family are looked for among the workspace's newest sessions (also
-        # bounded: no per-owner permission scan).
+        # them. Sessions a session starts join its family, which is one bounded read. One
+        # started outside a family is found only through the action, which records the session
+        # it hands work to: a workspace-wide listing would scan the session history.
         candidates: dict[str, Any] = {}
         families = sorted(
             {family for c in conversations.values() if (family := getattr(c, "family_id", None))}
@@ -429,15 +427,6 @@ class SessionStateReader:
                 pass
             except OmnigentError:
                 complete = False  # A family too large to read: some members are unknown.
-        # Best effort only: a just-started worker outside a family is usually among the
-        # newest sessions. A longer history is not evidence that one is missing, so it
-        # doesn't make the read incomplete; the agent records the session it hands work to
-        # on the action, which is read directly.
-        recent = self._store.list_conversations(
-            limit=MAX_RECENT_SESSIONS, kind=None, include_archived=True
-        )
-        for conversation in recent.data:
-            candidates.setdefault(conversation.id, conversation)
         # A worker can start workers of its own: follow the labels until nothing new is found.
         found = True
         while found:

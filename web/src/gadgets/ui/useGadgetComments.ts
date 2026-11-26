@@ -163,6 +163,9 @@ export function useGadgetComments(
   // committed, so a retry repeats it unchanged and then applies any edit separately.
   const sentBody = useRef<{ operationId: string; body: string } | null>(null);
 
+  // Comment bodies, by ID, that reached the session but aren't marked addressed yet.
+  const deliveredBodies = useRef(new Map<string, string>());
+
   const startComment = useCallback((selection: GadgetSelection) => {
     pendingPositions += 1;
     setPendingPosition(-pendingPositions);
@@ -229,16 +232,41 @@ export function useGadgetComments(
       },
       onAddressAll: () => {
         if (address === undefined || drafts.length === 0) return;
-        const ids = drafts.map((item) => item.id);
-        const markAddressed = () =>
-          Promise.all(ids.map((id) => updateGadgetComment(gadgetId, id, { status: "addressed" })));
+        // Comments the session already got, as they read then, only need marking: sending
+        // them again would hand it the same work twice. An edited one is sent again.
+        const delivered = deliveredBodies.current;
+        const known = drafts.filter((item) => delivered.get(item.id) === item.body);
+        const fresh = drafts.filter((item) => delivered.get(item.id) !== item.body);
+        const markAddressed = async (toMark: GadgetComment[]) => {
+          const results = await Promise.allSettled(
+            toMark.map((item) => updateGadgetComment(gadgetId, item.id, { status: "addressed" })),
+          );
+          results.forEach((result, index) => {
+            if (result.status === "fulfilled") delivered.delete(toMark[index].id);
+          });
+          const failed = results.find((result) => result.status === "rejected");
+          if (failed) throw failed.reason;
+        };
+        const remember = (sent: GadgetComment[]) => {
+          for (const item of sent) delivered.set(item.id, item.body);
+        };
         setAddressing(true);
         void run(async () => {
-          const delivery = await address(gadgetCommentsMessage(gadget, drafts), () => {
+          if (fresh.length === 0) {
+            await markAddressed(known);
+            return;
+          }
+          const delivery = await address(gadgetCommentsMessage(gadget, fresh), () => {
             // The session started in New session got them; until then they stay open.
-            void run(markAddressed);
+            remember(fresh);
+            void run(() => markAddressed([...known, ...fresh]));
           });
-          if (delivery === "sent") await markAddressed();
+          if (delivery === "sent") {
+            remember(fresh);
+            await markAddressed([...known, ...fresh]);
+          } else if (known.length > 0) {
+            await markAddressed(known);
+          }
         }).finally(() => setAddressing(false));
       },
       onEditComment: (id, body) => void run(() => updateGadgetComment(gadgetId, id, { body })),

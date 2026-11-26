@@ -47,6 +47,7 @@ class FakeConversations:
         labels: dict | None = None,
         background: bool = False,
         bound: bool = False,
+        family: str | None = None,
     ) -> None:
         root = self.rows[parent].root_conversation_id if parent else session_id
         self.rows[session_id] = SimpleNamespace(
@@ -59,6 +60,7 @@ class FakeConversations:
             pending_elicitation_count=pending,
             labels=labels or {},
             background_work_running=background,
+            family_id=family,
         )
         self.seen[session_id] = seen
         if bound:
@@ -105,7 +107,11 @@ class FakeConversations:
         return SimpleNamespace(data=ordered[:limit], has_more=len(ordered) > limit)
 
     def get_session_families(self, family_ids: list[str]) -> dict:
-        raise NotImplementedError
+        self.reads.append(("families", tuple(family_ids), None))
+        return {
+            family: [row for row in self.rows.values() if row.family_id == family]
+            for family in family_ids
+        }
 
     def get_session_connectivity(self, ids: list[str]) -> dict:
         return {
@@ -227,7 +233,7 @@ def test_an_independent_worker_does_not_borrow_its_creators_heartbeat(
     gadgets: Fixture, clock: dict
 ) -> None:
     conversations = FakeConversations()
-    conversations.add("s_gadget", seen=NOW)
+    conversations.add("s_gadget", seen=NOW, family="f_gadget")
     service = progress_service(gadgets, conversations)
     app = publish_actions_board(service)
     service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
@@ -241,6 +247,7 @@ def test_an_independent_worker_does_not_borrow_its_creators_heartbeat(
         seen=None,
         bound=True,
         labels={"omnigent.created_by_session_id": "s_gadget"},
+        family="f_gadget",
     )
     conversations.set("s_gadget", status="idle", updated=NOW + 2, seen=NOW + 11 * 60)
 
@@ -369,9 +376,8 @@ def test_asking_again_for_an_open_action_joins_it(
     conversations = FakeConversations()
     conversations.add("s_gadget", status="running", updated=NOW)
     if unrelated:
-        # More unrelated sessions than the newest-session listing holds, all from before the
-        # delivery: they say nothing about this action, so it still settles.
-        monkeypatch.setattr(progress_module, "MAX_RECENT_SESSIONS", 2)
+        # Unrelated sessions, all from before the delivery: they say nothing about this
+        # action, so it still settles.
         for n in range(4):
             conversations.add(f"s_other{n}", created=NOW - 900 + n, updated=NOW - 900 + n)
     service = progress_service(gadgets, conversations)
@@ -478,7 +484,7 @@ def test_independent_sessions_and_background_work_keep_an_action_running(
     gadgets: Fixture, clock: dict
 ) -> None:
     conversations = FakeConversations()
-    conversations.add("s_gadget")
+    conversations.add("s_gadget", family="f_gadget")
     service = progress_service(gadgets, conversations)
     app = publish_actions_board(service)
     service.set_gadget_session(app["id"], {"session_id": "s_gadget"})
@@ -492,6 +498,7 @@ def test_independent_sessions_and_background_work_keep_an_action_running(
         updated=NOW + 9,
         seen=None,
         labels={"omnigent.created_by_session_id": "s_gadget"},
+        family="f_gadget",
     )
     conversations.set("s_gadget", status="idle", updated=NOW + 3)
     assert status(service, app, action_id) == ("running", None)
@@ -664,8 +671,7 @@ def test_the_gadget_session_status_is_unknown_when_its_tree_was_not_all_read(
 def test_the_gadget_session_status_ignores_the_owners_other_sessions(
     gadgets: Fixture, clock: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A viewer with more sessions than the recent-session listing holds still gets an answer.
-    monkeypatch.setattr(progress_module, "MAX_RECENT_SESSIONS", 2)
+    # A viewer with many other sessions still gets an answer.
     conversations = FakeConversations()
     service = progress_service(gadgets, conversations)
     app = publish_actions_board(service)
@@ -683,10 +689,11 @@ def test_the_reader_follows_a_real_conversation_store(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation(title="Gadget session")
     child = store.create_conversation(title="Worker", parent_conversation_id=parent.id)
-    # A session it started on its own, linked only by the creator label.
+    # A session it started on its own: in its family, labelled with its creator.
     independent = store.create_conversation(
         title="Independent worker", labels={"omnigent.created_by_session_id": parent.id}
     )
+    store.add_new_sibling(parent.id, independent.id, user_id=None, move_existing=True)
     store.create_conversation(title="Someone else's work")
     listings: list[dict] = []
     real_list = store.list_conversations
@@ -702,10 +709,10 @@ def test_the_reader_follows_a_real_conversation_store(db_uri: str) -> None:
     assert set(states) == {parent.id, child.id, independent.id}
     assert states[child.id].parent_id == parent.id
     # Bounded reads only: trees through the root index (list_spawn_tree reads it in id order),
-    # and no per-owner listing, which loads every one of the owner's permissions first.
-    assert all(call.get("owned_by") is None for call in listings)
+    # never a workspace-wide or per-owner listing, which scan the session history.
+    assert listings
     assert all(
-        call.get("root_conversation_id") is None or call.get("sort_by") == "id"
+        call.get("root_conversation_id") is not None and call.get("sort_by") == "id"
         for call in listings
     )
     assert states[parent.id].status == "idle"
@@ -723,9 +730,8 @@ def test_a_gadget_session_that_fails_on_delivery_reports_its_failure_at_once(
     conversations = FakeConversations()
     conversations.add("s_gadget", seen=None)
     if many_sessions:
-        # More sessions than the recent-session listing holds, none related: the listing is
-        # incomplete, but the gadget session's own failure is known and says what happened.
-        monkeypatch.setattr(progress_module, "MAX_RECENT_SESSIONS", 2)
+        # Many sessions, none related: the gadget session's own failure is known and says
+        # what happened.
         for n in range(4):
             conversations.add(f"s_other{n}", created=NOW - 900 + n, updated=NOW - 900 + n)
     service = progress_service(gadgets, conversations)

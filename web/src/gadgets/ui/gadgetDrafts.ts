@@ -106,9 +106,32 @@ export function setUnfinishedGadgetBuild(
   else unfinishedBuilds.set(sessionId, build);
 }
 
+/**
+ * The session's build in progress: which run is current (a newer run or Cancel bumps it, and
+ * the older run's steps stop), and whether its build message is on its way. Per session, not
+ * per pane, so a pane remounted after a visit to another session owns the same run.
+ */
+export interface GadgetBuildRun {
+  run: number;
+  /** The run whose build message is on its way, or `null`. */
+  delivering: number | null;
+}
+
+const buildRuns = new Map<string, GadgetBuildRun>();
+
+export function gadgetBuildRun(sessionId: string): GadgetBuildRun {
+  let state = buildRuns.get(sessionId);
+  if (state === undefined) {
+    state = { run: 0, delivering: null };
+    buildRuns.set(sessionId, state);
+  }
+  return state;
+}
+
 /** Forgets every draft; for tests. */
 export function resetGadgetDrafts(): void {
   writeDrafts(new Map());
   unfinishedBuilds.clear();
+  buildRuns.clear();
   useGadgetDrafts.setState({ drafts: new Map() });
 }

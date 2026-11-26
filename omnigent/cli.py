@@ -13364,13 +13364,13 @@ def debug_migrate_accounts_to_oidc(
     Examples:
       # Dry run: append the org domain to every username
       omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com \\
-        --config /data/config.yaml
+        --gadget-dir /data/gadgets
       # Apply it
       omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --domain example.com \\
-        --config /data/config.yaml --commit
+        --gadget-dir /data/gadgets --commit
       # Explicit per-user mapping (add --commit to apply)
       omnigent debug migrate-accounts-to-oidc sqlite:///chat.db --map alice=alice@corp.com \\
-        --config /data/config.yaml
+        --gadget-dir /data/gadgets
 
     Gadgets are not moved: a user who owns gadgets or has pinned ones is
     refused, and their rows stay as they are. Delete or hand off those

@@ -53,6 +53,7 @@ import {
   gadgetDraftText,
   unfinishedGadgetBuild,
   useHasGadgetDraft,
+  gadgetBuildRun,
 } from "./gadgetDrafts";
 import {
   gadgetOpenKeepsSidebar,
@@ -198,8 +199,7 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
   // Cancel ends the build in progress: each step checks it is still the current one, and a
   // gadget it made after Cancel is deleted. Once the build message is on its way it can't be
   // taken back, so that step finishes and shows the gadget the session is building.
-  const operation = useRef(0);
-  const delivering = useRef(false);
+  const runs = gadgetBuildRun(sessionId);
   // Forgets the failed build, deleting its gadget unless its build message may have reached
   // the session: then the session may be building it, so it stays in the viewer's gadgets.
   const dropUnfinished = () => {
@@ -210,8 +210,8 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
     }
   };
   const build = async (description: string) => {
-    const run = ++operation.current;
-    const cancelled = () => run !== operation.current;
+    const run = ++runs.run;
+    const cancelled = () => run !== runs.run;
     let gadget = unfinished.current?.description === description ? unfinished.current.gadget : null;
     if (gadget === null) {
       // The description changed since the failed try: its gadget is not this one.
@@ -227,7 +227,7 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
     await show(gadget);
     // Cancel already deleted the unfinished gadget.
     if (cancelled()) return;
-    delivering.current = true;
+    runs.delivering = run;
     try {
       await openGadgetSession(gadget, composeGadgetBuildPrompt(gadget, description), navigate, {
         deliver: true,
@@ -235,19 +235,23 @@ function GadgetDraftPane({ sessionId, view }: { sessionId: string; view: GadgetT
         railSessionId: sessionId,
       });
     } catch (error) {
-      if (!mayHaveBeenDelivered(error)) throw error;
+      if (!mayHaveBeenDelivered(error)) {
+        // Cancelled while it was on its way, and it never arrived: finish the cancel.
+        if (cancelled()) dropUnfinished();
+        throw error;
+      }
       unfinished.current = { description, gadget, maybeDelivered: true };
       throw error;
     } finally {
-      delivering.current = false;
+      if (runs.delivering === run) runs.delivering = null;
     }
     unfinished.current = null;
     openGadgetTab(gadget);
   };
   // Cancel leaves no half-made gadget behind, except one already being built.
   const cancel = () => {
-    operation.current += 1;
-    if (!delivering.current) dropUnfinished();
+    runs.run += 1;
+    if (runs.delivering === null) dropUnfinished();
   };
   const cancelRef = useRef(cancel);
   cancelRef.current = cancel;
