@@ -6450,15 +6450,15 @@ async function reconcileOnReconnect(
   settleStatus = true,
 ): Promise<ReconnectBackfill> {
   // Failed reads still owe the same gap, whichever caller retries it. Retain
-  // acknowledged submissions as reservations, then append sends eligible for
-  // this newer read.
+  // acknowledged submissions as reservations, bounding only those: a current
+  // submission must stay eligible for this newer read.
   const binding = get().abortController;
-  const retained = (binding && shellReservationsByController.get(binding)) ?? [];
-  const retainedIds = new Set(retained.map((p) => p.tempId));
-  const reserved = [
-    ...retained,
-    ...get().pendingUserMessages.filter((p) => !retainedIds.has(p.tempId)),
-  ].slice(0, MAX_SETTLED_SHELL_INPUTS);
+  const pending = get().pendingUserMessages;
+  const pendingIds = new Set(pending.map((p) => p.tempId));
+  const acknowledged = ((binding && shellReservationsByController.get(binding)) ?? [])
+    .filter((p) => !pendingIds.has(p.tempId))
+    .slice(-MAX_SETTLED_SHELL_INPUTS);
+  const reserved = [...acknowledged, ...pending];
   if (binding) shellReservationsByController.set(binding, reserved);
   const outcome = await reconcileReservedOnReconnect(
     id,
@@ -8714,6 +8714,10 @@ function settleRecoveredShellInputs(
     const candidate = settled
       ? undefined
       : candidates.find((p) => isShellCommandBubble(p, block.input));
+    // An unreserved submission may own this input: leave it to its live event.
+    if (!candidate && next.pendingUserMessages.some((p) => isShellCommandBubble(p, block.input))) {
+      continue;
+    }
     next = settleShellInput(next, block.ctx.itemId, block.input, candidate ? [candidate] : []);
     if (candidate) candidates = candidates.filter((p) => p.tempId !== candidate.tempId);
   }

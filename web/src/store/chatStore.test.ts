@@ -17603,6 +17603,100 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
+  it.each([{ submitted: "before the retry" }, { submitted: "during the retry" }])(
+    "settles a command submitted $submitted of a failed read that filled its reservations",
+    async ({ submitted }) => {
+      const id = "conv_shell_reservations_full";
+      const before = userMessage("before", "hello");
+      seedSession(id, [before]);
+      const queued = (tempId: string, text: string) => ({
+        tempId,
+        pendingId: `pending_${tempId}`,
+        content: [{ type: "input_text" as const, text }],
+        posted: true,
+      });
+      // As many submissions as the reservation bound holds.
+      const stale = Array.from({ length: 64 }, (_, i) => queued(`stale_${i}`, `note ${i}`));
+      const receipts = stale.map((p) => userMessage(`receipt_${p.tempId}`, p.content[0]!.text));
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: stale,
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+
+      // The first recovery read reserves every submission, then fails.
+      const route = fetchMock.getMockImplementation()!;
+      let failSnapshot = true;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (failSnapshot && String(input).split("?")[0] === `/v1/sessions/${id}`) {
+          failSnapshot = false;
+          return mockResponse({ detail: "temporarily unavailable" }, { ok: false, status: 503 });
+        }
+        return route(input, init);
+      });
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      stale.forEach((p, i) =>
+        sinks[1]!.push(
+          sse("session.input.consumed", {
+            data: {
+              item_id: receipts[i]!.id,
+              type: "message",
+              cleared_pending_id: p.pendingId,
+              data: { role: "user", content: p.content },
+            },
+          }),
+        ),
+      );
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+
+      // The retry's snapshot returns the new command's input before its live mirror.
+      const input: ConversationItem = {
+        id: "new_shell_input",
+        response_id: "new_shell_turn",
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "ls",
+      };
+      seedSessionItems(id, [before, ...receipts, input]);
+      const command = queued("new", "!ls");
+      if (submitted === "before the retry") {
+        useChatStore.setState({ pendingUserMessages: [command] });
+      }
+      const releaseSnapshot = holdNextSessionSnapshot(id);
+      sinks[1]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(3);
+      if (submitted === "during the retry") {
+        useChatStore.setState({ pendingUserMessages: [command] });
+      }
+      releaseSnapshot();
+      await drainAsync();
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(input.id);
+      // Only a submission the read reserved settles here; a later one waits for its mirror.
+      expect(useChatStore.getState().pendingUserMessages).toEqual(
+        submitted === "before the retry" ? [] : [command],
+      );
+
+      sinks[2]!.push(sse("response.output_item.done", { item: input }));
+      await drainAsync();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+
+      sinks[2]!.push("data: [DONE]\n\n");
+      sinks[2]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
   it.each([
     ...[
       { timing: "during the gap", shellCount: 1, receiptCount: 1 },
