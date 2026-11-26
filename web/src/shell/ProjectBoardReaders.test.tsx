@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getProject, updateProjectConfig } from "@/lib/projectsApi";
+import { getBoardReadAudit, getProject, updateProjectConfig } from "@/lib/projectsApi";
 import { ProjectBoardReadersSection } from "./ProjectSharing";
 
 const SELF = "a".repeat(32);
@@ -9,6 +9,7 @@ const SISTER = "b".repeat(32);
 const UNSEEN = "c".repeat(32);
 
 vi.mock("@/lib/projectsApi", () => ({
+  getBoardReadAudit: vi.fn(),
   getProject: vi.fn(),
   listProjectShares: vi.fn(),
   revokeProjectShare: vi.fn(),
@@ -25,7 +26,16 @@ vi.mock("@/hooks/useConversations", () => ({
   }),
 }));
 
-function renderAs(readers: string[], shared: boolean) {
+function renderAs(
+  readers: string[],
+  shared: boolean,
+  reads: { project_id: string; project_name: string | null; reads: number }[] = [],
+) {
+  vi.mocked(getBoardReadAudit).mockResolvedValue({
+    since: 0,
+    recording: true,
+    data: reads.map((entry) => ({ ...entry, actions: {}, last_read_at: 1 })),
+  });
   vi.mocked(getProject).mockResolvedValue({
     id: SELF,
     name: "Home",
@@ -92,5 +102,16 @@ describe("ProjectBoardReadersSection", () => {
     expect(await screen.findByText("Sister factory")).toBeTruthy();
     expect(screen.queryByTestId("board-reader-input")).toBeNull();
     expect(screen.queryByRole("button", { name: /Stop .* reading this board/ })).toBeNull();
+  });
+
+  it("shows how often each listed Lead read the board, and recent readers since removed", async () => {
+    renderAs([SISTER], false, [
+      { project_id: SISTER, project_name: "Sister factory", reads: 14 },
+      { project_id: UNSEEN, project_name: null, reads: 1 },
+    ]);
+    expect(
+      await screen.findByText(/Its Lead read this board 14 times in the last day/),
+    ).toBeTruthy();
+    expect(screen.getByTestId("board-former-readers").textContent).toContain(`${UNSEEN} (1 read)`);
   });
 });

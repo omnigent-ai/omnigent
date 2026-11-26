@@ -271,6 +271,30 @@ export async function renameProject(id: string, name: string): Promise<Project> 
  * (the server treats `{}` as "clear", distinct from omitting the field, which
  * leaves config unchanged). Only `config` is sent, so the name is untouched.
  */
+/** One other project whose Lead read this board in the audit window. */
+export interface BoardReadAuditEntry {
+  project_id: string;
+  /** Null when the viewer can't see the reading project. */
+  project_name: string | null;
+  reads: number;
+  actions: Record<string, number>;
+  last_read_at: number;
+}
+
+export interface BoardReadAudit {
+  since: number;
+  /** False when the server records no usage events, so no reads can happen. */
+  recording: boolean;
+  data: BoardReadAuditEntry[];
+}
+
+/** Which other projects' Leads read this board in the last day. */
+export async function getBoardReadAudit(id: string): Promise<BoardReadAudit> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/board-reads/audit`);
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as BoardReadAudit;
+}
+
 export async function updateProjectConfig(id: string, config: ProjectConfig): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
     method: "PATCH",

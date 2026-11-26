@@ -68,6 +68,14 @@ async def test_a_listed_lead_reads_tickets_comments_and_stages_and_each_read_is_
     )
     assert [event.props["action"] for event in events] == ["list", "get", "comments", "stages"]
     assert {event.subject_id for event in events} == {reader["id"]}
+    # The board's people see who read it; a reading project is named only to those who see it.
+    audit = (await client.get(f"{reads}/audit", headers=bob)).json()
+    assert [(row["project_id"], row["reads"]) for row in audit["data"]] == [(reader["id"], 4)]
+    assert audit["data"][0]["actions"] == {"list": 1, "get": 1, "comments": 1, "stages": 1}
+    assert audit["data"][0]["project_name"] is None
+    seen_by_alice = (await client.get(f"{reads}/audit", headers=_as_user(ALICE))).json()
+    assert seen_by_alice["data"][0]["project_name"] == "Reader factory"
+    assert (await client.get(f"{reads}/audit", headers=carol)).status_code == 404
 
     # Refused: the person themselves, a worker, an unshared project that lists the reader.
     assert (await client.get(f"{reads}/tickets", headers=_as_user(ALICE))).status_code == 403

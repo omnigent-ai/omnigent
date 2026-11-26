@@ -14,12 +14,14 @@ from typing import Any
 
 from fastapi import APIRouter, Query, Request
 
+from omnigent.db.utils import now_epoch
 from omnigent.entities.project import Project
 from omnigent.entities.project_ticket import TICKET_PAGE_MAX
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.board_readers import may_read_board
 from omnigent.server.persona_mentions import MentionRateLimiter
+from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.project_lead_messages import calling_lead
 from omnigent.server.usage_events import record_usage_event, usage_event_store
 from omnigent.stores import ConversationStore, PermissionStore, ProjectStore
@@ -31,6 +33,7 @@ BOARD_READS_PER_HOUR = 300
 BOARD_READ_EVENT = "board.read"
 DESCRIPTION_MAX_CHARS = 20_000
 COMMENT_MAX_CHARS = 4_000
+AUDIT_WINDOW_SECONDS = 86_400
 _NOT_FOUND = "No project you may read has that ID"
 _limiter = MentionRateLimiter(limit=BOARD_READS_PER_HOUR, window_seconds=3600)
 
@@ -241,5 +244,45 @@ def create_project_board_reads_router(
         user_id, _, own, target = await reader(request, project_id, "stages")
         configuration = await asyncio.to_thread(tickets.stages, target.id, user_id=user_id)
         return wrapped(target, own, {"stages": _stages(configuration)})
+
+    @router.get("/audit")
+    async def get_board_read_audit(request: Request, project_id: str) -> dict[str, Any]:
+        """Which other projects' Leads read this board in the last day, and how often."""
+        user_id = require_user(request, auth_provider)
+        target = await asyncio.to_thread(projects.get, _identifier(project_id), user_id=user_id)
+        if target is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        store = usage_event_store(request.app)
+        since = now_epoch() - AUDIT_WINDOW_SECONDS
+        events = (
+            await asyncio.to_thread(
+                store.events, target.id, since_epoch=since, names=[BOARD_READ_EVENT]
+            )
+            if store is not None
+            else []
+        )
+        readers: dict[str, dict[str, Any]] = {}
+        for event in events:
+            if not event.subject_id:
+                continue
+            entry = readers.setdefault(
+                event.subject_id,
+                {"project_id": event.subject_id, "reads": 0, "actions": {}, "last_read_at": 0},
+            )
+            entry["reads"] += 1
+            action = event.props.get("action", "list")
+            entry["actions"][action] = entry["actions"].get(action, 0) + 1
+            entry["last_read_at"] = max(entry["last_read_at"], event.created_at)
+        for entry in readers.values():
+            # Name a reading project only when this viewer can see it.
+            source = await asyncio.to_thread(projects.get, entry["project_id"], user_id=user_id)
+            entry["project_name"] = source.name if source is not None else None
+        return {
+            "object": "project.board_read_audit",
+            "project_id": target.id,
+            "since": since,
+            "recording": store is not None,
+            "data": sorted(readers.values(), key=lambda entry: -entry["last_read_at"]),
+        }
 
     return router

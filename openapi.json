@@ -23991,6 +23991,51 @@
         ]
       }
     },
+    "/v1/projects/{project_id}/board-reads/audit": {
+      "get": {
+        "description": "Which other projects' Leads read this board in the last day, and how often.",
+        "operationId": "get_board_read_audit_v1_projects__project_id__board_reads_audit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Board Read Audit V1 Projects  Project Id  Board Reads Audit Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Board Read Audit",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
     "/v1/projects/{project_id}/board-reads/stages": {
       "get": {
         "description": "The board's stages and their instructions, for an allowed Lead.",

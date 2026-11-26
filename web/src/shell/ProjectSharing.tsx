@@ -17,6 +17,7 @@ import {
 import { useProjects } from "@/hooks/useConversations";
 import { useCopyLink } from "@/hooks/useCopyLink";
 import {
+  getBoardReadAudit,
   getProject,
   listProjectShares,
   type ProjectShareRole,
@@ -316,6 +317,11 @@ export function ProjectProductApproversSection({ projectId }: { projectId: strin
 
 const PROJECT_ID = /^[0-9a-f]{32}$/;
 
+function readSummary(reads: number): string {
+  if (reads === 0) return "Its Lead hasn't read this board in the last day";
+  return `Its Lead read this board ${reads} ${reads === 1 ? "time" : "times"} in the last day`;
+}
+
 /**
  * The owner's board readers: other projects whose Lead may read this board's tickets,
  * comments and stages. Off until the owner adds one; members see the list read-only.
@@ -331,8 +337,22 @@ export function ProjectBoardReadersSection({ projectId }: { projectId: string })
   const { status: copyStatus, copy } = useCopyLink();
   const [draft, setDraft] = useState("");
   const [draftError, setDraftError] = useState<string | null>(null);
+  const audit = useQuery({
+    queryKey: ["board-read-audit", projectId],
+    queryFn: () => getBoardReadAudit(projectId),
+    staleTime: 60_000,
+  });
   const readers = project.data?.config?.board_readers ?? [];
-  const nameOf = (id: string) => projects.data?.find((entry) => entry.id === id)?.name ?? null;
+  const nameOf = (id: string) =>
+    projects.data?.find((entry) => entry.id === id)?.name ??
+    audit.data?.data.find((entry) => entry.project_id === id)?.project_name ??
+    null;
+  const readsBy = (id: string) =>
+    audit.data?.data.find((entry) => entry.project_id === id)?.reads ?? 0;
+  // Projects removed from the list whose Lead still read the board in the last day.
+  const formerReaders = (audit.data?.data ?? []).filter(
+    (entry) => !readers.includes(entry.project_id),
+  );
   const save = useMutation({
     // Re-read so the whole-config write keeps every other stored setting.
     mutationFn: async (next: string[]) => {
@@ -429,13 +449,18 @@ export function ProjectBoardReadersSection({ projectId }: { projectId: string })
       <ul className="flex flex-col gap-1" data-testid="board-reader-list">
         {readers.map((id) => (
           <li key={id} className="flex items-center justify-between gap-2 text-sm">
-            <span className="truncate">
-              {nameOf(id) ?? (
-                <>
-                  <code className="font-mono text-xs">{id}</code>
-                  <span className="text-muted-foreground"> · a project you can't open</span>
-                </>
-              )}
+            <span className="flex min-w-0 flex-col">
+              <span className="truncate">
+                {nameOf(id) ?? (
+                  <>
+                    <code className="font-mono text-xs">{id}</code>
+                    <span className="text-muted-foreground"> · a project you can't open</span>
+                  </>
+                )}
+              </span>
+              <span className="text-muted-foreground text-xs" data-testid="board-reader-reads">
+                {readSummary(readsBy(id))}
+              </span>
             </span>
             {isOwner && (
               <Button
@@ -455,6 +480,17 @@ export function ProjectBoardReadersSection({ projectId }: { projectId: string })
           <li className="text-muted-foreground text-sm">No other project's Lead can read it.</li>
         )}
       </ul>
+      {formerReaders.length > 0 && (
+        <p className="text-muted-foreground text-sm" data-testid="board-former-readers">
+          No longer listed, read in the last day:{" "}
+          {formerReaders
+            .map(
+              (entry) =>
+                `${entry.project_name ?? entry.project_id} (${entry.reads} ${entry.reads === 1 ? "read" : "reads"})`,
+            )
+            .join(", ")}
+        </p>
+      )}
     </section>
   );
 }
