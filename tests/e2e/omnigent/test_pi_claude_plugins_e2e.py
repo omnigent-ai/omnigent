@@ -31,8 +31,12 @@ def _write(path: Path, content: str) -> None:
 
 
 def _seed_claude_home(home: Path) -> Path:
-    """Install two enabled marketplace plugins and one disabled; return the review plugin."""
+    """Install enabled and disabled plugins through a shared cache; return the review root."""
     claude = home / ".claude"
+    shared = home / "shared-plugin-cache"
+    shared.mkdir(parents=True)
+    (claude / "plugins").mkdir(parents=True)
+    (claude / "plugins" / "cache").symlink_to(shared, target_is_directory=True)
     cache = claude / "plugins" / "cache" / "market"
     review, ext, off = (cache / name / "1.0.0" for name in ("dp", "ext", "off"))
     _write(
@@ -74,7 +78,7 @@ def test_pi_gateway_loads_enabled_claude_plugins(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """Skills, a namespaced command and a Pi extension load; a disabled plugin does not."""
+    """Shared-cache skills, commands and a Pi extension load; a disabled plugin does not."""
     model = f"mock-claude-plugins-{uuid.uuid4().hex[:8]}"
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(mock_llm_server_url, [{"text": "Reviewed."}], key=model)

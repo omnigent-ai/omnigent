@@ -25,10 +25,17 @@ def _write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-@pytest.fixture
-def claude_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+@pytest.fixture(params=["directory", "symlinked_cache"])
+def claude_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Path:
     """A Claude config dir with the pi_claude_plugins feature enabled."""
     config = tmp_path / "claude"
+    if request.param == "symlinked_cache":
+        shared = tmp_path / "shared-cache"
+        shared.mkdir()
+        (config / "plugins").mkdir(parents=True)
+        (config / "plugins" / "cache").symlink_to(shared, target_is_directory=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     monkeypatch.setenv(FEATURES_ENV_VAR, "pi_claude_plugins")
     return config
@@ -81,7 +88,10 @@ def test_flag_off_leaves_settings_untouched(
     assert not (managed / _GENERATED).exists()
 
 
-def test_enabled_plugin_skills_and_namespaced_commands(claude_dir: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("install_path", ["resolved", "relative"])
+def test_enabled_plugin_skills_and_namespaced_commands(
+    claude_dir: Path, tmp_path: Path, install_path: str
+) -> None:
     """Skills are linked one directory each; commands get ``<plugin>:<command>`` names."""
     root = _install(
         claude_dir,
@@ -91,6 +101,20 @@ def test_enabled_plugin_skills_and_namespaced_commands(claude_dir: Path, tmp_pat
             "commands/review.md": "---\nallowed-tools: Bash(git:*)\n---\n"
             "Focus $ARGUMENTS from ${CLAUDE_PLUGIN_ROOT}\n",
             "commands/sub/deep.md": "Deep $ARGUMENTS\n",
+        },
+    )
+    _write_json(
+        claude_dir / "plugins" / "installed_plugins.json",
+        {
+            "plugins": {
+                "dp@market": [
+                    {
+                        "installPath": str(root)
+                        if install_path == "resolved"
+                        else "cache/market/dp/1.0.0"
+                    }
+                ]
+            }
         },
     )
     managed = tmp_path / "managed"
@@ -581,23 +605,26 @@ def test_fifo_settings_file_skips_the_whole_bridge(claude_dir: Path, tmp_path: P
 
 
 def test_project_scoped_installs_are_not_loaded(claude_dir: Path, tmp_path: Path) -> None:
-    """A user-enabled key does not load another project's install; a user install still loads."""
+    """Only a trusted user install loads; unusable entries do not hide a later valid one."""
     user = _install(claude_dir, "dp@market", files=_skill("user"))
+    outside = _install(claude_dir, "outside@market", files=_skill("outside"))
+    outside = outside.rename(tmp_path / "outside")
+    linked = user.parent / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
     other = claude_dir / "plugins" / "cache" / "market" / "dp" / "0.9.0"
     for relative, content in _skill("other").items():
         (other / relative).parent.mkdir(parents=True, exist_ok=True)
         (other / relative).write_text(content, encoding="utf-8")
-    _write_json(
-        claude_dir / "plugins" / "installed_plugins.json",
-        {
-            "plugins": {
-                "dp@market": [
-                    {"scope": "project", "projectPath": "/elsewhere", "installPath": str(other)},
-                    {"scope": "user", "installPath": str(user)},
-                ]
-            }
-        },
-    )
+    entries = [
+        {"scope": "project", "projectPath": "/elsewhere", "installPath": str(other)},
+        {"installPath": str(outside)},
+        {"installPath": str(linked)},
+    ]
+    installed = claude_dir / "plugins" / "installed_plugins.json"
+    _write_json(installed, {"plugins": {"dp@market": entries}})
+    assert add_claude_plugin_resources({}, tmp_path / "managed") == {}
+    entries.append({"scope": "user", "installPath": str(user)})
+    _write_json(installed, {"plugins": {"dp@market": entries}})
 
     result = add_claude_plugin_resources({}, tmp_path / "managed")
 
