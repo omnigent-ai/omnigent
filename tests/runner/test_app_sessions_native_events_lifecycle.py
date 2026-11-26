@@ -3697,22 +3697,20 @@ async def test_events_codex_native_stop_after_completed_turn_is_noop_not_503(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("active_turn_id", "expected_statuses"),
-    [(None, ["idle"]), ("turn_codex_live", [])],
-)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_codex_live"])
 async def test_events_codex_native_busy_edge_after_turn_ended_settles_idle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     active_turn_id: str | None,
-    expected_statuses: list[str],
 ) -> None:
-    """A forwarded ``running`` edge with no active Codex turn settles the session idle.
+    """A forwarded ``running`` edge with no active Codex turn is settled and reported idle.
 
     The edge can arrive after the turn's ``idle``, and nothing else would close it
-    while the runner stays connected. A turn Codex still runs keeps its status.
+    while the runner stays connected. The runner answers the forward with the
+    settlement for the server to apply. A turn Codex still runs keeps its status.
     """
     conv_id = f"c0dec0dec0dec0dec0dec0dec0de{'idle' if active_turn_id is None else 'live'}"
+    response_id = "codex_turn_codex_ended"
     fake_client = _RecordingCodexAppServerClient(
         transport="ws://127.0.0.1:43222",
         client_name="omnigent-codex-native-runner",
@@ -3726,6 +3724,7 @@ async def test_events_codex_native_busy_edge_after_turn_ended_settles_idle(
         socket_path="ws://127.0.0.1:43222",
         fake_client=fake_client,
     )
+    monkeypatch.setattr(subagent_work, "_children_reporting_start", {})
     from omnigent.runner.app import _session_event_queues_ref
 
     async with _runner_client(app) as client:
@@ -3739,21 +3738,23 @@ async def test_events_codex_native_busy_edge_after_turn_ended_settles_idle(
 
         status_resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "external_session_status", "data": {"status": "running"}},
-        )
-        assert status_resp.status_code == 204, status_resp.text
-        await asyncio.gather(
-            *(
-                task
-                for task in asyncio.all_tasks()
-                if task.get_name() == f"codex-native-busy-edge:{conv_id}"
-            )
+            json={
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": response_id},
+            },
         )
         events = _drain_session_event_queue(queue)
         turn_is_active = app.state.session_resource_registry.session_turn_is_active(conv_id)
 
-    statuses = [e.get("status") for e in events if e.get("type") == "session.status"]
-    assert statuses == expected_statuses, events
+    if active_turn_id is None:
+        assert status_resp.status_code == 200, status_resp.text
+        assert status_resp.json() == {"settled_status": "idle"}
+        assert conv_id not in subagent_work._children_reporting_start
+    else:
+        assert status_resp.status_code == 204, status_resp.text
+        assert subagent_work._children_reporting_start.get(conv_id) == response_id
+    # The server applies the settlement; a queued runner idle could overtake a newer turn.
+    assert [e for e in events if e.get("type") == "session.status"] == []
     assert turn_is_active is (active_turn_id is not None)
 
 

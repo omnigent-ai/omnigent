@@ -5916,6 +5916,71 @@ async def test_post_external_session_status_carries_response_id(
         assert (state.phase if state else None) == expected
 
 
+@pytest.mark.parametrize("newer_edge_during_forward", [False, True])
+async def test_post_external_session_status_applies_runner_busy_edge_settlement(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    newer_edge_during_forward: bool,
+) -> None:
+    """
+    A busy edge the runner reports stale settles the session idle unless a newer edge won.
+
+    A Codex ``running`` edge can reach the runner after its turn ended, which the
+    runner answers with ``{"settled_status": "idle"}``. A newer turn's ``running``
+    published while that forward was in flight keeps the session busy.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    events_url = f"/v1/sessions/{session['id']}/events"
+
+    async def _forward(
+        _session_id: str, _runner_router: object, body: dict[str, Any], **_kwargs: Any
+    ) -> _RunnerForwardResult:
+        if body["data"].get("response_id") != "codex_turn_ended":
+            return _RunnerForwardResult(status_code=204, body="")
+        if newer_edge_during_forward:
+            newer = await client.post(
+                events_url,
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "running", "response_id": "codex_turn_new"},
+                },
+            )
+            assert newer.status_code == 202, newer.text
+        return _RunnerForwardResult(status_code=200, body=json.dumps({"settled_status": "idle"}))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner", _forward
+    )
+
+    resp = await client.post(
+        events_url,
+        json={
+            "type": "external_session_status",
+            "data": {"status": "running", "response_id": "codex_turn_ended"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+
+    statuses = [
+        (event["status"], event.get("response_id"))
+        for _, event in published
+        if event["type"] == "session.status"
+    ]
+    if newer_edge_during_forward:
+        assert statuses == [("running", "codex_turn_ended"), ("running", "codex_turn_new")]
+        assert snapshot.json()["status"] == "running"
+        assert snapshot.json()["active_response_id"] == "codex_turn_new"
+    else:
+        assert statuses == [("running", "codex_turn_ended"), ("idle", None)]
+        assert snapshot.json()["status"] == "idle"
+        assert snapshot.json()["active_response_id"] is None
+
+
 async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

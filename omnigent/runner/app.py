@@ -4863,34 +4863,47 @@ def create_runner_app(
         _publish_event(conv_id, {"type": "session.status", "status": "idle"})
         resource_registry.note_external_session_status(conv_id, "idle")
 
-    async def _settle_codex_native_busy_edge(conv_id: str, activity_epoch: int) -> None:
+    async def _settle_codex_native_busy_edge(conv_id: str, response_id: str | None) -> bool:
         """
-        Publish ``idle`` when a forwarded busy edge arrives after its Codex turn ended.
+        Settle runner state ``idle`` when a forwarded busy edge arrives after its Codex turn ended.
 
         The forwarder records the active turn before posting ``running`` and clears it
-        before ``idle``, so a busy edge with no active turn is stale.
+        before ``idle``, so a busy edge with no active turn is stale. The server publishes
+        the matching ``idle`` itself, unless a newer status edge reached it meanwhile.
 
         :param conv_id: Codex-native session that reported ``running`` or ``waiting``.
-        :param activity_epoch: Session activity epoch recorded when the edge arrived.
+        :param response_id: Response id the edge carried, e.g. ``"codex_turn_1"``.
+        :returns: Whether the edge was stale and has been settled.
         """
+        activity_epoch = resource_registry.session_activity_epoch(conv_id)
         state = await _codex_native_bridge_state_for_session(
             conv_id, action="busy edge reconcile", missing_state_log_level=logging.DEBUG
         )
         if state is None or state.active_turn_id is not None:
-            return
+            return False
         if (
             conv_id in _active_turns
             or _session_message_buffers.get(conv_id)
             or resource_registry.session_activity_epoch(conv_id) != activity_epoch
         ):
-            return
+            return False
         _logger.info(
-            "Codex-native busy edge for %s has no active turn; publishing idle.",
+            "Codex-native busy edge for %s has no active turn; settling idle.",
             conv_id,
             extra={"session_id": conv_id},
         )
-        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        _record_native_pane_status(conv_id, "idle")
         resource_registry.note_external_session_status(conv_id, "idle")
+        # An unidentified settlement would also close a dispatch Codex has not accepted yet.
+        if response_id is not None:
+            note_subagent_child_turn_settled(conv_id, response_id=response_id)
+        _fan_out_child_delta_to_parent(
+            conv_id,
+            {"type": "session.status", "status": "idle"},
+            latest_assistant_text=None,
+            allow_history_preview_fallback=False,
+        )
+        return True
 
     def _on_proxy_stream_end(
         conv_id: str,
@@ -8620,16 +8633,6 @@ def create_runner_app(
                         if isinstance(data, dict) and isinstance(data.get("response_id"), str)
                         else None,
                     )
-                    if _session_harness_name(conversation_id) == "codex-native":
-                        _busy_reconcile = asyncio.create_task(
-                            _settle_codex_native_busy_edge(
-                                conversation_id,
-                                resource_registry.session_activity_epoch(conversation_id),
-                            ),
-                            name=f"codex-native-busy-edge:{conversation_id}",
-                        )
-                        _background_tasks.add(_busy_reconcile)
-                        _busy_reconcile.add_done_callback(_background_tasks.discard)
                 elif status in ("idle", "failed"):
                     note_subagent_child_turn_settled(
                         conversation_id,
@@ -8646,6 +8649,17 @@ def create_runner_app(
                     latest_assistant_text=output,
                     allow_history_preview_fallback=False,
                 )
+                if (
+                    status in ("running", "waiting")
+                    and _session_harness_name(conversation_id) == "codex-native"
+                    and await _settle_codex_native_busy_edge(
+                        conversation_id,
+                        data.get("response_id")
+                        if isinstance(data, dict) and isinstance(data.get("response_id"), str)
+                        else None,
+                    )
+                ):
+                    return JSONResponse({"settled_status": "idle"})
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
             interrupt_pending = False
             interrupt_work_id: str | None = None
