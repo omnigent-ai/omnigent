@@ -271,6 +271,7 @@ import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useSidebarSwipeToOpen } from "@/hooks/useSidebarSwipeToOpen";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
+import { leaveSessionView } from "./sessionCommands/archiveNavigation";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
 import {
@@ -6335,7 +6336,11 @@ function ConversationRowImpl({
     label,
     viewerId,
     serverInfo,
-    onLeave: isActive ? () => navigate("/", { replace: true }) : undefined,
+    // Leaving the open session leaves its view, as ⌘K's actions do.
+    onLeave: isActive
+      ? (cause) =>
+          leaveSessionView(cause, { conversation, source: "sidebar_menu", navigate, queryClient })
+      : undefined,
     componentIdPrefix: "sidebar.conversation",
   });
   // Subscribed so the just-recorded optimistic label flips the row
