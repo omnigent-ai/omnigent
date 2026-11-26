@@ -521,8 +521,8 @@ describe("CodeMirrorComposerInput mention tokens", () => {
   });
 });
 
-describe("CodeMirrorComposerInput mention tokens move as one character", () => {
-  // CodeMirror measures text for caret motion; jsdom has no layout.
+/** CodeMirror measures text for caret motion; jsdom has no layout, so ranges measure empty. */
+function useEmptyRangeGeometry() {
   const originalRangeRects = {
     getClientRects: Range.prototype.getClientRects,
     getBoundingClientRect: Range.prototype.getBoundingClientRect,
@@ -532,6 +532,10 @@ describe("CodeMirrorComposerInput mention tokens move as one character", () => {
     Range.prototype.getBoundingClientRect = () => new DOMRect();
   });
   afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+}
+
+describe("CodeMirrorComposerInput mention tokens move as one character", () => {
+  useEmptyRangeGeometry();
 
   const draft = "Read @readme.md now";
   const tokenStart = "Read ".length;
@@ -657,16 +661,7 @@ describe("leadingCommandSpan", () => {
 });
 
 describe("CodeMirrorComposerInput reply quotes", () => {
-  // CodeMirror measures text for caret motion; jsdom has no layout.
-  const originalRangeRects = {
-    getClientRects: Range.prototype.getClientRects,
-    getBoundingClientRect: Range.prototype.getBoundingClientRect,
-  };
-  beforeAll(() => {
-    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
-    Range.prototype.getBoundingClientRect = () => new DOMRect();
-  });
-  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+  useEmptyRangeGeometry();
 
   const a = quoteLine("a", "Alpha");
   const b = quoteLine("b", "Beta\nmore");

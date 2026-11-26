@@ -10817,6 +10817,27 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     expect(editor().value).toBe(kept);
   });
 
+  it("leaves a cancelled take's partial to the user, so neither a switch nor the next take waits on it", async () => {
+    const { switchTo } = await renderEditor();
+    type("Intro");
+    act(() => mic.current!.onListeningChange!(true));
+    act(() => mic.current!.onVoiceStart!());
+    type(" typed");
+    act(() => mic.current!.onInterim!("hel"));
+    act(() => mic.current!.onVoiceDiscard!());
+    act(() => mic.current!.onListeningChange!(false));
+    expect(editor().value).toBe("Intro typed hel");
+
+    switchTo(plainInfo);
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    act(() => mic.current!.onListeningChange!(true));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onInterim!("next"));
+    act(() => mic.current!.onTranscript("next"));
+    act(() => mic.current!.onListeningChange!(false));
+    expect(textarea()).toHaveValue("Intro typed hel next");
+  });
+
   it("changes nothing when a take is cancelled before any words", async () => {
     const { reply } = await renderEditor();
     type("Intro");

@@ -4935,6 +4935,7 @@ function ComposerImpl(
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
                 onVoiceStart={() => {
+                  dictation.release();
                   voiceSnapshotRef.current = value;
                   voiceTakeRef.current =
                     replyDocument === null
@@ -4955,6 +4956,8 @@ function ComposerImpl(
                 }}
                 onListeningChange={(listening) => {
                   setDictating(listening);
+                  // However a take ends, a partial it leaves is the user's text from now on.
+                  if (!listening) dictation.release();
                   // A take leaves focus on the mic button, where the editor's undo and redo keys
                   // don't reach; give it back to the editor once the take ends.
                   const active = document.activeElement;

@@ -28,9 +28,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that leaves the editor (switching sessions, a new-session handoff, a recovered
   send) keeps each chip's file as a tray attachment with its `@name` text
   unchanged.
-- `reply-quote-cards`: with the CodeMirror editor (see `codemirror-input`), the
-  main chat holds a reply in its one editor, each quote a card on a line of its
-  own. Arrow keys step over a card, and the caret never rests on one. Backspace
+- `reply-quote-cards`: with the CodeMirror editor (see `codemirror-input`),
+  selecting text in a chat message and choosing **Reply** quotes it in the main
+  chat's one editor, each quote a card on a line of its own. Arrow keys step over a card, and the caret never rests on one. Backspace
   at the start of the line after a card, Delete at the end of the line before
   it, or the card's X removes it; undo brings it back. After Reply the caret is
   on the empty line under the new card. Copy, cut and drag give a quote as `> `
@@ -42,8 +42,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   can differ. Discarding a dictation puts back the text from before the take
   only when nothing else edited the draft during it. A draft saved on one engine
   restores on the other. An engine switch with quotes puts the caret at the end
-  of the draft rather than where it was. Side chats keep one input per quote on
-  both engines.
+  of the draft rather than where it was. When a take ends, focus goes back to
+  the editor. Side chats keep one input per quote on both engines. To check it,
+  turn the flag on, select a passage of an agent reply, choose **Reply**, and
+  type under the card. Then arrow over the card, remove it with Backspace,
+  restore it with Ctrl/⌘+Z, and send: the message reads as the textarea sends it.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain

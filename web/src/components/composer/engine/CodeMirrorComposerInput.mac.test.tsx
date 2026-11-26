@@ -190,7 +190,6 @@ describe("CodeMirror composer keys on macOS", () => {
 describe("readline kills beside a reply card", () => {
   const value = `Intro\n${quoteLine("a", "Alpha")}\nReply`;
   const afterCard = value.length - "Reply".length;
-  afterEach(cleanup);
 
   it.each([
     ["⌃U at the start of the line after it", afterCard, "u"],

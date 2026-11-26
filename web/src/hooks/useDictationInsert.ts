@@ -110,6 +110,8 @@ export function useDictationInsert(
   replaceInterim: (text: string) => void;
   /** Report that the composer has been focused, so its caret is real. */
   noteFocus: () => void;
+  /** End a take's hold on the draft: a partial left in it becomes text no later take replaces. */
+  release: () => void;
   /** A streaming partial is in the draft, so the composer must not swap its input now. */
   hasInterim: boolean;
 } {
@@ -244,6 +246,11 @@ export function useDictationInsert(
     replaceInterim: useCallback((text: string) => insert(text, false), [insert]),
     noteFocus: useCallback(() => {
       focusedRef.current = true;
+    }, []),
+    release: useCallback(() => {
+      producedRef.current = null;
+      wantCaretRef.current = null;
+      setInterimPending(false);
     }, []),
     // A draft the hook didn't write releases its region during render, before state catches up.
     hasInterim: interimPending && (producedRef.current?.region ?? null) !== null,
