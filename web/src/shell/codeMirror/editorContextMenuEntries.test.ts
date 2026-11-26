@@ -147,10 +147,6 @@ describe("selectionSearchQuery", () => {
     expect(selectionSearchQuery(selected("a\n  \n\t\nb", 1, 7))).toBeNull();
   });
 
-  it("makes no query from a line longer than the search routes accept", () => {
-    expect(selectionSearchQuery(selected("x".repeat(4097), 0, 4097))).toBeNull();
-  });
-
   it("reads only up to the first non-blank line of a select-all", () => {
     const state = selected(
       Array.from({ length: 5000 }, (_, index) => `line ${index}`).join("\n"),

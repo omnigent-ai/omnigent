@@ -183,7 +183,10 @@ export class FindReplacer {
             const from = froms[match]!;
             if (!this.index.isPrecise(from)) continue;
             const to = tos[match]!;
-            const insert = inCase(replacement, state.doc.sliceString(from, to), options);
+            // Only Preserve case reads the matched text; otherwise every match takes the same text.
+            const insert = options.preserveCase
+              ? inCase(replacement, state.doc.sliceString(from, to), options)
+              : replacement;
             changes.push({ from, to, insert });
           }
           return { done: true };
