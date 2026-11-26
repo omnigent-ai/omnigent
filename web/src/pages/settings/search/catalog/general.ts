@@ -122,6 +122,23 @@ export const BROWSER_AGENT_TOOLS_ENTRY = settingsEntry({
   keywords: ["browser", "agent", "tools", "tabs", "hover", "scroll", "desktop"],
 });
 
+export const TRUSTED_REMOTE_HOSTS_ENTRY = settingsEntry({
+  id: "trusted-remote-hosts",
+  section: "general",
+  available: (availability) => availability.inAppBrowser,
+  label: "Trusted remote hosts for localhost previews",
+  description:
+    "Remote hosts whose sessions may open localhost pages in the in-app browser. Trust stays in place until removed; a host id is stable across restarts, so only a brand-new host needs a new entry.",
+  keywords: ["trusted", "remote", "host", "localhost", "preview", "sandbox", "desktop"],
+  parts: {
+    remove: "Remove trusted host",
+    add: "Trust host",
+    serverUrl: "Server URL",
+    hostId: "Host ID",
+  },
+  nameTemplates: { remove: { before: "Remove trusted host " } },
+});
+
 export const PROACTIVE_AGENT_ENTRY = settingsEntry({
   id: "proactive-agent",
   section: "general",
@@ -225,6 +242,7 @@ export const GENERAL_SETTINGS = [
   ADMIN_VIEW_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
   BROWSER_AGENT_TOOLS_ENTRY,
+  TRUSTED_REMOTE_HOSTS_ENTRY,
   PROACTIVE_AGENT_ENTRY,
 
   GLOBAL_SHORTCUT_ENTRY,

@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
@@ -9,7 +9,13 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import type { ServerInfo } from "@/lib/capabilities";
+import { resetUiFeatureOverridesForTests, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
+import { useFeatureFlagsPickerStore } from "@/store/featureFlagsPicker";
 import { ChatHeader } from "./ChatHeader";
+import { claimChatPaneViewToggleHost, releaseChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -72,6 +78,7 @@ const mobileMenu = {
 
 function renderHeader(props: {
   sidebarOpen: boolean;
+  serverInfo?: ServerInfo;
   isChildSession?: boolean;
   subAgentName?: string | null;
   conversationId?: string;
@@ -91,6 +98,7 @@ function renderHeader(props: {
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
   rightPanelOpen?: boolean;
+  rightPanelCollapsesItself?: boolean;
   showFilesPanel?: boolean;
   pending?: boolean;
   mobileMenu?: typeof mobileMenu;
@@ -102,7 +110,7 @@ function renderHeader(props: {
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
+        <TooltipProvider delayDuration={0}>
           <ChatHeader
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
@@ -134,17 +142,26 @@ function renderHeader(props: {
             hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
+            rightPanelCollapsesItself={props.rightPanelCollapsesItself}
             pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
       </QueryClientProvider>
     </MemoryRouter>,
+    {
+      wrapper: ({ children }) => (
+        <CapabilitiesProvider info={props.serverInfo ?? "loading"}>{children}</CapabilitiesProvider>
+      ),
+    },
   );
 }
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
+  resetUiFeatureOverridesForTests();
+  useFeatureFlagsPickerStore.setState({ open: false, replaced: false });
   vi.restoreAllMocks();
   setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
@@ -672,6 +689,34 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
   it("omits the toggle when there is no TerminalFirst context", () => {
     renderHeaderWithSession(null);
     expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
+  });
+});
+
+describe("ChatHeader — the switch in the chat pane's strip", () => {
+  it("renders the Chat/Terminal switch in the chat pane's spot while one is claimed", () => {
+    const view = renderHeaderWithSession(makeTerminalFirstCtx());
+    const header = view.container.querySelector("header")!;
+    const switchIn = (root: ParentNode) =>
+      root.querySelector('[role="group"][aria-label="Switch between chat and terminal"]');
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
+
+    const spot = document.createElement("span");
+    document.body.append(spot);
+    act(() => claimChatPaneViewToggleHost("sess-1", spot));
+    // The claim is module-wide: let it go even when an assertion below fails.
+    onTestFinished(() => {
+      releaseChatPaneViewToggleHost("sess-1", spot);
+      spot.remove();
+    });
+    expect(switchIn(header)).toBeNull();
+    expect(switchIn(spot)).toHaveAttribute("data-variant", "pane");
+    // One switch, so its chord stays bound once.
+    expect(
+      screen.getAllByRole("group", { name: /switch between chat and terminal/i }),
+    ).toHaveLength(1);
+
+    act(() => releaseChatPaneViewToggleHost("sess-1", spot));
+    expect(switchIn(header)).toHaveAttribute("data-variant", "header");
   });
 });
 
@@ -1218,5 +1263,79 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
     expect(screen.getByText("reviewer")).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — UI feature overrides", () => {
+  const serverInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { quick_pick_palette: true, canvas: false, session_overview: true },
+  };
+
+  it("hides the warning with no effective overrides", () => {
+    renderHeader({ sidebarOpen: true, serverInfo });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
+  });
+
+  it.each([false, true])("names overrides and opens the picker (mobile: %s)", async (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    expect(writeUiFeatureOverride("canvas", false)).toBe(true);
+    expect(writeUiFeatureOverride("session_overview", false)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({ sidebarOpen: true, serverInfo });
+    const label = "UI feature flags overridden: Canvas Off, Session cost sidebar Off";
+    const button = screen.getByRole("button", { name: label });
+    expect(button).toHaveClass("text-warning");
+    fireEvent.pointerMove(button, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+    fireEvent.click(button);
+    expect(useFeatureFlagsPickerStore.getState().open).toBe(true);
+  });
+
+  it.each<Record<string, boolean>>([
+    { quick_pick_palette: false, canvas: false },
+    { quick_pick_palette: true },
+  ])("hides stored decisions when the gate is disabled or flags are unreported", (features) => {
+    expect(writeUiFeatureOverride("canvas", true)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({
+      sidebarOpen: true,
+      serverInfo: { ...serverInfo, features },
+    });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
+  });
+});
+
+describe("ChatHeader — right panel toggle beside a sidebar that collapses itself", () => {
+  const toggle = (name: string) => screen.queryByRole("button", { name });
+
+  it("hides while the sidebar is open, so its own Collapse button is the only one", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_floating",
+      rightPanelOpen: true,
+      rightPanelCollapsesItself: true,
+    });
+    expect(toggle("Collapse right panel")).toBeNull();
+    expect(toggle("Expand right panel")).toBeNull();
+    // Nothing sits in the corner, so the header keeps its usual end padding.
+    expect(document.querySelector("header")).not.toHaveAttribute("data-corner-toggle");
+  });
+
+  it("shows Expand right panel while the sidebar is collapsed", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_floating",
+      rightPanelOpen: false,
+      rightPanelCollapsesItself: true,
+    });
+    expect(toggle("Expand right panel")).not.toBeNull();
+    // The row ends where the open sidebar's Collapse button sits, so the toggle keeps its spot.
+    expect(document.querySelector("header")).toHaveAttribute("data-corner-toggle");
+  });
+
+  it("keeps Collapse right panel when the sidebar has no corner button of its own", () => {
+    renderHeader({ sidebarOpen: true, conversationId: "conv_floating", rightPanelOpen: true });
+    expect(toggle("Collapse right panel")).not.toBeNull();
   });
 });

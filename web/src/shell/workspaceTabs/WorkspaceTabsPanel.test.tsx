@@ -14,15 +14,21 @@ import { toast } from "sonner";
 import { isPinnedTab } from "./pinnedTabs";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { browserViewId } from "@/lib/browserTabs";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
 import type * as PanesViewGateModule from "../panesViewGate";
 import { resetPaneSplitsCache, updatePaneSplit } from "../paneSplitStore";
 import type { TerminalGroup } from "@/lib/terminalGroups";
+import {
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
+  writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
+} from "@/lib/workspaceTabPreferences";
 
 import { resetTerminalGroupsCache, updateTerminalGroups } from "../terminalGroupsStore";
 import { requestTerminalOpen, resetTerminalOpenRequestsForTests } from "../terminalOpenRequest";
@@ -52,6 +58,7 @@ import {
   resetWorkspaceTabsSessionsForTests,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
+import { MAX_WORKSPACE_TABS, saveWorkspaceTabsSession } from "./workspaceTabsPersistence";
 
 // The tabs' content has its own suites; these tests cover which panel owns the keyboard, and
 // what the panel hands each place view.
@@ -122,7 +129,15 @@ vi.mock("../panesViewGate", async (importOriginal) => ({
   usePanesSplitsAllowed: (readOnly: boolean) => panesGate.shown && !readOnly,
 }));
 
+const floatingPanes = vi.hoisted(() => ({ on: false, wide: true }));
+vi.mock("../useFloatingPanes", () => ({
+  useFloatingPanes: () => floatingPanes.on,
+  useFloatingPanesShown: () => floatingPanes.on && floatingPanes.wide,
+}));
+
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+// A shell that couldn't end is still running, so its toast stays until the person dismisses it.
+const STAYS_UNTIL_DISMISSED = { duration: Number.POSITIVE_INFINITY, closeButton: true };
 
 type PanelOverrides = Partial<WorkspaceTabsPanelProps> & { conversationId: string };
 
@@ -198,9 +213,13 @@ function pressCloseTab() {
 }
 
 beforeEach(() => {
+  // These sessions start on an empty New tab; the Settings pins have their own tests.
+  window.localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, "[]");
   vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
   placeViews.latest.clear();
   placeViews.bySession.clear();
+  floatingPanes.on = false;
+  floatingPanes.wide = true;
 });
 
 afterEach(() => {
@@ -370,6 +389,127 @@ describe("the panel's placement", () => {
   });
 });
 
+describe("the gutter beside floating panes", () => {
+  const gutter = () => document.querySelector<HTMLElement>("[data-workspace-rail-gutter-handle]");
+  const rail = () => document.querySelector<HTMLElement>('aside[aria-label="Workspace"]')!;
+
+  it("drags the docked rail from a band beside it, placed by the rail's width", () => {
+    floatingPanes.on = true;
+    const onMouseDown = vi.fn();
+    renderPanels([
+      { conversationId: "conv_a", open: true, handleProps: { tabIndex: 0, onMouseDown } },
+    ]);
+    expect(rail().nextElementSibling).toBe(gutter());
+    expect(gutter()!.style.right).toBe("355px");
+    fireEvent.mouseDown(gutter()!);
+    expect(onMouseDown).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["without floating panes", { floating: false }],
+    ["full screen", { floating: true, maximized: true }],
+    ["in a grid cell", { floating: true, contained: true }],
+  ])("has no band %s", (_case, { floating, ...overrides }) => {
+    floatingPanes.on = floating;
+    renderPanels([{ conversationId: "conv_a", open: true, ...overrides }]);
+    expect(gutter()).toBeNull();
+  });
+});
+
+describe("the strip's Collapse right panel button", () => {
+  const collapse = () => screen.getByRole("button", { name: "Collapse right panel", hidden: true });
+
+  it("with floating panes, shows the collapse-right icon, stays in a narrow strip and hides the sidebar", () => {
+    floatingPanes.on = true;
+    const onHide = vi.fn();
+    renderPanels([{ conversationId: "conv_a", open: true, onHide }]);
+    expect(collapse().querySelector(".lucide-panel-right-close")).not.toBeNull();
+    expect(collapse().querySelector(".lucide-x")).toBeNull();
+    // The header hides its own toggle while this sidebar is open, so this one never folds away.
+    expect(collapse().className).not.toContain("@max-[240px]/rail:hidden");
+    fireEvent.click(collapse());
+    expect(onHide).toHaveBeenCalledTimes(1);
+  });
+
+  it("without floating panes, keeps its X and leaves a narrow strip to the header's toggle", () => {
+    renderPanels([{ conversationId: "conv_a", open: true, onHide: vi.fn() }]);
+    expect(collapse().querySelector(".lucide-x")).not.toBeNull();
+    expect(collapse().querySelector(".lucide-panel-right-close")).toBeNull();
+    expect(collapse().className).toContain("@max-[240px]/rail:hidden");
+  });
+});
+
+describe("All tabs' place in the strip", () => {
+  const button = (name: string) => screen.getByRole("button", { name, hidden: true });
+  const precedes = (first: Element, second: Element) =>
+    Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const firstTab = () => screen.getAllByRole("tab", { hidden: true })[0]!;
+  const stripDividers = () =>
+    document.querySelectorAll('aside[aria-label="Workspace"] [data-slot="separator"]');
+
+  it("leads the strip as layers before the tabs, with the divider after New tab", () => {
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    expect(precedes(stripDividers()[0]!, button("Full screen"))).toBe(true);
+  });
+
+  it("with floating panes, opens from a chevron beside Full screen, after the divider", () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(firstTab(), allTabs)).toBe(true);
+    expect(precedes(button("New tab"), allTabs)).toBe(true);
+    expect(precedes(allTabs, button("Full screen"))).toBe(true);
+    expect(allTabs.querySelector(".lucide-chevron-down")).not.toBeNull();
+    // One divider, between New tab and All tabs.
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    expect(precedes(stripDividers()[0]!, allTabs)).toBe(true);
+  });
+
+  it("keeps the classic place in a grid cell, which floating panes leave as it is", () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true, contained: true }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+  });
+
+  // The drawer holds the tabs below the desktop breakpoint, past 48rem too, where the panes float.
+  it.each([
+    ["a narrow window's", false],
+    ["a wider window's", true],
+  ])("in %s drawer, stays before the tabs as layers with the flag on", async (_, wide) => {
+    floatingPanes.on = true;
+    floatingPanes.wide = wide;
+    renderPanels([{ conversationId: "conv_a", open: true, placement: "drawer" }]);
+    const allTabs = button("All tabs");
+    expect(precedes(allTabs, firstTab())).toBe(true);
+    expect(allTabs.querySelector(".lucide-layers")).not.toBeNull();
+    expect(allTabs.querySelector(".lucide-chevron-down")).toBeNull();
+    expect(stripDividers()).toHaveLength(1);
+    expect(precedes(button("New tab"), stripDividers()[0]!)).toBe(true);
+    await userEvent.click(allTabs);
+    expect(await screen.findByRole("dialog", { hidden: true })).toHaveAttribute(
+      "data-align",
+      "start",
+    );
+  });
+
+  it("with floating panes, lines its list up with the button's end", async () => {
+    floatingPanes.on = true;
+    renderPanels([{ conversationId: "conv_a", open: true }]);
+    await userEvent.click(button("All tabs"));
+    const list = await screen.findByRole("dialog", { hidden: true });
+    expect(list).toHaveAttribute("data-align", "end");
+  });
+});
+
 describe("the Tasks tab's offer", () => {
   it.each([
     [true, "lists Open the Tasks panel among the workspace's commands"],
@@ -522,6 +662,67 @@ describe("WorkspaceTabsPanel search results", () => {
           .flatMap((tab) => ("place" in tab && tab.place.kind === "files" ? [tab.place] : [])),
       ).toContainEqual({ kind: "files", path: "src/app.py", line: { start: 351, column: 3 } }),
     );
+  });
+});
+
+describe("WorkspaceTabsPanel and the Workspace settings", () => {
+  it("starts a new session on its pinned pages and follows a changed first page", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents", "tasks"]);
+    writeDefaultWorkspaceTab("subagents");
+    // Tasks isn't offered in this session, so it isn't pinned there.
+    renderPanels([{ conversationId: "s-settings", showTasksTab: false }]);
+    const { store } = workspaceTabsSession("s-settings");
+    const strip = () =>
+      store.tabs().map((tab) => ("place" in tab ? [tab.place.kind, tab.pinned === true] : null));
+    await waitFor(() =>
+      expect(strip()).toEqual([
+        ["files", true],
+        ["agents", true],
+      ]),
+    );
+    expect(store.selectedTab()?.place.kind).toBe("agents");
+    act(() => writeDefaultWorkspaceTab("files"));
+    await waitFor(() => expect(store.selectedTab()?.place.kind).toBe("files"));
+  });
+
+  it("keeps a file a link opened before the sidebar first showed, with Settings as shipped", async () => {
+    window.localStorage.removeItem(PINNED_WORKSPACE_TABS_STORAGE_KEY);
+    const sessionId = "s-settings-link";
+    await openWorkspaceFile(sessionId, "src/linked.ts", { line: 7, commentId: "c1" }, "link");
+    const { store } = workspaceTabsSession(sessionId);
+    renderPanels([{ conversationId: sessionId }]);
+    await waitFor(() =>
+      expect(store.tabs().some((tab) => "place" in tab && tab.place.kind === "agents")).toBe(true),
+    );
+    expect(store.selectedTab()?.place).toMatchObject({ kind: "files", path: "src/linked.ts" });
+  });
+
+  it("adds a pinned page that didn't fit once a tab closes", async () => {
+    const sessionId = "s-settings-full";
+    const full = Array.from({ length: MAX_WORKSPACE_TABS }, (_, index) => ({
+      id: `kept-${index}`,
+      place: { kind: "files" as const, path: `src/file-${index}.ts` },
+      openedBy: "user" as const,
+    }));
+    saveWorkspaceTabsSession(sessionId, {
+      tabs: full,
+      selectedTabId: full[0].id,
+      timeline: [{ tabId: full[0].id, place: full[0].place }],
+      cursor: 0,
+      closed: [],
+    });
+    writePinnedWorkspaceTabs(["tasks"]);
+    writeDefaultWorkspaceTab("tasks");
+    renderPanels([{ conversationId: sessionId, showTasksTab: true }]);
+    const { store } = workspaceTabsSession(sessionId);
+    const hasTasks = () => store.tabs().some((tab) => "place" in tab && tab.place.kind === "tasks");
+    expect(store.tabs()).toHaveLength(MAX_WORKSPACE_TABS);
+    expect(hasTasks()).toBe(false);
+    await act(async () => {
+      await store.close(full.at(-1)!.id);
+    });
+    await waitFor(() => expect(hasTasks()).toBe(true));
+    expect(store.tabs()).toHaveLength(MAX_WORKSPACE_TABS);
   });
 });
 
@@ -1000,7 +1201,10 @@ describe("a shell's tab", () => {
       const { store } = await splitAB("s-group-partial", { endShell });
       await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
       await waitFor(() =>
-        expect(failed).toHaveBeenCalledWith("Couldn't close term_b:s. Try again."),
+        expect(failed).toHaveBeenCalledExactlyOnceWith(
+          "Couldn't close term_b:s. It's still running.",
+          STAYS_UNTIL_DISMISSED,
+        ),
       );
       // a's tab went; b's and c's stay, with the selection on one of them and history agreeing.
       const remaining = store.tabs().map((tab) => ("binding" in tab ? tab.binding : undefined));
@@ -1012,6 +1216,22 @@ describe("a shell's tab", () => {
       expect(store.tabs().some((tab) => tab.id === selected)).toBe(true);
       expect(store.history.state.visits[store.history.state.cursor]?.tabId).toBe(selected);
       failed.mockRestore();
+    });
+
+    it("names every shell that kept running in one message", async () => {
+      const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+      onTestFinished(() => failed.mockRestore());
+      const endShell = vi.fn(async () => false);
+      const { store } = await splitAB("s-group-all-fail", { endShell });
+      await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s +1" }));
+      await waitFor(() => expect(endShell).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(failed).toHaveBeenCalledExactlyOnceWith(
+          "Couldn't close term_a:s and term_b:s. They're still running.",
+          STAYS_UNTIL_DISMISSED,
+        ),
+      );
+      expect(store.tabs()).toHaveLength(3);
     });
 
     it("ends every shell the split names, though a member has no tab", async () => {
@@ -1220,6 +1440,25 @@ describe("a shell's tab", () => {
         expect(isPinnedTab(store.findTab(tabOf("terminal:term_b"))!)).toBe(false),
       );
     });
+  });
+
+  it("keeps a shell's tab that won't end, and says so once, naming it", async () => {
+    const failed = vi.spyOn(toast, "error").mockImplementation(() => "");
+    onTestFinished(() => failed.mockRestore());
+    const endShell = vi.fn(async () => false);
+    const { store, select } = await openShells("s-shell-close-fails", ["term_a", "term_b"], {
+      endShell,
+    });
+    select("term_a");
+    await userEvent.click(await screen.findByRole("button", { name: "Close term_a:s" }));
+    await waitFor(() =>
+      expect(failed).toHaveBeenCalledExactlyOnceWith(
+        "Couldn't close term_a:s. It's still running.",
+        STAYS_UNTIL_DISMISSED,
+      ),
+    );
+    expect(endShell).toHaveBeenCalledExactlyOnceWith("terminal:term_a");
+    expect(store.tabs()).toHaveLength(2);
   });
 
   it("keeps only the selected shell attached while the sidebar is closed", async () => {
@@ -1600,5 +1839,39 @@ describe("closing a group of tabs", () => {
     await waitFor(() =>
       expect(store.tabs().some((tab) => "place" in tab && tab.place.kind === "pull")).toBe(false),
     );
+  });
+});
+
+describe("a browser tab's label", () => {
+  afterEach(() => {
+    delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
+  });
+
+  it("follows its page's live title", async () => {
+    let urlChanged:
+      ((page: { conversationId: string; url: string; title: string }) => void) | null = null;
+    (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
+      onBrowserUrlChanged: (callback: typeof urlChanged) => {
+        urlChanged = callback;
+        return () => {};
+      },
+      browserHasView: async () => ({ exists: false }),
+    };
+    renderPanels([{ conversationId: "conv_a" }]);
+    await waitFor(() => expect(sessionsWithWorkspaceRows()).toEqual(["conv_a"]));
+    act(pressNewBrowser);
+    await waitFor(() => expect(browserTabCount("conv_a")).toBe(1));
+    const tab = workspaceTabsSession("conv_a").store.selectedTab()!;
+    const viewKey = tab.binding?.kind === "browser-view" ? tab.binding.viewKey : "";
+    await waitFor(() => expect(urlChanged).not.toBeNull());
+
+    act(() =>
+      urlChanged!({
+        conversationId: browserViewId("conv_a", viewKey),
+        url: "https://example.com/docs",
+        title: "Example docs",
+      }),
+    );
+    expect(await screen.findByRole("tab", { name: /Example docs/ })).toBeInTheDocument();
   });
 });

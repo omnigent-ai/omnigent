@@ -2,6 +2,7 @@ vi.mock("@/lib/fetchSessionHostId", () => ({
   fetchSessionHostId: vi.fn().mockResolvedValue("local-host"),
 }));
 import type { ReactNode } from "react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -12,6 +13,7 @@ import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as UseWorkspaceModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
@@ -287,6 +289,27 @@ vi.mock("./FilesPanelDrawer", () => ({
     />
   ),
 }));
+// What the runner says about a shell being closed; none answers 404, as an older server does.
+// `held` keeps every answer back until it settles.
+const shellRunner = vi.hoisted(() => ({
+  reading: null as Record<string, unknown> | null,
+  asked: [] as string[],
+  held: null as Promise<void> | null,
+}));
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return {
+    ...actual,
+    authenticatedFetch: async (url: string, init?: RequestInit) => {
+      const shell = /\/resources\/terminals\/([^/]+)\/shell$/.exec(url);
+      if (!shell) return actual.authenticatedFetch(url, init);
+      shellRunner.asked.push(decodeURIComponent(shell[1]));
+      await shellRunner.held;
+      const reading = shellRunner.reading;
+      return new Response(JSON.stringify(reading ?? {}), { status: reading ? 200 : 404 });
+    },
+  };
+});
 vi.mock("./TerminalsPanel", () => ({
   TerminalsPanel: ({
     open,
@@ -350,6 +373,7 @@ const forkSessionMock = vi.mocked(forkSession);
 const getSessionSlimMock = vi.mocked(getSessionSlim);
 
 import { AppShell } from "./AppShell";
+import { setSplitBesideChat, setSplitOnScreen } from "./chatPaneToolbarHost";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { bindConversationForTest, useChatStore } from "@/store/chatStore";
@@ -832,6 +856,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  shellRunner.reading = null;
+  shellRunner.asked = [];
+  shellRunner.held = null;
   toast.dismiss();
   cleanup();
   vi.useRealTimers();
@@ -1135,6 +1162,186 @@ describe("AppShell header", () => {
     expect(screen.getByRole("menuitem", { name: "Fork" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Rename" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Delete" })).toBeNull();
+  });
+
+  describe("the chat pane's strip with floating panes", () => {
+    const FLOATING = serverInfo({ features: { floating_panes: true } });
+
+    /** A window `width` px wide, as every min- and max-width query reads it (rem is 16px). */
+    function windowWidth(width: number) {
+      const baseMatchMedia = window.matchMedia;
+      const answer = (query: string) => {
+        const bound = /^\((min|max)-width: ([\d.]+)(px|rem)\)$/.exec(query);
+        if (!bound) return baseMatchMedia(query).matches;
+        const limit = Number(bound[2]) * (bound[3] === "rem" ? 16 : 1);
+        return bound[1] === "min" ? width >= limit : width <= limit;
+      };
+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+        ...baseMatchMedia(query),
+        matches: answer(query),
+      }));
+      onTestFinished(() => matchMedia.mockRestore());
+    }
+
+    function terminalFirstSession(labels: Record<string, string> = { "omnigent.ui": "terminal" }) {
+      mockConversations([{ id: "conv_terminal", permission_level: null, labels }]);
+      useTerminalsMock.mockReturnValue({
+        terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+        isLoading: false,
+        error: null,
+      });
+    }
+
+    const strip = () => screen.queryByRole("group", { name: "Chat pane" });
+    const viewSwitch = () =>
+      screen.getByRole("group", { name: "Switch between chat and terminal" });
+
+    // 1000px floats the cards below the desktop layout's width, where the header has no switch.
+    it.each([1440, 1000])(
+      "moves the Chat/Terminal switch from the header into the chat's card at %ipx",
+      async (width) => {
+        windowWidth(width);
+        terminalFirstSession();
+        renderShell("/c/conv_terminal", FLOATING);
+
+        expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+        expect(strip()).toContainElement(viewSwitch());
+        expect(viewSwitch()).toHaveAttribute("data-variant", "pane");
+        expect(document.querySelector("header")).not.toContainElement(viewSwitch());
+        const main = document.querySelector("main[data-session-id]")!;
+        expect(main).toHaveAttribute("data-chat-pane-strip", "");
+        expect(main.firstElementChild).toBe(strip());
+      },
+    );
+
+    it.each([1440, 1000])(
+      "keeps the row and its switch over the Terminal view at %ipx",
+      async (width) => {
+        windowWidth(width);
+        terminalFirstSession();
+        renderShell("/c/conv_terminal?view=terminal", FLOATING);
+
+        expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+        expect(await screen.findByRole("group", { name: "Chat pane" })).toContainElement(
+          viewSwitch(),
+        );
+      },
+    );
+
+    it("drops the row while a split floats beside the chat as its own cards, and brings it back", async () => {
+      windowWidth(1440);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      act(() => setSplitOnScreen("conv_terminal", true));
+      expect(strip()).toBeNull();
+      expect(column()).toHaveAttribute("data-main-view", "terminal");
+      act(() => setSplitOnScreen("conv_terminal", false));
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+    });
+
+    it("gives the chat back its card and row when its split leaves the screen but stays saved", async () => {
+      windowWidth(1440);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      act(() => {
+        setSplitBesideChat("conv_terminal", true);
+        setSplitOnScreen("conv_terminal", true);
+      });
+      expect(strip()).toBeNull();
+
+      // The panes view hides, as when the agent's terminal goes, and its split stays saved.
+      act(() => setSplitOnScreen("conv_terminal", false));
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      act(() => setSplitBesideChat("conv_terminal", false));
+    });
+
+    // 1000px floats the cards but is below the desktop layout, so there is no panes view.
+    it("keeps the chat's card and row when a split is published but the panes view isn't shown", async () => {
+      windowWidth(1000);
+      terminalFirstSession();
+      renderShell(
+        "/c/conv_terminal",
+        serverInfo({ features: { floating_panes: true, workspace_sidebar_v2: true } }),
+      );
+      const column = () => document.querySelector("[data-main-view]");
+
+      expect(await screen.findByRole("group", { name: "Chat pane" })).toBeInTheDocument();
+      act(() => setSplitOnScreen("conv_terminal", true));
+      expect(screen.getByRole("group", { name: "Chat pane" })).toContainElement(viewSwitch());
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+      act(() => setSplitOnScreen("conv_terminal", false));
+    });
+
+    it.each([
+      ["without floating panes", undefined, 1440, { "omnigent.ui": "terminal" }],
+      ["below 48rem", FLOATING, 700, { "omnigent.ui": "terminal" }],
+      ["in a chat-first session", FLOATING, 1440, {}],
+    ] as const)("adds no row %s", (_case, info, width, sessionLabels) => {
+      const labels: Record<string, string> = { ...sessionLabels };
+      windowWidth(width);
+      terminalFirstSession(labels);
+      renderShell("/c/conv_terminal", info);
+
+      expect(strip()).toBeNull();
+      expect(document.querySelector("main[data-session-id]")).not.toHaveAttribute(
+        "data-chat-pane-strip",
+      );
+      // The header keeps the switch in the desktop layout; narrower, its ⋯ menu offers the views.
+      if (labels["omnigent.ui"] === "terminal" && width >= 1181) {
+        expect(document.querySelector("header")).toContainElement(viewSwitch());
+        expect(viewSwitch()).toHaveAttribute("data-variant", "header");
+      }
+      if (width < 1181) {
+        expect(
+          screen.queryByRole("group", { name: "Switch between chat and terminal" }),
+        ).toBeNull();
+      }
+    });
+
+    it("adds no row while the session is still being created, as there's no switch yet", () => {
+      windowWidth(1440);
+      mockConversations([
+        { id: "temp:new", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      ]);
+      renderShell("/c/temp:new", FLOATING);
+
+      expect(strip()).toBeNull();
+      expect(document.querySelector("main[data-session-id]")).not.toHaveAttribute(
+        "data-chat-pane-strip",
+      );
+    });
+
+    it("takes the switch out of the header's Tab order and puts it first in the chat's", async () => {
+      windowWidth(1440);
+      terminalFirstSession();
+      renderShell("/c/conv_terminal", FLOATING);
+      const chatSegment = await screen.findByRole("button", { name: "Chat view" });
+      const terminalSegment = screen.getByRole("button", { name: /^Terminal / });
+
+      // Back from the switch is the header; on past it is the chat page's own controls.
+      chatSegment.focus();
+      await userEvent.tab({ shift: true });
+      expect(document.querySelector("header")).toContainElement(
+        document.activeElement as HTMLElement,
+      );
+      terminalSegment.focus();
+      await userEvent.tab();
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Chat" }));
+    });
   });
 
   it("defaults to chat view on a native Claude session", () => {
@@ -2048,7 +2255,7 @@ describe("Chat-mode terminal panel layout", () => {
     expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
   });
 
-  it("confirms before closing a shell tab, then kills the terminal", () => {
+  it("confirms before closing a shell tab, then kills the terminal", async () => {
     // Closing a tab kills the underlying terminal (destructive), so the "x"
     // opens a confirm modal first; confirming issues the delete (which the SSE
     // `resource.deleted` + cache prune turn into the tab disappearing). Closing
@@ -2075,7 +2282,7 @@ describe("Chat-mode terminal panel layout", () => {
 
     // Clicking the tab's "x" does NOT kill immediately — it asks first.
     fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("Close shell?");
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Close shell?");
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
 
     // Confirming kills the terminal by its resource id.
@@ -2083,7 +2290,75 @@ describe("Chat-mode terminal panel layout", () => {
     expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
   });
 
-  it("does not kill the terminal when the close confirmation is cancelled", () => {
+  /** An owner's session with one shell tab, selected, as the close cases below need. */
+  const renderOneShellTab = () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_abc");
+  };
+
+  it("closes a shell tab the runner reads idle without asking", async () => {
+    shellRunner.reading = { state: "idle" };
+    renderOneShellTab();
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+    await waitFor(() => expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(shellRunner.asked).toEqual(["terminal_main"]);
+  });
+
+  it("asks before closing a busy shell tab, naming its job", async () => {
+    shellRunner.reading = { state: "busy", foreground: "vim", background_jobs: 0 };
+    renderOneShellTab();
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+    expect(await screen.findByRole("dialog")).toHaveTextContent("vim is running in main · u-1");
+    expect(deleteTerminalMutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("terminal_main");
+  });
+
+  it("closes both shell tabs when the second is closed while the first is still checking", async () => {
+    let answer = () => {};
+    shellRunner.held = new Promise((resolve) => {
+      answer = resolve;
+    });
+    shellRunner.reading = { state: "idle" };
+    writeSessionWorkspaceState("conv_abc", { open: true, selectedTerminalKey: "terminal:t_one" });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "t_one", name: "one", session: "u-1", running: true },
+        { id: "t_two", name: "two", session: "u-2", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByRole("button", { name: "Close one · u-1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close two · u-2" }));
+    act(() => answer());
+    await waitFor(() => expect(deleteTerminalMutate).toHaveBeenCalledTimes(2));
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("t_one");
+    expect(deleteTerminalMutate).toHaveBeenCalledWith("t_two");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("does not kill the terminal when the close confirmation is cancelled", async () => {
     writeSessionWorkspaceState("conv_abc", {
       open: true,
       selectedTerminalKey: "terminal:terminal_main",
@@ -2102,7 +2377,7 @@ describe("Chat-mode terminal panel layout", () => {
     renderShell("/c/conv_abc");
 
     fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
 
     // No delete, and the shell's xterm is still mounted.
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
@@ -2137,7 +2412,7 @@ describe("Chat-mode terminal panel layout", () => {
     };
     // Cancelling the single confirmation kills nothing.
     await closeOthersOf("c · u-1");
-    expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+    expect(await screen.findByRole("dialog")).toHaveTextContent("Close 2 shells?");
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
 
@@ -2155,7 +2430,7 @@ describe("Chat-mode terminal panel layout", () => {
       return Promise.resolve();
     });
     await closeOthersOf("c · u-1");
-    fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Close shells" }));
     expect(deleteTerminalMutate.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
     await waitFor(() =>
       expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_c"),
@@ -2246,7 +2521,7 @@ describe("Chat-mode terminal panel layout", () => {
 
     fireEvent.contextMenu(screen.getByTitle("c · u-1"));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
-    fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Close shells" }));
 
     // Both kills are in flight, so both tabs read as closing and take no second close.
     for (const label of ["a · u-1", "b · u-1"]) {
@@ -2282,7 +2557,7 @@ describe("Chat-mode terminal panel layout", () => {
     renderShell("/c/conv_abc", undefined, { rerenderable: true });
 
     fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
-    fireEvent.click(screen.getByRole("button", { name: "Close shell" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Close shell" }));
     // Its tab was the last open one, so the rail hides.
     expect(await screen.findByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
 

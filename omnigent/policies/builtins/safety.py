@@ -418,12 +418,15 @@ _SCHEDULED_TASK_SETTINGS = (
     "max_cost_usd",
     "model_override",
     "reasoning_effort",
+    "workflow_id",
     "prompt",
 )
 _PREVIEW_VALUE_CHARS = 60
 _PREVIEW_EXTRA_CHARS = 200
 
 _SCHEDULED_TASK_REVIEW_FIELDS = frozenset({"prompt", "permission_mode"})
+# Free text the review renders in full rather than among the bounded settings.
+_SCHEDULED_TASK_FULL_TEXT_FIELDS = frozenset({"prompt", "workflow_details"})
 _PERMISSION_MODE_VALUES = f"a mode name, or {AGENT_DEFAULT_PERMISSION_MODE_HINT}"
 
 
@@ -434,8 +437,8 @@ def _clip(value: str) -> str:
     return value
 
 
-def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
-    """``key=value`` pairs for every argument but ``skip``, each value bounded.
+def _scheduled_task_settings(args: dict[str, object], *, skip: frozenset[str]) -> str:
+    """``key=value`` pairs for every argument but those in ``skip``, each value bounded.
 
     Known settings come first and are never dropped; other arguments follow and
     are capped as a group. The free-text prompt is rendered separately in full.
@@ -445,8 +448,8 @@ def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
         value = str(args[key])
         return f"{key}={_clip(value)}"
 
-    known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key != skip]
-    keys = sorted(key for key in args if key not in _SCHEDULED_TASK_SETTINGS and key != skip)
+    known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key not in skip]
+    keys = sorted(key for key in args if key not in _SCHEDULED_TASK_SETTINGS and key not in skip)
     extra: list[str] = []
     remaining = _PREVIEW_EXTRA_CHARS
     for index, key in enumerate(keys):
@@ -465,15 +468,32 @@ def scheduled_task_review_error(
     args: dict[str, object], *, action: str, require_complete: bool = True
 ) -> str | None:
     """Validate review values, allowing omitted fields only for legacy callers."""
-    missing = sorted(_SCHEDULED_TASK_REVIEW_FIELDS.difference(args))
+    # The server writes the prompt of a task created to run a saved workflow.
+    runs_workflow = action == "create" and args.get("workflow_id") is not None
+    required = (
+        _SCHEDULED_TASK_REVIEW_FIELDS - {"prompt"}
+        if runs_workflow
+        else _SCHEDULED_TASK_REVIEW_FIELDS
+    )
+    missing = sorted(required.difference(args))
     if require_complete and missing:
-        hint = (
-            "List the task and retry with its full prompt and permission_mode."
-            if action == "update"
-            else f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
-        )
+        if action == "update":
+            hint = "List the task and retry with its full prompt and permission_mode."
+        elif runs_workflow:
+            hint = f"Retry with permission_mode: {_PERMISSION_MODE_VALUES}."
+        else:
+            hint = f"Retry with prompt and permission_mode: {_PERMISSION_MODE_VALUES}."
         return f"Missing review fields ({', '.join(missing)}). {hint}"
-    if "prompt" in args or action == "create":
+    if runs_workflow:
+        workflow_id = args["workflow_id"]
+        if not isinstance(workflow_id, str) or not workflow_id.strip():
+            return "workflow_id must be the ID of one of your saved workflows."
+        if "prompt" in args:
+            return (
+                "Leave out prompt with workflow_id: the server writes the prompt that runs "
+                "the workflow. Give this run's specifics as workflow_details."
+            )
+    elif "prompt" in args or action == "create":
         prompt = args.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             return "The automation prompt must be a non-empty string."
@@ -490,7 +510,52 @@ def scheduled_task_review_error(
 
 def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str) -> str:
     """Render supplied instructions in full and identify legacy omissions."""
-    prompt = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+    workflow_id = args.get("workflow_id")
+    supplied = args.get("prompt", "(unchanged; not supplied by legacy caller)")
+    if action == "create" and "prompt" not in args and workflow_id is not None:
+        prompt: object = f"Runs the saved workflow {workflow_id}"
+    elif action == "update" and (workflow_id or "workflow_details" in args):
+        # Read as the server reads the task's prompt: its specifics stay only if it runs a
+        # saved workflow.
+        from omnigent.server.scheduled.workflow_automations import (
+            is_bare_saved_workflow_run,
+            saved_workflow_run,
+        )
+
+        details_given = "workflow_details" in args
+        if "prompt" not in args:
+            effect = (
+                "keeping the specifics of the stored prompt if it already runs a saved "
+                "workflow, unless workflow_details replaces them, and otherwise in its place"
+            )
+        elif not isinstance(supplied, str) or saved_workflow_run(supplied) is None:
+            effect = (
+                "in place of the current prompt below, whose instructions no longer run; "
+                "each run gets only the specifics in workflow_details"
+                if workflow_id
+                else "but the current prompt below runs no saved workflow, so the server "
+                "refuses the update"
+            )
+        elif not is_bare_saved_workflow_run(supplied):
+            effect = (
+                "but the current prompt below runs its workflow inside other text, so the "
+                "server keeps it only if this is the workflow it runs and workflow_details "
+                "is left out, and otherwise refuses the update"
+            )
+        elif details_given:
+            effect = (
+                "with the specifics in workflow_details in place of those in the current "
+                "prompt below"
+            )
+        else:
+            effect = "keeping the specifics of the current prompt below"
+        runs = f"the saved workflow {workflow_id}" if workflow_id else "its saved workflow"
+        prompt = f"Runs {runs}. The server writes the prompt that runs it, {effect}.\n{supplied}"
+    else:
+        prompt = supplied
+    if "workflow_details" in args:
+        details = args["workflow_details"] or "(none)"
+        prompt = f"{prompt}\nSpecifics for each run of its saved workflow:\n{details}"
     raw_permission_mode = args.get("permission_mode")
     permission_mode = (
         "agent default (no task override)"
@@ -517,7 +582,7 @@ def _scheduled_task_review(args: dict[str, object], *, action: str, subject: str
             )
     if args.get("session_mode") == "continue":
         permission_mode += "; a continued session keeps its own permission mode"
-    settings = _scheduled_task_settings(args, skip="prompt")
+    settings = _scheduled_task_settings(args, skip=_SCHEDULED_TASK_FULL_TEXT_FIELDS)
     return (
         f"Agent wants to {action} {subject}.\n"
         f"{legacy_notice}"

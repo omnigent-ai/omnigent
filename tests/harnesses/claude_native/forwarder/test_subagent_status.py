@@ -725,7 +725,11 @@ async def test_subagent_idle_observation_preserves_timing_and_deduplication(
 async def test_subagent_idle_observation_waits_out_an_open_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str
 ) -> None:
-    """An open tool step keeps the child running past the short gap; a turn end restores it."""
+    """
+    An open tool step keeps the child running past the short gap; a turn end restores it.
+
+    A message a hook then blocks from the child does not reopen its turn.
+    """
     now = 1000.0
     monkeypatch.setattr(
         forwarder, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic)
@@ -812,6 +816,16 @@ async def test_subagent_idle_observation_waits_out_an_open_turn(
         now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 1
         await tick()
         assert statuses == ["running", "idle", "running", "idle"]
+
+        blocked = 'Blocked\n\nOriginal prompt: <agent-message from="lead">Recheck</agent-message>'
+        with child_path.open("a", encoding="utf-8") as handle:
+            record = {"isSidechain": True, "type": "system", "uuid": "blocked"}
+            content = f"UserPromptSubmit operation blocked by hook:\n{blocked}"
+            handle.write(json.dumps({**record, "content": content}) + "\n")
+        await tick()
+        now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 1
+        await tick()
+        assert statuses == ["running", "idle", "running", "idle", "running", "idle"]
 
 
 async def test_subagent_idle_unsupported_cache_covers_other_children(tmp_path: Path) -> None:

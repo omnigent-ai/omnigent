@@ -1,4 +1,4 @@
-import type { AssistantMessagePhase } from "./conversationItems";
+import type { AssistantMessagePhase, TerminalCommandSubmission } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -364,6 +364,7 @@ export interface RoutingDecisionBlock {
 
 export interface TerminalCommandBlock {
   type: "terminal_command";
+  submission?: TerminalCommandSubmission;
   ctx: BlockContext;
   /** `"input"` for the command line; `"output"` for stdout/stderr. */
   kind: "input" | "output";

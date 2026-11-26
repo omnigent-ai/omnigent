@@ -257,6 +257,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { collectUnreadInboxItems } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
+import { useFloatingPanes } from "@/shell/useFloatingPanes";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
@@ -333,6 +334,7 @@ import {
   writeLegacyPinnedConversationIds,
   isOwnedByViewer,
   isSharedAutomationRun,
+  sessionBelongsToProject,
   sessionInSidebarFolder,
   sessionsListAcceptsDrop,
   UNTITLED_CONVERSATION_LABEL,
@@ -454,6 +456,11 @@ const ProjectIconsContext = createContext<Map<string, string>>(new Map());
 const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
 // The filter menu's "Show" toggles: which optional metadata each row renders.
 const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
+// The project folder a row is listed in, if any. A row filed there sits under the
+// folder's name; another owner's run placed in the automation folder isn't filed there.
+const EnclosingProjectFolderContext = createContext<{ id: string | null; name: string } | null>(
+  null,
+);
 // Row-invariant values resolved once at the list owner and shared, so a row
 // doesn't run `useIsMobileViewport` (a matchMedia-on-every-render store) or
 // `useViewerId` (an identity-resolve effect) per instance.
@@ -1093,6 +1100,7 @@ function SidebarImpl({
   // class so it only applies on desktop — on mobile the sidebar is a
   // full-screen overlay (``fixed inset-0``) and the variable is ignored.
   const { width: sidebarWidth, resizing, handleProps: resizeHandleProps } = useResizableSidebar();
+  const floatingPanes = useFloatingPanes();
 
   // On the mobile layout, a leftward swipe on the open drawer slides it shut and
   // a rightward swipe across the chat slides the closed one open, both under
@@ -1378,7 +1386,12 @@ function SidebarImpl({
         {!peek && (
           <div
             {...resizeHandleProps}
-            className="absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block"
+            className={cn(
+              "absolute inset-y-0 right-0 z-10 hidden w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 md:block",
+              // Where the panes float, 48rem and wider, the cursor band spans the gap with no bar.
+              floatingPanes &&
+                "min-[48rem]:w-[calc(var(--pane-gap)+5px)] min-[48rem]:hover:bg-transparent min-[48rem]:active:bg-transparent",
+            )}
           />
         )}
         {inSettings ? (
@@ -1995,6 +2008,8 @@ function ProjectFolder({
       onProjectRenamed?.(name, newName);
     } catch (error) {
       if (error instanceof ProjectMembersNotMovedError) {
+        // The unmoved sessions keep this folder alive under its old name.
+        setPendingName(null);
         onProjectRenamed?.(name, newName);
         showToast(error.message);
         return;
@@ -2012,6 +2027,7 @@ function ProjectFolder({
   });
   const orderedMenuActions = { ...menuActions, ordering };
 
+  const enclosingFolder = useMemo(() => ({ id: projectId, name }), [projectId, name]);
   let footer: ReactNode = null;
   if (loadingFirstPage) {
     footer = (
@@ -2064,122 +2080,128 @@ function ProjectFolder({
           style={ordering.insertion === "before" ? { top: 0 } : { bottom: 0 }}
         />
       )}
-      <ConversationSection
-        headerDrag={placeholder ? undefined : headerDrag}
-        title={shownName}
-        onRenameHeader={
-          placeholder || pendingName !== null ? undefined : () => setRenamingInline(true)
-        }
-        headerEditor={
-          renamingInline ? (
-            <SidebarEditRow
-              initialTitle={name}
-              label="Rename project"
-              inputTestId="rename-project-inline-input"
-              onCommit={(value) => void commitInlineRename(value)}
-              onCancel={() => setRenamingInline(false)}
-            />
-          ) : undefined
-        }
-        icon={
-          icon ? (
-            <span className="text-[14px] leading-none">{icon}</span>
-          ) : expanded ? (
-            <FolderOpenIcon
-              className={cn(
-                "ui-icon",
-                headerActive ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
-          ) : (
-            <FolderIcon
-              className={cn(
-                "ui-icon",
-                headerActive ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
-          )
-        }
-        active={headerActive}
-        marker={marker}
-        headerStatus={
-          menuActions.mute?.muted ? (
-            <BellOffIcon
-              role="img"
-              aria-label="Muted"
-              data-testid="project-muted-icon"
-              className="size-3.5 shrink-0 text-muted-foreground"
-            />
-          ) : undefined
-        }
-        conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
-        heldConversations={expanded ? undefined : [...(draftRow ? [draftRow] : []), ...heldRows]}
-        listRef={listRef}
-        activeConversationId={activeConversationId}
-        pinnedConversationIds={pinnedConversationIds}
-        sessionShortcutSlots={sessionShortcutSlots}
-        // Projects default collapsed: shown only when explicitly expanded.
-        collapsed={!expanded}
-        onToggleCollapsed={onToggleCollapsed}
-        onActivate={onActivate}
-        collapsedFamilies={collapsedFamilies}
-        onToggleFamily={onToggleFamily}
-        onRowClick={onRowClick}
-        onTogglePinned={onTogglePinned}
-        selectionMode={selectionMode}
-        selectedIds={selectedIds}
-        onToggleSelected={onToggleSelected}
-        onProjectAssigned={onProjectAssigned}
-        reorderGroup={reorderable ? `project:${name}` : undefined}
-        emptyMessage={
-          loadingFirstPage ? undefined : archived ? (
-            "No archived sessions"
-          ) : placeholder ? (
-            "No sessions"
-          ) : (
-            <span className="block">
-              No sessions. Start a{" "}
-              <Link
-                to={`/?project=${encodeURIComponent(name)}`}
-                className="font-medium text-primary underline-offset-4 hover:underline"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRowClick(e);
-                }}
-              >
-                new session
-              </Link>
-              .
-            </span>
-          )
-        }
-        indentRows
-        headerAction={
-          placeholder ? undefined : (
-            <ProjectFolderActions
-              projectName={name}
-              onNavigate={onRowClick}
-              actions={orderedMenuActions}
-            />
-          )
-        }
-        headerContextMenu={
-          placeholder ? undefined : (
-            <ContextMenuContent
-              className="min-w-40"
-              onCloseAutoFocus={menuActions.onCloseAutoFocus}
-            >
-              <ProjectFolderMenuItems
-                components={contextBundle}
+      <EnclosingProjectFolderContext.Provider value={enclosingFolder}>
+        <ConversationSection
+          headerDrag={placeholder ? undefined : headerDrag}
+          title={shownName}
+          onRenameHeader={
+            placeholder || pendingName !== null ? undefined : () => setRenamingInline(true)
+          }
+          headerEditor={
+            renamingInline ? (
+              <SidebarEditRow
+                initialTitle={name}
+                label="Rename project"
+                inputTestId="rename-project-inline-input"
+                onCommit={(value) => void commitInlineRename(value)}
+                onCancel={() => setRenamingInline(false)}
+              />
+            ) : undefined
+          }
+          icon={
+            icon ? (
+              <span className="text-[14px] leading-none">{icon}</span>
+            ) : expanded ? (
+              <FolderOpenIcon
+                className={cn(
+                  "ui-icon",
+                  headerActive
+                    ? "text-[var(--sidebar-active-foreground)]"
+                    : "text-muted-foreground",
+                )}
+              />
+            ) : (
+              <FolderIcon
+                className={cn(
+                  "ui-icon",
+                  headerActive
+                    ? "text-[var(--sidebar-active-foreground)]"
+                    : "text-muted-foreground",
+                )}
+              />
+            )
+          }
+          active={headerActive}
+          marker={marker}
+          headerStatus={
+            menuActions.mute?.muted ? (
+              <BellOffIcon
+                role="img"
+                aria-label="Muted"
+                data-testid="project-muted-icon"
+                className="size-3.5 shrink-0 text-muted-foreground"
+              />
+            ) : undefined
+          }
+          conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
+          heldConversations={expanded ? undefined : [...(draftRow ? [draftRow] : []), ...heldRows]}
+          listRef={listRef}
+          activeConversationId={activeConversationId}
+          pinnedConversationIds={pinnedConversationIds}
+          sessionShortcutSlots={sessionShortcutSlots}
+          // Projects default collapsed: shown only when explicitly expanded.
+          collapsed={!expanded}
+          onToggleCollapsed={onToggleCollapsed}
+          onActivate={onActivate}
+          collapsedFamilies={collapsedFamilies}
+          onToggleFamily={onToggleFamily}
+          onRowClick={onRowClick}
+          onTogglePinned={onTogglePinned}
+          selectionMode={selectionMode}
+          selectedIds={selectedIds}
+          onToggleSelected={onToggleSelected}
+          onProjectAssigned={onProjectAssigned}
+          reorderGroup={reorderable ? `project:${name}` : undefined}
+          emptyMessage={
+            loadingFirstPage ? undefined : archived ? (
+              "No archived sessions"
+            ) : placeholder ? (
+              "No sessions"
+            ) : (
+              <span className="block">
+                No sessions. Start a{" "}
+                <Link
+                  to={`/?project=${encodeURIComponent(name)}`}
+                  className="font-medium text-primary underline-offset-4 hover:underline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRowClick(e);
+                  }}
+                >
+                  new session
+                </Link>
+                .
+              </span>
+            )
+          }
+          indentRows
+          headerAction={
+            placeholder ? undefined : (
+              <ProjectFolderActions
                 projectName={name}
                 onNavigate={onRowClick}
                 actions={orderedMenuActions}
               />
-            </ContextMenuContent>
-          )
-        }
-        footer={footer}
-      />
+            )
+          }
+          headerContextMenu={
+            placeholder ? undefined : (
+              <ContextMenuContent
+                className="min-w-40"
+                onCloseAutoFocus={menuActions.onCloseAutoFocus}
+              >
+                <ProjectFolderMenuItems
+                  components={contextBundle}
+                  projectName={name}
+                  onNavigate={onRowClick}
+                  actions={orderedMenuActions}
+                />
+              </ContextMenuContent>
+            )
+          }
+          footer={footer}
+        />
+      </EnclosingProjectFolderContext.Provider>
       {menuDialogs}
     </div>
   );
@@ -4435,6 +4457,7 @@ const ORDERING_LABELS: Record<SidebarOrdering, string> = {
 };
 const SHOW_LABELS: Record<SidebarShowField, string> = {
   harness: "Harness",
+  project: "Project",
   updated: "Updated",
   environment: "Environment",
   repo: "Repo",
@@ -5767,31 +5790,41 @@ function SessionSharedHint({ sharing }: { sharing: SessionSharing }) {
   );
 }
 
-// A row's second line: the "Show" environment and branch, each omitted when empty.
+// A row's second line: the "Show" project, environment, repo and branch, each omitted when empty.
 function SessionMetaLine({
+  project,
   environment,
   repo,
   branch,
 }: {
+  project: { name: string; icon: string | null } | null;
   environment: ReactNode;
   repo: string | null;
   branch: string | null;
 }) {
-  const parts: { key: string; icon: LucideIcon; value: ReactNode }[] = [];
-  if (environment != null) parts.push({ key: "environment", icon: LaptopIcon, value: environment });
-  if (repo !== null) parts.push({ key: "repo", icon: FolderGit2Icon, value: repo });
-  if (branch !== null) parts.push({ key: "branch", icon: GitBranchIcon, value: branch });
+  const metaIcon = (Icon: LucideIcon) => <Icon aria-hidden className="size-3.5 shrink-0" />;
+  const parts: { key: string; icon: ReactNode; value: ReactNode }[] = [];
+  if (project !== null)
+    parts.push({
+      key: "project",
+      icon: <ProjectRowIcon icon={project.icon} />,
+      value: project.name,
+    });
+  if (environment != null)
+    parts.push({ key: "environment", icon: metaIcon(LaptopIcon), value: environment });
+  if (repo !== null) parts.push({ key: "repo", icon: metaIcon(FolderGit2Icon), value: repo });
+  if (branch !== null) parts.push({ key: "branch", icon: metaIcon(GitBranchIcon), value: branch });
   if (parts.length === 0) return null;
   return (
     <span
       data-testid="session-row-meta"
       className="flex w-full min-w-0 items-center gap-1.5 text-sm text-muted-foreground"
     >
-      {parts.map(({ key, icon: Icon, value }, i) => (
+      {parts.map(({ key, icon, value }, i) => (
         <Fragment key={key}>
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
-            <Icon aria-hidden className="size-3.5 shrink-0" />
+            {icon}
             <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
           </span>
         </Fragment>
@@ -6390,6 +6423,15 @@ function ConversationRowImpl({
   const trailingLayout =
     TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const showHarness = show.includes("harness");
+  // A row in its own project's folder already sits under that name; pins, other
+  // groupings and runs placed in the automation folder don't.
+  const enclosingFolder = useContext(EnclosingProjectFolderContext);
+  const inOwnProjectFolder =
+    enclosingFolder !== null && sessionBelongsToProject(conversation, enclosingFolder, viewerId);
+  const metaProject =
+    show.includes("project") && !inOwnProjectFolder && currentProject !== null
+      ? { name: currentProject, icon: projectFlyoutIcon }
+      : null;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -6398,7 +6440,7 @@ function ConversationRowImpl({
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =
-    metaEnvironment !== null || metaRepo !== null || metaBranch !== null
+    metaProject !== null || metaEnvironment !== null || metaRepo !== null || metaBranch !== null
       ? "top-4 md:top-3.5"
       : "top-1/2";
 
@@ -6590,7 +6632,12 @@ function ConversationRowImpl({
         </span>
       </div>
       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
-      <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+      <SessionMetaLine
+        project={metaProject}
+        environment={metaEnvironment}
+        repo={metaRepo}
+        branch={metaBranch}
+      />
     </>
   );
 

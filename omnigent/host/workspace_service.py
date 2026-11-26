@@ -4,7 +4,9 @@ This is the API's single implementation: the desktop app's direct socket and
 the server's route both reach this service. It reads through
 :class:`~omnigent.workspace_fs.WorkspaceReader`, so its answers match the REST
 file routes. Which workspace a call reads comes from the caller-supplied
-``reader_for``, which resolves it from the call's credentials.
+``reader_for``, which resolves it from the call's credentials. Its pull request
+methods are served only over the tunnel, for the session the server sends with
+the call (see :mod:`omnigent.host.workspace_pull_requests`); the socket serves none.
 
 Mount it with the generated ASGI app::
 
@@ -80,8 +82,17 @@ from omnigent.host import workspace_fuzzy
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_git import comparison, context, working_copy
 from omnigent.host.workspace_git.ignored import DirectoryIgnores
+from omnigent.host.workspace_git.repository_folder import repository_folder
 from omnigent.host.workspace_git.runner import Deadline, GitError, runs_on_this_host
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
+from omnigent.host.workspace_payloads import payload_struct
+from omnigent.host.workspace_pull_request_input import refuse_unserved_request
+from omnigent.host.workspace_pull_requests import (
+    PULL_REQUEST_OPS,
+    PullRequestCall,
+    PullRequestRefused,
+    run_pull_request_op,
+)
 from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
@@ -136,12 +147,16 @@ _SERVED: dict[str, _Served] = {
         optional_features=workspace_fuzzy.features,
     ),
     "SearchText": _Served(features=("text_search_priority",), tool="rg"),
-    "ResolveWorkingCopyBase": _Served(features=("revision_comparison",), tool="git"),
+    "ResolveWorkingCopyBase": _Served(
+        features=("revision_comparison", "comparison.repository"), tool="git"
+    ),
     "ListWorkingCopyChanges": _Served(tool="git"),
     "ReadBaseFile": _Served(tool="git"),
     "ListRepositoryRefs": _Served(tool="git"),
-    "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
+    "ListBranchCommits": _Served(features=("branch_commits", "branch_commits.head"), tool="git"),
     "ResolveRepositoryContext": _Served(tool="git"),
+    # Served only over the tunnel, for a call the server sent with its session.
+    **{name: _Served(tool="gh") for name in PULL_REQUEST_OPS},
 }
 
 
@@ -150,10 +165,16 @@ def _reads_ignore_rules() -> bool:
     return bool(shutil.which("git")) and runs_on_this_host()
 
 
-def capabilities() -> list[str]:
-    """The method and feature names GetCapabilities lists on this host."""
+def capabilities(*, pull_requests: bool = False) -> list[str]:
+    """The method and feature names GetCapabilities lists on this host.
+
+    :param pull_requests: Whether the call may read pull requests: only a tunnel call
+        that carries the session the server authorized.
+    """
     names: list[str] = []
     for name, served in _SERVED.items():
+        if name in PULL_REQUEST_OPS and not pull_requests:
+            continue
         if served.tool is None or shutil.which(served.tool):
             optional = served.optional_features() if served.optional_features else ()
             names += [name, *served.features, *optional]
@@ -182,17 +203,38 @@ class WorkspaceService(WorkspaceServiceMethods):
 
     :param reader_for: Returns the reader for the workspace a call may read.
         It must raise :class:`ConnectError` when the call isn't authorized.
+    :param pull_request_call: The session and vouch the server sent with a tunnel call,
+        or ``None``, e.g. on the direct socket, where pull requests aren't served.
     """
 
-    def __init__(self, reader_for: ReaderForCall) -> None:
+    def __init__(
+        self, reader_for: ReaderForCall, pull_request_call: PullRequestCall | None = None
+    ) -> None:
         self._reader_for = reader_for
+        self._pull_request_call = pull_request_call
 
     async def get_capabilities(
         self,
         _request: GetCapabilitiesRequest,
         _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
     ) -> GetCapabilitiesResponse:
-        return GetCapabilitiesResponse(capabilities=capabilities())
+        return GetCapabilitiesResponse(
+            capabilities=capabilities(pull_requests=self._pull_request_call is not None)
+        )
+
+    async def _serve_pull_request(
+        self, name: str, request: Message, ctx: RequestContext | None
+    ) -> Message:
+        # Refused before any reader, registry or gh work when the server sent no session.
+        call = self._pull_request_call
+        if call is None:
+            raise ConnectError(
+                Code.UNIMPLEMENTED, "Pull requests are served through the server's route"
+            )
+        refuse_unserved_request(name, request)
+        reader = await _read(self._reader_for, ctx)
+        payload = await _read(run_pull_request_op, name, reader, call, request)
+        return WORKSPACE_METHODS[name].response_type(payload=payload_struct(payload))
 
     async def list_directory(
         self,
@@ -293,7 +335,10 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse] | None,
     ) -> ResolveWorkingCopyBaseResponse:
         reader = await _read(self._reader_for, ctx)
-        return await working_copy.resolve_working_copy_base(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await working_copy.resolve_working_copy_base(
+            folder.path, request, folder.repository
+        )
 
     async def list_working_copy_changes(
         self,
@@ -301,7 +346,10 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse] | None,
     ) -> ListWorkingCopyChangesResponse:
         reader = await _read(self._reader_for, ctx)
-        return await working_copy.list_working_copy_changes(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await working_copy.list_working_copy_changes(
+            folder.path, request, folder.repository
+        )
 
     async def read_base_file(
         self,
@@ -309,7 +357,10 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ReadBaseFileRequest, ReadBaseFileResponse] | None,
     ) -> AsyncIterator[ReadBaseFileResponse]:
         reader = await _read(self._reader_for, ctx)
-        async with aclosing(working_copy.read_base_file(reader.root, request)) as responses:
+        folder = await repository_folder(reader, request.repository)
+        async with aclosing(
+            working_copy.read_base_file(folder.path, request, folder.repository)
+        ) as responses:
             async for response in responses:
                 yield response
 
@@ -319,7 +370,8 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ListRepositoryRefsRequest, ListRepositoryRefsResponse] | None,
     ) -> ListRepositoryRefsResponse:
         reader = await _read(self._reader_for, ctx)
-        return await comparison.list_repository_refs(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await comparison.list_repository_refs(folder.path, request, folder.repository)
 
     async def list_branch_commits(
         self,
@@ -327,7 +379,8 @@ class WorkspaceService(WorkspaceServiceMethods):
         ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse] | None,
     ) -> ListBranchCommitsResponse:
         reader = await _read(self._reader_for, ctx)
-        return await comparison.list_branch_commits(reader.root, request)
+        folder = await repository_folder(reader, request.repository)
+        return await comparison.list_branch_commits(folder.path, request, folder.repository)
 
     async def resolve_repository_context(
         self,
@@ -462,6 +515,22 @@ def _reader_at(
     return reader_for_workspace(expanded)
 
 
+def _pull_request_handler(name: str) -> Callable[..., object]:
+    """A WorkspaceService method that serves the pull request method ``name``."""
+
+    async def handle(
+        self: WorkspaceService, request: Message, ctx: RequestContext | None
+    ) -> Message:
+        return await self._serve_pull_request(name, request, ctx)
+
+    handle.__name__ = WORKSPACE_METHODS[name].python_name
+    return handle
+
+
+for _name in PULL_REQUEST_OPS:
+    setattr(WorkspaceService, WORKSPACE_METHODS[_name].python_name, _pull_request_handler(_name))
+
+
 async def _call(service: WorkspaceService, method: str, request: bytes) -> AsyncIterator[Message]:
     """Run one serialized call against ``service``, yielding its responses.
 
@@ -491,14 +560,27 @@ async def serve_tunnel_call(
     Yields one reply per response message, then a final ``done`` reply that
     carries the error, if any.
     """
-    service = WorkspaceService(lambda _ctx: _reader_at(reader_for_workspace, frame.workspace))
+    pull_request_call = (
+        PullRequestCall(
+            session_id=frame.session_id, vouch=frame.vouch, account_rights=frame.account_rights
+        )
+        if frame.session_id
+        else None
+    )
+    service = WorkspaceService(
+        lambda _ctx: _reader_at(reader_for_workspace, frame.workspace), pull_request_call
+    )
     request_id = frame.request_id
     try:
         async for response in _call(service, frame.method, frame.request):
             yield HostWorkspaceReplyFrame(request_id, message=response.SerializeToString())
     except ConnectError as exc:
         yield HostWorkspaceReplyFrame(
-            request_id, done=True, error_code=exc.code.value, error_message=exc.message
+            request_id,
+            done=True,
+            error_code=exc.code.value,
+            error_message=exc.message,
+            error_reason=exc.reason if isinstance(exc, PullRequestRefused) else None,
         )
         return
     except Exception:

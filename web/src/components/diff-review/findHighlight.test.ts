@@ -6,6 +6,7 @@ import {
   DIFF_FIND_HIGHLIGHTS,
   paintOwnedFindHighlights,
   PULL_REQUEST_FIND_HIGHLIGHTS,
+  searchMatchRange,
 } from "./findHighlight";
 
 let highlights: Map<string, FakeHighlight>;
@@ -82,5 +83,19 @@ describe("find highlight ownership", () => {
     paintOwnedFindHighlights(review, PULL_REQUEST_FIND_HIGHLIGHTS, [one], one);
     expect(highlights.has(DIFF_FIND_HIGHLIGHTS.current)).toBe(false);
     expect(painted(PULL_REQUEST_FIND_HIGHLIGHTS.current)).toEqual([one]);
+  });
+});
+
+describe("searchMatchRange", () => {
+  it("ranges a renamed file's old name in its header, apart from its new one", () => {
+    const item = document.createElement("div");
+    // As the diff header renders a rename: the old name, then the new one.
+    item.attachShadow({ mode: "open" }).innerHTML =
+      "<div data-prev-name><bdi>src/old.ts</bdi></div><div data-title><bdi>src/new.ts</bdi></div>";
+    const match = { id: "diff:src/new.ts", text: "src/old.ts", lineNumber: 1, from: 4, to: 10 };
+    expect(searchMatchRange(item, { ...match, target: "previousPath" })?.toString()).toBe("old.ts");
+    expect(
+      searchMatchRange(item, { ...match, text: "src/new.ts", target: "currentPath" })?.toString(),
+    ).toBe("new.ts");
   });
 });

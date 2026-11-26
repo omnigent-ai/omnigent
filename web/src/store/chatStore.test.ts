@@ -1378,6 +1378,30 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
+  it("settles a shell in a stale pending snapshot by its persisted identity", async () => {
+    const id = "conv_shell_bind";
+    seedSession(id, [
+      {
+        id: "shell",
+        response_id: "resp_shell",
+        status: "completed",
+        type: "terminal_command",
+        kind: "input",
+        input: "ls",
+        submission: { pending_id: "pending_shell" },
+      },
+    ]);
+    const content = [{ type: "input_text", text: "!ls" }];
+    sessionPendingInputs.set(id, [
+      { pending_id: "pending_shell", content },
+      { pending_id: "pending_later", content },
+    ]);
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pending_later",
+    ]);
+  });
+
   it("paints a backgrounded conversation instantly from its live entry, no rebind", async () => {
     // The feature: switching away no longer tears the stream down, so switching
     // back paints from the retained entry without a hydrating placeholder or a
@@ -3280,6 +3304,54 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(calls).toEqual([{ url: "/v1/sessions/conv_existing/events", method: "POST" }]);
   });
 
+  it.each([false, true])(
+    "settles a shell before its POST answers (response lost: %s)",
+    async (lost) => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      let finishPost!: (value: Response) => void;
+      let failPost!: (reason: Error) => void;
+      const pending = new Promise<Response>((resolve, reject) => {
+        finishPost = resolve;
+        failPost = reject;
+      });
+      let postedStableId: string | undefined;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          postedStableId = JSON.parse(init.body as string).data.stable_id;
+          return pending;
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("!ls", "agent_xyz");
+      await vi.waitFor(() => expect(postedStableId).toBeDefined());
+      expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({
+        stableId: postedStableId,
+      });
+      handleSessionEvent({
+        type: "terminal_command",
+        itemId: "shell",
+        responseId: "resp_shell",
+        kind: "input",
+        input: "ls",
+        stdout: null,
+        stderr: null,
+        submission: { pendingId: "pending_shell", stableId: postedStableId },
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      if (lost) failPost(new TypeError("Failed to fetch"));
+      else finishPost(mockResponse({ queued: true, pending_id: "pending_shell" }, { status: 202 }));
+      await sending;
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+    },
+  );
+
   it("invalidates conversations after every postEvent (existing-session sidebar reorder)", async () => {
     // Without this, the sender's chat lags 0-4 s behind their own message.
     useChatStore.setState({
@@ -3578,7 +3650,8 @@ describe("chatStore — send (first-send ordering)", () => {
       // The stream stays up meanwhile, partway through a reply.
       streams[0]!.push(previewDelta("Hello ", 0));
       streams[0]!.push(previewDelta("wor", 1));
-      await vi.advanceTimersByTimeAsync(10);
+      // Later chunks commit on the next animation frame.
+      await vi.advanceTimersByTimeAsync(20);
       const preview = () =>
         entry
           .getState()
@@ -3595,6 +3668,65 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(entry.getState().conversationLoadError).toBeNull();
       expect(gets.metadata).toHaveLength(4);
       expect(preview()).toEqual(["Hello world!"]);
+    });
+
+    it("loads again in place when retried before buffered chunks commit", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_down_frame", []);
+      const { streams } = failSnapshots("conv_down_frame", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_down_frame");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+      const entry = conversationRegistry.peek("conv_down_frame")!;
+      const preview = () =>
+        entry
+          .getState()
+          .blocks.filter((block) => block.ctx.itemId === "live:m1")
+          .map((block) => (block.type === "text_done" ? block.fullText : block.type));
+      streams[0]!.push(previewDelta("Hello ", 0));
+      streams[0]!.push(previewDelta("wor", 1));
+      // Both chunks are read, but no frame has committed the second yet.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(preview()).toEqual(["Hello "]);
+
+      await retryConversationLoad("conv_down_frame");
+      // Let the replaced pump unwind before the new stream replays the reply.
+      await vi.advanceTimersByTimeAsync(20);
+      streams[1]!.push(previewDelta("Hello world!", 2));
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(entry.getState().conversationLoadError).toBeNull();
+      expect(preview()).toEqual(["Hello world!"]);
+    });
+
+    it("shows only the replayed reply when retried right after a chunk arrives", async () => {
+      // Holds whether chunks commit on arrival or on the next frame: a retry
+      // must never let the replaced stream's latest chunk reach the new preview.
+      vi.useFakeTimers();
+      seedSession("conv_down_late", []);
+      const { streams } = failSnapshots("conv_down_late", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_down_late");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+      const entry = conversationRegistry.peek("conv_down_late")!;
+      streams[0]!.push(previewDelta("Hello ", 0));
+      await vi.advanceTimersByTimeAsync(20);
+      streams[0]!.push(previewDelta("wor", 1));
+      await vi.advanceTimersByTimeAsync(1);
+
+      await retryConversationLoad("conv_down_late");
+      await vi.advanceTimersByTimeAsync(20);
+      streams[1]!.push(previewDelta("Hello world!", 2));
+      await vi.advanceTimersByTimeAsync(20);
+
+      const preview = entry
+        .getState()
+        .blocks.filter((block) => block.ctx.itemId === "live:m1")
+        .map((block) => (block.type === "text_done" ? block.fullText : block.type));
+      expect(entry.getState().conversationLoadError).toBeNull();
+      expect(preview).toEqual(["Hello world!"]);
     });
 
     it("keeps the stream slot while the replacing bind waits on the session's host", async () => {
@@ -11999,6 +12131,71 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       pendingId: `pending_${n}`,
     });
 
+    it.each([
+      { submission: { pendingId: "pending_2" }, stableId: undefined },
+      { submission: { pendingId: "pending_2", stableId: "submit_2" }, stableId: "submit_2" },
+    ])(
+      "settles the named submission among identical commands: $submission",
+      ({ submission, stableId }) => {
+        const first = sent(1, "!ls");
+        const second = {
+          ...sent(2, "!ls"),
+          pendingId: stableId ? undefined : "pending_2",
+          stableId,
+        };
+        useChatStore.setState({ pendingUserMessages: [first, second] });
+        const event = { ...shellEvent("input"), submission };
+        handleSessionEvent(event);
+        handleSessionEvent(event);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([first]);
+        handleSessionEvent(receipt("legacy_second", "!ls", "pending_2"));
+        expect(useChatStore.getState().pendingUserMessages).toEqual([first]);
+      },
+    );
+
+    it.each([{}, { pendingId: "another_client" }])(
+      "does not guess from text when submission is %j",
+      (submission) => {
+        const pending = [sent(1, "!ls")];
+        useChatStore.setState({ pendingUserMessages: pending });
+        handleSessionEvent({ ...shellEvent("input"), submission });
+        expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+      },
+    );
+
+    it.each([true, false])(
+      "settles already-restored send drafts only by stable ID (match: %s)",
+      (matches) => {
+        const stableId = "a".repeat(32);
+        const failed = { conversationId: "conv_existing", stableId, text: "!ls", files: [] };
+        const restored = { ...failed, delivered: false };
+        useChatStore.setState({
+          failedSendDraft: failed,
+          restoredSendDraft: restored,
+          pendingRetryStableId: stableId,
+        });
+        handleSessionEvent({
+          ...shellEvent("input"),
+          submission: { pendingId: "pending_shell", stableId: matches ? stableId : "b".repeat(32) },
+        });
+        const state = useChatStore.getState();
+        expect(state.failedSendDraft).toEqual(matches ? null : failed);
+        expect(state.restoredSendDraft).toEqual({ ...restored, delivered: matches });
+        expect(state.pendingRetryStableId).toBe(matches ? null : stableId);
+      },
+    );
+
+    it("does not give a later same-text receipt credit for a modern shell", () => {
+      useChatStore.setState({ pendingUserMessages: [sent(1, "!ls")] });
+      handleSessionEvent({ ...shellEvent("input"), submission: { pendingId: "pending_1" } });
+      useChatStore.setState({
+        pendingUserMessages: [sent(2, "!ls"), sent(3, "thanks"), sent(4, "more")],
+      });
+      handleSessionEvent(receipt("skipped_second", "!ls", "pending_2"));
+      handleSessionEvent(receipt("thanks", "thanks", "pending_3"));
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(4, "more")]);
+    });
+
     it("pops the queued bubble whose command was mirrored", () => {
       // A `!cmd` runs as a shell command, so no `session.input.consumed`
       // follows. The server settles the entry whose text is that command; the
@@ -19104,6 +19301,97 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 
   it.each([
+    {
+      path: "ordinary backfill",
+      gapLength: 5,
+      submission: { pending_id: "pending_shell", stable_id: "a".repeat(32) },
+      clears: true,
+    },
+    {
+      path: "the fresh-window fallback",
+      gapLength: 100,
+      submission: { pending_id: "pending_shell" },
+      clears: true,
+    },
+    { path: "legacy history", gapLength: 5, submission: undefined, clears: false },
+    { path: "direct terminal history", gapLength: 100, submission: {}, clears: false },
+    {
+      path: "an input before the fresh history window",
+      gapLength: 101,
+      submission: { pending_id: "pending_shell" },
+      clears: false,
+      shellFirst: true,
+    },
+  ])(
+    "recovers a shell submission by identity through $path",
+    async ({ gapLength, submission, clears, ...placement }) => {
+      const id = `conv_shell_identity_${gapLength}`;
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const queued = (tempId: string) => ({
+        tempId,
+        content: [{ type: "input_text" as const, text: "!ls" }],
+      });
+      const later = queued("pending_later");
+      const pending = [queued("pending_shell"), later];
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        blocks: itemsToBlocks(windowItems),
+        pendingUserMessages: pending,
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      const shell: ConversationItem = {
+        id: "shell_gap",
+        response_id: "resp_shell",
+        status: "completed",
+        type: "terminal_command",
+        kind: "input",
+        input: "ls",
+        submission,
+      };
+      const gap = Array.from({ length: gapLength - 1 }, (_, i) => ({
+        ...gapUser("gap", i),
+        role: "assistant" as const,
+      }));
+      const shellFirst = "shellFirst" in placement && placement.shellFirst;
+      seedSessionItems(id, [...preGap, ...(shellFirst ? [shell, ...gap] : [...gap, shell])]);
+      sinks[0]!.error();
+      await drainAsync();
+      const expected = clears ? [later] : pending;
+      expect(useChatStore.getState().pendingUserMessages).toEqual(expected);
+      expect(useChatStore.getState().blocks.filter((b) => b.ctx.itemId === shell.id)).toHaveLength(
+        shellFirst ? 0 : 1,
+      );
+      if (shellFirst) {
+        await useChatStore.getState().loadMoreHistory();
+        expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === shell.id)).toBe(true);
+        expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+      }
+      if (clears)
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "legacy_shell",
+          itemType: "message",
+          clearedPendingId: "pending_shell",
+          data: { role: "user", content: [{ type: "input_text", text: "!ls" }] },
+        });
+      expect(useChatStore.getState().pendingUserMessages).toEqual(expected);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each([
     { path: "ordinary backfill", gapLength: 5 },
     { path: "the fresh-window fallback", gapLength: 100 },
   ])(
@@ -20477,6 +20765,137 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     expect(useChatStore.getState().blocks.filter((b) => b.type === "text_chunk")).toEqual([]);
 
     controller.abort();
+  });
+
+  it("keeps every chunk in order when a frame's chunks commit together", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_order",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_order");
+    sink.push(sse("response.created", { id: "resp_o", status: "in_progress", output: [] }));
+    const chunks = ["# Title\n\n", "- one ", "- two ", "```py\n", "x = 1\n", "```\n"];
+    chunks.forEach((chunk, index) => sink.push(nativeDelta("m1", index, chunk, false)));
+    await tick();
+    manual.fire();
+
+    expect(provisional()).toMatchObject({
+      fullText: chunks.join(""),
+      streamIndex: chunks.length - 1,
+      hasCodeBlocks: true,
+    });
+    expect(provisional()?.previewInterrupted).toBeUndefined();
+
+    sink.push(nativeDelta("m1", chunks.length, "done", true));
+    await tick();
+    expect(provisional()?.fullText).toBe(`${chunks.join("")}done`);
+    controller.abort();
+  });
+
+  it("commits a frame's later chunks in one store update", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_frame",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_frame");
+    sink.push(nativeDelta("m1", 0, "a ", false));
+    await tick();
+    // The first chunk paints without waiting for a frame.
+    expect(provisional()?.fullText).toBe("a ");
+
+    let commits = 0;
+    const unsubscribe = useChatStore.subscribe(() => {
+      commits += 1;
+    });
+    for (const [index, chunk] of ["b ", "c ", "d "].entries()) {
+      sink.push(nativeDelta("m1", index + 1, chunk, false));
+    }
+    await tick();
+    expect(commits).toBe(0);
+    manual.fire();
+    unsubscribe();
+    expect(commits).toBe(1);
+    expect(provisional()?.fullText).toBe("a b c d ");
+    controller.abort();
+  });
+
+  it("lands buffered chunks before the authoritative item replaces the preview", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_buffered_done",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_buffered_done");
+    sink.push(sse("response.created", { id: "resp_d", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "one ", false));
+    sink.push(nativeDelta("m1", 1, "two ", false));
+    sink.push(nativeDelta("m1", 2, "three", false));
+    const seen: string[] = [];
+    const unsubscribe = useChatStore.subscribe(() => {
+      const text = provisional()?.fullText;
+      if (text !== undefined) seen.push(text);
+    });
+    sink.push(messageDone("ci_1", "resp_d", "one two three", "m1"));
+    await tick();
+    manual.fire();
+    unsubscribe();
+
+    // The buffered chunks land before the item, which replaces the preview
+    // without a later frame recreating it.
+    expect(seen).toContain("one two three");
+    expect(provisional()).toBeUndefined();
+    const text = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
+    expect(text).toHaveLength(1);
+    expect(text[0]).toMatchObject({ ctx: { itemId: "ci_1" }, fullText: "one two three" });
+    controller.abort();
+  });
+
+  it("shows the text before an approval card without waiting for a frame", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_card",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_live_card");
+    sink.push(sse("response.created", { id: "resp_c", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "a ", false));
+    sink.push(nativeDelta("m1", 1, "b ", false));
+    sink.push(nativeDelta("m1", 2, "c ", false));
+    sink.push(elicitationReq("elicit_card"));
+    await tick();
+
+    // No frame has fired: the card's arrival alone must land the text before it.
+    const blocks = useChatStore.getState().blocks;
+    const textAt = blocks.findIndex((b) => b.ctx.itemId === "live:m1");
+    const cardAt = blocks.findIndex((b) => b.type === "elicitation");
+    expect(provisional()?.fullText).toBe("a b c ");
+    expect(cardAt).toBeGreaterThan(-1);
+    expect(textAt).toBeLessThan(cardAt);
+    controller.abort();
+  });
+
+  it("never lands a released conversation's chunks in the one bound after it", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_released",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller, manual } = startPump("conv_live_released");
+    sink.push(sse("response.created", { id: "resp_r", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "a ", false));
+    sink.push(nativeDelta("m1", 1, "b ", false));
+    await tick();
+
+    conversationRegistry.release("conv_live_released");
+    useChatStore.setState({ conversationId: "conv_live_next", blocks: [] });
+    manual.fire();
+    controller.abort();
+    await tick();
+
+    expect(useChatStore.getState().conversationId).toBe("conv_live_next");
+    expect(provisional()).toBeUndefined();
   });
 
   it("marks a skipped native chunk until the authoritative message arrives", async () => {
@@ -25287,6 +25706,74 @@ describe("a send cut off by a reload", () => {
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
     expect(peekQueuedSends("conv_reload").map((send) => send.stableId)).toEqual(["stable_held"]);
   });
+
+  it.each([
+    { identified: true, remaining: "none" },
+    { identified: false, remaining: "none" },
+    { identified: true, remaining: "unsent" },
+    { identified: false, remaining: "unsent" },
+    { identified: true, remaining: "queued" },
+    { identified: false, remaining: "queued" },
+    { identified: false, remaining: "none", delivery: "event" },
+    { identified: false, remaining: "none", delivery: "history" },
+  ])(
+    "filters delivered shells before reload restoration ($identified, $remaining)",
+    async ({ identified, remaining, ...timing }) => {
+      const delivery = "delivery" in timing ? timing.delivery : "snapshot";
+      const stableId = "a".repeat(32);
+      const unresolvedId = "b".repeat(32);
+      const shell: ConversationItem = {
+        id: "terminal_mirror",
+        response_id: "resp_shell",
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "echo hello",
+        submission: { pending_id: "pending_shell", stable_id: stableId },
+      };
+      seedSession("conv_reload", delivery === "snapshot" ? [shell] : []);
+      rememberUnsentSend("conv_reload", { stableId, text: "!echo hello", authorId: "user_a" });
+      const unresolved = { stableId: unresolvedId, text: "still unsent", authorId: "user_a" };
+      if (remaining === "unsent") rememberUnsentSend("conv_reload", unresolved);
+      if (remaining === "queued") rememberQueuedSends("conv_reload", [unresolved]);
+      let identityChanged: (() => void) | undefined;
+      if (!identified) {
+        vi.mocked(getCurrentUserId).mockReturnValue(null);
+        vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+          identityChanged = listener;
+          return () => {};
+        });
+      }
+      await useChatStore.getState().switchTo("conv_reload");
+      if (!identified) {
+        expect(useChatStore.getState().failedSendDraft).toBeNull();
+        if (delivery === "event") {
+          handleSessionEvent({
+            type: "terminal_command",
+            kind: "input",
+            itemId: "terminal_mirror",
+            responseId: "resp_shell",
+            input: "echo hello",
+            stdout: null,
+            stderr: null,
+            submission: { pendingId: "pending_shell", stableId },
+          });
+        } else if (delivery === "history") {
+          useChatStore.setState({ blocks: itemsToBlocks([shell]) });
+        }
+        vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+        identityChanged!();
+      }
+      if (remaining === "none") expect(useChatStore.getState().failedSendDraft).toBeNull();
+      else
+        expect(useChatStore.getState().failedSendDraft).toMatchObject({
+          text: "still unsent",
+          stableId: unresolvedId,
+        });
+      expect(peekUnsentSends("conv_reload")).toEqual([]);
+      expect(peekQueuedSends("conv_reload")).toEqual([]);
+    },
+  );
 
   it("drops a send the snapshot shows persisted", async () => {
     seedSession("conv_reload", [

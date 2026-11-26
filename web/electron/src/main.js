@@ -84,7 +84,15 @@ const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
-const { isTrustedRemoteContext, readTrustedRemoteHosts } = require("./trustedRemoteHosts");
+const {
+  addTrustedRemoteHost,
+  isTrustedRemoteContext,
+  readTrustedRemoteHosts,
+  removeTrustedRemoteHost,
+  serializeTrustedRemoteHosts,
+  normalizeTrustedHostId,
+} = require("./trustedRemoteHosts");
+const { createTrustedRemoteHostRequests } = require("./trustedRemoteHostRequests");
 const { normalizedServerTarget } = require("./hostStatusIdentity");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const {
@@ -433,6 +441,47 @@ async function approveSshPreviewHost(win, serverUrl, destination, needsVerificat
       `Allow only if you recognize "${destination}".`,
   });
   return win.isDestroyed() || windows.get(win)?.serverUrl !== serverUrl ? null : response === 1;
+}
+
+/** Persisted trusted remote hosts, reread on each check so hand edits apply. */
+const trustedRemoteHostRequests = createTrustedRemoteHostRequests({
+  isTrusted: (serverUrl, hostId) => {
+    try {
+      return isTrustedRemoteContext(
+        readTrustedRemoteHosts(loadSettings({ strict: true }).trusted_remote_hosts),
+        { serverTarget: serverUrl, sourceHostId: hostId },
+        serverUrl,
+      );
+    } catch {
+      return false;
+    }
+  },
+  add: (serverUrl, hostId) => {
+    const settings = loadSettings({ strict: true });
+    const result = addTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
+    if (result.added) {
+      settings.trusted_remote_hosts = result.entries;
+      saveSettings(settings);
+    }
+    return result.added;
+  },
+});
+
+/** Ask in the shell before persisting localhost access for a remote host. */
+async function approveTrustedRemoteHost(win, serverUrl, hostId) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Trust this host"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Let sessions on "${new URL(serverUrl).host}" open localhost pages?`,
+    detail:
+      `Server: ${serverUrl}\nHost ID: ${hostId}\n\n` +
+      "Sessions there, and their agents, could then open localhost, 127.0.0.1 and *.localhost pages in the Browser pane. Those are this computer's own ports, including any you forward from that host. Trust stays in place until you remove it in Settings, and the host's port must already be forwarded to this computer.\n\n" +
+      "Only trust hosts you recognize with access to this computer's local services.",
+  });
+  return win.isDestroyed() ? null : response === 1;
 }
 
 /**
@@ -2157,10 +2206,15 @@ function settingsPath() {
   return path.join(app.getPath("userData"), "settings.json");
 }
 
-function loadSettings() {
+function loadSettings({ strict = false } = {}) {
   try {
-    return JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
-  } catch {
+    const settings = JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    if (strict && (!settings || typeof settings !== "object" || Array.isArray(settings))) {
+      throw new Error("Desktop settings must be a JSON object.");
+    }
+    return settings;
+  } catch (error) {
+    if (strict && error.code !== "ENOENT") throw error;
     // Missing/corrupt file → empty settings (first launch).
     return {};
   }
@@ -3032,7 +3086,9 @@ function createWindow(targetUrl, opts = {}) {
     height: savedBounds?.height ?? defaultSize.height,
     // Without saved coordinates Electron centers the window.
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
-    minWidth: 720,
+    // Narrow enough to tile beside other windows; the docked sidebar (at most half the window)
+    // still leaves the chat room for its composer.
+    minWidth: 480,
     // Tall enough that the bundled setup page (logo, Start-locally, divider,
     // URL field, Connect, and a few recents) fits without overflowing.
     minHeight: 600,
@@ -4076,6 +4132,13 @@ function shouldPlayNotificationSound(key) {
   return true;
 }
 
+// Electron never emits `click` for a garbage-collected Notification, so the
+// notify handler keeps each one alive until it is clicked or fails to show. The
+// cap bounds the ones dismissed without a click, whose `close` isn't reliable.
+const MAX_RETAINED_NOTIFICATIONS = 100;
+/** @type {Set<Electron.Notification>} */
+const retainedNotifications = new Set();
+
 /**
  * Forget the saved server URL and return the focused window to the bundled
  * setup page so the user can enter a new one. For an ephemeral (debug
@@ -4796,6 +4859,9 @@ function createBrowserRegistryForWindow(win) {
       }
     },
     isHostFocused: () => !win.isDestroyed() && win.isFocused(),
+    focusHost: () => {
+      if (!win.isDestroyed()) win.webContents.focus();
+    },
     // Renderer measures in CSS px; convert to window DIPs using the host
     // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
     getHostZoomFactor: () => {
@@ -4811,12 +4877,24 @@ function createBrowserRegistryForWindow(win) {
       Menu.buildFromTemplate(items).popup({ window: win });
     },
   });
+  // A reloaded or replaced renderer asks again for the page keys it handles; an older
+  // bundle never asks, so pages keep them.
   win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isMainFrame && !isInPlace) {
       registry.setRecentSessionSwitchSupported(false);
+      registry.holdForwardedChords();
       registry.setOpenTabSupported(false);
     }
   });
+  // A new document, or an error page, asks for its own keys. A navigation that stopped
+  // without one, such as a cancelled reload, left the old renderer, which keeps them.
+  win.webContents.on("did-navigate", () => registry.releaseForwardedChords(false));
+  win.webContents.on("did-fail-load", (_event, errorCode, _description, _url, isMainFrame) => {
+    if (isMainFrame && errorCode !== ERR_ABORTED) registry.releaseForwardedChords(false);
+  });
+  win.webContents.on("did-stop-loading", () => registry.releaseForwardedChords(true));
+  // A crashed renderer can't take the keys it asked for.
+  win.webContents.on("render-process-gone", () => registry.setForwardedChords([]));
   return registry;
 }
 
@@ -5753,6 +5831,7 @@ function registerIpc() {
     // Focus the window that fired the notification (so a click lands on the
     // right one in a multi-window setup), falling back to any open window.
     notification.on("click", () => {
+      retainedNotifications.delete(notification);
       const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
       if (win) {
         if (win.isMinimized()) win.restore();
@@ -5770,6 +5849,11 @@ function registerIpc() {
         }
       }
     });
+    notification.on("failed", () => retainedNotifications.delete(notification));
+    retainedNotifications.add(notification);
+    if (retainedNotifications.size > MAX_RETAINED_NOTIFICATIONS) {
+      retainedNotifications.delete(retainedNotifications.values().next().value);
+    }
     notification.show();
     signalForeground();
     // Foreground + background audible cue on macOS: play the user's chosen
@@ -6104,6 +6188,78 @@ function registerIpc() {
     };
   });
 
+  // Each connected server manages only its own entries; all grants need shell consent.
+  const trustedRemoteHostsResult = (event) => {
+    if (!isPinnedOriginSender(event)) {
+      return {
+        ok: false,
+        error: "trusted remote hosts are only available to a connected server page",
+      };
+    }
+    const serverUrl = normalizedServerTarget(senderServerUrl(event));
+    if (!serverUrl) return { ok: false, error: "This window is not connected to a server." };
+    try {
+      return {
+        ok: true,
+        serverUrl,
+        hosts: serializeTrustedRemoteHosts(
+          loadSettings({ strict: true }).trusted_remote_hosts,
+        ).filter((entry) => entry.server_url === serverUrl),
+      };
+    } catch {
+      return {
+        ok: false,
+        error: "Could not read desktop settings. Repair settings.json and retry.",
+      };
+    }
+  };
+  const requestTrustedRemoteHost = (event, serverUrl, hostId) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const current = () =>
+      win &&
+      !win.isDestroyed() &&
+      isPinnedOriginSender(event) &&
+      normalizedServerTarget(senderServerUrl(event)) === serverUrl;
+    return trustedRemoteHostRequests.request(serverUrl, hostId, async () => {
+      if (!current()) return null;
+      loadSettings({ strict: true });
+      const answer = await approveTrustedRemoteHost(win, serverUrl, hostId);
+      return current() ? answer : null;
+    });
+  };
+  ipcMain.handle("omnigent:get-trusted-remote-hosts", (event) => trustedRemoteHostsResult(event));
+  ipcMain.handle("omnigent:add-trusted-remote-host", async (event, serverUrl, hostId) => {
+    const listed = trustedRemoteHostsResult(event);
+    if (!listed.ok) return listed;
+    const host = normalizeTrustedHostId(hostId);
+    if (normalizedServerTarget(serverUrl) !== listed.serverUrl || !host) {
+      return { ...listed, ok: false, error: "Enter a host ID for this window's server." };
+    }
+    const allowed = await requestTrustedRemoteHost(event, listed.serverUrl, host);
+    if (!allowed) {
+      return {
+        ok: false,
+        error: trustedRemoteHostRequests.hint(listed.serverUrl, host) ?? "Trust was not saved.",
+      };
+    }
+    return { ...trustedRemoteHostsResult(event), added: true };
+  });
+  ipcMain.handle("omnigent:remove-trusted-remote-host", (event, serverUrl, hostId) => {
+    const listed = trustedRemoteHostsResult(event);
+    if (!listed.ok) return listed;
+    if (normalizedServerTarget(serverUrl) !== listed.serverUrl) {
+      return { ...listed, ok: false, error: "Manage trusted hosts from their server's window." };
+    }
+    const settings = loadSettings({ strict: true });
+    const result = removeTrustedRemoteHost(settings.trusted_remote_hosts, serverUrl, hostId);
+    if (!result.removed) {
+      return { ...listed, ok: false, error: "That trusted host was not listed." };
+    }
+    settings.trusted_remote_hosts = result.entries;
+    saveSettings(settings);
+    return { ...trustedRemoteHostsResult(event), removed: true };
+  });
+
   // SPA → a workspace API call on a session host's local socket. The socket and
   // call shape are checked in workspaceSocket.js; the host checks the token.
   ipcMain.handle("omnigent:workspace-socket-request", (event, request) => {
@@ -6379,6 +6535,7 @@ function registerIpc() {
       sourceHostId,
       rememberedArcaHostId,
       sourceIsArcaHost,
+      onRecoveryRequested,
     ) => {
       const context = arcaPreviewRecoveryContextForEvent(
         event,
@@ -6388,6 +6545,7 @@ function registerIpc() {
         sourceIsArcaHost,
       );
       if (!context) return false;
+      onRecoveryRequested?.();
       const { target } = context;
       if (pendingPreviewReconnects.has(target)) return false;
       const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;
@@ -6436,6 +6594,25 @@ function registerIpc() {
         opts?.sourceSshTarget,
       );
     },
+    requestTrustedRemoteHostForEvent: async (event, url, opts) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const sourceHostId = normalizeTrustedHostId(opts?.sourceHostId);
+      if (
+        !win ||
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        opts?.trustedRemotePreviewProtocol !== TRUSTED_REMOTE_PREVIEW_PROTOCOL ||
+        win.isDestroyed() ||
+        !isPinnedOriginSender(event) ||
+        !isLoopbackPreviewUrl(url)
+      ) {
+        return false;
+      }
+      const serverUrl = normalizedServerTarget(senderServerUrl(event));
+      if (!serverUrl) return false;
+      // A declined or failed SSH check must not lead to another permission question.
+      if (sshPreviewHosts.hint(senderServerUrl(event), opts?.sourceHostId)) return false;
+      return requestTrustedRemoteHost(event, serverUrl, sourceHostId);
+    },
     getAgentNavigationHintForEvent: (
       event,
       url,
@@ -6457,8 +6634,10 @@ function registerIpc() {
         }
         const serverUrl = normalizedServerTarget(senderServerUrl(event));
         if (!serverUrl) return null;
+        const declinedHint = trustedRemoteHostRequests.hint(serverUrl, sourceHostId);
+        if (declinedHint) return declinedHint;
         const entry = JSON.stringify({ server_url: serverUrl, host_id: sourceHostId });
-        return `To allow localhost previews from this session's host, add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
+        return `To allow localhost previews from this session's host, trust it in Settings, or add ${entry} to trusted_remote_hosts in the desktop settings.json, then retry the preview.`;
       }
       if (typeof rememberedArcaHostId !== "string") {
         return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";

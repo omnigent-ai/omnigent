@@ -16,6 +16,8 @@ const workers = vi.hoisted(() => ({
   behaviour: "silent" as "silent" | "error" | "answer",
   made: [] as FakeWorker[],
   rendered: [] as string[],
+  // The languages each worker was asked to load before it starts.
+  startLanguages: [] as string[][],
 }));
 
 class FakeWorker extends EventTarget {
@@ -33,6 +35,7 @@ class FakeWorker extends EventTarget {
     }
     if (request.type !== "initialize") return;
     this.renderOptions = request.renderOptions;
+    workers.startLanguages.push((request.resolvedLanguages ?? []).map((language) => language.name));
     if (this.behaviour === "error") {
       queueMicrotask(() => this.dispatchEvent(new Event("error")));
     } else if (this.behaviour === "answer") {
@@ -73,6 +76,7 @@ interface WorkerRequest {
   id?: string;
   type?: string;
   renderOptions?: RenderOptions;
+  resolvedLanguages?: { name: string }[];
   diff?: FileDiffMetadata;
 }
 
@@ -92,6 +96,7 @@ beforeEach(async () => {
   workers.behaviour = "silent";
   workers.made = [];
   workers.rendered = [];
+  workers.startLanguages = [];
   vi.resetModules();
   vi.stubGlobal("Worker", FakeWorker);
   ({ DiffReview } = await import("./DiffReview"));
@@ -143,6 +148,14 @@ describe("a review while the shared pool starts or fails", () => {
     render(review());
     await waitFor(() => expect(drawn()).toContain("const two = 2;"));
     expect(shared.peekReady()).toBeNull();
+  });
+
+  it("starts its own workers with plain text, loading the file's language as it draws it", async () => {
+    workers.behaviour = "answer";
+    render(review());
+    await waitFor(() => expect(drawn()).toContain("const two = 2;"));
+    expect(workers.startLanguages.length).toBeGreaterThan(0);
+    for (const languages of workers.startLanguages) expect(languages).not.toContain("typescript");
   });
 
   it("shows its diff after a worker fails before the pool started", async () => {

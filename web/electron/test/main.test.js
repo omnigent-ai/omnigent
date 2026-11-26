@@ -22,6 +22,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const moduleLoader = require("node:module");
 const path = require("node:path");
+const v8 = require("node:v8");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
@@ -451,7 +452,9 @@ function loadNavigationHarness({
     Notification: Object.assign(
       function Notification(options) {
         calls.notifications = [...(calls.notifications ?? []), options];
-        return { on: () => {}, show: () => {} };
+        const notification = Object.assign(new EventEmitter(), { show: () => {} });
+        calls.shownNotifications = [...(calls.shownNotifications ?? []), new WeakRef(notification)];
+        return notification;
       },
       { isSupported: () => notificationsSupported },
     ),
@@ -691,6 +694,9 @@ function loadNavigationHarness({
               setRecentSessionSwitchSupported: () => {},
               setOpenTabSupported: (supported) =>
                 browserRegistryCalls.setOpenTabSupported.push(supported),
+              setForwardedChords: () => {},
+              holdForwardedChords: () => {},
+              releaseForwardedChords: () => {},
               activeConversationId: () => null,
             };
           },
@@ -777,6 +783,7 @@ function loadNavigationHarness({
     "\nmodule.exports.startDesktopOpenListener = startDesktopOpenListener;" +
     "\nmodule.exports.setBrowserHandoffTimeoutMs = (ms) => { browserHandoffTimeoutMs = ms; };" +
     "\nmodule.exports.registerConversationShownReset = registerConversationShownReset;" +
+    "\nmodule.exports.notificationTestApi = { retainedNotifications: () => retainedNotifications, maxRetainedNotifications: () => MAX_RETAINED_NOTIFICATIONS };" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -810,6 +817,7 @@ function loadNavigationHarness({
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   const api = module.exports.testApi;
   Object.assign(api, module.exports.panelTestApi);
+  Object.assign(api, module.exports.notificationTestApi);
   api.quitStarted = module.exports.quitStarted;
   api.startDesktopOpenListener = module.exports.startDesktopOpenListener;
   api.setBrowserHandoffTimeoutMs = module.exports.setBrowserHandoffTimeoutMs;
@@ -2936,7 +2944,7 @@ describe("panel windows", () => {
     assert.equal(h.api.mainWindows()[0], h.win);
     assert.equal(h.api.activeWindow(), h.win);
     assert.equal(h.calls.overlays, 1);
-    assert.equal(h.calls.windowOptions.at(-1).minWidth, 720);
+    assert.equal(h.calls.windowOptions.at(-1).minWidth, 480);
     h.emitWindow("close");
     assert.deepEqual(savedBounds(h), { x: 0, y: 0, width: 1280, height: 860, maximized: false });
   });
@@ -3598,6 +3606,119 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
     assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, [false]);
     harness.cleanup();
   });
+
+  const HOST_URL = "https://host.example/ml/omnigents";
+  const reload = (h) => h.emit("did-start-navigation", HOST_URL, false, true);
+  const chord = (key) => ({ key, metaKey: true, ctrlKey: false, altKey: false, shiftKey: false });
+  // The outgoing renderer can still send its list while the window loads the next document.
+  const updateMidReload = (h, registry) => (reload(h), registry.setForwardedChords([chord("j")]));
+  // Each case ends with the keys the window still takes from the page: none, its first list,
+  // or the list it sent mid-reload.
+  for (const [scenario, navigate, forwardedKeys] of [
+    [
+      "an update mid-reload, then a new document",
+      (h, registry) => (updateMidReload(h, registry), h.emit("did-navigate")),
+      [],
+    ],
+    [
+      "an update mid-reload, then an error page",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -105, "", HOST_URL, true)
+      ),
+      [],
+    ],
+    [
+      "an update mid-reload, then a cancelled reload",
+      (h, registry) => (
+        updateMidReload(h, registry),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      ["j"],
+    ],
+    ["a reload into a bundle that never asks", (h) => (reload(h), h.emit("did-navigate")), []],
+    [
+      "an error page replacing the shell",
+      (h) => (reload(h), h.emit("did-fail-load", -105, "", HOST_URL, true)),
+      [],
+    ],
+    ["a crashed renderer", (h) => h.emit("render-process-gone", {}, { reason: "crashed" }), []],
+    [
+      "a cancelled reload",
+      (h) => (
+        reload(h),
+        h.emit("did-fail-load", -3, "", HOST_URL, true),
+        h.emit("did-stop-loading")
+      ),
+      ["k"],
+    ],
+    [
+      "a reload that stopped without a new document",
+      (h) => (reload(h), h.emit("did-stop-loading")),
+      ["k"],
+    ],
+    [
+      "an in-page or subframe navigation",
+      (h) => (
+        h.emit("did-start-navigation", `${HOST_URL}#c/1`, true, true),
+        h.emit("did-start-navigation", "https://frame.example/", false, false)
+      ),
+      ["k"],
+    ],
+  ]) {
+    it(`${forwardedKeys.length ? "keeps forwarding keys" : "leaves a page its keys"} after ${scenario}`, () => {
+      const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+      try {
+        Object.assign(h.webContents, { focus() {} });
+        h.electron.session.fromPartition = () => ({
+          setPermissionRequestHandler() {},
+          setPermissionCheckHandler() {},
+          webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+        });
+        h.electron.createWebContentsView = () => {
+          const wc = Object.assign(new EventEmitter(), {
+            ipc: new EventEmitter(),
+            setWindowOpenHandler() {},
+            loadURL() {},
+          });
+          return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+        };
+        const registry = h.api.createBrowserRegistryForWindow(h.win);
+        const page = registry.openOrNavigate("browser-tab:conv:t1", "https://page.example/").entry
+          .view.webContents;
+        const press = (key) => {
+          let prevented = false;
+          const before = h.calls.progress.length;
+          page.emit(
+            "before-input-event",
+            { preventDefault: () => (prevented = true) },
+            { type: "keyDown", key, code: `Key${key.toUpperCase()}`, meta: true },
+          );
+          const forwarded = h.calls.progress
+            .slice(before)
+            .filter(({ channel }) => channel === "browser-forwarded-input");
+          return { prevented, forwarded: forwarded.length };
+        };
+
+        registry.setForwardedChords([chord("k")]);
+        assert.deepEqual(press("k"), { prevented: true, forwarded: 1 });
+        navigate(h, registry);
+        // A finished load that follows never hands back keys a new document didn't ask for.
+        h.emit("did-stop-loading");
+        for (const key of ["k", "j"]) {
+          const forwarded = forwardedKeys.includes(key);
+          assert.deepEqual(
+            press(key),
+            { prevented: forwarded, forwarded: forwarded ? 1 : 0 },
+            `⌘${key.toUpperCase()}`,
+          );
+        }
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
 });
 
 // Wiring guards for the window-open policy (src/popupPolicy.js decides,
@@ -5986,6 +6107,16 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         ),
         /can't be verified as Arca/,
       );
+      h.electron.dialog.showMessageBox = async () => ({ response: 1 });
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId,
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        true,
+        "a managed sandbox can still use explicit trust",
+      );
     });
   }
 
@@ -6036,7 +6167,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(resolvedUrl, `${resolvedOrigin}/omnigent`);
     assert.notEqual(resolvedUrl, serverUrl);
     const deps = h.browserIpcDeps();
-    const recover = deps.recoverAgentNavigationForEvent;
+    let recoveryRequested = false;
+    const recover = (...args) =>
+      deps.recoverAgentNavigationForEvent(...args, undefined, () => {
+        recoveryRequested = true;
+      });
     const hint = deps.getAgentNavigationHintForEvent;
     const event = { sender: h.webContents, senderFrame: { url: resolvedUrl } };
     let previewPrompts = 0;
@@ -6056,6 +6191,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       false,
     );
     assert.equal(previewPrompts, 0, "pending reconnect consent must not start another prompt");
+    assert.equal(recoveryRequested, true);
     assert.equal(h.calls.arcaConsentRuns.length, 1);
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
@@ -6068,7 +6204,13 @@ describe("browser-view teardown on server change (src/main.js)", () => {
       () => /declined/.test(hint(event, "http://localhost:5173", hostId, hostId)),
       "decline cooldown hint",
     );
+    recoveryRequested = false;
     assert.equal(await recover(event, "http://localhost:5173", hostId, hostId), false);
+    assert.equal(
+      recoveryRequested,
+      true,
+      "a declined recovery still suppresses another trust prompt",
+    );
     assert.equal(h.calls.arcaConsentRuns.length, 1);
   });
 
@@ -7642,22 +7784,40 @@ describe("localhost previews for hosts reached over SSH", () => {
     assert.equal(h.browserRegistryDeps().allowsLocalhost(context), false);
   });
 
-  it("keeps a declined host blocked until restart and tells the agent why", async (t) => {
-    const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
-    assert.equal((await connect()).ok, true);
-    assert.equal(deps.getAgentNavigationHintForEvent(event, preview, hostId), null);
+  for (const prefixed of [false, true]) {
+    it(`keeps a declined host blocked until restart (prefixed: ${prefixed})`, async (t) => {
+      const sourceHostId = prefixed ? `host_${hostId}` : hostId;
+      const { event, deps, questions, context, eligible, connect } = previewHarness(t, () => 0);
+      assert.equal((await connect()).ok, true);
+      assert.equal(deps.getAgentNavigationHintForEvent(event, preview, sourceHostId), null);
 
-    const opts = { sourceHostId: hostId, sessionHostProtocol: 1, sshPreviewProtocol: 1 };
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
-    assert.equal(questions.length, 1);
-    assert.equal(eligible(context()), false);
-    assert.match(
-      deps.getAgentNavigationHintForEvent(event, preview, hostId),
-      /"devbox" were declined/,
-    );
-    assert.equal(deps.getAgentNavigationHintForEvent(event, "https://example.com/", hostId), null);
-  });
+      const opts = {
+        sourceHostId,
+        sourceSshTarget: "devbox",
+        sessionHostProtocol: 1,
+        sshPreviewProtocol: 1,
+      };
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(await deps.requestPreviewHostForEvent(event, preview, opts), false);
+      assert.equal(
+        await deps.requestTrustedRemoteHostForEvent(event, preview, {
+          ...opts,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      assert.equal(questions.length, 1);
+      assert.equal(eligible(context()), false);
+      assert.match(
+        deps.getAgentNavigationHintForEvent(event, preview, sourceHostId),
+        prefixed ? /this host were declined/ : /"devbox" were declined/,
+      );
+      assert.equal(
+        deps.getAgentNavigationHintForEvent(event, "https://example.com/", sourceHostId),
+        null,
+      );
+    });
+  }
 
   it("does not ask an older renderer even for a recorded destination or supplied hint", async (t) => {
     const { event, deps, questions, eligible, connect } = previewHarness(t, () => 1);
@@ -7912,10 +8072,8 @@ describe("session windows (src/main.js)", () => {
     t.after(h.cleanup);
     assert.equal(openSessionWindow(h, "conv_1"), true);
     await flush();
-    assert.deepEqual(
-      { width: h.calls.windowOptions.at(-1).width, height: h.calls.windowOptions.at(-1).height },
-      { width: 960, height: 820 },
-    );
+    const { width, height, minWidth } = h.calls.windowOptions.at(-1);
+    assert.deepEqual({ width, height, minWidth }, { width: 960, height: 820, minWidth: 480 });
     assert.equal(h.calls.loadURL.at(-1)[0], `${serverUrl}/c/conv_1?window=session`);
     const state = h.api.windows.get(h.win);
     assert.equal(state.serverUrl, serverUrl);
@@ -8068,5 +8226,236 @@ describe("settings-based remote previews", () => {
     assert.equal(hint("https://example.com", true), null);
     assert.match(hint("http://localhost:5173", true, {}), /web app.*Update it/);
     assert.doesNotMatch(hint("http://localhost:5173", true, {}), /trusted_remote_hosts/);
+  });
+
+  it("confirms Settings grants and scopes host management to the connected server", async (t) => {
+    const server = "https://server.example.com";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const list = h.ipc.get("omnigent:get-trusted-remote-hosts");
+    const add = h.ipc.get("omnigent:add-trusted-remote-host");
+    const remove = h.ipc.get("omnigent:remove-trusted-remote-host");
+    // IPC results cross a vm boundary, so compare plain JSON copies.
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    const other = { server_url: "https://other.example.com/", host_id: "other-host" };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ trusted_remote_hosts: [other] }));
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts++;
+      assert.match(options.detail, /Server: https:\/\/server.example.com\//);
+      assert.match(options.detail, /Host ID: abc123/);
+      assert.equal(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts.length, 1);
+      return { response: 1 };
+    };
+    assert.deepEqual(plain(await list(event)), { ok: true, serverUrl: `${server}/`, hosts: [] });
+    assert.equal((await add(event, other.server_url, "abc123")).ok, false);
+    assert.equal((await remove(event, other.server_url, other.host_id)).ok, false);
+    const unpinned = { ...event, senderFrame: { url: "https://unconnected.example.com" } };
+    assert.equal((await list(unpinned)).ok, false);
+    assert.equal((await add(unpinned, server, "abc123")).ok, false);
+    assert.equal(prompts, 0);
+    const added = plain(await add(event, `${server}/`, "ABC123"));
+    assert.equal(added.ok, true);
+    assert.deepEqual(added.hosts, [{ server_url: `${server}/`, host_id: "abc123" }]);
+    assert.deepEqual(plain((await list(event)).hosts), added.hosts);
+    assert.equal((await add(event, server, "abc123")).ok, true);
+    assert.equal(prompts, 1, "existing trust is idempotent");
+    assert.equal((await add(event, "not a url", "abc123")).ok, false);
+    const removed = plain(await remove(event, server, "ABC123"));
+    assert.equal(removed.removed, true);
+    assert.deepEqual(removed.hosts, []);
+    assert.equal((await remove(event, server, "abc123")).ok, false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(h.settingsPath)).trusted_remote_hosts, [other]);
+  });
+
+  for (const [name, contents] of [
+    ["malformed", "{"],
+    ["non-object", "null"],
+    ["array", "[]"],
+    ["unreadable", null],
+  ]) {
+    it(`refuses to manage trust when desktop settings are ${name}`, async (t) => {
+      const server = "https://server.example.com";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.api.createBrowserRegistryForWindow(h.win);
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      if (contents === null) fs.mkdirSync(h.settingsPath);
+      else fs.writeFileSync(h.settingsPath, contents);
+      h.electron.dialog.showMessageBox = () =>
+        assert.fail("unreadable settings must not offer a grant");
+      const list = await h.ipc.get("omnigent:get-trusted-remote-hosts")(event);
+      assert.equal(list.ok, false);
+      assert.match(list.error, /Could not read desktop settings/);
+      assert.equal(
+        (await h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        (await h.ipc.get("omnigent:remove-trusted-remote-host")(event, server, "example-host")).ok,
+        false,
+      );
+      assert.equal(
+        await h.browserIpcDeps().requestTrustedRemoteHostForEvent(event, "http://localhost:5173", {
+          sourceHostId: "example-host",
+          sessionHostProtocol: 1,
+          trustedRemotePreviewProtocol: 1,
+        }),
+        false,
+      );
+      if (contents === null) assert.equal(fs.statSync(h.settingsPath).isDirectory(), true);
+      else assert.equal(fs.readFileSync(h.settingsPath, "utf8"), contents);
+    });
+  }
+
+  for (const changed of ["server", "page", "closed", "declined", "settings"]) {
+    it(`does not save a Settings grant when consent is ${changed}`, async (t) => {
+      const server = "https://server.example.com/app";
+      const h = loadNavigationHarness({ serverUrl: server });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const event = { sender: h.webContents, senderFrame: { url: server } };
+      const consent = Promise.withResolvers();
+      let prompted = false;
+      h.electron.dialog.showMessageBox = async () => {
+        prompted = true;
+        return consent.promise;
+      };
+      const pending = h.ipc.get("omnigent:add-trusted-remote-host")(event, server, "example-host");
+      await until(() => prompted, "native trust confirmation");
+      assert.equal(fs.existsSync(h.settingsPath), false);
+      if (changed === "server") h.api.windows.get(h.win).serverUrl = `${server}/other`;
+      if (changed === "page") h.setUrl("https://other.example.com");
+      if (changed === "closed") h.win.isDestroyed = () => true;
+      if (changed === "settings") fs.writeFileSync(h.settingsPath, "{");
+      consent.resolve({ response: changed === "declined" ? 0 : 1 });
+      assert.equal((await pending).ok, false);
+      if (changed === "settings") assert.equal(fs.readFileSync(h.settingsPath, "utf8"), "{");
+      else assert.equal(fs.existsSync(h.settingsPath), false);
+    });
+  }
+
+  it("trusts a host from the native dialog and holds a decline until restart", async (t) => {
+    const server = "https://server.example.com";
+    const host = "sandbox-host";
+    const h = loadNavigationHarness({ serverUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createBrowserRegistryForWindow(h.win);
+    const deps = h.browserIpcDeps();
+    const event = { sender: h.webContents, senderFrame: { url: server } };
+    const opts = {
+      sourceHostId: host.toUpperCase(),
+      sessionHostProtocol: 1,
+      trustedRemotePreviewProtocol: 1,
+    };
+    let prompts = 0;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts += 1;
+      assert.match(options.message, /Let sessions on/);
+      assert.match(options.detail, /Host ID: (sandbox-host|other-host)/);
+      return { response: prompts === 1 ? 1 : 0 };
+    };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", opts),
+      true,
+    );
+    assert.equal(prompts, 1);
+    assert.equal(deps.getAgentContextForEvent(event, opts).hostIsTrustedRemotePreview, true);
+    assert.equal(
+      h.browserRegistryDeps().allowsLocalhost(deps.getAgentContextForEvent(event, opts)),
+      true,
+    );
+    // A second host is asked once, declined, and not asked again this run.
+    const other = { ...opts, sourceHostId: "other-host" };
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(
+      await deps.requestTrustedRemoteHostForEvent(event, "http://localhost:5173", other),
+      false,
+    );
+    assert.equal(prompts, 2);
+    const settingsRetry = await h.ipc.get("omnigent:add-trusted-remote-host")(
+      event,
+      server,
+      "other-host",
+    );
+    assert.equal(settingsRetry.ok, false);
+    assert.match(settingsRetry.error, /restart Omnigent/);
+    assert.equal(prompts, 2, "Settings IPC must not bypass a native decline");
+    assert.match(
+      deps.getAgentNavigationHintForEvent(
+        event,
+        "http://localhost:5173",
+        "other-host",
+        undefined,
+        false,
+        true,
+        1,
+      ),
+      /restart Omnigent/,
+    );
+  });
+});
+
+describe("desktop notifications", () => {
+  const server = "https://omni.example";
+  const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+  const collectGarbage = () => {
+    v8.setFlagsFromString("--expose-gc");
+    vm.runInNewContext("gc")();
+  };
+
+  it("opens the notification's session when it is clicked after garbage collection", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    await h.ipc.get("omnigent:notify")(pageEvent(h), {
+      title: "Done",
+      navigatePath: "/c/conv_abc",
+    });
+    // A toast can report `close` and still be clicked later from Notification Center.
+    h.calls.shownNotifications.at(-1).deref().emit("close");
+    await wait();
+    collectGarbage();
+    await wait();
+    collectGarbage();
+
+    const notification = h.calls.shownNotifications.at(-1).deref();
+    assert.ok(notification, "the shown notification was garbage-collected before its click");
+    notification.emit("click");
+    assert.deepEqual(h.calls.progress.at(-1), {
+      channel: "omnigent:notification-activated",
+      data: "/c/conv_abc",
+    });
+  });
+
+  it("releases clicked or failed notifications and keeps only the newest others", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    const max = h.api.maxRetainedNotifications();
+    for (let i = 0; i <= max; i++) {
+      h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done", navigatePath: `/c/${i}` });
+    }
+    const shown = h.calls.shownNotifications.map((ref) => ref.deref());
+    const retainedIndexes = () =>
+      [...h.api.retainedNotifications()].map((notification) => shown.indexOf(notification));
+    const newestIndexes = shown.map((_, index) => index).slice(1);
+    assert.deepEqual(retainedIndexes(), newestIndexes);
+
+    shown.at(-1).emit("click");
+    shown.at(-3).emit("failed");
+    assert.deepEqual(
+      retainedIndexes(),
+      newestIndexes.filter((index) => index !== max && index !== max - 2),
+    );
   });
 });

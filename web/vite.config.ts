@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { validateHeaderName, validateHeaderValue } from "node:http";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
+import { databricksProfileForWorkspace } from "./vite.databricksProfile";
 import { shikiManualChunk } from "./vite.shiki";
 import { streamdownManualChunk } from "./vite.streamdown";
 import { devServerWorkerExports, workerBuildOptions } from "./vite.workerExports";
@@ -14,6 +15,11 @@ import { devServerWorkerExports, workerBuildOptions } from "./vite.workerExports
 // WORKSPACE_API_PATH (omnigent/cli_auth.py) so both sides agree on the shape of
 // a workspace URL.
 const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+// The workspace web-UI URL the CLI displays; mirrors WORKSPACE_UI_PATH in omnigent/util/server_url.py.
+const WORKSPACE_UI_PATH = "/omnigent";
+// Routes a request to one workspace on a host that fronts many; mirrors
+// DATABRICKS_ORG_ID_HEADER in omnigent/cli_auth.py.
+const DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id";
 
 function isWorkspaceHost(hostname: string): boolean {
   return hostname.endsWith(".databricks.com") || hostname.endsWith(".azuredatabricks.net");
@@ -24,42 +30,97 @@ function isWorkspaceHost(hostname: string): boolean {
 // automatically, so the browser's relative /v1/... paths reach the
 // workspace-hosted server without hand-typing the /api/2.0/omnigent prefix. An
 // explicit non-root path is respected (a custom mount, or a local server).
-function resolveTarget(raw: string): string {
+function resolveTarget(raw: string): { target: string; orgId: string | null } {
   const url = new URL(raw);
-  if (isWorkspaceHost(url.hostname) && (url.pathname === "" || url.pathname === "/")) {
+  // A `?o=<org-id>` workspace selector moves into the org-id routing header.
+  const orgId = url.searchParams.get("o");
+  if (orgId !== null && !/^\d+$/.test(orgId)) {
+    throw new Error("OMNIGENT_URL ?o= must be a numeric workspace org id");
+  }
+  url.search = "";
+  url.hash = "";
+  // A pasted web-UI URL (`<ws>/omnigent`) means the same server as the bare origin.
+  const root = url.pathname.replace(/\/$/, "");
+  if (isWorkspaceHost(url.hostname) && (root === "" || root === WORKSPACE_UI_PATH)) {
     url.pathname = WORKSPACE_API_PATH;
   }
-  return url.toString().replace(/\/$/, "");
+  return { target: url.toString().replace(/\/$/, ""), orgId };
 }
 
-const OMNIGENT_URL = resolveTarget(process.env.OMNIGENT_URL ?? "http://localhost:6767");
+const { target: OMNIGENT_URL, orgId: ORG_ID } = resolveTarget(
+  process.env.OMNIGENT_URL ?? "http://localhost:6767",
+);
+// Mint tokens from this Databricks CLI profile instead of matching by host.
+const DATABRICKS_PROFILE = process.env.OMNIGENT_DATABRICKS_PROFILE || undefined;
 
-let cachedToken: string | null | undefined;
+let cliToken: { value: string | null; expiresAt: number } = { value: null, expiresAt: 0 };
+let refreshAt = 0;
+let refreshing: Promise<void> | undefined;
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+let refreshFailing = false;
 
-function resolveToken(host: string): string | null {
-  if (cachedToken !== undefined) return cachedToken;
+function reportRefreshFailure(message: string) {
+  if (!refreshFailing) console.warn(`[dev-proxy] could not get a Databricks token: ${message}`);
+  refreshFailing = true;
+}
 
-  if (process.env.OMNIGENT_AUTH_TOKEN) {
-    cachedToken = process.env.OMNIGENT_AUTH_TOKEN;
-    return cachedToken;
+// Mints a CLI token in the background and again shortly before it expires, even
+// while idle; requests keep the current token meanwhile. Failures retry after 10s.
+function refreshToken(host: string): Promise<void> {
+  const target = new URL(host);
+  // A Databricks token never travels in cleartext, except to this machine.
+  if (
+    target.protocol === "http:" &&
+    !["localhost", "127.0.0.1", "[::1]"].includes(target.hostname)
+  ) {
+    reportRefreshFailure(`refusing to send it over plain http to ${host}; use https`);
+    return Promise.resolve();
   }
-
-  try {
-    const output = execFileSync(
+  refreshing ??= new Promise((resolve) => {
+    const profile =
+      DATABRICKS_PROFILE ?? (ORG_ID ? databricksProfileForWorkspace(host, ORG_ID) : undefined);
+    const selector = profile ? ["--profile", profile] : ["--host", host];
+    const args = ["auth", "token", ...selector, "--output", "json"];
+    // The CLI's own timeout allows for a browser login; the dev server shouldn't wait that long.
+    const child = execFile(
       "databricks",
-      ["auth", "token", "--host", host, "--output", "json"],
-      {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
+      args,
+      { encoding: "utf8", timeout: 30_000 },
+      (error, stdout) => {
+        const now = Date.now();
+        refreshAt = now + 10_000;
+        try {
+          if (error) throw error;
+          const tokenResponse = JSON.parse(stdout) as { access_token?: string; expiry?: string };
+          if (!tokenResponse.access_token)
+            throw new Error("databricks auth token returned no token");
+          // CLI OAuth tokens last about an hour; one without a parseable expiry is re-read in minutes.
+          const expiresAt = Date.parse(tokenResponse.expiry ?? "") || now + 5 * 60_000;
+          cliToken = { value: tokenResponse.access_token, expiresAt };
+          refreshAt = Math.max(refreshAt, expiresAt - 60_000);
+          refreshFailing = false;
+        } catch (failure) {
+          // Keep the current token, e.g. until the user logs in again.
+          reportRefreshFailure((failure as Error).message.trim());
+        }
+        clearTimeout(refreshTimer);
+        // setTimeout fires at once for delays past ~24.8 days; requests still refresh when due.
+        refreshTimer = setTimeout(() => resolveToken(host), Math.min(refreshAt - now, 2 ** 31 - 1));
+        refreshTimer.unref();
+        refreshing = undefined;
+        resolve();
       },
     );
-    const tokenResponse = JSON.parse(output) as { access_token?: string };
-    cachedToken = tokenResponse.access_token ?? null;
-  } catch {
-    cachedToken = null;
-  }
+    child.stdin?.end();
+  });
+  return refreshing;
+}
 
-  return cachedToken;
+function resolveToken(host: string): string | null {
+  if (process.env.OMNIGENT_AUTH_TOKEN) return process.env.OMNIGENT_AUTH_TOKEN;
+  const now = Date.now();
+  if (now >= refreshAt) void refreshToken(host);
+  return now < cliToken.expiresAt ? cliToken.value : null;
 }
 
 function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOptions["configure"]> {
@@ -71,6 +132,9 @@ function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOpti
   const basePath = parsed.pathname.replace(/\/$/, "");
 
   return (proxy) => {
+    // Start minting at server start too; `vite preview` skips the startup check.
+    if (useAuth) resolveToken(host);
+
     proxy.on("proxyReq", (proxyReq) => {
       if (basePath) proxyReq.path = `${basePath}${proxyReq.path}`;
       if (useAuth) {
@@ -105,10 +169,11 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
   if (!byOrigin || typeof byOrigin !== "object" || Array.isArray(byOrigin)) {
     throw new Error("OMNIGENT_PROXY_HEADERS must be a JSON object keyed by server origin");
   }
-  const headers = byOrigin[origin] === undefined ? {} : byOrigin[origin];
-  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+  const configured = byOrigin[origin] === undefined ? {} : byOrigin[origin];
+  if (!configured || typeof configured !== "object" || Array.isArray(configured)) {
     throw new Error("OMNIGENT_PROXY_HEADERS entries must be header objects");
   }
+  const headers = { ...(ORG_ID ? { [DATABRICKS_ORG_ID_HEADER]: ORG_ID } : {}), ...configured };
   for (const [name, value] of Object.entries(headers)) {
     validateHeaderName(name);
     if (typeof value !== "string") {
@@ -158,7 +223,8 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
 }
 
 const parsed = new URL(OMNIGENT_URL);
-const useAuth = !!process.env.OMNIGENT_AUTH_TOKEN || isWorkspaceHost(parsed.hostname);
+const useAuth =
+  !!process.env.OMNIGENT_AUTH_TOKEN || !!DATABRICKS_PROFILE || isWorkspaceHost(parsed.hostname);
 
 // A Databricks workspace-hosted server sits behind the multi-replica sharding
 // layer, so the dev bundle must emit the host_id slice key on host-scoped
@@ -176,11 +242,13 @@ function devProxyAuth(): Plugin {
   return {
     name: "dev-proxy-auth",
     apply: "serve",
-    config() {
+    async config() {
       if (!useAuth) {
         console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
         return;
       }
+      // Serve only once a token is ready, so the first requests are authenticated.
+      if (!process.env.OMNIGENT_AUTH_TOKEN) await refreshToken(parsed.origin);
       const token = resolveToken(parsed.origin);
       if (token) {
         console.log(
@@ -188,9 +256,12 @@ function devProxyAuth(): Plugin {
         );
         return;
       }
+      const login = DATABRICKS_PROFILE
+        ? `--profile ${DATABRICKS_PROFILE}`
+        : `--host ${parsed.origin}`;
       console.error(
         `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +
-          `  Set OMNIGENT_AUTH_TOKEN or run:  databricks auth login --host ${parsed.origin}\n`,
+          `  Set OMNIGENT_AUTH_TOKEN or OMNIGENT_DATABRICKS_PROFILE, or run:  databricks auth login ${login}\n`,
       );
       process.exit(1);
     },

@@ -8,6 +8,8 @@ import { isPinnedTab } from "./pinnedTabs";
 import { reorderStripEntries, type StripReorderEntry } from "./stripReorder";
 import { pinnedTabsMaxWidth, TAB_GAP } from "./tabStripWidth";
 import { useTabStripWidth } from "./useTabStripWidth";
+import { publishRailControlsWidth } from "./railControlsWidth";
+import { settingsPagePlace, useWorkspaceTabSettings } from "./workspaceTabSettings";
 import { tabGroup as tabGroupDefinition, tabGroupOf, tabPullRequestUrl } from "./tabGroups";
 import {
   type TabSearchClosing,
@@ -18,6 +20,7 @@ import {
   NEW_TAB_DIVIDER_ROOM,
   NewTabButton,
   PINNED_TAB_WIDTH,
+  StripDivider,
   StripTab,
   StripTabMenu,
   type TabTitle,
@@ -34,6 +37,7 @@ import {
   type LucideIcon,
   MaximizeIcon,
   XIcon,
+  PanelRightCloseIcon,
   MessageSquareIcon,
   MinimizeIcon,
   SearchIcon,
@@ -65,10 +69,10 @@ import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalDisplayLabel, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
-import { closeBrowserView, forgetBrowserTab } from "@/hooks/useBrowserTabs";
+import { closeBrowserView, forgetBrowserTab, useBrowserPageLabels } from "@/hooks/useBrowserTabs";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { getPullRequestStatus } from "@/lib/pullRequestStatus";
-import { shortcutAriaKeys, shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutAriaKeys, shortcutKeys } from "@/lib/shortcuts/registry";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentSessionIdFromTab, subagentTabId } from "@/lib/subagentTabs";
 import { ApiError, getSessionSlim } from "@/lib/sessionsApi";
@@ -125,6 +129,8 @@ import {
   type StripEntry,
   type TerminalGroup,
 } from "@/lib/terminalGroups";
+import { useFloatingPanesShown } from "../useFloatingPanes";
+import { WorkspaceRailEdgeHandle, WorkspaceRailGutterHandle } from "../WorkspaceRailResizeHandle";
 import { WorkspaceTabTooltip } from "../WorkspacePanel";
 import { NewTabPage, type NewTabRecent } from "./NewTabPage";
 import { useMountedShellKeys } from "./shellTabBudget";
@@ -134,10 +140,11 @@ import {
   recentPullRequestUrl,
 } from "./recentPullRequestRow";
 import { useRecentPullRequestFacts } from "./useRecentPullRequestFacts";
+import { shellLabelList } from "./useTabsShellClose";
 import { FileTypeIcon } from "@/shell/FileTypeIcon";
 import { WorkspaceHistoryChevrons } from "./WorkspaceHistoryChevrons";
 import { LOCAL_CHANGES_LABEL, type PlaceIcon, placeTitle, truncateMiddle } from "./placeTitle";
-import type { TabId, WorkspacePlace } from "./workspacePlace";
+import type { TabId } from "./workspacePlace";
 import { isUnknownTab, type WorkspaceTab, type WorkspaceTabRecord } from "./workspaceTab";
 import { isOnlyEmptyNewTab, LAST_NEW_TAB_REASON, type RecentPlace } from "./workspaceTabsStore";
 import {
@@ -149,7 +156,6 @@ import {
   type WorkspaceTabsSession,
   workspaceTabsSession,
 } from "./workspaceTabsSessions";
-import type { DefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { TasksPanel } from "../TasksPanel";
@@ -333,6 +339,12 @@ function WorkspaceTabsPanelImpl({
   onHistoryGo,
 }: WorkspaceTabsPanelProps) {
   const { session, tabs, selectedTabId } = useWorkspaceTabs(conversationId);
+  // The header keeps its toggle while this sidebar is too narrow to show its own Collapse.
+  const reportControlsWidth = useCallback(
+    (controlsWidth: number) => publishRailControlsWidth(conversationId, controlsWidth),
+    [conversationId],
+  );
+  useEffect(() => () => publishRailControlsWidth(conversationId, null), [conversationId]);
   const { store } = session;
   const knownTabs = tabs.filter((tab): tab is WorkspaceTab => !isUnknownTab(tab));
   const selectedTab = knownTabs.find((tab) => tab.id === selectedTabId);
@@ -548,6 +560,11 @@ function WorkspaceTabsPanelImpl({
     tab.binding?.kind === "agent" ? [subagentTabId(tab.binding.id)] : [],
   );
   const agentLabels = useSubagentTabLabels(agentTabIds);
+  // Each browser tab is named after its page's live title, as the desktop shell reports it.
+  const browserPages = useBrowserPageLabels(
+    conversationId,
+    knownTabs.flatMap((tab) => (tab.binding?.kind === "browser-view" ? [tab.binding.viewKey] : [])),
+  );
   // PRs on new-tab pages and open PR tabs, named from what the session already knows of them.
   const recentPullRequestUrls = [
     ...new Set(
@@ -583,12 +600,15 @@ function WorkspaceTabsPanelImpl({
   );
   const titleOf = (tab: WorkspaceTab): TabTitle => {
     const { place, binding } = tab;
+    const page =
+      binding?.kind === "browser-view" ? browserPages.pageFor(binding.viewKey) : undefined;
     const title = placeTitle(place, {
       otherFilePaths: filePaths.filter((path) => !(place.kind === "files" && place.path === path)),
       terminal: place.kind === "terminal" ? { label: terminalLabel(place.key) } : undefined,
       agentName: place.kind === "agent" ? agentLabels[subagentTabId(place.id)] : undefined,
       // Side chats are numbered in strip order, as the classic strip numbers them.
       chatTitle: place.kind === "chat" ? `Side chat ${chatTabs.indexOf(tab) + 1}` : undefined,
+      page: page ? { url: page.url, title: page.title } : undefined,
       // An attached shell shows its terminal, so its icon follows that, not the list.
       connecting:
         binding?.kind === "terminal" &&
@@ -678,6 +698,9 @@ function WorkspaceTabsPanelImpl({
     onReveal?.();
   };
   const inDrawer = placement === "drawer";
+  // Where the panes float now: the flag on and 48rem or wider. The drawer keeps its classic strip.
+  // A grid cell keeps its own layout, as the floating styles leave it.
+  const floatingPanes = useFloatingPanesShown() && !inDrawer && !contained;
   // Hotkeys and ⌘K rows act only while this panel is the keyboard target.
   const commandsActive = !pending && keyboardTarget;
   useNewBrowserHotkey(() => addBrowser(), showBrowserTab && commandsActive);
@@ -762,6 +785,15 @@ function WorkspaceTabsPanelImpl({
       return closed;
     };
   };
+  /** One message for a close, however many of its shells kept running. */
+  const reportShellsStillRunning = (keys: readonly string[]) => {
+    const names = shellLabelList(keys.map(terminalLabel));
+    const state = keys.length > 1 ? "They're still running." : "It's still running.";
+    toast.error(`Couldn't close ${names}. ${state}`, {
+      duration: Number.POSITIVE_INFINITY,
+      closeButton: true,
+    });
+  };
   /**
    * How closing a bound tab treats its resource: a shell asks, then ends, before its
    * tab goes; a browser view is released after. A side chat or sub-agent tab only
@@ -772,7 +804,11 @@ function WorkspaceTabsPanelImpl({
     if (binding?.kind === "terminal") {
       return {
         confirm: () => confirmCloseShell(binding.key),
-        teardown: () => endShell(binding.key),
+        teardown: async () => {
+          const ended = await endShell(binding.key);
+          if (!ended) reportShellsStillRunning([binding.key]);
+          return ended;
+        },
       };
     }
     return { release: releaseFor(tab) };
@@ -801,10 +837,7 @@ function WorkspaceTabsPanelImpl({
         teardownFor: endShell,
       })
       .then((result) => {
-        if (!result.ok && "failed" in result) {
-          const names = result.failed.map(terminalLabel).join(", ");
-          toast.error(`Couldn't close ${names}. Try again.`);
-        }
+        if (!result.ok && "failed" in result) reportShellsStillRunning(result.failed);
         return result;
       })
       .finally(() => release?.());
@@ -880,6 +913,16 @@ function WorkspaceTabsPanelImpl({
       tab,
       label: tab === "changes" ? LOCAL_CHANGES_LABEL : WORKSPACE_PANEL_TABS[tab].label,
     }));
+  // The Workspace settings' pinned pages and first page, as far as this session can show them.
+  const tabSettings = useWorkspaceTabSettings();
+  const openablePages = openablePanels.map((panel) => panel.tab).join(",");
+  // A tab closing makes room for a pinned page that didn't fit; an unchanged apply does nothing.
+  const tabCount = tabs.length;
+  useEffect(() => {
+    if (pending) return;
+    const pages = new Set(openablePages.split(","));
+    store.applyTabSettings(tabSettings, (page) => pages.has(page));
+  }, [store, tabSettings, openablePages, pending, tabCount]);
   const facts: WorkspaceCommandFacts = {
     openablePanels,
     browser: showBrowserTab,
@@ -973,7 +1016,7 @@ function WorkspaceTabsPanelImpl({
     switch (command.kind) {
       case "panel":
         if (fromNewTab) {
-          store.fillNewTab(fromNewTab, pagePlace(command.tab));
+          store.fillNewTab(fromNewTab, settingsPagePlace(command.tab));
           return;
         }
         void openWorkspacePage(conversationId, command.tab).then(reportRefusal);
@@ -1246,18 +1289,38 @@ function WorkspaceTabsPanelImpl({
     }
   };
 
-  const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
-  const effectiveHandleProps = pending
-    ? {
-        ...handleProps,
-        onMouseDown: undefined,
-        onKeyDown: undefined,
-        "aria-disabled": true,
-        tabIndex: -1,
+  // All tabs: before the tabs in the classic strip; with floating panes the strip starts with the
+  // tabs, and the list opens from beside Full screen.
+  const tabSearch = !pending && tabs.length > 0 && (
+    <WorkspaceTabSearch
+      trailing={floatingPanes}
+      open={tabSearchOpen}
+      onOpenChange={setTabSearchOpen}
+      entries={tabSearchEntries}
+      closing={tabSearchClosing}
+      reopen={
+        reopenCommand.availability.available
+          ? {
+              label: reopenCommand.menuLabel,
+              ...(reopenCommand.shortcut ? { shortcut: shortcutKeys(reopenCommand.shortcut) } : {}),
+            }
+          : null
       }
-    : handleProps;
+      onChoose={(choice) => {
+        const command =
+          choice.kind === "reopen"
+            ? reopenCommand
+            : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
+        if (command) runCommand(command);
+      }}
+    />
+  );
 
-  return (
+  const selectedUnknown = tabs.find((tab) => tab.id === selectedTabId && isUnknownTab(tab));
+  // Floating panes leave a gutter beside the rail; dragging it resizes the rail too.
+  const gutterHandle = floatingPanes && !maximized;
+
+  const rail = (
     <aside
       aria-label="Workspace"
       {...commandRegionProps("workspace")}
@@ -1296,48 +1359,23 @@ function WorkspaceTabsPanelImpl({
         style={{ width: maximized || inDrawer ? "100%" : `calc(${width}px - 1px)` }}
       >
         {!maximized && !inDrawer && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
+          <WorkspaceRailEdgeHandle
+            handleProps={handleProps}
+            pending={pending}
+            bare={gutterHandle}
           />
         )}
         <WorkspaceSidebarFrame
           stripWidth={stripWidth}
           tabListRef={tabListRef}
+          onControlsWidth={reportControlsWidth}
           leading={
             // ‹ › and the tab list sit together, without the strip's gap.
             <div className="flex shrink-0 items-center">
               {!pending && onHistoryGo && (
                 <WorkspaceHistoryChevrons commands={historyCommands} onGo={onHistoryGo} />
               )}
-              {!pending && tabs.length > 0 && (
-                <WorkspaceTabSearch
-                  open={tabSearchOpen}
-                  onOpenChange={setTabSearchOpen}
-                  entries={tabSearchEntries}
-                  closing={tabSearchClosing}
-                  reopen={
-                    reopenCommand.availability.available
-                      ? {
-                          label: reopenCommand.menuLabel,
-                          ...(reopenCommand.shortcut
-                            ? { shortcut: shortcutKeys(reopenCommand.shortcut) }
-                            : {}),
-                        }
-                      : null
-                  }
-                  onChoose={(choice) => {
-                    const command =
-                      choice.kind === "reopen"
-                        ? reopenCommand
-                        : showCommands.find((candidate) => candidate.panelKey === choice.tabId);
-                    if (command) runCommand(command);
-                  }}
-                />
-              )}
+              {!floatingPanes && tabSearch}
             </div>
           }
           tabs={
@@ -1454,12 +1492,18 @@ function WorkspaceTabsPanelImpl({
             // Below 160px "+" would run under Full screen, so it gives way; ⌘K and its chord still open a tab.
             !pending && (
               <div className="contents @max-[160px]/rail:hidden">
-                <NewTabButton onClick={newTab} />
+                <NewTabButton onClick={newTab} divider={!floatingPanes} />
               </div>
             )
           }
           trailing={
             <>
+              {floatingPanes && tabSearch ? (
+                <>
+                  <StripDivider />
+                  {tabSearch}
+                </>
+              ) : null}
               {!inDrawer && (
                 <WorkspaceTabTooltip
                   label={fullScreenCommand?.menuLabel ?? "Full screen"}
@@ -1495,10 +1539,18 @@ function WorkspaceTabsPanelImpl({
                     aria-keyshortcuts={shortcutAriaKeys("sidebar.right")}
                     onClick={onHide}
                     size="icon-xs"
-                    // A narrow strip leaves room to "+", as the header's toggle beside it does the same.
-                    className="flex size-6 text-muted-foreground hover:text-foreground @max-[240px]/rail:hidden"
+                    // A narrow strip leaves room to "+" while the header's toggle beside it also closes
+                    // the sidebar. Floating panes hide that toggle, so this one stays.
+                    className={cn(
+                      "flex size-6 text-muted-foreground hover:text-foreground",
+                      !floatingPanes && "@max-[240px]/rail:hidden",
+                    )}
                   >
-                    <XIcon className="size-4" />
+                    {floatingPanes ? (
+                      <PanelRightCloseIcon className="size-4" />
+                    ) : (
+                      <XIcon className="size-4" />
+                    )}
                   </Button>
                 </WorkspaceTabTooltip>
               )}
@@ -1558,21 +1610,19 @@ function WorkspaceTabsPanelImpl({
       </div>
     </aside>
   );
-}
-
-function pagePlace(page: DefaultWorkspaceTab): WorkspacePlace {
-  switch (page) {
-    case "files":
-      return { kind: "files" };
-    case "changes":
-      return { kind: "changes" };
-    case "github":
-      return { kind: "pulls" };
-    case "subagents":
-      return { kind: "agents" };
-    case "tasks":
-      return { kind: "tasks" };
-  }
+  return (
+    <>
+      {rail}
+      {gutterHandle && (
+        <WorkspaceRailGutterHandle
+          onMouseDown={handleProps.onMouseDown}
+          pending={pending}
+          railWidth={width}
+          shown={open}
+        />
+      )}
+    </>
+  );
 }
 
 function AttentionBar({

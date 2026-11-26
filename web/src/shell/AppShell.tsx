@@ -29,6 +29,10 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
+import { useSplitOnScreen } from "./chatPaneToolbarHost";
+import { ChatPaneStrip } from "./ChatPaneStrip";
+import { usePanesView } from "./panesViewGate";
+import { useFloatingPanes, useFloatingPanesShown } from "./useFloatingPanes";
 import {
   Outlet,
   useLocation,
@@ -54,6 +58,9 @@ import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useWorkspaceFullScreenCommand } from "@/shell/workspaceCommands/useWorkspaceFullScreenCommand";
+import { rightPanelCollapsesItself } from "./rightPanelCollapse";
+import { useRailControlsWidth } from "./workspaceTabs/railControlsWidth";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
@@ -189,8 +196,10 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { AppShellOverlays } from "./AppShellOverlays";
 import { AppShellRootProviders } from "./AppShellRootProviders";
 import { replaceThemePicker } from "@/store/themePicker";
+import { replaceFeatureFlagsPicker } from "@/store/featureFlagsPicker";
 import { commandViewForPath, useCommandSession } from "./commandContext";
 import { CloseShellDialog } from "./CloseShellDialog";
+import { joinShellTabsCloses, type ShellTabsClose, useShellCloseRequest } from "./shellCloseCheck";
 import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
@@ -426,6 +435,10 @@ function AppShellImpl() {
   // With tabs enabled, links, pages and shells open there. The session ref stays null
   // until a new session has its real id: there are no tabs to open in before that.
   const tabsSidebar = useTabsSidebar();
+  const floatingPanes = useFloatingPanes();
+  const floatingPanesShown = useFloatingPanesShown();
+  const panesView = usePanesView();
+  const splitOnScreen = useSplitOnScreen(conversationId);
   const tabsModeRef = useRef(false);
   tabsModeRef.current = tabsSidebar;
   const tabsSessionRef = useRef<string | null>(null);
@@ -530,6 +543,7 @@ function AppShellImpl() {
   const mobileViewport = useIsMobileViewport();
   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
   const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
+  const railControlsWidth = useRailControlsWidth(conversationId);
   const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
@@ -1080,12 +1094,6 @@ function AppShellImpl() {
   // ``inventoryTerminals``).
   const hideTerminalsTab = isClaudeNativeSubagent;
   const deleteTerminalMutation = useDeleteTerminal(conversationId ?? "");
-  // Tab key awaiting a close confirmation, or null. Closing a tab kills the
-  // terminal, so a user-initiated close routes through a confirm modal first.
-  const [terminalPendingClose, setTerminalPendingClose] = useState<{
-    keys: string[];
-    callbacks?: ShellCloseCallbacks;
-  } | null>(null);
   // While a close is in flight, grey the tabs being killed so the delay between
   // confirming and a tab disappearing (the DELETE round-trip + its
   // ``resource.deleted``) reads as "closing", not frozen. A bulk close kills
@@ -1474,9 +1482,6 @@ function AppShellImpl() {
     setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
-    // An open "Close shell?" dialog would target a terminal absent from the
-    // new session's list.
-    setTerminalPendingClose(null);
     setFileNavigation(undefined);
     setRightPanelVisibilityAnimating(false);
     if (!conversationId) {
@@ -2250,9 +2255,12 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
-  // The palette replaces the theme picker rather than stacking on it, which ends its preview.
+  // The palette replaces the theme and feature-flag pickers rather than stacking on them.
   useEffect(() => {
-    if (commandPaletteOpen) replaceThemePicker();
+    if (commandPaletteOpen) {
+      replaceThemePicker();
+      replaceFeatureFlagsPicker();
+    }
   }, [commandPaletteOpen]);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
@@ -2744,47 +2752,65 @@ function AppShellImpl() {
     }
   }, [openTerminals, openTerminalTab]);
 
-  // User clicked a tab's "x". Closing a tab kills the underlying terminal, so
-  // confirm first rather than acting immediately.
-  const requestCloseTerminal = useCallback((key: string, callbacks?: ShellCloseCallbacks) => {
-    setTerminalPendingClose({ keys: [key], callbacks });
-  }, []);
-  // A bulk tab close asks once for all of its shells.
-  const requestCloseTerminals = useCallback((keys: string[], callbacks?: ShellCloseCallbacks) => {
-    if (keys.length > 0) setTerminalPendingClose({ keys, callbacks });
-  }, []);
-  // Confirmed close: kill the terminal (DELETE). The `session.resource.deleted`
-  // delta + the mutation's cache prune drop it from the list, so its tab
-  // disappears. If it was the active tab, move focus to a neighbor (prefer the
-  // previous, else the next) so the rail doesn't snap back to Files; when none
-  // remain the selection clears.
-  const confirmCloseTerminal = useCallback(() => {
-    if (terminalPendingClose === null) return;
-    const { keys, callbacks } = terminalPendingClose;
-    setTerminalPendingClose(null);
-    setSelectedTerminalKey((active) => {
-      if (active === null || !keys.includes(active)) return active;
-      const idx = openTerminals.indexOf(active);
-      const kept = (key: string) => !keys.includes(key);
-      return (
-        openTerminals.slice(0, Math.max(idx, 0)).findLast(kept) ??
-        openTerminals.slice(idx + 1).find(kept) ??
-        null
-      );
-    });
-    if (!conversationId) return;
-    callbacks?.onConfirmed?.();
-    for (const key of keys) {
-      const info = terminals.find((t) => terminalTabKey(t) === key);
-      if (!info) continue;
-      setKillingTerminalIds((ids) => [...ids, info.id]);
-      // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
-      deleteTerminalMutation
-        .mutateAsync(info.id)
-        .catch(() => callbacks?.onFailed?.(key))
-        .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== info.id)));
-    }
-  }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
+  // Kill the tabs' terminals; if the active one closes, focus the previous kept neighbor,
+  // else the next, so the rail doesn't snap back to Files.
+  const closeTerminalTabs = useCallback(
+    (keys: string[], callbacks?: ShellCloseCallbacks) => {
+      setSelectedTerminalKey((active) => {
+        if (active === null || !keys.includes(active)) return active;
+        const idx = openTerminals.indexOf(active);
+        const kept = (key: string) => !keys.includes(key);
+        return (
+          openTerminals.slice(0, Math.max(idx, 0)).findLast(kept) ??
+          openTerminals.slice(idx + 1).find(kept) ??
+          null
+        );
+      });
+      if (!conversationId) return;
+      callbacks?.onConfirmed?.();
+      for (const key of keys) {
+        const info = terminals.find((t) => terminalTabKey(t) === key);
+        if (!info) continue;
+        setKillingTerminalIds((ids) => [...ids, info.id]);
+        // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+        deleteTerminalMutation
+          .mutateAsync(info.id)
+          .catch(() => callbacks?.onFailed?.(key))
+          .finally(() => setKillingTerminalIds((ids) => ids.filter((id) => id !== info.id)));
+      }
+    },
+    [openTerminals, terminals, conversationId, deleteTerminalMutation],
+  );
+  // Closing a tab kills its terminal: the rail's shell tabs close through the "Close shell?" flow.
+  const closeShell = useShellCloseRequest<ShellTabsClose>(
+    conversationId,
+    "rail_tab_close",
+    (closes) => {
+      const { keys, callbacks } = joinShellTabsCloses(closes);
+      closeTerminalTabs(keys, callbacks);
+    },
+  );
+  const terminalPendingClose = closeShell.pending
+    ? joinShellTabsCloses(closeShell.pending.items)
+    : null;
+  // User closed shell tabs. Idle shells close at once and anything else asks first; a bulk close
+  // asks once for all of its shells.
+  const requestCloseShell = closeShell.request;
+  const requestCloseTerminals = useCallback(
+    (keys: string[], callbacks?: ShellCloseCallbacks) => {
+      if (keys.length === 0) return;
+      const ids = keys.flatMap((key) => {
+        const info = terminals.find((t) => terminalTabKey(t) === key);
+        return info ? [info.id] : [];
+      });
+      requestCloseShell({ keys, callbacks }, ids.length === keys.length ? ids : null);
+    },
+    [terminals, requestCloseShell],
+  );
+  const requestCloseTerminal = useCallback(
+    (key: string, callbacks?: ShellCloseCallbacks) => requestCloseTerminals([key], callbacks),
+    [requestCloseTerminals],
+  );
 
   // The active shell selection is sticky: it changes only on explicit user
   // action (opening a shell/file, switching a nav tab, closing the active
@@ -3167,6 +3193,15 @@ function AppShellImpl() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" keeps the switcher.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  // With floating panes a split on screen draws cards of its own, so the session's column is no
+  // card then; marking it "terminal" takes the chat card's styling off, as the Terminal view's does.
+  const panesDrawCards = floatingPanesShown && panesView && splitOnScreen;
+  let mainColumnView: "chat" | "terminal" | undefined;
+  if (conversationId) mainColumnView = panesDrawCards ? "terminal" : "chat";
+  // A terminal-first chat's card has a row of its own, which takes the Chat/Terminal switch
+  // wherever the cards float. A sidebar shell in the main view has no switch to hold.
+  const chatPaneStrip =
+    floatingPanesShown && !!conversationId && terminalFirst && !isShellView && !panesDrawCards;
   const shellViewTargetAvailable =
     isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);
 
@@ -3259,6 +3294,24 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // ⇧⌘F and its ⌘K row: a hidden workspace opens straight into full screen.
+  const toggleWorkspaceFullScreen = useCallback(() => {
+    if (!workspacePanelVisible) {
+      revealRightPanel();
+      if (!rightPanelMaximized) toggleRightPanelMaximized();
+      return;
+    }
+    toggleRightPanelMaximized();
+  }, [workspacePanelVisible, revealRightPanel, rightPanelMaximized, toggleRightPanelMaximized]);
+  // Only the tabs sidebar fills the window; a phone shows the workspace as its own screen, and
+  // a grid route has its own rail.
+  const workspaceCanFillWindow =
+    tabsSidebar && !!conversationId && hasRailContent && !gridRoute && !mobileViewport;
+  useWorkspaceFullScreenCommand({
+    conversationId: conversationId ?? null,
+    fullScreen: workspaceCanFillWindow ? rightPanelMaximized && workspacePanelVisible : null,
+    toggle: toggleWorkspaceFullScreen,
+  });
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
   // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
@@ -3345,6 +3398,7 @@ function AppShellImpl() {
             // maximized workspace rail's tab strip in index.css): with the
             // sidebar open over the window corner there are no lights to clear.
             data-sidebar-open={sidebarOpen ? "true" : undefined}
+            data-floating-panes={floatingPanes ? "" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
           >
@@ -3436,15 +3490,17 @@ function AppShellImpl() {
               <div
                 data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 data-workspace-panel-animate={rightPanelVisibilityAnimating || undefined}
+                // A session's chat floats as one pane; the panes view floats its own cards.
+                data-main-view={mainColumnView}
                 className={cn(
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
                 )}
                 style={
                   {
-                    "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth}px`
-                      : "0px",
+                    // Only an inline rail takes room beside the header; below md it's a drawer.
+                    "--workspace-panel-offset":
+                      workspacePanelVisible && !mobileViewport ? `${inlinePanelWidth}px` : "0px",
                     "--omnigent-header-height": headerClearanceHidden ? "0px" : undefined,
                   } as CSSProperties
                 }
@@ -3512,6 +3568,15 @@ function AppShellImpl() {
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
+                    // The floating tabs sidebar collapses from its own corner button, where the toggle sits.
+                    rightPanelCollapsesItself={rightPanelCollapsesItself({
+                      floatingPanesShown,
+                      tabsSidebar,
+                      tabsInDrawer,
+                      rightPanelOpen,
+                      railWidth: inlinePanelWidth,
+                      controlsWidth: railControlsWidth,
+                    })}
                     pending={pendingConversation}
                     mobileMenu={{
                       fileViewerOpen,
@@ -3564,7 +3629,11 @@ function AppShellImpl() {
                   data-flyout-boundary=""
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
+                  data-chat-pane-strip={chatPaneStrip ? "" : undefined}
                 >
+                  {chatPaneStrip && conversationId && (
+                    <ChatPaneStrip conversationId={conversationId} />
+                  )}
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
                       <ShellCommandContext.Provider value={shellCommandAction}>
@@ -3844,8 +3913,9 @@ function AppShellImpl() {
               if (!info) return null;
               return terminalDisplayLabel(info);
             })()}
-            onConfirm={confirmCloseTerminal}
-            onCancel={() => setTerminalPendingClose(null)}
+            busy={closeShell.pending?.busy}
+            onConfirm={closeShell.confirm}
+            onCancel={closeShell.cancel}
           />
           <CloseWindowDialog
             prompt={closeWindowPrompt}

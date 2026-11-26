@@ -5270,6 +5270,48 @@ async def test_each_run_of_a_workflow_automation_starts_as_a_run_of_the_workflow
 
 
 @pytest.mark.asyncio
+async def test_a_prompt_rewritten_without_its_stored_workflow_runs_as_written(
+    db_uri: str,
+) -> None:
+    """A server that doesn't store workflows rewrote the prompt, so it runs no workflow."""
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflow = open_workflow_store(conversations).create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    agents = _sql_agent()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt="Summarize overnight activity",
+                workflow_id=workflow.id,
+                agent_id=next(iter(agents.agents)),
+                host_id=_SQL_HOST_ID,
+            )
+        }
+    )
+    plans_at_launch: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        sandbox_config=_FakeSandboxConfig(),
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    assert [run["status"] for run in store.runs] == ["running"]
+    assert plans_at_launch == [None]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("problem", "error_code", "paused"),
     [

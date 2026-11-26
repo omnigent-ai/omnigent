@@ -277,7 +277,8 @@ Independent creates can use an existing owned `project_id` instead of
 explicit agent, workspace or git selection. `sys_session_link_pr` takes
 `url`, optional `session_id` (defaults to this session), and `action` (`attach`
 or `remove`, default `attach`). It uses the target session's host and requires
-edit access there and an authorized private or read-only-shared source. The
+the owner grant on the target's root session (the host's account is its owner's)
+and an authorized private or read-only-shared source. The
 host or runner must be online and able to read the PR. An uncertain response
 requires checking the session before retrying.
 

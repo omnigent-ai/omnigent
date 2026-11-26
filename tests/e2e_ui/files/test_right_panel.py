@@ -18,6 +18,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui._shell_states import wait_until_shells_read
 from tests.e2e_ui.conftest import (
     _TERMINAL_PANEL_FILE,
     _TERMINAL_PANEL_FILE_CONTENT,
@@ -96,8 +97,8 @@ def test_right_panel_terminals_and_file_viewer(
     session bound to it. We send ``spin up zsh``, then verify:
 
     - the agent-launched shell appears as a closable soft tab in the rail,
-      its xterm connects inline when the tab is opened, and closing the tab
-      (after the confirm) kills the terminal;
+      its xterm connects inline when the tab is opened, and closing the idle
+      shell's tab kills the terminal without asking;
     - the Files tab can open a workspace file and the file viewer renders
       its contents.
 
@@ -166,12 +167,12 @@ def test_right_panel_terminals_and_file_viewer(
         expect(
             page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
         ).to_have_count(0)
-        # Closing the tab kills the terminal, so its "x" confirms first; after
-        # confirming the xterm unmounts. It was the last open tab, so the rail
-        # hides; reopen it for the Files steps below.
+        # Closing the tab kills the terminal; once the runner reads the shell idle
+        # at its prompt, its "x" closes it without asking and the xterm unmounts.
+        # It was the last open tab, so the rail hides; reopen it for the Files steps.
+        wait_until_shells_read(base_url, session_id, ["idle"])
         rail.get_by_role("button", name="Close zsh · main", exact=True).click()
-        page.get_by_role("button", name="Close shell").click()
-        expect(terminal_view).to_have_count(0)
+        expect(terminal_view).to_have_count(0, timeout=30_000)
         # The tab leaves, and the rail hides, once the kill returns; wait for that
         # before reopening it.
         expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=30_000)

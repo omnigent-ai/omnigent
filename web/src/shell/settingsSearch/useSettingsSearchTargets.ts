@@ -11,13 +11,10 @@ import {
   settingsSearchTargets,
 } from "@/pages/settings/search/settingsSearchIndex";
 import { settingsSearchMatchers } from "@/pages/settings/search/settingsSearchMatchers";
-import {
-  type BoundShortcutRow,
-  isBoundShortcutRow,
-  shortcutSettingsEntries,
-} from "@/pages/settings/search/shortcutEntries";
+import { shortcutSettingsEntries } from "@/pages/settings/search/shortcutEntries";
 import { useSettingsAvailability } from "@/pages/settings/search/useSettingsAvailability";
 import { currentShortcutEnvironment, type ShortcutId } from "@/lib/shortcuts/registry";
+import type { ShortcutPageRow } from "@/lib/shortcuts/shortcutPage";
 import {
   type SettingsNavItem,
   type SettingsSectionId,
@@ -29,7 +26,7 @@ export interface SettingsSearchTargets {
   /** The sections that show here, by id, for their icons. */
   sections: ReadonlyMap<SettingsSectionId, SettingsNavItem>;
   /** The live page row behind each shortcut target, for its key caps. */
-  shortcutRows: ReadonlyMap<ShortcutId, BoundShortcutRow>;
+  shortcutRows: ReadonlyMap<ShortcutId, ShortcutPageRow>;
   /** The matchers to rank by here, a typed chord matched as this environment's hotkeys are. */
   matchers: readonly SettingsSearchMatcher[];
 }
@@ -50,6 +47,7 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
   const mac = environment.mac;
   const native = environment.native;
   const desktopMenu = environment.desktopMenu;
+  const submitWithModEnter = environment.submitWithModEnter;
   return useMemo(() => {
     const sections = new Map(
       groups
@@ -67,14 +65,22 @@ export function useSettingsSearchTargets(): SettingsSearchTargets {
       availability,
     );
     const shortcutRows = new Map(
-      shortcutGroups.flatMap((group) =>
-        group.items.filter(isBoundShortcutRow).map((row) => [row.shortcutId, row] as const),
-      ),
+      shortcutGroups.flatMap((group) => group.items.map((row) => [row.shortcutId, row] as const)),
     );
     const matchers = settingsSearchMatchers(
-      { mac, native, desktopMenu },
+      { mac, native, desktopMenu, submitWithModEnter },
       new Set(shortcutRows.keys()),
     );
     return { targets, sections, shortcutRows, matchers };
-  }, [curatedOut, groups, mobile, availability, shortcutGroups, mac, native, desktopMenu]);
+  }, [
+    curatedOut,
+    groups,
+    mobile,
+    availability,
+    shortcutGroups,
+    mac,
+    native,
+    desktopMenu,
+    submitWithModEnter,
+  ]);
 }

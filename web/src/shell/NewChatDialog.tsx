@@ -329,7 +329,13 @@ import {
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
-import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  fetchHostsNow,
+  useHostModelOptions,
+  useHosts,
+  withoutSandboxHosts,
+  type Host,
+} from "@/hooks/useHosts";
 import {
   sandboxModelOptionsKey,
   useSandboxUnsupportedAgents,
@@ -6179,11 +6185,7 @@ function NewChatLandingContent({
       /* oxlint-disable no-await-in-loop */
       const deadline = Date.now() + 30_000;
       while (Date.now() < deadline) {
-        const hostList = await queryClient.fetchQuery({
-          queryKey: ["hosts", { includeSandbox: false }],
-          queryFn: () => fetchHosts(false),
-          staleTime: 0,
-        });
+        const hostList = withoutSandboxHosts(await fetchHostsNow(queryClient));
         const fresh = hostList.find((h) => h.status === "online" && !onlineBefore.has(h.host_id));
         if (fresh) {
           // Remember which host is the Arca instance so the picker can tag it.

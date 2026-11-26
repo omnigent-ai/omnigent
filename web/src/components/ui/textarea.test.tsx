@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { createRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Textarea } from "./textarea";
@@ -32,5 +33,13 @@ describe("Textarea analytics (componentId)", () => {
     render(<Textarea aria-label="Feedback" />);
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "x" } });
     expect(analytics).not.toHaveBeenCalled();
+  });
+});
+
+describe("Textarea ref", () => {
+  it("forwards its ref to the textarea, so a caller can place the caret", () => {
+    const ref = createRef<HTMLTextAreaElement>();
+    render(<Textarea ref={ref} aria-label="Reply" defaultValue="Draft" />);
+    expect(ref.current).toBe(screen.getByRole("textbox", { name: "Reply" }));
   });
 });

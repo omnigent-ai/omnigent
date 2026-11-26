@@ -187,6 +187,26 @@ describe("server-page update bridge", () => {
     assert.equal(h.hasListener("browser-recent-session-input"), false);
   });
 
+  it("lists the app chords a focused page hands over, and forwards them until unsubscribed", async () => {
+    const h = loadPreload();
+    const chord = { key: "k", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+    await h.desktop.browserSetForwardedChords([chord]);
+    assert.deepEqual(
+      h.invokes
+        .filter(({ channel }) => channel === "omnigent:browser-set-forwarded-chords")
+        // The preload builds the payload in its own realm; compare its plain values.
+        .map(({ args }) => JSON.parse(JSON.stringify(args))),
+      [{ chords: [chord] }],
+    );
+
+    const received = [];
+    const unsubscribe = h.desktop.onBrowserForwardedInput((input) => received.push(input));
+    h.emit("browser-forwarded-input", { type: "keydown", key: "k", metaKey: true });
+    assert.deepEqual(received, [{ type: "keydown", key: "k", metaKey: true }]);
+    unsubscribe();
+    assert.equal(h.hasListener("browser-forwarded-input"), false);
+  });
+
   it("asks the main process to cancel a declined recent-session switch", async () => {
     const h = loadPreload();
 

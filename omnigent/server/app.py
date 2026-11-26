@@ -103,6 +103,9 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.background_session_titles import (
+    install_coordinator as install_background_title_coordinator,
+)
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
     DeploymentGate,
@@ -346,6 +349,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_source_sessions: bool = True
     # Scheduled tasks accept ``mcp_services``; older servers reject it.
     scheduled_task_mcp_services: bool = True
+    # Scheduled tasks accept ``workflow_id`` and ``workflow_details`` and write the prompt
+    # that runs the saved workflow; older servers reject them.
+    scheduled_task_workflow_id: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
@@ -2598,10 +2604,12 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        install_background_title_coordinator(background_title_coordinator)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            install_background_title_coordinator(None)
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:

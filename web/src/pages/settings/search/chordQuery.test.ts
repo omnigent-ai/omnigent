@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { Chord, KeyChordInput } from "@/lib/shortcuts/chord";
 import {
   activeShortcutChords,
+  matchesShortcut,
+  shortcutDisplayRow,
   SHORTCUT_BINDINGS,
   type ShortcutEnvironment,
   type ShortcutId,
@@ -10,10 +12,11 @@ import {
 import { type ShortcutPageContext, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
 
 import { CHORD_TIER, parseChordQuery, rowsForChord, searchableChords } from "./chordQuery";
+import { SETTINGS_ENTRIES } from "./catalog";
 import type { SettingsAvailability } from "./catalog/types";
 import { searchSettings, settingsSearchTargets, textMatcher } from "./settingsSearchIndex";
 import { settingsSearchMatchers } from "./settingsSearchMatchers";
-import { isBoundShortcutRow, shortcutSettingsEntries } from "./shortcutEntries";
+import { shortcutSettingsEntries } from "./shortcutEntries";
 
 const press = (
   key: string,
@@ -216,10 +219,17 @@ function isBarePrintable(chord: Chord): boolean {
 /** Every environment the registry reads, as the page's own runtime can set them. */
 const ENVIRONMENTS: ShortcutEnvironment[] = [true, false].flatMap((mac) =>
   [true, false].flatMap((native) =>
-    [true, false].map((desktopMenu) => ({ mac, native, desktopMenu })),
+    [true, false].flatMap((desktopMenu) =>
+      [true, false].map((submitWithModEnter) => ({ mac, native, desktopMenu, submitWithModEnter })),
+    ),
   ),
 );
-const MAC_DESKTOP: ShortcutEnvironment = { mac: true, native: true, desktopMenu: true };
+const MAC_DESKTOP: ShortcutEnvironment = {
+  mac: true,
+  native: true,
+  desktopMenu: true,
+  submitWithModEnter: false,
+};
 
 const ALL_LISTED: ReadonlySet<ShortcutId> = new Set(SHORTCUT_BINDINGS.map((binding) => binding.id));
 
@@ -229,7 +239,7 @@ const rows = (query: string, environment: ShortcutEnvironment) => {
 };
 
 describe("finding shortcuts by chord", () => {
-  it("finds each listed binding by any of its searchable chords, in every spelling", () => {
+  it("finds each listed binding's row by any of its searchable chords, in every spelling", () => {
     for (const environment of ENVIRONMENTS) {
       for (const binding of SHORTCUT_BINDINGS) {
         for (const chord of searchableChords(binding.id, environment)) {
@@ -237,7 +247,7 @@ describe("finding shortcuts by chord", () => {
             expect(
               rows(spelling, environment),
               `${spelling} in ${JSON.stringify(environment)}`,
-            ).toContain(binding.id);
+            ).toContain(shortcutDisplayRow(binding.id));
           }
         }
       }
@@ -247,6 +257,15 @@ describe("finding shortcuts by chord", () => {
   it("finds real bindings by their keys", () => {
     expect(rows("cmd k", MAC_DESKTOP)).toContain("palette.commands");
     expect(rows("cmd /", MAC_DESKTOP)).toContain("shortcuts.show");
+  });
+
+  it("finds Send and Send now by the keys the send preference gives them", () => {
+    expect(rows("cmd enter", MAC_DESKTOP)).toContain("composer.sendWithQueue");
+    expect(rows("cmd enter", MAC_DESKTOP)).not.toContain("composer.send");
+    const modEnterSends = { ...MAC_DESKTOP, submitWithModEnter: true };
+    expect(rows("cmd enter", modEnterSends)).toContain("composer.send");
+    expect(rows("cmd enter", modEnterSends)).not.toContain("composer.sendWithQueue");
+    expect(rows("shift cmd enter", modEnterSends)).toContain("composer.sendWithQueue");
   });
 
   it("never finds a bare printable key, which only works in context", () => {
@@ -275,6 +294,7 @@ const PAGE_CONTEXT: ShortcutPageContext = {
   browser: true,
   submitWithModEnter: false,
   preventsKeyboardSubmit: false,
+  alwaysSteer: false,
   contentSearch: true,
   grids: true,
   splitTerminal: true,
@@ -295,14 +315,13 @@ const SHOWN: SettingsAvailability = {
   integrationProviders: { github: true, databricks: true },
   projectKanban: true,
   sessionTitleInstructions: true,
+  floatingPanes: true,
   proactiveAgent: true,
 };
 
 describe("chord results in Settings search", () => {
   const groups = shortcutPageGroups(PAGE_CONTEXT, true);
-  const listed = new Set(
-    groups.flatMap((group) => group.items.filter(isBoundShortcutRow).map((row) => row.shortcutId)),
-  );
+  const listed = new Set(groups.flatMap((group) => group.items.map((row) => row.shortcutId)));
   const targets = settingsSearchTargets(
     shortcutSettingsEntries(groups),
     [{ id: "shortcuts", label: "Keyboard shortcuts" }],
@@ -319,6 +338,28 @@ describe("chord results in Settings search", () => {
     expect(CHORD_TIER).toBeLessThan(1);
   });
 
+  it("finds a desktop menu row by the menu's accelerator, which no page hotkey matches", () => {
+    expect(keysFor("cmd w")[0]).toBe("tab.close");
+    expect(keysFor("cmd q")[0]).toBe("app.quit");
+    expect(keysFor("cmd ,")[0]).toBe("settings.open");
+    expect(keysFor("cmd opt p")[0]).toBe("session.pin");
+    expect(keysFor("cmd shift a")[0]).toBe("session.archive");
+    const closeTab = parseChordQuery("cmd w", true)!;
+    expect(matchesShortcut(closeTab, "tab.close", MAC_DESKTOP)).toBe(false);
+  });
+
+  it("finds no menu row in a browser tab, where the menu isn't there", () => {
+    const browser = { ...MAC_DESKTOP, native: false, desktopMenu: false };
+    const input = parseChordQuery("cmd w", true)!;
+    expect([...rowsForChord(input, browser, listed)]).not.toContain("tab.close");
+  });
+
+  it("finds the row an alternative or a part's chord is drawn on", () => {
+    expect(keysFor("opt enter")[0]).toBe("composer.newLine");
+    expect(keysFor("down")).toContain("slash.previous");
+    expect(keysFor("down")).not.toContain("slash.next");
+  });
+
   it("ranks other queries by text alone", () => {
     for (const query of ["sidebar", "terminal", "send"]) {
       expect(keysFor(query)).toEqual(
@@ -327,5 +368,25 @@ describe("chord results in Settings search", () => {
         ),
       );
     }
+  });
+
+  it("ranks a bare key name after the settings it names, and still finds its shortcut rows", () => {
+    const everything = settingsSearchTargets(
+      [...SETTINGS_ENTRIES, ...shortcutSettingsEntries(groups)],
+      [
+        { id: "appearance", label: "Appearance" },
+        { id: "shortcuts", label: "Keyboard shortcuts" },
+      ],
+      SHOWN,
+    );
+    const ids = (query: string) =>
+      searchSettings(query, everything, matchers).map((result) => result.target.entry.id);
+    // "tab" finds the Default Workspace tab setting before the Tab key's shortcut rows.
+    const tab = ids("tab");
+    expect(tab.indexOf("default-workspace-tab")).toBeGreaterThanOrEqual(0);
+    expect(tab.indexOf("default-workspace-tab")).toBeLessThan(tab.indexOf("shortcut.slash.apply"));
+    expect(ids("down")).toContain("shortcut.slash.previous");
+    // A chord with a modifier still ranks first.
+    expect(ids("cmd k")[0]).toBe("shortcut.palette.commands");
   });
 });

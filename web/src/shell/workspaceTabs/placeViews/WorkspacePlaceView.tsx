@@ -9,7 +9,7 @@ import { lazy, Suspense, useCallback, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
-import { shortcutKeys } from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import { requestFileFinder, useFileFinderAvailable } from "@/store/fileFinder";
 import { useShowIgnoredFiles, writeShowIgnoredFiles } from "@/lib/filesTreeIgnoredPreferences";
 import type { ChangedSort } from "@/lib/changedSort";
@@ -53,7 +53,7 @@ import {
 } from "./placeViewActions";
 import { FILES_TREE_WIDTH } from "./filesTreeWidth";
 import { FilesPageTree } from "./FilesPageTree";
-import { FilesTreeOptionsMenu, useFilesTreeOptionCommands } from "./filesTreeOptions";
+import { useFilesTreeOptionCommands } from "./filesTreeOptions";
 import { type FilesPageLeaveGuard, FilesPageViewer } from "./FilesPageViewer";
 import {
   HIDE_FILES_TREE_LABEL,
@@ -194,18 +194,22 @@ function FilesPlaceView({
   const showIgnored = useShowIgnoredFiles();
   const treeOptions = { ...files, showIgnored, onShowIgnoredChange: writeShowIgnoredFiles };
   useFilesTreeOptionCommands(treeOptions, commandsActive);
-  // Every Files place, the Files tab or a file tab, shows the same tree beside its file; a
-  // docked tree's options sit beside its toggle.
+  // Every Files place, the Files tab or a file tab, shows the same tree beside its file; the
+  // tree's options sit in its own header.
   const treeToggle = (
-    <>
-      <WorkspaceSidebarToggle
-        state={tree}
-        showLabel={SHOW_FILES_TREE_LABEL}
-        hideLabel={HIDE_FILES_TREE_LABEL}
-      />
-      {tree.wide && tree.shown ? <FilesTreeOptionsMenu {...treeOptions} /> : null}
-    </>
+    <WorkspaceSidebarToggle
+      state={tree}
+      showLabel={SHOW_FILES_TREE_LABEL}
+      hideLabel={HIDE_FILES_TREE_LABEL}
+    />
   );
+  // A file picked in the tree or the breadcrumbs: a file tab steps to it, the Files tab opens it.
+  const openPickedFile = (path: string, options?: { newTab?: boolean }) =>
+    run(
+      filesTab || options?.newTab
+        ? treeFileChosen(path, { newTab: options?.newTab })
+        : fileTabFileChosen(place, path),
+    );
   return (
     <WorkspaceSidebarLayout
       data-testid="workspace-files-place"
@@ -215,20 +219,18 @@ function FilesPlaceView({
       sidebar={
         <FilesPageTree
           conversationId={conversationId}
+          active={active}
+          commandsActive={commandsActive}
           activePath={place.path}
           sort={files.sort}
+          onSortChange={files.onSortChange}
           showHidden={files.showHidden}
-          onShowHidden={() => files.onShowHiddenChange(true)}
+          onShowHiddenChange={files.onShowHiddenChange}
           showIgnored={showIgnored}
-          onShowIgnored={() => writeShowIgnoredFiles(true)}
+          onShowIgnoredChange={writeShowIgnoredFiles}
           onFileSelect={(path, options) => {
             tree.dismissPopover();
-            // A file tab's tree steps that tab; the Files tab's opens there as before.
-            run(
-              filesTab || options?.newTab
-                ? treeFileChosen(path, { newTab: options?.newTab })
-                : fileTabFileChosen(place, path),
-            );
+            openPickedFile(path, options);
           }}
         />
       }
@@ -273,6 +275,7 @@ function FilesPlaceView({
           registerLeaveGuard={registerLeaveGuard}
           permissionLevel={files.permissionLevel}
           commentId={place.comment}
+          onOpenFile={(path) => openPickedFile(path)}
           // The Files tab closes its file back to the tree; another file tab goes to the Files tab.
           onClose={() =>
             filesTab

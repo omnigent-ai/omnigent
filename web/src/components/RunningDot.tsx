@@ -1,4 +1,5 @@
 import { Loader2Icon } from "lucide-react";
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import { cn } from "@/lib/utils";
 
 // Spin the HTML wrapper, not the svg: Chrome composites SVG transform animations
@@ -7,6 +8,7 @@ import { cn } from "@/lib/utils";
 export function RunningDot({ className }: { className?: string }) {
   return (
     <span
+      ref={throttleAnimations}
       aria-hidden
       role="presentation"
       data-testid="running-dot"

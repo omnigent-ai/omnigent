@@ -1,6 +1,6 @@
 # omnidev
 
-Dev tooling for Omnigent, in one binary with three surfaces:
+Dev tooling for Omnigent, in one binary with four surfaces:
 
 1. A per-repo dev **pod supervisor** (bare `omnidev`) — the default.
 2. **Install management** (`omnidev install`/`update`/`check`) — install
@@ -10,6 +10,8 @@ Dev tooling for Omnigent, in one binary with three surfaces:
 3. **An omnigent passthrough** (`omnidev omnigent …`) — run any omnigent command
    against the current checkout's pod, with the pod's isolated env applied.
    See [Running omnigent commands](#running-omnigent-commands).
+4. **A remote UI** (`omnidev ui`) — run only this checkout's UI against any
+   server, local or remote. See [Remote UI](#remote-ui).
 
 ## Pod supervisor
 
@@ -182,6 +184,32 @@ omnidev omnigent -- --verbose agent run …
 
 Supervisor-only flags (`--server-port`, `--clean`, `--no-vite`, …) don't apply
 to the passthrough; only `--pod-dir` is shared.
+
+## Remote UI
+
+`omnidev ui` (or `just dev ui`) runs only this checkout's Vite UI, proxied to
+an existing server. Nothing local is started: no backend, host, or pod.
+
+```bash
+omnidev ui                                   # pick a recent server or enter a URL
+omnidev ui --server http://localhost:9000    # connect directly
+omnidev ui --server 'https://<workspace-host>/?o=<org-id>' --databricks-profile <name>
+```
+
+- For a Databricks workspace, use the workspace URL. The proxy fills in the
+  `/api/2.0/omnigent` mount and sends a `?o=<org-id>` selector as the
+  `X-Databricks-Org-Id` header.
+- Tokens come from `databricks auth token`, matched by host or taken from
+  `--databricks-profile`, and are re-minted before they expire. An inherited
+  `OMNIGENT_AUTH_TOKEN` is ignored, and URLs with credentials or query
+  parameters other than `?o=` are rejected, so neither reaches another server
+  or the history file.
+- The picker lists the last 10 servers, most recent first, and always ends with
+  "Enter a new URL…". With no history it asks for a URL. Each server keeps the
+  profile last used with it (`--databricks-profile ""` clears it). The list is stored in
+  `${XDG_CACHE_HOME:-~/.cache}/omnidev/recent-servers.json`.
+- Vite runs in the foreground with `--open`, so its own shortcuts work (`h`
+  lists them). It runs `pnpm install` first when web deps are missing or stale.
 
 ## Managing your omnigent install
 
