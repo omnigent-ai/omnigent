@@ -1315,8 +1315,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
@@ -1471,8 +1471,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
@@ -1627,8 +1627,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
@@ -1783,8 +1783,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
@@ -1939,8 +1939,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
@@ -2095,8 +2095,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
@@ -2251,8 +2251,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true
@@ -2407,8 +2407,8 @@ workspace.moveTabLeft | Move workspace tab left | group=workspace | chords=alt+s
 workspace.moveTabRight | Move workspace tab right | group=workspace | chords=alt+shift+key:ArrowRight | keys=Alt ⇧ → | aria=Alt+Shift+ArrowRight | editor=Alt-Shift-ArrowRight | matches=true
 workspace.toggleFullScreen | Toggle workspace full screen | group=workspace | chords=mod+shift+code:KeyF | keys=Ctrl ⇧ F | aria=Control+Shift+F | editor=Mod-Shift-f | matches=true
 browser.new | Open a new browser tab | group=workspace | chords=mod+alt+code:KeyB | keys=Ctrl Alt B | aria=Control+Alt+B | editor=Mod-Alt-b | matches=true
-palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyF | keys=Ctrl Alt F | aria=Control+Alt+F | editor=Mod-Alt-f | matches=true
-palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+code:KeyP | keys=Ctrl Alt P | aria=Control+Alt+P | editor=Mod-Alt-p | matches=true
+palette.text | Search text in the open session's files | group=workspace | chords=mod+alt+code:KeyO | keys=Ctrl Alt O | aria=Control+Alt+O | editor=Mod-Alt-o | matches=true
+palette.files | Go to a file in the open session | group=workspace | chords=mod+alt+shift+code:KeyP | keys=Ctrl Alt ⇧ P | aria=Control+Alt+Shift+P | editor=Mod-Alt-Shift-p | matches=true
 files.toggleTree | Show or hide the Files tree | group=workspace | chords=mod+shift+code:KeyE | keys=Ctrl ⇧ E | aria=Control+Shift+E | editor=Mod-Shift-e | matches=true
 find.open | Find in file | group=workspace | chords=mod+key:f | keys=Ctrl F | aria=Control+F | editor=Mod-f | matches=true
 file.findAndReplace | Find and replace | group=files | chords=mod+alt+shift+code:KeyF ctrl+code:KeyH | keys=Ctrl Alt ⇧ F | aria=Control+Alt+Shift+F | editor=Mod-Alt-Shift-f Ctrl-h | matches=true true

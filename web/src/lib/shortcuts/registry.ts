@@ -619,17 +619,20 @@ const WORKSPACE_SIDEBAR_DEFINITIONS = {
     chords: () => [modAlt({ code: "KeyB" })],
   },
   // Physical keys, since Option rewrites letters; ⌃⌘F is the system's full screen on macOS.
+  // Elsewhere Ctrl+Alt+F and Ctrl+Alt+P are the Session menu's Fork and Pin.
   "palette.text": {
     group: "workspace",
     label: "Search text in the open session's files",
     chords: (environment) =>
-      environment.mac ? [{ ctrl: true, mod: true, code: "KeyO" }] : [modAlt({ code: "KeyF" })],
+      environment.mac ? [{ ctrl: true, mod: true, code: "KeyO" }] : [modAlt({ code: "KeyO" })],
   },
   "palette.files": {
     group: "workspace",
     label: "Go to a file in the open session",
     chords: (environment) =>
-      environment.mac ? [{ ctrl: true, mod: true, code: "KeyP" }] : [modAlt({ code: "KeyP" })],
+      environment.mac
+        ? [{ ctrl: true, mod: true, code: "KeyP" }]
+        : [modAlt({ shift: true, code: "KeyP" })],
   },
   // The Explorer chord editors use.
   "files.toggleTree": {
