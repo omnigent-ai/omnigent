@@ -8,6 +8,7 @@ import dataclasses
 import json
 import os
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -1075,6 +1076,55 @@ def test_record_owner_is_live_without_flock_never_signals(
     assert not record_owner_is_live(
         dataclasses.replace(_server_record(_VANITY), pid=os.getpid(), started_at=1)
     )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="boot id and start ticks come from /proc")
+def test_pid_is_recorded_daemon_survives_a_forward_clock_step() -> None:
+    """A record that names the daemon by boot id and start ticks ignores the clock.
+
+    On a board without a battery-backed clock, NTP steps the clock forward
+    after the host service has written ``started_at``; the process then looks
+    newer than its own record by more than the tolerance.
+    """
+    from omnigent.host.daemon_lifecycle import pid_is_recorded_daemon, process_start_identity
+
+    identity = process_start_identity(os.getpid())
+    assert identity is not None
+    boot_id, start_ticks = identity
+    stepped = dataclasses.replace(
+        _server_record(_VANITY),
+        pid=os.getpid(),
+        started_at=int(time.time()) - 600,
+        boot_id=boot_id,
+        start_ticks=start_ticks,
+    )
+
+    assert pid_is_recorded_daemon(stepped)
+    # The same pid after a reboot, or another process in this boot, is not the daemon.
+    assert not pid_is_recorded_daemon(dataclasses.replace(stepped, boot_id="other-boot"))
+    assert not pid_is_recorded_daemon(dataclasses.replace(stepped, start_ticks=start_ticks + 1))
+    # Records written by older daemons keep the clock-based check.
+    assert not pid_is_recorded_daemon(dataclasses.replace(stepped, boot_id=None, start_ticks=None))
+
+
+def test_daemon_record_round_trips_process_identity(tmp_path: Path) -> None:
+    """The identity survives the record file, and records without it still parse."""
+    from omnigent.host.daemon_lifecycle import read_daemon_record, record_from_json
+
+    record = dataclasses.replace(
+        _server_record(_VANITY), boot_id="5d1f0c2e-boot", start_ticks=123456
+    )
+    write_daemon_record(record, base_dir=tmp_path)
+    assert read_daemon_record(daemon_record_path(record.target, base_dir=tmp_path)) == record
+
+    legacy = {
+        key: value
+        for key, value in dataclasses.asdict(record).items()
+        if key not in {"boot_id", "start_ticks"}
+    }
+    parsed = record_from_json(legacy)
+    assert parsed is not None
+    assert (parsed.boot_id, parsed.start_ticks) == (None, None)
 
 
 @pytest.mark.parametrize(
