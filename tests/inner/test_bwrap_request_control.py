@@ -326,7 +326,10 @@ def test_cleanup_failure_cannot_make_later_cancellation_signal_a_reused_fd(
     with pytest.raises(error, match=message):
         case.owner.run(deadline=1.0)
     assert case.owner.done.is_set()
-    assert ("close", _INIT_FD) in case.events
+    assert sorted(fd for action, fd in case.events if action == "close") == [
+        _INIT_FD,
+        _LAUNCHER_FD,
+    ]
     case.control.close.assert_called_once()
     if failure != "descriptor":
         for stream in (case.process.stdin, case.process.stdout, case.process.stderr):
@@ -429,6 +432,77 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
         result.result(timeout=1)
     assert case.owner.admitted and case.owner.done.is_set()
     assert ("kill", _INIT_FD) in case.events and ("kill", _LAUNCHER_FD) in case.events
+    case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
+
+
+def test_cancellation_contends_with_retirement_and_never_signals_released_descriptors(
+    monkeypatch: pytest.MonkeyPatch, request_case: _RequestCase
+) -> None:
+    """Cancellation waits for retirement before it can inspect descriptor ownership."""
+    case = request_case
+    retiring = threading.Event()
+    release_close = threading.Event()
+    contention = threading.Event()
+    lock = threading.Lock()
+
+    class ContendedLock:
+        def __enter__(self) -> None:
+            if not lock.acquire(blocking=False):
+                contention.set()
+                lock.acquire()
+
+        def __exit__(self, *_args: object) -> None:
+            lock.release()
+
+    monkeypatch.setattr(case.owner, "_lock", ContendedLock())
+
+    def close(descriptor: int) -> None:
+        case.events.append(("close", descriptor))
+        if descriptor == _INIT_FD:
+            retiring.set()
+            assert release_close.wait(5)
+
+    monkeypatch.setattr(request_control.os, "close", close)
+    result: Future[request_control.BwrapRequestResult] = Future()
+    cancellation: Future[None] = Future()
+
+    def run() -> None:
+        try:
+            result.set_result(case.owner.run(deadline=1.0))
+        except Exception as error:
+            result.set_exception(error)
+
+    def cancel() -> None:
+        try:
+            case.owner.cancel()
+            cancellation.set_result(None)
+        except Exception as error:
+            cancellation.set_exception(error)
+
+    workers: list[threading.Thread] = []
+    try:
+        worker = threading.Thread(target=run)
+        worker.start()
+        workers.append(worker)
+        assert retiring.wait(5)
+        canceller = threading.Thread(target=cancel)
+        canceller.start()
+        workers.append(canceller)
+        assert contention.wait(5)
+        assert not cancellation.done() and not case.owner.done.is_set()
+    finally:
+        release_close.set()
+        for worker in workers:
+            worker.join(timeout=5)
+    assert all(not worker.is_alive() for worker in workers)
+    cancellation.result(timeout=1)
+    assert result.result(timeout=1).exit_code == 7
+    assert case.owner.admitted and case.owner.done.is_set()
+    assert not any(action == "kill" for action, _fd in case.events)
+    assert sorted(fd for action, fd in case.events if action == "close") == [
+        _INIT_FD,
+        _LAUNCHER_FD,
+    ]
     case.control.send.assert_called_once_with(b"admit:" + _TOKEN)
 
 
