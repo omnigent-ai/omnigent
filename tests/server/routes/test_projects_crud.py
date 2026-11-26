@@ -1717,6 +1717,47 @@ async def test_a_manager_invites_members_but_owner_only_settings_stay_with_the_o
     assert (await client.post(shares, json={"user_id": dan}, headers=bob)).status_code == 403
 
 
+async def test_only_the_owner_lists_other_projects_that_may_read_the_board(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """Board readers are owner-only: approvers, Managers and agents can't change them."""
+    client = multi_user_client
+    owner, bob = _as_user(ALICE), _as_user(BOB)
+    created = (await client.post("/v1/projects", json={"name": "Read me"}, headers=owner)).json()
+    sister = (await client.post("/v1/projects", json={"name": "Sister"}, headers=owner)).json()
+    path = f"/v1/projects/{created['id']}"
+    await client.post(f"{path}/shares", json={"user_id": BOB, "role": "manager"}, headers=owner)
+    approvers = {"product_approvers": [BOB]}
+    assert (await client.patch(path, json={"config": approvers}, headers=owner)).status_code == 200
+
+    readers = {**approvers, "board_readers": [sister["id"]]}
+    for refused in (
+        await client.patch(path, json={"config": readers}, headers=bob),
+        await client.patch(
+            path, json={"config": readers}, headers={**owner, ORCHESTRATION_SOURCE_HEADER: "x"}
+        ),
+        await client.patch(
+            path, json={"config": readers}, headers={**owner, RUNNER_TUNNEL_TOKEN_HEADER: "x"}
+        ),
+    ):
+        assert refused.status_code in (403, 404), refused.text
+    for malformed in (["not-an-id"], [sister["id"], sister["id"]], [created["id"]], "x"):
+        bad = await client.patch(
+            path, json={"config": {**approvers, "board_readers": malformed}}, headers=owner
+        )
+        assert bad.status_code == 400, (malformed, bad.text)
+
+    added = await client.patch(path, json={"config": readers}, headers=owner)
+    assert added.status_code == 200, added.text
+    stored = (await client.get(path, headers=bob)).json()["config"]
+    assert stored["board_readers"] == [sister["id"]]
+    # A member resending the stored list unchanged isn't refused.
+    resent = await client.patch(path, json={"config": readers}, headers=bob)
+    assert resent.status_code == 200, resent.text
+    revoked = await client.patch(path, json={"config": approvers}, headers=owner)
+    assert "board_readers" not in revoked.json()["config"]
+
+
 async def test_a_role_has_an_editable_owns_and_does_not_own_scope(
     project_client: httpx.AsyncClient,
 ) -> None:

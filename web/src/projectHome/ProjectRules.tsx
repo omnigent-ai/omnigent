@@ -10,7 +10,11 @@ import { useViewerId } from "@/hooks/useViewerId";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { ProjectSettingsDialog } from "@/shell/ProjectSettingsDialog";
-import { ProjectProductApproversSection, ProjectSharingSection } from "@/shell/ProjectSharing";
+import {
+  ProjectBoardReadersSection,
+  ProjectProductApproversSection,
+  ProjectSharingSection,
+} from "@/shell/ProjectSharing";
 import {
   canEditMandate,
   canEditStages,
@@ -384,6 +388,7 @@ export function ProjectRules({ projectName }: { projectName: string }) {
           <ApprovalRules projectId={projectId} />
           <RulesSection title="People" section="people" testId="project-rules-people">
             <ProjectSharingSection projectId={projectId} />
+            <ProjectBoardReadersSection projectId={projectId} />
           </RulesSection>
           <AdvancedRules projectName={projectName} projectId={projectId} />
         </div>

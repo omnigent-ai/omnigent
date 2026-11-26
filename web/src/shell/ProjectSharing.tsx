@@ -3,7 +3,7 @@
 // make a member a Manager, who can also add and remove ordinary members.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, LinkIcon, UsersIcon, XIcon } from "lucide-react";
+import { CheckIcon, CopyIcon, LinkIcon, UsersIcon, XIcon } from "lucide-react";
 import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useProjects } from "@/hooks/useConversations";
 import { useCopyLink } from "@/hooks/useCopyLink";
 import {
   getProject,
@@ -307,6 +308,151 @@ export function ProjectProductApproversSection({ projectId }: { projectId: strin
         ))}
         {project.isSuccess && approvers.length === 0 && (
           <li className="text-muted-foreground text-sm">Only the owner so far.</li>
+        )}
+      </ul>
+    </section>
+  );
+}
+
+const PROJECT_ID = /^[0-9a-f]{32}$/;
+
+/**
+ * The owner's board readers: other projects whose Lead may read this board's tickets,
+ * comments and stages. Off until the owner adds one; members see the list read-only.
+ */
+export function ProjectBoardReadersSection({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient();
+  const project = useQuery({
+    queryKey: ["project", projectId],
+    queryFn: () => getProject(projectId),
+    staleTime: 30_000,
+  });
+  const projects = useProjects();
+  const { status: copyStatus, copy } = useCopyLink();
+  const [draft, setDraft] = useState("");
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const readers = project.data?.config?.board_readers ?? [];
+  const nameOf = (id: string) => projects.data?.find((entry) => entry.id === id)?.name ?? null;
+  const save = useMutation({
+    // Re-read so the whole-config write keeps every other stored setting.
+    mutationFn: async (next: string[]) => {
+      const current = await getProject(projectId);
+      return updateProjectConfig(projectId, { ...current.config, board_readers: next });
+    },
+    onSuccess: () => {
+      setDraft("");
+      void queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+      void queryClient.invalidateQueries({ queryKey: ["project-config", projectId] });
+    },
+  });
+  const isOwner = project.data !== undefined && project.data.shared !== true;
+  const onSubmit = (event: FormEvent) => {
+    event.preventDefault();
+    const entry = draft.trim();
+    if (!entry) return;
+    const id = PROJECT_ID.test(entry)
+      ? entry
+      : (projects.data?.find((item) => item.name === entry)?.id ?? null);
+    if (id === null) {
+      setDraftError("No project you can see has that name. Paste its project ID instead.");
+      return;
+    }
+    if (id === projectId) {
+      setDraftError("This project can already read its own board.");
+      return;
+    }
+    setDraftError(null);
+    if (!readers.includes(id)) save.mutate([...readers, id]);
+    else setDraft("");
+  };
+  return (
+    <section className="flex flex-col gap-2 border-t pt-4" data-testid="project-board-readers">
+      <h3 className="font-medium text-ui">Other projects' Leads that may read this board</h3>
+      <p className="text-muted-foreground text-sm">
+        A listed project's Lead may read this board's tickets, comments and stages, never its chats,
+        files or mandate. Anyone with access to a listed project may see what its Lead reads here.
+        Off until you add one.
+      </p>
+      <p className="flex items-center gap-1 text-muted-foreground text-sm">
+        This project's ID: <code className="select-all font-mono text-xs">{projectId}</code>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Copy this project's ID"
+          onClick={() => void copy(projectId)}
+        >
+          {copyStatus === "copied" ? (
+            <CheckIcon className="size-3.5" />
+          ) : (
+            <CopyIcon className="size-3.5" />
+          )}
+        </Button>
+      </p>
+      {isOwner && (
+        <form onSubmit={onSubmit} className="flex gap-2">
+          <Input
+            value={draft}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              setDraftError(null);
+            }}
+            placeholder="Project name or ID"
+            aria-label="Project whose Lead may read this board"
+            data-testid="board-reader-input"
+            list="board-reader-projects"
+            className="flex-1"
+          />
+          <datalist id="board-reader-projects">
+            {(projects.data ?? [])
+              .filter((entry) => entry.id !== null && entry.id !== projectId)
+              .map((entry) => (
+                <option key={entry.id} value={entry.name} />
+              ))}
+          </datalist>
+          <Button
+            type="submit"
+            size="sm"
+            data-testid="board-reader-add"
+            loading={save.isPending}
+            disabled={draft.trim() === ""}
+          >
+            Add
+          </Button>
+        </form>
+      )}
+      {(draftError ?? (save.isError ? (save.error as Error).message : null)) && (
+        <p className="text-destructive text-sm" role="alert">
+          {draftError ?? (save.error as Error).message}
+        </p>
+      )}
+      <ul className="flex flex-col gap-1" data-testid="board-reader-list">
+        {readers.map((id) => (
+          <li key={id} className="flex items-center justify-between gap-2 text-sm">
+            <span className="truncate">
+              {nameOf(id) ?? (
+                <>
+                  <code className="font-mono text-xs">{id}</code>
+                  <span className="text-muted-foreground"> · a project you can't open</span>
+                </>
+              )}
+            </span>
+            {isOwner && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`Stop ${nameOf(id) ?? id} reading this board`}
+                onClick={() => save.mutate(readers.filter((entry) => entry !== id))}
+                disabled={save.isPending}
+              >
+                <XIcon className="size-3.5" />
+              </Button>
+            )}
+          </li>
+        ))}
+        {project.isSuccess && readers.length === 0 && (
+          <li className="text-muted-foreground text-sm">No other project's Lead can read it.</li>
         )}
       </ul>
     </section>

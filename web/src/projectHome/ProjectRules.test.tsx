@@ -38,6 +38,7 @@ vi.mock("./ProjectTicketStagesDialog", () => ({
 vi.mock("@/shell/ProjectSharing", () => ({
   ProjectSharingSection: () => <div data-testid="sharing-section" />,
   ProjectProductApproversSection: () => <div data-testid="approvers-section" />,
+  ProjectBoardReadersSection: () => <div data-testid="board-readers-section" />,
 }));
 vi.mock("@/shell/ProjectSettingsDialog", () => ({
   ProjectSettingsDialog: (props: { open: boolean; defaultsOnly?: boolean }) => {

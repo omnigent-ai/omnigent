@@ -11,13 +11,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from omnigent.server.board_readers import BOARD_READERS_CONFIG_KEY
+
 KIND_LABEL = "kind"
 KINDS = ("fix", "perf", "ux", "feature")
 FEATURE_KIND = "feature"
 PRODUCT_OK_LABEL = "product-ok"
 APPROVERS_CONFIG_KEY = "product_approvers"
 # Project config keys only the owner may change, by hand.
-OWNER_ONLY_CONFIG_KEYS = ("landing", APPROVERS_CONFIG_KEY)
+OWNER_ONLY_CONFIG_KEYS = ("landing", APPROVERS_CONFIG_KEY, BOARD_READERS_CONFIG_KEY)
 
 
 def product_approvers(project: Any) -> set[str]:

@@ -21,6 +21,8 @@ import { apiErrorFromResponse } from "./sessionsApi";
 export interface ProjectConfig {
   /** People besides the owner whose own `product-ok` approves others' features. Owner-only. */
   product_approvers?: string[];
+  /** Projects whose Lead may read this board's tickets, comments and stages. Owner-only. */
+  board_readers?: string[];
   /** Default host id, or the sandbox sentinel. */
   host_id?: string;
   /** Default working directory / repo path on that host. */

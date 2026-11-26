@@ -42,6 +42,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.server import session_live_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC, AuthProvider
+from omnigent.server.board_readers import validate_board_readers
 from omnigent.server.persona_mentions import Mention, PersonaMentionTargets
 from omnigent.server.product_approval import OWNER_ONLY_CONFIG_KEYS
 from omnigent.server.project_agents import create_role_agent
@@ -179,7 +180,7 @@ def _refuse_owner_config_write(
     *,
     is_owner: bool,
 ) -> None:
-    """The landing queue and product approvers are the owner's own settings.
+    """The landing queue, product approvers and board readers are the owner's own settings.
 
     Agents and other members of a shared project are refused when they change them.
     """
@@ -188,7 +189,7 @@ def _refuse_owner_config_write(
     changed = [
         key for key in OWNER_ONLY_CONFIG_KEYS if requested.get(key) != (current or {}).get(key)
     ]
-    if changed and (ORCHESTRATION_SOURCE_HEADER in request.headers or not is_owner):
+    if changed and (_is_agent_call(request) or not is_owner):
         raise OmnigentError(
             "Only the project owner can change " + ", ".join(f"`{key}`" for key in changed),
             code=ErrorCode.FORBIDDEN,
@@ -443,6 +444,7 @@ def create_projects_router(
             request, None, body.description, user_id=user_id, conversation_store=None
         )
         _refuse_owner_config_write(request, body.config, None, is_owner=True)
+        validate_board_readers(body.config, None)
         key = creation_key(request) if "Idempotency-Key" in request.headers else None
         project_id = creation_id("project", user_id, key) if key else uuid.uuid4().hex
         project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
@@ -617,6 +619,7 @@ def create_projects_router(
             _refuse_member_session_config_write(
                 body.config, stored.config if stored else None, is_owner=is_owner
             )
+            validate_board_readers(body.config, project_id)
         session_id = None
         if body.main_session_id is not None:
             current = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
