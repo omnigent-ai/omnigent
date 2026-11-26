@@ -35,19 +35,18 @@ export const DEFAULT_PANEL_VIEW: PullRequestPanelView = {
   subtab: "summary",
 };
 
+/** Classic's panel view, which `showPullRequestInPanel` also steers. */
 export const pullRequestPanelViewKey = (sessionId: string) =>
   ["pull-request-panel-view", sessionId] as const;
 
-/** Make the session's panel show its list of pull requests, now if it's open or once it opens. */
-export function showPullRequestListInPanel(queryClient: QueryClient, sessionId: string): void {
-  queryClient.setQueryData<PullRequestPanelView>(pullRequestPanelViewKey(sessionId), (current) => ({
-    ...(current ?? DEFAULT_PANEL_VIEW),
-    showingDetails: false,
-    subtab: "summary",
-    commit: undefined,
-    file: undefined,
-  }));
-}
+/** The new page's own panel view, so Classic never reads a tab or commit only it has. */
+export const pullRequestPageViewKey = (sessionId: string) =>
+  ["pr-page-panel-view", sessionId] as const;
+
+const panelViewKeys = (sessionId: string) => [
+  pullRequestPanelViewKey(sessionId),
+  pullRequestPageViewKey(sessionId),
+];
 
 /** Make the session's panel show `url`'s details, now if it's open or once it opens. */
 export function showPullRequestInPanel(
@@ -55,8 +54,7 @@ export function showPullRequestInPanel(
   sessionId: string,
   url: string,
 ): void {
-  queryClient.setQueryData<PullRequestPanelView>(
-    pullRequestPanelViewKey(sessionId),
-    viewForChosenPullRequest(url, "summary"),
-  );
+  for (const key of panelViewKeys(sessionId)) {
+    queryClient.setQueryData<PullRequestPanelView>(key, viewForChosenPullRequest(url, "summary"));
+  }
 }

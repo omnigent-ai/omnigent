@@ -2,11 +2,10 @@ import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 
 import {
-  DEFAULT_PANEL_VIEW,
   type PullRequestPanelView,
+  pullRequestPageViewKey,
   pullRequestPanelViewKey,
   showPullRequestInPanel,
-  showPullRequestListInPanel,
   viewForChosenPullRequest,
 } from "./pullRequestPanelView";
 
@@ -38,20 +37,11 @@ describe("pull request panel view", () => {
     expect(view(client, "conv_2")).toBeUndefined();
   });
 
-  it("shows the list, keeping the selection and clearing the commit and file", () => {
+  it("steers Classic and the new page alike, under keys of their own", () => {
     const client = new QueryClient();
-    showPullRequestListInPanel(client, "conv_1");
-    expect(view(client, "conv_1")).toEqual(DEFAULT_PANEL_VIEW);
-    client.setQueryData(pullRequestPanelViewKey("conv_1"), {
-      ...viewForChosenPullRequest(PR, "changes"),
-      commit: "abc123",
-      file: { path: "a.ts" },
-    });
-    showPullRequestListInPanel(client, "conv_1");
-    expect(view(client, "conv_1")).toEqual({
-      selected: PR,
-      showingDetails: false,
-      subtab: "summary",
-    });
+    const pageView = () => client.getQueryData(pullRequestPageViewKey("conv_1"));
+    showPullRequestInPanel(client, "conv_1", PR);
+    expect(pageView()).toEqual(view(client, "conv_1"));
+    expect(pullRequestPageViewKey("conv_1")).not.toEqual(pullRequestPanelViewKey("conv_1"));
   });
 });
