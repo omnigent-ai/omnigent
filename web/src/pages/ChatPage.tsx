@@ -2536,6 +2536,8 @@ function ComposerImpl(
   // A take in the one document: the document before it, the one dictation last left, and
   // whether anything else edited it since. See onVoiceDiscard.
   const voiceTakeRef = useRef<{ before: string; last: string; clean: boolean } | null>(null);
+  // Set while dictation writes through the editor, so its own change doesn't count as another edit.
+  const writingDictationRef = useRef(false);
   // In the one document dictation writes through the editor, so its card rules apply.
   // Only a final is an undo step, so undo takes back a whole utterance and never shows a partial.
   const writeDictation = (
@@ -2553,7 +2555,12 @@ function ComposerImpl(
     }
     const take = voiceTakeRef.current;
     if (take && target.value !== take.last) take.clean = false;
-    target.insertText(change.insert, change.from, change.to, { history: final });
+    writingDictationRef.current = true;
+    try {
+      target.insertText(change.insert, change.from, change.to, { history: final });
+    } finally {
+      writingDictationRef.current = false;
+    }
     if (take) take.last = target.value;
     return target.value;
   };
@@ -4464,6 +4471,8 @@ function ComposerImpl(
     const input = e.currentTarget;
     noteMentionTextChange(e);
     slashCompletion.onSelectionChange(input);
+    // Any edit but dictation's own keeps the take from being discarded, even one undone by hand.
+    if (voiceTakeRef.current && !writingDictationRef.current) voiceTakeRef.current.clean = false;
     if (replyDocument !== null) setReplyDocument(input.value);
     else editText(id, input.value);
     dirtyRef.current = true;

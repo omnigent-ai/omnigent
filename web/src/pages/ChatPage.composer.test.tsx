@@ -10663,6 +10663,21 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     expect(textarea().selectionStart).toBe(3);
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
     expect(cards()).toHaveLength(1);
+
+    // A caret the other engine's input can't hold goes to the end of the draft: one in a quote's
+    // input, which the editor lacks, and one before the last card, outside the textarea's tail.
+    const quoteInput = screen.getByLabelText<HTMLTextAreaElement>("Reply text before quote 1");
+    act(() => {
+      quoteInput.focus();
+      quoteInput.setSelectionRange(2, 2);
+    });
+    switchTo(codeMirrorInfo);
+    await editorReady();
+    expect(editor().selectionStart).toBe(editor().value.length);
+    act(() => editor().setSelectionRange(2, 2));
+    switchTo(plainInfo);
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    expect(textarea().selectionStart).toBe("My answer".length);
   });
 
   it.each([
@@ -10810,20 +10825,37 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     expect(cards()).toHaveLength(1);
   });
 
+  const retype = (word: string, next: string) => {
+    const at = editor().value.indexOf(word);
+    act(() => editor().setSelectionRange(at, at + word.length));
+    type(next);
+  };
   it.each([
-    ["a Reply", (reply: (text: string) => void) => reply("Added during the take")],
-    ["a typed edit", () => type(" typed")],
-  ])("keeps everything when a take is discarded after %s during it", async (_what, interrupt) => {
-    const { reply } = await renderEditor();
-    type("Intro");
-    act(() => mic.current!.onVoiceStart!());
-    act(() => mic.current!.onTranscript("spoken"));
-    interrupt(reply);
-    act(() => mic.current!.onTranscript("again"));
-    const kept = editor().value;
-    act(() => mic.current!.onVoiceDiscard!());
-    expect(editor().value).toBe(kept);
-  });
+    ["a Reply", (reply: (text: string) => void) => reply("Added during the take"), "again"],
+    ["a typed edit", () => type(" typed"), "again"],
+    // With no transcript after it, the draft reads as dictation left it.
+    [
+      "an edit away and back",
+      () => {
+        retype("spoken", "authored");
+        retype("authored", "spoken");
+      },
+      null,
+    ],
+  ])(
+    "keeps everything when a take is discarded after %s during it",
+    async (_what, interrupt, then) => {
+      const { reply } = await renderEditor();
+      type("Intro");
+      act(() => mic.current!.onVoiceStart!());
+      act(() => mic.current!.onTranscript("spoken"));
+      interrupt(reply);
+      if (then !== null) act(() => mic.current!.onTranscript(then));
+      const kept = editor().value;
+      act(() => mic.current!.onVoiceDiscard!());
+      expect(editor().value).toBe(kept);
+    },
+  );
 
   it("leaves a cancelled take's partial to the user, so neither a switch nor the next take waits on it", async () => {
     const { switchTo } = await renderEditor();

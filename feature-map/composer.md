@@ -34,9 +34,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   at the start of the line after a card, Delete at the end of the line before
   it, or the card's X removes it; undo brings it back. After Reply the caret is
   on the empty line under the new card. Copy, cut and drag give a quote as `> `
-  markdown, and a readline kill (⌃K, ⌃U, ⌃W) stops at a card. Writes from code
-  (clears, `/side`, attachments, recall) change only the text after the last
-  card. Removing a card takes its line and a blank line that only separates it,
+  markdown, and a readline kill (⌃K, ⌃U, ⌃W) stops at a card. Message-text
+  setters, including slash-command clears, `/side`, and attachments, change only
+  the tail; recall and send replace the whole draft. Removing a card takes its
+  line and a blank line that only separates it,
   and keeps the text around it as shown, so the text above and below joins with
   one line break; the textarea joins them with a blank line, so the sent text
   can differ. Discarding a dictation puts back the text from before the take
