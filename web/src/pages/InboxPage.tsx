@@ -70,6 +70,7 @@ import {
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
 import { SuggestionMedia } from "@/components/inbox/SuggestionMedia";
+import { useWhatsNewStore } from "@/components/WhatsNew";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -1290,6 +1291,8 @@ export function InboxPage() {
     );
   };
 
+  // On phones the release notice floats at the Inbox's foot; keep room under the last card.
+  const releaseNoticeShowing = useWhatsNewStore((state) => state.mounted && state.noticeVisible);
   const moreToLoad =
     (!advisorOnly && hasNextPage) ||
     (showUnread && automationInbox.hasNextPage) ||
@@ -1537,6 +1540,9 @@ export function InboxPage() {
         >
           {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
+      )}
+      {releaseNoticeShowing && (
+        <div aria-hidden data-testid="inbox-notice-clearance" className="h-12 md:hidden" />
       )}
     </PageScroll>
   );

@@ -18,6 +18,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
+import { useWhatsNewStore } from "@/components/WhatsNew";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as approvalCard from "@/components/blocks/ApprovalCard";
@@ -378,6 +379,20 @@ describe("InboxPage approval items", () => {
 
     expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
     expect(sessionsApi.getSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps room under the last card while the phone release notice shows", async () => {
+    // WHY: the notice floats at the Inbox's foot on phones and would otherwise cover the last card.
+    const before = useWhatsNewStore.getState();
+    onTestFinished(() =>
+      useWhatsNewStore.setState({ mounted: before.mounted, noticeVisible: before.noticeVisible }),
+    );
+    useWhatsNewStore.setState({ mounted: true, noticeVisible: true });
+    renderPage();
+    expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
+    expect(screen.getByTestId("inbox-notice-clearance")).toHaveClass("md:hidden");
+    act(() => useWhatsNewStore.setState({ noticeVisible: false }));
+    expect(screen.queryByTestId("inbox-notice-clearance")).toBeNull();
   });
 
   it("collapses an item when its toggle is clicked and hides the card", async () => {
