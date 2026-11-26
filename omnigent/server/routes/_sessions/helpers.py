@@ -9201,11 +9201,16 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param rejected: Why the session could not take the message, when its
+        native terminal definitively cannot start: the message is consumed
+        into a failed turn and nothing will deliver it. Told to the sender,
+        which otherwise reads the reply as a send that went through.
     """
 
     item_id: str | None
     pending_id: str | None
     accepted: bool = True
+    rejected: str | None = None
 
 
 def _extract_persistent_item_from_sse(

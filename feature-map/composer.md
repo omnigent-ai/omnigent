@@ -264,10 +264,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   under the composer with the text kept, a server refusal with the text
   restored (to the session's saved draft if the user has switched away), and a
   refused first run ("… The loop was not armed."), which cancels the timer just
-  saved. A refusal is the server rejecting the message: an error reply or a
-  policy denial. A first run the server accepts but that fails afterwards, such
-  as a native terminal that cannot start, shows as a failed turn and leaves the
-  loop armed; the next tick tries again, and `/loop stop` ends it.
+  saved. A refusal is an error reply, a policy denial, or a native terminal that
+  cannot start, which the server reports on the accepted reply as `rejected`.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

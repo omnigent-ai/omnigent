@@ -3,6 +3,7 @@ import { ApiError } from "./sessionsApi";
 import {
   cancelSessionTimer,
   INPUT_DENIED_CODE,
+  INPUT_REJECTED_CODE,
   runSessionTimerMutation,
   sendLoopPrompt,
   setSessionTimer,
@@ -63,6 +64,26 @@ describe("sendLoopPrompt", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ queued: false, denied: true }, 200));
     await expect(sendLoopPrompt("sess", "check CI")).rejects.toMatchObject({
       code: INPUT_DENIED_CODE,
+    });
+  });
+
+  it("throws when the session's terminal cannot start, which the server reports on an accepted reply", async () => {
+    // The message was consumed into a failed turn: queued, with an item, yet never run.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          queued: true,
+          item_id: "item_failed",
+          rejected: true,
+          reason: "Native Codex requires the 'codex' CLI on PATH.",
+        },
+        202,
+      ),
+    );
+    await expect(sendLoopPrompt("sess", "check CI")).rejects.toMatchObject({
+      code: INPUT_REJECTED_CODE,
+      message:
+        "The session could not run the prompt: Native Codex requires the 'codex' CLI on PATH",
     });
   });
 });

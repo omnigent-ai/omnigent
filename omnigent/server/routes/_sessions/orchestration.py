@@ -9379,7 +9379,12 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 failure_context=ensure_outcome.failure_context,
             )
-            return _SessionEventDispatchResult(item_id=item_id, pending_id=None, accepted=False)
+            return _SessionEventDispatchResult(
+                item_id=item_id,
+                pending_id=None,
+                accepted=False,
+                rejected=ensure_outcome.error.message,
+            )
         if ensure_outcome.policy_notice is not None:
             # Terminal is up but policy enforcement is off (fail-open). Post
             # a durable, non-fatal banner; the user message still forwards.

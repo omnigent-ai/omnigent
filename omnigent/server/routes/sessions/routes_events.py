@@ -4202,6 +4202,11 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        if dispatch.rejected is not None:
+            # The message was consumed into a turn that failed before any harness
+            # ran, so a sender that needs the prompt to run must not count it sent.
+            response["rejected"] = True
+            response["reason"] = dispatch.rejected
         return response
 
     if register_startup_dispatch is not None:

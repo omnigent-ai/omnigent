@@ -27,6 +27,8 @@ export interface SetSessionTimerInput {
 export const TIMER_NOT_SAVED_CODE = "timer_not_saved";
 /** A session policy refused the message, so no turn ran. */
 export const INPUT_DENIED_CODE = "input_denied";
+/** The session's native terminal cannot start, so the message became a failed turn. */
+export const INPUT_REJECTED_CODE = "input_rejected";
 
 /**
  * Whether *session* can hold saved timers: a top-level session, not a sub-agent's
@@ -110,9 +112,8 @@ export async function stopSessionLoop(sessionId: string): Promise<string | null>
  * Send a loop's prompt as the message every run of it sends: the first run from
  * the composer, then each tick from the server. Tagged so the transcript labels it.
  * Any refusal fails the run, an offline host included: nothing holds the message
- * for a resend. A policy denial, which the server reports as a success, throws too.
- * A run the server accepts but that fails afterwards, such as a native terminal
- * that cannot start, resolves: the transcript shows that turn's failure.
+ * for a resend. A policy denial or a native terminal that cannot start, which the
+ * server reports on a successful reply, throws too.
  */
 export async function sendLoopPrompt(sessionId: string, prompt: string): Promise<void> {
   const result = await postEvent(sessionId, {
@@ -125,6 +126,10 @@ export async function sendLoopPrompt(sessionId: string, prompt: string): Promise
   });
   if (result.denied) {
     throw new ApiError("A session policy refused the prompt", 403, INPUT_DENIED_CODE);
+  }
+  if (result.rejected) {
+    const reason = result.reason ? `: ${result.reason.replace(/\.$/, "")}` : "";
+    throw new ApiError(`The session could not run the prompt${reason}`, 409, INPUT_REJECTED_CODE);
   }
 }
 

@@ -31,6 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    ErrorData,
     FunctionCallData,
     MessageData,
     NewConversationItem,
@@ -821,6 +822,71 @@ async def test_native_transcript_preserves_browser_title_preference(
         finally:
             for pending in pending_inputs.snapshot_for(session_id):
                 pending_inputs.resolve(session_id, pending["pending_id"])
+
+
+async def test_a_message_a_native_terminal_cannot_take_is_reported_rejected(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native terminal that definitively can't start consumes the message into a failed
+    turn, and the accepted reply says so: a sender that needs the prompt to run, like the
+    composer's /loop first run, would otherwise count it as sent."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    failure = ErrorData(
+        source="execution",
+        code="native_terminal_start_failed",
+        message="Native Codex requires the 'codex' CLI on PATH.",
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=failure)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=False)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+        )
+        posted = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "origin": "loop",
+                    "content": [{"type": "input_text", "text": "check CI"}],
+                },
+            },
+        )
+    assert posted.status_code == 202, posted.text
+    body = posted.json()
+    assert body == {
+        "queued": True,
+        "item_id": body["item_id"],
+        "rejected": True,
+        "reason": failure.message,
+    }
+    # The message is consumed beside the error it met, not held for a later delivery.
+    assert not pending_inputs.has_pending(session["id"])
+    items = (await client.get(f"/v1/sessions/{session['id']}")).json()["items"]
+    assert [(item["id"] == body["item_id"], item["type"]) for item in items[-2:]] == [
+        (True, "message"),
+        (False, "error"),
+    ]
+    assert items[-1]["data"]["code"] == failure.code
 
 
 @pytest.mark.parametrize(
