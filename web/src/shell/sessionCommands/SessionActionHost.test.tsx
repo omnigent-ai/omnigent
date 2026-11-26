@@ -65,6 +65,10 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
   useActiveRootSessionId: () => ui.viewing,
 }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "viewer" }));
+const sessionWindows = vi.hoisted(() => ({ open: vi.fn() }));
+vi.mock("@/hooks/useOpenSessionWindow", () => ({
+  useOpenSessionWindow: () => sessionWindows.open,
+}));
 const readMarks = vi.hoisted(() => ({ unread: vi.fn(), read: vi.fn() }));
 vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UnseenModule>()),
@@ -171,6 +175,14 @@ describe("SessionActionHost", () => {
     // Already read, so Mark as read doesn't apply.
     act(() => requestSessionAction(SESSION, "mark-read"));
     expect(readMarks.read).not.toHaveBeenCalled();
+  });
+
+  it("opens the session in a new window, as its row does", () => {
+    const open = vi.fn();
+    sessionWindows.open = open;
+    renderHost();
+    act(() => requestSessionAction(SESSION, "open-in-new-window"));
+    expect(open).toHaveBeenCalledWith("c1");
   });
 
   it("asks nothing of the server for a session still being created", () => {
