@@ -1387,6 +1387,48 @@ async def test_interrupt_during_session_create_stops_once_without_send(
     assert state["session_closed"] == 1 and state["client_closed"] == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_fails", [False, True])
+async def test_interrupt_during_client_start_keeps_replacement_session(
+    monkeypatch: pytest.MonkeyPatch, start_fails: bool
+) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    module = sys.modules["copilot"]
+    start_entered = asyncio.Event()
+    start_release = asyncio.Event()
+    gated: list[bool] = []
+
+    class _GatedClient(module.CopilotClient):  # type: ignore[name-defined, misc]
+        async def start(self) -> None:
+            if not gated:
+                gated.append(True)
+                start_entered.set()
+                await start_release.wait()
+                if start_fails:
+                    raise RuntimeError("start blew up")
+            await super().start()
+
+    monkeypatch.setattr(module, "CopilotClient", _GatedClient)
+    ex = CopilotExecutor(github_token="gho_x")
+
+    async def run() -> list[Any]:
+        return [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+
+    first = asyncio.create_task(run())
+    await asyncio.wait_for(start_entered.wait(), timeout=10)
+    assert await ex.interrupt_session("conv1") is True
+    second = await run()
+    assert isinstance(second[-1], TurnComplete)
+    replacement = ex._session_states["conv1"]
+    closed_before = state["client_closed"]
+    start_release.set()
+    assert await asyncio.wait_for(first, timeout=10) == []
+    assert len(state["create_kwargs"]) == 1  # interrupted startup never created a session
+    assert state["client_closed"] == closed_before + 1  # the interrupted client was stopped
+    assert ex._session_states["conv1"] is replacement and replacement.session is not None
+    await ex.close()
+
+
 # ---------------------------------------------------------------------------
 # Session restart triggers (tool set + model), beyond the system-prompt case.
 # ---------------------------------------------------------------------------

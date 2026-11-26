@@ -579,6 +579,9 @@ class CopilotExecutor(Executor):
             # ``client.stop()`` reaps it. So a start failure (bad token, version
             # skew) must still hit ``_safe_stop`` below, or it orphans the CLI.
             await client.start()
+            if state.closed:
+                await _safe_stop(client)
+                return
             # ``append`` keeps Copilot's own operating instructions (how to use
             # its built-in tools) and layers the Omnigent agent's system prompt
             # on top — a ``replace`` would strip the tool-use guidance the model
@@ -640,7 +643,12 @@ class CopilotExecutor(Executor):
         try:
             await self._ensure_session(state, model, tools, system_prompt, reasoning_effort)
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
-            await self.close_session(session_key)
+            if state.closed:
+                return
+            # Drop only this turn's state; an interrupt may have installed a replacement.
+            if self._session_states.get(session_key) is state:
+                del self._session_states[session_key]
+            await self._close_state(state)
             yield ExecutorError(message=f"Failed to start copilot-sdk session: {exc}")
             return
         if state.closed or state.session is None:
