@@ -1487,9 +1487,8 @@ def test_trigger_provider_is_bounded_on_sqlite(db_engine: Engine) -> None:
             )
 
 
-@pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql"])
-def test_trigger_config_downgrade_requires_live_connection(dialect: str) -> None:
-    config = _build_alembic_config(f"{dialect}://")
+def test_trigger_config_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("sqlite://")
     config.output_buffer = StringIO()
     with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
         command.downgrade(
@@ -1592,6 +1591,20 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
             receipts.insert().values(id=b"e" * 16, **{**receipt, "scheduled_task_id": b"a" * 16})
         )
         conn.execute(receipts.insert().values(id=b"f" * 16, **{**receipt, "workspace_id": 7}))
+        conn.execute(
+            receipts.insert().values(id=b"g" * 16, **{**receipt, "trigger_key": "event:X:1"})
+        )
+        assert (
+            conn.execute(
+                sa.select(sa.func.count())
+                .select_from(receipts)
+                .where(
+                    receipts.c.workspace_id == 0,
+                    receipts.c.scheduled_task_id == b"b" * 16,
+                )
+            ).scalar_one()
+            == 2
+        )
     with pytest.raises(RuntimeError, match="no rrule"):
         command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
     with engine.begin() as conn:

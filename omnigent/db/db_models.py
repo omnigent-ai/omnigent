@@ -1790,8 +1790,8 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("kind IN (1, 2, 3)", name="ck_scheduled_tasks_task_kind"),
         CheckConstraint("smart_routing IN (1, 2)", name="ck_scheduled_tasks_smart_routing"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
-        # A workspace's active tasks for one trigger provider, and scheduled tasks
-        # (no provider) that still need a next run time, by equality seeks.
+        # Event lookups constrain state, provider, next_run_at IS NULL, and workspace.
+        # Event writers must leave next_run_at NULL to preserve the equality seek.
         Index(
             "ix_scheduled_tasks_trigger",
             "state",
