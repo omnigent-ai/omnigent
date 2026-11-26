@@ -612,7 +612,10 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 tasks.raise_for_status()
                 assert not tasks.json()["scheduled_tasks"]
                 assert native_settings is not None
-                assert native_settings.read_bytes() == native_settings_bytes
+                # agy normalizes JSON formatting; the complete user configuration must survive.
+                assert json.loads(native_settings.read_bytes()) == json.loads(
+                    native_settings_bytes
+                )
         finally:
             try:
                 with contextlib.suppress(Exception):
