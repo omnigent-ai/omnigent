@@ -90,6 +90,7 @@ from omnigent.host.workspace_pull_request_input import refuse_unserved_request
 from omnigent.host.workspace_pull_requests import (
     PULL_REQUEST_OPS,
     PullRequestCall,
+    PullRequestRefused,
     run_pull_request_op,
 )
 from omnigent.host.workspace_search import search_files, search_text
@@ -560,7 +561,9 @@ async def serve_tunnel_call(
     carries the error, if any.
     """
     pull_request_call = (
-        PullRequestCall(session_id=frame.session_id, vouch=frame.vouch)
+        PullRequestCall(
+            session_id=frame.session_id, vouch=frame.vouch, account_rights=frame.account_rights
+        )
         if frame.session_id
         else None
     )
@@ -573,7 +576,11 @@ async def serve_tunnel_call(
             yield HostWorkspaceReplyFrame(request_id, message=response.SerializeToString())
     except ConnectError as exc:
         yield HostWorkspaceReplyFrame(
-            request_id, done=True, error_code=exc.code.value, error_message=exc.message
+            request_id,
+            done=True,
+            error_code=exc.code.value,
+            error_message=exc.message,
+            error_reason=exc.reason if isinstance(exc, PullRequestRefused) else None,
         )
         return
     except Exception:

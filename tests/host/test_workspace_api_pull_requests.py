@@ -30,11 +30,12 @@ from omnigent.host.frames import (
     decode_host_frame,
 )
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
-from omnigent.host.workspace_payloads import payload_dict
+from omnigent.host.workspace_payloads import payload_dict, payload_struct
 from omnigent.runner import pr_resource
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server import workspace_access, workspace_api
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
+from omnigent.server.pull_request_viewers import PullRequestViewer
 from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callable_methods
 from omnigent.stores.session_pull_request_store import SessionPullRequests
 from omnigent.workspace_fs import WorkspaceReader
@@ -483,7 +484,12 @@ class _Tunnel:
         await poll_until_async(lambda: self.host.pending_workspace_calls, timeout_s=5)
 
 
-def _tunnel(tmp_path: Path, *, refuse_send: bool = False) -> _Tunnel:
+def _tunnel(
+    tmp_path: Path,
+    *,
+    refuse_send: bool = False,
+    viewer: PullRequestViewer = PullRequestViewer.VIEWER,
+) -> _Tunnel:
     registry = HostRegistry()
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
     host = registry.register("host_ws", object(), hello, owner=None)  # type: ignore[arg-type]
@@ -501,7 +507,7 @@ def _tunnel(tmp_path: Path, *, refuse_send: bool = False) -> _Tunnel:
         workspace_api.HostTarget(registry, host, str(tmp_path)),
         content_search=False,
         pull_requests=workspace_api.PullRequestRoute(
-            _SESSION, vouch=_no_vouch, overview=_as_reported
+            _SESSION, vouch=_no_vouch, overview=_as_reported, viewer=viewer
         ),
     )
     return _Tunnel(registry, host, service, sent)
@@ -559,7 +565,8 @@ async def test_an_unavailable_answer_after_the_frame_leaves_the_change_unconfirm
     assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _CHANGE_UNCONFIRMED)
 
 
-_WRITES = sorted(_PULL_REQUEST_WRITES)
+# The pull request changes; the review changes have their own cases below.
+_WRITES = sorted(_PULL_REQUEST_WRITES - set(host_tests._REVIEW_CALLS))
 
 
 async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str) -> ConnectError:
@@ -833,3 +840,357 @@ async def test_a_new_hosts_owner_methods_are_offered_to_the_owner_alone(
     owner_only = _PULL_REQUEST_OWNER_METHODS | {"GetPullRequest"}
     assert listed >= _PULL_REQUEST_READS - owner_only
     assert (listed & owner_only) == (owner_only if session_owner else set())
+
+
+def _failure_reasons(error: ConnectError) -> list[str]:
+    """The PullRequestFailure reasons an error carries, as a client reads them."""
+    return [
+        pb.PullRequestFailure.FromString(detail.message_bytes).reason
+        for detail in error.details
+        if detail.type_name == pb.PullRequestFailure.DESCRIPTOR.full_name
+    ]
+
+
+@pytest.fixture
+def review_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str, dict[str, Any]]]:
+    """Each GitHub review call a review method made on the host."""
+    return host_tests.record_review_calls(monkeypatch)
+
+
+@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
+async def test_a_review_change_to_a_linked_pr_runs_on_the_servers_word(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    request, function, _kwargs = host_tests._REVIEW_CALLS[method]
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    response = await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [(call.session_id, call.vouch) for call in host_calls] == [
+        (_SESSION, PullRequestVouch(server_tracked=True)),
+    ]
+    assert [(call[0], call[2]) for call in review_calls] == [(function, _PR)]
+
+
+@pytest.mark.parametrize("method", sorted(host_tests._REVIEW_CALLS))
+async def test_a_review_change_to_an_unlinked_pr_is_refused_before_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    review_calls: list[tuple[str, str, str, dict[str, Any]]],
+    method: str,
+) -> None:
+    request, _function, _kwargs = host_tests._REVIEW_CALLS[method]
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_OTHER_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await getattr(client, WORKSPACE_METHODS[method].python_name)(request)
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert host_calls == []
+    assert review_calls == []
+
+
+async def test_a_malformed_review_change_is_refused_before_the_vouch_as_invalid_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+
+    with pytest.raises(ConnectError) as refused:
+        await client.add_reaction(
+            pb.AddReactionRequest(pr_url=_PR, kind="issue", comment_id=5, content="MEH")
+        )
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+    assert _failure_reasons(refused.value) == ["invalid_input"]
+    assert store.reads == 0
+    assert host_calls == []
+
+
+async def test_a_hosts_refusal_reason_reaches_the_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    from omnigent.runner import github_reviews
+    from omnigent.runner.pull_request_errors import CommentChangedError
+
+    def changed(_root: str, _reference: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise CommentChangedError()
+
+    monkeypatch.setattr(github_reviews, "edit_comment", changed)
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.edit_comment(host_tests._REVIEW_CALLS["EditComment"][0])
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert _failure_reasons(refused.value) == ["comment_changed"]
+
+
+@pytest.mark.parametrize(
+    ("reason", "attached"),
+    [
+        ("comment_changed", ["comment_changed"]),
+        ("pull_request_changed", ["pull_request_changed"]),
+        ("invalid_input", ["invalid_input"]),
+        ("read_only_code_host", []),
+        ("<b>Click here</b>", []),
+        ("", []),
+        (None, []),
+    ],
+    ids=["comment", "head", "input", "other-known", "arbitrary", "empty", "none"],
+)
+async def test_only_an_allowed_reason_from_the_host_is_attached(
+    tmp_path: Path, reason: str | None, attached: list[str]
+) -> None:
+    """A host can't push its own text into the structured field a client acts on."""
+    tunnel = _tunnel(tmp_path)
+    request = host_tests._REVIEW_CALLS["EditComment"][0]
+    call = asyncio.create_task(tunnel.call("EditComment", request))
+    await tunnel.frame_sent()
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id,
+            done=True,
+            error_code="failed_precondition",
+            error_message="Refused",
+            error_reason=reason,
+        ),
+    )
+
+    with pytest.raises(ConnectError) as refused:
+        await call
+
+    assert refused.value.code == Code.FAILED_PRECONDITION
+    assert _failure_reasons(refused.value) == attached
+    assert len(refused.value.details) == len(attached)
+
+
+def test_a_pull_request_failure_carries_only_its_reason() -> None:
+    assert [field.name for field in pb.PullRequestFailure.DESCRIPTOR.fields] == ["reason"]
+    assert {
+        "comment_changed",
+        "pull_request_changed",
+        "invalid_input",
+    } == workspace_api.PULL_REQUEST_FAILURE_REASONS
+
+
+_REVIEW_UNCONFIRMED = "Could not confirm the review change. Check GitHub before retrying."
+_REVIEW_WRITES = sorted(set(host_tests._REVIEW_CALLS) - {"GetPendingReview"})
+
+
+@pytest.mark.parametrize("method", _REVIEW_WRITES)
+async def test_a_review_change_whose_host_drops_after_the_frame_is_unconfirmed(
+    tmp_path: Path, method: str
+) -> None:
+    tunnel = _tunnel(tmp_path)
+    request = host_tests._REVIEW_CALLS[method][0]
+    call = asyncio.create_task(tunnel.call(method, request))
+    await tunnel.frame_sent()
+    tunnel.registry.deregister("host_ws", conn=tunnel.host)
+
+    with pytest.raises(ConnectError) as lost:
+        await call
+
+    assert (lost.value.code, lost.value.message) == (Code.UNKNOWN, _REVIEW_UNCONFIRMED)
+
+
+@pytest.mark.parametrize("method", _REVIEW_WRITES)
+async def test_a_host_failure_after_a_review_change_was_sent_is_unconfirmed(
+    tmp_path: Path, method: str
+) -> None:
+    """A host error shaping GitHub's answer may follow a change GitHub made."""
+    tunnel = _tunnel(tmp_path)
+    error = await _end_after_frame(tunnel, method, host_tests._REVIEW_CALLS[method][0], "internal")
+
+    assert (error.code, error.message) == (Code.UNKNOWN, _REVIEW_UNCONFIRMED)
+
+
+async def test_a_host_failure_on_the_pending_review_read_stays_internal(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path)
+    error = await _end_after_frame(
+        tunnel, "GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0], "internal"
+    )
+
+    assert (error.code, error.message) == (Code.INTERNAL, "Workspace call failed")
+
+
+async def test_a_review_change_whose_answer_times_out_is_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_api, "_WRITE_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+
+    with pytest.raises(ConnectError) as lost:
+        await tunnel.call(
+            "SubmitPendingReview", host_tests._REVIEW_CALLS["SubmitPendingReview"][0]
+        )
+
+    assert (lost.value.code, lost.value.message) == (Code.DEADLINE_EXCEEDED, _REVIEW_UNCONFIRMED)
+
+
+async def test_the_pending_review_read_cut_off_by_the_host_stays_safe_to_retry(
+    tmp_path: Path,
+) -> None:
+    tunnel = _tunnel(tmp_path)
+    call = asyncio.create_task(
+        tunnel.call("GetPendingReview", host_tests._REVIEW_CALLS["GetPendingReview"][0])
+    )
+    await tunnel.frame_sent()
+    tunnel.registry.deregister("host_ws", conn=tunnel.host)
+
+    with pytest.raises(ConnectError) as cut_off:
+        await call
+
+    assert cut_off.value.code == Code.UNAVAILABLE
+
+
+_HOST_THREADS = {
+    "data": [
+        {
+            "id": "PRRT_1",
+            "can_reply": True,
+            "comments": {"data": [{"id": "PRRC_1", "database_id": 2**53 - 1, "can_update": True}]},
+        }
+    ]
+}
+
+
+async def _threads_through(tmp_path: Path, viewer: PullRequestViewer) -> dict[str, Any]:
+    tunnel = _tunnel(tmp_path, viewer=viewer)
+    call = asyncio.create_task(
+        tunnel.call("ListReviewThreads", pb.ListReviewThreadsRequest(pr_url=_PR))
+    )
+    await tunnel.frame_sent()
+    answer = pb.ListReviewThreadsResponse(payload=payload_struct(_HOST_THREADS))
+    deliver_workspace_reply(
+        tunnel.host,
+        HostWorkspaceReplyFrame(
+            request_id=tunnel.sent[0].request_id,
+            message=answer.SerializeToString(),
+            done=True,
+        ),
+    )
+    return payload_dict((await call).payload)
+
+
+async def test_the_owner_reads_threads_with_the_host_accounts_rights(tmp_path: Path) -> None:
+    """The largest comment number the host sends survives the payload's doubles exactly."""
+    threads = await _threads_through(tmp_path, PullRequestViewer.OWNER)
+    assert threads == _HOST_THREADS
+    [thread] = threads["data"]
+    number = thread["comments"]["data"][0]["database_id"]
+    assert int(number) == number == 2**53 - 1
+    assert pb.EditCommentRequest(comment_id=int(number)).comment_id == 2**53 - 1
+
+
+async def test_anyone_else_reads_threads_through_the_api_without_the_rights(
+    tmp_path: Path,
+) -> None:
+    [thread] = (await _threads_through(tmp_path, PullRequestViewer.VIEWER))["data"]
+    [comment] = thread["comments"]["data"]
+    assert (thread["id"], thread["can_reply"]) == ("PRRT_1", False)
+    assert (comment["database_id"], comment["can_update"]) == (2**53 - 1, False)
+
+
+@pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
+@pytest.mark.parametrize(
+    ("viewer", "asks"),
+    [
+        (PullRequestViewer.OWNER, True),
+        (PullRequestViewer.EDITOR, False),
+        (PullRequestViewer.VIEWER, False),
+    ],
+)
+async def test_the_frame_asks_for_the_accounts_rights_for_the_owner_alone(
+    tmp_path: Path, method: str, viewer: PullRequestViewer, asks: bool
+) -> None:
+    """The ask is the server's, in the frame; a request message can't carry it."""
+    tunnel = _tunnel(tmp_path, viewer=viewer)
+    request = (
+        pb.ListReviewThreadsRequest(pr_url=_PR)
+        if method == "ListReviewThreads"
+        else pb.ListReviewThreadCommentsRequest(pr_url=_PR, thread_id="PRRT_1", page_token="c")
+    )
+    call = asyncio.create_task(tunnel.call(method, request))
+    await tunnel.frame_sent()
+    call.cancel()
+
+    [frame] = tunnel.sent
+    assert frame.account_rights is asks
+
+
+async def test_no_other_pull_request_call_asks_for_the_accounts_rights(tmp_path: Path) -> None:
+    tunnel = _tunnel(tmp_path, viewer=PullRequestViewer.OWNER)
+    call = asyncio.create_task(tunnel.call("GetPullRequest", pb.GetPullRequestRequest(pr_url=_PR)))
+    await tunnel.frame_sent()
+    call.cancel()
+
+    [frame] = tunnel.sent
+    assert frame.account_rights is False
+
+
+def test_the_route_takes_the_reader_to_be_the_least_trusted_unless_told() -> None:
+    route = workspace_api.PullRequestRoute(_SESSION, vouch=_no_vouch, overview=_as_reported)
+    assert route.viewer is PullRequestViewer.VIEWER
+    assert {"ListReviewThreads", "ListReviewThreadComments"} == workspace_api.VIEWER_SHAPED_METHODS
+
+
+@pytest.mark.parametrize("method", ["ListReviewThreads", "ListReviewThreadComments"])
+async def test_a_failed_owner_lookup_reads_threads_without_the_rights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """As on REST: unsure who's reading, the read still answers, with no one's rights."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    def lookup_fails(*_args: Any, **_kwargs: Any) -> bool:
+        raise RuntimeError("permission store unavailable")
+
+    monkeypatch.setattr(routes_resources, "_is_session_owner", lookup_fails)
+    monkeypatch.setattr(
+        WorkspaceReader, "github_review_threads", lambda _self, *_args, **_kwargs: _HOST_THREADS
+    )
+    comments = _HOST_THREADS["data"][0]["comments"]
+    monkeypatch.setattr(
+        WorkspaceReader, "github_review_thread_comments", lambda _self, *_args, **_kwargs: comments
+    )
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    if method == "ListReviewThreads":
+        response = await client.list_review_threads(pb.ListReviewThreadsRequest(pr_url=_PR))
+        [thread] = payload_dict(response.payload)["data"]
+        assert thread["can_reply"] is False
+        [comment] = thread["comments"]["data"]
+    else:
+        response = await client.list_review_thread_comments(
+            pb.ListReviewThreadCommentsRequest(pr_url=_PR, thread_id="PRRT_1")
+        )
+        [comment] = payload_dict(response.payload)["data"]
+    assert comment["can_update"] is False
+
+
+@pytest.mark.parametrize("owner", [True, False], ids=["owner", "non-owner"])
+async def test_the_routes_owner_lookup_decides_who_sees_the_thread_rights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owner: bool,
+) -> None:
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(routes_resources, "_is_session_owner", lambda *_a, **_k: owner)
+    monkeypatch.setattr(
+        WorkspaceReader, "github_review_threads", lambda _self, *_args, **_kwargs: _HOST_THREADS
+    )
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    response = await client.list_review_threads(pb.ListReviewThreadsRequest(pr_url=_PR))
+
+    [thread] = payload_dict(response.payload)["data"]
+    assert thread["can_reply"] is owner
+    assert thread["comments"]["data"][0]["can_update"] is owner

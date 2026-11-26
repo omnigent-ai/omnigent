@@ -1489,3 +1489,9 @@ class ReadPullRequestImageResponse(_message.Message):
     metadata: PullRequestImageMetadata
     data: bytes
     def __init__(self, metadata: _Optional[_Union[PullRequestImageMetadata, _Mapping]] = ..., data: _Optional[bytes] = ...) -> None: ...
+
+class PullRequestFailure(_message.Message):
+    __slots__ = ("reason",)
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    reason: str
+    def __init__(self, reason: _Optional[str] = ...) -> None: ...
