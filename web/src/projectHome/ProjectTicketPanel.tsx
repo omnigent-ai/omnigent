@@ -131,6 +131,7 @@ interface TicketExpansionProps {
 
 function Panel({
   title,
+  heading,
   onClose,
   children,
   footer,
@@ -139,6 +140,8 @@ function Panel({
   onExpandedChange,
 }: {
   title: string;
+  /** Quiet bar text in place of *title*, when the body already shows the title. */
+  heading?: string;
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
@@ -152,9 +155,18 @@ function Panel({
       className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-[16px] border bg-background"
     >
       <header className="flex h-11 shrink-0 items-center gap-2 border-b border-border/60 pr-1.5 pl-4">
-        <h2 title={title} className="min-w-0 flex-1 truncate text-ui font-medium">
-          {title}
-        </h2>
+        {heading ? (
+          <>
+            <h2 className="sr-only">{title}</h2>
+            <p aria-hidden className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+              {heading}
+            </p>
+          </>
+        ) : (
+          <h2 title={title} className="min-w-0 flex-1 truncate text-ui font-medium">
+            {title}
+          </h2>
+        )}
         {actions}
         {onExpandedChange && (
           <Tooltip>
@@ -525,6 +537,7 @@ function TicketDetails({
       >
         <Panel
           title={ticket.title}
+          heading={`Ticket · ${stages.find((stage) => stage.id === ticket.stage_id)?.name ?? ticket.stage_id}`}
           actions={<TicketCopyLinkButton projectName={projectName} ticketId={ticketId} />}
           onClose={onClose}
           expanded={expanded}
@@ -605,7 +618,10 @@ function TicketDetails({
                 })
               }
             />
-            <div className="flex flex-wrap items-center gap-2">
+            <div
+              data-testid="ticket-panel-meta"
+              className="flex flex-wrap items-center gap-x-2 gap-y-1.5"
+            >
               <Select
                 value={ticket.stage_id}
                 disabled={update.isPending || configuration.isPending || configuration.isError}
@@ -619,7 +635,7 @@ function TicketDetails({
                 <SelectTrigger
                   size="sm"
                   aria-label="Ticket stage"
-                  className="shrink-0 border-border/60 bg-muted/30"
+                  className="h-7 shrink-0 border-border/60 bg-muted/30"
                 >
                   <SelectValue placeholder={ticket.stage_id} />
                 </SelectTrigger>
@@ -648,6 +664,15 @@ function TicketDetails({
                 </Button>
               )}
               <TicketCostBadge projectId={projectId} ticketId={ticketId} />
+              <TicketAssigneePicker
+                projectId={projectId}
+                value={ticketAssignee(ticket.labels)}
+                disabled={update.isPending}
+                onChange={(name) => {
+                  update.reset();
+                  update.mutate({ id: ticketId, changes: assigneeChanges(name) });
+                }}
+              />
               {ticket.labels.length > 0 && (
                 <TicketLabels labels={ticket.labels} waitingOn={ticket.waiting_on} />
               )}
@@ -685,22 +710,15 @@ function TicketDetails({
                 }
               />
             )}
-            {ticket.requested_by && (
-              <p className="text-sm text-muted-foreground" data-testid="ticket-panel-requester">
-                Requested by{" "}
-                <RequesterName requestedBy={ticket.requested_by} viewer={getCurrentUserId()} />
-              </p>
-            )}
-            <TicketAssigneePicker
-              projectId={projectId}
-              value={ticketAssignee(ticket.labels)}
-              disabled={update.isPending}
-              onChange={(name) => {
-                update.reset();
-                update.mutate({ id: ticketId, changes: assigneeChanges(name) });
-              }}
-            />
-            <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
+            <div className="space-y-1">
+              <TicketAgents projectId={projectId} projectName={projectName} ticket={ticket} />
+              {ticket.requested_by && (
+                <p className="text-xs text-muted-foreground" data-testid="ticket-panel-requester">
+                  Requested by{" "}
+                  <RequesterName requestedBy={ticket.requested_by} viewer={getCurrentUserId()} />
+                </p>
+              )}
+            </div>
             <section aria-label="Description" className="space-y-2">
               <div className="flex items-center gap-2">
                 <h3 className="flex-1 text-[length:calc(var(--text-ui)+2px)] font-bold">
@@ -1643,12 +1661,17 @@ function TicketActivityItem({
   );
   const stage = ticketEventStage(event);
   const age = relativeTime(event.created_at * 1000, nowMs);
+  // Routine changes such as stage moves read as a quiet line under the conversation.
+  const quiet = !note && !body && !outputImage && !involvement && event.kind !== "output";
   return (
     <li
       data-ticket-event-position={event.position}
       data-ask-highlight={highlighted || undefined}
+      data-quiet={quiet || undefined}
       className={cn(
-        "relative flex min-w-0 gap-3 pb-4 last:pb-0 before:absolute before:top-6 before:bottom-0 before:left-3 before:w-px before:bg-border/60 last:before:hidden",
+        "relative flex min-w-0 gap-3 last:pb-0",
+        quiet ? "pb-2" : "pb-4",
+        "before:absolute before:top-6 before:bottom-0 before:left-3 before:w-px before:bg-border/60 last:before:hidden",
         highlighted &&
           "-mx-2 rounded-md bg-status-yellow/10 px-2 pt-2 ring-1 ring-status-yellow/40",
       )}
@@ -1657,6 +1680,7 @@ function TicketActivityItem({
         className={cn(
           "relative flex size-6 shrink-0 items-center justify-center bg-background text-muted-foreground",
           note && "rounded-full bg-muted",
+          quiet && "opacity-70 [&_svg]:size-3",
         )}
       >
         {note && event.session_id ? (
@@ -1694,9 +1718,21 @@ function TicketActivityItem({
         )}
       </span>
       <div className="min-w-0 flex-1 space-y-2">
-        <div className="flex items-start gap-3 text-sm leading-6 text-muted-foreground">
+        <div
+          className={cn(
+            "flex items-start gap-3 leading-6 text-muted-foreground",
+            quiet ? "text-xs" : "text-sm",
+          )}
+        >
           <div className="min-w-0 flex-1 wrap-anywhere">
-            <span className={note ? "font-medium" : undefined}>{actor}</span>
+            <span
+              className={cn(
+                note && "font-medium",
+                quiet && "[&_.text-foreground]:text-muted-foreground",
+              )}
+            >
+              {actor}
+            </span>
             {note ? (
               event.payload.final === true ? (
                 <span className="ml-2">Final update</span>
@@ -1711,7 +1747,7 @@ function TicketActivityItem({
             )}
           </div>
           <time
-            className="shrink-0 text-sm leading-6 tabular-nums"
+            className={cn("shrink-0 leading-6 tabular-nums", quiet ? "text-xs" : "text-sm")}
             dateTime={new Date(event.created_at * 1000).toISOString()}
             title={absoluteTime(event.created_at * 1000)}
           >

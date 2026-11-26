@@ -36,9 +36,12 @@ export function TicketSessionLink({
   involvement,
   label,
   icon,
+  compact = false,
 }: {
   sessionId: string;
   showStatus?: boolean;
+  /** With `showStatus`, one line: icon, name, role, status and the chat action. */
+  compact?: boolean;
   showAgentName?: boolean;
   needsResponse?: boolean;
   involvement?: string;
@@ -81,9 +84,11 @@ export function TicketSessionLink({
     <Link
       className={cn(
         "rounded-sm text-foreground underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        showStatus
-          ? "flex min-w-0 flex-1 items-start gap-3 rounded-lg p-3 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
-          : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
+        showStatus && compact
+          ? "flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
+          : showStatus
+            ? "flex min-w-0 flex-1 items-start gap-3 rounded-lg p-3 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
+            : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
         showStatus && respond && "bg-tag-pink hover:bg-tag-pink",
       )}
       title={`${sessionTitle} (${sessionId})`}
@@ -93,37 +98,71 @@ export function TicketSessionLink({
       {showStatus &&
         (icon ??
           (agent ? (
-            <ComposerAgentIcon agent={agent} className="mt-0.5 text-muted-foreground" />
+            <ComposerAgentIcon
+              agent={agent}
+              className={cn("text-muted-foreground", !compact && "mt-0.5")}
+            />
           ) : (
-            <BotIcon aria-hidden className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+            <BotIcon
+              aria-hidden
+              className={cn("size-4 shrink-0 text-muted-foreground", !compact && "mt-0.5")}
+            />
           )))}
-      <span className={showStatus ? "min-w-0 flex-1 space-y-1 text-sm" : undefined}>
-        <span className={showStatus ? "block font-medium wrap-anywhere" : undefined}>{title}</span>
-        {showStatus && (
-          <span className="block text-muted-foreground wrap-anywhere">
+      {showStatus && compact ? (
+        <span className="flex min-w-0 flex-1 items-center gap-2 text-sm">
+          <span className="shrink-0 font-medium">{title}</span>
+          <span className="min-w-0 flex-1 truncate text-muted-foreground">
             {involvement || "Linked to this ticket"}
           </span>
-        )}
-        {showStatus && (
-          <span className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1">
-            {!awaiting && (
-              <span className="flex items-center gap-1.5 text-muted-foreground">
-                {!unavailable && !session?.archived && state && <SessionStateBadge state={state} />}
-                <span>{status}</span>
-              </span>
-            )}
-            <span
-              className={cn(
-                "inline-flex items-center gap-1 font-medium",
-                respond && "text-brand-accent",
-              )}
-            >
-              {respond ? "Respond" : "Open chat"}
-              <ChevronRightIcon aria-hidden className="size-3.5" />
+          {!awaiting && (
+            <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+              {!unavailable && !session?.archived && state && <SessionStateBadge state={state} />}
+              <span>{status}</span>
             </span>
+          )}
+          <span
+            className={cn(
+              "inline-flex shrink-0 items-center gap-0.5 text-xs font-medium",
+              respond ? "text-brand-accent" : "text-muted-foreground",
+            )}
+          >
+            {respond ? "Respond" : "Open chat"}
+            <ChevronRightIcon aria-hidden className="size-3.5" />
           </span>
-        )}
-      </span>
+        </span>
+      ) : (
+        <span className={showStatus ? "min-w-0 flex-1 space-y-1 text-sm" : undefined}>
+          <span className={showStatus ? "block font-medium wrap-anywhere" : undefined}>
+            {title}
+          </span>
+          {showStatus && (
+            <span className="block text-muted-foreground wrap-anywhere">
+              {involvement || "Linked to this ticket"}
+            </span>
+          )}
+          {showStatus && (
+            <span className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1">
+              {!awaiting && (
+                <span className="flex items-center gap-1.5 text-muted-foreground">
+                  {!unavailable && !session?.archived && state && (
+                    <SessionStateBadge state={state} />
+                  )}
+                  <span>{status}</span>
+                </span>
+              )}
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1 font-medium",
+                  respond && "text-brand-accent",
+                )}
+              >
+                {respond ? "Respond" : "Open chat"}
+                <ChevronRightIcon aria-hidden className="size-3.5" />
+              </span>
+            </span>
+          )}
+        </span>
+      )}
     </Link>
   );
 }

@@ -63,20 +63,15 @@ export function TicketAgents({
     ]),
   });
   return (
-    <section aria-label="Team members and sessions" className="space-y-2">
-      <h3 className="text-[length:calc(var(--text-ui)+2px)] font-bold">
-        Team members and sessions
-      </h3>
+    <section aria-label="Team members and sessions" className="-mx-2 space-y-1">
       <TicketError error={project.error ?? query.error} />
-      <ul
-        aria-label="Involved team members and sessions"
-        className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60"
-      >
+      <ul aria-label="Involved team members and sessions" className="flex flex-col">
         <li>
           {orchestratorId ? (
             <TicketSessionLink
               sessionId={orchestratorId}
               showStatus
+              compact
               needsResponse={responseSession === orchestratorId}
               involvement={orchestrator?.involvement || "Coordinates work and handles questions"}
               label={leadName}
@@ -86,18 +81,16 @@ export function TicketAgents({
             <Link
               to={projectOrchestratorPath(projectName)}
               aria-label="Open the Lead"
-              className="flex items-center gap-3 rounded-sm p-3 text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+              className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
             >
               <MessageSquareIcon aria-hidden className="size-4 text-muted-foreground" />
-              <span className="min-w-0 flex-1">
-                <span className="block font-medium">Lead</span>
-                <span className="block text-muted-foreground">
-                  Coordinates work and handles questions
-                </span>
-                <span className="mt-2 flex items-center gap-1 font-medium">
-                  Open chat
-                  <ChevronRightIcon aria-hidden className="size-3.5" />
-                </span>
+              <span className="shrink-0 font-medium">Lead</span>
+              <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                Coordinates work and handles questions
+              </span>
+              <span className="inline-flex shrink-0 items-center gap-0.5 text-xs font-medium text-muted-foreground">
+                Open chat
+                <ChevronRightIcon aria-hidden className="size-3.5" />
               </span>
             </Link>
           )}
@@ -109,6 +102,7 @@ export function TicketAgents({
               <TicketSessionLink
                 sessionId={session.session_id}
                 showStatus
+                compact
                 needsResponse={responseSession === session.session_id}
                 involvement={session.involvement}
                 label={personaNames.get(session.session_id)}
@@ -121,6 +115,7 @@ export function TicketAgents({
             <TicketSessionLink
               sessionId={agent.sessionId}
               showStatus
+              compact
               needsResponse={responseSession === agent.sessionId}
               involvement={agent.involvement}
               label={agent.name}
@@ -146,5 +141,5 @@ export function TicketAgents({
 
 /** A persona's avatar for its Agents row; ordinary sessions keep their agent icon. */
 function personaIcon(name: string | undefined) {
-  return name ? <PersonaAvatar name={name} size="md" className="mt-0.5" /> : undefined;
+  return name ? <PersonaAvatar name={name} size="sm" /> : undefined;
 }
