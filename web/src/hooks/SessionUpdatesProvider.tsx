@@ -640,10 +640,16 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           for (const item of frame.items) {
             if (!item.parent_session_id) continue;
             const fingerprint = JSON.stringify(item);
-            if (childRowFingerprintsRef.current.get(item.id) === fingerprint) continue;
             const parentList = queryClient
               .getQueryCache()
               .find({ queryKey: childSessionsQueryKey(item.parent_session_id), exact: true });
+            // A list whose refetch failed keeps retrying on later frames.
+            if (
+              childRowFingerprintsRef.current.get(item.id) === fingerprint &&
+              parentList?.state.status !== "error"
+            ) {
+              continue;
+            }
             // An unmounted list only goes stale, so leave the row unrecorded
             // and invalidate it again on the next frame.
             if (parentList?.isActive()) childRowFingerprintsRef.current.set(item.id, fingerprint);
