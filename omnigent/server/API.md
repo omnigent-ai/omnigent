@@ -1675,7 +1675,14 @@ against the snapshot to reconcile accepted inputs.
 Native shell-mode inputs (`!cmd`) settle when the matching `terminal_command`
 input is persisted. Its output does not acknowledge an input, and no
 `session.input.consumed` event is emitted for the shell command. Clients should
-remove only the sent bubble matching that command. During a mixed-version
+remove only the submission named by the input's server-owned `submission`:
+`{"pending_id": "...", "stable_id": "..."}`. `pending_id` names the queued entry;
+`stable_id`, when supplied by the sender, also correlates an optimistic bubble
+before the POST response arrives. This identity is persisted with the item and
+included in live events and history, so reconnect can acknowledge a missed input.
+An empty `submission: {}` explicitly means no web entry was consumed. Missing
+`submission` means a legacy record; clients must not infer history acknowledgements
+from command text. Output items carry no submission identity. During a mixed-version
 rollout, an older client can retain that bubble until refreshing its snapshot;
 an older server can still report the command as `native_prompt_not_recorded`.
 Updated clients preserve later bubbles when that older server's receipt arrives.

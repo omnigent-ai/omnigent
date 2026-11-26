@@ -3882,6 +3882,9 @@ def _parse_external_conversation_item(
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
+    if item_type == "terminal_command":
+        # Only the pending-input drain can establish submission ownership.
+        item_data = {key: value for key, value in item_data.items() if key != "submission"}
     try:
         data = parse_item_data(item_type, {"type": item_type, **item_data})
     except (ValueError, TypeError) as exc:

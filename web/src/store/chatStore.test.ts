@@ -1378,6 +1378,30 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
+  it("settles a shell in a stale pending snapshot by its persisted identity", async () => {
+    const id = "conv_shell_bind";
+    seedSession(id, [
+      {
+        id: "shell",
+        response_id: "resp_shell",
+        status: "completed",
+        type: "terminal_command",
+        kind: "input",
+        input: "ls",
+        submission: { pending_id: "pending_shell" },
+      },
+    ]);
+    const content = [{ type: "input_text", text: "!ls" }];
+    sessionPendingInputs.set(id, [
+      { pending_id: "pending_shell", content },
+      { pending_id: "pending_later", content },
+    ]);
+    await useChatStore.getState().switchTo(id);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pending_later",
+    ]);
+  });
+
   it("paints a backgrounded conversation instantly from its live entry, no rebind", async () => {
     // The feature: switching away no longer tears the stream down, so switching
     // back paints from the retained entry without a hydrating placeholder or a
@@ -3279,6 +3303,54 @@ describe("chatStore — send (first-send ordering)", () => {
     }));
     expect(calls).toEqual([{ url: "/v1/sessions/conv_existing/events", method: "POST" }]);
   });
+
+  it.each([false, true])(
+    "settles a shell before its POST answers (response lost: %s)",
+    async (lost) => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      let finishPost!: (value: Response) => void;
+      let failPost!: (reason: Error) => void;
+      const pending = new Promise<Response>((resolve, reject) => {
+        finishPost = resolve;
+        failPost = reject;
+      });
+      let postedStableId: string | undefined;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          postedStableId = JSON.parse(init.body as string).data.stable_id;
+          return pending;
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("!ls", "agent_xyz");
+      await vi.waitFor(() => expect(postedStableId).toBeDefined());
+      expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({
+        stableId: postedStableId,
+      });
+      handleSessionEvent({
+        type: "terminal_command",
+        itemId: "shell",
+        responseId: "resp_shell",
+        kind: "input",
+        input: "ls",
+        stdout: null,
+        stderr: null,
+        submission: { pendingId: "pending_shell", stableId: postedStableId },
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      if (lost) failPost(new TypeError("Failed to fetch"));
+      else finishPost(mockResponse({ queued: true, pending_id: "pending_shell" }, { status: 202 }));
+      await sending;
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().failedSendDraft).toBeNull();
+    },
+  );
 
   it("invalidates conversations after every postEvent (existing-session sidebar reorder)", async () => {
     // Without this, the sender's chat lags 0-4 s behind their own message.
@@ -12059,6 +12131,49 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       pendingId: `pending_${n}`,
     });
 
+    it.each([
+      { submission: { pendingId: "pending_2" }, stableId: undefined },
+      { submission: { pendingId: "pending_2", stableId: "submit_2" }, stableId: "submit_2" },
+    ])(
+      "settles the named submission among identical commands: $submission",
+      ({ submission, stableId }) => {
+        const first = sent(1, "!ls");
+        const second = {
+          ...sent(2, "!ls"),
+          pendingId: stableId ? undefined : "pending_2",
+          stableId,
+        };
+        useChatStore.setState({ pendingUserMessages: [first, second] });
+        const event = { ...shellEvent("input"), submission };
+        handleSessionEvent(event);
+        handleSessionEvent(event);
+        expect(useChatStore.getState().pendingUserMessages).toEqual([first]);
+        handleSessionEvent(receipt("legacy_second", "!ls", "pending_2"));
+        expect(useChatStore.getState().pendingUserMessages).toEqual([first]);
+      },
+    );
+
+    it.each([{}, { pendingId: "another_client" }])(
+      "does not guess from text when submission is %j",
+      (submission) => {
+        const pending = [sent(1, "!ls")];
+        useChatStore.setState({ pendingUserMessages: pending });
+        handleSessionEvent({ ...shellEvent("input"), submission });
+        expect(useChatStore.getState().pendingUserMessages).toEqual(pending);
+      },
+    );
+
+    it("does not give a later same-text receipt credit for a modern shell", () => {
+      useChatStore.setState({ pendingUserMessages: [sent(1, "!ls")] });
+      handleSessionEvent({ ...shellEvent("input"), submission: { pendingId: "pending_1" } });
+      useChatStore.setState({
+        pendingUserMessages: [sent(2, "!ls"), sent(3, "thanks"), sent(4, "more")],
+      });
+      handleSessionEvent(receipt("skipped_second", "!ls", "pending_2"));
+      handleSessionEvent(receipt("thanks", "thanks", "pending_3"));
+      expect(useChatStore.getState().pendingUserMessages).toEqual([sent(4, "more")]);
+    });
+
     it("pops the queued bubble whose command was mirrored", () => {
       // A `!cmd` runs as a shell command, so no `session.input.consumed`
       // follows. The server settles the entry whose text is that command; the
@@ -19162,6 +19277,84 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([
+    {
+      path: "ordinary backfill",
+      gapLength: 5,
+      submission: { pending_id: "pending_shell", stable_id: "a".repeat(32) },
+      clears: true,
+    },
+    {
+      path: "the fresh-window fallback",
+      gapLength: 100,
+      submission: { pending_id: "pending_shell" },
+      clears: true,
+    },
+    { path: "legacy history", gapLength: 5, submission: undefined, clears: false },
+    { path: "direct terminal history", gapLength: 100, submission: {}, clears: false },
+  ])(
+    "recovers a shell submission by identity through $path",
+    async ({ gapLength, submission, clears }) => {
+      const id = `conv_shell_identity_${gapLength}`;
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const queued = (tempId: string) => ({
+        tempId,
+        content: [{ type: "input_text" as const, text: "!ls" }],
+      });
+      const later = queued("pending_later");
+      const pending = [queued("pending_shell"), later];
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        blocks: itemsToBlocks(windowItems),
+        pendingUserMessages: pending,
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      const shell: ConversationItem = {
+        id: "shell_gap",
+        response_id: "resp_shell",
+        status: "completed",
+        type: "terminal_command",
+        kind: "input",
+        input: "ls",
+        submission,
+      };
+      const gap = Array.from({ length: gapLength - 1 }, (_, i) => ({
+        ...gapUser("gap", i),
+        role: "assistant" as const,
+      }));
+      seedSessionItems(id, [...preGap, ...gap, shell]);
+      sinks[0]!.error();
+      await drainAsync();
+      const expected = clears ? [later] : pending;
+      expect(useChatStore.getState().pendingUserMessages).toEqual(expected);
+      expect(useChatStore.getState().blocks.filter((b) => b.ctx.itemId === shell.id)).toHaveLength(
+        1,
+      );
+      if (clears)
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "legacy_shell",
+          itemType: "message",
+          clearedPendingId: "pending_shell",
+          data: { role: "user", content: [{ type: "input_text", text: "!ls" }] },
+        });
+      expect(useChatStore.getState().pendingUserMessages).toEqual(expected);
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it.each([
     { path: "ordinary backfill", gapLength: 5 },

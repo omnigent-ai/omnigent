@@ -5397,7 +5397,17 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
         },
     ]
 
+    from omnigent.runtime import pending_inputs
+
+    pending_id = None
     for event_data in events:
+        if (
+            event_data["item_type"] == "terminal_command"
+            and event_data["item_data"]["kind"] == "input"
+        ):
+            pending_id = pending_inputs.record(
+                session["id"], [{"type": "input_text", "text": "!pwd"}], stable_id="a" * 32
+            )
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
             json={"type": "external_conversation_item", "data": event_data},
@@ -5426,13 +5436,24 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
         "input": "pwd",
         "stdout": None,
         "stderr": None,
+        "submission": {"pending_id": pending_id, "stable_id": "a" * 32},
     }
     assert body["items"][5]["data"] == {
         "kind": "output",
         "input": None,
         "stdout": "/tmp/project",
         "stderr": "",
+        "submission": None,
     }
+    assert pending_inputs.snapshot_for(session["id"]) == []
+    history = await client.get(f"/v1/sessions/{session['id']}/items")
+    assert history.status_code == 200
+    terminal_input = next(
+        item
+        for item in history.json()["data"]
+        if item["type"] == "terminal_command" and item["kind"] == "input"
+    )
+    assert terminal_input["submission"] == {"pending_id": pending_id, "stable_id": "a" * 32}
 
     assert [event["type"] for _, event in published] == [
         "session.input.consumed",
@@ -5447,6 +5468,7 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[2][1]["item"]["type"] == "function_call_output"
     assert published[3][1]["item"]["type"] == "message"
     assert published[3][1]["message_id"] == "codex:thread_1:turn_1:agentMessage:item_1"
+    assert published[4][1]["item"]["submission"] == terminal_input["submission"]
     assert published[4][1]["item"]["type"] == "terminal_command"
     assert published[5][1]["item"]["type"] == "terminal_command"
 
