@@ -2540,6 +2540,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     hold = {"expired": 1.0, "host_flaps_expired": 1.5}.get(scenario, 30.0)
     finite_hold = scenario in {"expired", "host_flaps_expired"}
     monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(sessions_module, "HOST_BACK_WITHOUT_RUNNER_S", grace)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_HOLD_S", hold)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 0.05)
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
@@ -3006,6 +3007,110 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             forwarder_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await forwarder_task
+        if reconnect is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect.wait(timeout=budget(2.0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("runner_survived", [False, True], ids=["restarted", "kept_runner"])
+async def test_host_reconnect_ends_offline_hold_by_its_runner_list(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_survived: bool,
+) -> None:
+    """A host reconnecting here wakes the offline hold instead of waiting for a re-check.
+
+    A restarted host's hello no longer lists the held runner, so the turn settles
+    after the short grace and its runner is relaunched. A host that kept the
+    runner gives it the full grace to reconnect.
+    """
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from tests._helpers.polling import poll_until_async
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    grace = 2.0
+    monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(sessions_module, "HOST_BACK_WITHOUT_RUNNER_S", 0.05)
+    # Longer than the test, so only the host's reconnect can end the wait early.
+    monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 3600.0)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    host_checks: list[str] = []
+
+    async def host_row_offline(host_store: object, host_id: str) -> bool:
+        host_checks.append(host_id)
+        return True
+
+    monkeypatch.setattr(sessions_module, "_host_row_offline", host_row_offline)
+    launch = AsyncMock()
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", launch)
+
+    response = await tunnel_three_layer_stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert response.status_code == 201, response.text
+    session_id = response.json()["session_id"]
+    runner_id = "runner-host-reconnects"
+    host_id = "0123456789abcdef0123456789abcdef"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    store.set_host_id(session_id, host_id, workspace="/tmp/host-reconnects")
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    host_conn = None
+    hold_task: asyncio.Task[None] | None = None
+    reconnect: ApplicationCommunicator | None = None
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+        await poll_until_async(lambda: bool(host_checks), timeout_s=budget(grace + 5.0))
+        hold_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+        )
+        host_conn = ap_app.state.host_registry.register(
+            host_id,
+            AsyncMock(),
+            HostHelloFrame(
+                version="0.1.0-test",
+                frame_protocol_version=1,
+                name="returned-host",
+                runners=[runner_id] if runner_survived else [],
+            ),
+            owner=None,
+        )
+        if not runner_survived:
+            await asyncio.wait_for(asyncio.shield(hold_task), timeout=budget(5.0))
+            conv = store.get_conversation(session_id)
+            assert conv is not None
+            error = sessions_module._last_task_error_from_labels(conv.labels)
+            assert error is not None and error["code"] == "runner_interrupted"
+            launch.assert_awaited_once()
+            return
+        # Well past the short grace, the surviving runner can still reconnect.
+        await asyncio.sleep(grace / 8)
+        assert not hold_task.done()
+        reconnect = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+        await asyncio.wait_for(asyncio.shield(hold_task), timeout=budget(5.0))
+        assert sessions_module._session_status_cache[session_id] == "running"
+        launch.assert_not_awaited()
+    finally:
+        if hold_task is not None and not hold_task.done():
+            hold_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hold_task
+        if host_conn is not None:
+            ap_app.state.host_registry.deregister(host_id, conn=host_conn)
         if reconnect is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})

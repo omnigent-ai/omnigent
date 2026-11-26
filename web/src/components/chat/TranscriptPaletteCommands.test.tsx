@@ -213,6 +213,7 @@ describe("TranscriptPaletteCommands in the transcript", () => {
               showsWorking={false}
               agentsError={null}
               sandboxLaunching={false}
+              hostOffline={false}
               spacerMeasureRef={{ current: null }}
             />
           </FlagOn>

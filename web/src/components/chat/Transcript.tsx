@@ -88,6 +88,8 @@ export interface TranscriptProps {
   agentsError: unknown;
   /** True while a managed-sandbox launch is in flight (cold-launch spinner). */
   sandboxLaunching: boolean;
+  /** The session's host is offline, so the Working row says so instead of working. */
+  hostOffline: boolean;
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
 }
@@ -172,6 +174,7 @@ function TranscriptImpl({
   showsWorking,
   agentsError,
   sandboxLaunching,
+  hostOffline,
   spacerMeasureRef,
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
@@ -508,6 +511,7 @@ function TranscriptImpl({
                 <WorkingIndicatorRow
                   key={display.conversationId ?? "landing"}
                   show={showWorkingIndicator}
+                  hostOffline={hostOffline}
                 />
                 {/* Managed-sandbox launch status; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}

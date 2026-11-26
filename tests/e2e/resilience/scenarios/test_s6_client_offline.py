@@ -12,8 +12,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable, Iterator
-from pathlib import Path
+from collections.abc import Callable
 
 import pytest
 
@@ -25,27 +24,10 @@ from tests.e2e.resilience.scenarios import _contract as contract
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
-_WEB_UI = Path(__file__).resolve().parents[4] / "omnigent" / "server" / "static" / "web-ui"
 _COMPOSER = "Send a message…"
 _UI_TIMEOUT_MS = 30_000
 _CONNECTION_HINT = re.compile(r"reconnect|offline|connection|disconnected", re.IGNORECASE)
 _PHASES = [contract.TOOL_ENDS_DURING_OUTAGE, contract.APPROVAL_PENDING]
-
-
-@pytest.fixture
-def browser_page() -> Iterator[object]:
-    if not (_WEB_UI / "index.html").is_file():
-        pytest.skip("web UI is not built; run `pnpm --filter web run build`")
-    with sync_api.sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.launch()
-        except sync_api.Error as exc:
-            pytest.skip(f"Playwright Chromium unavailable: {exc}")
-        page = browser.new_page(viewport={"width": 1280, "height": 900})
-        try:
-            yield page
-        finally:
-            browser.close()
 
 
 def _offline(lab: Lab, mode: str) -> list[Fault]:

@@ -19,6 +19,7 @@ import {
   ArrowUpIcon,
   CheckIcon,
   ChevronRightIcon,
+  CloudOffIcon,
   ChevronUpIcon,
   CopyIcon,
   CornerDownRightIcon,
@@ -664,7 +665,13 @@ export function workingIndicatorLabel(
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
 
-export function WorkingIndicator() {
+/** Shown instead of a working label while the session's host is offline. */
+export const HOST_OFFLINE_WORKING_LABEL = "Host offline. Waiting for it to reconnect…";
+
+/**
+ * @param props.hostOffline - The turn waits on an offline host, so nothing is working.
+ */
+export function WorkingIndicator({ hostOffline = false }: { hostOffline?: boolean }) {
   const scopedConversationId = useContext(ConversationScopeContext);
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
@@ -695,6 +702,28 @@ export function WorkingIndicator() {
     blockedOn,
     scopedConversationId ? scopedState.status === "streaming" : rootLocalSending,
   );
+  if (hostOffline) {
+    return (
+      <>
+        <span role="status" aria-live="polite" className="sr-only">
+          {HOST_OFFLINE_WORKING_LABEL}
+        </span>
+        <Message
+          from="assistant"
+          data-testid="working-indicator"
+          data-host-offline="true"
+          aria-hidden="true"
+        >
+          <MessageContent>
+            <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
+              <CloudOffIcon aria-hidden strokeWidth={1.5} className="size-3.5 shrink-0" />
+              <span className="text-sm">{HOST_OFFLINE_WORKING_LABEL}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   if (waitsOnBackgroundAgents) {
     // The turn ended and the composer is free, but the session isn't idle:
     // name the agent it still waits on rather than shimmering "Working…".
@@ -775,7 +804,13 @@ const WORKING_ROW_CLOSE: KeyframeAnimationOptions = {
  * The Working row, kept while it eases closed after the turn ends, so a
  * transcript scrolled to its end doesn't drop by the row's height in one frame.
  */
-export function WorkingIndicatorRow({ show }: { show: boolean }) {
+export function WorkingIndicatorRow({
+  show,
+  hostOffline = false,
+}: {
+  show: boolean;
+  hostOffline?: boolean;
+}) {
   const rowRef = useRef<HTMLDivElement>(null);
   const [shown, setShown] = useState(show);
   const [closing, setClosing] = useState(false);
@@ -808,7 +843,7 @@ export function WorkingIndicatorRow({ show }: { show: boolean }) {
   if (!shown && !closing) return null;
   return (
     <div ref={rowRef} aria-hidden={closing || undefined}>
-      <WorkingIndicator />
+      <WorkingIndicator hostOffline={hostOffline} />
     </div>
   );
 }

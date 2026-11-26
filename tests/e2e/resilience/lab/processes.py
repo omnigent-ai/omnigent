@@ -77,11 +77,18 @@ class ManagedProcess:
             )
         self._events.emit("lab", "process_start", process=self.name, pid=self._proc.pid)
 
-    def stop(self, *, graceful: bool = True, timeout: float = 15.0) -> None:
+    def stop(
+        self,
+        *,
+        graceful: bool = True,
+        timeout: float = 15.0,
+        graceful_signal: signal.Signals = signal.SIGTERM,
+    ) -> None:
         """Stop the process group, escalating to SIGKILL after *timeout*.
 
-        :param graceful: Send SIGTERM first; ``False`` sends SIGKILL at once.
-        :param timeout: Seconds to wait after SIGTERM, e.g. ``15.0``.
+        :param graceful: Send *graceful_signal* first; ``False`` sends SIGKILL at once.
+        :param timeout: Seconds to wait after *graceful_signal*, e.g. ``15.0``.
+        :param graceful_signal: First signal, e.g. ``signal.SIGINT`` for Ctrl-C.
         """
         proc = self._proc
         if proc is None or proc.poll() is not None:
@@ -90,7 +97,7 @@ class ManagedProcess:
             "lab", "process_stop", process=self.name, pid=proc.pid, graceful=graceful
         )
         if graceful:
-            self._signal_group(proc.pid, signal.SIGTERM)
+            self._signal_group(proc.pid, graceful_signal)
             try:
                 proc.wait(timeout=timeout)
                 return

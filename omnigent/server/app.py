@@ -4994,7 +4994,8 @@ def create_app(
         A laptop that sleeps or loses Wi-Fi takes its runner along and usually
         resumes the turn when it wakes, so the turn waits for it instead of
         failing. A host that comes back without its runner gets one more grace,
-        then the caller settles the turn before relaunching its runner.
+        shortened when its hello shows the runner is gone, then the caller
+        settles the turn before relaunching its runner.
         A crash report cancels this task and fails the turn as before.
 
         :returns: ``None`` when nothing was held, else its status snapshots and outcome:
@@ -5003,6 +5004,7 @@ def create_app(
         """
         from omnigent.server.routes.sessions import (
             _MID_TURN_STATUSES,
+            HOST_BACK_WITHOUT_RUNNER_S,
             HOST_OFFLINE_HOLD_S,
             HOST_OFFLINE_RECHECK_S,
             RUNNER_DISCONNECT_GRACE_S,
@@ -5067,11 +5069,11 @@ def create_app(
                     break
                 if host_back_deadline is not None:
                     remaining = min(remaining, max(0.0, host_back_deadline - now))
-                if (
-                    await tunnel_registry.wait_for_runner(
-                        runner_id, timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining)
-                    )
-                    is not None
+                if await _wait_for_held_runner(
+                    runner_id,
+                    # Until the host is back, its reconnect here ends the wait early.
+                    host_id if host_back_deadline is None else None,
+                    timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining),
                 ):
                     outcome = "runner_reconnected"
                     break
@@ -5082,7 +5084,14 @@ def create_app(
                 if await _host_offline(host_id) is False:
                     now = loop.time()
                     if host_back_deadline is None:
-                        host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
+                        host_conn = host_registry.get(host_id) if host_id is not None else None
+                        # A host's hello lists its surviving runners; a restart lists none.
+                        grace_s = (
+                            HOST_BACK_WITHOUT_RUNNER_S
+                            if host_conn is not None and runner_id not in host_conn.hello.runners
+                            else RUNNER_DISCONNECT_GRACE_S
+                        )
+                        host_back_deadline = min(deadline, now + grace_s)
                     if now >= host_back_deadline:
                         outcome = "host_back_without_runner"
                         break
@@ -5105,6 +5114,32 @@ def create_app(
                     ),
                 )
         return _HostOfflineHold(outcome, mid_turn_sessions, owners)
+
+    async def _wait_for_held_runner(
+        runner_id: str, host_id: str | None, *, timeout_s: float
+    ) -> bool:
+        """Wait for a held runner to reconnect, ending early when *host_id* registers here.
+
+        :returns: Whether the runner reconnected.
+        """
+        if host_id is None:
+            return (
+                await tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s) is not None
+            )
+        runner_wait = asyncio.ensure_future(
+            tunnel_registry.wait_for_runner(runner_id, timeout_s=timeout_s)
+        )
+        host_wait = asyncio.ensure_future(
+            host_registry.wait_for_host(host_id, timeout_s=timeout_s)
+        )
+        try:
+            await asyncio.wait((runner_wait, host_wait), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            runner_wait.cancel()
+            host_wait.cancel()
+        return (
+            runner_wait.done() and not runner_wait.cancelled() and runner_wait.result() is not None
+        )
 
     async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
         """Whether host recovery owns the lost relay's outcome."""

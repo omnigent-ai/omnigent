@@ -1846,6 +1846,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               showsWorking={showsWorking}
               agentsError={agentsError}
               sandboxLaunching={sandboxLaunching}
+              hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
               spacerMeasureRef={spacerMeasureRef}
             />
           </EditSentMessageContext.Provider>

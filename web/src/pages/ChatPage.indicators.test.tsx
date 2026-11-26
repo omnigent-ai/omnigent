@@ -290,6 +290,26 @@ describe("WorkingIndicator", () => {
     expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
   });
 
+  it("says an offline host holds the turn instead of a working label", () => {
+    useChatStore.setState({
+      backgroundTaskCount: 1,
+      blockedOn: "permission prompt",
+      sessionStatus: "running",
+      status: "idle",
+    });
+    const { rerender } = render(<WorkingIndicator hostOffline />);
+    const row = screen.getByTestId("working-indicator");
+    expect(row).toHaveTextContent("Host offline. Waiting for it to reconnect…");
+    expect(row.querySelector(".otto-working")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Host offline. Waiting for it to reconnect…",
+    );
+
+    rerender(<WorkingIndicator />);
+    expect(screen.getByTestId("working-indicator")).not.toHaveTextContent("Host offline");
+    expect(screen.getByTestId("working-indicator").querySelector(".otto-working")).not.toBeNull();
+  });
+
   describe("parked on a terminal permission prompt", () => {
     const sideChatId = "conv_side_child";
     const terminalFirstSession: TerminalFirstContextValue = {
