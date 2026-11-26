@@ -94,6 +94,7 @@ import {
   isTextBlock,
   keyedAttachments,
   PENDING_FILE_PREFIX,
+  slashCommandEchoItemId,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { isCommandListed } from "@/store/paletteCommands";
@@ -351,41 +352,52 @@ function isStartupFailureBubble(bubble: Bubble): boolean {
   );
 }
 
-/** The committed bubble each transcript item renders in. */
-function bubbleIndexByItemId(committed: Bubble[]): Map<string, number> {
-  const indexes = new Map<string, number>();
-  committed.forEach((bubble, index) => {
-    if (bubble.kind !== "assistant") {
-      indexes.set(bubble.itemId, index);
-      return;
-    }
-    // Reasoning renders without its item id; the bubble key keeps its first item's.
-    indexes.set(bubble.stableId, index);
-    for (const item of bubble.items) {
-      if (item.itemId !== null) indexes.set(item.itemId, index);
-    }
-  });
-  return indexes;
+interface BubbleSpan {
+  first: number;
+  last: number;
 }
 
-// After the newest rendered item saved before the message, else before the oldest rendered
-// one saved after it, else first. An older server names neither: above the failure notice, or last.
+/** The first and last committed bubble showing each transcript item. */
+function bubbleSpansByItemId(committed: Bubble[]): Map<string, BubbleSpan> {
+  const spans = new Map<string, BubbleSpan>();
+  committed.forEach((bubble, index) => {
+    for (const id of bubble.kind === "assistant" ? (bubble.itemIds ?? []) : [bubble.itemId]) {
+      const span = spans.get(id);
+      if (span === undefined) spans.set(id, { first: index, last: index });
+      else span.last = index;
+    }
+  });
+  return spans;
+}
+
+// A skill receipt also shows the user's typed command, under a derived id.
+function itemSpan(spans: Map<string, BubbleSpan>, id: string): BubbleSpan | undefined {
+  const own = spans.get(id);
+  const echo = spans.get(slashCommandEchoItemId(id));
+  if (own === undefined || echo === undefined) return own ?? echo;
+  return { first: Math.min(own.first, echo.first), last: Math.max(own.last, echo.last) };
+}
+
+// After the newest rendered item saved before the message, else before the oldest rendered one
+// saved after it. Otherwise last when nothing followed it, else first (older than what's loaded).
+// An older server names neither: above the startup failure notice, or last.
 function undeliveredIndex(
   input: PendingInput,
-  rendered: Map<string, number>,
+  spans: Map<string, BubbleSpan>,
   notice: number,
   end: number,
 ): number {
   if (input.precedingItemIds === undefined) return notice === -1 ? end : notice;
   for (const id of input.precedingItemIds) {
-    const bubble = rendered.get(id);
-    if (bubble !== undefined) return bubble + 1;
+    const span = itemSpan(spans, id);
+    if (span !== undefined) return span.last + 1;
   }
-  for (const id of input.followingItemIds ?? []) {
-    const bubble = rendered.get(id);
-    if (bubble !== undefined) return bubble;
+  const following = input.followingItemIds ?? [];
+  for (const id of following) {
+    const span = itemSpan(spans, id);
+    if (span !== undefined) return span.first;
   }
-  return 0;
+  return following.length === 0 ? end : 0;
 }
 
 /** Place undelivered messages where they were sent, in submission order. */
@@ -396,12 +408,12 @@ export function placeUndeliveredBubbles(
 ): Bubble[] {
   if (failedInputs.length === 0) return committed;
   const bubbles = buildUndeliveredBubbles(failedInputs, selfAuthor);
-  const rendered = bubbleIndexByItemId(committed);
+  const spans = bubbleSpansByItemId(committed);
   const notice = committed.findIndex(isStartupFailureBubble);
   const placed = new Map<number, Bubble[]>();
   let previous = 0;
   for (const [index, input] of failedInputs.entries()) {
-    const at = Math.max(previous, undeliveredIndex(input, rendered, notice, committed.length));
+    const at = Math.max(previous, undeliveredIndex(input, spans, notice, committed.length));
     previous = at;
     placed.set(at, [...(placed.get(at) ?? []), bubbles[index]!]);
   }
