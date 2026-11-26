@@ -19,7 +19,8 @@ import {
 import { useMemo, useRef } from "react";
 
 import type { Chord } from "@/lib/shortcuts/chord";
-import { OPEN_SESSION_CHORDS } from "@/lib/shortcuts/registry";
+import { OPEN_SESSION_CHORDS, type ShortcutId } from "@/lib/shortcuts/registry";
+import { useQuickPickPaletteEnabled } from "@/shell/screenCommands/useQuickPickPaletteCommands";
 import {
   AVAILABLE,
   type CommandAvailability,
@@ -76,6 +77,14 @@ export interface OpenSessionCommand {
   nativeShortcut?: Chord;
 }
 
+/** The registry binding whose chord runs each command in the browser, with QuickPick on. */
+const BROWSER_SHORTCUTS: Partial<Record<OpenSessionCommandId, ShortcutId>> = {
+  pin: "session.pin",
+  unpin: "session.pin",
+  archive: "session.archive",
+  unarchive: "session.archive",
+  fork: "session.fork",
+};
 const PIN_SAVING_REASON = "A pin change is still saving.";
 
 function offeredUnless(offered: boolean, disabledReason?: string): CommandAvailability {
@@ -175,6 +184,8 @@ export function useOpenSessionPaletteCommands({
   facts: OpenSessionFacts;
   onRun: (id: OpenSessionCommandId) => void;
 }): void {
+  // The desktop menu shows its own chords; the browser's wait for QuickPick.
+  const browserShortcuts = useQuickPickPaletteEnabled() && !facts.desktopShortcuts;
   const runRef = useRef(onRun);
   runRef.current = onRun;
   const commands = openSessionCommands(facts);
@@ -195,6 +206,7 @@ export function useOpenSessionPaletteCommands({
         availability: command.availability,
         destructive: command.destructive,
         nativeShortcut: command.nativeShortcut,
+        shortcut: browserShortcuts ? BROWSER_SHORTCUTS[command.id] : undefined,
         // Dialogs such as Rename take focus once the palette has closed.
         movesFocus: true,
         // Read again at run time: a caller may hold this row past a change in the session.
@@ -210,7 +222,7 @@ export function useOpenSessionPaletteCommands({
         },
       })),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the signature covers `commands`.
-    [conversationId, signature],
+    [conversationId, signature, browserShortcuts],
   );
   usePaletteCommands(`open-session:${conversationId}`, "Session", paletteCommands);
 }
