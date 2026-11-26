@@ -277,7 +277,10 @@ def _claude_project_directories(cwd: Path) -> list[Path]:
 
 
 def _claude_allowlisted_servers(
-    cwd: Path, inheritance: McpInheritance, env: Mapping[str, str] | None
+    cwd: Path,
+    inheritance: McpInheritance,
+    env: Mapping[str, str] | None,
+    managed_settings: Sequence[Mapping[str, object]],
 ) -> list[tuple[str, Mapping[str, object]]]:
     """Return the readable configs of strict-allowlisted servers Claude may load from *cwd*."""
     from omnigent.harnesses.claude_native.bridge import claude_global_config_path
@@ -301,7 +304,7 @@ def _claude_allowlisted_servers(
         return payload if isinstance(payload, dict) else {}
 
     present, managed = managed_claude_mcp_config()
-    tables = [managed]
+    tables = [managed, *managed_settings]
     if not present:
         user = read(claude_global_config_path(cwd, env))
         projects = user.get("projects")
@@ -339,15 +342,15 @@ def _claude_inherited_denials(
 
     Claude unions allowlists across its settings sources, but a deny from any source
     wins, so mirroring them is the only way an injected allowlist can narrow them.
-    Servers in ``managed-mcp.json`` skip the allowlist, so their names are denied too.
+    Policy-delivered servers skip the allowlist, so their names are denied too.
 
     :raises McpStrictModeError: When an inherited transport entry cannot be denied
         without also blocking an allowlisted server or the ``omnigent`` relay.
     """
     from omnigent.host.mcp_inventory import managed_claude_mcp_config
 
-    allowlisted: list[tuple[str, Mapping[str, object]]] | None = None
-    denials: list[dict[str, object]] = []
+    settings: list[tuple[Path, dict[str, object]]] = []
+    managed_settings: list[Mapping[str, object]] = []
     for path in _claude_inherited_settings_paths(cwd, executor, env, setting_sources):
         try:
             text = path.read_text(encoding="utf-8")
@@ -361,6 +364,14 @@ def _claude_inherited_denials(
             raise McpStrictModeError(executor, path, "invalid JSON") from error
         if not isinstance(payload, dict):
             raise McpStrictModeError(executor, path, "not a JSON object")
+        settings.append((path, payload))
+        servers = payload.get("managedMcpServers")
+        if isinstance(servers, dict):
+            managed_settings.append(servers)
+
+    allowlisted: list[tuple[str, Mapping[str, object]]] | None = None
+    denials: list[dict[str, object]] = []
+    for path, payload in settings:
         inherited = payload.get("allowedMcpServers")
         for entry in inherited if isinstance(inherited, list) else ():
             for field, value in entry.items() if isinstance(entry, dict) else ():
@@ -385,7 +396,9 @@ def _claude_inherited_denials(
                     )
                 elif field == "serverUrl" and isinstance(value, str):
                     if allowlisted is None:
-                        allowlisted = _claude_allowlisted_servers(cwd, inheritance, env)
+                        allowlisted = _claude_allowlisted_servers(
+                            cwd, inheritance, env, managed_settings
+                        )
                     matched = next(
                         (
                             name
@@ -412,9 +425,10 @@ def _claude_inherited_denials(
                 if mirrored and {field: value} not in denials:
                     denials.append({field: value})
     _, managed = managed_claude_mcp_config()
-    for name in managed:
-        if not inheritance.allows(name) and {"serverName": name} not in denials:
-            denials.append({"serverName": name})
+    for table in (*managed_settings, managed):
+        for name in table:
+            if not inheritance.allows(name) and {"serverName": name} not in denials:
+                denials.append({"serverName": name})
     return denials
 
 

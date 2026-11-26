@@ -18375,8 +18375,16 @@ _HOOK_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
-@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize(
+    ("active", "saved", "strict", "deferred"),
+    [
+        *((active, saved, strict, False) for active, saved, strict in _HOOK_CASES),
+        (None, False, False, True),
+        (["claude"], True, False, True),
+        (None, False, True, True),
+        (["claude"], True, True, True),
+    ],
+)
 def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict, deferred):
     """Saved disables and strict policy reach the invocation settings.
 

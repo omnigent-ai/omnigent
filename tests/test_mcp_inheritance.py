@@ -54,27 +54,58 @@ def test_harness_entry_overrides_global_fields_and_canonicalizes_aliases():
 
 
 @pytest.mark.parametrize(
-    "cfg,inherit,warning",
+    "cfg,inherit,allow,warning",
     [
-        ({"mcp": "strict"}, True, "config `mcp` must be a mapping"),
-        ({"mcp": {"inherit": "false"}}, True, "config `mcp.inherit` must be true or false"),
-        ({"mcp": {"inherit": False, "allow": "docs"}}, False, "config `mcp.allow` must be a list"),
+        ({"mcp": "strict"}, True, [], "config `mcp` must be a mapping"),
+        ({"mcp": {"inherit": "false"}}, True, [], "config `mcp.inherit` must be true or false"),
+        (
+            {"mcp": {"inherit": False, "allow": "docs"}},
+            False,
+            [],
+            "config `mcp.allow` must be a list",
+        ),
         (
             {"mcp": {"inherit": False, "allow": ["docs", 1]}},
             False,
+            [],
             "config `mcp.allow` must be a list",
         ),
         (
             {"harness": {"codex": {"mcp": ["x"]}}},
             True,
+            [],
             "config `harness.codex.mcp` must be a mapping",
+        ),
+        (
+            {"mcp": {"inherit": False, "allow": ["docs"]}, "harness": {"codex": {"mcp": ["x"]}}},
+            False,
+            ["docs"],
+            "config `harness.codex.mcp` must be a mapping",
+        ),
+        (
+            {
+                "mcp": {"inherit": False, "allow": ["docs"]},
+                "harness": {"codex": {"mcp": {"inherit": "true"}}},
+            },
+            False,
+            ["docs"],
+            "config `harness.codex.mcp.inherit` must be true or false",
+        ),
+        (
+            {
+                "mcp": {"inherit": False, "allow": ["docs"]},
+                "harness": {"codex": {"mcp": {"allow": "extra"}}},
+            },
+            False,
+            ["docs"],
+            "config `harness.codex.mcp.allow` must be a list",
         ),
     ],
 )
-def test_malformed_fields_warn_once_and_are_ignored(cfg, inherit, warning, caplog):
+def test_malformed_fields_warn_once_and_are_ignored(cfg, inherit, allow, warning, caplog):
     for _ in range(2):
         inheritance = resolve_mcp_inheritance("codex", cfg)
-    assert inheritance == McpInheritance(inherit, frozenset())
+    assert inheritance == McpInheritance(inherit, frozenset(allow))
     assert caplog.text.count(warning) == 1
 
 

@@ -283,7 +283,16 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
         {"allowedMcpServers": [{"serverName": "local_only"}]},
     )
     managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
-    _write_json(managed, {"allowedMcpServers": [{"serverName": "managed_only"}]})
+    _write_json(
+        managed,
+        {
+            "allowedMcpServers": [{"serverName": "managed_only"}],
+            "managedMcpServers": {
+                "policy_only": {"type": "http", "url": "https://mcp.example.com/policy"},
+                "kept": {"type": "sse", "url": "https://kept.example.com/mcp"},
+            },
+        },
+    )
     # Servers in managed-mcp.json skip the allowlist, so only a deny stops them.
     _write_json(
         managed.with_name("managed-mcp.json"),
@@ -291,7 +300,12 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
     )
     _write_json(
         managed.with_name("managed-settings.d") / "10-team.json",
-        {"allowedMcpServers": [{"serverName": "drop_in_only"}]},
+        {
+            "allowedMcpServers": [{"serverName": "drop_in_only"}],
+            "managedMcpServers": {
+                "drop_in_policy": {"type": "sse", "url": "https://mcp.example.com/team"}
+            },
+        },
     )
     # Claude versions read project settings from the launch directory or the Git root.
     _write_json(
@@ -314,10 +328,28 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
             {"serverName": "local_only"},
             {"serverName": "managed_only"},
             {"serverName": "drop_in_only"},
+            {"serverName": "policy_only"},
+            {"serverName": "drop_in_policy"},
             {"serverName": "pinned"},
         ],
         "allowedMcpServers": [{"serverName": "omnigent"}, {"serverName": "kept"}],
     }
+    hermetic = apply_claude_settings(
+        settings,
+        executor=executor,
+        active_harnesses=None,
+        cwd=claude_project / "sub",
+        setting_sources=[],
+    )
+    parsed_hermetic = hermetic if isinstance(hermetic, dict) else json.loads(hermetic)
+    assert parsed_hermetic["deniedMcpServers"] == [
+        {"serverName": "caller"},
+        {"serverName": "managed_only"},
+        {"serverName": "drop_in_only"},
+        {"serverName": "policy_only"},
+        {"serverName": "drop_in_policy"},
+        {"serverName": "pinned"},
+    ]
 
 
 @pytest.mark.parametrize("main_local", ["readable", "unreadable"])
@@ -409,16 +441,28 @@ def test_claude_strict_refuses_inherited_command_entries(claude_project, executo
         ("https://mcp.example.com/kept", "user"),
         ("https://mcp.example.com/kept", "project_key"),
         ("https://mcp.example.com/*", "mcp_json"),
+        ("https://mcp.example.com/kept", "managed_settings"),
+        ("https://mcp.example.com/*", "managed_drop_in"),
     ],
 )
 def test_claude_strict_refuses_url_entries_matching_allowlisted_servers(
     claude_project, pattern, source
 ):
     """Denying such an entry blocks the server; keeping it admits others at that URL."""
+    from omnigent.onboarding import ambient
+
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     servers = {"mcpServers": {"kept": {"type": "http", "url": "https://mcp.example.com/kept"}}}
     if source == "mcp_json":
         _write_json(claude_project / ".mcp.json", servers)
+    elif source.startswith("managed_"):
+        managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
+        settings_path = (
+            managed
+            if source == "managed_settings"
+            else managed.with_name("managed-settings.d") / "10-team.json"
+        )
+        _write_json(settings_path, {"managedMcpServers": servers["mcpServers"]})
     else:
         # Claude keys projects by the physical path of its working directory.
         user = {"projects": {str(claude_project.resolve()): servers}}

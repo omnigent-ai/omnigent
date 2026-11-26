@@ -385,17 +385,20 @@ unchanged. Saved preferences remain available when the flags are re-enabled.
 
 **MCP inheritance:** `mcp: {inherit: false, allow: [names]}` in the user's
 `~/.omnigent/config.yaml`, optionally overridden under `harness.<id>.mcp`, makes
-Claude and Codex launches load only the `omnigent` server plus the allowlist,
+Claude and Codex launches restrict inherited file-configured servers to `omnigent` plus the allowlist,
 apart from the plugin and unreadable-config limits below.
 It needs no server flag and has no UI. Project config cannot change it. Claude
 gets `allowedMcpServers` through `--settings`, and because Claude unions
 allowlists across settings sources, every other inherited user, project, local
 or managed `allowedMcpServers` entry (project and local files from the cwd, Git
 root and linked-worktree main checkout) is mirrored into `deniedMcpServers`, as
-are non-allowlisted `managed-mcp.json` names, which bypass Claude's allowlist.
+are non-allowlisted `managed-mcp.json` and `managedMcpServers` names from
+managed settings and drop-ins, which bypass Claude's allowlist. Their URLs
+participate in transport-conflict detection too.
 Managed-host native launches read these for the wrapper-resolved cwd and
 environment (`apply_claude_launch_mcp_policy`); SDK launches use the executor cwd
-and CLI env, and `omnigent claude` its own cwd and env (a `CLAUDE_LAUNCHER`
+and CLI env with the SDK's selected setting scopes (managed policy always
+applies), and `omnigent claude` its own cwd and env (a `CLAUDE_LAUNCHER`
 plugin's wrapper is not modeled).
 Any inherited `serverCommand` entry, or a `serverUrl` entry matching an
 allowlisted server's URL, raises `McpStrictModeError`: Claude 2.1.283 admits stdio

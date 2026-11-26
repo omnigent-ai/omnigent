@@ -549,7 +549,7 @@ runs the session.
 <summary>Limit which MCP servers launched agents load</summary>
 
 By default, Claude Code and Codex sessions that Omnigent launches load the same
-MCP servers as the CLI on its own. To start them with only Omnigent's tools plus
+MCP servers as the CLI on its own. To restrict inherited file-configured servers to Omnigent's tools plus
 servers you name (within the limits below), add this to `~/.omnigent/config.yaml`:
 
 ```yaml
@@ -570,9 +570,10 @@ project, local and managed Claude settings (project and local files are read
 from the launch directory, its Git root and, for a linked worktree, the main
 checkout); Claude would otherwise combine those
 lists with Omnigent's. Servers other than allowed ones in `managed-mcp.json` are
-denied by name, since Claude does not apply the allowlist to them. A `serverUrl`
+denied by name, since Claude does not apply the allowlist to them. This also covers
+`managedMcpServers` in managed settings and their drop-ins. A `serverUrl`
 entry is denied too, but one matching an allowed server's URL (in Claude's
-global config, the project's `.mcp.json` or `managed-mcp.json`) stops the
+global config, the project's `.mcp.json`, `managed-mcp.json` or managed settings) stops the
 launch, as does any `serverCommand` entry: Claude then admits stdio servers by
 command alone, which would bypass the names or reject Omnigent's relay. Codex
 receives `-c mcp_servers.<name>.enabled=false` for every other server it would
