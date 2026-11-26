@@ -525,7 +525,7 @@ async def test_forward_session_cost_splits_display_and_policy(
 
 @pytest.mark.asyncio
 async def test_forward_session_cost_prices_saved_inference_binding(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Saved bindings price child spend; invalid bindings still forward known cost."""
     from omnigent.llms.context_window import ModelPricing
@@ -617,6 +617,7 @@ async def test_forward_session_cost_prices_saved_inference_binding(
             )
 
         await poll()
+        caplog.clear()
         monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG")
         ambient_config.clear()
         ambient_config["inference"] = {
@@ -627,6 +628,7 @@ async def test_forward_session_cost_prices_saved_inference_binding(
             lambda _: ModelPricing(input_per_token=3.0 / 1_000_000, output_per_token=0.0),
         )
         await poll()
+        assert "Could not resolve transcript pricing provider; using legacy pricing" in caplog.text
     assert posted == [
         {
             "cumulative_cost_usd": pytest.approx(0.01),
