@@ -62,10 +62,10 @@ export function TerminalSplitControls({
     "split_controls_close",
     // MainTerminalView prunes each pane once its terminal leaves the list.
     (closing) => {
-      for (const terminal of closing) deleteTerminal.mutate(terminal.id);
+      for (const terminal of eachTerminalOnce(closing)) deleteTerminal.mutate(terminal.id);
     },
   );
-  const closing = closeShell.pending?.items ?? [];
+  const closing = eachTerminalOnce(closeShell.pending?.items ?? []);
   const agentTerminal = findAgentTerminal(terminals);
   const declaredShells = agent?.terminals ?? [];
   if (
@@ -175,6 +175,11 @@ export function TerminalSplitControls({
       />
     </div>
   );
+}
+
+/** A shell closed twice before its check answered is still one shell to ask about and kill. */
+function eachTerminalOnce(terminals: readonly TerminalInfo[]): TerminalInfo[] {
+  return [...new Map(terminals.map((terminal) => [terminal.id, terminal])).values()];
 }
 
 /** One split direction: a header icon opening the shell-type picker, default first. */
