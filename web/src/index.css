@@ -1696,8 +1696,9 @@ html[data-electron-mac] .canvas-workspace {
   padding-top: var(--fullscreen-overlay-inset-top);
 }
 /* The title-bar cluster below sits above the z-50 layer to clear the sidebar,
- * so it steps aside while a full-window view covers the app. */
-html[data-electron-mac]:has([data-fullscreen-overlay]) .electron-sidebar-header-actions {
+ * so it steps aside while a full-window view covers the app. The view marks the
+ * root (useMarkFullscreenOverlayOpen); `html:has()` would restyle every keystroke. */
+html[data-electron-mac][data-fullscreen-overlay-open] .electron-sidebar-header-actions {
   display: none;
 }
 /* Align to the native lights at y=24px, regardless of the host rem size.
