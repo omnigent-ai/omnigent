@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import itertools
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -656,6 +658,83 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
     assert lookup_calls == [["1949523062921b6989466e2fc257925a"]]
     assert snapshot.runner_online is False
     assert snapshot.host_online is False
+
+
+class _JobTaggingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Default executor that tags every submitted job with a sequence number."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=1)
+        self.current = threading.local()
+        self._next_job = itertools.count()
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> concurrent.futures.Future[Any]:
+        job = next(self._next_job)
+
+        def run() -> Any:
+            self.current.job = job
+            return fn(*args, **kwargs)
+
+        return super().submit(run)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_reads_overlays_in_one_executor_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Liveness, usage and the resume-host read share one executor hop.
+
+    Each ``asyncio.to_thread`` hop waits in the default executor's queue, so on
+    a busy replica the snapshot's latency grows with its hop count.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1949523062921b6989466e2fc257925a"
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    conv.host_id = "host_1"
+    executor = _JobTaggingExecutor()
+    jobs: dict[str, int] = {}
+
+    def _liveness_lookup(session_ids: list[str]) -> dict[str, SessionLiveness]:
+        jobs["liveness"] = executor.current.job
+        return {session_id: SessionLiveness(runner_online=True, host_online=False)}
+
+    class _HostStore:
+        def get_host(self, host_id: str) -> object:
+            jobs["host"] = executor.current.job
+            return SimpleNamespace(id=host_id)
+
+    real_usage = orchestration.load_session_usage
+
+    def _usage(*args: Any, **kwargs: Any) -> Any:
+        jobs["usage"] = executor.current.job
+        return real_usage(*args, **kwargs)
+
+    monkeypatch.setattr(orchestration, "load_session_usage", _usage)
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda host, config: True)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(executor)
+    try:
+        snapshot = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            session_id,
+            conversation=conv,
+            liveness_lookup=_liveness_lookup,
+            host_store=_HostStore(),  # type: ignore[arg-type]
+            sandbox_config=SimpleNamespace(),  # type: ignore[arg-type]
+        )
+    finally:
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+        executor.shutdown(wait=True)
+
+    assert set(jobs) == {"liveness", "host", "usage"}
+    assert len(set(jobs.values())) == 1
+    assert snapshot.runner_online is True
+    assert snapshot.host_online is False
+    assert snapshot.host_resumable is True
+    assert snapshot.usage_included is True
 
 
 @pytest.mark.asyncio

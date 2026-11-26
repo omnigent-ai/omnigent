@@ -183,4 +183,13 @@ export function useCanStartSideChat(
   return session?.sideChatAllowed ?? (!isLoading && isOwnerLevel(permissionLevel));
 }
 
+/**
+ * Whether the viewer holds the owner grant on the session's root, as the server decides
+ * it for side chats (no admin bypass). `null` while loading or from a server that doesn't say.
+ */
+export function useIsSessionOwner(sessionId: string | null | undefined): boolean | null {
+  const { session } = useSession(sessionId);
+  return session?.sideChatAllowed ?? null;
+}
+
 export type { GrantList, Permission, ShareGrant, ShareTarget };

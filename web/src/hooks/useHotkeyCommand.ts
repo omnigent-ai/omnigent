@@ -9,7 +9,7 @@ import {
   activeShortcutChords,
   shortcutBinding,
   type WorkspaceSidebarShortcutId,
-} from "@/shell/workspaceTabs/workspaceSidebarShortcuts";
+} from "@/lib/shortcuts/registry";
 import {
   AVAILABLE,
   type CommandAvailability,

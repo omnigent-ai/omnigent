@@ -84,6 +84,7 @@ from omnigent.db.account_authority import account_authority_scope, account_check
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.workflow import Workflow
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.native.permission_modes import (
@@ -104,6 +105,7 @@ from omnigent.server.managed_hosts import (
     managed_repo_labels,
     parse_repo_workspace,
     read_managed_repo_workspaces,
+    read_provider_recovery_hint,
 )
 from omnigent.server.permissions import check_session_access
 from omnigent.server.proactive_agent import fire_skip_reason, is_proactive_task
@@ -164,13 +166,20 @@ from omnigent.server.scheduled.telemetry import (
     start_fire_stage,
     startup_failure_stage,
 )
+from omnigent.server.scheduled.workflow_automations import task_workflow_id
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.session_journal import (
+    WorkflowNotFoundError,
+    initialize_workflow_plan,
+    load_workflow_for_run,
+)
 from omnigent.server.session_mcp_selection import (
     SessionMcpSelection,
     mcp_selection_for,
     run_sandbox,
     session_mcp_label_keys,
 )
+from omnigent.server.workflows import workflows_enabled
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
@@ -253,7 +262,6 @@ _STAGED_LAUNCH_ERRORS = _LaunchErrorCodes("sandbox_create_failed", "runner_start
 SANDBOX_REGISTRATION_TIMEOUT_S = 12 * 60
 # How long an abandoned launch gets to stop before its sandbox is torn down.
 _ABANDONED_LAUNCH_SETTLE_S = 30.0
-_REGISTRATION_HINT_TIMEOUT_S = 1.0
 
 # ``launch_start(conv, task, host_id, error_codes)`` — start provisioning a sandbox
 # in the background once the managed fire's prompt is saved. ``host_id`` is the
@@ -861,6 +869,18 @@ async def _run_fire_for_task(
                 await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="paused")
             return
 
+    try:
+        start_fire_stage("workflow_validation")
+        # An automation saved continuing one session keeps sending its prompt as before.
+        workflow = None if task.session_mode == "continue" else await _task_workflow(deps, task)
+    except _CannotLaunchScheduledFire as exc:
+        _logger.warning("scheduled fire: task %s cannot start its workflow: %s", task.id, exc)
+        await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
+        if exc.error_code == "workflow_missing":
+            # Every later run would fail the same way.
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="paused")
+        return
+
     dispatch = fire_dispatch.managed if managed else fire_dispatch.connected
     preflight = None if managed else fire_dispatch.connected_preflight
 
@@ -930,6 +950,7 @@ async def _run_fire_for_task(
                 SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id,
                 SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: recorder.run_id,
             },
+            workflow=workflow,
         )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
@@ -1089,6 +1110,63 @@ async def _source_session_problem(deps: FireDeps, task: ScheduledTask) -> tuple[
             "source_session_incompatible",
         )
     return None
+
+
+async def _task_workflow(deps: FireDeps, task: ScheduledTask) -> Workflow | None:
+    """The saved workflow each run of *task* starts as a run of, or ``None`` if it runs none.
+
+    :raises _CannotLaunchScheduledFire: ``workflows_disabled``, ``workflow_missing``
+        when the owner can no longer run it, or ``workflow_invalid``.
+    """
+    workflow_id = await asyncio.to_thread(task_workflow_id, task)
+    if workflow_id is None:
+        return None
+    if not workflows_enabled(deps.app_state):
+        raise _CannotLaunchScheduledFire(
+            "this automation runs a saved workflow, but workflows are disabled on this server",
+            error_code="workflows_disabled",
+        )
+    try:
+        return await load_workflow_for_run(
+            deps.conversation_store,
+            workflow_id,
+            user_id=task.user_id,
+            permission_store=deps.permission_store,
+        )
+    except WorkflowNotFoundError as exc:
+        raise _CannotLaunchScheduledFire(
+            "the saved workflow this automation runs was deleted or is no longer shared "
+            "with its owner, so the automation is paused",
+            error_code="workflow_missing",
+        ) from exc
+    except OmnigentError as exc:
+        raise _CannotLaunchScheduledFire(
+            f"the saved workflow this automation runs can't start: {exc}",
+            error_code="workflow_invalid",
+        ) from exc
+
+
+async def _start_workflow_run(
+    deps: FireDeps, task: ScheduledTask, conv: Conversation, workflow: Workflow
+) -> None:
+    """Write *workflow*'s steps as the new session's plan, as a manual launch does.
+
+    :raises _CannotLaunchScheduledFire: With ``workflow_plan_failed``, whose message
+        leaves out the storage error, which can carry SQL; the server log keeps it.
+    """
+    try:
+        await initialize_workflow_plan(
+            deps.conversation_store, conv, workflow, user_id=task.user_id
+        )
+    # Any storage failure, not only the journal's own errors; cancellation still propagates.
+    except Exception as exc:
+        _logger.exception(
+            "scheduled fire: task %s could not write workflow %s's plan", task.id, workflow.id
+        )
+        raise _CannotLaunchScheduledFire(
+            "could not start the run of the saved workflow",
+            error_code="workflow_plan_failed",
+        ) from exc
 
 
 async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -1348,20 +1426,24 @@ def session_approval_skipping_mode(conv: Conversation) -> str | None:
     return None
 
 
+def _asks_for_approval(task: ScheduledTask) -> bool:
+    """Whether *task* selects a permission mode that keeps approval."""
+    return (
+        task.permission_mode is not None
+        and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES
+    )
+
+
 async def _inherited_permission_problem(
     deps: FireDeps, task: ScheduledTask, agent: Any, *, continued: bool = False
 ) -> tuple[str, str] | None:
     """Why *task* may not run in its agent's default permission mode.
 
     A new session applies the task's own mode over that default, so any selected mode
-    opts out of it. A continued session keeps the agent's default, so only a task that
-    selects an approval-skipping mode itself opts in to running in one.
+    opts out of it. A continued session wakes in its own mode, the agent's default, so
+    only a task that selects a mode keeping approval objects to one that skips it.
     """
-    opted_in = (
-        task.permission_mode in APPROVAL_SKIPPING_PERMISSION_MODES
-        if continued
-        else task.permission_mode is not None
-    )
+    opted_in = not _asks_for_approval(task) if continued else task.permission_mode is not None
     if opted_in:
         return None
     problem = await inherited_approval_skipping_problem(agent, deps.agent_cache)
@@ -1394,12 +1476,13 @@ async def continued_session_problem(
         return "the session is a sub-agent's session", "continued_session_incompatible"
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
+    # A task without a mode wakes the session in whatever mode it is in.
     session_mode = session_approval_skipping_mode(conv)
-    if session_mode is not None and task.permission_mode not in APPROVAL_SKIPPING_PERMISSION_MODES:
+    if session_mode is not None and _asks_for_approval(task):
         return (
             f"the session is in permission mode {session_mode!r}, which skips approval, but the "
-            "automation does not select such a mode; switch the session to a mode that asks for "
-            "approval or uses the auto classifier",
+            f"automation selects {task.permission_mode!r}, which asks for it; switch the session "
+            "to a mode that asks for approval, or clear the automation's mode",
             UNATTENDED_PERMISSION_ERROR_CODE,
         )
     # A pin the task changed since would otherwise be ignored silently: the
@@ -1997,10 +2080,16 @@ def _session_labels(
 
 
 async def _create_session(
-    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+    deps: FireDeps,
+    task: ScheduledTask,
+    *,
+    labels: dict[str, str],
+    workflow: Workflow | None,
 ) -> Conversation:
     # Host operations and database threads can commit after caller cancellation.
-    creation = asyncio.create_task(_create_session_resources(deps, task, labels=labels))
+    creation = asyncio.create_task(
+        _create_session_resources(deps, task, labels=labels, workflow=workflow)
+    )
     try:
         return await asyncio.shield(creation)
     except asyncio.CancelledError:
@@ -2022,9 +2111,21 @@ async def _create_session(
 
 
 async def _create_session_resources(
-    deps: FireDeps, task: ScheduledTask, *, labels: dict[str, str]
+    deps: FireDeps,
+    task: ScheduledTask,
+    *,
+    labels: dict[str, str],
+    workflow: Workflow | None,
 ) -> Conversation:
-    """Create a conversation bound to the task's agent, carrying the stored spec."""
+    """Create a conversation bound to the task's agent, carrying the stored spec.
+
+    :param labels: The session's labels, including the run's
+        ``SCHEDULED_TASK_RUN_LABEL_KEY``, which the workflow plan records.
+    :param workflow: The saved workflow the session starts as a run of, if any: its
+        steps become the session's plan before the prompt is sent.
+    :raises _CannotLaunchScheduledFire: With ``workflow_plan_failed`` if the plan
+        can't be written; the session is discarded.
+    """
     from omnigent.server.routes._host_worktree import (
         WORKTREE_ROOT_LABEL_KEY,
         WorktreeHostUnavailableError,
@@ -2104,6 +2205,8 @@ async def _create_session_resources(
         if labels:
             await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
             conv.labels.update(labels)
+        if workflow is not None:
+            await _start_workflow_run(deps, task, conv, workflow)
         return conv
     except Exception:
         if conv is not None:
@@ -2941,6 +3044,10 @@ class _ClaimedRunRecorder:
         set_current_session_id(conversation_id)
         await self._lease.attach_session(conversation_id)
 
+    async def hand_back_timer_firing(self, host_id: str) -> None:
+        """Return a timer's firing unsent, for the replica that owns *host_id* to claim."""
+        await self._lease.hand_back_timer_firing(host_id)
+
     async def finish(
         self,
         status: str,
@@ -3044,15 +3151,8 @@ class _ClaimedRunRecorder:
         hint_callback = launch.host_online_failure_hint if launch is not None else None
 
         async def failure_reason() -> str:
-            if hint_callback is not None:
-                try:
-                    async with asyncio.timeout(_REGISTRATION_HINT_TIMEOUT_S):
-                        hint = await asyncio.to_thread(hint_callback)
-                    if hint:
-                        return f"{reason} — {hint}"
-                except Exception:
-                    _logger.warning("Could not build the sandbox registration hint", exc_info=True)
-            return reason
+            hint = await read_provider_recovery_hint(hint_callback)
+            return f"{reason} — {hint}" if hint else reason
 
         # Fence queued inputs before diagnostics yield; late registration cannot deliver them.
         reason = await self._fail_saved_prompt(conversation_id, failure_reason)
@@ -3236,9 +3336,11 @@ async def _fire_timer(
     """Wake a timer's session with its hidden firing message.
 
     A session that was deleted, archived or closed, or that the timer's owner can no
-    longer send to, stops the timer instead: it is never woken or recreated. The
-    session's input policies check the wake as they would a message. A cancel stops
-    later firings; one already on its way may still arrive.
+    longer send to, stops the timer instead: it is never woken or recreated. A session
+    that moved to another host gets the firing back unsent, for the replica that owns
+    that host to claim at its next poll. The session's input policies check the wake as
+    they would a message. A cancel stops later firings; one already on its way may still
+    arrive.
     """
     session_id = task.session_id
     assert session_id is not None  # a timer always names its session
@@ -3251,6 +3353,12 @@ async def _fire_timer(
         await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
         return
     assert conv is not None
+    # Firings are claimed by the replica that owns the timer's saved host, which may no
+    # longer serve the session; a session without a host keeps the saved one.
+    if conv.host_id is not None and conv.host_id != task.host_id:
+        _logger.info("scheduled fire: timer %s follows its session to %s", task.id, conv.host_id)
+        await recorder.hand_back_timer_firing(conv.host_id)
+        return
     try:
         await dispatch(conv, task)
     except TimerWakeRefused as refused:

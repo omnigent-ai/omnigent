@@ -18,7 +18,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
-import type { CUSTOM_AGENT_CREATE_ENTRY } from "@/pages/settings/search/catalog/customAgents";
+import { CUSTOM_AGENT_CREATE_ENTRY } from "@/pages/settings/search/catalog/customAgents";
 import { settingsControlProps } from "@/pages/settings/search/settingsControl";
 import {
   settingsOverlayProps,
@@ -236,34 +236,15 @@ export function CreateAgentDialog({
   );
 }
 
-/**
- * The Settings row a create form renders in, which names its top-level fields and buttons. The
- * shell's dialog passes none and keeps its own names.
- */
-type CreateAgentSettingsEntry = typeof CUSTOM_AGENT_CREATE_ENTRY;
-
-type CreateAgentFieldPart = keyof CreateAgentSettingsEntry["parts"];
-
-function settingsFieldProps(
-  entry: CreateAgentSettingsEntry | undefined,
-  part: CreateAgentFieldPart,
-) {
-  return entry ? settingsControlProps(entry, part) : {};
-}
-
 /** Settings saves persist the agent and keep the draft available on failure. */
 export function CreateAgentForm({
   onCreate,
   onCancel,
   notice,
-  submitLabel = "Create",
-  settingsEntry,
 }: {
   onCreate: (input: AgentBundleInput) => void | Promise<void>;
   onCancel: () => void;
   notice?: string;
-  submitLabel?: string;
-  settingsEntry?: CreateAgentSettingsEntry;
 }) {
   const fields = useAgentFormFields();
   const [pending, setPending] = useState(false);
@@ -288,7 +269,7 @@ export function CreateAgentForm({
       {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
       <div className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
         <fieldset disabled={pending} className="contents">
-          <AgentFormFields {...fields} settingsEntry={settingsEntry} />
+          <AgentFormFields {...fields} />
         </fieldset>
       </div>
       {error && (
@@ -298,7 +279,7 @@ export function CreateAgentForm({
       )}
       <DialogFooter>
         <Button
-          {...settingsFieldProps(settingsEntry, "cancel")}
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "cancel")}
           type="button"
           variant="ghost"
           onClick={onCancel}
@@ -307,13 +288,13 @@ export function CreateAgentForm({
           Cancel
         </Button>
         <Button
-          {...settingsFieldProps(settingsEntry, "submit")}
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "submit")}
           type="submit"
           data-testid="create-agent-submit"
           loading={pending}
           disabled={!fields.canSubmit || pending}
         >
-          {submitLabel}
+          {CUSTOM_AGENT_CREATE_ENTRY.parts.submit}
         </Button>
       </DialogFooter>
     </form>
@@ -411,8 +392,7 @@ function AgentFormFields({
   removeMCPServer,
   updateMCPEntry,
   nameInvalid,
-  settingsEntry,
-}: ReturnType<typeof useAgentFormFields> & { settingsEntry?: CreateAgentSettingsEntry }) {
+}: ReturnType<typeof useAgentFormFields>) {
   return (
     <>
       {/* Name */}
@@ -421,7 +401,7 @@ function AgentFormFields({
           Name <span className="text-destructive">*</span>
         </label>
         <Input
-          {...settingsFieldProps(settingsEntry, "name")}
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "name")}
           id="create-agent-name"
           data-testid="create-agent-name"
           aria-required
@@ -452,7 +432,7 @@ function AgentFormFields({
           Description
         </label>
         <Input
-          {...settingsFieldProps(settingsEntry, "description")}
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "description")}
           id="create-agent-description"
           data-testid="create-agent-description"
           value={description}
@@ -473,19 +453,17 @@ function AgentFormFields({
           valueHasNoPii
         >
           <SelectTrigger
-            {...(settingsEntry
-              ? settingsControlProps(settingsEntry, "harness")
-              : { "aria-label": "Harness" })}
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "harness")}
             data-testid="create-agent-harness"
             aria-required
             className="w-full"
           >
             <SelectValue />
           </SelectTrigger>
-          <SelectContent {...(settingsEntry ? settingsOverlayProps(settingsEntry, "harness") : {})}>
+          <SelectContent {...settingsOverlayProps(CUSTOM_AGENT_CREATE_ENTRY, "harness")}>
             {harnessOptions.map((opt) => (
               <SelectItem
-                {...(settingsEntry ? settingsRuntimeChoiceProps(settingsEntry, "harness") : {})}
+                {...settingsRuntimeChoiceProps(CUSTOM_AGENT_CREATE_ENTRY, "harness")}
                 key={opt.value}
                 value={opt.value}
               >
@@ -502,7 +480,7 @@ function AgentFormFields({
           Model <span className="text-destructive">*</span>
         </label>
         <Input
-          {...settingsFieldProps(settingsEntry, "model")}
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "model")}
           id="create-agent-model"
           data-testid="create-agent-model"
           aria-required
@@ -521,7 +499,7 @@ function AgentFormFields({
           System instructions
         </label>
         <Textarea
-          {...settingsFieldProps(settingsEntry, "instructions")}
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "instructions")}
           id="create-agent-instructions"
           data-testid="create-agent-instructions"
           value={instructions}
@@ -537,7 +515,7 @@ function AgentFormFields({
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
           <Button
-            {...settingsFieldProps(settingsEntry, "addServer")}
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "addServer")}
             type="button"
             variant="ghost"
             size="sm"
@@ -549,10 +527,11 @@ function AgentFormFields({
             Add server
           </Button>
         </div>
-        {mcpEntries.map((entry) => (
+        {mcpEntries.map((entry, index) => (
           <MCPServerRow
             key={entry.key}
             entry={entry}
+            position={index + 1}
             onChange={(patch) => updateMCPEntry(entry.key, patch)}
             onRemove={() => removeMCPServer(entry.key)}
           />
@@ -565,13 +544,18 @@ function AgentFormFields({
 /** A single MCP server entry in the form. */
 function MCPServerRow({
   entry,
+  position,
   onChange,
   onRemove,
 }: {
   entry: MCPFormEntry;
+  /** Its place in the list, which names its own name field and, until it has a name, the rest. */
+  position: number;
   onChange: (patch: Partial<MCPFormEntry>) => void;
   onRemove: () => void;
 }) {
+  // Until it's named, a server is identified by its position.
+  const serverName = entry.name.trim() || `server ${position}`;
   return (
     <div
       className="flex flex-col gap-2 rounded-md border border-border p-3"
@@ -579,7 +563,9 @@ function MCPServerRow({
     >
       <div className="flex items-center gap-2">
         <Input
-          aria-label="Server name"
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "serverName", {
+            runtime: String(position),
+          })}
           data-testid="create-agent-mcp-name"
           value={entry.name}
           onChange={(e) => onChange({ name: e.target.value })}
@@ -593,13 +579,15 @@ function MCPServerRow({
           valueHasNoPii
         >
           <SelectTrigger
-            aria-label="Transport"
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "serverTransport", {
+              runtime: serverName,
+            })}
             data-testid="create-agent-mcp-transport"
             className="w-24"
           >
             <SelectValue />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent {...settingsOverlayProps(CUSTOM_AGENT_CREATE_ENTRY, "serverTransport")}>
             <SelectItem value="stdio">stdio</SelectItem>
             <SelectItem value="http">http</SelectItem>
           </SelectContent>
@@ -609,7 +597,9 @@ function MCPServerRow({
           variant="ghost"
           size="icon"
           onClick={onRemove}
-          aria-label="Remove server"
+          {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "removeServer", {
+            runtime: serverName,
+          })}
           data-testid="create-agent-mcp-remove"
           className="size-7 text-muted-foreground hover:text-destructive"
         >
@@ -620,21 +610,25 @@ function MCPServerRow({
       {entry.transport === "stdio" ? (
         <>
           <Input
-            aria-label="Command"
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "command", { runtime: serverName })}
             data-testid="create-agent-mcp-command"
             value={entry.command}
             onChange={(e) => onChange({ command: e.target.value })}
             placeholder="command (e.g. npx)"
           />
           <Input
-            aria-label="Arguments"
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "arguments", {
+              runtime: serverName,
+            })}
             data-testid="create-agent-mcp-args"
             value={entry.args}
             onChange={(e) => onChange({ args: e.target.value })}
             placeholder="args (e.g. -y @modelcontextprotocol/server-github)"
           />
           <Textarea
-            aria-label="Environment variables"
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "environment", {
+              runtime: serverName,
+            })}
             data-testid="create-agent-mcp-env"
             value={entry.env}
             onChange={(e) => onChange({ env: e.target.value })}
@@ -645,14 +639,14 @@ function MCPServerRow({
       ) : (
         <>
           <Input
-            aria-label="Server URL"
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "url", { runtime: serverName })}
             data-testid="create-agent-mcp-url"
             value={entry.url}
             onChange={(e) => onChange({ url: e.target.value })}
             placeholder="https://mcp.example.com/sse"
           />
           <Textarea
-            aria-label="HTTP headers"
+            {...settingsControlProps(CUSTOM_AGENT_CREATE_ENTRY, "headers", { runtime: serverName })}
             data-testid="create-agent-mcp-headers"
             value={entry.headers}
             onChange={(e) => onChange({ headers: e.target.value })}

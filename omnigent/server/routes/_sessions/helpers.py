@@ -94,7 +94,11 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.native.permission_modes import (
+    PERMISSION_LAUNCH_ARGS,
+    created_session_launch_args,
+    inherited_permission_mode,
+)
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
@@ -114,7 +118,13 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
+from omnigent.server import (
+    background_session_titles,
+    presence,
+    session_live_state,
+    session_pull_requests,
+    shutdown_state,
+)
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -161,6 +171,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
     _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
     _ACP_SUBAGENT_ID_LABEL_KEY,
     _ANTIGRAVITY_NATIVE_HARNESS,
@@ -3871,6 +3882,9 @@ def _parse_external_conversation_item(
     # Cap a native tool result so a multi-MB output isn't persisted + broadcast as one frame.
     if item_type == "function_call_output" and isinstance(item_data.get("output"), str):
         item_data = {**item_data, "output": cap_tool_output(item_data["output"])}
+    if item_type == "terminal_command":
+        # Only the pending-input drain can establish submission ownership.
+        item_data = {key: value for key, value in item_data.items() if key != "submission"}
     try:
         data = parse_item_data(item_type, {"type": item_type, **item_data})
     except (ValueError, TypeError) as exc:
@@ -5464,9 +5478,11 @@ def _publish_status(
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
-        # A turn can open or merge a PR while nobody watches; refresh what the server
-        # stores. Stops and archives publish idle without persisting it, and skip this.
+        # A turn can open or merge a PR while nobody watches, and the first turn's
+        # reply can name a session better than its first message did. Stops and
+        # archives publish idle without persisting it, and skip both.
         session_pull_requests.notify_turn_end(session_id)
+        background_session_titles.notify_turn_end(session_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
@@ -7508,9 +7524,17 @@ async def _wait_for_managed_runner_tunnel(
     tracker: ManagedLaunchTracker,
     *,
     settle_failure: bool = True,
+    conversation_store: ConversationStore | None = None,
+    host_id: str | None = None,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
+
+    A message that finds the runner slow to connect relaunches it on the same
+    host, and the host stops the runner it replaced. Given *conversation_store*
+    and *host_id*, the wait moves on to the runner the session is now bound to
+    on that host rather than failing on one that can no longer connect. It stops
+    following replacements after ``_MANAGED_RUNNER_REPLACEMENT_WAIT_S``.
 
     :param session_id: Session/conversation identifier.
     :param runner_id: Runner id returned by the host launch frame.
@@ -7518,16 +7542,54 @@ async def _wait_for_managed_runner_tunnel(
     :param tracker: Managed launch tracker to settle on failure.
     :param settle_failure: Publish and settle a timeout immediately. Callers
         with rollback work can defer settlement until cleanup finishes.
+    :param conversation_store: Store to re-read the session's runner binding
+        from after a timeout, or ``None`` to wait only for *runner_id*.
+    :param host_id: Host the runner was launched on. A binding to any other
+        host is not followed.
     :returns: ``True`` when the runner connected; ``False`` on timeout.
     """
+    from omnigent.server.managed_hosts import is_move_claim
     from omnigent.server.routes import sessions as _facade
 
-    runner = await tunnel_registry.wait_for_runner(
-        runner_id,
-        timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-    )
-    if runner is not None:
-        return True
+    connect_timeout_s = _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+    follow_deadline = time.monotonic() + _facade._MANAGED_RUNNER_REPLACEMENT_WAIT_S
+    awaited_runner_ids: set[str] = set()
+    while True:
+        runner = await tunnel_registry.wait_for_runner(runner_id, timeout_s=connect_timeout_s)
+        if runner is not None:
+            return True
+        awaited_runner_ids.add(runner_id)
+        if conversation_store is None or host_id is None or time.monotonic() >= follow_deadline:
+            break
+        try:
+            bound = await asyncio.to_thread(
+                conversation_store.get_profile_host_binding, session_id
+            )
+        except ConversationNotFoundError:
+            break
+        remaining_s = follow_deadline - time.monotonic()
+        if (
+            remaining_s <= 0
+            or bound.host_id != host_id
+            or bound.runner_id is None
+            or bound.runner_id in awaited_runner_ids
+            or is_move_claim(bound.runner_id)
+        ):
+            break
+        _logger.info(
+            "Managed runner %s was replaced by %s for session %s; waiting for the replacement",
+            runner_id,
+            bound.runner_id,
+            session_id,
+            extra={"session_id": session_id},
+        )
+        runner_id = bound.runner_id
+        # The message that relaunched it waits this long for a confirmed spawn.
+        connect_timeout_s = min(
+            _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            * _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR,
+            remaining_s,
+        )
     _logger.error(
         "Managed runner connection timed out",
         extra=debug_event(
@@ -7553,13 +7615,18 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
     managed launch (create-time provisioning or a dead-sandbox
     relaunch): resolve as soon as the launch settles, surface the
     recorded reason when it failed, and give up with a clear retry
-    hint when the launch outlives the rendezvous budget.
+    hint when the launch outlives the rendezvous budget. A launch whose
+    provisioned sandbox's host has not registered says so instead,
+    with the provider's recovery guidance when it offers some.
 
     :param launch: The session's tracker entry.
     :raises OmnigentError: 503 when the launch failed or is still
         running at the timeout.
     """
-    from omnigent.server.managed_hosts import MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S
+    from omnigent.server.managed_hosts import (
+        MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
+        read_provider_recovery_hint,
+    )
 
     try:
         await asyncio.wait_for(
@@ -7567,10 +7634,15 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
             timeout=MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S,
         )
     except TimeoutError:
-        raise OmnigentError(
-            "The session's managed sandbox is still provisioning; try again shortly",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from None
+        message = "The session's managed sandbox is still provisioning; try again shortly"
+        # The hint is bound only while a provisioned sandbox's host registers.
+        if (hint_callback := launch.host_online_failure_hint) is not None:
+            hint = await read_provider_recovery_hint(hint_callback)
+            message = (
+                "The host in the session's managed sandbox has not connected to the server"
+                + (f" — {hint}" if hint else " yet; try again shortly")
+            )
+        raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE) from None
     if launch.error is not None:
         raise OmnigentError(
             f"The session's managed sandbox failed to launch: {launch.error}",
@@ -8525,8 +8597,12 @@ def _build_new_item(
     :raises OmnigentError: When ``body.data`` does not satisfy the
         payload schema for ``body.type``.
     """
+    item_data = {"type": body.type, **body.data}
+    if body.type == "terminal_command":
+        # Direct events do not drain a web submission, regardless of producer claims.
+        item_data["submission"] = {} if item_data.get("kind") == "input" else None
     try:
-        data = parse_item_data(body.type, {"type": body.type, **body.data})
+        data = parse_item_data(body.type, item_data)
     except ValidationError as exc:
         raise OmnigentError(
             f"invalid data for {body.type!r} item: {exc}",
@@ -11477,6 +11553,63 @@ def _derive_terminal_launch_args_from_spec(
     return None
 
 
+# Spec keys that declare a native session's own approval stance.
+_SPEC_PERMISSION_KEYS = ("permission_mode", "exec_mode", "yolo")
+
+
+def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
+    """
+    The harness and permission mode a Claude Code session is running in now.
+
+    The mode label tracks switches made after launch, so it wins over the launch
+    flags it may have replaced. Other harnesses, Codex included, report nothing:
+    their recorded mode can go stale or be left to config, so it isn't passed on.
+
+    :param conv: The session row, e.g. a sub-agent's parent.
+    :returns: ``(harness, mode)``, e.g. ``("claude-native", "auto")``, or ``None``
+        when the session isn't a Claude Code session with a known mode.
+    """
+    from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
+
+    native_agent = _native_coding_agent_for_session(conv)
+    if native_agent is None or native_agent.harness != _CLAUDE_NATIVE_HARNESS:
+        return None
+    mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+    mode = mode or claude_launch_permission_mode(list(conv.terminal_launch_args or []))
+    return (_CLAUDE_NATIVE_HARNESS, mode) if mode else None
+
+
+def _inherited_parent_permission_launch_args(
+    parent: Conversation | None, harness: str | None, spec: AgentSpec | None
+) -> list[str] | None:
+    """
+    Launch args that start a sub-agent in the closest match to its parent's mode.
+
+    A child spec that declares its own stance keeps it. A parent mode that skips
+    approval isn't inherited, the same as one the creating agent requests.
+
+    :param parent: The child's parent session, or ``None``.
+    :param harness: The child's canonical harness, e.g. ``"codex-native"``.
+    :param spec: The child's own agent spec, when it loaded.
+    :returns: The CLI args, or ``None`` to keep the harness default.
+    """
+    if parent is None or harness is None:
+        return None
+    if spec is not None and _spec_harness(spec) == harness:
+        if any(spec.executor.config.get(key) is not None for key in _SPEC_PERMISSION_KEYS):
+            return None
+    live = _session_live_permission_mode(parent)
+    if live is None:
+        return None
+    mode = inherited_permission_mode(live[0], live[1], harness)
+    if mode is None:
+        return None
+    try:
+        return created_session_launch_args(harness, mode)
+    except ValueError:
+        return None
+
+
 def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
     """
     Resolve terminal-first wrapper labels from an already-loaded sub-spec.
@@ -13339,6 +13472,7 @@ __all__ = [
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
+    "_inherited_parent_permission_launch_args",
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",

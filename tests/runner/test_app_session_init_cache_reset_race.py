@@ -79,8 +79,8 @@ class _SessionSnapshotServerClient(NullServerClient):
 def _spec(version: str) -> AgentSpec:
     """Build an agent spec carrying a version-marked, user-invocable skill.
 
-    ``skills_filter="none"`` suppresses host-skill discovery and the journal
-    group is off, which drops Omnigent's own skills, so the skills read is
+    ``skills_filter="none"`` suppresses host-skill discovery and the journal and
+    memory groups are off, which drops Omnigent's own skills, so the skills read is
     exactly the bundled set — hermetic, independent of the dev's real
     ``~/.claude/skills/``.
 
@@ -100,7 +100,7 @@ def _spec(version: str) -> AgentSpec:
             )
         ],
         skills_filter="none",
-        tool_groups=ToolGroupsConfig(journal=False),
+        tool_groups=ToolGroupsConfig(journal=False, memory=False),
     )
 
 

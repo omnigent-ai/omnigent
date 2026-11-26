@@ -84,3 +84,111 @@
   padding: 0 4px;
   margin: 0 2px;
 }
+
+/* Indent guides: a 1px line at each indent level, one gradient tile per level; the cursor's
+   block adds a stronger line over its own guide. */
+.cm-editor {
+  --cm-indent-guide-color: color-mix(in oklch, var(--foreground) 12%, transparent);
+  --cm-indent-guide-active-color: color-mix(in oklch, var(--foreground) 34%, transparent);
+}
+.cm-line.cm-indent-guides {
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--cm-indent-guide-color) 0 1px,
+    transparent 1px var(--cm-indent-unit)
+  );
+  background-size: calc(var(--cm-indent-guides) * var(--cm-indent-unit)) 100%;
+  background-repeat: no-repeat;
+}
+.cm-line.cm-indent-guides.cm-indent-guide-active {
+  background-image:
+    linear-gradient(var(--cm-indent-guide-active-color), var(--cm-indent-guide-active-color)),
+    repeating-linear-gradient(
+      to right,
+      var(--cm-indent-guide-color) 0 1px,
+      transparent 1px var(--cm-indent-unit)
+    );
+  background-size:
+    1px 100%,
+    calc(var(--cm-indent-guides) * var(--cm-indent-unit)) 100%;
+  background-position:
+    var(--cm-indent-guide-active) 0,
+    0 0;
+}
+
+/* Sticky scroll: the lines opening the scopes around the top of the view, pinned to the
+   scroller's top-left corner above the gutters, under the find bar. */
+.cm-stickyScroll {
+  position: sticky;
+  top: 0;
+  left: 0;
+  flex: none;
+  width: 0;
+  height: 0;
+  z-index: 201;
+}
+.cm-stickyScroll-rows {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+  /* Its own stacking context, so the innermost row slides under the others, not under it. */
+  isolation: isolate;
+  background-color: var(--background);
+}
+.cm-stickyScroll-shown .cm-stickyScroll-rows {
+  box-shadow: 0 3px 4px -2px color-mix(in oklch, var(--foreground) 22%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+.dark [data-testid="file-viewer"] .cm-stickyScroll-rows {
+  background: var(--shell-canvas, var(--background));
+}
+.cm-stickyScroll-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  height: var(--cm-sticky-line-height);
+  line-height: var(--cm-sticky-line-height);
+  white-space: pre;
+  cursor: pointer;
+  background-color: inherit;
+}
+/* The innermost line slides up under the others as its scope scrolls away. */
+.cm-stickyScroll-line:last-child {
+  z-index: -1;
+}
+.cm-stickyScroll-line:hover {
+  background-image: linear-gradient(var(--viewer-active-line), var(--viewer-active-line));
+}
+.cm-stickyScroll-line:hover .cm-stickyScroll-number {
+  color: var(--foreground);
+}
+.cm-stickyScroll-number {
+  flex: none;
+  box-sizing: border-box;
+  width: var(--cm-sticky-gutter-width);
+  padding-right: calc(
+    var(--cm-sticky-gutter-width) - var(--cm-sticky-number-width) + var(--cm-sticky-number-padding)
+  );
+  text-align: right;
+  color: var(--muted-foreground);
+}
+.cm-stickyScroll-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.cm-stickyScroll-code {
+  display: inline-block;
+  transform: translateX(var(--cm-sticky-text-offset));
+}
+
+/* The text Find in selection is limited to; matches outside it aren't highlighted. */
+.cm-find-scope {
+  background-color: color-mix(in oklch, var(--primary) 14%, transparent);
+}
+.cm-editor .cm-find-outside-scope .cm-searchMatch,
+.cm-editor .cm-find-outside-scope .cm-searchMatch.cm-searchMatch-selected {
+  background-color: transparent;
+}

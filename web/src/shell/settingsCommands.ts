@@ -1,10 +1,18 @@
-// ⌘K rows for settings people change often: the appearance mode, the terminal theme and two
-// chat switches, each one row with a page of its values. Each shares its name, choices and
-// write path with its Settings control.
+// ⌘K rows for settings people change often: the appearance mode, the terminal theme, two
+// chat switches and the file viewer's sticky scroll, each one row with a page of its values.
+// Each shares its name, choices and write path with its Settings control or saved preference.
 
 import { useMemo } from "react";
 import { useTheme } from "next-themes";
-import { FoldVerticalIcon, type LucideIcon, MonitorIcon, SendIcon } from "lucide-react";
+import {
+  FoldVerticalIcon,
+  type LucideIcon,
+  MonitorIcon,
+  PanelsTopLeftIcon,
+  PinIcon,
+  SendIcon,
+  SquareIcon,
+} from "lucide-react";
 
 import { normalizeThemeMode, type ThemeMode } from "@/components/theme/themeMode";
 import {
@@ -14,7 +22,15 @@ import {
 } from "@/components/theme/themeModeOptions";
 import { useTerminalThemeMode } from "@/components/theme/useTerminalIsDark";
 import { useAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  isPaneCornersChoice,
+  PANE_CORNERS_CHOICES,
+  PANE_CORNERS_LABELS,
+  type PaneCornersChoice,
+  paneCornersPreference,
+} from "@/lib/paneCornersPreference";
 import { useHostTheme } from "@/lib/embedded";
+import { useStickyScroll, writeStickyScroll } from "@/lib/fileViewPreferences";
 import {
   useFoldAssistantNarration,
   writeFoldAssistantNarration,
@@ -26,11 +42,15 @@ import {
 } from "@/lib/terminalThemePreferences";
 import { ALWAYS_STEER_ENTRY } from "@/pages/settings/search/catalog/general";
 import {
+  PANE_CORNERS_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
   TERMINAL_THEME_ENTRY,
 } from "@/pages/settings/search/catalog/appearance";
-import type { PaletteCommand } from "@/store/paletteCommands";
+import { HIDDEN, type PaletteCommand } from "@/store/paletteCommands";
 import { booleanSetting, type PaletteSetting, settingCommand } from "@/store/paletteSettings";
+
+import { type PaneCornersState, usePaneCorners } from "./useFloatingPanes";
+import { useTabsSidebar } from "./useTabsSidebar";
 
 /** An on/off setting, named as Settings shows it. */
 interface SettingSwitch {
@@ -53,6 +73,25 @@ export const ALWAYS_STEER_SETTING: SettingSwitch = {
   icon: SendIcon,
   keywords: ALWAYS_STEER_ENTRY.keywords,
 };
+
+/** Whether the file viewer pins the lines that open the scopes around the top of the view. */
+export function stickyScrollSetting(
+  enabled: boolean,
+  offered: boolean,
+  write: (enabled: boolean) => void = writeStickyScroll,
+): PaletteSetting {
+  return booleanSetting({
+    id: "file-viewer.sticky-scroll",
+    owner: "app",
+    label: "Sticky scroll",
+    icon: PinIcon,
+    keywords: ["sticky", "scroll", "scopes", "breadcrumbs", "pinned", "header", "file", "code"],
+    // Only the tabs sidebar's code viewer pins scopes.
+    availability: offered ? undefined : HIDDEN,
+    enabled,
+    write,
+  });
+}
 
 /** The appearance mode; embedded in Databricks, System reads "Use Databricks setting". */
 export function appearanceModeSetting(
@@ -106,6 +145,42 @@ export function settingSwitchSetting(
   return booleanSetting({ ...setting, owner: "app", enabled, write });
 }
 
+const PANE_CORNERS_DESCRIPTIONS: Record<PaneCornersChoice, string> = {
+  automatic: "Follows this server's default for floating panes.",
+  floating: "Show the chat and workspace sidebar as rounded cards.",
+  sharp: "Show the chat and workspace sidebar edge to edge.",
+};
+
+/**
+ * Floating panes or sharp corners on this device. Automatic follows the server's policy and
+ * names what it gives now; the row shows only where the floating design exists.
+ */
+export function paneCornersSetting(
+  { available, choice, policyFloating, floating }: PaneCornersState,
+  write: (choice: PaneCornersChoice) => void = (next) => paneCornersPreference.write(next),
+): PaletteSetting {
+  return {
+    id: PANE_CORNERS_ENTRY.id,
+    owner: "app",
+    label: PANE_CORNERS_ENTRY.label,
+    icon: floating ? PanelsTopLeftIcon : SquareIcon,
+    keywords: PANE_CORNERS_ENTRY.keywords,
+    current: choice,
+    availability: available ? undefined : HIDDEN,
+    choices: PANE_CORNERS_CHOICES.map((value) => ({
+      value,
+      label:
+        value === "automatic"
+          ? `Automatic (${PANE_CORNERS_LABELS[policyFloating ? "floating" : "sharp"]})`
+          : PANE_CORNERS_LABELS[value],
+      description: PANE_CORNERS_DESCRIPTIONS[value],
+    })),
+    choose: (value) => {
+      if (isPaneCornersChoice(value)) write(value);
+    },
+  };
+}
+
 /** Every setting row above, current as the settings change here or in another window. */
 export function useSettingsCommands(): PaletteCommand[] {
   const { theme, setTheme } = useTheme();
@@ -114,6 +189,9 @@ export function useSettingsCommands(): PaletteCommand[] {
   const terminalTheme = useTerminalThemeMode();
   const showFinalAnswer = useFoldAssistantNarration();
   const alwaysSteer = useAlwaysSteer();
+  const paneCorners = usePaneCorners();
+  const stickyScroll = useStickyScroll();
+  const tabsSidebar = useTabsSidebar();
   return useMemo(
     () => [
       settingCommand(appearanceModeSetting(mode, followsHost, setTheme)),
@@ -126,7 +204,19 @@ export function useSettingsCommands(): PaletteCommand[] {
         ),
       ),
       settingCommand(settingSwitchSetting(ALWAYS_STEER_SETTING, alwaysSteer, writeAlwaysSteer)),
+      settingCommand(paneCornersSetting(paneCorners)),
+      settingCommand(stickyScrollSetting(stickyScroll, tabsSidebar)),
     ],
-    [mode, followsHost, setTheme, terminalTheme, showFinalAnswer, alwaysSteer],
+    [
+      mode,
+      followsHost,
+      setTheme,
+      terminalTheme,
+      showFinalAnswer,
+      alwaysSteer,
+      paneCorners,
+      stickyScroll,
+      tabsSidebar,
+    ],
   );
 }

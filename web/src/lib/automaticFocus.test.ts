@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { isBehindOpenLayer } from "./automaticFocus";
+import { closingDialogFocus, isBehindOpenLayer } from "./automaticFocus";
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -40,5 +40,34 @@ describe("isBehindOpenLayer", () => {
     const button = element('<button id="outside">Outside</button>', "#outside");
     element('<div role="menu" data-state="closed"></div>', "[role=menu]");
     expect(isBehindOpenLayer(button)).toBe(false);
+  });
+});
+
+describe("closingDialogFocus", () => {
+  const PICKER = "[data-picker]";
+
+  it("returns focus to the opener while focus is still in a closing picker, or on the page", () => {
+    const opener = element('<textarea id="opener"></textarea>', "#opener");
+    const query = element('<div data-picker><input id="query" /></div>', "#query");
+    query.focus();
+    expect(closingDialogFocus(opener, PICKER)).toEqual({ movedOn: false, restore: opener });
+    query.blur();
+    expect(closingDialogFocus(opener, PICKER)).toEqual({ movedOn: false, restore: opener });
+  });
+
+  it("leaves focus that something moved out of every picker where it is", () => {
+    const opener = element('<textarea id="opener"></textarea>', "#opener");
+    const elsewhere = element('<button id="elsewhere">Elsewhere</button>', "#elsewhere");
+    elsewhere.focus();
+    expect(closingDialogFocus(opener, PICKER).movedOn).toBe(true);
+  });
+
+  it("restores nothing to an opener that left the page or sits behind an open layer", () => {
+    const opener = element('<textarea id="opener"></textarea>', "#opener");
+    element('<div role="dialog" data-state="open"><button id="in">In</button></div>', "#in");
+    expect(closingDialogFocus(opener, PICKER).restore).toBeNull();
+    document.body.innerHTML = "";
+    expect(closingDialogFocus(opener, PICKER).restore).toBeNull();
+    expect(closingDialogFocus(null, PICKER)).toEqual({ movedOn: false, restore: null });
   });
 });

@@ -49,6 +49,10 @@ dependencies = [
     # Portable zombie-aware PID liveness checks for the host daemon
     # lifecycle (omnigent/host/local_server.py).
     "psutil>=5.9,<8",
+    # Ranks file paths for the workspace API's fuzzy file search
+    # (omnigent/host/workspace_fuzzy.py). Prebuilt abi3 wheels for macOS,
+    # Linux (glibc and musl) and Windows.
+    "frizbee>=0.13,<1",
     # CEL (Common Expression Language) for inline policy evaluation.
     # Non-Turing-complete, side-effect-free, guaranteed to terminate.
     # NOT pure-Python: cel-python hard-depends on google-re2 (a C++ extension,

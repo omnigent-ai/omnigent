@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import type { Chord } from "@/lib/shortcuts/chord";
+
 import type { MatchHighlight } from "./HighlightedText";
 import type { MatchRange } from "./match";
 
@@ -49,7 +51,32 @@ export interface QuickPickItem<Value = unknown> {
    * description as a hint), two to a line when there's room; with a query it's a plain row.
    */
   layout?: "card";
+  /**
+   * Buttons beside the row, outside its option, shown while it's hovered or active, such as
+   * Close. The pointer clicks them; the keyboard runs one by its `chord` on the active row.
+   */
+  actions?: readonly QuickPickRowAction[];
   value: Value;
+}
+
+/** A button beside one row, such as Close; see `QuickPickItem.actions`. */
+export interface QuickPickRowAction {
+  id: string;
+  /** Its tooltip and the name its row announces it by, such as "Close tab". */
+  label: string;
+  icon: ReactNode;
+  /** The keys that run it on the active row, while the query field has focus. */
+  chord?: Chord;
+  run: () => void;
+}
+
+/** A button in a group's heading, such as Close all; it takes Tab like the footer's buttons. */
+export interface QuickPickGroupAction {
+  id: string;
+  label: string;
+  /** The accessible name when the label alone is unclear, such as "Close all pull requests". */
+  ariaLabel?: string;
+  run: () => void;
 }
 
 /**

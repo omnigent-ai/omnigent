@@ -18,6 +18,7 @@ import { ShellCommandDraftContext } from "@/shell/ShellCommandContext";
 import { toast } from "sonner";
 import * as host from "@/lib/host";
 import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
+import { lastTerminalInputAt, resetTerminalInputTimes } from "@/lib/terminalInputTimes";
 import { resolveInitialAttachUrl, setTerminalLaunching, watchDirectUpgrade } from "@/lib/terminals";
 import {
   readTerminalClipboardPreference,
@@ -80,6 +81,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     onFileLink?: (uri: string) => boolean;
     onState: (state: ConnectionState) => void;
     onActivity?: () => void;
+    onInput?: () => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
@@ -108,7 +110,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       onState: (state: ConnectionState) => void,
       _isDark?: boolean,
       onActivity?: () => void,
-      _onInput?: () => void,
+      onInput?: () => void,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void,
       focusOnConnect = true,
@@ -125,6 +127,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         onFileLink,
         onState,
         onActivity,
+        onInput,
         dispose: this.dispose,
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
@@ -140,6 +143,7 @@ beforeEach(() => {
   act(() => toast.dismiss());
   render(<Toaster visibleToasts={100} />);
   terminalSessionMock.instances = [];
+  resetTerminalInputTimes();
   clipboardMock.copyText.mockReset().mockResolvedValue(undefined);
   vi.mocked(resolveInitialAttachUrl).mockReset();
   vi.mocked(watchDirectUpgrade).mockReset();
@@ -323,6 +327,61 @@ describe("control-mode terminal", () => {
     );
     await act(async () => {});
     expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
+  it("notes the user's typing for the shell it went to, and still tells the caller", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    const first = vi.fn();
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_zsh_s1" onInput={first} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    // Types into a session's own input callback, the latest by default; returns when it typed.
+    const typed = (instance = terminalSessionMock.instances.at(-1)!) => {
+      const at = performance.now();
+      act(() => instance.onInput?.());
+      return at;
+    };
+
+    // The session's own input callback notes the time and calls the caller's handler.
+    let at = typed();
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
+    expect(first).toHaveBeenCalledOnce();
+
+    // A new handler takes over without a new attach, and the note still happens.
+    const second = vi.fn();
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_s1" onInput={second} />);
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    resetTerminalInputTimes();
+    at = typed();
+    expect(second).toHaveBeenCalledOnce();
+    expect(first).toHaveBeenCalledOnce();
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
+
+    // Without a handler, typing is still noted.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_s1" />);
+    resetTerminalInputTimes();
+    at = typed();
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
+
+    // Another terminal, then another session: typing is noted for the one shown, not the old.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s2" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    resetTerminalInputTimes();
+    at = typed();
+    expect(lastTerminalInputAt("conv_abc", "terminal_bash_s2")).toBeGreaterThanOrEqual(at);
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBe(-Infinity);
+    // Input the old session still delivers is noted for its own shell.
+    resetTerminalInputTimes();
+    at = typed(terminalSessionMock.instances[0]);
+    expect(lastTerminalInputAt("conv_abc", "terminal_zsh_s1")).toBeGreaterThanOrEqual(at);
+    expect(lastTerminalInputAt("conv_abc", "terminal_bash_s2")).toBe(-Infinity);
+    rerender(<TerminalView sessionId="conv_other" terminalId="terminal_bash_s2" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(3));
+    resetTerminalInputTimes();
+    at = typed();
+    expect(lastTerminalInputAt("conv_other", "terminal_bash_s2")).toBeGreaterThanOrEqual(at);
+    expect(lastTerminalInputAt("conv_abc", "terminal_bash_s2")).toBe(-Infinity);
   });
 
   it("does not re-dial a launch-time attach that already reached its shell", async () => {

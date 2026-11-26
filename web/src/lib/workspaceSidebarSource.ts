@@ -9,6 +9,7 @@ import {
   isRunnerUnavailable503,
   RunnerOfflineError,
 } from "@/hooks/useWorkspaceChangedFiles";
+import type { RevisionSpec } from "@/lib/customComparison";
 import { authenticatedFetch } from "@/lib/identity";
 import type { ListedEntry } from "@/lib/workspaceApi";
 import {
@@ -96,7 +97,7 @@ export interface WorkspaceSidebarSource {
   ) => Promise<ListRepositoryRefsResponse>;
   listBranchCommits: (
     sessionId: string,
-    baseRevision: string,
+    range: RevisionSpec,
     signal?: AbortSignal,
   ) => Promise<ListBranchCommitsResponse>;
   resolveRepositoryContext: (
@@ -317,9 +318,9 @@ export const DEFAULT_WORKSPACE_SIDEBAR_SOURCE: WorkspaceSidebarSource = {
     hostOnly("listRepositoryRefs", signal, () =>
       workspaceSidebarApi().listRepositoryRefs(sessionId, signal),
     ),
-  listBranchCommits: (sessionId, baseRevision, signal) =>
+  listBranchCommits: (sessionId, range, signal) =>
     hostOnly("listBranchCommits", signal, () =>
-      workspaceSidebarApi().listBranchCommits(sessionId, baseRevision, signal),
+      workspaceSidebarApi().listBranchCommits(sessionId, range, signal),
     ),
   resolveRepositoryContext: (sessionId, signal) =>
     hostOnly("resolveRepositoryContext", signal, () =>

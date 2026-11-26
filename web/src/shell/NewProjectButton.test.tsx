@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -247,6 +247,32 @@ describe("NewProjectButton", () => {
 
     await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(2));
     expect(mocks.createDirectory).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a fresh dialog each time, without what was typed or picked before", async () => {
+    renderButton();
+    fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+      target: { value: "Garden" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Working directory: Not selected" }));
+    fireEvent.click(screen.getByRole("button", { name: "Select test folder" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Create a folder using the project name" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByPlaceholderText("Project name…")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "New project" }));
+
+    expect(screen.getByPlaceholderText("Project name…")).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    expect(screen.getByTestId("new-project-workspace")).toHaveAccessibleName(
+      "Working directory: Not selected",
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "Create a folder using the project name" }),
+    ).not.toBeChecked();
   });
 
   it("does not finish a dismissed folder submission or clear a reopened modal", async () => {
@@ -662,6 +688,34 @@ describe("NewProjectButton project repositories", () => {
     expect(mocks.cloneRepository).not.toHaveBeenCalled();
     expect(mocks.createProject).toHaveBeenCalledWith(
       { name: "Garden", config: { host_id: "host_2" } },
+      expect.any(Object),
+    );
+  });
+
+  it("keeps a folder submission when the selected source is picked again", async () => {
+    mocks.serverInfo = projectServerInfo;
+    let resolveDirectory: ((path: string) => void) | undefined;
+    mocks.createDirectory.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveDirectory = resolve;
+      }),
+    );
+    renderButton([laptop]);
+
+    const source = screen.getByRole("radiogroup", { name: "Project source" });
+    expect(within(source).getByRole("radio", { name: "Folder" })).toBeChecked();
+    expect(within(source).getByRole("radio", { name: "Repository" })).not.toBeChecked();
+    nameProject("Garden");
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Create a folder using the project name" }),
+    );
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    fireEvent.click(within(source).getByRole("radio", { name: "Folder" }));
+    await act(async () => resolveDirectory?.("/Users/me/Garden"));
+
+    expect(mocks.createProject).toHaveBeenCalledWith(
+      { name: "Garden", config: { host_id: "host_1", workspace: "/Users/me/Garden" } },
       expect.any(Object),
     );
   });

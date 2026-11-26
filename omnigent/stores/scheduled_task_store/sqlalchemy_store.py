@@ -214,6 +214,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         kind=decode_scheduled_task_kind(row.kind),
         session_id=row.session_id,
         source_session_id=row.source_session_id,
+        workflow_id=row.workflow_id,
         workspace=row.workspace,
         base_branch=row.base_branch,
         execution_target=decode_scheduled_task_execution_target(row.execution_target),
@@ -327,6 +328,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
+        workflow_id: str | None = None,
         workspace: str | None = None,
         base_branch: str | None = None,
         host_id: str | None = None,
@@ -382,6 +384,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 kind=encoded_kind,
                 session_id=session_id,
                 source_session_id=source_session_id,
+                workflow_id=workflow_id,
                 workspace=workspace,
                 base_branch=base_branch,
                 execution_target=encode_scheduled_task_execution_target(execution_target),
@@ -556,6 +559,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
+        workflow_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
         base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
@@ -572,8 +576,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         ``None`` leaves most fields unchanged. For the per-task overrides
         (``model_override``, ``reasoning_effort``, ``permission_mode``),
         ``workspace``, ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
-        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
-        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``session_id``, ``workflow_id``, and ``last_run_conversation_id``, the
+        sentinel default means "not provided / leave unchanged"; passing ``None``
+        explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (a set
         ``bypassPermissions`` can be turned back off), and clearing both
         ``host_id`` and ``workspace`` unpins a task (e.g. switching it to
@@ -674,6 +679,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     changed = True
             if session_id is not _UNSET and row.session_id != session_id:
                 row.session_id = session_id
+                changed = True
+            if workflow_id is not _UNSET and row.workflow_id != workflow_id:
+                row.workflow_id = workflow_id
                 changed = True
             if workspace is not _UNSET and row.workspace != workspace:
                 row.workspace = workspace
@@ -1887,3 +1895,47 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return result
 
         return run_write_transaction(self._session_immediate, "finish_startup", write)
+
+    def hand_back_timer_firing(
+        self, run: ScheduledTaskRun, *, now: Callable[[], float], host_id: str
+    ) -> ScheduledTaskRun | None:
+        """Lock the task, then the run, as finishing a startup does. See protocol."""
+        if run.workspace_id != current_workspace_id():
+            return None
+
+        def write(session: Session) -> ScheduledTaskRun | None:
+            task = session.get(
+                SqlScheduledTask, (run.workspace_id, run.scheduled_task_id), with_for_update=True
+            )
+            row = session.get(
+                SqlScheduledTaskRun, (run.workspace_id, run.id), with_for_update=True
+            )
+            timestamp = int(now())
+            if (
+                row is None
+                or row.status != encode_scheduled_task_run_status("starting")
+                or row.lease_expires_at != run.lease_expires_at
+                or row.lease_expires_at is None
+                or row.lease_expires_at <= timestamp
+            ):
+                return None
+            row.status = encode_scheduled_task_run_status("skipped")
+            row.lease_expires_at = None
+            row.finished_at = timestamp
+            if task is None or task.state == encode_scheduled_task_state("deleted"):
+                row.error = "the timer was cancelled before this firing went out"
+                row.error_code = "timer_cancelled"
+                result = _run_to_entity(row)
+                _purge_finished_deleted_task(session, task, row)
+                return result
+            row.error = f"the timer's session moved to host {host_id}"
+            row.error_code = "timer_host_moved"
+            task.host_id = host_id
+            # Later than the claimed occurrence, so the next claim gets its own trigger key.
+            task.next_run_at = timestamp + 1
+            if task.state == encode_scheduled_task_state("completed"):
+                task.state = encode_scheduled_task_state("active")
+            task.updated_at = timestamp
+            return _run_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "hand_back_timer_firing", write)

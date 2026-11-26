@@ -8,6 +8,7 @@ import { AGENT_BROWSER_TAB_ID, agentBrowserTabId, browserViewId } from "@/hooks/
 import {
   SESSION_HOST_PROTOCOL,
   SSH_PREVIEW_PROTOCOL,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL,
   type BrowserHostOptions,
 } from "@/lib/nativeBridge";
 import {
@@ -425,6 +426,7 @@ export async function dispatchAgentBrowserAction<D extends object, R extends Age
                 ? {
                     sessionHostProtocol: SESSION_HOST_PROTOCOL,
                     sshPreviewProtocol: SSH_PREVIEW_PROTOCOL,
+                    trustedRemotePreviewProtocol: TRUSTED_REMOTE_PREVIEW_PROTOCOL,
                     sourceHostId,
                   }
                 : undefined),

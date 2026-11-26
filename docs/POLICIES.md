@@ -415,6 +415,52 @@ github_access:
       - "fix/*"
 ```
 
+### GitLab
+
+#### `gitlab_policy`
+
+Controls a small set of GitLab issue and merge-request activities through `glab` shell commands. Configure which GitLab servers and projects an agent can read, create issues in, and comment on issues in. Projects can have nested groups (`team/subgroup/project`). Paths match case-insensitively. The policy is opt-in and uses the existing ALLOW, DENY, and ASK approval flow.
+
+| Automatically classified commands | Scope |
+|-----------------------------------|-------|
+| `glab issue list`, `view` | Read issue lists and individual issues |
+| `glab mr list`, `view`, `diff` | Read merge requests and their changes |
+| `glab issue create` | Create an issue with explicit `--title` and `--description` |
+| `glab issue note` | Comment on a numeric issue ID with explicit `--message` |
+
+The aliases `ls`, `show`, `new`, and `comment` receive the same checks. Automatic decisions require `--repo` / `-R` to specify a full HTTPS project URL or a configured `host/group/project` selector. Views, diffs, and comments also require a numeric issue or merge-request ID. Missing selectors, bare project paths, positional URLs, unknown options, and interactive input return ASK. Common list filters, pagination, JSON output, view comments, issue labels, and confidentiality are supported; other options require approval.
+
+Supported writes outside `write_repos` return DENY. Supported reads outside `read_repos` return DENY when `read_all=false`; otherwise supported reads on configured hosts are allowed. A bare allowlist entry applies to that project path across configured hosts; an HTTPS URL pins it to one server. Invalid configuration fails when the policy loads.
+
+Git remote operations, `git config` commands, Git global options, merge-request writes, forks, custom `glab api` requests (including reads), and other command families require approval. Recognized direct `glab issue`, `mr`, and `repo` deletion actions with supported shell syntax return DENY; commands obscured by unsupported shell syntax require approval. Local Git commands such as `status`, `diff`, `add`, `commit`, `branch`, and `tag` remain eligible for normal execution when invoked without Git global options. Their subcommand options are not inspected; this includes `git branch -u origin/main`, which changes local upstream configuration. Branch restrictions and configurable force/tag/deletion handling are deferred and are not exposed as settings. Attaching this policy alongside another forge's policy also makes Git remote operations require approval.
+
+Shell wrappers and chained commands use the shared POSIX shell parser with conservative approval guards for syntax that differs in Windows shells. Single quotes, backslashes, carets, percent signs, smart quotes, embedded `!`, shell expansion, unquoted shell redirection, unmodelled ASCII control characters (other than tabs/newlines), and detected CLI environment assignments require approval, including when they occur in literal issue text. Use plain double quotes for text containing spaces. Double-quoted literal `<` and `>` remain ordinary text. These guards run before command recognition and tokenization, including for commands without a literal GitLab executable name. Options following a shell command-string flag (`bash -c -- ...`, for example) require approval. Standalone shell negation (`!`) preserves the underlying command’s decision. DENY takes precedence over ASK across independently understood command segments. Unrecognized command forms mentioning `git` or `glab` require approval. Executable recognition ignores casing and `.exe` suffix casing. This is not a full cmd.exe or PowerShell parser. The policy inspects command text and assumes existing CLI configuration and executables are trusted. Environment variable removals (`env -u`, `unset`) are not modeled. It does not contact GitLab to verify project existence or resolve configuration. GitLab MCP tools, direct HTTP clients, and arbitrary scripts accessing GitLab are outside its coverage; use additional controls for those paths. GitLab account permissions still apply after policy approval.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `hosts` | string[] | `["gitlab.com"]` | Trusted GitLab HTTPS authorities, including explicit ports |
+| `read_all` | boolean | `true` | Allow supported reads across projects on configured hosts |
+| `read_repos` | string[] | `[]` | Readable projects when `read_all=false` |
+| `write_repos` | string[] | `[]` | Projects permitting issue creation and issue comments |
+| `shell_tools` | string[] | every harness shell tool | Tools whose `command` argument is inspected |
+| `deny_reason` | string | `GitLab operation blocked by policy.` | Prefix for DENY explanations |
+
+```yaml
+gitlab_access:
+  type: function
+  handler: omnigent.policies.builtins.gitlab.gitlab_policy
+  factory_params:
+    hosts:
+      - gitlab.example.com
+    read_all: false
+    read_repos:
+      - https://gitlab.example.com/team/app
+    write_repos:
+      - https://gitlab.example.com/team/app
+```
+
+For this configuration, `glab issue create -R https://gitlab.example.com/team/app -t Fix -d Details` is allowed by this policy, the same write to `team/other` is denied, and `git push` or `glab mr create` asks for approval.
+
 ### Google Workspace
 
 #### `gdrive_policy`

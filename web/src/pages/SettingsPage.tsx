@@ -42,6 +42,8 @@ import {
   useRef,
   useState,
 } from "react";
+import { paneCornersSetting } from "@/shell/settingsCommands";
+import { usePaneCorners } from "@/shell/useFloatingPanes";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useProactiveAgentSettings } from "@/hooks/useProactiveAgentSettings";
 import {
@@ -109,8 +111,10 @@ import {
   ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_IN_DESKTOP_APP_ENTRY,
   OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  PROACTIVE_AGENT_ENTRY,
   PROJECT_KANBAN_BOARD_ENTRY,
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   TERMINAL_CLIPBOARD_ENTRY,
@@ -124,6 +128,7 @@ import {
   HIDE_UNCONFIGURED_HARNESSES_ENTRY,
   PEER_SESSION_MESSAGES_ENTRY,
   SHOW_FINAL_ANSWER_ENTRY,
+  PANE_CORNERS_ENTRY,
   TERMINAL_THEME_ENTRY,
   THEME_MODE_ENTRY,
   TRANSCRIPT_VIEW_DEFAULT_ENTRY,
@@ -159,6 +164,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { BrowserAgentToolsSettingsGroup } from "@/components/BrowserPane/agentTools/BrowserAgentToolsSettingsGroup";
+import { TrustedRemoteHostsSettingsGroup } from "@/components/BrowserPane/agentTools/TrustedRemoteHostsSettingsGroup";
 import {
   Select,
   SelectContent,
@@ -177,7 +183,6 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, signOutOfBrowserSession } from "@/lib/accountsApi";
 import {
   beginGithubConnect,
@@ -395,10 +400,16 @@ import {
   resetCliPath,
   supportsBrowser,
   supportsGlobalShortcut,
+  supportsWidenWindowForRightSidebar,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
 } from "@/lib/nativeBridge";
+import {
+  desktopAppHandoffSupported,
+  readOpenInDesktopApp,
+  writeOpenInDesktopApp,
+} from "@/lib/desktopAppHandoff";
 import { readOpenLinksInApp, writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { PROACTIVE_AGENT_DISPLAY_NAME } from "@/lib/proactiveInbox";
 import { cn } from "@/lib/utils";
@@ -408,8 +419,10 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { SearchableShortcutsList } from "./settings/SearchableShortcutsList";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
 import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
+import { WidenWindowForRightSidebarControl } from "./settings/WidenWindowForRightSidebarControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -687,6 +700,54 @@ function TerminalThemeControl() {
         />
       </SettingsOwner>
     </SettingsItem>
+  );
+}
+
+/** Floating panes or sharp corners on this device; the same setting ⌘K's Pane corners row offers. */
+function PaneCornersControl() {
+  const paneCorners = usePaneCorners();
+  const setting = paneCornersSetting(paneCorners);
+  const current = setting.choices.find((choice) => choice.value === setting.current);
+  return (
+    <SettingsItem entry={PANE_CORNERS_ENTRY} className="flex items-center justify-between gap-4">
+      <SettingsEntryLabel entry={PANE_CORNERS_ENTRY} className="flex-1" />
+      <SettingsOwner entry={PANE_CORNERS_ENTRY}>
+        <Select
+          value={setting.current}
+          onValueChange={(next) => void setting.choose(next)}
+          componentId="settings.appearance.pane_corners"
+          valueHasNoPii
+        >
+          <SelectTrigger
+            {...settingsControlProps(PANE_CORNERS_ENTRY)}
+            data-testid="pane-corners-select"
+            className="w-full sm:w-56"
+          >
+            <SelectValue>{current?.label}</SelectValue>
+          </SelectTrigger>
+          <SelectContent {...settingsOverlayProps(PANE_CORNERS_ENTRY)}>
+            {setting.choices.map((choice) => (
+              <SelectItem
+                key={choice.value}
+                value={choice.value}
+                data-testid={`pane-corners-${choice.value}`}
+              >
+                {choice.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </SettingsOwner>
+    </SettingsItem>
+  );
+}
+
+function PaneCornersRow() {
+  if (!usePaneCorners().available) return null;
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <PaneCornersControl />
+    </div>
   );
 }
 
@@ -1345,6 +1406,7 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <ColorThemeControl />
             </div>
+            <PaneCornersRow />
           </SettingsGroup>
 
           <SettingsGroup title="Chat defaults" testId="settings-group-chat">
@@ -2015,6 +2077,35 @@ function OpenLinksInAppControl() {
   );
 }
 
+/**
+ * Whether a conversation link opened in this browser moves to the running
+ * desktop app. Ordinary browsers only; off until the user accepts the page's offer.
+ */
+function OpenInDesktopAppControl() {
+  const [enabled, setEnabled] = useState(readOpenInDesktopApp);
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeOpenInDesktopApp(next);
+  }, []);
+
+  return (
+    <SettingsItem
+      entry={OPEN_IN_DESKTOP_APP_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_IN_DESKTOP_APP_ENTRY} className="flex-1" />
+      <Switch
+        {...settingsControlProps(OPEN_IN_DESKTOP_APP_ENTRY)}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-in-desktop-app-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_in_desktop_app"
+      />
+    </SettingsItem>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
 
@@ -2167,7 +2258,7 @@ function ProactiveAgentGroup() {
   if (!available) return null;
   return (
     <SettingsGroup title={PROACTIVE_AGENT_DISPLAY_NAME} testId="settings-group-proactive-agent">
-      <ProactiveAgentSettingControl scope="me" />
+      <ProactiveAgentSettingControl scope="me" entry={PROACTIVE_AGENT_ENTRY} />
     </SettingsGroup>
   );
 }
@@ -2175,6 +2266,8 @@ function ProactiveAgentGroup() {
 function GeneralSection() {
   const info = useServerInfo();
   const titleInstructions = info !== "loading" && info.session_title_instructions === true;
+  const globalShortcut = supportsGlobalShortcut();
+  const widenWindowForRightSidebar = supportsWidenWindowForRightSidebar();
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
@@ -2209,14 +2302,25 @@ function GeneralSection() {
             <OpenLinksInAppControl />
           </SettingsGroup>
         )}
+        {desktopAppHandoffSupported() && (
+          <SettingsGroup title="Conversation links" testId="settings-group-conversation-links">
+            <OpenInDesktopAppControl />
+          </SettingsGroup>
+        )}
         <BrowserAgentToolsSettingsGroup />
-        {supportsGlobalShortcut() && (
+        <TrustedRemoteHostsSettingsGroup />
+        {(globalShortcut || widenWindowForRightSidebar) && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
-            <GlobalShortcutControl />
-            {isFeatureEnabled(info, "floating_composer") && (
+            {globalShortcut && <GlobalShortcutControl />}
+            {globalShortcut && isFeatureEnabled(info, "floating_composer") && (
               // Empty, and hidden, unless the shell can change the panel's shortcut by id.
               <div className="mt-4 border-t border-border pt-4 empty:hidden">
                 <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
+            {widenWindowForRightSidebar && (
+              <div className={cn(globalShortcut && "mt-4 border-t border-border pt-4")}>
+                <WidenWindowForRightSidebarControl />
               </div>
             )}
           </SettingsGroup>
@@ -2656,7 +2760,7 @@ function StepperButton({
 function ShortcutsSection() {
   return (
     <Section title="Keyboard shortcuts" description="Speed up common actions with the keyboard.">
-      <KeyboardShortcutsList variant="settings" />
+      <SearchableShortcutsList />
     </Section>
   );
 }

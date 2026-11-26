@@ -16,6 +16,7 @@
  */
 
 import { hostFetch } from "./host";
+import { effectiveQuickPickEnabled, readUiFeatureOverrides } from "./uiFeatureOverrides";
 
 /**
  * Server session-sharing policy (mirrors the backend ``SharingMode``):
@@ -78,7 +79,9 @@ export type FeatureKey =
   | "quick_pick_palette"
   | "floating_composer"
   | "workspace_sidebar_v2"
-  | "sidebar_saved_views";
+  | "sidebar_saved_views"
+  | "floating_panes"
+  | "shared_session_updates_socket";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -275,6 +278,12 @@ export interface ServerInfo {
    */
   session_mute?: boolean;
   /**
+   * True when ``GET /v1/sessions/projects`` reports each project's ``muted``.
+   * Older servers drop it, so a saved project mute would never read back and
+   * the client offers Mute project only when this is set. Fails to ``false``.
+   */
+  project_mute?: boolean;
+  /**
    * True when scheduled tasks accept ``session_mode`` and ``session_id``.
    * Older servers reject the fields, so the automation dialog hides its
    * Session control there. Fails to ``false``.
@@ -282,6 +291,11 @@ export interface ServerInfo {
   scheduled_task_session_modes?: boolean;
   /** Scheduled tasks accept `mcp_services`; older servers reject it. */
   scheduled_task_mcp_services?: boolean;
+  /**
+   * Scheduled tasks accept `workflow_id` and `workflow_details`, and the server writes
+   * the prompt that runs the workflow; older servers reject them.
+   */
+  scheduled_task_workflow_id?: boolean;
   /**
    * True when a session create (and so ``sys_session_create``) accepts
    * ``permission_mode``. Older servers ignore the field, so trigger templates
@@ -555,10 +569,12 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   automations_enabled: true,
   session_search_scope: false,
   session_mute: false,
+  project_mute: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
   session_create_workflow_id: false,
   scheduled_task_mcp_services: false,
+  scheduled_task_workflow_id: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_trigger_headers: false,
@@ -602,7 +618,15 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
-  return info !== "loading" && info.features?.[feature] === true;
+  if (info === "loading") return false;
+  if (info.features && Object.hasOwn(info.features, feature)) {
+    const overrides = readUiFeatureOverrides();
+    if (feature === "quick_pick_palette" || effectiveQuickPickEnabled(info, overrides)) {
+      const override = overrides[feature];
+      if (override !== undefined) return override;
+    }
+  }
+  return info.features?.[feature] === true;
 }
 
 export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
@@ -747,10 +771,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           session_mute: data.session_mute === true,
+          project_mute: data.project_mute === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
           session_create_workflow_id: data.session_create_workflow_id === true,
           scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
+          scheduled_task_workflow_id: data.scheduled_task_workflow_id === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,

@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import IO
 
@@ -34,7 +34,7 @@ _LEAKED_ENV_KEYS = frozenset({"RUNNER_SERVER_URL", "OMNIGENT_REMOTE_AUTH_TOKEN"}
 
 
 def sandbox_server_config(gateway_url: str) -> dict[str, object]:
-    """Server YAML: a managed provider whose Codex is gateway-backed, with no inference binding."""
+    """Server YAML: a managed provider whose Claude Code and Codex are gateway-backed, unbound."""
     return {
         "sandbox": {
             "provider": SANDBOX_PROVIDER,
@@ -50,6 +50,10 @@ def sandbox_server_config(gateway_url: str) -> dict[str, object]:
                             "api_key_ref": f"env:{_SANDBOX_KEY_ENV}",
                             "wire_api": "responses",
                         },
+                        "anthropic": {
+                            "base_url": gateway_url,
+                            "api_key_ref": f"env:{_SANDBOX_KEY_ENV}",
+                        },
                     }
                 }
             },
@@ -61,6 +65,11 @@ def sandbox_server_config(gateway_url: str) -> dict[str, object]:
             },
         }
     }
+
+
+def sandbox_server_database_uri(workdir: Path) -> str:
+    """Database of the server :func:`spawn_sandbox_server` starts in *workdir*."""
+    return f"sqlite:///{workdir / 'server.db'}"
 
 
 def spawn_sandbox_server(
@@ -105,7 +114,7 @@ def spawn_sandbox_server(
                 "--port",
                 str(port),
                 "--database-uri",
-                f"sqlite:///{workdir / 'server.db'}",
+                sandbox_server_database_uri(workdir),
                 "--artifact-location",
                 str(artifacts),
             ],
@@ -149,19 +158,16 @@ def agent_id_for(base_url: str, name: str) -> str:
     return ids[0]
 
 
-@pytest.fixture(scope="module")
-def gateway_sandbox_server(
-    built_spa: None,
-    mock_llm_server_url: str,
-    tmp_path_factory: pytest.TempPathFactory,
+@contextlib.contextmanager
+def running_gateway_sandbox(
+    workdir: Path, mock_llm_server_url: str, models: Sequence[str]
 ) -> Iterator[str]:
-    """A hostless server offering the Islo sandbox; the mock LLM is the ambient gateway."""
-    workdir = tmp_path_factory.mktemp("gateway_sandbox_server")
+    """Run :func:`spawn_sandbox_server` while the mock LLM, its gateway, lists *models*."""
     proc, base_url, log_handle = spawn_sandbox_server(workdir, mock_llm_server_url)
     try:
         httpx.post(
             f"{mock_llm_server_url}/mock/served_models",
-            json={"models": list(GATEWAY_MODELS)},
+            json={"models": list(models)},
             timeout=10.0,
         ).raise_for_status()
         yield base_url
@@ -173,6 +179,18 @@ def gateway_sandbox_server(
             )
         stop_server(proc)
         log_handle.close()
+
+
+@pytest.fixture(scope="module")
+def gateway_sandbox_server(
+    built_spa: None,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """A hostless server offering the Islo sandbox; the mock LLM is the ambient gateway."""
+    workdir = tmp_path_factory.mktemp("gateway_sandbox_server")
+    with running_gateway_sandbox(workdir, mock_llm_server_url, GATEWAY_MODELS) as base_url:
+        yield base_url
 
 
 def _open_harness_picker(page: Page) -> None:

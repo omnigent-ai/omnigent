@@ -4,7 +4,7 @@
  */
 
 import { useMemo, useState } from "react";
-import { ChevronRightIcon, CornerLeftUpIcon } from "lucide-react";
+import { ChevronRightIcon, ClockIcon, CornerLeftUpIcon } from "lucide-react";
 
 import {
   RunGraphButton,
@@ -16,10 +16,13 @@ import {
 import { Button } from "@/components/ui/button";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
+import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { useNow } from "@/hooks/useNow";
 import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useWorkflowRunDescendants, useWorkflowRuns } from "@/hooks/useWorkflow";
+import { automationPagePath } from "@/lib/automationFromSession";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { Link } from "@/lib/routing";
 import { formatRunTimestamp } from "@/lib/scheduleText";
 import type { StepState } from "@/lib/sessionJournal";
@@ -30,6 +33,7 @@ import {
   isWorkflowRunWorking,
   runStepProgress,
   type WorkflowRun,
+  type WorkflowRunAutomation,
   type WorkflowRunStarter,
   type WorkflowRunState,
 } from "@/lib/workflowRuns";
@@ -137,6 +141,7 @@ export function WorkflowRunRow({
             {stateLabel}
             {run.archived && <span>Archived</span>}
           </p>
+          {run.automation && <RunAutomation automation={run.automation} />}
           {startedBy && <RunStartedBy starter={startedBy} />}
           {progress.length > 0 && (
             <RunTimeline
@@ -190,6 +195,25 @@ export function WorkflowRunRow({
         />
       )}
     </li>
+  );
+}
+
+/** Links a run to the automation whose scheduled run started it. */
+function RunAutomation({ automation }: { automation: WorkflowRunAutomation }) {
+  const info = useServerInfo();
+  const automationsEnabled = useAutomationsEnabled();
+  if (!automationsEnabled) return null;
+  return (
+    <Link
+      to={automationPagePath(info, automation)}
+      className="relative z-10 mt-1 flex w-fit max-w-full items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+      data-testid="workflow-run-automation"
+    >
+      <ClockIcon aria-hidden className="size-3.5 shrink-0" />
+      <span className="truncate">
+        Scheduled · <span className="font-medium text-foreground">{automation.name}</span>
+      </span>
+    </Link>
   );
 }
 

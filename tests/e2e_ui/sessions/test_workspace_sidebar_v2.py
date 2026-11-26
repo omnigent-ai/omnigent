@@ -11,14 +11,18 @@ The flag is turned on by answering ``/v1/info`` with it added to the server's ow
 the server side of the flag is covered by ``tests/server/test_feature_flags.py``. Pull
 requests come from the same stubs as ``test_github_tab.py``, so no ``gh`` runs. The Changes
 journey runs on its own server and host, with ``workspace_api_server_access`` on, so its Git
-reads go through the workspace API. A reopened shell tab says it's connecting until the session
+reads go through the workspace API; there, Files shows a chain of only-child folders as one row
+before any of them is opened. A reopened shell tab says it's connecting until the session
 lists its shell, then shows its terminal.
 """
 
 from __future__ import annotations
 
+import contextlib
 import re
+import shutil
 import subprocess
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -49,15 +53,15 @@ _VIEWPORTS = {
 _TABS_CHUNK = re.compile(
     r"/assets/(?:WorkspaceTabsHost|workspaceTabsSessions|featurePaletteRows)-[^/]*\.js"
 )
-# Text only the tabs sidebar's code carries: its CodeMirror token class, history group,
-# New Tab picker and shortcut list. A chunk rule that pulled that code into an eager chunk,
-# or a lazy branch that loaded it, would bring one of them here.
+# Text only the tabs sidebar's code carries (token class, history group, New Tab picker); an
+# eager chunk or lazy load of that code would bring one here. Shortcut labels aren't markers:
+# they live in the shared registry every page loads.
 _TABS_CODE_MARKERS = (
     "cm-shiki-token",
     "Workspace history",
     "Open an app in this tab",
-    "Reopen closed workspace tab",
 )
+_PINNED_PAGES_KEY = "omnigent:pinned-workspace-tabs"
 _FILE = "tabs_sidebar_notes.py"
 _EDIT = "# saved from the tabs sidebar"
 _PR_TITLE = "Add the GitHub tab"
@@ -74,8 +78,19 @@ def workspace_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, st
         _cleanup_session_workdir(session_id)
 
 
-def _set_flag(page: Page, enabled: bool) -> None:
-    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``."""
+def _start_with_no_pinned_pages(page: Page) -> None:
+    """Start the session's strips with nothing pinned, for a journey that opens its own tabs."""
+    page.add_init_script(f"window.localStorage.setItem({_PINNED_PAGES_KEY!r}, JSON.stringify([]))")
+
+
+def _set_flag(page: Page, enabled: bool, *, settings_pins: bool = False) -> None:
+    """Answer ``/v1/info`` with the server's own payload and the flag set to ``enabled``.
+
+    With the flag on, a journey opens the tabs it needs, so its strips start with nothing
+    pinned unless ``settings_pins`` keeps Settings as shipped.
+    """
+    if enabled and not settings_pins:
+        _start_with_no_pinned_pages(page)
 
     def answer(route: Route) -> None:
         response = route.fetch()
@@ -250,6 +265,109 @@ def test_tabs_sidebar_files_history_and_pull_request(
         assert any(marker in body for body in bodies), marker
 
 
+def test_all_tabs_groups_the_tabs_and_closes_them_by_row_and_by_group(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """A file tab, a PR tab, then a new tab → All tabs lists them under Pull requests, Files
+    and Other, the new one marked Current → ⌘⌫ closes the file → Close all closes the PR's tab.
+    """
+    base_url, session_id = workspace_session
+    _stub_github(page)
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+
+    _open_app(page, sidebar, "Files")
+    sidebar.get_by_role("treeitem", name=re.compile(re.escape(_FILE))).click()
+    expect(sidebar.locator(".cm-content")).to_contain_text("print('hello')", timeout=30_000)
+    file_tab = sidebar.get_by_role("tab", name=re.compile(rf"^{re.escape(_FILE)}"))
+    _open_app(page, sidebar, "Pull Requests")
+    sidebar.get_by_role("button", name=re.compile(rf"#{_PR_NUMBER}\b")).first.click()
+    pr_tab = sidebar.get_by_role("tab", name=re.compile(rf"#{_PR_NUMBER}"))
+    expect(pr_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    sidebar.get_by_role("button", name="New tab", exact=True).click()
+    expect(sidebar.get_by_role("combobox", name="Open an app in this tab")).to_be_focused()
+
+    sidebar.get_by_role("button", name="All tabs").click()
+    tab_list = page.get_by_role("listbox", name="Search tabs")
+    other = tab_list.get_by_role("group", name=re.compile(r"^Other"))
+    expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
+    files = tab_list.get_by_role("group", name=re.compile(r"^Files 1"))
+    file_row = files.get_by_role("option", name=re.compile(re.escape(_FILE)))
+    expect(file_row).to_be_visible()
+    pulls = tab_list.get_by_role("group", name=re.compile(r"^Pull requests 1"))
+    pr_row = pulls.get_by_role("option", name=re.compile(rf"#{_PR_NUMBER} {_PR_TITLE}"))
+    expect(pr_row).to_contain_text("octocat")
+    expect(pr_row).to_contain_text("Checks failing")
+
+    # The pointer picks the file's row; the query keeps the keys, and ⌘⌫ closes that tab.
+    file_row.hover()
+    expect(file_row).to_have_attribute("aria-selected", "true")
+    page.keyboard.press("ControlOrMeta+Backspace")
+    expect(file_tab).to_have_count(0)
+    expect(files).to_have_count(0)
+
+    page.get_by_role("button", name="Close all pull request tabs").click()
+    expect(pr_tab).to_have_count(0)
+    expect(pulls).to_have_count(0)
+    # The list stays open on what's left, with the new tab on screen.
+    expect(other.get_by_role("option", name=re.compile("Current"))).to_have_count(1)
+
+
+def test_a_new_strip_starts_on_the_settings_pinned_pages(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """With Settings as shipped, a session's first strip shows its pinned pages, on Files."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True, settings_pins=True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    files_tab = sidebar.get_by_role("tab", name=re.compile(r"^Files"))
+    expect(files_tab).to_have_attribute("aria-selected", "true", timeout=30_000)
+    # Pull Requests and Tasks join only where the session offers them.
+    for page_name in ("Diffs", "Agents"):
+        expect(sidebar.get_by_role("tab", name=re.compile(rf"^{page_name}"))).to_have_count(1)
+    expect(sidebar.get_by_role("tab", name="New tab", exact=True)).to_have_count(0)
+
+
+def test_full_screen_chord_opens_the_sidebar_full_screen_and_leaves_it(
+    page: Page, workspace_session: tuple[str, str]
+) -> None:
+    """⇧⌘F opens a closed sidebar straight into full screen, and leaves it again."""
+    base_url, session_id = workspace_session
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    collapse = sidebar.get_by_role("button", name="Collapse right panel")
+    expect(collapse).to_be_visible(timeout=60_000)
+    collapse.click()
+    expect(sidebar).to_have_count(0)
+    # The session remembers the closed rail, so it reloads without the sidebar ever showing.
+    page.reload()
+    expect(page.get_by_role("button", name="Expand right panel")).to_be_visible(timeout=60_000)
+    expect(sidebar).to_have_count(0)
+
+    maximized = page.locator("[data-maximized]")
+    # The chord binds once its code loads, which the closed rail doesn't wait for.
+    deadline = time.monotonic() + 60
+    while maximized.count() == 0:
+        assert time.monotonic() < deadline, "⇧⌘F never opened the sidebar"
+        page.keyboard.press("ControlOrMeta+Shift+F")
+        with contextlib.suppress(AssertionError):
+            expect(maximized).to_have_count(1, timeout=1_000)
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    full_screen = page.get_by_role("button", name=re.compile(r"full screen", re.IGNORECASE))
+    expect(full_screen).to_have_attribute("aria-pressed", "true")
+
+    page.keyboard.press("ControlOrMeta+Shift+F")
+    expect(full_screen).to_have_attribute("aria-pressed", "false")
+    expect(maximized).to_have_count(0)
+
+
 def test_files_menu_copies_the_path_and_a_link_to_the_file(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
@@ -281,7 +399,11 @@ def test_files_menu_copies_the_path_and_a_link_to_the_file(
 def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     page: Page, workspace_session: tuple[str, str]
 ) -> None:
-    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen."""
+    """A ``?file=`` link with ``comment`` and ``fullscreen=1`` shows that thread, full screen.
+
+    Settings stay as shipped, so the strip takes its pinned pages as the link opens; the
+    linked file keeps the selection.
+    """
     base_url, session_id = workspace_session
     anchor = "hello"
     response = httpx.post(
@@ -297,7 +419,7 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     )
     response.raise_for_status()
     comment_id = response.json()["id"]
-    _set_flag(page, True)
+    _set_flag(page, True, settings_pins=True)
     page.set_viewport_size(_VIEWPORTS["desktop"])
     page.goto(f"{base_url}/c/{session_id}?file={_FILE}&comment={comment_id}&fullscreen=1")
 
@@ -307,6 +429,10 @@ def test_file_link_opens_its_comment_in_a_full_screen_sidebar(
     expect(page.locator("[data-maximized]")).to_have_count(1)
     # The link is handed to the tab, so a reload doesn't open it again.
     expect(page).not_to_have_url(re.compile(r"[?&](?:file|comment|fullscreen)="))
+    expect(sidebar.get_by_role("tab", name=re.compile(r"^Agents"))).to_have_count(1)
+    file_tab = sidebar.get_by_role("tab", name=re.compile(rf"^{re.escape(_FILE)}"))
+    expect(file_tab).to_have_attribute("aria-selected", "true")
+    expect(viewer).to_contain_text("Say goodbye too")
 
 
 def test_tabs_sidebar_shell_tab_connects_then_shows_its_terminal(
@@ -600,3 +726,134 @@ def test_changes_compare_branches_and_tags_through_the_workspace_api(
     open_right_rail(page)
     expect(changed("feature_first.txt")).to_be_visible(timeout=60_000)
     expect_first("feature_last.txt", "feature_first.txt")
+
+
+def test_files_shows_a_folder_chain_as_one_row_through_the_workspace_api(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """The host reports ``com/example/app`` with the root listing, so no folder needs opening."""
+    base_url, session_id = git_session
+    chain = tmp_path / "repository" / "com" / "example" / "app"
+    chain.mkdir(parents=True)
+    (chain / "Main.java").write_text("class Main {}\n")
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    # The tabs sidebar loads lazily; a cold start can outlast the click's default timeout.
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+
+    merged = sidebar.get_by_role("treeitem", name="com / example / app", exact=True)
+    expect(merged).to_be_visible(timeout=30_000)
+    expect(sidebar.get_by_role("treeitem", name="com", exact=True)).to_have_count(0)
+    merged.click()
+    expect(sidebar.get_by_role("treeitem", name="Main.java", exact=True)).to_be_visible(
+        timeout=15_000
+    )
+
+
+_BIG_FOLDER_FILES = 1200
+# Scroll the tree that holds `row` to its end.
+_SCROLL_TREE_TO_END = """(row) => {
+  for (let node = row.parentElement; node; node = node.parentElement) {
+    const scrolls = /(auto|scroll)/.test(getComputedStyle(node).overflowY);
+    if (scrolls && node.scrollHeight > node.clientHeight + 4) {
+      node.scrollTop = node.scrollHeight;
+      return;
+    }
+  }
+}"""
+
+
+def test_files_lists_a_folder_longer_than_one_listing_page_to_its_last_file(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A folder past one REST listing page of 1,000 entries lists all of them."""
+    # The runner's listing answers 1,000 entries a page, as a session's usually does.
+    base_url, session_id = seeded_session
+    environment = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default", timeout=10.0
+    )
+    environment.raise_for_status()
+    # Nothing may have written to the workspace yet, so its root is made along with the folder.
+    big = Path(environment.json()["metadata"]["root"]) / "big"
+    big.mkdir(parents=True)
+    try:
+        _list_big_folder_to_its_end(page, base_url, session_id, big)
+    finally:
+        shutil.rmtree(big, ignore_errors=True)
+
+
+def _list_big_folder_to_its_end(page: Page, base_url: str, session_id: str, big: Path) -> None:
+    for index in range(_BIG_FOLDER_FILES):
+        (big / f"f{index:04d}.txt").write_text(f"file {index}\n")
+    # Listed over REST, whose endpoint answers 1,000 entries a page; the workspace API's host
+    # may list a whole folder in one page.
+    page.route(
+        "**/workspace/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory",
+        lambda route: route.fulfill(
+            status=404,
+            content_type="application/json",
+            body='{"code": "not_found", "message": "listed over REST"}',
+        ),
+    )
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+
+    sidebar.get_by_role("treeitem", name="big", exact=True).click()
+    # Rows are virtualized and the host may list in any order, so a row's set size says how
+    # many entries the folder holds.
+    listed_file = sidebar.get_by_role("treeitem", name=re.compile(r"^f\d{4}\.txt$")).first
+    expect(listed_file).to_have_attribute("aria-setsize", str(_BIG_FOLDER_FILES), timeout=30_000)
+    # Scrolled to its end, the tree reaches the folder's last file.
+    last = sidebar.get_by_role("treeitem", name=f"f{_BIG_FOLDER_FILES - 1:04d}.txt", exact=True)
+    for _ in range(20):
+        if last.count():
+            break
+        listed_file.evaluate(_SCROLL_TREE_TO_END)
+        page.wait_for_timeout(200)
+    expect(last).to_be_visible(timeout=15_000)
+
+
+def test_files_lists_git_ignored_files_marked_as_ignored_only_once_switched_on(
+    page: Page, git_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Files leaves out what Git ignores; the options switch lists it, marked, until it's off."""
+    base_url, session_id = git_session
+    repository = tmp_path / "repository"
+    (repository / ".gitignore").write_text("build/\n")
+    (repository / "build").mkdir()
+    (repository / "build" / "app.bin").write_text("x")
+    _set_flag(page, True)
+    _open_session(page, base_url, session_id, "desktop")
+    open_right_rail(page)
+    sidebar = page.get_by_role("complementary", name="Workspace")
+    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
+    _open_app(page, sidebar, "Files")
+    # A full-screen workspace docks the tree, with its options in the tree's header.
+    page.get_by_role("button", name="Full screen", exact=True).click()
+    build = sidebar.get_by_role("treeitem", name=re.compile(r"^build\b"))
+    expect(sidebar.get_by_role("treeitem", name="base.txt", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    expect(build).to_have_count(0)
+
+    def switch_ignored_files() -> None:
+        sidebar.get_by_test_id("files-page-tree-header").get_by_role(
+            "button", name="Tree options", exact=True
+        ).click()
+        page.get_by_role("menuitemcheckbox", name="Show git-ignored files").click()
+
+    switch_ignored_files()
+    expect(build).to_have_attribute("data-item-git-status", "ignored", timeout=30_000)
+    expect(sidebar.get_by_role("treeitem", name="base.txt", exact=True)).not_to_have_attribute(
+        "data-item-git-status", "ignored"
+    )
+
+    switch_ignored_files()
+    expect(build).to_have_count(0, timeout=30_000)

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/nativeBridge", () => ({
   SESSION_HOST_PROTOCOL: 1,
   SSH_PREVIEW_PROTOCOL: 1,
+  TRUSTED_REMOTE_PREVIEW_PROTOCOL: 1,
   isElectronShell: () => true,
   supportsBrowser: () => true,
   getHostIdentity: async () => ({ cliInstalled: true, hostId: "host_laptop" }),
@@ -587,6 +588,7 @@ describe("pages the session's host can't read", () => {
       expect(call[3]).toEqual({
         sessionHostProtocol: 1,
         sshPreviewProtocol: 1,
+        trustedRemotePreviewProtocol: 1,
         sourceHostId: "source-host",
       });
       // Listing changes no tab's policy.

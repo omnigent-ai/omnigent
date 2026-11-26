@@ -50,6 +50,7 @@ import { updateTerminalSplit, useTerminalSplitPanes } from "./terminalSplitPanes
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
+import { BELOW_SESSION_HEADER } from "./sessionHeaderInset";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -436,7 +437,11 @@ export function MainTerminalView({
       // Distinguishes the revealed surface from the hidden pre-warmed
       // mount for tests — both are in the DOM.
       data-visible={visible}
-      className={cn("main-terminal-view flex min-h-0 flex-1 flex-col pt-12", className)}
+      className={cn(
+        "main-terminal-view flex min-h-0 flex-1 flex-col",
+        BELOW_SESSION_HEADER,
+        className,
+      )}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
         {!showPanes ? (

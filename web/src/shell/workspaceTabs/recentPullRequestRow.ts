@@ -5,6 +5,10 @@
 
 import type { PullRequest, PullRequestAssociation } from "@/hooks/usePullRequests";
 import { pullRequestIdentityParts, type NamedPullRequest } from "@/lib/pullRequestIdentity";
+import {
+  hasNewerPullRequestLifecycle,
+  type PullRequestStatusSummary,
+} from "@/lib/pullRequestStatus";
 
 import { pullRequestNumber, pullRequestUrlParts } from "./placeTitle";
 import type { WorkspacePlace } from "./workspacePlace";
@@ -15,6 +19,24 @@ export interface RecentPullRequestFacts {
   linked: readonly PullRequestAssociation[];
   /** Each pull request's details already read, by URL. */
   details: ReadonlyMap<string, PullRequest>;
+  /** When each of `details` was read, in epoch milliseconds, where the cache says. */
+  detailsUpdatedAt?: ReadonlyMap<string, number>;
+}
+
+/**
+ * What's known of a PR's lifecycle: its details, unless the session's link saw a newer change,
+ * as when it merged after the details were read.
+ */
+export function knownPullRequestStatus(
+  url: string,
+  facts: RecentPullRequestFacts,
+): PullRequestStatusSummary | undefined {
+  const details = facts.details.get(url);
+  const linked = facts.linked.find((pr) => pr.url === url);
+  if (!details) return linked;
+  if (!linked) return details;
+  const readAt = facts.detailsUpdatedAt?.get(url) ?? 0;
+  return hasNewerPullRequestLifecycle(linked, details, readAt) ? linked : details;
 }
 
 export interface RecentPullRequestRow {

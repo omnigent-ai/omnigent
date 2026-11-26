@@ -212,6 +212,13 @@ describe("Files tab", () => {
       { place: { kind: "files", path: "src/c.ts" } },
       { opener: "user", disposition: "new" },
     );
+    // A breadcrumb pick steps the same tab, through the navigation its unsaved-edit guard holds.
+    onNavigate.mockClear();
+    captured.viewer!.onOpenFile!("src/d.ts");
+    expect(onNavigate.mock.calls).toEqual([
+      [{ kind: "files", path: "src/d.ts" }, { replace: false }],
+    ]);
+    expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
   it("shows the file at its cited lines and opens its changes there for Show changes", () => {
@@ -340,31 +347,21 @@ describe("Files tab", () => {
     expect(screen.getAllByRole("button", { name: "Hide Files Tree" })).toHaveLength(1);
   });
 
-  it("sorts the tree and shows hidden files from the toolbar's options", async () => {
+  it("keeps the tree's options in the tree's own header, not the toolbar", () => {
     const { fileSettings } = renderView({ kind: "files", path: "a.ts" });
-    const options = () =>
-      within(screen.getByTestId("file-viewer")).getByRole("button", { name: "Files tree options" });
-    await userEvent.click(options());
-    expect(screen.getByRole("menuitemradio", { name: "Last edited" })).toBeChecked();
-    await userEvent.click(screen.getByRole("menuitemradio", { name: "Size" }));
+    expect(
+      within(screen.getByTestId("file-viewer")).queryByRole("button", {
+        name: /^Tree options/,
+      }),
+    ).toBeNull();
+    act(() => captured.tree!.onSortChange("size"));
     expect(fileSettings.onSortChange).toHaveBeenCalledWith("size");
     expect(captured.tree!.sort).toBe("size");
-
-    await userEvent.click(options());
-    expect(screen.getByRole("menuitemradio", { name: "Size" })).toBeChecked();
-    const showHidden = screen.getByRole("menuitemcheckbox", { name: "Show hidden files" });
-    expect(showHidden).not.toBeChecked();
-    await userEvent.click(showHidden);
-    expect(fileSettings.onShowHiddenChange).toHaveBeenCalledWith(true);
-    expect(captured.tree!.showHidden).toBe(true);
-    await userEvent.click(options());
-    expect(screen.getByRole("menuitemcheckbox", { name: "Show hidden files" })).toBeChecked();
-    await userEvent.keyboard("{Escape}");
   });
 
   it("shows hidden files when an all-hidden workspace's tree asks", () => {
     const { fileSettings } = renderView({ kind: "files", path: "a.ts" });
-    act(() => captured.tree!.onShowHidden!());
+    act(() => captured.tree!.onShowHiddenChange(true));
     expect(fileSettings.onShowHiddenChange).toHaveBeenCalledTimes(1);
     expect(fileSettings.onShowHiddenChange).toHaveBeenCalledWith(true);
     expect(captured.tree!.showHidden).toBe(true);
@@ -373,7 +370,6 @@ describe("Files tab", () => {
   it("leaves the options to ⌘K while the tree is hidden", async () => {
     renderView({ kind: "files", path: "a.ts" });
     await userEvent.click(screen.getByRole("button", { name: "Hide Files Tree" }));
-    expect(screen.queryByRole("button", { name: "Files tree options" })).toBeNull();
     expect(registeredPaletteCommands().some((row) => row.id === "files-tree-hidden")).toBe(true);
   });
 
@@ -382,7 +378,6 @@ describe("Files tab", () => {
     renderView({ kind: "files", path: "a.ts" });
     await userEvent.click(screen.getByRole("button", { name: "Show Files Tree" }));
     expect(screen.getByRole("dialog", { name: "Workspace files" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Files tree options" })).toBeNull();
     expect(registeredPaletteCommands().some((row) => row.id === "files-tree-hidden")).toBe(true);
   });
 
@@ -401,6 +396,7 @@ describe("Files tab", () => {
       "Sort Files Tree by Size",
       "Sort Files Tree by Type",
       "Hide Hidden Files",
+      "Show Git-Ignored Files",
     ]);
     act(() => listed.find((row) => row.label === "Sort Files Tree by Type")!.run());
     expect(fileSettings.onSortChange).toHaveBeenCalledWith("type");
@@ -416,7 +412,29 @@ describe("Files tab", () => {
       "Sort Files Tree by Last edited",
       "Sort Files Tree by Size",
       "Show Hidden Files",
+      "Show Git-Ignored Files",
     ]);
+  });
+
+  it("shows git-ignored files from the tree and ⌘K, off by default and kept per device", () => {
+    renderView({ kind: "files", path: "a.ts" });
+    expect(captured.tree!.showIgnored).toBe(false);
+    act(() => captured.tree!.onShowIgnoredChange(true));
+    expect(captured.tree!.showIgnored).toBe(true);
+    expect(window.localStorage.getItem("omnigent:files-tree-show-ignored")).toBe("true");
+
+    const hide = registeredPaletteCommands().find((row) => row.id === "files-tree-ignored")!;
+    expect(hide.label).toBe("Hide Git-Ignored Files");
+    act(() => hide.run());
+    expect(captured.tree!.showIgnored).toBe(false);
+    expect(window.localStorage.getItem("omnigent:files-tree-show-ignored")).not.toBe("true");
+  });
+
+  it("gives the tree's ⌘K commands to the keyboard target only, while both trees stay on screen", () => {
+    renderView({ kind: "files", path: "a.ts" }, { keyboardTarget: false });
+    expect(captured.tree).toMatchObject({ active: true, commandsActive: false });
+    renderView({ kind: "files", path: "b.ts" }, { keyboardTarget: true });
+    expect(captured.tree).toMatchObject({ active: true, commandsActive: true });
   });
 
   it("leaves ⌘K and ⇧⌘E to the keyboard target when two Files places are on screen", () => {

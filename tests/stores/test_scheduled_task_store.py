@@ -349,6 +349,27 @@ def test_update_workspace_explicit_null_clears_it(
     assert cleared.host_id is None
 
 
+def test_workflow_id_round_trips_and_clears(store: SqlAlchemyScheduledTaskStore) -> None:
+    """The saved workflow a task runs reads back, stays unless updated, and clears to None."""
+    workflow_id = _uid("wf")
+    created = store.create(
+        scheduled_task_id=_uid("st_wf"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        workflow_id=workflow_id,
+    )
+    assert created.workflow_id == workflow_id
+    assert store.get(_uid("st_wf")).workflow_id == workflow_id
+    renamed = store.update(_uid("st_wf"), name="renamed")
+    assert renamed is not None and renamed.workflow_id == workflow_id
+    cleared = store.update(_uid("st_wf"), workflow_id=None)
+    assert cleared is not None and cleared.workflow_id is None
+
+
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     """Updating ``state`` to ``paused`` reads back ``paused``."""
     store.create(
@@ -3207,6 +3228,31 @@ def test_a_spent_one_shot_timer_is_removed_once_its_run_finishes(
     )
     assert store.get(timer.id) is None
     assert store.list_runs(timer.id)[0] == []
+
+
+def test_a_timer_firing_is_handed_back_only_under_its_live_lease(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _timer(store, "moved")
+    new_host = _uid("new-host")
+    run = _claim_timer(store, task)
+    assert run is not None and run.lease_expires_at is not None
+    claimed = store.get(task.id)
+    # Once the lease ran out, recovery owns the run, so a late hand-back changes nothing.
+    expired = run.lease_expires_at
+    assert store.hand_back_timer_firing(run, now=lambda: expired, host_id=new_host) is None
+    assert store.get(task.id) == claimed
+    assert [stored.status for stored in store.list_runs(task.id)[0]] == ["starting"]
+    handed = store.hand_back_timer_firing(run, now=lambda: _TIMER_FIRST_RUN, host_id=new_host)
+    assert handed is not None
+    assert (handed.status, handed.error_code) == ("skipped", "timer_host_moved")
+    # The one-shot is active again on the new host, due a second later than it was.
+    reopened = store.get(task.id)
+    assert (reopened.state, reopened.host_id, reopened.next_run_at) == (
+        "active",
+        new_host,
+        _TIMER_FIRST_RUN + 1,
+    )
 
 
 def test_a_timer_claims_one_firing_at_a_time(store: SqlAlchemyScheduledTaskStore) -> None:

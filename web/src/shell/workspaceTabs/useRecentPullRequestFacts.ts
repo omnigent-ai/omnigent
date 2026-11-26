@@ -33,13 +33,23 @@ export function useRecentPullRequestFacts(
   );
   useSyncExternalStore(subscribe, () => detailsVersion(client, keys));
   const details = new Map<string, PullRequest>();
-  if (info.data?.pr) details.set(info.data.pr.url, info.data.pr);
+  const detailsUpdatedAt = new Map<string, number>();
+  if (info.data?.pr) {
+    details.set(info.data.pr.url, info.data.pr);
+    detailsUpdatedAt.set(info.data.pr.url, info.dataUpdatedAt);
+  }
+  // The PR's own query and the session's may both hold a PR's details; the later read wins.
   keys.forEach((key, index) => {
     const pr = client.getQueryData<PullRequestInfo>(key)?.pr;
-    if (pr) details.set(urls[index]!, pr);
+    if (!pr) return;
+    const url = urls[index]!;
+    const readAt = client.getQueryState(key)?.dataUpdatedAt ?? 0;
+    if (readAt < (detailsUpdatedAt.get(url) ?? 0)) return;
+    details.set(url, pr);
+    detailsUpdatedAt.set(url, readAt);
   });
   const linked = linkedPullRequests(info.data, stored.data);
-  return { linked, details };
+  return { linked, details, detailsUpdatedAt };
 }
 
 /** Each URL's details key, as the PR's own query names it. */

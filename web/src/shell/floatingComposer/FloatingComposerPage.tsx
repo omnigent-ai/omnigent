@@ -33,12 +33,27 @@ function dismiss() {
   floatingComposerBridge()?.dismiss();
 }
 
+// Ready is said once per document: the composer stays mounted across launches.
+let readySent = false;
+
+/** Tells the shell the composer has painted, so an open shows it without a loading state. */
+function sayReady() {
+  if (readySent) return;
+  readySent = true;
+  const send = () => floatingComposerBridge()?.ready?.();
+  // A hidden window gets no frames, and nothing paints until it shows; its content is laid out.
+  if (document.visibilityState === "hidden") send();
+  // A frame callback runs before that frame paints; the next one runs after it has.
+  else requestAnimationFrame(() => requestAnimationFrame(send));
+}
+
 export function FloatingComposerPage() {
   // A delivered launch starts a fresh composer; a failed one keeps the prompt where it was.
   const [generation, setGeneration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   // Only the latest launch's outcome counts, so an older one can't clear a newer prompt.
   const latestLaunch = useRef(0);
+  const shownListeners = useRef(new Set<() => void>());
   const presentation = useMemo<ComposerPresentation>(
     () => ({
       kind: "floating",
@@ -53,6 +68,10 @@ export function FloatingComposerPage() {
         });
       },
       onFilePicker: (state) => floatingComposerBridge()?.filePicker(state),
+      subscribeShown: (listener) => {
+        shownListeners.current.add(listener);
+        return () => shownListeners.current.delete(listener);
+      },
       openAppPage: (page) => {
         void Promise.resolve()
           .then(() => floatingComposerBridge()?.openInMainWindow(page))
@@ -64,6 +83,26 @@ export function FloatingComposerPage() {
     }),
     [],
   );
+
+  // New Chat renders its composer synchronously, so it's on screen by the time this runs.
+  useEffect(sayReady, []);
+
+  // The prompt takes the keyboard whenever the panel does: on the shell's word, or on this
+  // document's first render if the panel is already up (a word sent before then is lost).
+  useEffect(() => {
+    const announce = () => {
+      for (const listener of shownListeners.current) listener();
+    };
+    if (document.visibilityState === "visible") announce();
+    const onShown = floatingComposerBridge()?.onShown;
+    if (onShown) return onShown(announce);
+    // An older shell never says so; a window taking focus with nothing focused in it stands in.
+    const onWindowFocus = () => {
+      if (document.activeElement === document.body) announce();
+    };
+    window.addEventListener("focus", onWindowFocus);
+    return () => window.removeEventListener("focus", onWindowFocus);
+  }, []);
 
   // Escape hides the panel, after any open picker or menu has taken its own Escape.
   useEffect(() => {

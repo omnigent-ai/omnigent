@@ -1,7 +1,9 @@
 import "@testing-library/jest-dom/vitest";
 import { configure } from "@testing-library/react";
 import type * as ReactVirtualModule from "@tanstack/react-virtual";
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
+
+import { abortInFlightXhrs, FetchBackedXhr, sentXhrs } from "@/test/fetchBackedXhr";
 
 // Tooltip surfaces intentionally wait 1s; leave enough margin for async queries
 // to observe them without racing Testing Library's matching default timeout.
@@ -142,4 +144,11 @@ Object.defineProperty(window, "matchMedia", {
     removeEventListener: () => {},
     dispatchEvent: () => false,
   }),
+});
+
+// Uploads report progress through XMLHttpRequest; route them through the test's fetch mock.
+globalThis.XMLHttpRequest = FetchBackedXhr as unknown as typeof XMLHttpRequest;
+afterEach(() => {
+  abortInFlightXhrs();
+  sentXhrs.length = 0;
 });

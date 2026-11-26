@@ -3,7 +3,7 @@
 
 import type { Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "../codeViewerHelpers";
 import { commentSelectionAt } from "../commentHighlights";
@@ -43,6 +43,15 @@ interface CodeMirrorCommentLayer {
   extension: Extension;
   /** The floating selection buttons, or null while hidden. */
   actions: React.ReactNode;
+  /** The same selection actions, for the editor's right-click menu. */
+  selectionActions: CodeMirrorSelectionActions;
+}
+
+export interface CodeMirrorSelectionActions {
+  canComment: boolean;
+  canAttachToAgent: boolean;
+  onAddComment: () => void;
+  onAttachToAgent: () => void;
 }
 
 /**
@@ -160,8 +169,19 @@ export function useCodeMirrorCommentLayer(
     onAttachToAgent: attachToAgent,
   });
 
+  const selectionActions = useMemo(
+    () => ({
+      canComment,
+      canAttachToAgent,
+      onAddComment: addComment,
+      onAttachToAgent: attachToAgent,
+    }),
+    [canComment, canAttachToAgent, addComment, attachToAgent],
+  );
+
   return {
     extension,
+    selectionActions,
     actions: buttonPosition && (
       <CommentSelectionActions
         position={buttonPosition}

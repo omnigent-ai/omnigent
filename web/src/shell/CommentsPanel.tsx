@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { CheckIcon, Link2Icon, WandSparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
+import { replaceEmojiShortcodes } from "@/lib/emojiShortcodes";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
@@ -401,6 +402,8 @@ function CommentCard({
 }: CommentCardProps) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(c.body);
+  // Display only: editing still shows the body as typed.
+  const displayBody = useMemo(() => replaceEmojiShortcodes(c.body), [c.body]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
@@ -504,7 +507,7 @@ function CommentCard({
               !expanded && "line-clamp-4",
             )}
           >
-            {c.body}
+            {displayBody}
           </p>
           {(clamped || expanded) && (
             <button

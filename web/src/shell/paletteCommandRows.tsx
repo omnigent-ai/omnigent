@@ -11,7 +11,7 @@ import {
 } from "@/store/paletteCommands";
 import { currentChoiceLabel } from "@/store/paletteSettings";
 
-import { shortcutKeys } from "./workspaceTabs/workspaceSidebarShortcuts";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 
 /** What a command row runs, and the target its command was built for. */
 export interface PaletteCommandRow {

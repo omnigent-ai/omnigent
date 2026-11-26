@@ -13,7 +13,6 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
@@ -556,9 +555,9 @@ class ToolManager:
         # Advise-models is capability-gated: expose it only when some router can
         # answer. Hiding the tool prevents agents from probing router_on via a
         # no-op call when routing is disabled.
-        from omnigent.server.routing_backend import routing_available
+        from omnigent.runtime import routing_stamp
 
-        if routing_available(get_caps()):
+        if routing_stamp():
             self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents

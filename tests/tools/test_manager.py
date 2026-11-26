@@ -608,6 +608,38 @@ def test_advise_models_hidden_when_routing_disabled() -> None:
     assert "sys_advise_models" not in names
 
 
+def test_advise_models_hidden_when_the_remote_server_does_not_route() -> None:
+    """A runner whose server reports no routing hides the advisor, as a router-less one does."""
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=None,
+        remote_routing_available=False,
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_list_models" in names
+    assert "sys_advise_models" not in names
+
+
+def test_advise_models_follows_the_routing_stamp_on_each_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each build reads the routing stamp, so a flip shows on the next ToolManager."""
+    from omnigent.runtime import _globals, set_remote_routing_available
+    from omnigent.runtime.caps import RuntimeCaps
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+
+    def advertised() -> set[str]:
+        return {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+
+    assert "sys_advise_models" not in advertised()
+    set_remote_routing_available(True)
+    assert "sys_advise_models" in advertised()
+    set_remote_routing_available(False)
+    assert "sys_advise_models" not in advertised()
+
+
 def test_advise_models_exposed_from_a_backends_only_deployment() -> None:
     """The gate is "some source can answer", not "a legacy client is set".
 
@@ -631,6 +663,22 @@ def test_advise_models_exposed_when_routing_enabled() -> None:
     with patch("omnigent.runtime._globals._caps", new=caps):
         names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_list_models" in names
+    assert "sys_advise_models" in names
+
+
+def test_advise_models_exposed_when_only_the_remote_server_routes() -> None:
+    """Expose the advisor when only the attached server can route.
+
+    The runner has no routing backends of its own, so the server's answer
+    from the session-init envelope decides the gate.
+    """
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=None,
+        remote_routing_available=True,
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_advise_models" in names
 
 
@@ -702,17 +750,18 @@ def test_both_grants_compose() -> None:
 
 def test_session_get_info_schema_has_optional_session_id() -> None:
     """
-    ``sys_session_get_info`` advertises a single optional ``session_id``
-    parameter (omitting it defaults to the caller's own session). If
-    ``session_id`` became required, an agent inspecting its own session
-    would be forced to look up its own id first.
+    ``sys_session_get_info`` advertises only optional parameters: ``session_id``
+    (omitting it defaults to the caller's own session) and the ``include_usage``
+    opt-in. If ``session_id`` became required, an agent inspecting its own
+    session would be forced to look up its own id first.
     """
     mgr = ToolManager(_make_spec([]))
     schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_session_get_info"
     )
     params = schema["function"]["parameters"]
-    assert set(params["properties"]) == {"session_id"}
+    assert set(params["properties"]) == {"session_id", "include_usage"}
+    assert params["properties"]["include_usage"]["type"] == "boolean"
     # No required fields — session_id is optional by design.
     assert params["required"] == []
 

@@ -50,12 +50,16 @@ from omnigent.server.scheduled.schedule import (
     scheduled_trigger_key,
     timer_rule,
 )
+from omnigent.server.session_journal import open_store as open_journal_store
 from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.server.workflows import open_store as open_workflow_store
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests.server.scheduled.test_dispatch_scheduler import _drain
 from tests.server.scheduled.test_fire import (
+    _WORKFLOW_STEPS,
     FakeAgentStore,
     FakeHostStore,
     FakePermissionStore,
@@ -67,6 +71,8 @@ from tests.server.scheduled.test_fire import (
     _FakeConversation,
     _FakeHost,
     _managed_sandbox_config,
+    _workflow_prompt,
+    _workflows_on,
 )
 from tests.server.scheduled.test_scheduler import FakeClock
 
@@ -122,6 +128,7 @@ def _claim(
     agent_id: str = _AGENT_ID,
     user_id: str | None = None,
     one_time: bool = False,
+    prompt: str = "do the thing",
     **kwargs: Any,
 ) -> _Claimed:
     """Create a due task and claim its first occurrence, as the scheduler's poll would.
@@ -134,7 +141,7 @@ def _claim(
     created = store.create(
         uuid.uuid4().hex,
         "nightly",
-        "do the thing",
+        prompt,
         "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
         user_id,
         agent_id,
@@ -168,6 +175,7 @@ def _deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDeps:
         managed_launches=overrides.get("managed_launches"),
         startup_inputs=overrides.get("startup_inputs"),
         project_store=overrides.get("project_store"),
+        app_state=overrides.get("app_state"),
     )
 
 
@@ -216,6 +224,34 @@ async def test_connected_fire_runs_on_the_claimed_run(
     assert row["attributes"]["run_id"] == run.id
     assert row["attributes"]["task_id"] == claimed.task.id
     assert row["attributes"]["trigger_key"] == run.trigger_key
+
+
+async def test_a_claimed_run_of_a_workflow_automation_starts_as_a_run_of_the_workflow(
+    store, db_uri
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflow = open_workflow_store(conversations).create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    claimed = _claim(store, prompt=_workflow_prompt(workflow.id))
+    plans_at_launch: list[Any] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, app_state=_workflows_on()),
+        launch_dispatch=dispatch,
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    [plan] = plans_at_launch
+    assert (run.status, run.conversation_id) == ("running", plan.conversation_id)
+    assert (plan.workflow_id, plan.scheduled_task_run_id) == (workflow.id, run.id)
+    assert plan.content["steps"] == workflow.steps
 
 
 @pytest.mark.parametrize(
@@ -1193,7 +1229,7 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
     release_hint = threading.Event()
     event_loop_thread = threading.get_ident()
     hint_threads: list[int] = []
-    monkeypatch.setattr(fire_mod, "_REGISTRATION_HINT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(managed_hosts, "PROVIDER_RECOVERY_HINT_TIMEOUT_S", 0.01)
 
     def hint() -> str | None:
         hint_threads.append(threading.get_ident())
@@ -2200,7 +2236,9 @@ async def test_failed_run_releases_its_binding_without_deleting_a_peers_sandbox(
 
 
 def _timer_session(**overrides: Any) -> _FakeConversation:
-    return _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, **overrides)
+    return _FakeConversation(
+        **{"id": _CONV_ID, "agent_id": _AGENT_ID, "host_id": _HOST_ID, **overrides}
+    )
 
 
 def _timer_deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDeps:
@@ -2209,8 +2247,13 @@ def _timer_deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDe
     return _deps(store, **overrides)
 
 
-def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claimed:
-    """Save a 30-second timer due now for the test session, then claim it as a poll would."""
+def _set_timer(
+    store: SqlAlchemyScheduledTaskStore, *, repeat: bool, host_id: str | None = _HOST_ID
+) -> ScheduledTask:
+    """Save a 30-second timer due now for the test session, as its route does.
+
+    :param host_id: The session's host when the timer was set, or ``None`` if it had none.
+    """
     now = int(time.time())
     task_id = uuid.uuid4().hex
     store.create(
@@ -2223,12 +2266,21 @@ def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claim
         "UTC",
         session_mode="continue",
         session_id=_CONV_ID,
-        host_id=_HOST_ID,
+        host_id=host_id,
         first_run_at=now,
         kind="timer",
         schedule_anchor=now - 30,
     )
     task = store.get(task_id)
+    assert task is not None
+    return task
+
+
+def _claim_timer(store: SqlAlchemyScheduledTaskStore, *, repeat: bool) -> _Claimed:
+    """Save a 30-second timer due now for the test session, then claim it as a poll would."""
+    task = _set_timer(store, repeat=repeat)
+    now = task.next_run_at
+    assert now is not None
     clock = FakeClock(now)
     run = store.claim_scheduled_run(
         task,
@@ -2252,11 +2304,16 @@ def _startup_outcomes(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str |
 
 @pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
 @pytest.mark.parametrize(
-    "labels",
-    [{}, {"omnigent.claude_native.permission_mode": "bypassPermissions"}],
-    ids=["asks-for-approval", "skips-approval"],
+    "session",
+    [
+        {},
+        {"labels": {"omnigent.claude_native.permission_mode": "bypassPermissions"}},
+        # A session without a host keeps the timer on its saved one.
+        {"host_id": None},
+    ],
+    ids=["asks-for-approval", "skips-approval", "without-a-host"],
 )
-async def test_a_timer_firing_wakes_its_session(store, repeat, labels) -> None:
+async def test_a_timer_firing_wakes_its_session(store, repeat, session) -> None:
     """The session is woken in whatever permission mode it is in, as a message would."""
     claimed = _claim_timer(store, repeat=repeat)
     seen: list[tuple[str, str]] = []
@@ -2264,7 +2321,7 @@ async def test_a_timer_firing_wakes_its_session(store, repeat, labels) -> None:
     async def dispatch(conv: Any, task: ScheduledTask) -> None:
         seen.append((conv.id, task.prompt))
 
-    sessions = _ExistingConversationStore(_timer_session(labels=labels))
+    sessions = _ExistingConversationStore(_timer_session(**session))
     await ClaimedRunExecutor(
         _timer_deps(store, conversation_store=sessions), launch_dispatch=dispatch
     ).fire(claimed.task, claimed.lease)
@@ -2278,7 +2335,7 @@ async def test_a_timer_firing_wakes_its_session(store, repeat, labels) -> None:
     assert (run.status, run.conversation_id, run.error_code) == ("succeeded", _CONV_ID, None)
     saved = store.get(claimed.task.id)
     # A tick never writes its task, which would race the next claim's snapshot.
-    assert (saved.state, saved.last_run_at) == ("active", None)
+    assert (saved.state, saved.last_run_at, saved.host_id) == ("active", None, _HOST_ID)
 
 
 async def test_a_cancel_during_a_firing_stops_later_ticks_but_not_this_one(store, caplog) -> None:
@@ -2301,6 +2358,93 @@ async def test_a_cancel_during_a_firing_stops_later_ticks_but_not_this_one(store
     await firing
     assert _startup_outcomes(caplog) == [("succeeded", None)]
     assert store.get(claimed.task.id) is None
+
+
+_MOVED_HOST_ID = uuid.uuid5(uuid.NAMESPACE_DNS, "moved-host").hex
+
+
+@pytest.mark.parametrize("repeat", [False, True], ids=["one_shot", "repeating"])
+@pytest.mark.parametrize("saved_host", [_HOST_ID, None], ids=["moved", "set_before_a_host"])
+async def test_a_timer_follows_its_session_to_another_replicas_host(
+    store, repeat, saved_host
+) -> None:
+    """The replica that claimed the firing hands it back unsent; the session's host's sends it."""
+    timer = _set_timer(store, repeat=repeat, host_id=saved_host)
+    assert timer.next_run_at is not None
+    clock = FakeClock(timer.next_run_at)
+    sessions = _ExistingConversationStore(_timer_session(host_id=_MOVED_HOST_ID))
+    deps = _timer_deps(store, conversation_store=sessions)
+    woken: dict[str, list[str]] = {"saved host": [], "session's host": []}
+
+    def replica(name: str, owned_key: str) -> PersistentTaskScheduler:
+        """A server replica that owns one host, or its workspace's tasks without one."""
+
+        async def dispatch(conv: Any, task: ScheduledTask) -> None:
+            woken[name].append(conv.id)
+
+        async def owned_hosts(keys: Any) -> list[str]:
+            return [key for key in keys if key == owned_key]
+
+        executor = ClaimedRunExecutor(deps, launch_dispatch=dispatch)
+        return PersistentTaskScheduler(
+            store, executor.fire, executor.recover, owned_hosts=owned_hosts, now=clock.now
+        )
+
+    saved = replica("saved host", host_ownership_key(timer.workspace_id, saved_host))
+    session_host = replica("session's host", _MOVED_HOST_ID)
+    try:
+        for scheduler in (session_host, saved):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+        # The saved host's replica handed the firing back unsent, a one-shot's included.
+        handed_back = store.get(timer.id)
+        assert (handed_back.state, handed_back.host_id, handed_back.next_run_at) == (
+            "active",
+            _MOVED_HOST_ID,
+            timer.next_run_at + 1,
+        )
+        clock.advance(1)
+        for scheduler in (saved, session_host, saved):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+    finally:
+        await saved.stop()
+        await session_host.stop()
+    assert woken == {"saved host": [], "session's host": [_CONV_ID]}
+    if not repeat:
+        assert store.get(timer.id) is None
+        return
+    [run] = _runs(store, timer)
+    assert (run.status, run.host_id, run.conversation_id) == (
+        "succeeded",
+        _MOVED_HOST_ID,
+        _CONV_ID,
+    )
+    assert store.get(timer.id).next_run_at == timer.next_run_at + 30
+
+
+@pytest.mark.parametrize("cancelled", ["before_the_hand_back", "after_it"])
+async def test_a_cancel_stops_a_timer_firing_handed_to_another_host(
+    store, caplog, cancelled
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.scheduled.dispatch_scheduler")
+    claimed = _claim_timer(store, repeat=False)
+    sessions = _ExistingConversationStore(_timer_session(host_id=_MOVED_HOST_ID))
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _timer_deps(store, conversation_store=sessions), launch_dispatch=dispatch
+    )
+    if cancelled == "before_the_hand_back":
+        assert await asyncio.to_thread(store.delete, claimed.task.id)
+    await executor.fire(claimed.task, claimed.lease)
+    if cancelled == "after_it":
+        assert await asyncio.to_thread(store.delete, claimed.task.id)
+    dispatch.assert_not_awaited()
+    expected = "timer_cancelled" if cancelled == "before_the_hand_back" else "timer_host_moved"
+    assert _startup_outcomes(caplog) == [("skipped", expected)]
+    # Nothing is left for the new host's replica to claim.
+    assert store.get(claimed.task.id) is None
+    assert store.list_due_tasks(claimed.task.next_run_at + 3600) == []
 
 
 @pytest.mark.parametrize(
