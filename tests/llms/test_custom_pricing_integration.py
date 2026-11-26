@@ -239,8 +239,9 @@ if __name__ == "__main__":
         {"api_key": "expensive-key"},
         {"api_key": "$PRICING_TEST_KEY"},
         {"api_key_ref": "env:PRICING_TEST_KEY"},
+        {"api_key": "expensive-key", "base_url": "$PRICING_TEST_ENDPOINT"},
     ],
-    ids=["inline", "unavailable-env", "unavailable-ref"],
+    ids=["inline", "unavailable-env", "unavailable-ref", "unavailable-endpoint"],
 )
 def test_fetch_pricing_with_explicit_provider_entry_beats_default(
     monkeypatch: pytest.MonkeyPatch,
@@ -256,6 +257,8 @@ def test_fetch_pricing_with_explicit_provider_entry_beats_default(
 
     monkeypatch.delenv("PRICING_TEST_KEY", raising=False)
     monkeypatch.delenv("OMNIGENT_PRICING_TEST_KEY", raising=False)
+    monkeypatch.delenv("PRICING_TEST_ENDPOINT", raising=False)
+    monkeypatch.delenv("OMNIGENT_PRICING_TEST_ENDPOINT", raising=False)
     expensive_entry = load_providers(
         {
             "providers": {
