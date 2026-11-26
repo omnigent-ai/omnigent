@@ -174,6 +174,29 @@ describe("TranscriptPaletteCommands", () => {
     act(() => command("Fork from latest response…").run());
     expect(openForkDialog).toHaveBeenCalledWith({ upToResponseId: "r1" });
   });
+
+  it("steps through the prompts as ⌘⌥↑ and ⌘⌥↓ do, once there is one", () => {
+    const messageNav = { goPrev: vi.fn(), goNext: vi.fn() };
+    const { rerender } = render(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={BUBBLES} messageNav={messageNav} />,
+      { wrapper: withFlag(true) },
+    );
+    const previous = command("Go to previous message");
+    expect([previous.shortcut, command("Go to next message").shortcut]).toEqual([
+      "message.previous",
+      "message.next",
+    ]);
+    act(() => previous.run());
+    act(() => command("Go to next message").run());
+    expect([messageNav.goPrev.mock.calls.length, messageNav.goNext.mock.calls.length]).toEqual([
+      1, 1,
+    ]);
+
+    rerender(
+      <TranscriptPaletteCommands conversationId="c1" bubbles={[]} messageNav={messageNav} />,
+    );
+    expect(command("Go to previous message").availability?.available).toBe(false);
+  });
 });
 
 function userBlock(itemId: string, content: UserMessageBlock["content"]): UserMessageBlock {
@@ -258,4 +281,50 @@ describe("useStopResponsePaletteCommand", () => {
     rerender({ working: false, readOnly: false });
     expect(command("Stop response").availability?.available).toBe(false);
   });
+
+  it.each([
+    [false, true],
+    [true, false],
+  ])(
+    "steps messages on Ctrl+Alt+Shift+↑ off macOS only with quick_pick_palette off (on: %s)",
+    (quickPick, shiftSteps) => {
+      useChatStore.setState({
+        conversationId: "c1",
+        blocks: [userBlock("u1", [{ type: "input_text", text: "Fix the parser" }])],
+      });
+      const Flag = withFlag(quickPick);
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter initialEntries={["/c/c1"]}>
+            <Flag>
+              <Transcript
+                setConversationEl={vi.fn()}
+                containerEl={null}
+                scroller={null}
+                setScroller={vi.fn()}
+                sendScrollNonce={0}
+                hasMoreHistory={false}
+                loadingMoreHistory={false}
+                isMobileViewport={false}
+                showsWorking={false}
+                agentsError={null}
+                sandboxLaunching={false}
+                spacerMeasureRef={{ current: null }}
+              />
+            </Flag>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      const press = (init: KeyboardEventInit) => {
+        const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+        window.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      // Ctrl+Alt+↑ steps either way; with the flag, Shift added is Previous session's.
+      expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true })).toBe(true);
+      expect(press({ key: "ArrowUp", ctrlKey: true, altKey: true, shiftKey: true })).toBe(
+        shiftSteps,
+      );
+    },
+  );
 });
