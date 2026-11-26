@@ -51,6 +51,12 @@ export function workspacePathInRepository(path: string, repository: string): str
   return repository ? `${repository}/${path}` : path;
 }
 
+/** `relative` under `workspace`, adding no second separator after a root such as `/` or `C:\`. */
+function inWorkspace(workspace: string, relative: string): string {
+  const base = trimHostPath(workspace);
+  return base.endsWith("/") ? `${base}${relative}` : `${base}/${relative}`;
+}
+
 /**
  * A workspace-relative or absolute path as `repository`'s listing names it; null when it lies
  * outside that folder.
@@ -68,8 +74,8 @@ export function repositoryPathOf(
   }
   // Matched on the host's terms, so a Windows path's separators and case don't matter.
   const inRepository = pathInWorktree(
-    repository ? `${workspace}/${repository}` : workspace,
-    absolute ? path : `${workspace}/${path}`,
+    repository ? inWorkspace(workspace, repository) : workspace,
+    absolute ? path : inWorkspace(workspace, path),
   );
   return repository && inRepository === "" ? null : inRepository;
 }

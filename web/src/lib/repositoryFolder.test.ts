@@ -148,6 +148,15 @@ describe("paths between a worktree's review and its session", () => {
     );
     expect(repositoryPathOf("C:/repo/src/a.ts", "", "C:/repo")).toBe("src/a.ts");
     expect(repositoryPathOf("/src/a.ts", "", "/")).toBe("src/a.ts");
+    // A workspace at a filesystem root, or written with a trailing separator.
+    expect(repositoryPathOf("/worktree/a.ts", "worktree", "/")).toBe("a.ts");
+    expect(repositoryPathOf("worktree/a.ts", "worktree", "/")).toBe("a.ts");
+    expect(repositoryPathOf("C:\\worktree\\a.ts", "worktree", "C:\\")).toBe("a.ts");
+    expect(repositoryPathOf("worktree/a.ts", "worktree", "C:\\")).toBe("a.ts");
+    expect(repositoryPathOf("/repo/.worktrees/feature/a.ts", FOLDER, "/repo/")).toBe("a.ts");
+    expect(repositoryPathOf("C:\\repo\\.worktrees\\feature\\a.ts", FOLDER, "C:\\repo\\")).toBe(
+      "a.ts",
+    );
     // A Windows host's case doesn't matter, and the file keeps its own spelling.
     expect(repositoryPathOf("C:\\repo\\.WORKTREES\\Feature\\src\\A.ts", FOLDER, "C:\\repo")).toBe(
       "src/A.ts",
