@@ -95,7 +95,7 @@ export function quoteTextStart(document: string): number {
     if (parseQuoteLine(line) === null) break;
     offset += line.length + 1;
   }
-  return offset;
+  return Math.min(offset, document.length);
 }
 
 /** `document` with its tail, the text after the last card, replaced by `tail`. Every card stays. */

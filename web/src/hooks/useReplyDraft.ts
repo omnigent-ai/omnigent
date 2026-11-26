@@ -57,7 +57,7 @@ export function useReplyDraft(initialSingleDocument = false) {
     (next: SetStateAction<string>) => editText(activeTextId, next),
     [activeTextId, editText],
   );
-  // The editor's own edit, undo included, kept exactly as it stands.
+  // Stored verbatim (the editor already settled it); ignored outside single-document mode.
   const setReplyDocument = useCallback((document: string) => {
     setState((current) => (typeof current === "string" ? document : current));
   }, []);

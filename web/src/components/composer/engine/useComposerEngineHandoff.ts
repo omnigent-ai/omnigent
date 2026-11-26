@@ -6,6 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "re
 import {
   COMPOSER_INPUT_ID_ATTRIBUTE,
   COMPOSER_INPUT_SELECTOR,
+  composerTargetElement,
   composerTargetOf,
   type ComposerInputEngine,
   type ComposerTextTarget,
@@ -60,19 +61,20 @@ function capture(root: HTMLElement, activeId: string | null): HandoffSnapshot | 
 
 function restore(root: HTMLElement, snapshot: HandoffSnapshot): ComposerTextTarget | null {
   // An input the new engine lacks, like a quote's in one document, hands over to the tail.
-  const target = composerTargetOf(
-    inputWithId(root, snapshot.inputId) ?? composerInputs(root).at(-1),
-  );
+  const element = inputWithId(root, snapshot.inputId) ?? composerInputs(root).at(-1);
+  const target = composerTargetOf(element);
   if (!target) return null;
-  // The offsets index the old text; in a draft that changed shape the caret goes to the end.
-  const same = target.value === snapshot.value;
+  // The offsets and scroll belong to the old input's text; otherwise the caret goes to the end.
+  const same = inputIdOf(element) === snapshot.inputId && target.value === snapshot.value;
   const end = target.value.length;
   target.setSelectionRange(
     same ? snapshot.selectionStart : end,
     same ? snapshot.selectionEnd : end,
   );
-  target.scrollTop = snapshot.scrollTop;
-  target.scrollLeft = snapshot.scrollLeft;
+  if (same) {
+    target.scrollTop = snapshot.scrollTop;
+    target.scrollLeft = snapshot.scrollLeft;
+  }
   if (snapshot.focused) target.focus({ preventScroll: true });
   return target;
 }
@@ -204,9 +206,9 @@ export function useComposerEngineHandoff(
     const root = rootRef.current;
     pending.current = null;
     if (!snapshot || !root) return;
-    // The restored input stays the remembered one for the next switch, focused or not.
-    lastFocusedId.current = snapshot.inputId;
     const target = restore(root, snapshot);
+    // The restored input stays the remembered one for the next switch, focused or not.
+    lastFocusedId.current = target ? inputIdOf(composerTargetElement(target)) : snapshot.inputId;
     if (target) onActiveInputChangeRef.current?.(target);
   }, [rendered, rootRef]);
 

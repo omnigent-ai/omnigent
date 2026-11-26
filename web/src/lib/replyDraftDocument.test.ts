@@ -90,6 +90,7 @@ describe("document edits", () => {
   it("finds where the text starts after the cards that open a document", () => {
     expect(quoteTextStart(doc(a, b, "Text"))).toBe(doc(a, b, "").length);
     expect(quoteTextStart(doc("Text", a, ""))).toBe(0);
+    expect(quoteTextStart(doc(a, b))).toBe(doc(a, b).length);
   });
 
   it("copies quotes as markdown", () => {

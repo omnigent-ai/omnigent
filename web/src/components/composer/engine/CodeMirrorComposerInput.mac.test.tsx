@@ -202,6 +202,15 @@ describe("readline kills beside a reply card", () => {
     expect(target().value).toBe(value);
   });
 
+  it("kills a selection across a card whole, and undo brings it all back", () => {
+    const { target, press } = mount(value, 0, undefined, true);
+    act(() => target().setSelectionRange(2, value.length - 2));
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe("Inly");
+    press({ key: "z", code: "KeyZ", metaKey: true });
+    expect(target().value).toBe(value);
+  });
+
   it("kills up to a card but not across it", () => {
     const { target, press } = mount(value, value.length, undefined, true);
     press({ key: "u", code: "KeyU", ctrlKey: true });

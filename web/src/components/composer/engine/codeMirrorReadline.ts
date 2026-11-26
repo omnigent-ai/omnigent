@@ -77,15 +77,13 @@ function kill(boundary: Boundary): Command {
     const range = state.selection.main;
     const text = state.doc.toString();
     const end = range.empty ? boundary(text, range.head) : range.to;
-    const [from, to] = stopKill(
-      state,
-      ...coverAtomicRanges(
-        view,
-        Math.min(range.empty ? range.head : range.from, end),
-        Math.max(range.empty ? range.head : range.from, end),
-      ),
-      range.head,
+    const covered = coverAtomicRanges(
+      view,
+      Math.min(range.empty ? range.head : range.from, end),
+      Math.max(range.empty ? range.head : range.from, end),
     );
+    // A selection's kill takes all of it, a card included; only a caret's kill stops at one.
+    const [from, to] = range.empty ? stopKill(state, ...covered, range.head) : covered;
     if (from === to) return true;
     const backward = range.empty && to === range.head;
     view.dispatch(
