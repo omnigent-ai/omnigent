@@ -38,6 +38,7 @@ import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
 import { ProjectBoardActions, ProjectViewTools } from "@/projectHome/ProjectBoardActions";
 import { ProjectRules } from "@/projectHome/ProjectRules";
+import { usePendingMandateProposals } from "@/projectHome/ProjectMandateDialog";
 import { ProjectHomeTabs, ProjectSummary } from "@/projectHome/ProjectSummary";
 import {
   TicketBoardRequesterFilter,
@@ -166,6 +167,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
     navigate(`${projectHomePath(projectName)}${next.size ? `?${next}` : ""}`);
   };
 
+  const rulesBadge = usePendingMandateProposals(tickets ? (projectId ?? null) : null);
   // Phones keep these tools in the top bar.
   const viewTools = isMobile ? undefined : <ProjectViewTools projectName={projectName} />;
   // Phones hold the project's actions in a labelled row of their own, above the tabs.
@@ -193,7 +195,12 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
         <ProjectFileViewerHost projectId={projectId} />
         <PageScroll maxWidthClassName="max-w-none" extraTop={isMobile ? "0.25rem" : "0.5rem"}>
           {phoneActions}
-          <ProjectHomeTabs view={view} onChange={showTab} end={viewTools} />
+          <ProjectHomeTabs
+            view={view}
+            onChange={showTab}
+            end={viewTools}
+            rulesBadge={rulesBadge}
+          />
           {view === "summary" ? (
             <ProjectSummary key={projectName} projectName={projectName} />
           ) : (
@@ -221,6 +228,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
             view="board"
             onChange={showTab}
             end={viewTools}
+            rulesBadge={rulesBadge}
             trailing={
               <TicketBoardRequesterFilter
                 mine={boardMine}

@@ -155,7 +155,6 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const viewerId = useViewerId();
   const mandate = useProjectMandate(projectId, mandateEnabled).data;
   const mandateReadOnly = !canEditMandate(mandate, viewerId);
-  const pendingProposals = mandateEnabled ? (mandate?.mandate_proposals?.length ?? 0) : 0;
   const { actions, dialogs } = useProjectFolderMenu(
     projectName,
     projectId,
@@ -168,15 +167,7 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
   const itemClass = cn("mobile-touch-target", isMobile && "gap-2.5 px-2.5 py-2");
   return (
     <div className={isMobile ? "contents" : "flex shrink-0 items-center gap-0.5"}>
-      {/* Phones keep these in the menu below: eight header buttons don't fit beside the sidebar button. */}
-      {mandateEnabled && !isMobile && (
-        <MandateProposalsButton
-          projectId={projectId}
-          className={buttonClass}
-          iconClass={iconClass}
-          onOpen={() => setEditingMandate(true)}
-        />
-      )}
+      {/* Phones keep settings in the menu below: the header has no room beside the sidebar button. */}
       {!isMobile && (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -214,16 +205,9 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
             size="icon-sm"
             aria-label={`Project actions for ${projectName}`}
             data-testid="project-home-actions"
-            className={cn(buttonClass, "relative")}
+            className={buttonClass}
           >
             <MoreHorizontalIcon className={iconClass} />
-            {isMobile && pendingProposals > 0 && (
-              <span
-                aria-hidden
-                data-testid="project-actions-proposals-dot"
-                className="absolute top-2 right-2 size-2 rounded-full bg-brand-accent"
-              />
-            )}
           </MobileHeaderButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -240,17 +224,6 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
           }}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
-          {isMobile && pendingProposals > 0 && (
-            <DropdownMenuItem
-              className={itemClass}
-              data-testid="project-mandate-proposals-item"
-              onSelect={() => setEditingMandate(true)}
-            >
-              <ScrollTextIcon className="size-3.5" />
-              Review {pendingProposals} proposed mandate{" "}
-              {pendingProposals === 1 ? "addition" : "additions"}
-            </DropdownMenuItem>
-          )}
           {isMobile && (
             <DropdownMenuItem
               className={itemClass}
@@ -338,43 +311,6 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
         />
       )}
     </div>
-  );
-}
-
-/** Appears while agents' proposed mandate additions wait for the owner. */
-function MandateProposalsButton({
-  projectId,
-  className,
-  iconClass,
-  onOpen,
-}: {
-  projectId: string | null;
-  className: string;
-  iconClass?: string;
-  onOpen: () => void;
-}) {
-  const isMobile = useIsMobileViewport();
-  const pending = useProjectMandate(projectId).data?.mandate_proposals?.length ?? 0;
-  if (pending === 0) return null;
-  const label = `${pending} proposed mandate ${pending === 1 ? "addition" : "additions"}`;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <MobileHeaderButton
-          type="button"
-          variant="ghost"
-          size={isMobile ? "icon-sm" : "sm"}
-          aria-label={label}
-          data-testid="project-mandate-proposals-button"
-          className={cn(className, "text-foreground")}
-          onClick={onOpen}
-        >
-          <ScrollTextIcon className={iconClass} />
-          {!isMobile && pending}
-        </MobileHeaderButton>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">Review proposed mandate additions</TooltipContent>
-    </Tooltip>
   );
 }
 

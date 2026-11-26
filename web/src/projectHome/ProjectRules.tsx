@@ -154,12 +154,31 @@ function MandateRules({ projectName, projectId }: { projectName: string; project
           ? "You can change it."
           : "Only the owner or a product approver can change it; agents can only propose changes."}
       </p>
-      {pending > 0 && (
-        <p className="text-sm font-medium" data-testid="project-rules-mandate-pending">
-          {pending === 1 ? "1 proposed change" : `${pending} proposed changes`} waiting
-          {canEdit ? " for you" : " for the owner or a product approver"}.
-        </p>
-      )}
+      {pending > 0 &&
+        (canEdit ? (
+          <div
+            className="flex items-center gap-3 rounded-lg border border-brand-accent/30 bg-brand-accent/5 px-3 py-2"
+            data-testid="project-rules-mandate-pending"
+          >
+            <span aria-hidden className="size-2 shrink-0 rounded-full bg-brand-accent" />
+            <p className="min-w-0 flex-1 text-sm font-medium">
+              {pending === 1 ? "1 proposed change" : `${pending} proposed changes`} to the mandate
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setOpen(true)}
+              data-testid="project-rules-mandate-review"
+            >
+              Review
+            </Button>
+          </div>
+        ) : (
+          <p className="text-sm font-medium" data-testid="project-rules-mandate-pending">
+            {pending === 1 ? "1 proposed change" : `${pending} proposed changes`} waiting for the
+            owner or a product approver.
+          </p>
+        ))}
       {project.isPending ? (
         <Spinner aria-label="Loading mandate" />
       ) : mandate ? (

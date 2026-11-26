@@ -387,14 +387,16 @@ describe("ProjectHomeTitle", () => {
     expect(screen.getByRole("dialog", { name: "Payments mandate" })).toBeInTheDocument();
   });
 
-  it("flags proposed mandate additions waiting for the owner", async () => {
+  it("leaves proposed mandate changes to the Rules tab, not the header", () => {
     mocks.mandateProposals = [
       { id: "a", text: "Attach a video.", created_at: 1 },
       { id: "b", text: "Never push.", created_at: 2 },
     ];
     renderMandateHeader();
-    await userEvent.click(screen.getByRole("button", { name: "2 proposed mandate additions" }));
-    expect(screen.getByRole("dialog", { name: "Payments mandate" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /proposed mandate/ })).toBeNull();
+    expect(
+      screen.getAllByRole("button").map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["Project settings", "Project actions for Payments"]);
   });
 
   it("hides the title and keeps phone header actions to New session and one menu", () => {

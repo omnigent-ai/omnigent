@@ -26,6 +26,7 @@ import {
   type Project,
 } from "@/lib/projectsApi";
 import { useViewerId } from "@/hooks/useViewerId";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { TicketError } from "./TicketControls";
 import { useTicketProject } from "./useProjectTickets";
 
@@ -100,6 +101,16 @@ export function useProjectMandate(projectId: string | null, enabled = true) {
     enabled: projectId !== null && enabled,
     staleTime: 30_000,
   });
+}
+
+/** How many mandate proposals wait on the viewer: zero unless they can accept them. */
+export function usePendingMandateProposals(projectId: string | null): number {
+  const info = useServerInfo();
+  const enabled = info !== "loading" && info.project_mandate === true;
+  const project = useProjectMandate(projectId, enabled).data;
+  const viewerId = useViewerId();
+  if (!enabled || project === undefined || !canEditMandate(project, viewerId)) return 0;
+  return project.mandate_proposals?.length ?? 0;
 }
 
 /**

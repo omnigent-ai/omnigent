@@ -603,12 +603,15 @@ export function ProjectHomeTabs({
   className,
   trailing,
   end,
+  rulesBadge = 0,
 }: {
   view: ProjectHomeView;
   onChange: (view: ProjectHomeView) => void;
   className?: string;
   trailing?: ReactNode;
   end?: ReactNode;
+  /** Mandate proposals waiting on the viewer, flagged on the Rules tab. */
+  rulesBadge?: number;
 }) {
   return (
     <div
@@ -638,6 +641,11 @@ export function ProjectHomeTabs({
               type="button"
               role="tab"
               aria-selected={selected}
+              aria-label={
+                id === "rules" && rulesBadge > 0
+                  ? `Rules, ${rulesBadge} proposed mandate ${rulesBadge === 1 ? "change" : "changes"}`
+                  : undefined
+              }
               className={cn(
                 "inline-flex h-7 items-center gap-1.5 rounded-[7px] px-2.5 text-[13px] font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
                 selected
@@ -649,6 +657,15 @@ export function ProjectHomeTabs({
               {/* Phones drop the icons so the whole toolbar fits on one line. */}
               <Icon aria-hidden className="size-3.5 max-sm:hidden" />
               <span className="text-optical">{label}</span>
+              {id === "rules" && rulesBadge > 0 && (
+                <span
+                  aria-hidden
+                  data-testid="project-rules-tab-badge"
+                  className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-accent px-1 text-[10px] leading-none font-semibold text-white tabular-nums"
+                >
+                  {rulesBadge}
+                </span>
+              )}
             </button>
           );
         })}

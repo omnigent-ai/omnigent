@@ -117,13 +117,18 @@ describe("ProjectRules", () => {
     expect(screen.getByTestId("project-rules-mandate-pending")).toHaveTextContent(
       "1 proposed change waiting for the owner or a product approver.",
     );
+    expect(screen.queryByTestId("project-rules-mandate-review")).toBeNull();
   });
 
   it("lets the owner, or a member who is a product approver, edit the mandate", () => {
     mocks.project = { ...mocks.project!, shared: false };
     renderRules();
     expect(screen.getByTestId("project-rules-mandate-open")).toHaveTextContent("Edit mandate");
-    expect(screen.getByTestId("project-rules-mandate-pending")).toHaveTextContent("for you.");
+    expect(screen.getByTestId("project-rules-mandate-pending")).toHaveTextContent(
+      "1 proposed change to the mandate",
+    );
+    fireEvent.click(screen.getByTestId("project-rules-mandate-review"));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Mandate dialog");
     cleanup();
 
     mocks.project = {
