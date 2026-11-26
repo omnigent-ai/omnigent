@@ -35,6 +35,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
+from omnigent.entities.scheduled_task import (
+    DEFAULT_RETRY_DELAY_SECONDS,
+    MAX_RETRY_DELAY_SECONDS,
+    MAX_SCHEDULED_TASK_RETRIES,
+    MIN_RETRY_DELAY_SECONDS,
+)
 from omnigent.entities.workflow import Workflow
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
@@ -91,6 +97,7 @@ from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
     is_trigger_automation,
+    retry_attempt,
     timer_rule,
 )
 from omnigent.server.scheduled.telemetry import log_task_created
@@ -207,6 +214,14 @@ class CreateScheduledTaskRequest(BaseModel):
     # deployment's service names; validated against the owner's connections.
     mcp_services: list[str] = Field(default_factory=list, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)
+    # Retries of a run whose startup failed before its prompt reached the agent;
+    # above 0 needs ``scheduled_task_retries`` in ``/v1/info``.
+    max_retries: int = Field(default=0, ge=0, le=MAX_SCHEDULED_TASK_RETRIES)
+    retry_delay_seconds: int = Field(
+        default=DEFAULT_RETRY_DELAY_SECONDS,
+        ge=MIN_RETRY_DELAY_SECONDS,
+        le=MAX_RETRY_DELAY_SECONDS,
+    )
     # "continue" sends every run's prompt into one session: ``session_id`` when
     # given, else the session the first run creates. A prompt that runs a saved
     # workflow needs "new" (see ``workflow_session_reuse_error``).
@@ -291,6 +306,10 @@ class UpdateScheduledTaskRequest(BaseModel):
     # Replaces the task's MCP services; [] clears them.
     mcp_services: list[str] | None = Field(default=None, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+    max_retries: int | None = Field(default=None, ge=0, le=MAX_SCHEDULED_TASK_RETRIES)
+    retry_delay_seconds: int | None = Field(
+        default=None, ge=MIN_RETRY_DELAY_SECONDS, le=MAX_RETRY_DELAY_SECONDS
+    )
     session_mode: Literal["new", "continue"] | None = None
     # Null makes a continue-mode task's next run start a new session.
     session_id: str | None = Field(default=None, min_length=1)
@@ -322,6 +341,23 @@ class UpdateScheduledTaskRequest(BaseModel):
         if "agent_id" in self.model_fields_set and self.agent_id is None:
             raise ValueError("agent_id cannot be null")
         return self
+
+
+def retries_supported(request: Request) -> bool:
+    """Whether tasks may save ``max_retries`` above 0.
+
+    Gated by the ``automation_retries`` release feature, because an older database
+    scheduler polling the same database would start a waiting retry at once.
+    """
+    return bool(getattr(request.app.state, "automation_retries_enabled", False))
+
+
+def _require_retry_support(request: Request, max_retries: int) -> None:
+    if max_retries > 0 and not retries_supported(request):
+        raise OmnigentError(
+            "max_retries needs automation retries, which this server does not enable",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _validate_worktree_target(
@@ -408,6 +444,8 @@ def _to_response(
         "permission_mode": task.permission_mode,
         "mcp_services": list(task.mcp_services),
         "max_cost_usd": task.max_cost_usd,
+        "max_retries": task.max_retries,
+        "retry_delay_seconds": task.retry_delay_seconds,
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "source_session_id": task.source_session_id,
@@ -484,6 +522,8 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
+        # 0 for an occurrence's first try, then 1, 2, ... for its automatic retries.
+        "retry_attempt": retry_attempt(run.trigger_key),
         "error_detail": (
             run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if include_error_detail and run.error else None
         ),
@@ -656,6 +696,8 @@ def _clone_request(task: ScheduledTask) -> CreateScheduledTaskRequest:
         permission_mode=task.permission_mode,
         mcp_services=list(task.mcp_services),
         max_cost_usd=task.max_cost_usd,
+        max_retries=task.max_retries,
+        retry_delay_seconds=task.retry_delay_seconds,
         session_mode="continue" if task.session_mode == "continue" else "new",
         workspace=task.workspace,
         base_branch=task.base_branch,
@@ -1438,6 +1480,9 @@ def create_scheduled_tasks_router(
         ):
             # A run files nothing into a deleted project, so the copy starts unfiled.
             create = create.model_copy(update={"project_id": None})
+        if not retries_supported(request):
+            # Retries saved before the release feature was turned off are not copied.
+            create = create.model_copy(update={"max_retries": 0})
         return await _create_task(request, create, cloned_from=task)
 
     async def _create_task(
@@ -1480,6 +1525,7 @@ def create_scheduled_tasks_router(
                 "first_run_at needs one-time automations, which this server does not enable",
                 code=ErrorCode.INVALID_INPUT,
             )
+        _require_retry_support(request, body.max_retries)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         timezone = await asyncio.to_thread(_resolve_create_timezone, body, store, owner_id)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
@@ -1583,6 +1629,8 @@ def create_scheduled_tasks_router(
                     permission_mode=permission_mode,
                     mcp_services=mcp_services,
                     max_cost_usd=body.max_cost_usd,
+                    max_retries=body.max_retries,
+                    retry_delay_seconds=body.retry_delay_seconds,
                     session_mode=body.session_mode,
                     session_id=body.session_id,
                     source_session_id=source_copy.id if source_copy is not None else None,
@@ -2169,10 +2217,10 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
-        if fields.get("session_mode") is None:
-            fields.pop("session_mode", None)
-        if fields.get("mcp_services") is None:
-            fields.pop("mcp_services", None)
+        for name in ("session_mode", "mcp_services", "max_retries", "retry_delay_seconds"):
+            if fields.get(name) is None:
+                fields.pop(name, None)
+        _require_retry_support(request, fields.get("max_retries", 0))
         derives_workflow_prompt = await _apply_workflow_update(request, existing, fields, owner)
         if await asyncio.to_thread(_align_stored_workflow, existing, fields):
             derives_workflow_prompt = True

@@ -245,3 +245,35 @@ def test_a_rule_a_timer_never_saves_is_invalid(task, rule: str) -> None:
         timer_interval(rule)
     # The scheduler finds no firing for it instead of failing the poll.
     assert next_scheduled_time(replace(task, kind="timer", rrule=rule), _ANCHOR) is None
+
+
+def test_retries_of_an_occurrence_count_up_from_its_original_key() -> None:
+    from omnigent.server.scheduled.schedule import (
+        original_trigger_key,
+        retry_attempt,
+        retry_trigger_key,
+        trigger_kind,
+    )
+
+    first = retry_trigger_key("schedule:1700000000")
+    second = retry_trigger_key(first)
+    assert (first, second) == ("retry:1:schedule:1700000000", "retry:2:schedule:1700000000")
+    assert retry_trigger_key("manual:abc") == "retry:1:manual:abc"
+    assert [original_trigger_key(key) for key in ("manual:abc", first, second)] == [
+        "manual:abc",
+        "schedule:1700000000",
+        "schedule:1700000000",
+    ]
+    assert [trigger_kind(key) for key in ("schedule:1", "manual:abc", second, "other")] == [
+        "schedule",
+        "manual",
+        "retry",
+        None,
+    ]
+    assert [retry_attempt(key) for key in ("schedule:1", "manual:abc", None, first, second)] == [
+        0,
+        0,
+        0,
+        1,
+        2,
+    ]

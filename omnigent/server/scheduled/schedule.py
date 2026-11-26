@@ -118,6 +118,61 @@ def manual_trigger_key() -> str:
     return f"manual:{uuid.uuid4().hex}"
 
 
+_RETRY_TRIGGER_PREFIX = "retry:"
+
+# Executor failures from before the prompt could reach the agent that a later attempt
+# can get past. Ones a retry would repeat, such as a rejected permission mode, are left out.
+RETRYABLE_STARTUP_ERROR_CODES = frozenset(
+    {
+        "host_offline",
+        "no_online_host",
+        "host_registry_unavailable",
+        "default_workspace_unresolved",
+        "owner_identity_unavailable",
+        "owner_grant_failed",
+        "session_create_failed",
+        "worktree_create_failed",
+        "managed_sandbox_unavailable",
+        "sandbox_create_failed",
+        "sandbox_registration_timeout",
+        "launch_failed",
+    }
+)
+
+
+def retry_attempt(trigger_key: str | None) -> int:
+    """Which retry of its occurrence a run with *trigger_key* is; ``0`` for the first try."""
+    if trigger_key is None or not trigger_key.startswith(_RETRY_TRIGGER_PREFIX):
+        return 0
+    attempt = trigger_key[len(_RETRY_TRIGGER_PREFIX) :].partition(":")[0]
+    return int(attempt) if attempt.isdigit() else 0
+
+
+def original_trigger_key(trigger_key: str) -> str:
+    """The key of the occurrence a run with *trigger_key* tries: its own unless it is a retry."""
+    if retry_attempt(trigger_key) == 0:
+        return trigger_key
+    return trigger_key[len(_RETRY_TRIGGER_PREFIX) :].partition(":")[2]
+
+
+def retry_trigger_key(trigger_key: str) -> str:
+    """The key of the next retry of the occurrence a run with *trigger_key* tried.
+
+    Retries of one occurrence keep its original key, e.g. ``schedule:1700000000``
+    retries as ``retry:1:schedule:1700000000``, then ``retry:2:schedule:1700000000``.
+    """
+    attempt = retry_attempt(trigger_key) + 1
+    return f"{_RETRY_TRIGGER_PREFIX}{attempt}:{original_trigger_key(trigger_key)}"
+
+
+def trigger_kind(trigger_key: str) -> str | None:
+    """What started a run keyed *trigger_key*, e.g. ``"retry"``; ``None`` for any other key."""
+    for kind in ("schedule", "manual", "retry"):
+        if trigger_key.startswith(f"{kind}:"):
+            return kind
+    return None
+
+
 # Namespace for task IDs that are not UUIDs, such as ones a deployment allocates.
 _NON_UUID_TASK_ID_NAMESPACE = uuid.UUID("8220eb40-f537-40d8-882a-419033fcd6ad")
 

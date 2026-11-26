@@ -2163,6 +2163,65 @@ async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> 
     assert store.get(task.id).next_run_at is None
 
 
+async def test_a_failed_startup_retries_on_the_first_poll_after_its_delay(
+    store, monkeypatch
+) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, max_retries=1, retry_delay_seconds=60)
+    clock = FakeClock(task.next_run_at)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run.trigger_key)
+        await lease.finish("failed", error_code="host_offline", retryable=True)
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    clock.advance(59)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [f"schedule:{task.next_run_at}"]
+
+    clock.advance(1)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == [f"schedule:{task.next_run_at}", f"retry:1:schedule:{task.next_run_at}"]
+    # Its one retry is used up.
+    assert store.list_pending_runs() == []
+
+
+@pytest.mark.parametrize(("found", "retried"), [("unsent", True), ("failed", False)])
+async def test_recovery_retries_only_a_startup_whose_prompt_was_never_sent(
+    store, monkeypatch, caplog, found, retried
+) -> None:
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    _create_tasks_half_past_the_hour(monkeypatch)
+    task = _task(store, max_retries=1, retry_delay_seconds=60)
+    clock = FakeClock(task.next_run_at)
+
+    async def fire(snapshot, lease):
+        await asyncio.Event().wait()
+
+    async def recover(run):
+        return found
+
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now)
+    await scheduler.poll_once()
+    assert scheduler._recovery is not None
+    await scheduler._recovery
+    clock.advance(120)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+
+    runs = {run.trigger_key: run for run in store.list_runs(task.id)[0]}
+    first = runs.pop(f"schedule:{task.next_run_at}")
+    assert (first.status, first.error_code) == ("failed", "startup_expired")
+    # "failed" covers a prompt the agent may have received; retrying could run it twice.
+    assert list(runs) == ([f"retry:1:schedule:{task.next_run_at}"] if retried else [])
+    assert [e["outcome"] for e in _events(caplog, "scheduled_run_recovered")] == ["failed"]
+
+
 async def test_run_now_waits_for_the_host_owner_to_start_it(store, monkeypatch) -> None:
     _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store)

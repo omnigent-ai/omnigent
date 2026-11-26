@@ -86,5 +86,9 @@ no connected host so Run now fails naturally without touching a real host.
   the latest 1,000 dismissed run IDs; older dismissed failures may reappear after
   eviction. Embeddings without a stable backend identity use memory only.
 - Mark as read acknowledges the notification; it does not rerun the task or
-  change run history. No automatic retry, host restart, or OS/email alert is added.
+  change run history. No host restart or OS/email alert is added.
+- An automation with [Retries](./automation-templates.md) on starts a failed
+  startup again by itself. While a retry waits it is the latest run, so the
+  warning and Inbox item appear once the retries run out, or when a waiting
+  retry is dropped because the automation was paused or its retries turned off.
 - Older servers without the failure-feed capability retain the existing Inbox.

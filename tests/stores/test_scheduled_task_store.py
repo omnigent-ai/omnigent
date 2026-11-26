@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -2196,6 +2197,406 @@ def test_run_now_request_follows_a_target_change_before_its_claim(
     claimed_task, claimed = store.claim_pending_run(moved, now=now + 2, lease_seconds=120)
     assert claimed_task.execution_target == "managed_sandbox"
     assert (claimed.status, claimed.host_id) == ("starting", moved.host_id)
+
+
+def _failed_claim(
+    store: SqlAlchemyScheduledTaskStore, task, *, retryable: bool = True, after: int = 30
+):
+    """Claim *task*'s due occurrence and fail its startup *after* seconds later."""
+    now = task.next_run_at
+    run = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    return store.transition_starting_run(
+        run,
+        now=lambda: now + after,
+        status="failed",
+        error_code="host_offline",
+        retryable=retryable,
+    )
+
+
+def _pending_retries(store: SqlAlchemyScheduledTaskStore, task_id: str):
+    return [run for run in store.list_pending_runs() if run.scheduled_task_id == task_id]
+
+
+def _bounded_run_reads(store: SqlAlchemyScheduledTaskStore, action) -> list[tuple[str, str]]:
+    """The ``LIMIT`` reads of ``scheduled_task_runs`` that *action* makes, with their plans.
+
+    A plan is SQLite's ``EXPLAIN QUERY PLAN`` output, or ``""`` on another engine.
+    """
+    from sqlalchemy import event
+
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "FROM scheduled_task_runs" in statement and "LIMIT" in statement:
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        action()
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    if store._engine.dialect.name != "sqlite":
+        return [(statement, "") for statement, _ in queries]
+    with store._engine.connect() as connection:
+        return [
+            (
+                statement,
+                str(
+                    connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+                ),
+            )
+            for statement, parameters in queries
+        ]
+
+
+def _assert_seeks(plan: str, index: str, *terms: str) -> None:
+    """*plan* seeks *index* on every one of *terms*, e.g. ``"status=?"``, without sorting.
+
+    A term in the seek is not filtered after it, so the read stops at its limit. An
+    engine that reports no plan passes.
+    """
+    if plan:
+        assert index in plan and "SEARCH" in plan and "TEMP B-TREE" not in plan, plan
+        assert all(term in plan for term in terms), plan
+
+
+@pytest.mark.parametrize(
+    "sandbox_session_mode",
+    [None, "new", "continue"],
+    ids=["connected_host", "new_sandbox_each_run", "one_sandbox_for_a_continued_session"],
+)
+def test_a_failed_startup_is_retried_until_its_retries_run_out(
+    store: SqlAlchemyScheduledTaskStore, sandbox_session_mode: str | None
+) -> None:
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id, sandbox_host_id
+
+    task = store.update(_due_task(store).id, max_retries=2, retry_delay_seconds=60)
+    if sandbox_session_mode is not None:
+        task = store.update(
+            task.id,
+            execution_target="managed_sandbox",
+            session_mode=sandbox_session_mode,
+            host_id=None,
+            workspace=None,
+        )
+
+    def host_of(trigger_key: str) -> str | None:
+        """The host a retry is routed by: the scheduler replica that owns it starts it."""
+        if sandbox_session_mode is None:
+            return task.host_id
+        if sandbox_session_mode == "continue":
+            return continued_sandbox_host_id(task.id, task.workspace_id)
+        # A new sandbox of its own, named by the retry's key.
+        return sandbox_host_id(task.id, task.workspace_id, trigger_key)
+
+    failed = _failed_claim(store, task)
+    [retry] = _pending_retries(store, task.id)
+    first_key = f"retry:1:schedule:{task.next_run_at}"
+    assert (retry.status, retry.trigger_key, retry.host_id) == (
+        "scheduled",
+        first_key,
+        host_of(first_key),
+    )
+    assert retry.scheduled_at == failed.finished_at + 60
+    # A retry waits out its delay.
+    assert store.claim_pending_run(retry, now=retry.scheduled_at - 1, lease_seconds=120) is None
+    _, claimed = store.claim_pending_run(retry, now=retry.scheduled_at, lease_seconds=120)
+    store.transition_starting_run(
+        claimed,
+        now=lambda: retry.scheduled_at + 5,
+        status="failed",
+        error_code="host_offline",
+        retryable=True,
+    )
+    [second] = _pending_retries(store, task.id)
+    assert second.trigger_key == f"retry:2:schedule:{task.next_run_at}"
+    assert second.host_id == host_of(second.trigger_key)
+    _, claimed = store.claim_pending_run(second, now=second.scheduled_at, lease_seconds=120)
+    store.transition_starting_run(
+        claimed,
+        now=lambda: second.scheduled_at + 5,
+        status="failed",
+        error_code="host_offline",
+        retryable=True,
+    )
+    assert _pending_retries(store, task.id) == []
+
+
+@pytest.mark.parametrize(
+    ("max_retries", "retryable", "delay"),
+    [(0, True, 60), (1, False, 60), (1, True, 3600), (1, True, 3570)],
+    ids=[
+        "retries_off",
+        "prompt_may_have_been_sent",
+        "next_run_comes_first",
+        "next_run_comes_at_the_same_time",
+    ],
+)
+def test_a_failed_startup_is_not_retried(
+    store: SqlAlchemyScheduledTaskStore, max_retries: int, retryable: bool, delay: int
+) -> None:
+    task = store.update(_due_task(store).id, max_retries=max_retries, retry_delay_seconds=delay)
+    _failed_claim(store, task, retryable=retryable)
+    assert _pending_retries(store, task.id) == []
+
+
+@pytest.mark.parametrize(
+    "retry_claimed_first_after",
+    [None, 0, 5],
+    ids=["occurrence_claimed_first", "retry_claimed_first_when_due", "retry_claimed_first_later"],
+)
+def test_the_next_occurrence_supersedes_a_pending_retry(
+    store: SqlAlchemyScheduledTaskStore, retry_claimed_first_after: int | None
+) -> None:
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=60)
+    _failed_claim(store, task)
+    [retry] = _pending_retries(store, task.id)
+    due = store.get(task.id)
+    now = due.next_run_at + (retry_claimed_first_after or 0)
+    if retry_claimed_first_after is not None:
+        # A replica that doesn't own the due occurrence's host reaches the retry first.
+        assert store.claim_pending_run(retry, now=now, lease_seconds=120) is None
+    occurrence = store.claim_scheduled_run(
+        due,
+        now=now,
+        next_run_at=due.next_run_at + 3600,
+        host_id=due.host_id,
+        lease_seconds=120,
+    )
+    assert occurrence is not None and occurrence.status == "starting"
+    assert _pending_retries(store, task.id) == []
+    superseded = store.get_run(retry.id)
+    # The code is the whole reason; a detail would only repeat it in the run list.
+    assert (superseded.status, superseded.error_code, superseded.error) == (
+        "skipped",
+        "retry_superseded",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("edit", "error_code"),
+    [
+        (lambda store, task: store.update(task.id, state="paused"), "task_paused"),
+        (lambda store, task: store.pause_invalid_schedule(store.get(task.id)), "task_paused"),
+        (lambda store, task: store.update(task.id, max_retries=0), "retry_cancelled"),
+    ],
+    ids=["paused", "paused_for_an_invalid_schedule", "retries_off"],
+)
+def test_a_waiting_retry_is_dropped_as_soon_as_its_task_no_longer_retries(
+    store: SqlAlchemyScheduledTaskStore, edit: Callable[..., Any], error_code: str
+) -> None:
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=3000)
+    _failed_claim(store, task)
+    [retry] = _pending_retries(store, task.id)
+
+    edit(store, task)
+
+    # Long before its deadline: a scheduler from before retries starts every pending
+    # run at once, so none may be left for it.
+    assert _pending_retries(store, task.id) == []
+    skipped = store.get_run(retry.id)
+    assert (skipped.status, skipped.error_code, skipped.error) == ("skipped", error_code, None)
+    # Undoing the edit doesn't bring it back.
+    store.update(task.id, state="active", max_retries=1)
+    assert store.claim_pending_run(retry, now=retry.scheduled_at, lease_seconds=120) is None
+    assert _pending_retries(store, task.id) == []
+
+
+def test_a_lower_retry_limit_keeps_a_waiting_retry_it_still_allows(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = store.update(_due_task(store).id, max_retries=2, retry_delay_seconds=60)
+    _failed_claim(store, task)
+    [retry] = _pending_retries(store, task.id)
+
+    store.update(task.id, max_retries=1, name="renamed")
+
+    assert [run.id for run in _pending_retries(store, task.id)] == [retry.id]
+
+
+def test_the_last_occurrence_is_retried_after_it_completes_its_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=60)
+    now = task.next_run_at
+    last = store.claim_scheduled_run(
+        task, now=now, next_run_at=None, host_id=task.host_id, lease_seconds=120
+    )
+    assert store.get(task.id).state == "completed"
+    store.transition_starting_run(
+        last, now=lambda: now + 30, status="failed", error_code="host_offline", retryable=True
+    )
+    [retry] = _pending_retries(store, task.id)
+    _, claimed = store.claim_pending_run(retry, now=retry.scheduled_at, lease_seconds=120)
+    assert (claimed.status, claimed.trigger_key) == ("starting", f"retry:1:schedule:{now}")
+
+
+def test_a_late_failure_is_not_retried_once_the_next_occurrence_started(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=60)
+    first_at = task.next_run_at
+    first = store.claim_scheduled_run(
+        task, now=first_at, next_run_at=first_at + 3600, host_id=task.host_id, lease_seconds=7200
+    )
+    due = store.get(task.id)
+    store.claim_scheduled_run(
+        due,
+        now=first_at + 3600,
+        next_run_at=first_at + 7200,
+        host_id=due.host_id,
+        lease_seconds=120,
+    )
+    # The first startup outlived the schedule's interval; its retry would still be
+    # due before the occurrence after the one that already started.
+    store.transition_starting_run(
+        first,
+        now=lambda: first_at + 3601,
+        status="failed",
+        error_code="sandbox_registration_timeout",
+        retryable=True,
+    )
+    assert _pending_retries(store, task.id) == []
+
+
+def test_a_late_retry_failure_is_judged_by_its_occurrence_not_its_own_deadline(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    task = store.update(_due_task(store).id, max_retries=2, retry_delay_seconds=3000)
+    first_at = task.next_run_at
+    _failed_claim(store, task)
+    [retry] = _pending_retries(store, task.id)
+    _, retrying = store.claim_pending_run(retry, now=retry.scheduled_at, lease_seconds=7200)
+    # A schedule edit brought the next occurrence forward, to before the retry's deadline.
+    earlier = retry.scheduled_at - 60
+    with store._session_immediate("test_schedule_edit") as session:
+        session.execute(update(SqlScheduledTask).values(next_run_at=earlier))
+    due = store.get(task.id)
+    assert first_at < due.next_run_at < retry.scheduled_at
+    store.claim_scheduled_run(
+        due,
+        now=retry.scheduled_at + 1,
+        next_run_at=first_at + 7200,
+        host_id=due.host_id,
+        lease_seconds=120,
+    )
+    store.transition_starting_run(
+        retrying,
+        now=lambda: retry.scheduled_at + 2,
+        status="failed",
+        error_code="host_offline",
+        retryable=True,
+    )
+    # That occurrence is later than the one the retry tried, and already runs the prompt.
+    assert _pending_retries(store, task.id) == []
+
+
+def test_a_task_has_one_waiting_retry_at_a_time(store: SqlAlchemyScheduledTaskStore) -> None:
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=600)
+    failed = _failed_claim(store, task)
+    [retry] = _pending_retries(store, task.id)
+    now = failed.finished_at + 1
+    manual = store.request_manual_run(
+        store.get(task.id), now=now, trigger_key="manual:abc", host_id=task.host_id
+    )
+    _, claimed = store.claim_pending_run(manual, now=now, lease_seconds=120)
+    store.transition_starting_run(
+        claimed, now=lambda: now + 5, status="failed", error_code="host_offline", retryable=True
+    )
+    # The retry already waiting runs the prompt, so the Run now failure adds none.
+    assert [run.id for run in _pending_retries(store, task.id)] == [retry.id]
+
+
+def test_a_retry_that_never_started_leaves_its_failure_as_the_latest_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=3000)
+    start = task.next_run_at - 3500
+
+    def fail_a_run_now(at: int):
+        manual = store.request_manual_run(
+            store.get(task.id), now=at, trigger_key=f"manual:{at}", host_id=task.host_id
+        )
+        _, claimed = store.claim_pending_run(manual, now=at, lease_seconds=120)
+        return store.transition_starting_run(
+            claimed, now=lambda: at, status="failed", error_code="host_offline", retryable=True
+        )
+
+    def latest() -> tuple[str, list[str]]:
+        failures = store.list_inbox_failures(owner_user_id=None)[0]
+        status = store.list_latest_run_status_for_tasks([task.id])[task.id]
+        return status, [failure.run_id for failure in failures]
+
+    # A cancelled retry keeps the date of its deadline, so any number of them can pile
+    # up above the failures they followed.
+    for cycle in range(6):
+        failed = fail_a_run_now(start + cycle)
+        # A waiting retry is the latest run: the failure is not final yet.
+        assert latest() == ("scheduled", [])
+        store.update(task.id, max_retries=0)
+        assert latest() == ("failed", [failed.id])
+        store.update(task.id, max_retries=1)
+
+    failed = fail_a_run_now(start + 10)
+    store.update(task.id, state="paused")
+    assert latest() == ("failed", [failed.id])
+    assert {run.status for run in store.list_runs(task.id, limit=7)[0]} == {"skipped"}
+
+
+def test_retry_bookkeeping_seeks_the_runs_it_needs_and_no_others(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import _LATEST_RUN_CLASSES
+
+    task = store.update(_due_task(store).id, max_retries=1, retry_delay_seconds=60)
+
+    def fail_then_read_the_latest_run() -> None:
+        _failed_claim(store, task)
+        store.list_latest_run_status_for_tasks([task.id])
+        store.list_inbox_failures(owner_user_id=None)
+
+    reads = _bounded_run_reads(store, fail_then_read_the_latest_run)
+    # A waiting retry, a later occurrence, and a task's newest runs.
+    kinds = set()
+    for statement, plan in reads:
+        if "ORDER BY" in statement:
+            kinds.add("newest")
+            _assert_seeks(plan, "ix_scheduled_task_runs_scheduled_task_id", "scheduled_task_id=?")
+        elif "scheduled_at >" in statement:
+            kinds.add("later")
+            _assert_seeks(
+                plan,
+                "ix_scheduled_task_runs_task_status",
+                "status=?",
+                "trigger_kind=?",
+                "scheduled_at>?",
+            )
+        else:
+            kinds.add("waiting")
+            _assert_seeks(plan, "ix_scheduled_task_runs_task_status", "status=?", "trigger_kind=?")
+    assert kinds == {"newest", "later", "waiting"}
+
+    # Behind a retry that never started, the latest-run lookups seek the newest run of
+    # every other status and kind instead of reading back through the history.
+    store.update(task.id, max_retries=0)
+    reads = _bounded_run_reads(store, lambda: store.list_inbox_failures(owner_user_id=None))
+    [(statement, plan)] = [read for read in reads if "UNION ALL" in read[0]]
+    assert statement.count("LIMIT") == len(_LATEST_RUN_CLASSES) == 23
+    if plan:
+        seek = (
+            "SEARCH scheduled_task_runs USING INDEX ix_scheduled_task_runs_task_status "
+            "(workspace_id=? AND scheduled_task_id=? AND status=? AND trigger_kind=?)"
+        )
+        assert plan.count(seek) == len(_LATEST_RUN_CLASSES), plan
+        assert "SCAN scheduled_task_runs" not in plan and "TEMP B-TREE" not in plan, plan
 
 
 def test_switching_to_legacy_timers_skips_pending_run_now_requests(

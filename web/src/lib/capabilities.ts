@@ -421,6 +421,11 @@ export interface ServerInfo {
    */
   scheduled_task_clone?: boolean;
   /**
+   * True when scheduled tasks accept `max_retries` above 0, which needs the database
+   * scheduler and the `automation_retries` release feature; absent on older servers (off).
+   */
+  scheduled_task_retries?: boolean;
+  /**
    * The deployment offers the proactive agent (Omni Advisor) to this caller;
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
    */
@@ -820,6 +825,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
           scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
           scheduled_task_clone: data.scheduled_task_clone === true,
+          scheduled_task_retries: data.scheduled_task_retries === true,
           proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

@@ -2545,6 +2545,14 @@
             ],
             "title": "Max Cost Usd"
           },
+          "max_retries": {
+            "default": 0,
+            "format": "int64",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Max Retries",
+            "type": "integer"
+          },
           "mcp_services": {
             "items": {
               "type": "string"
@@ -2611,6 +2619,14 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "retry_delay_seconds": {
+            "default": 300,
+            "format": "int64",
+            "maximum": 3600.0,
+            "minimum": 60.0,
+            "title": "Retry Delay Seconds",
+            "type": "integer"
           },
           "rrule": {
             "title": "Rrule",
@@ -8260,6 +8276,11 @@
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_retries": {
+            "default": false,
+            "title": "Scheduled Task Retries",
             "type": "boolean"
           },
           "scheduled_task_run_pull_requests": {
@@ -15985,6 +16006,20 @@
             ],
             "title": "Max Cost Usd"
           },
+          "max_retries": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 5.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Retries"
+          },
           "mcp_services": {
             "anyOf": [
               {
@@ -16065,6 +16100,20 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "retry_delay_seconds": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "maximum": 3600.0,
+                "minimum": 60.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Delay Seconds"
           },
           "rrule": {
             "anyOf": [

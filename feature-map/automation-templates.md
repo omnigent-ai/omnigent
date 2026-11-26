@@ -183,7 +183,8 @@ to customize.
   and timezone are separate controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.
   Advanced starts collapsed and contains Workspace or
-  Repository, Project, model/effort/permission settings, and Ends. Name remains
+  Repository, Project, model/effort/permission settings, Ends and, for a
+  schedule on a server that supports it, Retries. Name remains
   required and editable without opening Advanced; changing instructions preserves
   it. Configured overrides are summarized beside Advanced, and invalid
   settings reveal their controls. Escape closes the active selector or folder browser
@@ -204,6 +205,13 @@ to customize.
   **Start a new session for each match**. With `automations_v2` on a server
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
+- **Retries:** when `/v1/info` reports `scheduled_task_retries`, which needs
+  `automations_v2` and the `automation_retries` release feature, Advanced has a
+  Retries row for a schedule: Off, or 1 to 5 retries and the wait before each
+  (1 to 60 minutes). It starts a run again when its startup failed before the
+  prompt reached the agent. A trigger has no Retries row, since it polls again
+  within minutes. The detail page's Configuration lists Retries when they are
+  on, and run history labels each retry **Retry N**.
 - **MCP services:** when the server's MCP registry is on and `/v1/info` reports
   `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
   the new-chat service list and its sign-in. A new automation starts with none,

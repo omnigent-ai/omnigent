@@ -46,6 +46,7 @@ class Feature(StrEnum):
     AUTOMATIONS = "automations"
     AUTOMATIONS_V2 = "automations_v2"
     ONE_TIME_AUTOMATIONS = "one_time_automations"
+    AUTOMATION_RETRIES = "automation_retries"
     SESSION_TIMERS = "session_timers"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
@@ -165,6 +166,19 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.AUTOMATION_RETRIES,
+        description=(
+            "Save max_retries above 0 on automations, so a run whose startup failed before "
+            "its prompt was sent starts again. Enable it only once every database scheduler "
+            "sharing the database runs a release with retries; an older one starts a waiting "
+            "retry at once, without its delay. Turning it off stops new retry settings, "
+            "not saved ones"
+        ),
+        owner="server",
+        review_by_release="0.27.0",
         frontend_visible=False,
     ),
     FeatureDefinition(

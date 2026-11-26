@@ -54,6 +54,7 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ComposerHarnessTrigger } from "@/components/composer/ComposerControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
+import { AutomationRetryField } from "@/components/scheduled/AutomationRetryField";
 import {
   TriggerTemplateFields,
   type TriggerMcpService,
@@ -139,6 +140,7 @@ import {
   type ScheduleModel,
 } from "@/lib/scheduleBuilder";
 import {
+  DEFAULT_RETRY_DELAY_SECONDS,
   ScheduledTaskApiError,
   RANDOM_WORKTREE_BASE_REF,
   type ScheduledTask,
@@ -298,6 +300,7 @@ export function CreateScheduledTaskDialog({
   const resolveProjectId = useResolveOrCreateProjectId();
   const worktreesSupported = info !== "loading" && info.scheduled_task_worktrees === true;
   const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
+  const retriesSupported = info !== "loading" && info.scheduled_task_retries === true;
   const triggersSupported =
     sessionModesSupported && isFeatureEnabled(info, "session_orchestration");
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
@@ -529,6 +532,8 @@ export function CreateScheduledTaskDialog({
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
+  const [maxRetries, setMaxRetries] = useState(0);
+  const [retryDelaySeconds, setRetryDelaySeconds] = useState(DEFAULT_RETRY_DELAY_SECONDS);
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
   // "managed_sandbox") instead of a connected host. Catalog-backed providers
   // offer repository selection instead of browsing a connected host.
@@ -653,6 +658,8 @@ export function CreateScheduledTaskDialog({
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
       setCostLimit(editingTask?.maxCostUsd == null ? "" : String(editingTask.maxCostUsd));
+      setMaxRetries(editingTask?.maxRetries ?? 0);
+      setRetryDelaySeconds(editingTask?.retryDelaySeconds ?? DEFAULT_RETRY_DELAY_SECONDS);
       if (editingTask) {
         const parsedSchedule = savedSchedule;
         setName(editingTask.name);
@@ -1263,6 +1270,8 @@ export function CreateScheduledTaskDialog({
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   const usesTriggerSchedule =
     triggerMode || triggerType !== "schedule" || editedTriggerSource !== null;
+  // A trigger polls again within minutes, which a retry would rarely beat.
+  const retriesShown = retriesSupported && !usesTriggerSchedule;
   const compatibleTriggerSchedule =
     validateSchedule(defaultTriggerSchedule, {
       sessionMode,
@@ -1733,6 +1742,11 @@ export function CreateScheduledTaskDialog({
         rrule: editingTask?.rrule && scheduleUnchanged ? editingTask.rrule : buildRRule(schedule),
         timezone,
         ...(maxCostUsd !== (editingTask?.maxCostUsd ?? null) ? { maxCostUsd } : {}),
+        ...(retriesShown && maxRetries !== (editingTask?.maxRetries ?? 0) ? { maxRetries } : {}),
+        ...(retriesShown &&
+        retryDelaySeconds !== (editingTask?.retryDelaySeconds ?? DEFAULT_RETRY_DELAY_SECONDS)
+          ? { retryDelaySeconds }
+          : {}),
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
           ? { baseBranch }
@@ -2569,6 +2583,16 @@ export function CreateScheduledTaskDialog({
                                 </DropdownMenuContent>
                               </DropdownMenu>
                             </div>
+                          )}
+
+                          {retriesShown && (
+                            <AutomationRetryField
+                              maxRetries={maxRetries}
+                              retryDelaySeconds={retryDelaySeconds}
+                              onMaxRetriesChange={setMaxRetries}
+                              onRetryDelayChange={setRetryDelaySeconds}
+                              triggerClassName={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                            />
                           )}
 
                           {(!sandboxMode || sandboxRepoCatalog.length > 0) && (

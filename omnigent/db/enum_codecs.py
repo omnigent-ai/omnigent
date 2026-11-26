@@ -140,6 +140,19 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "starting": 6,
 }
 
+# What started a run: the prefix of its trigger key, as a code an index can seek.
+SCHEDULED_TASK_RUN_TRIGGER_KIND: dict[str, int] = {
+    "schedule": 1,
+    "manual": 2,
+    "retry": 3,
+}
+
+# Whether a claimed run's prompt has left the executor that claimed it.
+SCHEDULED_TASK_RUN_PROMPT_DISPATCH: dict[str, int] = {
+    "not_started": 1,
+    "started": 2,
+}
+
 # Journal entry kinds. The column has no CHECK, so a new kind needs no migration.
 JOURNAL_ENTRY_KIND: dict[str, int] = {
     "status": 1,
@@ -395,6 +408,30 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_scheduled_task_run_trigger_kind(name: str) -> int:
+    """Encode a ``scheduled_task_runs.trigger_kind`` name to its int code."""
+    return _encode(SCHEDULED_TASK_RUN_TRIGGER_KIND, name, field="scheduled_task_runs.trigger_kind")
+
+
+def decode_scheduled_task_run_trigger_kind(code: int) -> str:
+    """Decode a ``scheduled_task_runs.trigger_kind`` int code to its name."""
+    return _decode(SCHEDULED_TASK_RUN_TRIGGER_KIND, code, field="scheduled_task_runs.trigger_kind")
+
+
+def encode_scheduled_task_run_prompt_dispatch(name: str) -> int:
+    """Encode a ``scheduled_task_runs.prompt_dispatch`` name to its int code."""
+    return _encode(
+        SCHEDULED_TASK_RUN_PROMPT_DISPATCH, name, field="scheduled_task_runs.prompt_dispatch"
+    )
+
+
+def decode_scheduled_task_run_prompt_dispatch(code: int) -> str:
+    """Decode a ``scheduled_task_runs.prompt_dispatch`` int code to its name."""
+    return _decode(
+        SCHEDULED_TASK_RUN_PROMPT_DISPATCH, code, field="scheduled_task_runs.prompt_dispatch"
+    )
 
 
 def encode_journal_entry_kind(name: str) -> int:

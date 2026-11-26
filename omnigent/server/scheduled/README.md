@@ -107,6 +107,87 @@ the same way as for a scheduled occurrence.
 - Once the request is recorded, the route returns 202, even if starting it here
   fails; a later poll starts it. It returns 503 when the scheduler is not running.
 
+## Retries
+
+A task's `max_retries` and `retry_delay_seconds` retry a startup that failed
+before its prompt reached the agent. The routes save `max_retries` above 0 only
+with the `automation_retries` release feature; the scheduler follows whatever is
+saved.
+
+- **Recording.** The executor passes `retryable=True` to `lease.finish("failed")`
+  only for an error code in `RETRYABLE_STARTUP_ERROR_CODES` and only when the
+  prompt send never began. Recovery's `on_expired` returns `unsent` instead of
+  `failed` when it can show the prompt never left its executor; the scheduler
+  records both as `failed` (`startup_expired`) and retries only `unsent`.
+  `transition_starting_run` then records the retry in the same write: a
+  `scheduled` run keyed `retry:<attempt>:<original key>` whose `scheduled_at` is
+  the failure time plus the delay.
+- **Proof that a prompt was not sent.** A claim sets the run's `prompt_dispatch`
+  to `not_started`. `StartupLease.begin_dispatch` sets it to `started` under the
+  live lease, and the built-in executor calls it just before it sends the prompt
+  to a runner or saves it for a sandbox's host to deliver. Recovery returns
+  `unsent` only for a run still at `not_started` whose session, if it has one,
+  shows no sign of the prompt. It does not read the session's harness or the
+  task, which can both change after the claim, and a run claimed by a release
+  that doesn't record the column (`NULL`) is `failed`. A sandbox launch is the
+  one exception: its prompt is saved before the launch, so its proof is that the
+  host never bound. A launch already marked failed on the session counts only
+  when this server's own launch tracker shows it never bound, since a launch
+  that fails after binding drops its host and leaves the same mark. An unbound
+  launch this server has no record of, because another server ran it or this
+  one restarted, is `failed` once its dispatch began: its host may have bound
+  and been dropped again, and an empty transcript proves nothing, since a
+  prompt a native harness took may not be echoed yet. A prompt whose save for
+  the sandbox failed is not retried, since the save may have landed. The
+  executor reads the tracker the same way
+  when a launch fails or its registration wait runs out: it retries only a
+  launch that has ended with its record still unbound. A launch that bound as
+  the wait ran out, is still stopping, or succeeded and so dropped its record
+  may have delivered the prompt. Both the executor and recovery fail the saved
+  prompt before they record a failure that can be retried, so a retry that
+  continues the same session never finds it waiting.
+- **When no retry is recorded.** Once `attempt` reaches `max_retries`; for a
+  paused or timer task; when the retry would start at or after the task's
+  `next_run_at`; when a scheduled occurrence due after the failed one already
+  has a run that was not skipped, which happens when a startup outlasts the
+  schedule's interval; and when the task already has a retry waiting. A retry
+  row is dated at its own deadline, so "after the failed one" is measured from
+  the run it retries, found by its original key. The last rule keeps a task to
+  one waiting retry.
+- **Lookups.** `trigger_kind` repeats the key's prefix as a code, so the waiting
+  retry is one seek of `ix_scheduled_task_runs_task_status` on status and kind,
+  and the later occurrence one seek on status, kind and `scheduled_at`. Neither
+  reads the task's other pending runs or its history.
+- **Starting.** Retries are pending runs, so `_claim_pending` finds them like Run
+  now requests. It passes over one whose `scheduled_at` hasn't come, and
+  `claim_pending_run` refuses it too. Its host comes from its own key, so a
+  new-session sandbox retry gets a new sandbox.
+- **Dropping.** `update` and `pause_invalid_schedule` record the task's waiting
+  retry as `skipped` in the same write when they pause the task (`task_paused`)
+  or leave `max_retries` below the retry's attempt (`retry_cancelled`). A retry
+  that is ruled out therefore never stays pending, and undoing the edit doesn't
+  bring it back. `claim_pending_run` checks both again before it starts one.
+- **Superseding.** Claiming a scheduled occurrence records the task's waiting
+  retry as `skipped` (`retry_superseded`). A retry claimed once that occurrence
+  is due is superseded too: a sandbox occurrence and its retry have different
+  hosts, so another replica may claim the occurrence only afterwards.
+- **Latest run.** `list_latest_run_status_for_tasks` and `list_inbox_failures`
+  pass over a `skipped` retry, so the failure it would have retried stays the
+  task's latest run. A skipped retry keeps the date of its deadline, so any
+  number of them can be newer than that run, and the lookups don't read back
+  through them. When a task's newest run is one, they seek
+  `ix_scheduled_task_runs_task_status` once per other status and kind for the
+  newest run of each, and take the newest of those. A waiting retry is the
+  latest run until it starts; it is dated at its deadline, so a Run now that
+  finishes meanwhile sorts below it.
+
+A database scheduler from before this release starts a pending retry at once,
+like a Run now request, without its delay. Keep `automation_retries` off until
+every scheduler polling the database has this release. Before rolling back to
+one, turn the feature off and set `max_retries` to 0 on every task that has it:
+that drops its waiting retry in the same write, so no pending retry is left for
+the older scheduler.
+
 ## Startup leases
 
 Only the server doing a startup renews its lease. If a renewal fails, it keeps
@@ -372,8 +453,8 @@ host; with a single replica, that is the restarted server.
 | Server stops… | Saved state | What happens next | Result |
 | --- | --- | --- | --- |
 | Before the claim commits | Nothing changed | The next poll claims the occurrence | Runs normally, just late |
-| After the claim, before the session exists | Run is `starting`, no session | Recovery finds nothing was launched | `failed` (`startup_expired`); the occurrence is not retried |
-| Connected host, session created, prompt not sent | Session without the prompt | Recovery finds no prompt, agent output, or active turn | `failed`; the prompt is never resent, and a runner already started on the host is left idle |
+| After the claim, before the session exists | Run is `starting`, no session | Recovery finds nothing was launched | `failed` (`startup_expired`); the occurrence runs again only if recovery reports it `unsent` and the task has a [retry](#retries) left |
+| Connected host, session created, prompt not sent | Session without the prompt | Recovery finds no prompt, agent output, or active turn | `failed`; recovery never resends the prompt, and a runner already started on the host is left idle. If the result is `unsent`, a retry the task has left starts a new run |
 | Connected host, prompt sent, `running` not recorded | Session has the prompt | Recovery reads the session | `running`, `succeeded` if the turn already ended, or `failed` if the session failed |
 | Managed sandbox, prompt saved, sandbox still starting | Saved prompt, no host bound | Recovery waits `shutdown_drain_s` past the lease expiry, because a shutting-down server may still bind the sandbox | Bound in time: `running`, and the sandbox's server delivers the prompt. Otherwise: sandbox torn down, prompt failed, `failed` |
 | Managed sandbox, launch already failed | Session startup marked failed | Recovery tears down any sandbox for the run | `failed` |
@@ -388,7 +469,10 @@ host; with a single replica, that is the restarted server.
 ### How recovery decides
 
 When a startup's lease expires, recovery inspects what the run saved and chooses its
-final status without resending the prompt, as shown below.
+final status without resending the prompt, as shown below. `unsent` is a failure
+with proof that the prompt never left its executor (see [Retries](#retries)). It
+is saved as `failed` like the others, and is the only result a task's retries
+act on.
 
 ```mermaid
 flowchart TD
@@ -399,31 +483,31 @@ flowchart TD
     Id -- "authorization revoked" --> FX["failed, no cleanup"]
     Id -- "temporary error" --> U0["Check again on a later sweep"]
     Id -- ok --> B{"Session attached<br/>to the run?"}
-    B -- No --> F1["failed<br/>nothing was launched"]
+    B -- No --> F1["unsent if the run's dispatch<br/>never began, else failed"]
     B -- Yes --> C{"Session still exists?"}
     C -- No --> T1["Tear down sandbox if managed"] --> F2["failed"]
     C -- Yes --> D{"Managed sandbox run?<br/>(from the run's host ID,<br/>not the task's current target)"}
 
     D -- "No, connected host" --> E{"Prompt or agent output<br/>in the transcript,<br/>or a turn active?"}
-    E -- No --> F3["failed<br/>prompt never sent, never resent"]
+    E -- No --> F3["unsent if the run's dispatch<br/>never began, else failed;<br/>never resent"]
     E -- Yes --> O{"Session state"}
 
     D -- Yes --> G{"Launch already<br/>marked failed?"}
-    G -- Yes --> T2["Tear down sandbox"] --> F4["failed"]
+    G -- Yes --> T2["Tear down sandbox"] --> F4["unsent if this server's launch<br/>never bound its host, else failed"]
     G -- No --> H{"Host bound<br/>to the session?"}
     H -- Yes --> P{"Prompt still pending?"}
     P -- Yes --> R1["running"]
     P -- No --> O
     H -- No --> I{"Still starting on this server,<br/>or within shutdown_drain_s<br/>after the lease expired?"}
     I -- Yes --> U["Check again on a later sweep"]
-    I -- No --> T3["Tear down sandbox,<br/>fail the saved prompt"] --> F5["failed"]
+    I -- No --> T3["Tear down sandbox,<br/>fail the saved prompt"] --> F5["unsent<br/>failed if this server<br/>saw the launch bind"]
 
     O -- "session failed" --> F6["failed"]
     O -- "idle, newest item is the agent's reply" --> S["succeeded"]
     O -- otherwise --> R2["running"]
 
     R1 & R2 & S & F1 & F2 & F3 & F4 & F5 & F6 & FX --> W{"Does the run still have<br/>the same expired lease?"}
-    W -- Yes --> Done["Result recorded<br/>failed uses startup_expired"]
+    W -- Yes --> Done["Result recorded<br/>failed and unsent are saved as<br/>failed with startup_expired"]
     W -- No --> Gone["Already recorded elsewhere"]
 ```
 
@@ -577,6 +661,7 @@ executor's job.
 | `"running"` | Startup was handed off; keep the work. |
 | `"succeeded"` | The prompt was delivered and the turn already finished. Recovery records this itself, because the turn-completion hook only updates `running` runs. |
 | `"failed"` | Startup cannot continue, and cleanup is done. |
+| `"unsent"` | As `"failed"`, and the prompt provably never reached the agent. It is recorded as `failed`, and the task's [retries](#retries) may start the run again. Return `"failed"` when unsure. |
 | `None`, or an exception | The outcome or cleanup is unclear; check again on a later pass. |
 
 - The store accepts the result only if the run still has the same expired lease.
@@ -707,7 +792,9 @@ was never sent.
 Run events carry `task_id`, `run_id`, `task_workspace_id`, `scheduled_at`, and
 `trigger_key`. Due-occurrence observations, claim attempts, and skipped claims have no run ID. Use
 `(task_workspace_id, task_id, trigger_key)` for occurrence identity: manual runs
-can share a timestamp with a scheduled run without being duplicates.
+can share a timestamp with a scheduled run without being duplicates. A retry's key
+is its occurrence's key behind `retry:<attempt>:`; strip that prefix to count an
+occurrence together with its retries.
 
 The executor scopes ordinary server logs and child tasks with occurrence IDs,
 `target`, and `session_mode`. Managed startup inputs persist these fields in
@@ -802,7 +889,7 @@ run. It is the last observed boundary, not proof of the exact crash location;
 
 | Metric | How to calculate it |
 | --- | --- |
-| Observed fire success | Distinct occurrence keys with `prompt_sent` divided by distinct observed schedule keys from `occurrence_observed`/`claim_attempted`/`claimed`, excluding intentionally skipped occurrences. Due observations retain visibility of ownership and validation failures; claim attempts retain DB claim failures that created no run. Filter `trigger_key` to `schedule:` for scheduled-only metrics; report manual runs separately. |
+| Observed fire success | Distinct occurrence keys with `prompt_sent` divided by distinct observed schedule keys from `occurrence_observed`/`claim_attempted`/`claimed`, excluding intentionally skipped occurrences. Due observations retain visibility of ownership and validation failures; claim attempts retain DB claim failures that created no run. Filter `trigger_key` to `schedule:` for scheduled-only metrics, after stripping a `retry:<attempt>:` prefix so an occurrence that succeeded on a retry counts as a success; report manual runs separately. |
 | Duplicate fires | Occurrences with more than one distinct `run_id` in `prompt_sent`. Failed attempts with no accepted prompt do not count as duplicate fires. |
 | Duplicate sends | Occurrences with more than one distinct `dispatch_id` in `prompt_sent`, after deduplicating ingested rows by `log_id`. This also detects repeated delivery within one run; duplicate claims remain separately protected by the DB constraint. |
 | Session creation count | Count distinct `session_id` values on `session_created`, grouped by occurrence or run. Useful for diagnosing repeated creation; a created session does not prove a prompt was sent. |

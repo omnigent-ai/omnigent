@@ -8327,3 +8327,63 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     expect(screen.queryByTestId("task-mcp-services-menu")).not.toBeInTheDocument();
   });
 });
+
+describe("CreateScheduledTaskDialog retries", () => {
+  it.each([false, true])("offers retries only on a server that has them=%s", async (supported) => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ maxRetries: 2, retryDelaySeconds: 60 })}
+      />,
+      { info: { scheduled_task_retries: supported } },
+    );
+    expect(screen.queryByTestId("task-retries-trigger") !== null).toBe(supported);
+
+    // An unrelated edit leaves the saved retries alone, shown or not.
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input).toMatchObject({ name: "Renamed" });
+    expect(input).not.toHaveProperty("maxRetries");
+    expect(input).not.toHaveProperty("retryDelaySeconds");
+  });
+
+  it("offers no retries for a trigger, which polls again within minutes", () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialTrigger="github" />, {
+      info: {
+        scheduled_task_retries: true,
+        scheduled_task_session_modes: true,
+        scheduled_task_subhour: true,
+      },
+    });
+    expect(screen.queryByTestId("task-retries-trigger")).toBeNull();
+  });
+
+  it("saves the picked retry count and delay", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ maxRetries: 0, retryDelaySeconds: 300 })}
+      />,
+      { info: { scheduled_task_retries: true } },
+    );
+    closeTopLevelPopovers();
+    const trigger = screen.getByTestId("task-retries-trigger");
+    expect(trigger).toHaveTextContent("Off");
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("task-retries-count-2"));
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(screen.getByTestId("task-retries-delay-60"));
+    expect(trigger).toHaveTextContent("2 retries · 1 minute apart");
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      maxRetries: 2,
+      retryDelaySeconds: 60,
+    });
+  });
+});

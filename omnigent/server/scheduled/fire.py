@@ -122,6 +122,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
     FireIdentityRevoked,
+    RecoveryResult,
     StartupLease,
 )
 from omnigent.server.scheduled.harness_settings import (
@@ -141,6 +142,7 @@ from omnigent.server.scheduled.run_sharing import (
     sync_continued_session,
 )
 from omnigent.server.scheduled.schedule import (
+    RETRYABLE_STARTUP_ERROR_CODES,
     continued_sandbox_host_id,
     is_trigger_automation,
     strip_trigger_header,
@@ -198,14 +200,20 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class _PromptSendProgress:
-    """Whether a continued run's dispatch has begun sending its prompt."""
+    """How far a run's dispatch has got with its prompt."""
 
+    # Records, on the run, that the prompt is about to leave this executor.
+    record: Callable[[], Awaitable[None]]
     started: bool = False
 
+    async def begin(self) -> None:
+        """Record the dispatch, then mark the send as begun."""
+        await self.record()
+        self.started = True
 
-# Set by a continued run around its dispatch; ``_send_prompt`` marks it just
-# before sending. A shared object rather than a flag, so a mark made in a
-# child task is still seen.
+
+# Set around a run's dispatch; ``_send_prompt`` marks it just before sending.
+# A shared object rather than a flag, so a mark made in a child task is still seen.
 _PROMPT_SEND_PROGRESS: ContextVar[_PromptSendProgress | None] = ContextVar(
     "scheduled_prompt_send_progress", default=None
 )
@@ -369,6 +377,10 @@ class _FireRecorder(Protocol):
         """Record the fired session before it is launched, so recovery can find it."""
         ...
 
+    async def dispatching(self) -> None:
+        """Record that the fire's prompt is about to leave this executor."""
+        ...
+
     async def finish(
         self,
         status: str,
@@ -420,6 +432,9 @@ class _NewRunRecorder:
         # turn starts first still need to count as this run's.
         self._session_id = conversation_id
         note_unrecorded_legacy_run_session(conversation_id, self._task.id)
+
+    async def dispatching(self) -> None:
+        return None
 
     async def finish(
         self,
@@ -1303,7 +1318,7 @@ async def _continue_session(
         app_state=deps.app_state,
         host_registry=deps.host_registry,
     )
-    progress = _PromptSendProgress()
+    progress = _PromptSendProgress(recorder.dispatching)
     progress_token = _PROMPT_SEND_PROGRESS.set(progress)
     # Stamped before the prompt goes in, so the journal entries the session records
     # are attributed to this run on any replica, even after a restart. A task, so
@@ -2828,7 +2843,7 @@ async def _send_prompt(
         progress = _PROMPT_SEND_PROGRESS.get()
         if progress is not None:
             # From here a failure may come after the runner took the prompt.
-            progress.started = True
+            await progress.begin()
         dispatch_id = uuid.uuid4().hex
         log_delivery(
             "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id
@@ -2875,13 +2890,23 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
 
         if deps.startup_inputs is None:
             raise RuntimeError("managed sandboxes are not configured")
-        # No browser preference applies to a fire; keep the server default.
-        await deps.startup_inputs.enqueue(
-            conv.id,
-            _prompt_event(run_prompt_text(task)),
-            user_id=task.user_id or RESERVED_USER_LOCAL,
-            headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
-        )
+        progress = _PROMPT_SEND_PROGRESS.get()
+        if progress is not None:
+            # Once saved, the prompt is delivered without this executor.
+            await progress.record()
+        try:
+            # No browser preference applies to a fire; keep the server default.
+            await deps.startup_inputs.enqueue(
+                conv.id,
+                _prompt_event(run_prompt_text(task)),
+                user_id=task.user_id or RESERVED_USER_LOCAL,
+                headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
+            )
+        except BaseException:
+            if progress is not None:
+                # The save may have landed all the same, and nothing fences it here.
+                progress.started = True
+            raise
 
     return _dispatch
 
@@ -2976,14 +3001,12 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
 
 
 def _launch_error_code(
-    tracker: ManagedLaunchTracker, session_id: str, codes: _LaunchErrorCodes
+    tracker: ManagedLaunchTracker | None, session_id: str, codes: _LaunchErrorCodes
 ) -> str:
-    launch = tracker.get(session_id)
-    return (
-        codes.after_binding
-        if launch is not None and launch.bound.is_set()
-        else codes.before_binding
-    )
+    launch = tracker.get(session_id) if tracker is not None else None
+    # A launch that succeeds forgets its record, so only a kept one can show no binding.
+    never_bound = launch is not None and not launch.bound.is_set()
+    return codes.before_binding if never_bound else codes.after_binding
 
 
 async def _fail_running_run(
@@ -3044,6 +3067,11 @@ class _ClaimedRunRecorder:
         set_current_session_id(conversation_id)
         await self._lease.attach_session(conversation_id)
 
+    async def dispatching(self) -> None:
+        if self._task.kind != "timer":
+            # A timer's wake is never retried, so its ticks skip this write.
+            await self._lease.begin_dispatch()
+
     async def hand_back_timer_firing(self, host_id: str) -> None:
         """Return a timer's firing unsent, for the replica that owns *host_id* to claim."""
         await self._lease.hand_back_timer_firing(host_id)
@@ -3055,12 +3083,18 @@ class _ClaimedRunRecorder:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        prompt_may_be_taken: bool = False,
     ) -> None:
+        progress = _PROMPT_SEND_PROGRESS.get()
         await self._lease.finish(
             status,
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
+            # Never retry a prompt the runner may already have taken.
+            retryable=error_code in RETRYABLE_STARTUP_ERROR_CODES
+            and not prompt_may_be_taken
+            and (progress is None or not progress.started),
             failure_stage=(
                 (startup_failure_stage(error_code) if error_code != "launch_failed" else None)
                 or current_fire_stage()
@@ -3117,11 +3151,17 @@ class _ClaimedRunRecorder:
             await self._abandon_unregistered_sandbox(conv.id, launch_task)
             return
         if error is not None:
+            # Before a retry can be recorded, so that it never finds this prompt still
+            # waiting. The launch fails it as well, but only once it has settled.
+            await self._fail_saved_prompt(conv.id, error)
             await self.finish(
                 "failed",
                 conversation_id=conv.id,
                 error=error,
-                error_code=_STAGED_LAUNCH_ERRORS.before_binding,
+                # A launch that bound and then rolled its host back reads as unbound here.
+                error_code=_launch_error_code(
+                    self._deps.managed_launches, conv.id, _STAGED_LAUNCH_ERRORS
+                ),
             )
             return
         await self.finish("running", conversation_id=conv.id)
@@ -3164,11 +3204,15 @@ class _ClaimedRunRecorder:
             # A launch cancelled before it binds never settles its tracker entry.
             if tracker is not None and launch is not None and not launch.settled.is_set():
                 tracker.fail(conversation_id, reason)
+        # A host that bound, even as this wait ran out, may have taken the saved prompt.
+        # Only a launch that has ended with its record unbound shows none did.
+        never_bound = launch_task.done() and launch is not None and not launch.bound.is_set()
         await self.finish(
             "failed",
             conversation_id=conversation_id,
             error=reason,
             error_code="sandbox_registration_timeout",
+            prompt_may_be_taken=not never_bound,
         )
 
 
@@ -3255,6 +3299,16 @@ def _delivered_run_outcome(
     if conv.live_status == "idle" and evidence.answered:
         return "succeeded"
     return "running"
+
+
+def _undelivered_outcome(run: ScheduledTaskRun) -> Literal["failed", "unsent"]:
+    """Outcome of an interrupted startup with no sign that its prompt arrived.
+
+    Only the run's own record that its dispatch never began proves the prompt was not
+    sent. A session shows nothing of a prompt sent to a harness that writes its own
+    transcript, and a run claimed by a release without that record proves nothing.
+    """
+    return "unsent" if run.prompt_dispatch == "not_started" else "failed"
 
 
 async def _timer_session_problem(
@@ -3411,6 +3465,10 @@ class ClaimedRunExecutor:
             self._deps, task, lease, registration_timeout_s=self._registration_timeout_s
         )
         async with contextlib.AsyncExitStack() as stack:
+            # Lets a failed startup tell whether its prompt was ever sent, so only an
+            # unsent one is retried.
+            progress_token = _PROMPT_SEND_PROGRESS.set(_PromptSendProgress(recorder.dispatching))
+            stack.callback(_PROMPT_SEND_PROGRESS.reset, progress_token)
             stack.enter_context(scheduled_run_scope(run_log_context(task, lease.run)))
             try:
                 with fire_stage("owner_identity"):
@@ -3468,13 +3526,13 @@ class ClaimedRunExecutor:
             error_code="reauthorization_required",
         )
 
-    async def recover(
-        self, run: ScheduledTaskRun
-    ) -> Literal["running", "succeeded", "failed"] | None:
+    async def recover(self, run: ScheduledTaskRun) -> RecoveryResult | None:
         """``on_expired``: decide an interrupted startup from its session; never resend.
 
-        A temporary failure to act as the owner propagates, so a later sweep
-        checks the run again.
+        ``unsent`` is a failure found with proof that the prompt never left its
+        executor, the only one the task's retries may start again; without proof
+        the result is ``failed``. A temporary failure to act as the owner
+        propagates, so a later sweep checks the run again.
         """
         task = await asyncio.to_thread(self._deps.scheduled_task_store.get, run.scheduled_task_id)
         if task is not None and task.kind == "timer":
@@ -3506,14 +3564,12 @@ class ClaimedRunExecutor:
         stack.enter_context(account_authority_scope(task.user_id, task.account_generation))
         stack.enter_context(host_owner_scope(task.user_id, task.account_generation))
 
-    async def _inspect_startup(
-        self, run: ScheduledTaskRun
-    ) -> Literal["running", "succeeded", "failed"] | None:
+    async def _inspect_startup(self, run: ScheduledTaskRun) -> RecoveryResult | None:
         from omnigent.server.scheduled.schedule import sandbox_host_id
 
         if run.conversation_id is None:
-            # Launch starts only after the session is recorded, so nothing ran.
-            return "failed"
+            # A run that continues a session records it only once its prompt is delivered.
+            return _undelivered_outcome(run)
         conv = await asyncio.to_thread(
             self._deps.conversation_store.get_conversation, run.conversation_id
         )
@@ -3532,8 +3588,8 @@ class ClaimedRunExecutor:
             return await self._inspect_managed_startup(run, conv)
         evidence = await self._transcript_evidence(conv.id)
         if not evidence.delivered and conv.live_status not in ("running", "waiting"):
-            # The prompt was never sent, and recovery never sends it.
-            return "failed"
+            # Nothing shows the prompt arrived, and recovery never sends it.
+            return _undelivered_outcome(run)
         return _delivered_run_outcome(conv, evidence)
 
     async def _transcript_evidence(self, conversation_id: str) -> _TranscriptEvidence:
@@ -3547,14 +3603,20 @@ class ClaimedRunExecutor:
 
     async def _inspect_managed_startup(
         self, run: ScheduledTaskRun, conv: Conversation
-    ) -> Literal["running", "succeeded", "failed"] | None:
-        from omnigent.server.startup_inputs import STARTUP_LABEL
+    ) -> RecoveryResult | None:
+        from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL
 
+        tracker = self._deps.managed_launches
+        launch = tracker.get(conv.id) if tracker is not None else None
         if conv.labels.get(STARTUP_LABEL) == "failed":
             # The launch failure is already recorded on the session. A sandbox
             # that bound anyway can never deliver the failed prompt.
             await self._terminate_sandbox(run)
-            return "failed"
+            # A launch that failed after binding, or a failed move, leaves the same label,
+            # so only this server's record of the launch shows its host never bound.
+            never_bound = launch is not None and not launch.bound.is_set()
+            unsent = never_bound and STARTUP_SETTLED_BY_LABEL not in conv.labels
+            return "unsent" if unsent else "failed"
         if conv.host_id is not None:
             # The prompt was saved before the launch began; the host's replica
             # delivers it.
@@ -3565,12 +3627,9 @@ class ClaimedRunExecutor:
                 return "running"
             evidence = await self._transcript_evidence(conv.id)
             if not evidence.delivered and conv.live_status not in ("running", "waiting"):
-                # Nothing is saved to deliver and nothing reached the agent: a
-                # session that joined the task's sandbox never got its prompt.
-                return "failed"
+                # Nothing is saved to deliver and nothing shows the prompt arrived.
+                return _undelivered_outcome(run)
             return _delivered_run_outcome(conv, evidence)
-        tracker = self._deps.managed_launches
-        launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and not launch.settled.is_set():
             # Still provisioning on this server; a later sweep sees the binding.
             return None
@@ -3587,7 +3646,13 @@ class ClaimedRunExecutor:
         await self._terminate_sandbox(run)
         if self._deps.startup_inputs is not None:
             await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
-        return "failed"
+        if launch is None:
+            # Another server ran the launch, which may have bound a host and dropped it
+            # again. A transcript without the prompt proves nothing: a prompt a native
+            # harness took may not be echoed into it yet.
+            return _undelivered_outcome(run)
+        # A launch this server saw bind has since rolled its host back.
+        return "failed" if launch.bound.is_set() else "unsent"
 
     async def _terminate_sandbox(self, run: ScheduledTaskRun) -> None:
         # A continue task's sandbox outlives any one session: another session of

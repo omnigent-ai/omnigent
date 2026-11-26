@@ -470,6 +470,8 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-workspace")).toHaveTextContent("Host home directory");
     expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("UTC");
     expect(screen.getByTestId("task-detail-cost-limit")).toHaveTextContent("No limit");
+    // Retries are listed only when they are on.
+    expect(screen.queryByTestId("task-detail-retries")).not.toBeInTheDocument();
   });
 
   it("shows saved launch settings and the continued session configuration", () => {
@@ -487,6 +489,8 @@ describe("header, prompt, configuration", () => {
         projectId: "proj_1",
         timezone: "America/Los_Angeles",
         maxCostUsd: 2.5,
+        maxRetries: 2,
+        retryDelaySeconds: 300,
       }),
     );
     renderPage();
@@ -501,6 +505,9 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-project")).toHaveTextContent("Inbox");
     expect(screen.getByTestId("task-detail-timezone")).toHaveTextContent("America/Los_Angeles");
     expect(screen.getByTestId("task-detail-cost-limit")).toHaveTextContent("$2.50");
+    expect(screen.getByTestId("task-detail-retries")).toHaveTextContent(
+      "2 retries · 5 minutes apart",
+    );
     expect(screen.getByText(/saved launch settings/)).toBeInTheDocument();
   });
 
@@ -1333,6 +1340,18 @@ describe("run history", () => {
     setRuns([]);
     renderPage();
     expect(screen.getByTestId("task-detail-runs-empty")).toHaveTextContent("No runs yet.");
+  });
+
+  it("labels an automatic retry with its attempt", () => {
+    setTask(task());
+    setRuns([
+      run({ id: "run_2", retryAttempt: 2, scheduledAt: 1_700_000_600 }),
+      run({ id: "run_1", status: "failed", errorCode: "host_offline" }),
+    ]);
+    renderPage();
+    const [retry, firstTry] = screen.getAllByTestId("task-detail-run");
+    expect(within(retry).getByTestId("run-retry-attempt")).toHaveTextContent("Retry 2");
+    expect(within(firstTry).queryByTestId("run-retry-attempt")).toBeNull();
   });
 
   it("renders a READ succeeded run with a grey dot ('Completed' tooltip) and a clickable row", async () => {

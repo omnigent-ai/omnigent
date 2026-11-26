@@ -206,6 +206,18 @@ class StartupLease:
 
         await self._transition("starting", conversation_id=conversation_id, committed=log_session)
 
+    async def begin_dispatch(self) -> None:
+        """Record that the prompt is about to leave this executor; raise if the lease was lost.
+
+        Recovery takes an interrupted startup as unsent only while this was never recorded.
+        """
+        await self._write(
+            lambda: self._store.renew_starting_run(
+                self.run.id, now=self._now, lease_seconds=self._lease_seconds, dispatching=True
+            ),
+            renewing=True,
+        )
+
     async def finish(
         self,
         status: str,
@@ -214,11 +226,14 @@ class StartupLease:
         error: str | None = None,
         error_code: str | None = None,
         failure_stage: str | None = None,
+        retryable: bool = False,
     ) -> None:
         """Record prompt delivery or a known startup failure, with a live lease.
 
         ``succeeded`` is for a prompt delivered into a continued session, whose
-        run does not wait for the turn it joins.
+        run does not wait for the turn it joins. A ``failed`` startup is
+        *retryable* only when its prompt never reached the agent; the task's
+        retry settings then decide whether it runs again.
         """
         if status not in {"running", "succeeded", "failed", "skipped"}:
             raise ValueError(
@@ -234,6 +249,7 @@ class StartupLease:
             conversation_id=conversation_id,
             error=error,
             error_code=error_code,
+            retryable=retryable,
             committed=lambda _previous: self._log_startup_ended(
                 status, error_code=error_code, failure_stage=failure_stage, finished_at=finished_at
             ),
@@ -303,6 +319,7 @@ class StartupLease:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        retryable: bool = False,
         committed: Callable[[ScheduledTaskRun], None] | None = None,
     ) -> None:
         await self._write(
@@ -313,6 +330,7 @@ class StartupLease:
                 conversation_id=conversation_id,
                 error=error,
                 error_code=error_code,
+                retryable=retryable,
             ),
             committed=committed,
         )
@@ -379,9 +397,9 @@ class StartupLease:
 
 
 ClaimedFire = Callable[[ScheduledTask, StartupLease], Awaitable[None]]
-ReconcileStartup = Callable[
-    [ScheduledTaskRun], Awaitable[Literal["running", "succeeded", "failed"] | None]
-]
+# What recovery found; ``unsent`` is a failed startup whose prompt never reached the agent.
+RecoveryResult = Literal["running", "succeeded", "failed", "unsent"]
+ReconcileStartup = Callable[[ScheduledTaskRun], Awaitable[RecoveryResult | None]]
 # Receives host ownership keys and returns the subset this replica owns.
 OwnedHosts = Callable[[Sequence[str]], Awaitable[Collection[str]]]
 # Acts as the task's owner for the calls one startup or recovery makes.
@@ -407,7 +425,7 @@ class FireIdentityRevoked(Exception):
     """
 
 
-_RECOVERY_RESULTS = ("running", "succeeded", "failed")
+_RECOVERY_RESULTS = ("running", "succeeded", "failed", "unsent")
 
 
 async def _owns_every_host(keys: Sequence[str]) -> Collection[str]:
@@ -612,10 +630,11 @@ class PersistentTaskScheduler:
             )
 
     async def _claim_pending(self) -> None:
-        """Start Run now requests whose host this replica owns, one page per poll.
+        """Start Run now requests and due retries on this replica's hosts, one page per poll.
 
         The cursor persists across polls and wraps at the end, so requests owned
-        by other replicas cost each poll at most one page.
+        by other replicas cost each poll at most one page. A retry stays pending
+        until its ``scheduled_at``.
         """
         if self._stopped or len(self._startups) >= self._max_startups:
             return
@@ -631,6 +650,8 @@ class PersistentTaskScheduler:
                 # Resume here next poll, so no request is skipped.
                 return
             self._pending_cursor = (run.workspace_id, run.id)
+            if run.scheduled_at > self._now():
+                continue
             try:
                 if host_ownership_key(run.workspace_id, run.host_id) in owned:
                     await self._start_pending(run)
@@ -837,9 +858,11 @@ class PersistentTaskScheduler:
                                 if status not in _RECOVERY_RESULTS:
                                     raise ValueError(
                                         f"Invalid recovery result {status!r}. "
-                                        "Expected 'running', 'succeeded', 'failed', or None "
-                                        "to check again later."
+                                        "Expected 'running', 'succeeded', 'failed', 'unsent', "
+                                        "or None to check again later."
                                     )
+                                unsent = status == "unsent"
+                                status = "failed" if unsent else status
                                 transition = asyncio.ensure_future(
                                     asyncio.to_thread(
                                         self._store.transition_starting_run,
@@ -854,6 +877,7 @@ class PersistentTaskScheduler:
                                         error_code="startup_expired"
                                         if status == "failed"
                                         else None,
+                                        retryable=unsent,
                                     )
                                 )
                                 # Logged on completion, even if this sweep times out first.

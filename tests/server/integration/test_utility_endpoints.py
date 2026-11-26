@@ -139,6 +139,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_subhour"] is True
     # The one_time_automations release feature is off by default.
     assert data["scheduled_task_one_time"] is False
+    # So is automation_retries.
+    assert data["scheduled_task_retries"] is False
     # Lets the trigger form save its header; older servers would send it to the model.
     assert data["scheduled_task_trigger_headers"] is True
     assert data["automation_trigger_poll_minutes"] == 10

@@ -37,6 +37,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AutomationPaletteCommands } from "@/components/scheduled/AutomationPaletteCommands";
+import { retrySummary } from "@/components/scheduled/AutomationRetryField";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
 import {
@@ -750,6 +751,13 @@ function TaskDetail({ taskId }: { taskId: string }) {
               value={task.maxCostUsd == null ? "No limit" : formatSessionCostUsd(task.maxCostUsd)}
               testId="task-detail-cost-limit"
             />
+            {(task.maxRetries ?? 0) > 0 && (
+              <ConfigField
+                label="Retries"
+                value={retrySummary(task.maxRetries ?? 0, task.retryDelaySeconds ?? 0)}
+                testId="task-detail-retries"
+              />
+            )}
           </dl>
           {task.sessionMode === "continue" && task.sessionId && (
             <p className="mt-3 text-xs text-muted-foreground">
@@ -1088,6 +1096,11 @@ function RunRow({
           style={summaryWidth ? { paddingRight: summaryWidth } : undefined}
         >
           <span className="text-sm font-normal">{timestamp ?? "—"}</span>
+          {(run.retryAttempt ?? 0) > 0 && (
+            <span className="text-xs text-muted-foreground" data-testid="run-retry-attempt">
+              Retry {run.retryAttempt}
+            </span>
+          )}
           {duration && (
             <span className="text-xs text-muted-foreground" data-testid="run-duration">
               {duration}

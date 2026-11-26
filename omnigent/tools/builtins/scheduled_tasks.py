@@ -22,6 +22,12 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from omnigent.entities.scheduled_task import (
+    DEFAULT_RETRY_DELAY_SECONDS,
+    MAX_RETRY_DELAY_SECONDS,
+    MAX_SCHEDULED_TASK_RETRIES,
+    MIN_RETRY_DELAY_SECONDS,
+)
 from omnigent.tools.base import Tool
 
 # Shorter waits belong to sys_timer_set. Rounding up to the minute can add up to
@@ -49,6 +55,29 @@ _WORKFLOW_DETAILS_DESC = (
     "workflow, e.g. 'Only the upload tests'."
 )
 
+# The retry settings, the same in the create and update schemas.
+_RETRY_PROPERTIES: dict[str, dict[str, Any]] = {
+    "max_retries": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": MAX_SCHEDULED_TASK_RETRIES,
+        "description": (
+            "Optional. How many times a run is started again when its startup fails "
+            "before the prompt reaches the agent (for example, its host is offline). "
+            "0 (default) never retries. A run whose prompt was delivered is never retried."
+        ),
+    },
+    "retry_delay_seconds": {
+        "type": "integer",
+        "minimum": MIN_RETRY_DELAY_SECONDS,
+        "maximum": MAX_RETRY_DELAY_SECONDS,
+        "description": (
+            f"Optional seconds to wait before each retry, {MIN_RETRY_DELAY_SECONDS} to "
+            f"{MAX_RETRY_DELAY_SECONDS} (default {DEFAULT_RETRY_DELAY_SECONDS}). A retry "
+            "that would start at or after the next scheduled run is dropped."
+        ),
+    },
+}
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
@@ -171,6 +200,7 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Omit for no automation-specific cap."
                             ),
                         },
+                        **_RETRY_PROPERTIES,
                         "session_mode": {
                             "type": "string",
                             "enum": ["new", "continue"],
@@ -382,6 +412,7 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "calls and may leave the task incomplete."
                             ),
                         },
+                        **_RETRY_PROPERTIES,
                         "session_mode": {
                             "type": "string",
                             "enum": ["new", "continue"],

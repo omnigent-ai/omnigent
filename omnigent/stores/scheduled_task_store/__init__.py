@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.entities.scheduled_task import DEFAULT_RETRY_DELAY_SECONDS
 from omnigent.errors import ErrorCode, OmnigentError
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
@@ -149,6 +150,8 @@ class ScheduledTaskStore(ABC):
         permission_mode: str | None = None,
         mcp_services: tuple[str, ...] = (),
         max_cost_usd: float | None = None,
+        max_retries: int = 0,
+        retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
         session_mode: str = "new",
         session_id: str | None = None,
         source_session_id: str | None = None,
@@ -183,6 +186,9 @@ class ScheduledTaskStore(ABC):
             (Claude Code), e.g. ``"acceptEdits"``.
         :param mcp_services: MCP service names every fired session starts with.
         :param max_cost_usd: Optional per-firing cost budget in USD.
+        :param max_retries: How many times a run whose startup failed before
+            its prompt reached the agent is started again; ``0`` never retries.
+        :param retry_delay_seconds: How long to wait before each retry.
         :param session_mode: ``"new"`` (default) starts a new session per
             firing; ``"continue"`` sends each firing's prompt into one session.
         :param session_id: The existing session a ``"continue"`` task sends
@@ -336,6 +342,8 @@ class ScheduledTaskStore(ABC):
         permission_mode: str | None = _UNSET,
         mcp_services: tuple[str, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
+        max_retries: int | None = None,
+        retry_delay_seconds: int | None = None,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workflow_id: str | None = _UNSET,
@@ -378,6 +386,9 @@ class ScheduledTaskStore(ABC):
         ``guard`` is called with the task as locked for this update, before any
         change. Whatever it raises aborts the update with nothing saved. It runs
         while the task row is locked, so it should do bounded work.
+
+        Pausing the task, or setting ``max_retries`` below the attempt of a retry
+        that is waiting to start, records that retry as ``skipped`` in the same write.
 
         Returns ``None`` if the task does not exist.
 
@@ -669,7 +680,9 @@ class ScheduledTaskStore(ABC):
         new run with a ``scheduled_at`` at/after the last scheduled fire) becomes
         the reported status as soon as it is recorded. Callers should force-fail
         stale ``running`` runs BEFORE calling this so a dead orphan reports
-        ``failed`` rather than a stuck ``running``.
+        ``failed`` rather than a stuck ``running``. A retry that never started
+        (``skipped``) is passed over, however many there are: the task reports its
+        newest run that is not one.
 
         Workspace-scoped (filters on ``current_workspace_id()``) like every other
         read; an empty id list returns an empty map without a query.

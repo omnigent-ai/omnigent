@@ -42,6 +42,16 @@ _CODECS = [
         ec.decode_scheduled_task_run_status,
     ),
     (
+        ec.SCHEDULED_TASK_RUN_TRIGGER_KIND,
+        ec.encode_scheduled_task_run_trigger_kind,
+        ec.decode_scheduled_task_run_trigger_kind,
+    ),
+    (
+        ec.SCHEDULED_TASK_RUN_PROMPT_DISPATCH,
+        ec.encode_scheduled_task_run_prompt_dispatch,
+        ec.decode_scheduled_task_run_prompt_dispatch,
+    ),
+    (
         ec.SCHEDULED_TASK_SESSION_MODE,
         ec.encode_scheduled_task_session_mode,
         ec.decode_scheduled_task_session_mode,
@@ -141,6 +151,8 @@ def test_shipped_codes_are_stable() -> None:
         "skipped": 5,
         "starting": 6,
     }
+    assert ec.SCHEDULED_TASK_RUN_TRIGGER_KIND == {"schedule": 1, "manual": 2, "retry": 3}
+    assert ec.SCHEDULED_TASK_RUN_PROMPT_DISPATCH == {"not_started": 1, "started": 2}
     assert ec.JOURNAL_ENTRY_KIND == {
         "status": 1,
         "note": 2,

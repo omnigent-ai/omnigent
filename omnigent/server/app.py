@@ -452,6 +452,9 @@ class ServerInfoResponse(BaseModel):
     # ``POST /v1/scheduled-tasks/{id}/clone`` copies an automation under a new ID, on
     # the database scheduler (``automations_v2``) only; absent on older servers.
     scheduled_task_clone: bool = False
+    # Scheduled tasks accept ``max_retries`` above 0. Needs the database scheduler and
+    # the ``automation_retries`` release feature; absent on older servers.
+    scheduled_task_retries: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -2815,6 +2818,10 @@ def create_app(
     app.state.one_time_automations_enabled = automations_v2_enabled and (
         resolved_feature_flags.enabled(Feature.ONE_TIME_AUTOMATIONS)
     )
+    # Saving retries waits until every scheduler on the database delays and pauses them.
+    app.state.automation_retries_enabled = automations_v2_enabled and (
+        resolved_feature_flags.enabled(Feature.AUTOMATION_RETRIES)
+    )
 
     app.state.scheduled_task_store = scheduled_task_store
     app.state.proactive_provisioner = ProactiveProvisioner()
@@ -4239,6 +4246,8 @@ def create_app(
                 "scheduled_task_shared_with_me": automation_sharing,
                 "scheduled_task_clone": automations_enabled
                 and bool(app.state.scheduled_task_dispatch_enabled),
+                "scheduled_task_retries": automations_enabled
+                and bool(app.state.automation_retries_enabled),
                 "session_timers": bool(app.state.session_timers_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
