@@ -20,6 +20,7 @@ import { shortcutKeys } from "@/lib/shortcuts/registry";
 
 import type { OpenFileOptions } from "../FileViewerContext";
 import { goToFileSearchState } from "../goToFileSearchStatus";
+import { useShowMoreParking } from "../paletteSessionItems";
 import { GO_TO_FILE_LABEL } from "./goToFileCommands";
 import type { GoToFileTarget } from "./goToFileItems";
 import { SessionSearchPreview } from "./SessionSearchPreview";
@@ -236,6 +237,8 @@ function OpenGoToFileDialog({
   };
   const view = views[mode];
   const copy = MODE_COPY[mode];
+  // Show more keeps the keyboard's place, as in ⌘K.
+  const showMore = useShowMoreParking(view.items, { query, open });
   return (
     <QuickPickDialog<FinderTarget>
       open={open}
@@ -254,6 +257,8 @@ function OpenGoToFileDialog({
       }
       query={query}
       onQueryChange={setQuery}
+      activeId={showMore.activeId}
+      onActiveIdChange={showMore.clear}
       // The rows come ranked: recent files first, then the best matches, or lines as found.
       segments={[{ sourceId: `go-to-file:${mode}`, ranking: "provider", items: view.items }]}
       emptyMessage={view.emptyMessage}
@@ -302,10 +307,11 @@ function OpenGoToFileDialog({
             }
       }
       inputTestId={INPUT_TEST_ID}
-      onAccept={({ value }) => {
+      onAccept={(item) => {
+        const { value } = item;
         if (!isFileTarget(value)) {
           if (value.kind === "more") {
-            value.load();
+            showMore.accept({ ...item, value });
             return "keepOpen";
           }
           sessionsView.rememberRow(value.id);

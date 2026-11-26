@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
@@ -42,6 +42,11 @@ function paletteSession(row: Conversation): PaletteSession {
 const NAMED = conversation("conv_named", "Upload retries");
 const MESSAGED = conversation("conv_messaged", "Storage cleanup", "…the upload kept failing…");
 const RECENT = conversation("conv_recent", "Recent work");
+// The message matches each later page brings, one a page.
+const LATER_MESSAGED = [
+  conversation("conv_page2", "Bucket audit", "…an upload stalled…"),
+  conversation("conv_page3", "Cache warmup", "…retry the upload…"),
+];
 
 // ⌘K's session search, as the finder calls it: what it was asked for, and its answer.
 const searches = vi.hoisted(() => ({
@@ -52,14 +57,17 @@ const searches = vi.hoisted(() => ({
   retries: 0,
   // The query the server last answered, when the debounce lags the typed one; null keeps up.
   answered: null as string | null,
-  // Whether message matches have another page, and how often it was asked for.
-  contentMore: false,
+  // How many pages of message matches there are, and how often another was asked for.
+  contentPages: 1,
   contentPagesFetched: 0,
+  // Whether the first message page's matches were all listed by name, so it adds no rows.
+  firstContentPageListed: false,
 }));
 vi.mock("../usePaletteSessionSearch", () => ({
   usePaletteSessionSearch: (options: { open: boolean }) => {
     searches.options.push(options);
     const [query, setQuery] = useState("");
+    const [contentPagesLoaded, setContentPagesLoaded] = useState(1);
     const typed = options.open && query.trim() !== "";
     const debouncedQuery = searches.answered ?? query;
     const showingServerMatches = typed && debouncedQuery === query;
@@ -80,15 +88,19 @@ vi.mock("../usePaletteSessionSearch", () => ({
         : [paletteSession(RECENT)],
       contentSessions:
         showingServerMatches && query.toLowerCase().includes("upload")
-          ? [paletteSession(MESSAGED)]
+          ? [
+              ...(searches.firstContentPageListed ? [] : [MESSAGED]),
+              ...LATER_MESSAGED.slice(0, contentPagesLoaded - 1),
+            ].map(paletteSession)
           : [],
       showingServerMatches,
       titleSearch: paging,
       contentSearch: {
         ...paging,
-        hasNextPage: searches.contentMore,
+        hasNextPage: contentPagesLoaded < searches.contentPages,
         fetchNextPage: () => {
           searches.contentPagesFetched += 1;
+          setContentPagesLoaded((count) => count + 1);
         },
       },
       searchFetching: false,
@@ -166,7 +178,8 @@ beforeEach(() => {
   searches.failed = null;
   searches.retries = 0;
   searches.answered = null;
-  searches.contentMore = false;
+  searches.contentPages = 1;
+  searches.firstContentPageListed = false;
   searches.contentPagesFetched = 0;
   fetchSessionItemsPage.mockReset();
   fetchSessionItemsPage.mockImplementation(async (sessionId: string) => ({
@@ -245,7 +258,7 @@ describe("the finder's Sessions tab", () => {
   });
 
   it("offers no message page for a query typed since the server answered", async () => {
-    searches.contentMore = true;
+    searches.contentPages = 2;
     renderHost();
     const dialog = openSessions("upload");
     expect(within(dialog).getByRole("option", { name: /Show more/ })).toBeInTheDocument();
@@ -255,6 +268,51 @@ describe("the finder's Sessions tab", () => {
     await userEvent.type(within(dialog).getByRole("combobox", { name: "Search sessions" }), "s");
     expect(within(dialog).queryByRole("option", { name: /Show more/ })).toBeNull();
     expect(searches.contentPagesFetched).toBe(0);
+  });
+
+  it("keeps the keyboard on the last row through Show more, on a middle page and the last", async () => {
+    searches.contentPages = 3;
+    renderHost();
+    const dialog = openSessions("upload");
+    const input = within(dialog).getByRole("combobox", { name: "Search sessions" });
+    const active = () =>
+      document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    const press = (key: string) => fireEvent.keyDown(input, { key });
+    // Upload retries, Storage cleanup, Show more.
+    press("ArrowDown");
+    press("ArrowDown");
+    expect(active()).toContain("Show more");
+    press("Enter");
+    await within(dialog).findByRole("option", { name: /Bucket audit/ });
+    expect(active()).toContain("Storage cleanup");
+    press("ArrowDown");
+    expect(active()).toContain("Bucket audit");
+
+    // The last page takes Show more away, and the keyboard stays where it was.
+    press("ArrowDown");
+    press("Enter");
+    await within(dialog).findByRole("option", { name: /Cache warmup/ });
+    expect(within(dialog).queryByRole("option", { name: /Show more/ })).toBeNull();
+    expect(active()).toContain("Bucket audit");
+    press("ArrowDown");
+    expect(active()).toContain("Cache warmup");
+    expect(searches.contentPagesFetched).toBe(2);
+  });
+
+  it("keeps Show more for a message page all listed by name, then goes to the first row it brings", async () => {
+    searches.contentPages = 2;
+    searches.firstContentPageListed = true;
+    renderHost();
+    const dialog = openSessions("upload");
+    const input = within(dialog).getByRole("combobox", { name: "Search sessions" });
+    const active = () =>
+      document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    // Upload retries, then In messages with only its Show more.
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(active()).toContain("Show more");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await within(dialog).findByRole("option", { name: /Bucket audit/ });
+    expect(active()).toContain("Bucket audit");
   });
 
   it("lists recent sessions before a query", () => {

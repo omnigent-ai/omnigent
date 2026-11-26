@@ -10,8 +10,8 @@ import type { Conversation } from "@/hooks/useConversations";
 import {
   type MoreRowTarget,
   paletteSessionItem,
-  paletteShowMoreItems,
   type SessionRowTarget,
+  sessionSearchItems,
 } from "../paletteSessionItems";
 import { usePaletteSessionSearch } from "../usePaletteSessionSearch";
 
@@ -82,21 +82,15 @@ export function useSessionsFinderView(active: boolean, query: string): SessionsF
         paletteSessionItem(session, RECENT_SESSIONS_GROUP, highlight),
       );
     }
-    return [
-      ...visibleSessions.map((session) =>
-        paletteSessionItem(session, NAME_MATCHES_GROUP, highlight),
-      ),
-      ...(showingServerMatches
-        ? paletteShowMoreItems("title", titleSearch, visibleSessions, NAME_MATCHES_GROUP)
-        : []),
-      ...contentSessions.map((session) =>
-        paletteSessionItem(session, MESSAGE_MATCHES_GROUP, highlight),
-      ),
-      // Like the title group, only the query the server answered pages, never one typed since.
-      ...(showingServerMatches
-        ? paletteShowMoreItems("content", contentSearch, contentSessions, MESSAGE_MATCHES_GROUP)
-        : []),
-    ];
+    // ⌘K's own rows. A message page whose matches are all listed by name keeps its Show more
+    // here, so the pages after it stay in reach.
+    const { names, messages } = sessionSearchItems(
+      { visibleSessions, contentSessions, showingServerMatches, titleSearch, contentSearch },
+      { names: NAME_MATCHES_GROUP, messages: MESSAGE_MATCHES_GROUP },
+      highlight,
+      { keepPagingWithoutRows: true },
+    );
+    return [...names, ...messages];
   }, [
     typed,
     searchedQuery,
