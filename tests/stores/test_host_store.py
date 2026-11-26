@@ -2052,7 +2052,9 @@ def test_managed_sandbox_reaper_mysql_deep_page_seeks_to_the_cursor(
     finally:
         event.remove(store._engine, "before_cursor_execute", explain)
 
-    assert len(page) == 50
+    assert [getattr(host, slot) for _, host in page] == [
+        f"sb-{index:04d}" for index in range(500, 550)
+    ]
     assert len(plans) == 1
     assert "Index range scan" in plans[0], plans[0]
     examined = [
