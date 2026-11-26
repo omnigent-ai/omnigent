@@ -28,6 +28,11 @@ const state: WorkspaceTabsSessionState = {
       place: { kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes" },
       openedBy: "user",
     },
+    {
+      id: "q",
+      place: { kind: "pull", url: "https://github.com/o/r/pull/2", view: "changes", list: true },
+      openedBy: "user",
+    },
     { id: "k", place: { kind: "tasks" }, openedBy: "user" },
   ],
   selectedTabId: "a",
@@ -174,6 +179,15 @@ describe("workspace tab storage", () => {
       }),
     ).toEqual({ kind: "changes", comparison: head, comparisonRoot: root });
   });
+
+  it.each([false, "true", 1, null, {}])(
+    "restores a pull request without list mode for list: %j",
+    (list) => {
+      expect(
+        parsePlace({ kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes", list }),
+      ).toEqual({ kind: "pull", url: "https://github.com/o/r/pull/1", view: "changes" });
+    },
+  );
 
   it("drops malformed fields one by one and keeps the rest", () => {
     window.localStorage.setItem(

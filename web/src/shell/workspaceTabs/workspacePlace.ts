@@ -53,6 +53,8 @@ export type WorkspacePlace =
       commit?: string;
       path?: string;
       line?: LineRange;
+      /** The session's pull requests show beside it, and choosing one shows it in this tab. */
+      list?: true;
     }
   | { kind: "terminal"; key: string }
   | { kind: "agents" }
@@ -109,7 +111,8 @@ export function placeIdentity(place: WorkspacePlace): string | null {
     case "pulls":
       return "pulls";
     case "pull":
-      return `pull:${place.url}`;
+      // A pull request beside the list never stands in for its own tab, nor it for the list.
+      return place.list ? `pull-list:${place.url}` : `pull:${place.url}`;
     case "terminal":
       return `terminal:${place.key}`;
     case "agents":

@@ -98,6 +98,10 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
       },
     ],
     [
+      `omnigent://pull?url=${encodeURIComponent(PR)}&view=changes&list=1`,
+      { place: { kind: "pull", url: PR, view: "changes", list: true } },
+    ],
+    [
       `omnigent://pull?url=${encodeURIComponent(PR)}&focus=checks`,
       { place: { kind: "pull", url: PR, view: "summary", focus: "checks" } },
     ],
@@ -158,6 +162,15 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     expect(parsed("OMNIGENT://Files")).toEqual({ place: { kind: "files" } });
     expect(parsed("omnigent://files#ignored")).toEqual({ place: { kind: "files" } });
   });
+
+  it.each(["0", "true", "", "11"])(
+    "leaves a pull request out of list mode for list=%j",
+    (value) => {
+      expect(parsed(`omnigent://pull?url=${encodeURIComponent(PR)}&list=${value}`)).toEqual({
+        place: { kind: "pull", url: PR, view: "summary" },
+      });
+    },
+  );
 
   it("drops and reports parameters a kind doesn't take", () => {
     const result = parseWorkspaceLink("omnigent://pulls?path=a.ts&zoom=2&tab=t1");

@@ -236,6 +236,7 @@ function parsePlace(kind: string, id: string | undefined, params: Params): Works
       const line = parseLineRange(params.get("line"), params.get("column"));
       if (path !== undefined) place.path = path;
       if (line !== undefined) place.line = line;
+      if (params.get("list") === "1") place.list = true;
       return place;
     }
     case "terminal":
@@ -355,6 +356,7 @@ function placeParams(place: WorkspacePlace): [string, string][] {
       if (place.commit !== undefined) entries.push(["commit", place.commit]);
       if (place.path !== undefined) entries.push(["path", place.path]);
       if (place.line) entries.push(...formatLine(place.line));
+      if (place.list) entries.push(["list", "1"]);
       return entries;
     }
     case "search":
