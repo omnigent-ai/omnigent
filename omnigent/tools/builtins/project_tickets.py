@@ -595,6 +595,14 @@ class SaveProjectArtifact(BaseModel):
         description="Whether this is a demo of the ticket's change. Videos count as demos "
         "unless this is false; set true for a demo in another format.",
     )
+    replace_id: str | None = Field(
+        default=None,
+        description=(
+            "ID of an artifact you saved earlier, to replace its content in place: it keeps "
+            "its ID and URL, and its revision goes up. Use it to update a running log or "
+            "report instead of saving a new copy."
+        ),
+    )
 
 
 class SysProjectArtifactSaveTool(_TicketTool):
@@ -605,7 +613,9 @@ class SysProjectArtifactSaveTool(_TicketTool):
         "this project's Files so the user can open it from the project and its tickets. "
         "With ticket_id, also posts a ticket comment with the file as an artifact output. "
         "Returns the artifact's id and url; pass {type: artifact, url} in a later "
-        "sys_ticket_comment's outputs to attach it elsewhere. Prefer this over publishing to "
+        "sys_ticket_comment's outputs to attach it elsewhere. To update a file you saved "
+        "earlier, pass its id as replace_id rather than saving a copy; a replace posts a "
+        "ticket comment only when you give one. Prefer this over publishing to "
         "external services or reporting local-only paths."
     )
     arguments = SaveProjectArtifact

@@ -18,6 +18,7 @@ from fastapi import APIRouter, Form, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
+from omnigent.db.utils import generate_file_id, now_epoch
 from omnigent.entities import Conversation, StoredFile
 from omnigent.entities.project import PROJECT_IDENTITY_LABEL_KEY
 from omnigent.errors import ErrorCode, OmnigentError
@@ -91,6 +92,8 @@ def _describe(project_id: str, stored: StoredFile) -> dict[str, Any]:
         "source_session_id": metadata.get("source_session_id"),
         "demo": bool(metadata.get("demo")),
         "url": project_file_content_path(project_id, stored.id),
+        "revision": metadata.get("revision", 1),
+        "updated_at": metadata.get("updated_at", stored.created_at),
     }
 
 
@@ -125,12 +128,15 @@ def create_project_files_router(
     @router.post("", status_code=201)
     async def upload_project_file(
         request: Request,
+        response: Response,
         project_id: str,
         file: UploadFile,
         title: str | None = Form(default=None),
         ticket_id: str | None = Form(default=None),
         demo: bool | None = Form(default=None),
+        replace_id: str | None = Form(default=None),
     ) -> dict[str, Any]:
+        """Save a file to the project, or replace an earlier one's content in place."""
         project = await require_project(request, project_id)
         content = await file.read(MAX_PROJECT_FILE_BYTES + 1)
         if len(content) > MAX_PROJECT_FILE_BYTES:
@@ -152,6 +158,12 @@ def create_project_files_router(
         if source:
             metadata["source_session_id"] = _hex(source, "Session")
         filename = (file.filename or "file").strip()[:200] or "file"
+        if replace_id:
+            replaced = await _replace(
+                project, _hex(replace_id, "File"), metadata, filename, content, _content_type(file)
+            )
+            response.status_code = 200
+            return _describe(project, replaced)
         stored = await asyncio.to_thread(
             file_store.create,
             filename=filename,
@@ -165,6 +177,47 @@ def create_project_files_router(
             await asyncio.to_thread(file_store.delete, stored.id)
             raise
         return _describe(project, stored)
+
+    async def _replace(
+        project: str,
+        file_id: str,
+        metadata: dict[str, Any],
+        filename: str,
+        content: bytes,
+        content_type: str,
+    ) -> StoredFile:
+        """Swap a project artifact's bytes, keeping its id and URL."""
+        existing = await project_file(project, file_id)
+        previous = existing.source_metadata or {}
+        if previous.get("kind") != "artifact":
+            raise OmnigentError(
+                "Only a saved artifact can be replaced", code=ErrorCode.INVALID_INPUT
+            )
+        if metadata.get("source_session_id") and not previous.get("source_session_id"):
+            raise OmnigentError(
+                "Agents can't replace a file a person uploaded", code=ErrorCode.FORBIDDEN
+            )
+        merged = {**previous, **metadata}
+        merged["revision"] = int(previous.get("revision", 1)) + 1
+        merged["updated_at"] = now_epoch()
+        new_key = generate_file_id()
+        await asyncio.to_thread(artifact_store.put, new_key, content)
+        updated = await asyncio.to_thread(
+            file_store.replace_content,
+            existing.id,
+            blob_key=new_key,
+            bytes=len(content),
+            content_type=content_type,
+            filename=filename,
+            source_metadata=merged,
+        )
+        old_key = existing.blob_key or existing.id
+        if updated is None:
+            await asyncio.to_thread(artifact_store.delete, new_key)
+            raise OmnigentError("File not found", code=ErrorCode.NOT_FOUND)
+        if await asyncio.to_thread(file_store.is_blob_key_orphaned, old_key):
+            await asyncio.to_thread(artifact_store.delete, old_key)
+        return updated
 
     @router.get("")
     async def list_project_files(
@@ -200,6 +253,10 @@ def create_project_files_router(
     async def project_file_content(request: Request, project_id: str, file_id: str) -> Response:
         project = await require_project(request, project_id)
         stored = await project_file(project, file_id)
+        # A replaced artifact keeps its URL, so caches revalidate against its blob.
+        etag = f'"{stored.blob_key or stored.id}"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
         content = await asyncio.to_thread(artifact_store.get, stored.blob_key or stored.id)
         media_type = stored.content_type or "application/octet-stream"
         if media_type in _TEXT_TYPES:
@@ -212,7 +269,8 @@ def create_project_files_router(
             if media_type == "text/plain"
             else media_type,
             headers={
-                "Cache-Control": "private, max-age=31536000, immutable",
+                "Cache-Control": "private, no-cache",
+                "ETag": etag,
                 "Content-Disposition": f'{disposition}; filename="{safe_name}"',
                 "Content-Security-Policy": "sandbox",
                 "X-Content-Type-Options": "nosniff",

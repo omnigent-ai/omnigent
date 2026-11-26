@@ -997,6 +997,17 @@
             "title": "File",
             "type": "string"
           },
+          "replace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replace Id"
+          },
           "ticket_id": {
             "anyOf": [
               {
@@ -24639,6 +24650,7 @@
         ]
       },
       "post": {
+        "description": "Save a file to the project, or replace an earlier one's content in place.",
         "operationId": "upload_project_file_v1_projects__project_id__files_post",
         "parameters": [
           {

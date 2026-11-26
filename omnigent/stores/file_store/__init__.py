@@ -150,6 +150,29 @@ class FileStore(ABC):
         """
         raise NotImplementedError
 
+    def replace_content(
+        self,
+        file_id: str,
+        *,
+        blob_key: str,
+        bytes: int,
+        content_type: str | None,
+        filename: str,
+        source_metadata: dict[str, Any] | None,
+    ) -> StoredFile | None:
+        """
+        Point an existing file row at new bytes, keeping its id.
+
+        :param file_id: The row to update.
+        :param blob_key: Artifact-store key already holding the new bytes.
+        :param bytes: New size in bytes.
+        :param content_type: New MIME type.
+        :param filename: New original filename.
+        :param source_metadata: Replacement metadata dict.
+        :returns: The updated file, or ``None`` when no such row exists.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def delete(
         self,

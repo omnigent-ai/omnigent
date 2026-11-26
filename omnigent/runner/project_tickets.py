@@ -539,6 +539,8 @@ async def _save_artifact(
         form["ticket_id"] = ticket_id
     if body.get("demo") is not None:
         form["demo"] = "true" if body["demo"] else "false"
+    if body.get("replace_id"):
+        form["replace_id"] = body["replace_id"]
     headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
     response = await client.post(
         f"/v1/projects/{project_id}/files",
@@ -550,7 +552,8 @@ async def _save_artifact(
     response.raise_for_status()
     artifact = response.json()
     result: dict[str, Any] = {"artifact": artifact}
-    if ticket_id is not None:
+    # A replace updates the file the ticket already links; comment only when asked.
+    if ticket_id is not None and (not body.get("replace_id") or body.get("comment")):
         text = body.get("comment") or f"Attached `{artifact['title']}`."
         result["comment"] = await request(
             "POST",

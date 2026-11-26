@@ -273,6 +273,43 @@ class SqlAlchemyFileStore(FileStore):
             rows = [_to_entity(row) for row in session.execute(stmt).scalars().all()]
         return [row for row in rows if (row.source_metadata or {}).get(key) == value][:limit]
 
+    def replace_content(
+        self,
+        file_id: str,
+        *,
+        blob_key: str,
+        bytes: int,
+        content_type: str | None,
+        filename: str,
+        source_metadata: dict[str, Any] | None,
+    ) -> StoredFile | None:
+        """
+        Point an existing file row at new bytes, keeping its id and created time.
+
+        :param file_id: The row to update.
+        :param blob_key: Artifact-store key already holding the new bytes.
+        :param bytes: New size in bytes.
+        :param content_type: New MIME type.
+        :param filename: New original filename.
+        :param source_metadata: Replacement metadata dict.
+        :returns: The updated file, or ``None`` when no such row exists.
+        """
+        encoded_metadata = json.dumps(source_metadata) if source_metadata is not None else None
+
+        def write(session: Session) -> StoredFile | None:
+            with query_name_scope("omnigent.file_store.select_file_by_id"):
+                row = session.get(SqlFile, (current_workspace_id(), file_id))
+            if not row:
+                return None
+            row.blob_key = blob_key
+            row.bytes = bytes
+            row.content_type = content_type
+            row.filename = filename
+            row.source_metadata = encoded_metadata
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "replace_file_content", write)
+
     def delete(
         self,
         file_id: str,
