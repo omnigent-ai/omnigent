@@ -72,16 +72,19 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import ipaddress
 import json
 import logging
 import os
 import re
+import ssl
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 _logger = logging.getLogger(__name__)
 
@@ -92,6 +95,10 @@ MAX_STREAMS_ENV = "OMNIGENT_DICTATION_MAX_STREAMS"
 #: Worker stream URL for the ``remote`` engine, e.g.
 #: ``ws://venus:8100/v1/dictation/stream``.
 REMOTE_URL_ENV = "OMNIGENT_DICTATION_REMOTE_URL"
+#: Shared bearer token between the main server and a remote worker. Unset
+#: keeps the worker unauthenticated (trusted network only). Generate one
+#: with ``openssl rand -hex 32``.
+WORKER_TOKEN_ENV = "OMNIGENT_DICTATION_WORKER_TOKEN"
 
 #: Built-in engine names. The default (empty ``OMNIGENT_DICTATION_ENGINE``)
 #: resolves to the sherpa engine.
@@ -113,6 +120,7 @@ REASON_EXTRA_NOT_INSTALLED = "extra_not_installed"
 REASON_MODELS_MISSING = "models_missing"
 REASON_UNKNOWN_ENGINE = "unknown_engine"
 REASON_REMOTE_URL_MISSING = "remote_url_missing"
+REASON_REMOTE_CONFIG_INVALID = "remote_config_invalid"
 
 DEFAULT_MAX_STREAMS = 2
 
@@ -474,6 +482,82 @@ class _SherpaStream:
         """No-op: the recognizer stream frees with the handle."""
 
 
+def _validate_worker_token(token: str) -> str:
+    """Return *token* if it is usable as a bearer credential.
+
+    :raises ValueError: When empty or not printable non-space ASCII. The
+        message never echoes the token.
+    """
+    if not token or not all("!" <= char <= "~" for char in token):
+        raise ValueError(
+            f"{WORKER_TOKEN_ENV} must be non-empty printable ASCII without "
+            "whitespace (e.g. `openssl rand -hex 32`)"
+        )
+    return token
+
+
+def worker_token() -> str | None:
+    """The configured worker token, or ``None`` when the variable is unset.
+
+    A set-but-empty or malformed value raises instead of silently
+    disabling authentication.
+
+    :raises ValueError: When the variable is set but invalid.
+    """
+    raw = os.environ.get(WORKER_TOKEN_ENV)
+    if raw is None:
+        return None
+    return _validate_worker_token(raw)
+
+
+def _validate_authenticated_url(url: str) -> None:
+    """Reject worker URLs unsafe for carrying a bearer token.
+
+    Allows ``wss://`` to any host and ``ws://`` only to loopback. Messages
+    never echo the URL, which may hold credentials.
+
+    :raises ValueError: When the URL is malformed or unsafe.
+    """
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        _ = parts.port
+    except ValueError:
+        raise ValueError("dictation worker URL is malformed") from None
+    if parts.scheme not in ("ws", "wss") or not hostname:
+        raise ValueError("dictation worker URL must be ws:// or wss:// with a host")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("dictation worker URL must not contain credentials")
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        raise ValueError("dictation worker URL must not contain a query or fragment")
+    if parts.scheme == "ws" and not _is_loopback_host(hostname):
+        raise ValueError(
+            "authenticated dictation worker URL must use wss:// unless the host is loopback"
+        )
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_config_rejection(error: BaseException) -> bool:
+    """True for failures a local fallback must not mask.
+
+    The worker refusing the credential (401/403) or an unverifiable TLS
+    certificate point at misconfiguration, not an outage.
+    """
+    from websockets.exceptions import InvalidStatus
+
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return True
+    return isinstance(error, InvalidStatus) and error.response.status_code in (401, 403)
+
+
 class RemoteDictationEngine:
     """Relays dictation takes to a remote worker over WebSocket.
 
@@ -484,24 +568,36 @@ class RemoteDictationEngine:
 
     Fallback happens per take, at stream creation: if the worker is
     unreachable, the lazily-built local engine (when models are
-    installed) serves the take instead. A worker dying mid-take fails
-    that take; the next one retries the worker.
+    installed) serves the take instead. A rejected credential (401/403)
+    or failed certificate verification raises instead of falling back.
+    A worker dying mid-take fails that take; the next one retries the worker.
     """
 
     def __init__(
         self,
         url: str,
         *,
+        token: str | None = None,
         fallback_factory: Callable[[], DictationEngine] | None = None,
     ) -> None:
         """
         :param url: Worker stream URL, e.g.
             ``ws://venus:8100/v1/dictation/stream``.
+        :param token: Bearer token sent in the ``Authorization`` header,
+            or ``None`` for an unauthenticated worker. When set, *url*
+            must be ``wss://`` (or ``ws://`` to loopback) without
+            credentials, query, or fragment.
         :param fallback_factory: Builds the local fallback engine on
             first use (lazy — its model weights cost ~real RAM), or
             ``None`` when no local model is installed.
+        :raises ValueError: When *token* or the authenticated *url* is
+            invalid.
         """
+        if token is not None:
+            _validate_worker_token(token)
+            _validate_authenticated_url(url)
         self._url = url
+        self._token = token
         self._fallback_factory = fallback_factory
         self._fallback: DictationEngine | None = None
         self._fallback_lock = threading.Lock()
@@ -509,9 +605,9 @@ class RemoteDictationEngine:
     def create_stream(self) -> DictationStreamHandle:
         """Connect a take to the worker, or to the local fallback."""
         try:
-            return _RemoteStream(self._url)
-        except Exception:
-            if self._fallback_factory is None:
+            return _RemoteStream(self._url, token=self._token)
+        except Exception as error:
+            if self._fallback_factory is None or _is_config_rejection(error):
                 raise
             _logger.warning(
                 "dictation worker unreachable at %s; using local fallback engine",
@@ -534,10 +630,11 @@ class _RemoteStream:
     relay just forwards it.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, *, token: str | None = None) -> None:
         from websockets.sync.client import connect
 
-        self._ws = connect(url, open_timeout=5)
+        headers = {"Authorization": f"Bearer {token}"} if token is not None else None
+        self._ws = connect(url, open_timeout=5, additional_headers=headers)
         try:
             deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
             while True:
@@ -631,8 +728,14 @@ def _remote_available() -> tuple[bool, str | None]:
     degrades cleanly (local fallback, or an error frame) when a take
     actually starts.
     """
-    if not _remote_url():
+    url = _remote_url()
+    if not url:
         return False, REASON_REMOTE_URL_MISSING
+    try:
+        if worker_token() is not None:
+            _validate_authenticated_url(url)
+    except ValueError:
+        return False, REASON_REMOTE_CONFIG_INVALID
     return True, None
 
 
@@ -651,7 +754,7 @@ def _build_remote_engine() -> RemoteDictationEngine:
         if _sherpa_available()[0]
         else None
     )
-    return RemoteDictationEngine(url, fallback_factory=fallback)
+    return RemoteDictationEngine(url, token=worker_token(), fallback_factory=fallback)
 
 
 #: Scripted transcript the fake engine reveals; asserted verbatim by the

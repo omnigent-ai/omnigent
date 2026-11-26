@@ -98,7 +98,8 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 | `OMNIGENT_DICTATION_PUNCT_DIR` | `~/.omnigent/models/dictation/punct` | optional online-punctuation model dir (`model*.onnx` + `bpe.vocab`) |
 | `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
 | `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name (`sherpa`, `remote`, `fake`) |
-| `OMNIGENT_DICTATION_REMOTE_URL` | unset | worker stream URL for the `remote` engine, e.g. `ws://venus:8100/v1/dictation/stream` |
+| `OMNIGENT_DICTATION_REMOTE_URL` | unset | worker stream URL for the `remote` engine, e.g. `wss://worker.example.test:8100/v1/dictation/stream` |
+| `OMNIGENT_DICTATION_WORKER_TOKEN` | unset | shared bearer token on the worker and main server; unset preserves unauthenticated workers |
 
 `scripts/fetch-dictation-models.sh` downloads a known-good pair (streaming
 Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
@@ -143,8 +144,8 @@ transcript events down), so no new protocol or code path was needed. The
 browser never talks to the worker; the main server authenticates the user on
 its own route, then relays over a `websockets` client.
 
-Run the worker wherever the models live (it is **unauthenticated** — bind it
-to a trusted LAN/VPN only):
+By default the worker is unauthenticated. Keep this mode on a trusted LAN/VPN
+only:
 
 ```
 pip install omnigent[dictation] && scripts/fetch-dictation-models.sh
@@ -160,6 +161,32 @@ OMNIGENT_DICTATION_REMOTE_URL=ws://<worker-host>:8100/v1/dictation/stream \
 omnigent server ...
 ```
 
+To require service authentication, generate a random token with
+`openssl rand -hex 32` and set `OMNIGENT_DICTATION_WORKER_TOKEN` to the same
+value on both machines. The main server sends it only in the worker's
+`Authorization: Bearer` header, never to the browser. The worker rejects
+missing or incorrect credentials before accepting the socket, loading models,
+or allocating a stream. Empty tokens, whitespace, and non-ASCII characters
+are configuration errors rather than a way to disable authentication.
+
+Authenticated remote connections require `wss://`, with certificate and
+hostname verification enabled. Serve TLS directly with uvicorn or terminate
+TLS at a trusted reverse proxy that preserves the Authorization header:
+
+```sh
+python -m uvicorn omnigent.server.dictation_worker:create_worker_app \
+    --factory --host 0.0.0.0 --port 8100 \
+    --ssl-certfile cert.pem --ssl-keyfile key.pem
+```
+
+On the main server, set `OMNIGENT_DICTATION_REMOTE_URL` to
+`wss://worker.example.test:8100/v1/dictation/stream`. Private certificate
+authorities can use Python's standard `SSL_CERT_FILE` trust configuration.
+Plain `ws://` with a token is allowed only for `localhost` or a literal
+loopback IP, such as a local TLS tunnel. Authenticated URLs cannot contain
+embedded credentials, a query, or a fragment. A TLS-terminating proxy's
+unencrypted upstream connection must stay on a trusted network.
+
 `RemoteDictationEngine` registers by name like every other engine (no changes
 to the route, protocol, or selection logic). `_RemoteStream` bridges the
 worker's async push events into the synchronous handle interface via a daemon
@@ -167,7 +194,9 @@ reader thread, and `close()` releases the worker's capacity slot promptly.
 Fallback is per take: if the worker is unreachable and local models are
 installed, a lazily-built local sherpa engine serves the take instead (its
 weights cost no RAM until the worker actually goes down); each new take
-retries the worker first.
+retries the worker first. Authentication rejections with HTTP 401 or 403 do
+not fall back locally, nor do TLS certificate verification failures. Invalid
+token or authenticated URL settings report dictation as unavailable.
 
 Client timeouts (`web/src/lib/dictation.ts`) are widened to exceed the
 worker's cold-load budget (`_REMOTE_READY_TIMEOUT_S` / `_REMOTE_STOP_TIMEOUT_S`
