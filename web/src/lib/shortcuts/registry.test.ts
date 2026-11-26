@@ -192,8 +192,8 @@ describe("shortcut registry", () => {
   });
 
   it("draws each alternative and part on a binding's own row", () => {
-    const ids = new Set<string>(SHORTCUT_BINDINGS.map((binding) => binding.id));
-    for (const binding of SHORTCUT_BINDINGS) {
+    const ids = new Set<string>(APP_SHORTCUT_BINDINGS.map((binding) => binding.id));
+    for (const binding of APP_SHORTCUT_BINDINGS) {
       const row = binding.alternateOf ?? binding.partOf;
       if (row === undefined) continue;
       expect(ids.has(row), binding.id).toBe(true);

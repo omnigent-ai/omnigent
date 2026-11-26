@@ -8,8 +8,8 @@ import { describe, expect, it } from "vitest";
 
 import type { KeyChordInput } from "@/lib/shortcuts/chord";
 import {
+  APP_SHORTCUT_BINDINGS,
   matchesShortcut,
-  SHORTCUT_BINDINGS,
   type ShortcutId,
   WORKSPACE_SIDEBAR_BINDINGS,
 } from "@/lib/shortcuts/registry";
@@ -156,7 +156,7 @@ function clashingShortcuts(accelerator: string, mac: boolean): ShortcutId[] {
     submitWithModEnter,
   }));
   const allowed = [...(SAME_COMMAND[accelerator] ?? []), ...(KNOWN_OVERLAPS[accelerator] ?? [])];
-  return [...SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS]
+  return [...APP_SHORTCUT_BINDINGS, ...WORKSPACE_SIDEBAR_BINDINGS]
     .filter(
       (binding) =>
         !allowed.includes(binding.id) &&
@@ -195,6 +195,11 @@ describe("desktop menu accelerators", () => {
 
   it("would catch an app shortcut on a menu item's keys", () => {
     expect(clashingShortcuts("CmdOrCtrl+K", false)).toContain("palette.commands");
+  });
+
+  it("would catch a shortcut that waits for quick_pick_palette on a menu item's keys", () => {
+    expect(clashingShortcuts("Ctrl+Tab", true)).toContain("session.next");
+    expect(clashingShortcuts("Ctrl+]", true)).toContain("session.recent");
   });
 
   it.each([
