@@ -18168,3 +18168,65 @@ def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir
             bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
+
+
+@pytest.mark.asyncio
+async def test_relay_answers_an_unapproved_call_before_claudes_tool_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approval nobody answers ends with a reason before Claude Code gives up."""
+    from omnigent.runner import pending_approvals
+
+    monkeypatch.setattr(claude_native_bridge, "_client_tool_timeout_s", lambda: 420.0)
+    monkeypatch.setattr(claude_native_bridge, "_CLIENT_TOOL_TIMEOUT_MARGIN_S", 419.9)
+    monkeypatch.setattr(claude_native_bridge, "_CLIENT_TOOL_ANSWER_FLOOR_S", 0.1)
+    events: list[dict] = []
+
+    async def executor(name, arguments):
+        return {
+            "approved": await pending_approvals.wait_for_user_approval(
+                elicitation_id="elicit_client_limit",
+                conversation_id="conv_client_limit",
+                publish_event=lambda _, event: events.append(event),
+                timeout_seconds=30,
+            )
+        }
+
+    result = await asyncio.wait_for(
+        asyncio.to_thread(
+            claude_native_bridge._run_relay_tool,
+            executor,
+            asyncio.get_running_loop(),
+            "sys_scheduled_task_update",
+            {},
+        ),
+        5,
+    )
+    assert result["isError"]
+    text = result["content"][0]["text"]
+    assert "needs a person's approval" in text and "not applied" in text
+    assert "7-minute" in text
+    for _ in range(50):
+        if events:
+            break
+        await asyncio.sleep(0.02)
+    assert events[-1]["reason"] == "unanswered"
+
+
+def test_client_tool_timeout_prefers_managed_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.harnesses.claude_native import main as claude_native_main
+
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text(json.dumps({"env": {"MCP_TOOL_TIMEOUT": "420000"}}))
+    monkeypatch.setattr(claude_native_main, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed,))
+    monkeypatch.setenv("MCP_TOOL_TIMEOUT", "60000")
+    claude_native_bridge._client_tool_timeout_s.cache_clear()
+    try:
+        assert claude_native_bridge._client_tool_timeout_s() == 420.0
+        managed.write_text("{}")
+        claude_native_bridge._client_tool_timeout_s.cache_clear()
+        assert claude_native_bridge._client_tool_timeout_s() == 60.0
+    finally:
+        claude_native_bridge._client_tool_timeout_s.cache_clear()

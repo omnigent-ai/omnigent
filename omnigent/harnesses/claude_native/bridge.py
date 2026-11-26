@@ -325,6 +325,11 @@ _TOOL_RELAY_HEARTBEAT_S = 1.0
 _MCP_CALL_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "mcp_call_cancel_event", default=None
 )
+# Claude Code ends an MCP call after MCP_TOOL_TIMEOUT ms (often set by managed
+# settings). Omnigent answers this long before that so the agent gets a reason.
+_CLIENT_TOOL_TIMEOUT_ENV = "MCP_TOOL_TIMEOUT"
+_CLIENT_TOOL_TIMEOUT_MARGIN_S = 20.0
+_CLIENT_TOOL_ANSWER_FLOOR_S = 30.0
 # Socket inactivity budget. Whitespace heartbeats keep approval waits alive;
 # the relay separately enforces active execution time and cancels disconnected calls.
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
@@ -9233,6 +9238,35 @@ def _tool_relay_handler_factory(
     return _ToolRelayHandler
 
 
+@functools.lru_cache(maxsize=1)
+def _client_tool_timeout_s() -> float | None:
+    """Claude Code's MCP tool-call limit in seconds, or ``None`` when it isn't set.
+
+    Managed settings win over the process environment, as they do in Claude Code.
+    """
+    from omnigent.harnesses.claude_native.main import _managed_settings_paths
+
+    values: list[object] = []
+    for path in _managed_settings_paths():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        env = payload.get("env") if isinstance(payload, dict) else None
+        if isinstance(env, dict) and _CLIENT_TOOL_TIMEOUT_ENV in env:
+            values.append(env[_CLIENT_TOOL_TIMEOUT_ENV])
+            break
+    values.append(os.environ.get(_CLIENT_TOOL_TIMEOUT_ENV))
+    for value in values:
+        try:
+            milliseconds = float(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if milliseconds > 0:
+            return milliseconds / 1000.0
+    return None
+
+
 def _run_relay_tool(
     tool_executor: ToolExecutor,
     loop: asyncio.AbstractEventLoop,
@@ -9252,7 +9286,14 @@ def _run_relay_tool(
     :param keep_alive: Check caller liveness and refresh the HTTP response while waiting.
     :returns: MCP tool-call response.
     """
+    client_limit = _client_tool_timeout_s()
     deadline = ToolCallDeadline(_TOOL_CALL_TIMEOUT_S)
+    answer_by = (
+        time.monotonic()
+        + max(_CLIENT_TOOL_ANSWER_FLOOR_S, client_limit - _CLIENT_TOOL_TIMEOUT_MARGIN_S)
+        if client_limit is not None
+        else None
+    )
 
     async def execute() -> object:
         with bind_tool_call_deadline(deadline):
@@ -9261,6 +9302,20 @@ def _run_relay_tool(
     future = asyncio.run_coroutine_threadsafe(execute(), loop)
     try:
         while not future.done():
+            if answer_by is not None and time.monotonic() >= answer_by:
+                minutes = (client_limit or 0) / 60
+                if deadline.is_paused():
+                    return _mcp_error(
+                        f"{name} needs a person's approval, and no one approved it within "
+                        f"Claude Code's {minutes:.0f}-minute tool limit, so it was cancelled "
+                        "and not applied. Ask a person to watch for the approval prompt "
+                        "and retry, or to make the change themselves."
+                    )
+                return _mcp_error(
+                    f"{name} was still running at Claude Code's {minutes:.0f}-minute tool "
+                    "limit. Cancellation requested; completion is unknown. Check the "
+                    "affected state before retrying."
+                )
             remaining = deadline.remaining()
             if remaining <= 0:
                 return _mcp_error(

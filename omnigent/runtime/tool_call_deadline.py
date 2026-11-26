@@ -31,6 +31,11 @@ class ToolCallDeadline:
                 paused += min(now - self._paused_at, self._pause_limit)
             return max(0.0, self._seconds - (now - self._started - paused))
 
+    def is_paused(self) -> bool:
+        """Whether the call is waiting on an approval right now."""
+        with self._lock:
+            return self._paused_at is not None
+
     @contextmanager
     def pause(self, seconds: float) -> Iterator[None]:
         """Exclude at most the approval's own deadline from active elapsed time."""
