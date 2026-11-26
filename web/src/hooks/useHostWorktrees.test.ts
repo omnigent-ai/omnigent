@@ -222,6 +222,18 @@ describe("matchWorktree", () => {
       true,
     ],
     [
+      "a forward-slash UNC share in another case",
+      "//Server/Share/repo",
+      "//server/share/Repo",
+      true,
+    ],
+    [
+      "a forward-slash UNC folder in another case",
+      "//server/share/Repo",
+      "//Server/Share/repo/src",
+      true,
+    ],
+    [
       "another share on the same server",
       "\\\\server\\share\\repo",
       "\\\\server\\other\\repo",
