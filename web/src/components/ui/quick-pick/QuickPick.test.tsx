@@ -991,3 +991,26 @@ describe("QuickPick switcher presentation", () => {
     expect(input.closest(".sr-only")).toBeNull();
   });
 });
+
+describe("QuickPick switcher header", () => {
+  it("shows no back button or end control, which would take focus where nothing shows", () => {
+    renderPicker({
+      presentation: "switcher",
+      onBack: vi.fn(),
+      backLabel: "Back",
+      inputEnd: <button type="button">Options</button>,
+    });
+    expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Options" })).toBeNull();
+  });
+
+  it("keeps both in the default presentation", () => {
+    renderPicker({
+      onBack: vi.fn(),
+      backLabel: "Back",
+      inputEnd: <button type="button">Options</button>,
+    });
+    expect(screen.getByRole("button", { name: "Back" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Options" })).toBeTruthy();
+  });
+});

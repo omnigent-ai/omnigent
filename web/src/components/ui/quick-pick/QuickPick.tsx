@@ -368,6 +368,21 @@ function navigationFor(
 /** The list's and the preview's height side by side, so neither jumps as the rows change. */
 const PREVIEW_HEIGHT = "h-[min(24rem,60vh)]";
 
+/** The result list's height: the container's, a switcher's rows, beside a preview, or capped. */
+function listHeightClass({
+  fillHeight,
+  switcher,
+  preview,
+}: {
+  fillHeight: boolean;
+  switcher: boolean;
+  preview: boolean;
+}): string {
+  if (fillHeight) return "min-h-0 flex-1";
+  if (switcher) return "max-h-[min(24rem,60vh)] min-h-16";
+  return preview ? PREVIEW_HEIGHT : "max-h-72";
+}
+
 /**
  * The list alone, or beside the active row's preview when the picker has one. A row with
  * nothing to preview, or no active row, shows "No preview" in the same place.
@@ -1107,7 +1122,8 @@ export function QuickPick<Value>({
         className,
       )}
     >
-      {/* A switcher has no visible query; the field still holds focus and the list's keys. */}
+      {/* A switcher has no visible query; the field still holds focus and the list's keys, and
+          the header shows no other control, which would take focus where nothing shows. */}
       <div
         onKeyDown={handleHeaderKeyDown}
         className={cn(
@@ -1116,7 +1132,7 @@ export function QuickPick<Value>({
           switcher && "sr-only",
         )}
       >
-        {onBack ? (
+        {onBack && !switcher ? (
           // No tooltip: an open tooltip would take Escape from the dialog. The footer shows esc Back.
           <Button
             type="button"
@@ -1174,7 +1190,7 @@ export function QuickPick<Value>({
             <XIcon />
           </Button>
         )}
-        {inputEnd}
+        {!switcher && inputEnd}
       </div>
       {belowInput}
       <PreviewBeside
@@ -1189,13 +1205,7 @@ export function QuickPick<Value>({
           onKeyDown={handleResultsKeyDown}
           className={cn(
             "overflow-y-auto p-1",
-            fillHeight
-              ? "min-h-0 flex-1"
-              : switcher
-                ? "max-h-[min(24rem,60vh)] min-h-16"
-                : renderPreview
-                  ? PREVIEW_HEIGHT
-                  : "max-h-72",
+            listHeightClass({ fillHeight, switcher, preview: renderPreview !== undefined }),
             renderPreview && "w-[45%] shrink-0",
             collapsed && "hidden",
           )}
