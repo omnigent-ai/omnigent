@@ -85,6 +85,7 @@ import {
   ListFilterIcon,
   LaptopIcon,
   LayoutDashboardIcon,
+  LayoutGridIcon,
   Loader2Icon,
   MailIcon,
   MailOpenIcon,
@@ -297,6 +298,7 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+import { useShowTilesInSidebar } from "@/tiles/tilesPreferences";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -633,6 +635,7 @@ function useActiveNavItem(): {
   isTasksPage: boolean;
   isWorkflowsPage: boolean;
   isUsagePage: boolean;
+  isTilesPage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
   projectHomeName: string | null;
@@ -658,6 +661,7 @@ function useActiveNavItem(): {
   const isWorkflowsPage =
     !isExtensionRoute && (leaf === "workflows" || segments.at(-2) === "workflows");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
+  const isTilesPage = !isExtensionRoute && leaf === "tiles";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
   const projectKanban = useProjectKanbanEnabled();
@@ -672,6 +676,7 @@ function useActiveNavItem(): {
     !isTasksPage &&
     !isWorkflowsPage &&
     !isUsagePage &&
+    !isTilesPage &&
     !isExtensionRoute;
   const searchParams = new URLSearchParams(location.search);
   const requestedProject = isNewSessionRoute ? searchParams.get("project") : null;
@@ -689,6 +694,7 @@ function useActiveNavItem(): {
     isTasksPage,
     isWorkflowsPage,
     isUsagePage,
+    isTilesPage,
     activeExtensionPageId,
     newSessionProjectName,
     projectHomeName,
@@ -827,6 +833,16 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored, ownedIds]);
 }
 
+/** Single agent ⇄ Tiles, keeping the same agent active in both directions. */
+export function tilesToggleDestination(
+  onTilesPage: boolean,
+  activeTileId: string | null,
+  currentConversationId: string | undefined,
+): string {
+  if (onTilesPage) return activeTileId ? `/c/${activeTileId}` : "/";
+  return currentConversationId ? `/tiles?active=${currentConversationId}` : "/tiles";
+}
+
 function inboxBadgeLabel(count: number, incomplete: boolean, capped: boolean): string {
   const items = count === 1 ? "1 inbox item waiting" : `${count} inbox items waiting`;
   // The server stops counting suggestions at its limit, so the total is a floor.
@@ -848,6 +864,8 @@ function SidebarImpl({
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
+  const showTilesInSidebar = useShowTilesInSidebar();
+  const tilesEnabled = isFeatureEnabled(serverInfo, "tiles_view") && showTilesInSidebar;
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
   const [selectionMode, setSelectionMode] = useState(false);
@@ -996,6 +1014,7 @@ function SidebarImpl({
     isTasksPage,
     isWorkflowsPage,
     isUsagePage,
+    isTilesPage,
     activeExtensionPageId,
     newSessionProjectName,
     projectHomeName,
@@ -1607,6 +1626,21 @@ function SidebarImpl({
                   )}
                 </Link>
               </Button>
+              {tilesEnabled && (
+                <PrimaryNavLink
+                  to={tilesToggleDestination(
+                    isTilesPage,
+                    searchParams.get("active"),
+                    activeConversationId,
+                  )}
+                  label={isTilesPage ? "Single agent" : "Tiles"}
+                  icon={isTilesPage ? SquareIcon : LayoutGridIcon}
+                  active={false}
+                  onClick={onNavClick}
+                  componentId="sidebar.tiles-toggle"
+                  testId="tiles-toggle-nav"
+                />
+              )}
               {canvasEnabled && (
                 <PrimaryNavLink
                   to={canvasDestination.pathname + canvasDestination.search}

@@ -186,6 +186,8 @@ export interface SettingsAvailability {
   archiveWorktreeCleanup: boolean;
   /** The server lists managed MCP services in `enabled_connections`. */
   mcpServices: boolean;
+  /** The server offers the Tile view (`tiles_view`). */
+  tilesView: boolean;
   /** Which sandbox account connections the server lists in `enabled_connections`. */
   integrationProviders: { github: boolean; databricks: boolean };
   /** The server turns on project kanban boards. */

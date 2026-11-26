@@ -7,6 +7,7 @@ import { PageLoading, PaneLoading } from "@/components/PageLoading";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Outlet, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { TilesLaunchRedirect } from "@/tiles/TilesLaunchRedirect";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useProjectKanbanBoardPreference } from "@/lib/projectKanbanPreferences";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -88,6 +89,10 @@ const ProjectHomePage = withPageView(
 );
 const TasksPage = withPaneLoading(
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+);
+const TilesPage = withPageView(
+  "tiles",
+  withPaneLoading(lazy(() => import("@/pages/TilesPage").then((m) => ({ default: m.TilesPage })))),
 );
 const UsagePage = withPageView(
   "usage",
@@ -230,6 +235,7 @@ function AppRoutes({ basename }: AppProps) {
 
   return (
     <Suspense fallback={<PageLoading />}>
+      <TilesLaunchRedirect prefix={prefix} />
       <Routes>
         {info !== "loading" && info.accounts_enabled && (
           <>
@@ -331,6 +337,14 @@ function AppRoutes({ basename }: AppProps) {
             element={
               <FeatureGatedPage feature="workflows">
                 <WorkflowDetailPage />
+              </FeatureGatedPage>
+            }
+          />
+          <Route
+            path={`${prefix}/tiles`}
+            element={
+              <FeatureGatedPage feature="tiles_view">
+                <TilesPage />
               </FeatureGatedPage>
             }
           />

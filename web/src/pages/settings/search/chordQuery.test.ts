@@ -311,6 +311,7 @@ const SHOWN: SettingsAvailability = {
   adminView: true,
   accountsEnabled: true,
   archiveWorktreeCleanup: true,
+  tilesView: true,
   mcpServices: true,
   integrationProviders: { github: true, databricks: true },
   projectKanban: true,

@@ -70,6 +70,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sidebar_saved_views": False,
         "floating_panes": False,
         "shared_session_updates_socket": False,
+        "tiles_view": False,
     }
 
 
@@ -219,6 +220,14 @@ def test_floating_composer_is_a_frontend_visible_feature() -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: "floating_composer"})
     assert flags.enabled(Feature.FLOATING_COMPOSER)
     assert flags.frontend_dict()["floating_composer"] is True
+
+
+def test_tiles_view_is_a_default_off_frontend_visible_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.TILES_VIEW)
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "tiles_view"})
+
+    assert flags.enabled(Feature.TILES_VIEW)
+    assert flags.frontend_dict()["tiles_view"] is True
 
 
 def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
