@@ -155,6 +155,20 @@ describe("paths between a worktree's review and its session", () => {
     expect(repositoryPathOf("/repo/src/a.ts", "", "/repo")).toBe("src/a.ts");
   });
 
+  it.each([
+    ["a workspace file, no folder", "src/a.ts", "", "src/a.ts"],
+    ["a file in the folder", ".worktrees/feature/src/a.ts", ".worktrees/feature", "src/a.ts"],
+    [
+      "a sibling sharing the folder's name",
+      ".worktrees/feature-two/a.ts",
+      ".worktrees/feature",
+      null,
+    ],
+    ["an absolute path it can't place", "/repo/a.ts", "", null],
+  ])("maps %s with no workspace known", (_case, path, repository, expected) => {
+    expect(repositoryPathOf(path, repository, null)).toBe(expected);
+  });
+
   it("leaves UNC shares unmapped, since the worktree matcher doesn't read them as Windows paths", () => {
     const share = "\\\\server\\share\\repo";
     expect(repositoryPathOf(`${share}\\.worktrees\\feature\\a.ts`, FOLDER, share)).toBeNull();
