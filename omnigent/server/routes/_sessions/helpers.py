@@ -6091,6 +6091,37 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
     session_stream.publish(session_id, payload)
 
 
+async def _stop_superseded_loops(session_id: str, conversation_store: ConversationStore) -> None:
+    """
+    Stop every user's ``/loop`` in a session another one has superseded.
+
+    Its viewers follow to the successor, where a loop left ticking here would run
+    unseen and out of reach of ``/loop stop``. Each loop's label is cleared, so its
+    next firing retires the timer instead of sending. Best-effort.
+
+    :param session_id: The superseded session, e.g. ``"conv_old"``.
+    :param conversation_store: Store holding the session's labels.
+    """
+    from omnigent.stores.conversation_store import LOOP_TIMER_LABEL_PREFIX
+
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        loops = {} if conv is None else conv.labels
+        for key, timer_id in loops.items():
+            if key.startswith(LOOP_TIMER_LABEL_PREFIX):
+                await asyncio.to_thread(
+                    conversation_store.replace_label_if,
+                    session_id,
+                    key,
+                    expected=timer_id,
+                    value=None,
+                )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to stop the loops of superseded session %s", session_id, exc_info=True
+        )
+
+
 def _publish_session_superseded(
     session_id: str,
     target_conversation_id: str,
@@ -13600,6 +13631,7 @@ __all__ = [
     "_start_managed_launch_task",
     "_stop_session_host_runner",
     "_stop_session_via_runner",
+    "_stop_superseded_loops",
     "_stored_file_to_resource",
     "_stream_live_events",
     "_structured_ask_user_question",

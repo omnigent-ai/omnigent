@@ -11936,11 +11936,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         itemId: "msg_hi",
         itemType: "message",
         clearedPendingId: null,
-        data: {
-          role: "user",
-          origin: "loop",
-          content: [{ type: "input_text", text: "the original draft" }],
-        },
+        data: { role: "user", content: [{ type: "input_text", text: "the original draft" }] },
       });
 
       const state = useChatStore.getState();
@@ -11948,8 +11944,36 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.pendingUserMessages).toEqual([]);
       expect(state.blocks).toHaveLength(1);
       expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_hi");
-      // A /loop run's label survives the promotion.
-      expect((state.blocks[0] as UserMessageBlock).origin).toBe("loop");
+    });
+
+    it.each([
+      ["names no pending entry", null],
+      ["names an entry this client never held", "pending_tick"],
+    ])("a /loop run that %s leaves the user's own pending message alone", (_, cleared) => {
+      // A tick queued behind a busy turn is consumed before the message the user sent
+      // after it. It was never an optimistic bubble here, so the FIFO head is not its.
+      const mine = {
+        tempId: "pend_mine",
+        content: [
+          { type: "input_image" as const, file_id: "file_1", filename: "shot.png" },
+          { type: "input_text" as const, text: "look at this" },
+        ],
+      };
+      useChatStore.setState({ blocks: [], pendingUserMessages: [mine] });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_tick",
+        itemType: "message",
+        clearedPendingId: cleared,
+        data: { role: "user", origin: "loop", content: [{ type: "input_text", text: "check CI" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([mine]);
+      const [tickBlock] = state.blocks as UserMessageBlock[];
+      expect(tickBlock).toMatchObject({ type: "user_message", origin: "loop" });
+      expect(tickBlock?.content).toEqual([{ type: "input_text", text: "check CI" }]);
     });
   });
 

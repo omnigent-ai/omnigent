@@ -2544,10 +2544,9 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
         return (None if user_id == RESERVED_USER_LOCAL else user_id), conv
 
-    # The caller's running /loop in a session is remembered on the session, one label
-    # per user holding the timer's id, so a new loop replaces it and a stop finds it
-    # without listing timers. The label changes by compare-and-swap, so clients arming
-    # or stopping at once, on any replica, agree on which loop is running.
+    # A session remembers each user's running /loop in a label holding its timer's id,
+    # changed by compare-and-swap, so clients arming or stopping at once, on any
+    # replica, agree on which loop runs without listing timers.
     _LOOP_STOP_ATTEMPTS = 5
 
     async def _running_loop(
@@ -2809,6 +2808,23 @@ def create_scheduled_tasks_router(
             or not await asyncio.to_thread(store.delete, task.id)
         ):
             raise OmnigentError("Timer not found", code=ErrorCode.NOT_FOUND)
+        if timer_origin(task.name) == "loop":
+            # Forget the loop too, unless a newer one has taken its place.
+            try:
+                await asyncio.to_thread(
+                    conversation_store.replace_label_if,
+                    conv.id,
+                    loop_timer_label_key(user_id),
+                    expected=task.id,
+                    value=None,
+                )
+            except Exception:
+                _logger.warning(
+                    "cancelled loop %s is still named by session %s",
+                    task.id,
+                    conv.id,
+                    exc_info=True,
+                )
         return {"timer_id": task.id, "status": "cancelled"}
 
     combined = APIRouter()

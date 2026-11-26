@@ -400,8 +400,13 @@ def test_fork_drops_per_user_pin_and_mute_labels(
 ) -> None:
     """A fork is a NEW conversation, so it must not inherit the source's pins or
     mutes: no user's per-user key rides along (those keys have a dynamic
-    suffix, so a prefix drop is required)."""
-    from omnigent.stores.conversation_store import muted_label_key, pinned_label_key
+    suffix, so a prefix drop is required). Nor a user's running ``/loop``, whose
+    timer stays with the source."""
+    from omnigent.stores.conversation_store import (
+        loop_timer_label_key,
+        muted_label_key,
+        pinned_label_key,
+    )
 
     source = conversation_store.create_conversation()
     conversation_store.set_labels(
@@ -410,6 +415,7 @@ def test_fork_drops_per_user_pin_and_mute_labels(
             pinned_label_key("alice"): "1721760000000",
             pinned_label_key("bob"): "1700000000000",
             muted_label_key("alice"): "1",
+            loop_timer_label_key("alice"): "st_loop",
             "kept": "yes",
         },
     )
@@ -420,6 +426,7 @@ def test_fork_drops_per_user_pin_and_mute_labels(
     assert pinned_label_key("alice") not in fork.labels
     assert pinned_label_key("bob") not in fork.labels
     assert muted_label_key("alice") not in fork.labels
+    assert loop_timer_label_key("alice") not in fork.labels
 
 
 def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:

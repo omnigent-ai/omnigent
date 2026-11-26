@@ -9909,6 +9909,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation((s) => {
         const eventContent = userContentFromEvent(event);
         const pendingHead = s.pendingUserMessages[0];
+        // A message no human typed (a /loop run) was never an optimistic bubble here, so
+        // it may only clear the entry the server names, never the FIFO head.
+        const origin = consumedMessageOrigin(event);
+        const ownsNoBubble = origin !== undefined;
         // Bare envelopes typed in the terminal must not consume unrelated web input.
         const unmatchedEnvelope =
           eventContent !== null &&
@@ -9954,7 +9958,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // by user]` record) is synthesized by the CLI, owns no pending entry,
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
-          if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
+          if (
+            ownsNoBubble ||
+            unmatchedEnvelope ||
+            (eventContent !== null && isSystemUserContent(eventContent))
+          ) {
             return {};
           }
           if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
@@ -9987,7 +9995,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
-                  consumedMessageOrigin(event),
+                  origin,
                 ),
               ],
             };
@@ -10004,6 +10012,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const head =
           settledShell ||
+          ownsNoBubble ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
@@ -10024,7 +10033,6 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 head.tempId,
                 event.createdBy ?? head.author,
                 head.createdAtS,
-                consumedMessageOrigin(event),
               ),
             ],
           };
@@ -10042,7 +10050,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               undefined,
               event.createdBy,
               undefined,
-              consumedMessageOrigin(event),
+              origin,
             ),
           ],
         };

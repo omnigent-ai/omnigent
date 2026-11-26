@@ -4238,7 +4238,7 @@ def create_app(
                 "scheduled_task_clone": automations_enabled
                 and bool(app.state.scheduled_task_dispatch_enabled),
                 "session_timers": bool(app.state.session_timers_enabled),
-                "session_loops": True,
+                "session_loops": scheduled_task_store is not None,
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "session_archive_runner_checks": True,

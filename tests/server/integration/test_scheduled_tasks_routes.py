@@ -7926,6 +7926,7 @@ async def test_a_timer_is_one_hidden_task_its_session_can_cancel(
     session_id = _owned_session(db_uri)
     info = (await auth_client.get("/v1/info", headers=_headers())).json()
     assert info["session_timers"] is True
+    assert info["session_loops"] is True
     before = time.time()
     created = await auth_client.post(
         f"/v1/sessions/{session_id}/timers",
@@ -8321,6 +8322,65 @@ async def test_a_loop_a_failed_replace_or_stop_leaves_behind_is_one_the_session_
     monkeypatch.undo()
     assert (await stop()).json() == expected_stop
     assert store.get(first).state == "active"
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_a_loops_label_stays_on_the_server_and_goes_when_the_loop_does(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A client never sees the label naming a loop, so one that copies a session's labels
+    (a native ``/clear`` creating its replacement) carries none; and the label goes when
+    the loop is cancelled by id or its session is superseded."""
+    session_id = _owned_session(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    label = loop_timer_label_key("alice@example.com")
+
+    async def arm() -> str:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 300, "repeat": True, "note": "check CI", "origin": "loop"},
+            headers=_headers(),
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["timer_id"]
+
+    first = await arm()
+    assert conversations.get_conversation(session_id).labels[label] == first
+    snapshot = (await auth_client.get(f"/v1/sessions/{session_id}", headers=_headers())).json()
+    assert not [key for key in snapshot["labels"] if key.startswith("omnigent.loop_timer.")]
+    # The labels a native /clear copies are accepted for the session replacing this one.
+    replacement = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": snapshot["agent_id"], "labels": snapshot["labels"]},
+        headers=_headers(),
+    )
+    assert replacement.status_code == 201, replacement.text
+
+    # Cancelled by id, as the composer does after a refused first run.
+    cancelled = await auth_client.delete(
+        f"/v1/sessions/{session_id}/timers/{first}", headers=_headers()
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert label not in conversations.get_conversation(session_id).labels
+
+    # Superseded, as /clear and /rewind leave a session: its viewers follow the new one,
+    # so the loop is forgotten here and its next firing retires it (test_claimed_fire).
+    second = await arm()
+    superseded = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_superseded",
+            "data": {"target_conversation_id": replacement.json()["id"]},
+        },
+        headers=_headers(),
+    )
+    assert superseded.status_code == 202, superseded.text
+    assert label not in conversations.get_conversation(session_id).labels
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(second).state == "active"
+    stopped = await auth_client.delete(
+        f"/v1/sessions/{session_id}/timers", params={"origin": "loop"}, headers=_headers()
+    )
+    assert stopped.json() == {"timer_id": None, "status": "none"}
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)

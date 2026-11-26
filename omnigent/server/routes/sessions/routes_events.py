@@ -263,6 +263,7 @@ from omnigent.server.routes._sessions.helpers import (
     _set_background_work_running,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
+    _stop_superseded_loops,
     _stream_live_events,
     _wait_for_runner_client,
     reconcile_orphaned_running_status,
@@ -2751,6 +2752,7 @@ def register_events_routes(
                     "data.target_conversation_id",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            await _stop_superseded_loops(session_id, conversation_store)
             _publish_session_superseded(session_id, target_conversation_id.strip())
             return {"queued": False}
         if body.type == _EXTERNAL_BTW_SIDECHAT_TYPE:

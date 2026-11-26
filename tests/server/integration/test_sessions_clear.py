@@ -38,6 +38,7 @@ from omnigent.server.managed_hosts import (
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import routes_core
+from omnigent.stores.conversation_store import loop_timer_label_key
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
@@ -230,6 +231,8 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     repos = ["https://github.com/acme/api", "https://github.com/acme/web#main"]
     sandbox_labels = {**managed_repo_labels(repos), REQUESTED_HOST_ID_LABEL_KEY: _HOST_ID}
     store.set_labels(source_id, sandbox_labels)
+    # A /loop running in the source: its viewers are about to move on.
+    store.set_labels(source_id, {loop_timer_label_key(None): "st_loop"})
     store.update_conversation(
         source_id, cost_control_mode_override="on", subagent_routing_override="on"
     )
@@ -271,6 +274,10 @@ async def test_claude_sdk_clear_moves_to_a_fresh_session_on_the_same_placement(
     assert fork.labels["team"] == "core"
     # A relaunch of the shared sandbox still re-clones the repositories.
     assert {key: fork.labels.get(key) for key in sandbox_labels} == sandbox_labels
+    # The loop neither follows unseen nor ticks on behind: the source forgets it, so
+    # its next firing retires the timer, and the new session starts with none.
+    assert loop_timer_label_key(None) not in fork.labels
+    assert loop_timer_label_key(None) not in store.get_conversation(source_id).labels
     assert read_managed_repo_workspaces(fork.labels) == repos
     # Untitled, so the first message names it like any new chat.
     assert fork.title is None

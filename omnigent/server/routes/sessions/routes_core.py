@@ -219,6 +219,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
     _set_read_state,
     _start_managed_launch_task,
+    _stop_superseded_loops,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -6266,6 +6267,7 @@ def register_core_routes(
                         exc_info=True,
                         extra={"session_id": source.id},
                     )
+                await _stop_superseded_loops(source.id, conversation_store)
                 _publish_session_superseded(source.id, fork.id, reason=reason)
                 _logger.info(
                     "Session superseded by %s",
