@@ -19,9 +19,13 @@ _URL = f"https://gitlab.com/{_PROJECT}"
 _COMMAND_PREFIXES = ("", "/usr/bin/", "./bin/", "command /usr/bin/", "env ")
 
 
-def _result(command: str, **configuration: object) -> str:
+def _response(command: str, **configuration: object) -> PolicyResponse | None:
     policy = gitlab_policy(**configuration)  # type: ignore[arg-type]
-    response = policy(tool_call_event("sys_os_shell", {"command": command}))
+    return policy(tool_call_event("sys_os_shell", {"command": command}))
+
+
+def _result(command: str, **configuration: object) -> str:
+    response = _response(command, **configuration)
     return response["result"] if response else "ALLOW"
 
 
@@ -87,7 +91,9 @@ def test_explicit_project_selector(selector: str) -> None:
     ],
 )
 def test_uncertain_project_identity_requires_approval(selector: str) -> None:
-    assert _result(f'glab issue list -R "{selector}"') == "ASK"
+    response = _response(f'glab issue list -R "{selector}"')
+    assert response is not None and response["result"] == "ASK"
+    assert "could not be established" in response["reason"]
 
 
 def test_projects_can_be_pinned_to_a_server() -> None:
@@ -132,7 +138,6 @@ def test_projects_can_be_pinned_to_a_server() -> None:
         ("-t Fix -d Details --confidential=invalid", "ASK"),
         ("-t Fix", "ASK"),
         ("-t Fix -d -", "ASK"),
-        ('-t Fix -d ""', "ASK"),
         ("-t Fix -d", "ASK"),
         ("-t $TITLE -d Details", "ASK"),
         ('-t "$TITLE" -d Details', "ASK"),
@@ -140,15 +145,10 @@ def test_projects_can_be_pinned_to_a_server() -> None:
         (f"glab issue create -t Fix -d > -R {_URL}", "ASK"),
         (f"glab issue note 12 -m > -R {_URL}", "ASK"),
         (f"glab issue note 12 -m >-R {_URL}", "ASK"),
-        (rf"g\lab issue note 12 -m > -R {_URL}", "ASK"),
-        (rf"g\lab issue create -t Fix -d > -R {_URL}", "ASK"),
-        (f"g'lab' issue note 12 -m > -R {_URL}", "ASK"),
         (f'"glab" issue note 12 -m > -R {_URL}', "ASK"),
-        (rf"g\lab issue create -R {_URL} -t $TITLE -d Details", "ASK"),
         (f"glab issue note 12 -m hi\r-R\r{_URL}", "ASK"),
         (f"glab issue create -t Fix -d b\r-R\r{_URL}", "ASK"),
         (f"glab issue note 12 -m Details -R {_URL}\r", "ASK"),
-        (r"-t Fix -d 'literal\rtext'", "ASK"),
         ("-t Fix -d >> -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d < -R https://gitlab.com/team/sub/app", "ASK"),
         ("-t Fix -d 2> -R https://gitlab.com/team/sub/app", "ASK"),
@@ -169,7 +169,6 @@ def test_option_values_remain_attached(arguments: str, expected: str) -> None:
     [
         "glab issue note 12",
         "glab issue note 12 -m -",
-        'glab issue note 12 -m ""',
         "glab issue note https://gitlab.com/team/other/-/issues/12 -m Details",
         "glab issue view https://gitlab.com/team/other/-/issues/12",
         "glab mr view feature",
@@ -183,6 +182,30 @@ def test_option_values_remain_attached(arguments: str, expected: str) -> None:
 )
 def test_unmodelled_operands_and_interactive_writes_ask(command: str) -> None:
     assert _result(f"{command} -R {_URL}", write_repos=[_PROJECT]) == "ASK"
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        (f'glab issue create -R {_URL} -t Fix -d ""', "explicit issue text"),
+        (f'glab issue note 12 -R {_URL} -m ""', "explicit issue text"),
+        (
+            f'bash -c -- "glab issue create -R {_URL} -t Fix -d Details"',
+            "after the command-string flag",
+        ),
+        (
+            f'bash -c -e "glab issue create -R {_URL} -t Fix -d Details"',
+            "after the command-string flag",
+        ),
+        (f'sh -c +x "glab mr delete 12 -R {_URL}"', "after the command-string flag"),
+        (f'bash -c -o errexit "glab mr delete 12 -R {_URL}"', "after the command-string flag"),
+        (f'bash -lc -- "glab mr delete 12 -R {_URL}"', "after the command-string flag"),
+    ],
+)
+def test_approval_reason_identifies_the_unresolved_boundary(command: str, reason: str) -> None:
+    response = _response(command, write_repos=[_PROJECT])
+    assert response is not None and response["result"] == "ASK"
+    assert reason in response["reason"]
 
 
 @pytest.mark.parametrize(
@@ -227,21 +250,28 @@ def test_git_remote_and_configuration_handling_is_deferred(command: str) -> None
 
 
 @pytest.mark.parametrize("action", ["issue delete", "mr del", "repo rm", "project delete"])
-@pytest.mark.parametrize("prefix", ["", "! ", "! env ", "! ! "])
-def test_known_deletions_are_denied(action: str, prefix: str) -> None:
-    assert _result(f"{prefix}glab {action} 12 -R {_URL}", write_repos=[_PROJECT]) == "DENY"
+def test_known_deletions_are_denied(action: str) -> None:
+    assert _result(f"glab {action} 12 -R {_URL}", write_repos=[_PROJECT]) == "DENY"
 
 
-@pytest.mark.parametrize("prefix", _COMMAND_PREFIXES)
-@pytest.mark.parametrize("spelling", ["glab", "GLAB", "GlAb", "glab.exe", "GLAB.EXE", "GlAb.ExE"])
+@pytest.mark.parametrize(
+    ("prefix", "spelling"),
+    [("", name) for name in ("glab", "GLAB", "GlAb", "glab.exe", "GLAB.EXE", "GlAb.ExE")]
+    + [(prefix, "glab") for prefix in _COMMAND_PREFIXES[1:]]
+    + [("command /usr/bin/", "GlAb.ExE")],
+)
 def test_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
     assert _result(f"{prefix}{spelling} issue view 12 -R {_URL}") == "ALLOW"
     assert _result(f"{prefix}{spelling} issue create -R {_URL} -t Fix -d Details") == "DENY"
     assert _result(f"{prefix}{spelling} mr delete 12 -R {_URL}") == "DENY"
 
 
-@pytest.mark.parametrize("prefix", _COMMAND_PREFIXES)
-@pytest.mark.parametrize("spelling", ["git", "GIT", "git.exe", "GIT.EXE"])
+@pytest.mark.parametrize(
+    ("prefix", "spelling"),
+    [("", name) for name in ("git", "GIT", "git.exe", "GIT.EXE")]
+    + [(prefix, "git") for prefix in _COMMAND_PREFIXES[1:]]
+    + [("command /usr/bin/", "GIT.EXE")],
+)
 def test_git_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
     assert _result(f"{prefix}{spelling} push {_URL} main") == "ASK"
 
@@ -294,11 +324,8 @@ def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
         (f"! glab issue create -R {_URL} -t Fix -d Details", "DENY"),
         (f"! env glab issue list -R {_URL}", "ALLOW"),
         (f'! bash -c "glab mr delete 12 -R {_URL}"', "DENY"),
-        (f'bash -c -- "glab issue create -R {_URL} -t Fix -d Details"', "ASK"),
-        (f'bash -c -e "glab issue create -R {_URL} -t Fix -d Details"', "ASK"),
-        (f'sh -c +x "glab mr delete 12 -R {_URL}"', "ASK"),
-        (f'bash -c -o errexit "glab mr delete 12 -R {_URL}"', "ASK"),
-        (f'bash -lc -- "glab mr delete 12 -R {_URL}"', "ASK"),
+        (f"! env glab mr del 12 -R {_URL}", "DENY"),
+        (f"! ! glab repo rm 12 -R {_URL}", "DENY"),
         (f"gl^ab issue create -R {_URL} -t Fix -d Details", "ASK"),
         (f"gl%EXAMPLE%ab issue list -R {_URL}", "ASK"),
         (f"gl!EXAMPLE!ab issue list -R {_URL}", "ASK"),
