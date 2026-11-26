@@ -17476,18 +17476,27 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         { liveAck: "shell input" },
         { liveAck: "shell input", identicalAlreadyPending: true },
         { liveAck: "receipt", retryRead: true },
+        { liveAck: "receipt", retryRead: true, retryOnRevisit: true },
         { liveAck: "shell input", identicalAlreadyPending: true, recoverSecond: true },
       ].map((scenario) => ({
         ...path,
         identicalAlreadyPending: false,
         retryRead: false,
+        retryOnRevisit: false,
         recoverSecond: false,
         ...scenario,
       })),
     ),
   )(
-    "keeps a new identical command through $path after a live $liveAck (another pending: $identicalAlreadyPending; retry: $retryRead; second recovered: $recoverSecond)",
-    async ({ gapLength, liveAck, identicalAlreadyPending, retryRead, recoverSecond }) => {
+    "keeps a new identical command through $path after a live $liveAck (another pending: $identicalAlreadyPending; retry: $retryRead; on revisit: $retryOnRevisit; second recovered: $recoverSecond)",
+    async ({
+      gapLength,
+      liveAck,
+      identicalAlreadyPending,
+      retryRead,
+      retryOnRevisit,
+      recoverSecond,
+    }) => {
       const id = "conv_shell_receipt_first";
       const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
       const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
@@ -17569,9 +17578,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync();
       if (retryRead) {
         expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).not.toContain(oldInput.id);
-        sinks[1]!.error();
+        if (retryOnRevisit) {
+          // Switching away and back reconciles before the pump retries its failed read.
+          await useChatStore.getState().switchTo(null);
+          await useChatStore.getState().switchTo(id);
+        } else {
+          sinks[1]!.error();
+        }
         await drainAsync();
-        expect(sinks).toHaveLength(3);
+        expect(sinks).toHaveLength(retryOnRevisit ? 2 : 3);
       }
       expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(oldInput.id);
       expect(useChatStore.getState().pendingUserMessages).toEqual(expected);

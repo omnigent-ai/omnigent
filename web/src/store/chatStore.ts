@@ -1559,6 +1559,9 @@ const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; mod
 // Snapshot reconciliation must teach the already-running stream pump which
 // native preview messages have finalized, including warm session revisits.
 const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
+// Submissions reserved for the shell inputs a reconnect read may recover,
+// shared by every reconcile on the binding until one read succeeds.
+const shellReservationsByController = new WeakMap<AbortController, PendingUserMessage[]>();
 
 /**
  * Evict a conversation from the live registry.
@@ -6445,11 +6448,44 @@ async function reconcileOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
   settleStatus = true,
-  pendingBeforeRecovery?: PendingUserMessage[],
+): Promise<ReconnectBackfill> {
+  // Failed reads still owe the same gap, whichever caller retries it. Retain
+  // acknowledged submissions as reservations, then append sends eligible for
+  // this newer read.
+  const binding = get().abortController;
+  const retained = (binding && shellReservationsByController.get(binding)) ?? [];
+  const retainedIds = new Set(retained.map((p) => p.tempId));
+  const reserved = [
+    ...retained,
+    ...get().pendingUserMessages.filter((p) => !retainedIds.has(p.tempId)),
+  ].slice(0, MAX_SETTLED_SHELL_INPUTS);
+  if (binding) shellReservationsByController.set(binding, reserved);
+  const outcome = await reconcileReservedOnReconnect(
+    id,
+    set,
+    get,
+    ignoredNativeMessageIds,
+    settleStatus,
+    reserved,
+  );
+  // A slower earlier run must not release the latest run's reservations.
+  if (binding && outcome !== "failed" && shellReservationsByController.get(binding) === reserved) {
+    shellReservationsByController.delete(binding);
+  }
+  return outcome;
+}
+
+/** {@link reconcileOnReconnect} against the submissions reserved at its start. */
+async function reconcileReservedOnReconnect(
+  id: string,
+  set: Setter,
+  get: Getter,
+  ignoredNativeMessageIds: Set<string>,
+  settleStatus: boolean,
+  pendingCandidates: PendingUserMessage[],
 ): Promise<ReconnectBackfill> {
   if (queryClient === null) return "skipped";
   const stateBeforeFetch = get();
-  const pendingCandidates = pendingBeforeRecovery ?? stateBeforeFetch.pendingUserMessages;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   const turnEdgesBeforeFetch = streamTurnEdgeRevisions.get(id) ?? 0;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
@@ -6735,7 +6771,6 @@ export async function startStreamPump(
   // The open currently live, so routing changes and missed events can recycle it.
   let liveAttempt: AbortController | null = null;
   let backfillRuns = 0;
-  let pendingBeforeBackfill: PendingUserMessage[] | null = null;
   const missedEventRecovery: MissedEventRecovery = {
     recycleStream: () => {
       if (liveAttempt === null || !hasConnected) return false;
@@ -6748,26 +6783,15 @@ export async function startStreamPump(
     backfill: async (settleStatus) => {
       backfillRuns += 1;
       const run = backfillRuns;
-      // Failed reads still owe the same gap. Retain acknowledged submissions
-      // as reservations, then append sends eligible for the retry's newer read.
-      const retainedIds = new Set(pendingBeforeBackfill?.map((p) => p.tempId));
-      pendingBeforeBackfill = [
-        ...(pendingBeforeBackfill ?? []),
-        ...get().pendingUserMessages.filter((p) => !retainedIds.has(p.tempId)),
-      ].slice(0, MAX_SETTLED_SHELL_INPUTS);
       const outcome = await reconcileOnReconnect(
         id,
         set,
         get,
         ignoredNativeMessageIds,
         settleStatus,
-        pendingBeforeBackfill,
       );
       // A slower earlier run must not overwrite the latest run's outcome.
-      if (run === backfillRuns) {
-        missedEventRecovery.backfillOwed = outcome === "failed";
-        if (outcome !== "failed") pendingBeforeBackfill = null;
-      }
+      if (run === backfillRuns) missedEventRecovery.backfillOwed = outcome === "failed";
     },
   };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so
