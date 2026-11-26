@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { bootstrapDelta, percentile } from "./ab.mjs";
-import { armOrder } from "./cdp.mjs";
+import { armOrder, assertColdLoad } from "./cdp.mjs";
+
+test("cold-load marker timeouts fail instead of producing a sample", () => {
+  assert.throws(
+    () => assertColdLoad("example", { timeout: "marker", markerTs: -1, paintedTs: -1 }),
+    /cold load example failed/,
+  );
+  assert.throws(() => assertColdLoad("example", {}), /cold load example failed/);
+  assert.doesNotThrow(() => assertColdLoad("example", { markerTs: 12, paintedTs: 16 }));
+});
 
 test("arm order counterbalances adjacent pairs", () => {
   assert.deepEqual([0, 1, 2, 3].flatMap(armOrder), ["a", "b", "b", "a", "a", "b", "b", "a"]);

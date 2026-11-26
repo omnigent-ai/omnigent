@@ -16,6 +16,19 @@ export function armOrder(index) {
   return index % 2 === 0 ? ["a", "b"] : ["b", "a"];
 }
 
+export function assertColdLoad(id, settled) {
+  if (
+    !settled ||
+    settled.timeout ||
+    !Number.isFinite(settled.markerTs) ||
+    settled.markerTs < 0 ||
+    !Number.isFinite(settled.paintedTs) ||
+    settled.paintedTs < 0
+  ) {
+    throw new Error(`cold load ${id} failed: ${JSON.stringify(settled)}`);
+  }
+}
+
 export function findChrome(explicit) {
   const cache = path.join(os.homedir(), ".cache", "ms-playwright");
   const playwright = fs.existsSync(cache)

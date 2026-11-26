@@ -37,10 +37,22 @@ test(
       for (const key of ["a", "b", "c", "d", "e"]) {
         const items = JSON.parse(fs.readFileSync(path.join(fixtures, `items_${key}.json`), "utf8"));
         const ids = new Set(itemsToBlocks(items).map((block) => block.ctx.itemId));
+        const outputs = new Map(
+          items
+            .filter((item) => item.type === "function_call_output")
+            .map((item) => [item.call_id, item]),
+        );
         for (const item of items) {
           types.add(item.type);
           assert.ok(item.response_id, `${key}: ${item.id} has no response ID`);
           assert.ok(ids.has(item.id), `${key}: ${item.type} ${item.id} was dropped`);
+          if (item.type === "function_call") {
+            assert.equal(
+              outputs.get(item.call_id)?.response_id,
+              item.response_id,
+              `${key}: ${item.id} output has a different response ID`,
+            );
+          }
         }
       }
       for (const type of [

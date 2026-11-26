@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import {
   armOrder,
+  assertColdLoad,
   cdpConnect,
   ensurePortFree,
   findChrome,
@@ -923,8 +924,7 @@ async function main() {
           `window.__waitSettled(${JSON.stringify(MARKERS[id])}, { timeoutMs: 30000, sinceTs: performance.now() - 1 })`,
           true,
         );
-        if (!settled || settled.timeout || settled.markerTs < 0 || settled.paintedTs < 0)
-          throw new Error(`cold load ${id} failed: ${JSON.stringify(settled)}`);
+        assertColdLoad(id, settled);
         const snap = await page.eval(`(() => {
           const nav = performance.getEntriesByType("navigation")[0];
           return {
