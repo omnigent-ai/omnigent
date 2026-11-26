@@ -248,13 +248,8 @@ def _cel_event(event: PolicyEvent) -> dict[str, object]:
     # CEL expressions cannot call methods on it and json_to_cel would
     # raise ValueError trying to convert it.
     cel_event: dict[str, object] = {k: v for k, v in event.items() if k != "llm_client"}
-    # REQUEST-phase ``data`` is now the structured dict
-    # ({"user_content", "attachments"}) from the input gate, but CEL
-    # expressions authored against the request phase expect the user text as
-    # a bare string (e.g. ``event.data.contains("secret")``). Project it back
-    # to that string so existing request-phase CEL policies keep matching — a
-    # map here would silently fail-open (string ops raise -> abstain -> ALLOW,
-    # and ``==`` against a string is just false).
+    # Request policies expect the user text as a string (``event.data.contains``);
+    # the input gate's structured map would make their string ops fail open.
     if event.get("type") == "request":
         cel_event["data"] = request_user_text(event.get("data"))
     return cel_event
@@ -311,7 +306,7 @@ def validate_cel_policy_params(factory_params: dict[str, object]) -> str | None:
 
     Compiles the expression, then evaluates it on one neutral event per phase.
     Session policies see every phase and an evaluation error abstains, so an
-    expression that fails here would never apply to that phase's events.
+    expression that fails here does not apply to such events.
 
     :param factory_params: Schema-checked :func:`cel_policy` arguments, e.g.
         ``{"expression": 'event.type == "tool_call" ? {"result": "ASK"} : null'}``.
@@ -327,11 +322,16 @@ def validate_cel_policy_params(factory_params: dict[str, object]) -> str | None:
     for phase in _DRY_RUN_CONTENT:
         try:
             program.evaluate({"event": json_to_cel(_cel_event(_dry_run_event(phase)))})
+        except RecursionError:
+            return (
+                f"CEL policy: expression is nested too deeply to evaluate a {phase.value} event."
+            )
         except (CELEvalError, ValueError, TypeError):
             return (
-                f"CEL policy: expression fails to evaluate on {phase.value} events, so the "
-                "policy would not apply to them. Guard type-specific fields, e.g. "
-                'event.type == "tool_call" && event.data.name == "sys_os_shell".'
+                f"CEL policy: expression fails to evaluate a {phase.value} event, and a failed "
+                "evaluation abstains. Guard fields that some events lack, e.g. "
+                'event.type == "tool_call" && event.data.name == "sys_os_shell", '
+                "or has(event.session_state.count)."
             )
     return None
 

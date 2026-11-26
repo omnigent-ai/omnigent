@@ -198,8 +198,19 @@ def test_validate_skips_unknown_handler() -> None:
     [
         (_UNGUARDED_TOOL_NAME_CHAIN, "request"),
         ('event.type == "tool_call" && event.data.arguments.command == "rm"', "tool_call"),
+        ('event.type == "tool_result" && event.data.missing == "x"', "tool_result"),
+        ('event.type == "response" && event.data.missing == "x"', "response"),
+        ('event.type == "llm_request" && event.data.missing == "x"', "llm_request"),
+        ('event.type == "llm_response" && event.data.missing == "x"', "llm_response"),
     ],
-    ids=["unguarded-tool-name-chain", "missing-tool-argument"],
+    ids=[
+        "unguarded-tool-name-chain",
+        "missing-tool-argument",
+        "tool-result",
+        "response",
+        "llm-request",
+        "llm-response",
+    ],
 )
 def test_validate_cel_rejects_expression_failing_on_a_phase(
     expression: str, failing_phase: str
@@ -208,7 +219,15 @@ def test_validate_cel_rejects_expression_failing_on_a_phase(
     load_registry()
     error = validate_factory_params(_CEL_HANDLER, {"expression": expression})
     assert error is not None
-    assert f"fails to evaluate on {failing_phase} events" in error
+    assert f"fails to evaluate a {failing_phase} event" in error
+
+
+def test_validate_cel_rejects_too_deeply_nested_expression() -> None:
+    """Exhausting the evaluator's recursion limit is a validation error, not a crash."""
+    load_registry()
+    error = validate_factory_params(_CEL_HANDLER, {"expression": "(" * 2000 + "true" + ")" * 2000})
+    assert error is not None
+    assert "nested too deeply to evaluate a request event" in error
 
 
 def test_validate_cel_rejects_syntax_error() -> None:
@@ -230,6 +249,8 @@ def test_validate_cel_rejects_syntax_error() -> None:
         'event.type == "request" && event.data.contains("secret") ? {"result": "DENY"} : null',
         'event.context.usage.total_cost_usd > 5.0 ? {"result": "ASK"} : null',
         'event.context.actor.run_as.endsWith("@example.com") ? null : {"result": "DENY"}',
+        "has(event.session_state.count) && event.session_state.count > 5"
+        ' ? {"result": "DENY"} : null',
     ],
     ids=[
         "guarded-tool-name",
@@ -238,6 +259,7 @@ def test_validate_cel_rejects_syntax_error() -> None:
         "request-text",
         "session-cost",
         "actor",
+        "guarded-session-state",
     ],
 )
 def test_validate_cel_accepts_expression_evaluating_on_every_phase(expression: str) -> None:

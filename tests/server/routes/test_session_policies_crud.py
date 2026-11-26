@@ -124,7 +124,7 @@ async def test_create_session_cel_policy_rejects_expression_failing_on_a_phase(
         ),
     )
     assert resp.status_code == 400
-    assert "fails to evaluate on request events" in resp.json()["error"]["message"]
+    assert "fails to evaluate a request event" in resp.json()["error"]["message"]
     listed = await client.get(f"/v1/sessions/{session_id}/policies")
     assert [p for p in listed.json()["data"] if p["source"] == "session"] == []
 
