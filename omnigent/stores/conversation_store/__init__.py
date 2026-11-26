@@ -212,6 +212,23 @@ SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX = "omnigent.pending_scheduled_run."
 # Server-owned: the web composer's running /loop for one user (the suffix hashes the
 # user), holding its timer's task id so a new loop replaces it and a stop finds it.
 LOOP_TIMER_LABEL_PREFIX = "omnigent.loop_timer."
+
+
+def loop_timer_label_key(user_id: str | None) -> str:
+    """
+    The label naming *user_id*'s running ``/loop`` timer in a session.
+
+    A loop's firing checks that this label still names it, so a timer the label no
+    longer names, however it was left behind, retires itself instead of ticking on.
+
+    :param user_id: Authenticated user id, or ``None`` in single-user / no-auth mode
+        (→ the ``local`` sentinel).
+    :returns: ``"omnigent.loop_timer.<sha256(user)[:16]>"``.
+    """
+    user_key = (user_id or _PINNED_LABEL_LOCAL_USER).encode()
+    return LOOP_TIMER_LABEL_PREFIX + hashlib.sha256(user_key).hexdigest()[:16]
+
+
 # The run whose agent has appended real activity; copied history never sets it.
 SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
 

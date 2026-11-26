@@ -111,6 +111,8 @@ export async function stopSessionLoop(sessionId: string): Promise<string | null>
  * the composer, then each tick from the server. Tagged so the transcript labels it.
  * Any refusal fails the run, an offline host included: nothing holds the message
  * for a resend. A policy denial, which the server reports as a success, throws too.
+ * A run the server accepts but that fails afterwards, such as a native terminal
+ * that cannot start, resolves: the transcript shows that turn's failure.
  */
 export async function sendLoopPrompt(sessionId: string, prompt: string): Promise<void> {
   const result = await postEvent(sessionId, {

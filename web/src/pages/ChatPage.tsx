@@ -3648,7 +3648,8 @@ function ComposerImpl(
             await sendLoopPrompt(loopSessionId, command.prompt);
           } catch (err: unknown) {
             // Every tick would meet the same refusal, so arm nothing. The server has
-            // already stopped the loop this one replaced, so say so.
+            // already stopped the loop this one replaced, so say so. A run the server
+            // accepted but that failed afterwards isn't a refusal: the loop stays armed.
             const reason = (err instanceof Error ? err.message : "The first run failed").replace(
               /\.$/,
               "",

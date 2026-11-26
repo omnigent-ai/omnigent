@@ -70,40 +70,22 @@ describe("sendLoopPrompt", () => {
 const loopInput = { seconds: 300, repeat: true, note: "check CI", origin: "loop" };
 
 describe("setSessionTimer", () => {
-  it("posts the timer with its origin and maps the saved reply", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(SAVED, 201));
-    const timer = await setSessionTimer("conv_a", {
-      seconds: 300,
-      repeat: true,
-      note: "check CI",
-      origin: "loop",
-    });
+  it.each([
+    ["no loop", null],
+    ["the loop it replaced", "st_old"],
+  ])("posts the timer with its origin and maps the saved reply, naming %s", async (_, replaced) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...SAVED, replaced_timer_id: replaced }, 201));
+    const timer = await setSessionTimer("conv_a", loopInput);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_a/timers");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(String(init.body))).toEqual({
-      seconds: 300,
-      repeat: true,
-      note: "check CI",
-      origin: "loop",
-    });
+    expect(JSON.parse(String(init.body))).toEqual(loopInput);
     expect(timer).toEqual({
       timerId: "st_timer",
       fireAt: "2026-11-25T10:05:00+00:00",
       intervalSeconds: 300,
-      replacedTimerId: null,
+      replacedTimerId: replaced,
     });
-  });
-
-  it("names the loop the new one replaced", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ ...SAVED, replaced_timer_id: "st_old" }, 201));
-    const timer = await setSessionTimer("conv_a", {
-      seconds: 300,
-      repeat: true,
-      note: "check CI",
-      origin: "loop",
-    });
-    expect(timer.replacedTimerId).toBe("st_old");
   });
 
   it("throws the server's reason when it keeps no timers for the session", async () => {

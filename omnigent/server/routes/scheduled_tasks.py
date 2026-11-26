@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import math
 import time
@@ -120,8 +119,8 @@ from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
-    LOOP_TIMER_LABEL_PREFIX,
     SCHEDULED_TASK_RUN_LABEL_KEY,
+    loop_timer_label_key,
 )
 from omnigent.stores.permission_store import MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE
 from omnigent.stores.project_store import ProjectStore
@@ -2551,10 +2550,6 @@ def create_scheduled_tasks_router(
     # or stopping at once, on any replica, agree on which loop is running.
     _LOOP_STOP_ATTEMPTS = 5
 
-    def _loop_label(user_id: str | None) -> str:
-        user_key = (user_id or RESERVED_USER_LOCAL).encode()
-        return LOOP_TIMER_LABEL_PREFIX + hashlib.sha256(user_key).hexdigest()[:16]
-
     async def _running_loop(
         conv: Conversation, user_id: str | None, timer_id: str | None
     ) -> ScheduledTask | None:
@@ -2698,7 +2693,7 @@ def create_scheduled_tasks_router(
             # one replaces, however many clients arm at once.
             try:
                 previous_id = await asyncio.to_thread(
-                    conversation_store.swap_label, conv.id, _loop_label(user_id), task.id
+                    conversation_store.swap_label, conv.id, loop_timer_label_key(user_id), task.id
                 )
             except BaseException:
                 # A loop the session can't find could never be stopped.
@@ -2741,7 +2736,7 @@ def create_scheduled_tasks_router(
         if origin != "loop":
             raise OmnigentError("origin must be 'loop'", code=ErrorCode.INVALID_INPUT)
         user_id, conv = await _timer_session(request, session_id)
-        label = _loop_label(user_id)
+        label = loop_timer_label_key(user_id)
         # Clear the label only while it still names the loop read, then cancel that loop;
         # an arm that moved the label meanwhile keeps its loop and the stop looks again.
         for _ in range(_LOOP_STOP_ATTEMPTS):

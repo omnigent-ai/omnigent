@@ -244,7 +244,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that outlasts its interval accumulates ticks. One loop per user per session,
   kept by the server: a new `/loop` replaces the caller's running loop in that
   session however many tabs arm one, and `/loop stop` (no arguments) stops it
-  (`DELETE /v1/sessions/{id}/timers?origin=loop`); the agent's own
+  (`DELETE /v1/sessions/{id}/timers?origin=loop`). A loop ticks only while the
+  session still names it as the caller's loop, so one a failed replace or stop
+  left behind retires itself at its next firing; the agent's own
   `sys_timer_set` timers are never touched, and in a shared session each
   collaborator's loop is their own. Intervals are a leading `5m`, `2h` or `1d`
   token, from 2 minutes (the server's saved-timer floor) to 7 days. A prompt
@@ -262,7 +264,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   under the composer with the text kept, a server refusal with the text
   restored (to the session's saved draft if the user has switched away), and a
   refused first run ("… The loop was not armed."), which cancels the timer just
-  saved.
+  saved. A refusal is the server rejecting the message: an error reply or a
+  policy denial. A first run the server accepts but that fails afterwards, such
+  as a native terminal that cannot start, shows as a failed turn and leaves the
+  loop armed; the next tick tries again, and `/loop stop` ends it.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

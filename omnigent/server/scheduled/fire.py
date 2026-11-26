@@ -188,6 +188,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    loop_timer_label_key,
 )
 from omnigent.util.session_lifecycle import is_session_closed
 
@@ -3345,10 +3346,12 @@ async def _check_timer_wake(deps: FireDeps, task: ScheduledTask, conv: Conversat
 async def _fire_timer(
     deps: FireDeps, task: ScheduledTask, recorder: _ClaimedRunRecorder, dispatch: LaunchDispatch
 ) -> None:
-    """Wake a timer's session with its hidden firing message.
+    """Wake a timer's session with its hidden firing message, or a loop's with its prompt.
 
     A session that was deleted, archived or closed, or that the timer's owner can no
-    longer send to, stops the timer instead: it is never woken or recreated. A session
+    longer send to, stops the timer instead: it is never woken or recreated. So does a
+    ``/loop`` timer the session no longer names as its user's running loop: replaced or
+    stopped, nothing else can reach it, so it retires rather than ticking on. A session
     that moved to another host gets the firing back unsent, for the replica that owns
     that host to claim at its next poll. The session's input policies check the wake as
     they would a message. A cancel stops later firings; one already on its way may still
@@ -3365,6 +3368,17 @@ async def _fire_timer(
         await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
         return
     assert conv is not None
+    if (
+        timer_origin(task.name) == "loop"
+        and conv.labels.get(loop_timer_label_key(task.user_id)) != task.id
+    ):
+        # The session's label, not the timer rows, says which loop runs for its user.
+        _logger.info("scheduled fire: loop %s stopped: the session no longer runs it", task.id)
+        await recorder.finish(
+            "skipped", error="the session no longer runs this loop", error_code="loop_superseded"
+        )
+        await asyncio.to_thread(deps.scheduled_task_store.delete, task.id)
+        return
     # Firings are claimed by the replica that owns the timer's saved host, which may no
     # longer serve the session; a session without a host keeps the saved one.
     if conv.host_id is not None and conv.host_id != task.host_id:

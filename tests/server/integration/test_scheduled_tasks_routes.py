@@ -53,6 +53,7 @@ from omnigent.server.scheduled.workflow_automations import (
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.conversation_store import loop_timer_label_key
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -8245,6 +8246,78 @@ async def test_a_loop_the_session_cannot_record_is_not_saved(
             headers=_headers(),
         )
     assert SqlAlchemyScheduledTaskStore(db_uri).list(kinds=("timer",)) == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize(
+    "failure", ["retiring the replaced loop", "retiring the stopped loop", "the swap's await"]
+)
+async def test_a_loop_a_failed_replace_or_stop_leaves_behind_is_one_the_session_no_longer_names(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Once the label has moved, a failure can leave the old loop's timer behind, but the
+    session no longer names it: a stop never finds it and its next firing retires it
+    (``test_claimed_fire``), so no loop ticks on that ``/loop stop`` cannot reach."""
+    session_id = _owned_session(db_uri)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    label = loop_timer_label_key("alice@example.com")
+
+    async def arm(note: str) -> httpx.Response:
+        return await auth_client.post(
+            f"/v1/sessions/{session_id}/timers",
+            json={"seconds": 300, "repeat": True, "note": note, "origin": "loop"},
+            headers=_headers(),
+        )
+
+    async def stop() -> httpx.Response:
+        return await auth_client.delete(
+            f"/v1/sessions/{session_id}/timers", params={"origin": "loop"}, headers=_headers()
+        )
+
+    first = (await arm("check CI")).json()["timer_id"]
+    assert conversations.get_conversation(session_id).labels[label] == first
+
+    def refuse_delete(self: object, task_id: str) -> bool:
+        raise RuntimeError("task store down")
+
+    if failure == "the swap's await":
+        real_swap = SqlAlchemyConversationStore.swap_label
+
+        def swap_then_cancel(self: Any, *args: Any, **kwargs: Any) -> str | None:
+            # Cancelling the await doesn't stop the thread: the swap commits regardless.
+            real_swap(self, *args, **kwargs)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "swap_label", swap_then_cancel)
+        # The app answers a request cancelled mid-flight with 499, client closed request.
+        assert (await arm("again")).status_code == 499
+        # The arm undid its loop, so the label names a timer that is gone.
+        named = conversations.get_conversation(session_id).labels.get(label)
+        assert named not in (None, first) and store.get(named) is None
+        expected_stop = {"timer_id": None, "status": "none"}
+    elif failure == "retiring the replaced loop":
+        monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "delete", refuse_delete)
+        with pytest.raises(RuntimeError, match="task store down"):
+            await arm("again")
+        named = conversations.get_conversation(session_id).labels.get(label)
+        assert named not in (None, first) and store.get(named).state == "active"
+        expected_stop = {"timer_id": named, "status": "cancelled"}
+    else:
+        monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "delete", refuse_delete)
+        with pytest.raises(RuntimeError, match="task store down"):
+            await stop()
+        assert label not in conversations.get_conversation(session_id).labels
+        expected_stop = {"timer_id": None, "status": "none"}
+    # The first loop's timer row is still active, but only its next firing will see it.
+    assert store.get(first).state == "active"
+    monkeypatch.undo()
+    assert (await stop()).json() == expected_stop
+    assert store.get(first).state == "active"
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
