@@ -68,6 +68,12 @@ them kept failing."""
 INCOMING_PER_RESUME = 8
 """Intents one call moves into the queue."""
 
+INTENT_SEGMENT_SIZE = 64
+"""Intent slots per intent segment: what one call lists or tries is bounded by this."""
+
+INTENT_SEGMENT_ATTEMPTS = 4
+"""Segments one intent tries before giving up, when writers keep filling them meanwhile."""
+
 
 def _key(user_id: str, registration: str | None) -> str:
     return hashlib.sha256(repr((user_id, registration)).encode()).hexdigest()[:32]
@@ -80,15 +86,19 @@ def _segment(number: int) -> str:
     return f"{_QUEUE}/s{number:08d}"
 
 
+def _intent_segment(number: int) -> str:
+    return f"{_INCOMING}/s{number:08d}"
+
+
 class _CleanupQueue:
     """The notes of unfinished cleanups, in numbered segments with a head naming the first
     and the newest, so each call reads a bounded part of it.
 
     ``keys/<key>.json`` says which segment holds a registration's note (so it is queued once),
-    ``deleted/<key>.json`` marks a deleted registration for good, and ``incoming/<key>.json``
-    holds an intent not yet queued. ``again/<key>.json`` says a write landed for a queued
-    registration, so its cleanup looks again before it finishes. The head is written, and
-    segments are appended to, only under the queue's lock.
+    ``deleted/<key>.json`` marks a deleted registration for good, and an intent not yet queued
+    holds a slot of a numbered intent segment (see :meth:`intend`). ``again/<key>.json``
+    says a write landed for a queued registration, so its cleanup looks again before it
+    finishes. The head is written, and segments are appended to, only under the queue's lock.
 
     The head is a create-only version under ``queue/heads/``: a new version is written before
     the older ones are removed, and reads take the newest, so a write stopped at any point
@@ -194,16 +204,72 @@ class _CleanupQueue:
         except NotFound:
             return [], False
 
-    def intend(self, user_id: str, registration: str | None, workspace: int) -> None:
-        """Record the cleanup's intent where :meth:`take_incoming` finds it; takes no lock."""
-        self._files.mkdirs(_INCOMING)
-        with contextlib.suppress(Conflict):  # Recorded already.
-            self._files.create_json(
-                f"{_INCOMING}/{_key(user_id, registration)}.json",
-                {"user_id": user_id, "registration": registration, "workspace": workspace},
-            )
+    # Intents are written without the queue's lock, into numbered segments of
+    # INTENT_SEGMENT_SIZE slots: ``incoming/s<n>/<slot>.json``. ``incoming/made/<n>.json``
+    # says segment n was started and ``incoming/done/<n>.json`` that its reader finished it;
+    # neither is ever removed, and each is made in order, so both run from 1 without gaps and
+    # are found by probing numbers, never by listing. Each call thus reads one segment and
+    # O(log segments) markers, however many intents wait.
 
-    def add(self, user_id: str, registration: str | None, workspace: int) -> None:
+    def _exists(self, path: str) -> bool:
+        try:
+            self._files.read_json(path)
+        except NotFound:
+            return False
+        return True
+
+    def _first_missing(self, directory: str) -> int:
+        """The lowest n >= 1 without ``<directory>/<n>.json``, in O(log n) probes."""
+        if not self._exists(f"{directory}/1.json"):
+            return 1
+        low, high = 1, 2
+        while self._exists(f"{directory}/{high}.json"):
+            low, high = high, high * 2
+        while high - low > 1:
+            middle = (low + high) // 2
+            if self._exists(f"{directory}/{middle}.json"):
+                low = middle
+            else:
+                high = middle
+        return high
+
+    def _start_intent_segment(self, number: int) -> None:
+        self._files.mkdirs(f"{_INCOMING}/made")
+        with contextlib.suppress(Conflict):  # Another writer started it.
+            self._files.create_json(f"{_INCOMING}/made/{number}.json", {})
+        self._files.mkdirs(_intent_segment(number))
+
+    def intend(self, user_id: str, registration: str | None, workspace: int) -> str | None:
+        """Record the cleanup's intent where :meth:`take_incoming` finds it; takes no lock.
+
+        :returns: The intent's path, for :meth:`add` to remove once queued, or ``None`` when
+            every segment tried filled up meanwhile (logged; the caller queues it directly).
+        """
+        note = {"user_id": user_id, "registration": registration, "workspace": workspace}
+        number = max(1, self._first_missing(f"{_INCOMING}/made") - 1)
+        for _ in range(INTENT_SEGMENT_ATTEMPTS):
+            self._start_intent_segment(number)
+            for slot in range(INTENT_SEGMENT_SIZE):
+                path = f"{_intent_segment(number)}/{slot:04d}.json"
+                try:
+                    self._files.create_json(path, note)
+                except Conflict:
+                    continue  # Taken by another intent.
+                except NotFound:
+                    break  # Its reader finished and removed the segment meanwhile.
+                # Written after the reader marked the segment finished, it may not be read:
+                # record it again in a later segment, which the reader is still to read.
+                if not self._exists(f"{_INCOMING}/done/{number}.json"):
+                    return path
+                break
+            number += 1
+        _LOG.warning("Gadget cleanup intent not recorded: every segment tried was full")
+        return None
+
+    def add(
+        self, user_id: str, registration: str | None, workspace: int, *, intent: str | None = None
+    ) -> None:
+        """Queue the registration's cleanup once, then remove *intent*, from :meth:`intend`."""
         key = _key(user_id, registration)
         with self._locked():
             if self._queued_at(key) is None:
@@ -217,24 +283,46 @@ class _CleanupQueue:
                 with contextlib.suppress(Conflict):
                     self._files.create_json(f"{_AGAIN}/{key}.json", {})
             # Queued now, so the intent has done its job.
-            if self._files.supports_delete:
+            if intent is not None and self._files.supports_delete:
                 with contextlib.suppress(NotFound):
-                    self._files.delete_tree(f"{_INCOMING}/{key}.json")
+                    self._files.delete_tree(intent)
 
     def take_incoming(self, limit: int) -> None:
-        """Queue up to *limit* intents a deletion left without queueing them."""
+        """Queue up to *limit* intents a deletion left without queueing them.
+
+        Reads only the oldest unfinished intent segment. Once it is empty and a later one was
+        started, it is marked finished, read once more for intents written meanwhile (which
+        the writer also records again elsewhere), and removed.
+        """
         if not self._files.supports_delete:
             return  # Nothing leaves the intents there, so they would hide later ones.
-        names, _ = self._listed(_INCOMING, limit)
+        number = self._first_missing(f"{_INCOMING}/done")
+        if not self._exists(f"{_INCOMING}/made/{number}.json"):
+            return
+        taken = self._take_from(number, limit)
+        if taken or not self._exists(f"{_INCOMING}/made/{number + 1}.json"):
+            return
+        self._files.mkdirs(f"{_INCOMING}/done")
+        with contextlib.suppress(Conflict):  # Another reader finished it.
+            self._files.create_json(f"{_INCOMING}/done/{number}.json", {})
+        self._take_from(number, INTENT_SEGMENT_SIZE)
+        with contextlib.suppress(NotFound):
+            self._files.delete_tree(_intent_segment(number))
+
+    def _take_from(self, number: int, limit: int) -> int:
+        """Queue up to *limit* intents of segment *number*; how many it found."""
+        directory = _intent_segment(number)
+        names, _ = self._listed(directory, limit)
         for name in names:
+            path = f"{directory}/{name}"
             try:
-                note = self._files.read_json(f"{_INCOMING}/{name}")
+                note = self._files.read_json(path)
             except NotFound:
                 continue
             except CorruptData:
-                _LOG.warning("Dropping an unreadable gadget cleanup intent %s", name)
+                _LOG.warning("Dropping an unreadable gadget cleanup intent %s", path)
                 with contextlib.suppress(NotFound):
-                    self._files.delete_tree(f"{_INCOMING}/{name}")
+                    self._files.delete_tree(path)
                 continue
             user_id, registration = note.get("user_id"), note.get("registration")
             workspace = note.get("workspace", DEFAULT_WORKSPACE_ID)
@@ -244,9 +332,10 @@ class _CleanupQueue:
                 or type(workspace) is not int
             ):
                 with contextlib.suppress(NotFound):
-                    self._files.delete_tree(f"{_INCOMING}/{name}")
+                    self._files.delete_tree(path)
                 continue
-            self.add(user_id, registration, workspace)
+            self.add(user_id, registration, workspace, intent=path)
+        return len(names)
 
     def mark_deleted(self, user_id: str, registration: str | None, workspace: int) -> None:
         self._files.mkdirs("deleted")
@@ -375,11 +464,11 @@ class DeletedAccountGadgets:
         # first and takes no lock, so a queue too busy to take the note doesn't lose it.
         # Without a registration (a store that tells accounts apart only by name) a mark
         # would catch the next account of the name too, so there is none.
-        queue.intend(user_id, registration, workspace)
+        intent = queue.intend(user_id, registration, workspace)
         if registration is not None:
             queue.mark_deleted(user_id, registration, workspace)
         try:
-            queue.add(user_id, registration, workspace)
+            queue.add(user_id, registration, workspace, intent=intent)
         except Conflict as error:
             _LOG.warning("Gadget cleanup queued later, the queue is busy: %s", error)
         if not self._enabled():
@@ -407,9 +496,9 @@ class DeletedAccountGadgets:
             return
         workspace = mark.get("workspace", DEFAULT_WORKSPACE_ID)
         workspace = workspace if type(workspace) is int else DEFAULT_WORKSPACE_ID
-        queue.intend(user_id, registration, workspace)
+        intent = queue.intend(user_id, registration, workspace)
         try:
-            queue.add(user_id, registration, workspace)
+            queue.add(user_id, registration, workspace, intent=intent)
         except Conflict as error:
             # The write itself landed; the intent gets it queued on a later call.
             _LOG.warning("Gadget cleanup queued later, the queue is busy: %s", error)

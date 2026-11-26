@@ -18417,6 +18417,24 @@
       "post": {
         "description": "Create a private gadget from `{\"name\"}`; answers the gadget with 201.",
         "operationId": "create_gadget_v1_gadgets_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
@@ -19350,6 +19368,30 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "if_version": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "revision_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "revision_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -19562,6 +19604,24 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {

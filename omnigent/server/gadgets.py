@@ -351,7 +351,9 @@ def create_gadgets_router(
         limit, cursor = _page(request, 100)
         return _json(await run(request, lambda service: service.list_owned(limit, cursor)))
 
-    @router.post("/gadgets", status_code=201)
+    @router.post(
+        "/gadgets", status_code=201, openapi_extra=_json_body({"name": _STRING}, ["name"])
+    )
     async def create_gadget(request: Request) -> Response:
         """Create a private gadget from ``{"name"}``; answers the gadget with 201."""
         body = await _body(request)
@@ -454,7 +456,12 @@ def create_gadgets_router(
         guide, collection schemas, constraints and actions, without its HTML."""
         return _json(await run(request, lambda service: service.describe(app_id)))
 
-    @router.post("/gadgets/{app_id}/publish")
+    @router.post(
+        "/gadgets/{app_id}/publish",
+        openapi_extra=_json_body(
+            {"revision_id": _STRING, "if_version": {"type": ["string", "null"]}}, ["revision_id"]
+        ),
+    )
     async def publish(app_id: str, request: Request) -> Response:
         """Publish ``{"revision_id", "if_version"}``; answers the gadget."""
         body = await _body(request)
@@ -513,7 +520,10 @@ def create_gadgets_router(
         """The caller's gadget session: ``{"session_id", "version"}``."""
         return _json(await run(request, lambda service: service.get_gadget_session(app_id)))
 
-    @router.put("/gadgets/{app_id}/session")
+    @router.put(
+        "/gadgets/{app_id}/session",
+        openapi_extra=_json_body({"session_id": _STRING}, ["session_id"]),
+    )
     async def set_gadget_session(app_id: str, request: Request) -> Response:
         """Register ``{"session_id"}`` as the caller's gadget session."""
         body = await _body(request)

@@ -2349,6 +2349,82 @@ def test_a_long_cleanup_backlog_is_read_a_bounded_part_at_a_time(tmp_path, monke
     assert all(worked.count(user) == 1 for user in users[::3])
 
 
+def test_a_backlog_of_unqueued_intents_is_read_a_bounded_part_at_a_time(
+    tmp_path, monkeypatch
+) -> None:
+    """Deletions that found the queue busy leave intents; one call reads one intent segment
+    and a few numbered markers, however many intents wait, and every intent is queued."""
+    import os
+
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store import local as local_module
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    class NoGrants:
+        def forget(self, gadget_id: str) -> None:
+            pass
+
+    size = 4
+    monkeypatch.setattr(gadget_accounts, "INTENT_SEGMENT_SIZE", size)
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    gadgets = DeletedAccountGadgets(store, NoGrants())  # type: ignore[arg-type]
+    queue = gadgets._queue()
+    users = [f"user{n:03d}" for n in range(120)]
+    for user in users:
+        assert queue.intend(user, None, 0) is not None  # Never queued: the queue was busy.
+
+    examined = 0
+    real_scandir = os.scandir
+
+    def counting_scandir(path: object):  # type: ignore[no-untyped-def]
+        nonlocal examined
+        name = os.fspath(path)  # type: ignore[arg-type]
+        entries = list(real_scandir(path))
+        if "/incoming" in name:
+            examined += len(entries)
+        return _Entries(entries)
+
+    class _Entries(list):
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+    monkeypatch.setattr(local_module.os, "scandir", counting_scandir)
+    for _ in range(len(users)):
+        examined = 0
+        queue.take_incoming(gadget_accounts.INCOMING_PER_RESUME)
+        # One segment, listed at most twice: never the backlog.
+        assert examined <= 2 * size < len(users)
+    monkeypatch.setattr(local_module.os, "scandir", real_scandir)
+    queued = {key for _, key in queue.front(len(users) + 1)}
+    assert queued == {f"{gadget_accounts._key(user, None)}.json" for user in users}
+
+
+def test_an_intent_written_as_its_segment_is_finished_is_recorded_again(tmp_path) -> None:
+    """A writer that fills a slot after the reader marked its segment finished records the
+    intent again in a later segment, so the reader's last pass can't miss it."""
+    from omnigent.gadgets import accounts as gadget_accounts
+    from omnigent.gadgets.accounts import DeletedAccountGadgets
+    from omnigent.stores.gadget_store.local import LocalGadgetStore
+
+    store = LocalGadgetStore(str(tmp_path / "gadgets"))
+    files = DeletedAccountGadgets._files_of(store)
+    queue = gadget_accounts._CleanupQueue(files)
+    queue.intend("alice", None, 0)
+    # The reader marked segment 1 finished, but the writer still sees it as the newest.
+    files.mkdirs("incoming/done")
+    files.create_json("incoming/done/1.json", {})
+
+    path = queue.intend("bob", None, 0)
+
+    assert path is not None and path.startswith("incoming/s00000002/")
+    queue.take_incoming(8)
+    assert f"{gadget_accounts._key('bob', None)}.json" in {key for _, key in queue.front(8)}
+
+
 def test_a_head_update_stopped_half_way_leaves_the_queue_readable(tmp_path, monkeypatch) -> None:
     """A note sent to a later segment, then the queue's head update stops while retiring the
     emptied first segment: reopened, the queue still finds the note, and only its cleanup
@@ -2410,11 +2486,11 @@ def test_a_deletion_whose_queueing_fails_is_cleaned_up_after_a_restart(
     real_add = gadget_accounts._CleanupQueue.add
     calls = {"n": 0}
 
-    def busy_once(self, user_id, registration, workspace):  # type: ignore[no-untyped-def]
+    def busy_once(self, user_id, registration, workspace, **kwargs):  # type: ignore[no-untyped-def]
         calls["n"] += 1
         if calls["n"] == 1:
             raise StoreConflict("The gadget cleanup queue is busy", reason="busy")
-        return real_add(self, user_id, registration, workspace)
+        return real_add(self, user_id, registration, workspace, **kwargs)
 
     monkeypatch.setattr(gadget_accounts._CleanupQueue, "add", busy_once)
     assert accounts.delete_user("alice") is True
