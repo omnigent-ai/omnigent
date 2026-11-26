@@ -26,7 +26,12 @@ import { WORKSPACE_TEXT_SEARCH_COPY } from "@/lib/workspaceTextSearchCopy";
 import { FileCommandMenuItem } from "@/shell/fileCommands/FileCommandMenuItem";
 import type { FileCommandId } from "@/shell/fileCommands/model";
 import { useFileCommands } from "@/shell/fileCommands/useFileCommands";
-import { requestFileFinder, requestTextSearch, useFileFinderAvailable } from "@/store/fileFinder";
+import {
+  requestFileFinder,
+  requestTextSearch,
+  useFileFinderAvailable,
+  useTextSearchAvailable,
+} from "@/store/fileFinder";
 
 export const FILE_ACTIONS_LABEL = "File actions";
 export const FIND_IN_FILE_LABEL = "Find in file";
@@ -46,8 +51,9 @@ export function FileActionsMenu({ conversationId, path, onFind }: FileActionsMen
   const file = useFileCommands(path, { conversationId });
   // A finder opens once the menu has returned focus to ⋯, so cancelling it lands there.
   const menuHandOff = useMenuCloseHandOff();
-  // The finder searches names and text alike, so one check offers both.
-  const findersAvailable = useFileFinderAvailable(conversationId);
+  // Go to File needs the session's finder; Search Text also needs its files' text searchable.
+  const goToFileAvailable = useFileFinderAvailable(conversationId);
+  const textSearchAvailable = useTextSearchAvailable(conversationId);
   const commandRows = (ids: readonly FileCommandId[]) =>
     ids.flatMap((id) => {
       const command = file.commands.find((candidate) => candidate.id === id);
@@ -94,32 +100,38 @@ export function FileActionsMenu({ conversationId, path, onFind }: FileActionsMen
     },
     {
       key: "finders",
-      rows: findersAvailable
-        ? [
-            <DropdownMenuItem
-              key="go-to-file"
-              onSelect={() =>
-                menuHandOff.runAfterClose(() => requestFileFinder(conversationId), {
-                  afterFocusReturns: true,
-                })
-              }
-            >
-              <FileSearchIcon />
-              {GO_TO_FILE_LABEL}
-            </DropdownMenuItem>,
-            <DropdownMenuItem
-              key="search-text"
-              onSelect={() =>
-                menuHandOff.runAfterClose(() => requestTextSearch(conversationId), {
-                  afterFocusReturns: true,
-                })
-              }
-            >
-              <TextSearchIcon />
-              {WORKSPACE_TEXT_SEARCH_COPY.command}
-            </DropdownMenuItem>,
-          ]
-        : [],
+      rows: [
+        ...(goToFileAvailable
+          ? [
+              <DropdownMenuItem
+                key="go-to-file"
+                onSelect={() =>
+                  menuHandOff.runAfterClose(() => requestFileFinder(conversationId), {
+                    afterFocusReturns: true,
+                  })
+                }
+              >
+                <FileSearchIcon />
+                {GO_TO_FILE_LABEL}
+              </DropdownMenuItem>,
+            ]
+          : []),
+        ...(textSearchAvailable
+          ? [
+              <DropdownMenuItem
+                key="search-text"
+                onSelect={() =>
+                  menuHandOff.runAfterClose(() => requestTextSearch(conversationId), {
+                    afterFocusReturns: true,
+                  })
+                }
+              >
+                <TextSearchIcon />
+                {WORKSPACE_TEXT_SEARCH_COPY.command}
+              </DropdownMenuItem>,
+            ]
+          : []),
+      ],
     },
   ].filter((group) => group.rows.length > 0);
   return (

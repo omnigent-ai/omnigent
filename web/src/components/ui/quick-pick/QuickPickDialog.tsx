@@ -342,7 +342,9 @@ export function QuickPickDialog<Value>({
           if (finishClose()) event.preventDefault();
         }}
         className={cn(
-          "top-[12vh] translate-y-0 gap-0 overflow-hidden rounded-xl p-0 sm:max-w-xl",
+          "top-[12vh] translate-y-0 gap-0 overflow-hidden rounded-xl p-0",
+          // A preview beside the list takes a wider dialog.
+          quickPickProps.renderPreview ? "sm:max-w-4xl" : "sm:max-w-xl",
           contentClassName,
         )}
         style={isIOSShell() ? { ...IOS_PICKER_ANCHOR, ...contentStyle } : contentStyle}
