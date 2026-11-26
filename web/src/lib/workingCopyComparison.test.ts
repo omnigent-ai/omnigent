@@ -46,7 +46,6 @@ import {
 } from "./workingCopyComparison";
 
 const SESSION = "conv_cmp";
-const NO_PROBLEM = { reason: "", transient: false };
 
 const comparison: BranchPointComparison = {
   id: "cmp_1",
@@ -736,9 +735,10 @@ describe("comparison fetchers", () => {
       kind: "unavailable",
       problem: { reason: FOLDER_REFUSED, transient: false },
     });
-    expect(
-      comparisonProblemMessage(refused.kind === "unavailable" ? refused.problem : NO_PROBLEM),
-    ).toBe("Diffs can't show this folder. Choose a folder inside the workspace.");
+    if (refused.kind !== "unavailable") throw new Error("expected the folder to be refused");
+    expect(comparisonProblemMessage(refused.problem)).toBe(
+      "Diffs can't show this folder. Choose a folder inside the workspace.",
+    );
   });
 
   it("keeps each session's listing when two sessions compare the same commits", async () => {

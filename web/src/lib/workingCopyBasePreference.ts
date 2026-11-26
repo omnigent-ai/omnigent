@@ -128,5 +128,6 @@ export function useBaseIntent(repository: string, workspaceKey = ""): WorkingCop
 /** Forgets the bases chosen in folders, for tests. */
 export function resetFolderBaseIntentsForTests(): void {
   folderIntents.clear();
+  folderSources.clear();
   folderListeners.forEach((listener) => listener());
 }

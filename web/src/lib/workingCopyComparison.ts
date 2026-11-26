@@ -5,6 +5,8 @@
 // module holds the comparison views, the user-facing texts, and the decision of
 // which base a session shows.
 
+import { Code, ConnectError } from "@connectrpc/connect";
+
 import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { type RevisionField, type RevisionSpec, sameRevisions } from "@/lib/customComparison";
 import { workspacePathInRepository } from "@/lib/repositoryFolder";
@@ -92,17 +94,13 @@ export const FOLDER_NOT_SERVED = "folder_not_served";
 /** The host refused the folder, as one outside the workspace or in a Git directory. */
 export const FOLDER_REFUSED = "folder_refused";
 
-/** Connect's code for a request the host refuses as invalid. */
-const INVALID_ARGUMENT = 3;
-
 /** Why a repository folder's listing failed, where the folder itself is the reason. */
 function folderProblemFrom(error: unknown): ComparisonProblem | null {
   if (error instanceof WorkspaceMethodUnavailableError) {
     return { reason: FOLDER_NOT_SERVED, transient: false };
   }
-  if (error instanceof Error && error.name === "ConnectError") {
-    const code = (error as Error & { code?: number }).code;
-    if (code === INVALID_ARGUMENT) return { reason: FOLDER_REFUSED, transient: false };
+  if (error instanceof ConnectError && error.code === Code.InvalidArgument) {
+    return { reason: FOLDER_REFUSED, transient: false };
   }
   return null;
 }
@@ -893,12 +891,9 @@ function hostLastCommit(
       : null;
   if (listing) return { ...shown, listing };
   const reconnecting = problem !== null && isReconnectingReason(problem.reason);
-  const transient =
-    support.kind === "unreachable"
-      ? support.message
-      : problem
-        ? comparisonProblemMessage(problem)
-        : null;
+  let transient: string | null = null;
+  if (support.kind === "unreachable") transient = support.message;
+  else if (problem) transient = comparisonProblemMessage(problem);
   if (transient && !reconnecting) return { base: "unavailable", message: transient, retry: true };
   return { base: "pending", message: COMPARING };
 }
