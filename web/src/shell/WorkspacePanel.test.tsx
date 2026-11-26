@@ -10,7 +10,7 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
-import type { ReactNode, RefObject } from "react";
+import { Profiler, type ProfilerOnRenderCallback, type ReactNode, type RefObject } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -52,18 +52,25 @@ const paneRenders = vi.hoisted(() => vi.fn());
 vi.mock("./FileViewer", () => ({
   FileViewer: ({
     path,
+    conversationId,
     open,
     mediaActive,
     onExitFullScreen,
   }: {
     path: string;
+    conversationId: string;
     open: boolean;
     mediaActive: boolean;
     onExitFullScreen?: () => void;
   }) => {
-    paneRenders("file");
+    paneRenders("file", conversationId);
     return (
-      <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+      <div
+        data-testid="file-viewer-stub"
+        data-session={conversationId}
+        data-open={open}
+        data-media-active={mediaActive}
+      >
         {path}
         {onExitFullScreen && (
           <button type="button" onClick={onExitFullScreen}>
@@ -260,6 +267,8 @@ function renderWorkspace(
     resizing?: boolean;
     inert?: boolean;
     mobileSideChatsOpen?: boolean;
+    mobileFileTarget?: HTMLElement | null;
+    onCommit?: ProfilerOnRenderCallback;
     queryClient?: QueryClient;
     initialPath?: string;
     withHide?: boolean;
@@ -283,7 +292,7 @@ function renderWorkspace(
     initialOverrides.queryClient ??
     new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onHide = vi.fn();
-  const tree = () => (
+  const panel = () => (
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId={overrides.conversationId ?? "conv_ws"}
@@ -316,6 +325,7 @@ function renderWorkspace(
         agentCount={1}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
+        mobileFileTarget={overrides.mobileFileTarget}
         openFiles={overrides.openFiles ?? []}
         openFileViewer={openFileViewer}
         onCloseFile={onCloseFile}
@@ -340,6 +350,15 @@ function renderWorkspace(
       />
     </TooltipProvider>
   );
+  const tree = () =>
+    initialOverrides.onCommit ? (
+      <Profiler id="workspace" onRender={initialOverrides.onCommit}>
+        <output data-testid="transcript-session">{overrides.conversationId ?? "conv_ws"}</output>
+        {panel()}
+      </Profiler>
+    ) : (
+      panel()
+    );
   const fileViewerContext =
     initialOverrides.fileGuard && fileViewerContextWithGuard(initialOverrides.fileGuard);
   // The panel reads session snapshots and renders router links.
@@ -1094,6 +1113,123 @@ describe("WorkspacePanel open-file tabs", () => {
     expect(onCloseFile).not.toHaveBeenCalledWith("src/App.tsx");
     act(() => allowClose[0]!());
     expect(onCloseFile).toHaveBeenCalledWith("src/App.tsx");
+  });
+});
+
+describe("WorkspacePanel conversation handoff", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ["collapsed", { open: false }, false],
+    ["inert", { open: true, inert: true }, false],
+    ["zero width", { open: true, width: 0 }, false],
+    ["hidden on mobile", { open: true }, true],
+  ] as const)(
+    "updates %s content only after the transcript's paint opportunity",
+    (_case, visibility, mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      const commits: (string | null)[][] = [];
+      const { rerender } = renderWorkspace({
+        ...visibility,
+        conversationId: "conv_a",
+        onCommit: () =>
+          commits.push([
+            screen.getByTestId("transcript-session").textContent,
+            screen.queryByTestId("file-viewer-stub")?.getAttribute("data-session") ?? null,
+          ]),
+      });
+      commits.length = 0;
+      paneRenders.mockClear();
+
+      rerender({ conversationId: "conv_b", selectedFilePath: "notes.md", openFiles: ["notes.md"] });
+      expect(commits[0]).toEqual(["conv_b", null]);
+      expect(paneRenders).not.toHaveBeenCalledWith("file", "conv_b");
+      act(() => vi.advanceTimersToNextFrame());
+      expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+      act(() => vi.runOnlyPendingTimers());
+      expect(commits.at(-1)).toEqual(["conv_b", "conv_b"]);
+    },
+  );
+
+  it("updates an open rail in the transcript's commit", () => {
+    const commits: (string | null)[][] = [];
+    const { rerender } = renderWorkspace({
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+      onCommit: () =>
+        commits.push([
+          screen.getByTestId("transcript-session").textContent,
+          screen.getByTestId("file-viewer-stub").getAttribute("data-session"),
+        ]),
+    });
+    commits.length = 0;
+    rerender({ conversationId: "conv_b" });
+    expect(commits[0]).toEqual(["conv_b", "conv_b"]);
+    expect(commits.every(([transcript, panel]) => transcript === panel)).toBe(true);
+  });
+
+  it.each(["rail", "mobile file overlay"])(
+    "opening the %s immediately shows the current session without remounting",
+    (surface) => {
+      const mobile = surface === "mobile file overlay";
+      isMobileMock.mockReturnValue(mobile);
+      const target = document.createElement("div");
+      document.body.appendChild(target);
+      try {
+        const { rerender } = renderWorkspace({
+          conversationId: "conv_a",
+          selectedFilePath: "notes.md",
+        });
+        const viewer = screen.getByTestId("file-viewer-stub");
+        viewer.scrollTop = 120;
+        rerender({ open: false });
+        expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+        expect(viewer.scrollTop).toBe(120);
+        rerender({ conversationId: "conv_b", selectedFilePath: "current.md" });
+        act(() => vi.advanceTimersToNextFrame());
+        expect(viewer).toHaveAttribute("data-session", "conv_a");
+
+        rerender(mobile ? { mobileFileTarget: target } : { open: true });
+        expect(screen.getByTestId("file-viewer-stub")).toBe(viewer);
+        expect(viewer).toHaveAttribute("data-session", "conv_b");
+        expect(viewer).toHaveTextContent("current.md");
+        act(() => vi.runOnlyPendingTimers());
+        expect(viewer).toHaveAttribute("data-session", "conv_b");
+        rerender({ conversationId: "conv_c" });
+        expect(viewer).toHaveAttribute("data-session", "conv_c");
+      } finally {
+        target.remove();
+      }
+    },
+  );
+
+  it("skips an intermediate session even after its frame callback ran", () => {
+    const { rerender } = renderWorkspace({
+      open: false,
+      conversationId: "conv_a",
+      selectedFilePath: "notes.md",
+    });
+    paneRenders.mockClear();
+    rerender({ conversationId: "conv_b" });
+    act(() => vi.advanceTimersToNextFrame());
+    rerender({ conversationId: "conv_c" });
+    act(() => vi.advanceTimersToNextFrame());
+    act(() => vi.runOnlyPendingTimers());
+    expect(paneRenders).not.toHaveBeenCalledWith("file", "conv_b");
+    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-session", "conv_c");
+  });
+
+  it("keeps same-session changes immediate while collapsed", () => {
+    const { rerender } = renderWorkspace({ open: false, selectedFilePath: "notes.md" });
+    rerender({ selectedFilePath: "current.md" });
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("current.md");
   });
 });
 
