@@ -10678,6 +10678,21 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
     switchTo(plainInfo);
     await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
     expect(textarea().selectionStart).toBe("My answer".length);
+
+    // A switch waits out a composition; the layout and the draft's form change only together.
+    fireEvent.compositionStart(textarea());
+    switchTo(codeMirrorInfo);
+    expect(document.querySelector(".cm-content")).toBeNull();
+    expect(textarea()).toHaveValue("My answer");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    fireEvent.compositionEnd(textarea());
+    await editorReady();
+    expect(editor().value.split("\n")).toEqual([
+      "My introduction",
+      expect.any(String),
+      "My answer",
+    ]);
+    expect(cards()).toHaveLength(1);
   });
 
   it.each([
@@ -10793,8 +10808,11 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
       act(() => mic.current!.onInterim!("hello wor"));
       expect(editor().value).toBe(dictated(base, "hello wor"));
       act(() => mic.current!.onTranscript("hello world"));
-      act(() => mic.current!.onInterim!("and"));
-      act(() => mic.current!.onTranscript("and more"));
+      // One socket read can carry a partial and its final, with no render between them.
+      act(() => {
+        mic.current!.onInterim!("and");
+        mic.current!.onTranscript("and more");
+      });
       expect(editor().value).toBe(dictated(base, "hello world and more"));
       expect(cards()).toHaveLength(1);
 
@@ -10810,6 +10828,27 @@ describe("Composer reply quotes in the CodeMirror editor", () => {
       expect(editor().value).toBe(dictated(base, "hello world"));
     },
   );
+
+  it("leaves an edit made during a take whole, the next partial starting after it", async () => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    reply("First point");
+    const base = editor().value;
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onInterim!("hel"));
+    // In a browser a partial and a keystroke can each land before the other renders.
+    act(() => {
+      insertComposerText(editor(), " typed");
+      mic.current!.onInterim!("hello");
+    });
+    act(() => {
+      mic.current!.onInterim!("hello world");
+      insertComposerText(editor(), "!");
+    });
+    type("?");
+    expect(editor().value).toBe(`${base}hel typed hello world!?`);
+    expect(cards()).toHaveLength(1);
+  });
 
   it("discards a take that only dictated, back to the text before it", async () => {
     const { reply } = await renderEditor();

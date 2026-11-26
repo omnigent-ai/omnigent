@@ -303,7 +303,10 @@ class QuoteCardWidget extends WidgetType {
     const { id } = this;
     remove.addEventListener("click", () => {
       const range = quoteRemovalRange(view.state.doc.toString(), id);
-      if (range && !view.state.readOnly) view.dispatch({ changes: range, userEvent: "delete" });
+      if (!range || view.state.readOnly) return;
+      view.dispatch({ changes: range, userEvent: "delete" });
+      // Pressed from the keyboard, the button held focus, and the removal takes it away.
+      view.focus();
     });
     // A click on the card puts the caret on the line after it, never in the card's own text.
     row.addEventListener("mousedown", (event) => {

@@ -2566,7 +2566,16 @@ function ComposerImpl(
   };
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(replyDocument ?? value, writeDictation, textareaRef);
+  const dictation = useDictationInsert(
+    replyDocument ?? value,
+    writeDictation,
+    textareaRef,
+    // The editor holds the whole document, and a keystroke there can beat its render.
+    () => {
+      const target = textareaRef.current;
+      return replyDocument !== null && target && !isComposerTextarea(target) ? target.value : null;
+    },
+  );
   const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session

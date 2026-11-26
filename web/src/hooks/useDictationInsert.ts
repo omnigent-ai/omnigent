@@ -125,6 +125,8 @@ export function useDictationInsert(
     final: boolean,
   ) => string | void,
   textareaRef?: RefObject<ComposerTextTarget | null>,
+  /** The input's text now, or null: an editor the setter writes through holds edits not rendered yet. */
+  readDraft?: () => string | null,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
   appendFinal: (text: string) => void;
@@ -172,7 +174,8 @@ export function useDictationInsert(
     if (position === null) return;
     wantCaretRef.current = null;
     const ta = textareaRef?.current;
-    if (!ta) return;
+    // A caret asked for in a draft edited since this hook's write would land inside that edit.
+    if (!ta || producedRef.current === null) return;
     // Deliberately does not focus: a take is usually driven from the mic
     // button, and stealing focus drops its Enter-commit / Esc-cancel keys.
     // Some browsers scroll an unfocused element to reveal the new selection,
@@ -188,6 +191,14 @@ export function useDictationInsert(
 
   const insert = useCallback(
     (text: string, pin: boolean) => {
+      // An edit can reach the input before its render reaches here. It isn't this hook's, so
+      // the hook gives up the draft, as a render would, and builds on the text the input holds.
+      const held = readDraft?.() ?? null;
+      if (held !== null && held !== draftRef.current) {
+        producedRef.current = null;
+        wantCaretRef.current = null;
+        draftRef.current = held;
+      }
       const current = draftRef.current;
       const mine = producedRef.current;
       const region = mine?.region ?? null;
@@ -267,7 +278,7 @@ export function useDictationInsert(
       wantCaretRef.current = caret;
       setInterimPending(owned !== null);
     },
-    [setDraft, textareaRef],
+    [setDraft, textareaRef, readDraft],
   );
 
   return {

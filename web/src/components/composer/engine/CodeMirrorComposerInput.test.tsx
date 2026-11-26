@@ -10,6 +10,7 @@ import {
 import { Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import userEvents from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
@@ -522,7 +523,7 @@ describe("CodeMirrorComposerInput mention tokens", () => {
 });
 
 /** CodeMirror measures text for caret motion; jsdom has no layout, so ranges measure empty. */
-function useEmptyRangeGeometry() {
+function mockEmptyRangeGeometry() {
   const originalRangeRects = {
     getClientRects: Range.prototype.getClientRects,
     getBoundingClientRect: Range.prototype.getBoundingClientRect,
@@ -535,7 +536,7 @@ function useEmptyRangeGeometry() {
 }
 
 describe("CodeMirrorComposerInput mention tokens move as one character", () => {
-  useEmptyRangeGeometry();
+  mockEmptyRangeGeometry();
 
   const draft = "Read @readme.md now";
   const tokenStart = "Read ".length;
@@ -661,7 +662,7 @@ describe("leadingCommandSpan", () => {
 });
 
 describe("CodeMirrorComposerInput reply quotes", () => {
-  useEmptyRangeGeometry();
+  mockEmptyRangeGeometry();
 
   const a = quoteLine("a", "Alpha");
   const b = quoteLine("b", "Beta\nmore");
@@ -736,15 +737,17 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     ["at the start of the document", 0, lines("#", a, "Mid", b, "")],
     ["at a card's end", a.length, lines(a, "#", "Mid", b, "")],
     ["at a card's start", lines(a, "Mid", "").length, lines(a, "Mid", "#", b, "")],
-  ])("moves text typed or pasted %s to a line of its own", (_where, at, expected) => {
+  ])("moves text typed, pasted or dropped %s to a line of its own", (_where, at, expected) => {
     const { target, edit } = mountQuotes(lines(a, "Mid", b, ""));
     edit(at, at, "#");
     expect(target().value).toBe(expected);
     expect(target().selectionStart).toBe(expected.indexOf("#") + 1);
 
-    const pasted = mountQuotes(lines(a, "Mid", b, ""));
-    pasted.edit(at, at, `${quoteLine("z", "Zed")}#`, "input.paste");
-    expect(pasted.target().value).toBe(expected);
+    for (const userEvent of ["input.paste", "input.drop"]) {
+      const inserted = mountQuotes(lines(a, "Mid", b, ""));
+      inserted.edit(at, at, `${quoteLine("z", "Zed")}#`, userEvent);
+      expect(inserted.target().value).toBe(expected);
+    }
   });
 
   it("deletes a quote typed over whole, and keeps one beside a typed-over break", () => {
@@ -810,15 +813,19 @@ describe("CodeMirrorComposerInput reply quotes", () => {
     ["last", 1, lines("Opener", a, "")],
   ])(
     "removes the %s card with its X after an undo, and undo brings it back",
-    (_which, index, removed) => {
+    async (_which, index, removed) => {
       const value = lines("Opener", a, "", b, "");
-      const { target, caretAt, run, removeButtons } = mountQuotes(value);
+      const { target, editor, caretAt, run, removeButtons } = mountQuotes(value);
       caretAt(value.length);
       run(deleteCharBackward);
       run(undo);
-      fireEvent.click(removeButtons()[index]!);
+      // From the keyboard, so the X holds focus when it goes, and undo is a key to the editor.
+      const user = userEvents.setup();
+      act(() => removeButtons()[index]!.focus());
+      await user.keyboard("{Enter}");
       expect(target().value).toBe(removed);
-      run(undo);
+      expect(editor.hasFocus).toBe(true);
+      await user.keyboard("{Control>}z{/Control}");
       expect(target().value).toBe(value);
     },
   );
