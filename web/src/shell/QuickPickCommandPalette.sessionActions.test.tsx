@@ -448,4 +448,24 @@ describe("QuickPick ⌘K verb-first session actions", () => {
     expect(input).toHaveValue("rename a session");
     await waitFor(() => expect(activeRow(input)).toHaveTextContent("Rename a Session…"));
   });
+
+  it("goes back from a picked session's actions to the picker, on that session", async () => {
+    const { input } = renderWithPicks();
+    fireEvent.change(input, { target: { value: "archive a session" } });
+    await screen.findByRole("option", { name: /Archive a Session…/ });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Archive which session?"));
+    fireEvent.change(input, { target: { value: "notes" } });
+    await waitFor(() => expect(optionNames()).toEqual([expect.stringContaining("Review notes")]));
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(heading()).toBe("Actions for “Review notes”"));
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(heading()).toBe("Archive which session?"));
+    expect(input).toHaveValue("notes");
+    await waitFor(() => expect(activeRow(input)).toHaveTextContent("Review notes"));
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(heading()).toBeNull());
+    expect(input).toHaveValue("archive a session");
+  });
 });
