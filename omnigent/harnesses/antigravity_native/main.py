@@ -958,6 +958,7 @@ async def _write_cli_startup_instructions(
         ValueError,
         ExtractionError,
         OmnigentError,
+        yaml.YAMLError,
     ) as error:
         _logger.warning(
             "Could not resolve Antigravity startup instructions (%s)",

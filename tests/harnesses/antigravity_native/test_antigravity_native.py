@@ -698,7 +698,8 @@ async def test_launch_and_record_threads_headless_skip_flag(
 
 
 @pytest.mark.parametrize(
-    "startup_case", ["authored", "bundle-error", "invalid-archive", "invalid-root", "write-error"]
+    "startup_case",
+    ["authored", "bundle-error", "invalid-archive", "invalid-root", "invalid-yaml", "write-error"],
 )
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     monkeypatch: pytest.MonkeyPatch,
@@ -737,6 +738,8 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
         bundle = b"not an archive"
     elif startup_case == "invalid-root":
         bundle = bundle_files({"config.yaml": b"[]\n"})
+    elif startup_case == "invalid-yaml":
+        bundle = bundle_files({"config.yaml": b"executor: [\n"})
     previous_rule = None
     if startup_case == "write-error":
         bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
