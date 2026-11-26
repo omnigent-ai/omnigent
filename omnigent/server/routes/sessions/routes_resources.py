@@ -119,16 +119,19 @@ from omnigent.server.schemas import (
     CopiedFile,
     CopyFilesRequest,
     CopyFilesResponse,
+    ErrorResponse,
     SessionPullRequestList,
     SessionRepositoryBranchList,
     SessionResourceObject,
     SessionResourcePaginatedList,
+    TerminalShellState,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_pull_request_store import SessionPullRequestLimitError
+from omnigent.terminals.shell_inspection import ShellInspection
 
 if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
@@ -198,6 +201,12 @@ class _RunnerStreamResponse(StreamingResponse):
 # budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
 # reported as failed.
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
+# A terminal resource id as the runner builds it, checked before it goes into a runner path.
+_TERMINAL_RESOURCE_ID_RE = re.compile(r"terminal_[A-Za-z0-9_.-]{1,200}")
+# The shell route's answer when the session's runner is offline or unreachable.
+_SHELL_RUNNER_OFFLINE = "This session's runner isn't available right now."
+# The whole runner call, since a tunneled runner's transport doesn't enforce httpx's timeout.
+_SHELL_PROXY_TIMEOUT_S = 1.0
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
@@ -660,11 +669,11 @@ def register_resources_routes(
                 and isinstance(response_payload.get("detail"), str)
             ):
                 raise HTTPException(status_code=400, detail=response_payload["detail"])
+            msg = "runner resource endpoint failed"
             if isinstance(response_payload, dict):
-                error = response_payload.get("error", {})
-                msg = error.get("message") or "runner resource endpoint failed"
-            else:
-                msg = "runner resource endpoint failed"
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    msg = error["message"] or msg
             raise HTTPException(status_code=502, detail=msg)
         if not isinstance(response_payload, dict):
             raise HTTPException(
@@ -1799,6 +1808,79 @@ def register_resources_routes(
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
         return await _proxy_get_to_runner(session_id, path, conv, for_control=True)
+
+    @router.get(
+        "/sessions/{session_id}/resources/terminals/{terminal_id}/shell",
+        response_model=TerminalShellState,
+        responses={
+            403: {"model": ErrorResponse, "description": "The caller can't close this terminal"},
+            404: {
+                "model": ErrorResponse,
+                "description": "No such running terminal in a session the caller can see",
+            },
+            502: {"description": "The runner failed to inspect the terminal"},
+            503: {
+                "model": ErrorResponse,
+                "description": "The runner is offline, or too old to inspect terminals",
+            },
+        },
+    )
+    async def get_session_terminal_shell(
+        request: Request,
+        session_id: str,
+        terminal_id: str,
+    ) -> dict[str, Any]:
+        """
+        Whether a terminal runs anything besides its login shell, so closing it can skip asking.
+
+        Only a caller who may close the terminal may ask: edit access, as deleting it needs.
+        Every miss answers one fixed 404, and runner failures become fixed messages: the
+        runner's text never reaches the caller, and its answer is rebuilt field by field. A
+        runner tunnel on another replica keeps its routing error, so the client can resend.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Terminal resource id, e.g. ``"terminal_bash_s1"``.
+        :returns: ``{"state", "foreground", "background_jobs"}``.
+        """
+        not_found = OmnigentError("Terminal not found", code=ErrorCode.NOT_FOUND)
+        if _TERMINAL_RESOURCE_ID_RE.fullmatch(terminal_id) is None:
+            raise not_found
+        try:
+            conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise not_found from None
+            raise
+        path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell"
+        older_runner = "This session's runner can't inspect terminals."
+        try:
+            async with asyncio.timeout(_SHELL_PROXY_TIMEOUT_S):
+                payload = await _proxy_get_to_runner(
+                    session_id,
+                    path,
+                    conv,
+                    timeout=_SHELL_PROXY_TIMEOUT_S,
+                    unsupported_endpoint_message=older_runner,
+                    for_control=True,
+                )
+        except TimeoutError:
+            # A runner that stops answering fails the same way as one that answers badly.
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        except WrongReplicaError:
+            # Its host id tells the client where to resend; it carries no runner text.
+            raise
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise not_found from None
+            if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                # An older runner and an offline one both ask before closing, but read apart.
+                message = older_runner if exc.message == older_runner else _SHELL_RUNNER_OFFLINE
+                raise OmnigentError(message, code=ErrorCode.RUNNER_UNAVAILABLE) from None
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        except HTTPException:
+            raise HTTPException(status_code=502, detail="Couldn't inspect the terminal.") from None
+        return ShellInspection.from_untrusted(payload).to_dict()
 
     @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
     async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:
