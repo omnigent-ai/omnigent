@@ -35,13 +35,14 @@ import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 const setWatched = vi.fn();
 const start = vi.fn();
 const subscribe = vi.fn((_fn: () => void) => () => {});
+const subscribeStatus = vi.fn((_fn: () => void) => () => {});
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
     start: (...args: unknown[]) => start(...args),
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
-    subscribeStatus: () => () => {},
+    subscribeStatus: (fn: () => void) => subscribeStatus(fn),
     isConnected: () => false,
   },
 }));
@@ -175,6 +176,7 @@ beforeEach(() => {
   setWatched.mockClear();
   start.mockClear();
   subscribe.mockClear();
+  subscribeStatus.mockClear();
 });
 
 afterEach(() => {
@@ -1836,4 +1838,113 @@ it("keeps a directly opened shared session watched and permission-aware with the
     client.clear();
     vi.unstubAllGlobals();
   }
+});
+
+describe("SessionUpdatesProvider sub-agent tree refetches", () => {
+  function childRow(id: string, parentId: string, status = "idle") {
+    return { ...conv(id), parent_session_id: parentId, status };
+  }
+
+  // A mounted (observed) child list for `parentId`; returns its fetch spy.
+  function mountChildList(client: QueryClient, parentId: string, childIds: string[]) {
+    const rows = childIds.map((id) => ({ id }));
+    const fetchChildren = vi.fn(async () => rows);
+    const stop = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey(parentId),
+      queryFn: fetchChildren,
+      initialData: rows,
+      staleTime: Infinity,
+    }).subscribe(() => {});
+    onTestFinished(stop);
+    return fetchChildren;
+  }
+
+  function childListInvalidations(invalidate: { mock: { calls: unknown[][] } }, parentId: string) {
+    const key = JSON.stringify(childSessionsQueryKey(parentId));
+    return invalidate.mock.calls.filter(
+      ([filters]) => JSON.stringify((filters as { queryKey?: unknown })?.queryKey) === key,
+    );
+  }
+
+  it("does not refetch a mounted child list when a snapshot restates unchanged rows", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = mountChildList(client, "conv_a", ["child_1", "child_2"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [childRow("child_1", "conv_a"), childRow("child_2", "conv_a")];
+
+    // First sight refetches once, in case a row moved since the list loaded.
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+
+    // A watch-set change restates the same rows: no refetch.
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    act(() => handler({ type: "snapshot", items: [...rows, conv("conv_a")] }));
+    expect(childListInvalidations(invalidate, "conv_a")).toEqual([]);
+    expect(fetchChildren).toHaveBeenCalledTimes(1);
+  });
+
+  it("refetches the parent's list when a child's row changes", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = mountChildList(client, "conv_a", ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "snapshot", items: [childRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [childRow("child_1", "conv_a", "running")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches a list when a new child of it first appears", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = mountChildList(client, "conv_a", ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "snapshot", items: [childRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [childRow("child_2", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches every child list on the snapshot after a reconnect", async () => {
+    // Children created while disconnected get no discovery push.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchRootChildren = mountChildList(client, "conv_a", ["child_1"]);
+    const fetchGrandchildren = mountChildList(client, "child_1", ["grand_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [childRow("child_1", "conv_a"), childRow("grand_1", "child_1")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchRootChildren).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fetchGrandchildren).toHaveBeenCalledTimes(1));
+
+    // The socket dropped: isConnected() is now false.
+    for (const [onStatus] of subscribeStatus.mock.calls) act(() => onStatus());
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchRootChildren).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(fetchGrandchildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps invalidating an unmounted child list until it is mounted", () => {
+    // Invalidation only marks an unobserved list stale, and lists don't
+    // refetch on mount, so each frame must mark it again.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    client.setQueryData(childSessionsQueryKey("conv_a"), [{ id: "child_1" }]);
+    renderProvider(client, ["/"]);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const handler = frameHandler();
+    const rows = [childRow("child_1", "conv_a")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    act(() => handler({ type: "snapshot", items: rows }));
+    expect(childListInvalidations(invalidate, "conv_a")).toHaveLength(2);
+  });
 });

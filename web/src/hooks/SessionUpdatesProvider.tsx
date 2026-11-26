@@ -374,6 +374,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // the post-reconnect snapshot.
   const commentsFingerprintsRef = useRef(new Map<string, string>());
 
+  // Last streamed row (as JSON) per sub-agent session. Every watch-set change
+  // restates the whole watch-set in a snapshot, so only a new or changed row
+  // makes its parent's child list refetch. Cleared on disconnect: children
+  // created while offline get no discovery push, so reconnect refetches all.
+  const childRowFingerprintsRef = useRef(new Map<string, string>());
+
   // Last streamed archived flag per session, for the frozen Archived snapshot.
   const snapshotArchivedRef = useRef(new Map<string, boolean>());
 
@@ -555,6 +561,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       if (targets.size > 0) reconciler.schedule(targets);
     });
 
+    const unsubscribeStatus = sessionUpdatesSocket.subscribeStatus(() => {
+      if (!sessionUpdatesSocket.isConnected()) childRowFingerprintsRef.current.clear();
+    });
+
     const unsubscribeFrames = sessionUpdatesSocket.subscribe((frame: SessionUpdatesFrame) => {
       switch (frame.type) {
         case "heartbeat":
@@ -578,6 +588,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         case "removed":
           for (const id of frame.ids) {
             commentsFingerprintsRef.current.delete(id);
+            childRowFingerprintsRef.current.delete(id);
             snapshotArchivedRef.current.delete(id);
             // A revoked share or a deletion must not be re-injected by the
             // keep-alive once the refetch correctly leaves it out.
@@ -617,14 +628,27 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             for (const id of commentsFingerprintsRef.current.keys()) {
               if (!watchedIds.has(id)) commentsFingerprintsRef.current.delete(id);
             }
+            for (const id of childRowFingerprintsRef.current.keys()) {
+              if (!watchedIds.has(id)) childRowFingerprintsRef.current.delete(id);
+            }
           }
           // For child sessions the server includes parent_session_id in the
-          // wire item. Invalidate the parent's child_sessions cache so tree
-          // views (SubagentsPanel, SubagentsGraphView) pick up status changes
-          // without polling.
+          // wire item. Invalidate the parent's child_sessions cache when the
+          // row changed so tree views (SubagentsPanel, SubagentsGraphView)
+          // pick up status changes without polling.
           const parentIds = new Set<string>();
           for (const item of frame.items) {
-            if (item.parent_session_id) parentIds.add(item.parent_session_id);
+            if (!item.parent_session_id) continue;
+            const fingerprint = JSON.stringify(item);
+            if (childRowFingerprintsRef.current.get(item.id) === fingerprint) continue;
+            const parentList = queryClient
+              .getQueryCache()
+              .find({ queryKey: childSessionsQueryKey(item.parent_session_id), exact: true });
+            // An unmounted list only goes stale, so leave the row unrecorded
+            // and invalidate it again on the next frame.
+            if (parentList?.isActive()) childRowFingerprintsRef.current.set(item.id, fingerprint);
+            else childRowFingerprintsRef.current.delete(item.id);
+            parentIds.add(item.parent_session_id);
           }
           for (const parentId of parentIds) {
             void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(parentId) });
@@ -689,6 +713,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     });
 
     return () => {
+      unsubscribeStatus();
       unsubscribeFrames();
       unsubscribeMutations();
       unsubscribeMuteRecheck();
