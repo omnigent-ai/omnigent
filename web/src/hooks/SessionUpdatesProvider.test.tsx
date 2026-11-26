@@ -2052,4 +2052,31 @@ describe("SessionUpdatesProvider sub-agent list refetches that must keep working
     act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
     await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
   });
+
+  it("retries a child list whose refetch failed on the next frame that restates it", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockRejectedValueOnce(new Error("503 Service Unavailable"))
+      .mockResolvedValue([{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const running = subagentRow("child_1", "conv_a", "running");
+
+    act(() => handler({ type: "snapshot", items: [subagentRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [running] }));
+    await waitFor(() =>
+      expect(client.getQueryState(childSessionsQueryKey("conv_a"))?.status).toBe("error"),
+    );
+    // Any later watch-set change restates the row.
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), running] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(client.getQueryState(childSessionsQueryKey("conv_a"))?.status).toBe("success"),
+    );
+  });
 });
