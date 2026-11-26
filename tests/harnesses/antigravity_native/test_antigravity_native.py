@@ -25,6 +25,8 @@ from omnigent.harnesses.antigravity_native.bridge import (
     read_tmux_info,
 )
 from omnigent.harnesses.antigravity_native.main import antigravity_terminal_resource_id
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+from omnigent.spec.types import AgentSpec
 
 
 def _mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
@@ -495,11 +497,15 @@ _PLACEHOLDER_ID = "agy_conv_fresh_placeholder"
 
 def _terminal_launch_handler(request: httpx.Request) -> httpx.Response:
     """Minimal handler that accepts the terminal POST and returns a stub resource."""
+    if request.method == "GET":
+        return httpx.Response(200, json={})
     return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
 
 
 def _terminal_launch_handler_with_pane(request: httpx.Request) -> httpx.Response:
     """Terminal POST handler that exposes a local tmux pane in the response metadata."""
+    if request.method == "GET":
+        return httpx.Response(200, json={})
     return httpx.Response(
         200,
         json={
@@ -542,6 +548,76 @@ async def test_launch_and_record_advertises_tmux_target_when_pane_exposed(
 # ---------------------------------------------------------------------------
 # _launch_is_headless — attended vs unattended signal (phase 4 task 1)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sub_agent_name", "available", "expected"),
+    [
+        (None, True, "Parent instructions."),
+        ("worker", True, "Child instructions."),
+        (None, False, None),
+    ],
+    ids=["root", "sub-agent", "missing-legacy-bundle"],
+)
+async def test_cli_fallback_delivers_effective_session_startup_instructions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sub_agent_name: str | None,
+    available: bool,
+    expected: str | None,
+) -> None:
+    """The CLI uses the selected session agent and retains old-server fallback."""
+    from omnigent.runner.native import orchestration
+
+    child = AgentSpec(spec_version=1, name="worker", instructions="Child instructions.")
+    root = AgentSpec(
+        spec_version=1,
+        name="parent",
+        instructions="Parent instructions.",
+        sub_agents=[child],
+    )
+
+    async def resolve(
+        _client: object, _cache: object, agent_id: str, session_id: str | None = None
+    ) -> orchestration.ResolvedSpec | None:
+        assert (agent_id, session_id) == ("agent", "sess")
+        return orchestration.ResolvedSpec(root, None) if available else None
+
+    selected: list[AgentSpec | None] = []
+
+    async def memory(
+        _client: object,
+        session_id: str,
+        entry: orchestration.ResolvedSpec | None,
+        *,
+        workspace: object = None,
+    ) -> str | None:
+        assert session_id == "sess"
+        selected.append(entry.spec if entry is not None else None)
+        return "MEMORY GUIDANCE" if entry is not None else None
+
+    monkeypatch.setattr("omnigent.runner._entry._resolve_agent_spec_from_server", resolve)
+    monkeypatch.setattr(orchestration, "memory_startup_guidance", memory)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/sess"
+        return httpx.Response(200, json={"agent_id": "agent", "sub_agent_name": sub_agent_name})
+
+    bridge_dir = tmp_path / "bridge"
+    async with _mock_client(handler) as client:
+        await _mod._write_cli_startup_instructions(client, "sess", bridge_dir)
+
+    rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+    text = rule.read_text(encoding="utf-8")
+    assert WORKSPACE_IMAGE_INSTRUCTION in text
+    if expected is not None:
+        assert expected in text
+        assert "MEMORY GUIDANCE" in text
+    else:
+        assert "MEMORY GUIDANCE" not in text
+    assert ("Parent instructions." in text) is (available and sub_agent_name is None)
+    assert ("Child instructions." in text) is (available and sub_agent_name == "worker")
+    assert selected == [child if sub_agent_name == "worker" else root if available else None]
 
 
 class _FakeStream:
@@ -599,6 +675,8 @@ async def test_launch_and_record_threads_headless_skip_flag(
     captured_args: list[str] = []
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={})
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
@@ -644,6 +722,8 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     captured_env: dict[str, str] = {}
 
     def _capture_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={})
         body = json.loads(request.content)
         captured_args.extend(body["spec"]["args"])
         captured_env.update(body["spec"]["env"])
