@@ -9,7 +9,7 @@ and skips).
 Tool categories:
 - _OS_ENV_TOOLS: execute through a runner-local OSEnvironment (sys_os_*)
 - _REST_TOOLS: call server REST APIs (sys_call_async, sys_cancel_async)
-- _FILE_TOOLS: call server file APIs (sys_upload_file, sys_list_files, sys_download_file)
+- _FILE_TOOLS: call server file APIs (sys_files_upload, sys_files_list, sys_files_download)
 - _TERMINAL_TOOLS: runner-local TerminalRegistry
 - MCP tools: spec-defined; dispatched via RunnerMcpManager passed
   in by proxy_stream (designs/RUNNER_MCP.md). Not in the static
@@ -141,9 +141,9 @@ from omnigent.tools.builtins.sys_terminal import (
     SysTerminalSendTool,
 )
 from omnigent.tools.builtins.timer import (
-    # Shared with the in-process sys_timer_set tool so the runner's firing
-    # loop validates the same argument shape and delay ceiling the LLM-facing
-    # schema advertises.
+    # Shared with the in-process tool and the server's timer route, so every
+    # surface rejects the same arguments and honors one delay ceiling.
+    DURABLE_TIMER_MIN_SECONDS,
     validate_timer_set_args,
 )
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
@@ -253,6 +253,9 @@ _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 # still fails out promptly. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
+# A managed create returns once its session is stored and provisions the sandbox
+# afterwards, but a loaded server can take longer than 30s to store it.
+_MANAGED_SESSION_CREATE_TIMEOUT = httpx.Timeout(120.0, connect=30.0)
 
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
@@ -427,8 +430,7 @@ _HINDSIGHT_TOOLS = frozenset({"hindsight_retain", "hindsight_recall", "hindsight
 # reads the runner host's config/credentials, same as the spawn paths.
 _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 
-# Priority 5g: Timer tools — runner-local asyncio.sleep tasks
-# (RUNNER_TIMER_DISPATCH.md).
+# Priority 5g: Timer tools — saved and fired by the server as scheduled tasks.
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 
 # Priority 5f.3: sys_advise_models — server-side via MCP intercept;
@@ -637,8 +639,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     ``pi.registerTool`` and the claude-native relay both consume.
 
     :param spec: The session's resolved agent spec. ``None`` falls back to the
-        always-on read/discovery surface (never the opt-in spawn writes, whose
-        gate can't be evaluated without the spec), mirroring the relay.
+        always-on read/discovery surface, never opt-in tools such as the spawn
+        writes or the session file tools, whose gates can't be evaluated
+        without the spec. This mirrors the relay.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -708,9 +711,6 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysAgentDownloadTool,
             SysAddPolicyTool,
             SysPolicyRegistryTool,
-            UploadFileTool,
-            ListFilesTool,
-            DownloadFileTool,
         ):
             if _cls is SysSessionMessageTool and not peer_session_messaging_enabled():
                 continue
@@ -1140,11 +1140,13 @@ def should_dispatch_locally(tool_name: str, agent_spec: object = None) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
-# Granted tool names per live AgentSpec + effective harness, keyed by
-# ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
-# guards against id reuse after the spec is garbage-collected.
+# Granted tool names per live AgentSpec, effective harness, and routing answer,
+# keyed by ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
+# guards against id reuse after the spec is garbage-collected. The routing answer
+# is part of the key because it gates ``sys_advise_models``, so a flip is seen
+# on the next call without clearing the cache.
 _granted_tool_names_cache: dict[
-    tuple[int, str | None], tuple[weakref.ref[AgentSpec], frozenset[str]]
+    tuple[int, str | None, bool], tuple[weakref.ref[AgentSpec], frozenset[str]]
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
@@ -1186,7 +1188,9 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
     :raises Exception: Propagates ``ToolManager`` construction failures so
         callers can fail closed instead of guessing at the surface.
     """
-    cache_key = (id(agent_spec), harness)
+    from omnigent.runtime import routing_stamp
+
+    cache_key = (id(agent_spec), harness, routing_stamp())
     cached = _granted_tool_names_cache.get(cache_key)
     if cached is not None and cached[0]() is agent_spec:
         return cached[1]
@@ -1214,8 +1218,10 @@ def _ungranted_tool_reason(
 
     The check is skipped when no granted surface is known: ``agent_spec`` is
     ``None`` (spec-less dispatch paths) or is not a real :class:`AgentSpec`
-    (partial stand-ins cannot build a ``ToolManager``). Fails closed when the
-    surface exists but cannot be computed.
+    (partial stand-ins cannot build a ``ToolManager``). A spec-less dispatch
+    still refuses the session file tools: they are opt-in, and the
+    ``tool_groups.files`` that turns them on is in the missing spec. Fails
+    closed when the surface exists but cannot be computed.
 
     :param tool_name: Tool the caller wants to dispatch, e.g. ``"sys_os_shell"``.
     :param agent_spec: The session's resolved agent spec, or ``None``.
@@ -1225,6 +1231,11 @@ def _ungranted_tool_reason(
     """
     from omnigent.spec.types import AgentSpec as _AgentSpec
 
+    if agent_spec is None and tool_name in _FILE_TOOLS:
+        return (
+            f"tool {tool_name!r} is not enabled: the agent spec is unavailable, "
+            "so its tool_groups.files setting can't be checked"
+        )
     if not isinstance(agent_spec, _AgentSpec):
         return None
     try:
@@ -4088,7 +4099,12 @@ async def _execute_session_create(
             from omnigent.runner.session_requests import post_on_host
 
             resp = await post_on_host(
-                server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
+                server_client,
+                endpoint,
+                host_id=host_id,
+                json=body,
+                headers=headers,
+                timeout=_MANAGED_SESSION_CREATE_TIMEOUT if placement == "managed" else 30.0,
             )
         else:
             resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
@@ -4852,10 +4868,30 @@ def _has_subagent(
     return False
 
 
-# ── Timer dispatch (RUNNER_TIMER_DISPATCH.md) ─────────────────
-# Argument validation and the delay ceiling live in the timer builtin
-# (``validate_timer_set_args``) so this firing path and the LLM-facing
-# schema stay in lockstep.
+# ── Timer dispatch ─────────────────────────────────────────────
+# Long top-level timers are saved by the server, so they survive runner restarts; others
+# stay in this runner's memory. Both check arguments with ``validate_timer_set_args``.
+
+
+def _runner_timer_warning(reason: str) -> str:
+    """The agent-facing caveat for a timer kept in this runner's memory, for *reason*."""
+    return (
+        f"This timer is kept only in this runner's memory: {reason}. It is lost if the "
+        "runner stops or restarts before it fires (a crash or update, the host sleeping or "
+        "rebooting, or the session moving to another runner), and a firing is skipped if "
+        "the server can't be reached at that moment. Until it fires, it keeps the runner "
+        "from shutting down when idle."
+    )
+
+
+async def _server_saves_timers(server_client: httpx.AsyncClient) -> bool:
+    """Whether the server advertises durable timers; an unreachable one saves none."""
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        info.raise_for_status()
+        return info.json().get("session_timers") is True
+    except (httpx.HTTPError, ValueError):
+        return False
 
 
 async def _execute_timer_set(
@@ -4865,23 +4901,81 @@ async def _execute_timer_set(
     conversation_id: str | None = None,
 ) -> str:
     """
-    Schedule a timer that fires after a delay.
+    Set a timer that wakes this session: on the server when it can save it, else here.
 
     :param args: Parsed arguments. Keys: ``seconds`` (number),
         ``repeat`` (bool, default False), ``note`` (optional str).
-    :param server_client: httpx client for persisting firings.
-    :param conversation_id: Session the timer belongs to, e.g.
-        ``"conv_abc123"``.
-    :returns: JSON string with ``timer_id`` and ``status``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: Session the timer wakes, e.g. ``"conv_abc123"``.
+    :returns: JSON with ``timer_id``, ``status`` and ``durable``, plus a ``warning`` for a
+        timer kept in this runner, or ``{"error"}``.
     """
-    from omnigent.runner import app as _app
-
     validated = validate_timer_set_args(args)
     if isinstance(validated, str):
         return json.dumps({"error": validated})
     seconds, repeat, note = validated
     if server_client is None or conversation_id is None:
         return json.dumps({"error": "timer requires server_client and conversation_id"})
+    if seconds < DURABLE_TIMER_MIN_SECONDS:
+        minutes = DURABLE_TIMER_MIN_SECONDS // 60
+        reason = f"timers under {minutes} minutes aren't saved on the server"
+    elif not await _server_saves_timers(server_client):
+        reason = "this server doesn't save timers, or couldn't be reached to save it"
+    else:
+        saved = await _save_server_timer(server_client, conversation_id, seconds, repeat, note)
+        if "error" in saved or saved.get("durable") is True:
+            return json.dumps(saved)
+        reason = str(saved.get("reason") or "the server didn't save it")
+    return _set_runner_timer(conversation_id, server_client, seconds, repeat, note, reason)
+
+
+async def _save_server_timer(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    seconds: float,
+    repeat: bool,
+    note: str | None,
+) -> _JsonObject:
+    """
+    Ask the server to save the timer.
+
+    :returns: The server's reply: ``durable`` true with the saved timer, or ``durable``
+        false with the ``reason`` it keeps none for this session; else ``{"error"}``.
+    """
+    try:
+        resp = await server_client.post(
+            f"{_session_url(conversation_id)}/timers",
+            json={"seconds": seconds, "repeat": repeat, "note": note},
+            timeout=30.0,
+        )
+        if resp.status_code < 400:
+            return resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        # The server may have saved the timer before its reply was lost.
+        return {"error": f"sys_timer_set failed ({exc}); the timer may still have been set"}
+    error = f"server returned {resp.status_code}"
+    if resp.status_code >= 500:
+        # A gateway can answer 502 or 504 after the server saved the timer.
+        error += "; the timer may still have been set"
+    return {"error": error, "details": resp.text[:1000]}
+
+
+def _set_runner_timer(
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+    seconds: float,
+    repeat: bool,
+    note: str | None,
+    reason: str,
+) -> str:
+    """
+    Start a timer in this runner's memory, which posts its wake to the session.
+
+    :param reason: Why the server isn't keeping it, e.g. ``"this server doesn't save
+        timers"``; the result's ``warning`` names it.
+    :returns: JSON with ``timer_id``, ``status``, ``durable`` false and the ``warning``.
+    """
+    from omnigent.runner import app as _app
 
     timer_id = f"timer_{uuid.uuid4().hex}"
     task = asyncio.create_task(
@@ -4900,6 +4994,8 @@ async def _execute_timer_set(
         {
             "timer_id": timer_id,
             "status": "scheduled",
+            "durable": False,
+            "warning": _runner_timer_warning(reason),
             "seconds": seconds,
             "repeat": repeat,
             "note": note,
@@ -4969,14 +5065,16 @@ async def _timer_loop(
 async def _execute_timer_cancel(
     args: _JsonObject,
     *,
+    server_client: httpx.AsyncClient | None = None,
     conversation_id: str | None = None,
 ) -> str:
     """
-    Cancel a previously scheduled timer by ``timer_id``.
+    Cancel one of this session's timers by ``timer_id``: this runner's own, or the server's.
 
     :param args: Parsed arguments with ``timer_id`` (string).
+    :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: Session the timer belongs to.
-    :returns: JSON with ``status`` ``"cancelled"`` or ``"not_found"``.
+    :returns: JSON with ``status`` ``"cancelled"`` or ``"not_found"``, or ``{"error"}``.
     """
     from omnigent.runner import app as _app
 
@@ -4985,8 +5083,23 @@ async def _execute_timer_cancel(
         return json.dumps({"error": "timer_id is required"})
     if conversation_id is None:
         return json.dumps({"error": "timer_cancel requires conversation_id"})
-    cancelled = _app.cancel_timer(conversation_id, timer_id)
-    return json.dumps({"timer_id": timer_id, "status": "cancelled" if cancelled else "not_found"})
+    if _app.cancel_timer(conversation_id, timer_id):
+        return json.dumps({"timer_id": timer_id, "status": "cancelled"})
+    if server_client is None or not _SCHEDULED_TASK_ID_RE.fullmatch(timer_id):
+        return json.dumps({"timer_id": timer_id, "status": "not_found"})
+    try:
+        resp = await server_client.delete(
+            f"{_session_url(conversation_id)}/timers/{timer_id}", timeout=30.0
+        )
+    except httpx.HTTPError as exc:
+        return json.dumps({"error": f"sys_timer_cancel failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"timer_id": timer_id, "status": "not_found"})
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}
+        )
+    return json.dumps(resp.json())
 
 
 async def _execute_comment_tool(
@@ -5304,6 +5417,8 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "host_id",
     "execution_target",
     "project_id",
+    "workflow_id",
+    "workflow_details",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -5324,6 +5439,8 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "execution_target",
     "state",
     "project_id",
+    "workflow_id",
+    "workflow_details",
 )
 _SCHEDULED_TASK_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 # IDs a deployment allocates in another form, limited to characters safe in one path segment.
@@ -5341,6 +5458,13 @@ _SCHEDULED_TASK_GATED_FIELDS = (
         ("mcp_services",),
         "scheduled_task_mcp_services",
         "does not support mcp_services; omit it to start runs without MCP services",
+    ),
+    (
+        ("workflow_id", "workflow_details"),
+        "scheduled_task_workflow_id",
+        "does not support workflow_id; to run a saved workflow, retry with the prompt "
+        "exactly '/workflow Run the saved workflow \"<name>\" (ID <id>).', optionally "
+        "followed by a blank line and this run's details",
     ),
 )
 
@@ -6294,6 +6418,54 @@ async def _project_name_or_none(
         return None
 
 
+_SESSION_USAGE_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_tokens",
+)
+
+
+def _session_usage_projection(snap: _JsonObject) -> _JsonObject | None:
+    """
+    Project a usage-inclusive session snapshot into ``sys_session_get_info``'s ``usage``.
+
+    Token totals sum the per-model buckets the server reports; a bucket no
+    model recorded stays ``None`` rather than reading as zero.
+
+    :param snap: ``GET /v1/sessions/{id}?include_usage=true`` body, e.g.
+        ``{"total_cost_usd": 0.42, "usage_by_model": {"m": {"input_tokens": 12}}}``.
+    :returns: ``{"total_cost_usd", "cost_hidden", <token totals>, "by_model"}``,
+        or ``None`` when the server skipped the usage aggregate.
+    """
+    if snap.get("usage_included") is False:
+        return None
+    raw_by_model = snap.get("usage_by_model")
+    by_model = (
+        {model: usage for model, usage in raw_by_model.items() if isinstance(usage, dict)}
+        if isinstance(raw_by_model, dict)
+        else {}
+    )
+    token_totals: dict[str, int | None] = {}
+    for field in _SESSION_USAGE_TOKEN_FIELDS:
+        counts = [usage.get(field) for usage in by_model.values()]
+        recorded = [
+            count for count in counts if isinstance(count, int) and not isinstance(count, bool)
+        ]
+        token_totals[field] = sum(recorded) if recorded else None
+    cost = snap.get("total_cost_usd")
+    return {
+        # Null means unpriced or hidden by the operator, never a priced $0.
+        "total_cost_usd": (
+            float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) else None
+        ),
+        "cost_hidden": snap.get("cost_hidden") is True,
+        **token_totals,
+        "by_model": by_model,
+    }
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -6321,7 +6493,12 @@ async def _session_get_info_via_rest(
     (the server denied the read, so from the caller's vantage the target
     is one it may not see).
 
-    :param args: Parsed tool arguments; optional ``session_id``.
+    With ``include_usage`` the snapshot also carries the spawn-tree usage
+    aggregate, projected as ``usage``; it is opt-in because the aggregate
+    reads every descendant session.
+
+    :param args: Parsed tool arguments; optional ``session_id`` and
+        ``include_usage``.
     :param conversation_id: The caller's own session id, used as the
         default target when ``session_id`` is omitted.
     :param server_client: HTTP client pointed at the Omnigent server.
@@ -6332,10 +6509,15 @@ async def _session_get_info_via_rest(
         return json.dumps(
             {"error": "sys_session_get_info requires a non-empty 'session_id' string"}
         )
+    include_usage = args.get("include_usage") is True
     try:
         # ``status`` is projected, so keep the live-status probe on a cache miss.
         resp = await _get_session_metadata(
-            server_client, raw_target, timeout=30.0, include_live_status=True
+            server_client,
+            raw_target,
+            timeout=30.0,
+            include_usage=include_usage,
+            include_live_status=True,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_get_info failed: {exc}"})
@@ -6356,10 +6538,13 @@ async def _session_get_info_via_rest(
         _host_harnesses_or_none(snap_host_id, server_client),
         _project_name_or_none(_optional_string(snap.get("project_id")), server_client),
     )
+    usage = {"usage": _session_usage_projection(snap)} if include_usage else {}
     return json.dumps(
         {
             "session_id": snap.get("id"),
             "status": snap.get("status"),
+            # An archived session refuses messages from other sessions until unarchived.
+            "archived": snap.get("archived"),
             # Persisted conversation activity is distinct from lifecycle
             # status: repeated polls with an unchanged value let an
             # orchestrator detect a running session that is not advancing.
@@ -6401,6 +6586,7 @@ async def _session_get_info_via_rest(
             # waiting on.
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
+            **usage,
         }
     )
 
@@ -8204,7 +8390,7 @@ async def execute_tool(
     :param session_workspace: The session's own server-stored workspace, e.g.
         ``Path("/repo")``; ``None`` when it has none, or
         :data:`UNKNOWN_SESSION_WORKSPACE` when it could not be read. Bounds
-        ``sys_upload_file`` reads; unlike ``runner_workspace`` it never falls
+        ``sys_files_upload`` reads; unlike ``runner_workspace`` it never falls
         back to the runner's.
     :returns: Tool output string.
     """
@@ -8437,6 +8623,7 @@ async def execute_tool(
             else:
                 output = await _execute_timer_cancel(
                     args,
+                    server_client=server_client,
                     conversation_id=conversation_id,
                 )
         elif tool_name in _TASK_LIFECYCLE_TOOLS:
@@ -9264,7 +9451,7 @@ def _session_upload_roots(
     resource_registry: SessionResourceRegistry | None,
 ) -> list[Path]:
     """
-    Return the directories ``sys_upload_file`` may read from, searched in order.
+    Return the directories ``sys_files_upload`` may read from, searched in order.
 
     The session's own workspace wins: its native terminal and tools run there.
     Otherwise use the session's default environment root, the one its filesystem
@@ -9342,7 +9529,7 @@ async def _execute_file_tool(
     """
     Execute a file tool by calling session-scoped server file APIs.
 
-    :param tool_name: File tool name, e.g. ``"sys_upload_file"``.
+    :param tool_name: File tool name, e.g. ``"sys_files_upload"``.
     :param args: Parsed tool arguments.
     :param server_client: HTTP client for the Omnigent server.
     :param conversation_id: Owning session/conversation id,
@@ -9365,7 +9552,7 @@ async def _execute_file_tool(
     if tool_name == UploadFileTool.name():
         path = args.get("path")
         if not isinstance(path, str) or not path:
-            return "Error: sys_upload_file failed: empty path"
+            return "Error: sys_files_upload failed: empty path"
         # The read runs in the un-sandboxed runner, so the path must stay inside this
         # session's workspace, or an agent could upload host or sibling-session files.
         roots = _session_upload_roots(
@@ -9376,11 +9563,11 @@ async def _execute_file_tool(
             resource_registry=resource_registry,
         )
         if not roots:
-            return "Error: sys_upload_file failed: the session workspace is unknown"
+            return "Error: sys_files_upload failed: the session workspace is unknown"
         try:
             resolved = _resolve_upload_path(path, roots)
         except ValueError as exc:
-            return f"Error: sys_upload_file failed: {exc}"
+            return f"Error: sys_files_upload failed: {exc}"
         filename = resolved.name
         try:
             with open(resolved, "rb") as f:
@@ -9395,7 +9582,7 @@ async def _execute_file_tool(
                 return json.dumps({"file_id": data.get("id"), "filename": filename})
             return f"Error: upload returned {resp.status_code}"
         except Exception as exc:  # noqa: BLE001
-            return f"Error: sys_upload_file failed: {exc}"
+            return f"Error: sys_files_upload failed: {exc}"
 
     if tool_name == DownloadFileTool.name():
         file_id = args.get("file_id", "")
@@ -10881,6 +11068,7 @@ def _execute_skill_tool(
     :returns: Tool output string.
     """
     from omnigent.spec.skill_sources import framework_skills
+    from omnigent.spec.types import AgentSpec
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
@@ -10899,7 +11087,9 @@ def _execute_skill_tool(
         agent_root=runner_workspace,
         skills_filter=skills_filter,
         fallback_skills=(
-            framework_skills(agent_spec) if workflows_enabled and agent_spec is not None else []
+            framework_skills(agent_spec, workflows_enabled=workflows_enabled)
+            if isinstance(agent_spec, AgentSpec)
+            else []
         ),
     )
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)

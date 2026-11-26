@@ -66,7 +66,14 @@ and a changed file is flagged.
   Pull Requests from the session-actions menu, which opens the Workspace drawer.
   The list shows even when the session has one pull request; select one to open
   it in that tab, then open Changes. The desktop composer's PR link opens a
-  session's only pull request in its own tab.
+  session's only pull request in its own tab. ⌘K → **Show all pull requests**
+  selects the session's Pull Requests tab, or opens one, and shows a collapsed
+  workspace sidebar. A pull request's page has an **All pull requests** button
+  that does the same and leaves the pull request's own tab open. The strip's All
+  tabs list groups pull request tabs under **Pull requests**, whose heading offers
+  **Close merged (n)** and **Close all**, also in ⌘K as **Close merged pull request
+  tabs** and **Close all pull request tabs**. Group closes keep pinned tabs, and
+  tabs with unsaved edits ask once for the whole group; cancelling closes none.
 - `composer-mobile`: The composer shows no PR link on narrow screens. Open the
   Session actions menu, choose Pull Requests, then open Changes in the drawer.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link, then

@@ -98,6 +98,81 @@ describe("treeComparator", () => {
     tree.resetPaths(PATHS, { initialExpandedPaths: ["src/", "docs/"] });
     expect(rows(tree).slice(-2)).toEqual(["a.ts", "b.ts"]);
   });
+
+  /** An expanded tree of `meta`'s paths, folders being the entries `meta` lists without a size. */
+  function sortedRows(sort: ChangedSort, meta: Map<string, TreeEntryMeta>): string[] {
+    const paths = [...meta].map(([path, entry]) => (entry.bytes === null ? `${path}/` : path));
+    const tree = new FileTreeModel({
+      paths,
+      initialExpansion: "open",
+      sort: treeComparator(sort, meta),
+    });
+    return rows(tree);
+  }
+
+  it("places a folder by its own date, not a newer subfolder's", () => {
+    const meta = new Map<string, TreeEntryMeta>([
+      ["m", { bytes: null, modified_at: 200 }],
+      ["m/a.ts", { bytes: 1, modified_at: 1 }],
+      ["z", { bytes: null, modified_at: 100 }],
+      ["z/sub", { bytes: null, modified_at: 999 }],
+      ["z/sub/new.ts", { bytes: 1, modified_at: 999 }],
+      ["z/old.ts", { bytes: 1, modified_at: 2 }],
+    ]);
+    expect(sortedRows("recent", meta)).toEqual([
+      "m/",
+      "m/a.ts",
+      "z/",
+      "z/sub/",
+      "z/sub/new.ts",
+      "z/old.ts",
+    ]);
+  });
+
+  it("places a folder by its own type, not a subfolder's", () => {
+    const meta = new Map<string, TreeEntryMeta>([
+      ["lib.b", { bytes: null, modified_at: 1 }],
+      // The extensionless child must not change its parent's type order.
+      ["lib.b/plain", { bytes: null, modified_at: 1 }],
+      ["lib.b/plain/x.ts", { bytes: 1, modified_at: 1 }],
+      ["lib.b/y.ts", { bytes: 1, modified_at: 1 }],
+      ["pkg.a", { bytes: null, modified_at: 1 }],
+      ["pkg.a/z.ts", { bytes: 1, modified_at: 1 }],
+    ]);
+    expect(sortedRows("type", meta)).toEqual([
+      "pkg.a/",
+      "pkg.a/z.ts",
+      "lib.b/",
+      "lib.b/plain/",
+      "lib.b/plain/x.ts",
+      "lib.b/y.ts",
+    ]);
+  });
+
+  it("orders a nested level by that level's own dates", () => {
+    const meta = new Map<string, TreeEntryMeta>([
+      ["src", { bytes: null, modified_at: 1 }],
+      ["src/old", { bytes: null, modified_at: 10 }],
+      ["src/old/deep", { bytes: null, modified_at: 999 }],
+      ["src/old/deep/fresh.ts", { bytes: 1, modified_at: 999 }],
+      ["src/old/note.md", { bytes: 1, modified_at: 5 }],
+      ["src/new", { bytes: null, modified_at: 500 }],
+      ["src/new/stale.ts", { bytes: 1, modified_at: 1 }],
+      ["src/later.ts", { bytes: 1, modified_at: 300 }],
+      ["src/earlier.ts", { bytes: 1, modified_at: 200 }],
+    ]);
+    expect(sortedRows("recent", meta)).toEqual([
+      "src/",
+      "src/new/",
+      "src/new/stale.ts",
+      "src/old/",
+      "src/old/deep/",
+      "src/old/deep/fresh.ts",
+      "src/old/note.md",
+      "src/later.ts",
+      "src/earlier.ts",
+    ]);
+  });
 });
 
 describe("treeOrderSignature", () => {

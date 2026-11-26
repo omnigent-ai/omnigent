@@ -88,12 +88,12 @@ export function useFileCommandEnvironment(
   return useMemo(
     () => ({
       local,
-      sshTarget: mobile ? null : sshTarget,
+      sshTarget,
       linkable: conversationId !== null,
       revealSupported: supportsFileReveal(),
       fileManager: fileManagerName(),
     }),
-    [local, mobile, sshTarget, conversationId],
+    [local, sshTarget, conversationId],
   );
 }
 

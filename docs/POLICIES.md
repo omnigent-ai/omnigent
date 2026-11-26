@@ -415,6 +415,78 @@ github_access:
       - "fix/*"
 ```
 
+### GitLab
+
+#### `gitlab_policy`
+
+Controls supported Git downloads and pushes, plus a small set of issue and merge-request activities through `glab` shell commands. Configure which GitLab servers and projects an agent can read and write, and which branches may receive pushes. Projects can have nested groups (`team/subgroup/project`). Paths match case-insensitively. The policy is opt-in and uses the existing ALLOW, DENY, and ASK approval flow.
+
+| Automatically classified commands | Scope |
+|-----------------------------------|-------|
+| `glab issue list`, `view` | Read issue lists and individual issues |
+| `glab mr list`, `view`, `diff` | Read merge requests and their changes |
+| `glab issue create` | Create an issue with explicit `--title` and `--description` |
+| `glab issue note` | Comment on a numeric issue ID with explicit `--message` |
+| `glab mr create` / `new` | Create a same-project MR with explicit projects, branches, text, and safety overrides |
+| `glab mr update` | Update a numeric MR's title, description, labels, draft/ready state, or target-branch metadata |
+| `git clone`, `fetch`, `pull` | Download from an explicit HTTPS project URL |
+| `git push` | Push individually named refs to an explicit HTTPS project URL |
+
+The aliases `ls`, `show`, `new`, `comment`, and MR `accept` receive the same checks. Automatic decisions require `--repo` / `-R` to specify a full HTTPS project URL or a configured `host/group/project` selector. Views, diffs, and comments also require a numeric issue or merge-request ID. Missing selectors, bare project paths, positional URLs, unknown options, and interactive input return ASK. Common list filters, pagination, JSON output, view comments, issue labels, and confidentiality are supported; other options require approval.
+
+Supported writes outside `write_repos` return DENY. Supported reads outside `read_repos` return DENY when `read_all=false`; otherwise supported reads on configured hosts are allowed. A bare allowlist entry applies to that project path across configured hosts; an HTTPS URL pins it to one server. Invalid configuration fails when the policy loads.
+
+MR creation requires `--repo` / `-R` and `--head` / `-H` to identify the same explicit server and project, literal `--source-branch` / `-s` and `--target-branch` / `-b`, non-empty `--title` / `-t` and `--description` / `-d`, plus `--remove-source-branch=false` and `--allow-collaboration=false`. These overrides exclude project defaults that could enable deletion or grant additional source-branch permissions. `--yes`, draft/WIP state, and labels are supported. Missing inputs, a different or inferred head project, pushing/filling, auto-merge, branch creation, attachments, templates, and hidden target-project overrides require approval.
+
+MR updates require one numeric ID, an explicit `--repo`, and at least one supported metadata change: title, description, labels/unlabels, draft/WIP/ready state, or `--target-branch` (no `-b` alias on update). Empty or editor text and file-based input require approval. Creating or updating MR metadata does not change branch contents, so `write_branches` does not restrict it, including selecting a target branch that cannot receive automatic pushes. Descriptions containing a line beginning with `/` after optional whitespace require approval because GitLab may interpret them as quick actions. The check conservatively covers code-block lines and unrecognized slash commands too.
+
+MR merge/`accept` and rebase remain approval-gated. A numeric MR ID does not establish its target branch or its possibly separate fork's source project and branch. In glab 1.123.0, `merge --remove-source-branch=false` omits the API override, leaving the stored removal preference unresolved. Known forbidden merge projects are denied; rebase does not treat the MR's containing project as its source write destination. An explicit removal request on create or merge is denied by default once the configured project is established, even if the MR ID is omitted. `allow_destructive=true` changes that guard to approval, not automatic permission. Update's `--remove-source-branch` toggles stored state and therefore asks; `=false` is a no-op, not a way to disable an existing preference.
+
+Git transfers require a full HTTPS project URL; named remotes (`origin`), omitted destinations, SSH URLs, and local paths return ASK. Common clone branch/depth options, fetch depth/pruning options, pull `--ff-only` / `--no-rebase`, and push verbosity/upstream/atomic options are supported. Unknown options return ASK. Each option keeps its value, including values that resemble another option.
+
+An ordinary push must name its destination fully: `git push https://gitlab.example.com/team/app HEAD:refs/heads/feature`. `refs/heads/feature` alone also works. Bare `feature`, `HEAD:feature`, and `HEAD:heads/feature` return ASK because their meaning can depend on existing refs or configuration. Every destination branch must match `write_branches` exactly, with case preserved; omit this setting or use an empty list to permit any branch in a writable project. Branch restrictions do not affect issues, tags, or MR metadata.
+
+Recognized force pushes, tag pushes, and remote ref deletions return DENY by default, including when the remote is named or omitted. A valid explicit HTTPS authority outside the configured GitLab hosts returns ASK before these guards; malformed project paths on configured hosts still receive the guards. Authorities include their port, and URLs carrying credentials remain unresolved and receive the guards. Set `deny_force_push=false`, `deny_tag_push=false`, or `allow_destructive=true` to pass the corresponding operation through project and branch checks. Explicit tag refs (`refs/tags/v1`) use project permissions and the tag guard. Bulk pushes (`--all`, `--mirror`, `--prune`, `--tags`, `--follow-tags`) still require approval when their default guards are disabled, because the full destination set is unresolved. Shorthand `push URL tag v1` also requires approval when the tag guard is disabled. Dry runs receive the same checks as real pushes.
+
+Git global options (including `-C` and `-c`), `git config`, remote configuration commands, clone configuration, custom transfer programs, recursive submodule options, additional repositories, and push options require approval. `--no-recurse-submodules` is supported; other recursion modes remain behind approval. Other merge-request actions, forks, custom `glab api` requests (including reads), and other command families also require approval. Recognized direct `glab issue`, `mr`, and `repo` deletion actions with supported shell syntax return DENY even when `allow_destructive=true`; that setting does not permit deleting GitLab issues, merge requests, or projects. Local Git commands such as `status`, `diff`, `add`, `commit`, `branch`, and `tag` remain eligible for normal execution when invoked without Git global options. Their subcommand options are not inspected; this includes `git branch -u origin/main`, which changes local upstream configuration. Attaching another forge policy may still make Git transfers require approval.
+
+Shell wrappers and chained commands use the shared POSIX shell parser with conservative approval guards for syntax that differs in Windows shells. Single quotes, backslashes, carets, percent signs, smart quotes, embedded `!`, shell expansion, unquoted shell redirection, unmodelled ASCII control characters (other than tabs/newlines), and detected CLI environment names require approval, including when they occur in literal issue text. The environment guard checks identifier boundaries in raw command segments and parsed token text for protected variable names (`HOME`, `PATH`, `XDG_CONFIG_HOME`, `XDG_CONFIG_DIRS`, GitLab host/configuration selectors, `GIT_*` / `GITLAB_*` / `GLAB_*` and `LD_*` / `DYLD_*` prefixes, standard HTTP/proxy variables in either case, TLS certificate selectors, and `SSH_ASKPASS`) before wrapper resolution or command classification, including names attached to short options. Names match case-insensitively across hosts to cover Windows lookup. This conservatively asks for `export GIT_CONFIG_COUNT`, `printf -v GIT_CONFIG_COUNT 1`, and even literal text such as `git commit -m HOME` or `git add git_helpers.py`; it does not interpret shell variable effects. Use plain double quotes for text containing spaces. Double-quoted literal `<` and `>` remain ordinary text. These guards run before command recognition and tokenization, including for commands without a literal GitLab executable name. Options following a shell command-string flag (`bash -c -- ...`, for example) require approval. Standalone shell negation (`!`) preserves the underlying command’s decision. DENY takes precedence over ASK across independently understood command segments. Unrecognized command forms mentioning `git` or `glab` require approval. Executable recognition ignores casing and `.exe` suffix casing. This is not a full cmd.exe or PowerShell parser. The policy inspects command text and assumes existing CLI configuration and executables are trusted. This includes configuration written through file tools and environment state established in earlier tool calls; arbitrary file writes and script effects are not simulated. Literal protected variable names in removals (`env -u`, `unset`) also require approval. It does not contact GitLab to verify project existence or resolve configuration. GitLab MCP tools, direct HTTP clients, and arbitrary scripts accessing GitLab are outside its coverage; use additional controls for those paths. GitLab account permissions still apply after policy approval.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `hosts` | string[] | `["gitlab.com"]` | Trusted GitLab HTTPS authorities, including explicit ports |
+| `read_all` | boolean | `true` | Allow supported reads across projects on configured hosts |
+| `read_repos` | string[] | `[]` | Readable projects when `read_all=false` |
+| `write_repos` | string[] | `[]` | Projects permitting supported issue/MR writes and Git pushes |
+| `write_branches` | string[] | `[]` | Exact, case-sensitive push destination branch names; empty permits all |
+| `allow_destructive` | boolean | `false` | Permit explicit Git ref deletions through write checks; MR source-removal requests still require approval |
+| `deny_tag_push` | boolean | `true` | Block tag pushes |
+| `deny_force_push` | boolean | `true` | Block force flags and force-prefixed refspecs |
+| `shell_tools` | string[] | every harness shell tool | Tools whose `command` argument is inspected |
+| `deny_reason` | string | `GitLab operation blocked by policy.` | Prefix for DENY explanations |
+
+```yaml
+gitlab_access:
+  type: function
+  handler: omnigent.policies.builtins.gitlab.gitlab_policy
+  factory_params:
+    hosts:
+      - gitlab.example.com
+    read_all: false
+    read_repos:
+      - https://gitlab.example.com/team/app
+    write_repos:
+      - https://gitlab.example.com/team/app
+```
+
+For this configuration, `glab issue create -R https://gitlab.example.com/team/app -t Fix -d Details` is allowed by this policy, the same write to `team/other` is denied, and `git push origin feature` or an incomplete `glab mr create` asks for approval. Add `write_branches: [feature]` to allow pushes such as `git push https://gitlab.example.com/team/app HEAD:refs/heads/feature` while blocking a push to `refs/heads/main`.
+
+This explicit same-project MR creation is also allowed:
+
+```sh
+glab mr create -R https://gitlab.example.com/team/app -H https://gitlab.example.com/team/app -s feature -b main -t Fix -d Details --remove-source-branch=false --allow-collaboration=false
+```
+
 ### Google Workspace
 
 #### `gdrive_policy`

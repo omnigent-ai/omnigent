@@ -10411,7 +10411,10 @@ async def test_sys_session_share_public_allows_public_grant(level: str, number: 
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
+@pytest.mark.parametrize("archived", [False, True])
+async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(
+    archived: bool,
+) -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
@@ -10442,6 +10445,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_id": "ag_xyz",
                     "agent_name": "researcher",
                     "status": "running",
+                    "archived": archived,
                     "created_at": 1,
                     "updated_at": 84,
                     "title": "auth flow",
@@ -10486,6 +10490,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["archived"] is archived
     assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
@@ -10517,6 +10522,120 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert "items" not in info
     assert "total_cost_usd" not in info
     assert "usage_by_model" not in info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_usage", "expected_usage"),
+    [
+        pytest.param(
+            {
+                "total_cost_usd": 1.25,
+                "usage_by_model": {
+                    "model-a": {
+                        "input_tokens": 12,
+                        "output_tokens": 4,
+                        "total_tokens": 30,
+                        "cache_read_input_tokens": 14,
+                        "total_cost_usd": 1.0,
+                    },
+                    "model-b": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+                },
+            },
+            {
+                "total_cost_usd": 1.25,
+                "cost_hidden": False,
+                "input_tokens": 15,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 14,
+                "cache_creation_input_tokens": None,
+                "total_tokens": 34,
+                "by_model": {
+                    "model-a": {
+                        "input_tokens": 12,
+                        "output_tokens": 4,
+                        "total_tokens": 30,
+                        "cache_read_input_tokens": 14,
+                        "total_cost_usd": 1.0,
+                    },
+                    "model-b": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4},
+                },
+            },
+            id="priced",
+        ),
+        pytest.param(
+            {
+                "total_cost_usd": None,
+                "cost_hidden": True,
+                "usage_by_model": {"model-a": {"input_tokens": 7}},
+            },
+            {
+                "total_cost_usd": None,
+                "cost_hidden": True,
+                "input_tokens": 7,
+                "output_tokens": None,
+                "cache_read_input_tokens": None,
+                "cache_creation_input_tokens": None,
+                "total_tokens": None,
+                "by_model": {"model-a": {"input_tokens": 7}},
+            },
+            id="cost-hidden",
+        ),
+        pytest.param(
+            {"total_cost_usd": None, "usage_by_model": None},
+            {
+                "total_cost_usd": None,
+                "cost_hidden": False,
+                "input_tokens": None,
+                "output_tokens": None,
+                "cache_read_input_tokens": None,
+                "cache_creation_input_tokens": None,
+                "total_tokens": None,
+                "by_model": {},
+            },
+            id="no-usage-yet",
+        ),
+        pytest.param({"usage_included": False}, None, id="aggregate-skipped"),
+    ],
+)
+async def test_sys_session_get_info_include_usage_reports_cost_and_tokens(
+    snapshot_usage: dict[str, object],
+    expected_usage: dict[str, object] | None,
+) -> None:
+    """
+    ``include_usage`` asks the server for the usage aggregate and projects it.
+
+    Token totals sum the per-model buckets, an unrecorded bucket stays null
+    instead of reading as zero, and an unpriced or hidden cost stays null.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_reads: list[dict[str, str]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            session_reads.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={"id": "conv_target", "status": "idle", **snapshot_usage},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target", "include_usage": True}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert [read["include_usage"] for read in session_reads] == ["true"]
+    info = json.loads(output)
+    assert info["session_id"] == "conv_target"
+    assert info["usage"] == expected_usage
 
 
 @pytest.mark.asyncio
@@ -15644,6 +15763,231 @@ async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed
     first, second, first_again, updated, second_again = resolve_counts
     assert first > 0 and second > first
     assert first_again == second and updated > first_again and second_again == updated
+
+
+@pytest.mark.asyncio
+async def test_routing_flip_rebuilds_advertised_tools_without_dropping_mcp(monkeypatch):
+    """A routing change reaches the advertised tools and keeps the MCP tools.
+
+    The routing answer arrives on the session-init envelope. Rebuilding the
+    advertised tools must also rediscover MCP, because a kept MCP spec hash
+    skips discovery and would drop the MCP tools from the rebuilt list.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        build_runner_session_init_payload,
+    )
+    from omnigent.runtime import _globals
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.spec.types import MCPServerConfig
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+    sid = "conv_routing_flip"
+    spec = AgentSpec(
+        spec_version=1,
+        name="flip",
+        spawn=True,
+        mcp_servers=[MCPServerConfig(name="tracker", transport="registry")],
+    )
+    discoveries: list[int] = []
+
+    async def resolver(agent_id, session_id=None):
+        return spec
+
+    async def schemas(self, _spec):
+        discoveries.append(1)
+        return SimpleNamespace(
+            schemas=[
+                {
+                    "type": "function",
+                    "name": "mcp__tracker__ping",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_names={"mcp__tracker__ping"},
+            failures={},
+        )
+
+    def tool_names(body):
+        return {t.get("name") or t.get("function", {}).get("name") for t in body["tools"]}
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=resolver,
+        server_client=NullServerClient(),
+    )
+    conv = Conversation(
+        id=sid,
+        agent_id="ag_flip",
+        runner_id="runner_test",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=sid,
+    )
+    message = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_flip",
+        "harness": "hermes",
+        "content": [],
+    }
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions", json=build_runner_session_init_payload(conv, server_version="t")
+        )
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        before = tool_names(recording.posted_bodies[-1])
+        discoveries_before_flip = len(discoveries)
+
+        response = await http.post(
+            "/v1/sessions",
+            json=build_runner_session_init_payload(
+                conv, server_version="t", smart_routing_available=True
+            ),
+        )
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        after = tool_names(recording.posted_bodies[-1])
+
+        # An ID-only legacy init carries no answer, so the process keeps the last one.
+        response = await http.post(
+            "/v1/sessions", json={"session_id": sid, "agent_id": "ag_flip", "sub_agent_name": None}
+        )
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        after_legacy = tool_names(recording.posted_bodies[-1])
+
+        # An envelope from a server that predates the field reads as "no router".
+        old_payload = build_runner_session_init_payload(conv, server_version="t")
+        del old_payload[SESSION_INIT_PAYLOAD_KEY]["smart_routing_available"]
+        response = await http.post("/v1/sessions", json=old_payload)
+        assert response.status_code in (200, 201), response.text
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        after_old_server = tool_names(recording.posted_bodies[-1])
+
+    assert "mcp__tracker__ping" in before and "mcp__tracker__ping" in after
+    assert "sys_advise_models" not in before
+    assert "sys_advise_models" in after
+    assert "sys_advise_models" in after_legacy
+    assert "mcp__tracker__ping" in after_legacy and "mcp__tracker__ping" in after_old_server
+    assert "sys_advise_models" not in after_old_server
+    assert len(discoveries) > discoveries_before_flip
+
+
+@pytest.mark.asyncio
+async def test_routing_flip_during_another_sessions_mcp_discovery_keeps_both_sessions_tools(
+    monkeypatch,
+):
+    """A routing flip from session B must not disturb session A's in-flight discovery.
+
+    A pauses inside its MCP discovery, B's session-init envelope flips the routing
+    answer, then A finishes. Both sessions keep their built-in and MCP tools, and
+    ``sys_advise_models`` follows the answer on each session's next turn.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from omnigent.runtime import _globals
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.spec.types import MCPServerConfig
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+    sid_a, sid_b = "conv_interleave_a", "conv_interleave_b"
+    entered_a = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def resolver(agent_id, session_id=None):
+        return AgentSpec(
+            spec_version=1,
+            name=session_id,
+            spawn=True,
+            mcp_servers=[MCPServerConfig(name="tracker", transport="registry")],
+        )
+
+    async def schemas(self, spec):
+        if spec.name == sid_a and not entered_a.is_set():
+            entered_a.set()
+            await release_a.wait()
+        return SimpleNamespace(
+            schemas=[
+                {
+                    "type": "function",
+                    "name": "mcp__tracker__ping",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_names={"mcp__tracker__ping"},
+            failures={},
+        )
+
+    def tool_names(body):
+        return {t.get("name") or t.get("function", {}).get("name") for t in body["tools"]}
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=resolver,
+        server_client=NullServerClient(),
+    )
+    message = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "ag_interleave",
+        "harness": "hermes",
+        "content": [],
+    }
+
+    async def send(http, sid):
+        response = await http.post(f"/v1/sessions/{sid}/events?stream=false", json=message)
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(sid)
+        return tool_names(recording.posted_bodies[-1])
+
+    conv_b = Conversation(
+        id=sid_b,
+        agent_id="ag_interleave",
+        runner_id="runner_test",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=sid_b,
+    )
+    async with _runner_test_client(app) as http:
+        turn_a = asyncio.create_task(send(http, sid_a))
+        await asyncio.wait_for(entered_a.wait(), timeout=10)
+        # B's envelope flips the answer while A is paused inside its MCP discovery.
+        response = await http.post(
+            "/v1/sessions",
+            json=build_runner_session_init_payload(
+                conv_b, server_version="t", smart_routing_available=True
+            ),
+        )
+        assert response.status_code in (200, 201), response.text
+        release_a.set()
+        a_first = await turn_a
+
+        a_second = await send(http, sid_a)
+        b_first = await send(http, sid_b)
+
+    for names in (a_first, a_second, b_first):
+        assert "mcp__tracker__ping" in names, names
+        assert "sys_list_models" in names, names
+    assert "sys_advise_models" not in a_first
+    assert "sys_advise_models" in a_second
+    assert "sys_advise_models" in b_first
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from starlette.datastructures import State
 
 from omnigent.entities import Conversation
 from omnigent.entities.session_journal import JournalEntry
@@ -37,6 +38,7 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
+from omnigent.server.proactive_agent import is_proactive_task
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._sessions.helpers import (
     _session_sandbox_status_cache,
@@ -45,6 +47,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes.scheduled_task_permissions import (
     display_names_or_ids,
     request_from_agent,
+    scheduled_task_viewer_role,
 )
 from omnigent.server.routes.workflow_permissions import (
     WorkflowViewerRole,
@@ -61,6 +64,7 @@ from omnigent.server.schemas import (
     WorkflowList,
     WorkflowObject,
     WorkflowRun,
+    WorkflowRunAutomation,
     WorkflowRunList,
     WorkflowRunProgress,
     WorkflowRunStarter,
@@ -78,9 +82,11 @@ from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     MAX_SESSION_FAMILY_MEMBERS,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
 )
 from omnigent.stores.permission_store import MAX_SHARED_WORKFLOWS_PAGE_SIZE, PermissionStore
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.stores.workflow_store import (
     WORKFLOW_PAGE_MAX,
@@ -248,10 +254,18 @@ def _sandbox_launching(session: Conversation) -> bool:
     return session.labels.get(STARTUP_LABEL) == "pending"
 
 
+def workflows_enabled(app_state: State | None) -> bool:
+    """Whether the server whose ``app.state`` this is enables workflows.
+
+    :param app_state: The server's ``app.state``; ``None`` reads the default flags.
+    """
+    flags = getattr(app_state, "feature_flags", FeatureFlags())
+    return flags.enabled(Feature.WORKFLOWS)
+
+
 def require_workflows(request: Request) -> None:
     """Reject workflow and journal requests unless the server enables workflows."""
-    flags = getattr(request.app.state, "feature_flags", FeatureFlags())
-    if not flags.enabled(Feature.WORKFLOWS):
+    if not workflows_enabled(request.app.state):
         raise OmnigentError("Workflows are disabled on this server", code=ErrorCode.NOT_FOUND)
 
 
@@ -260,6 +274,7 @@ def create_workflows_router(
     *,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
 ) -> APIRouter:
     """Build the workflows router, mounted under ``/v1``.
 
@@ -270,6 +285,8 @@ def create_workflows_router(
     :param permission_store: Checks whether that calling session is shared
         with edit access, and keeps who each workflow is shared with; ``None``
         disables the check and sharing.
+    :param scheduled_task_store: Names the automation whose scheduled run started
+        each listed run; ``None`` names none.
     """
     router = APIRouter(dependencies=[Depends(require_workflows)])
 
@@ -841,6 +858,34 @@ def create_workflows_router(
         _name_workflows(runs, user_id)
         return runs
 
+    def _name_automations(
+        request: Request, runs: Sequence[WorkflowRun], user_id: str | None
+    ) -> None:
+        """
+        Name the automation whose scheduled run started each run's session, when the
+        caller may see that automation. Blocking.
+        """
+        if scheduled_task_store is None:
+            return
+        sessions = conversation_store.get_conversations([run.session_id for run in runs])
+        origins = {
+            session_id: task_id
+            for session_id, session in sessions.items()
+            if (task_id := session.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY))
+        }
+        if not origins:
+            return
+        tasks = scheduled_task_store.get_many(sorted(set(origins.values())))
+        caller_id = None if user_id == RESERVED_USER_LOCAL else user_id
+        for run in runs:
+            task = tasks.get(origins.get(run.session_id, ""))
+            if (
+                task is not None
+                and not is_proactive_task(task)
+                and scheduled_task_viewer_role(request, task, caller_id, permission_store)
+            ):
+                run.automation = WorkflowRunAutomation(id=task.id, name=task.name)
+
     def _readable_session(user_id: str | None, session_id: str) -> Conversation | None:
         try:
             session = conversation_store.get_conversation(uuid_to_bytes(session_id).hex())
@@ -910,7 +955,10 @@ def create_workflows_router(
 
         def runs(store: SessionJournalStore) -> list[WorkflowRun]:
             listed = _runs(store, plans, user_id)
-            return _link_runs(store, listed, plans, user_id) if listed else listed
+            if not listed:
+                return listed
+            _name_automations(request, listed, user_id)
+            return _link_runs(store, listed, plans, user_id)
 
         data = await asyncio.to_thread(runs, journal)
         return WorkflowRunList(data=data, next_cursor=next_cursor)

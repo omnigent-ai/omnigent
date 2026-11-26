@@ -5,12 +5,16 @@ import { type ReactNode, useSyncExternalStore } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { DiffReviewCommand } from "@/components/diff-review/diffReviewCommands";
+import type { DiffReviewToolbarProps } from "@/components/diff-review/DiffReviewToolbar";
+import { DEFAULT_DIFF_REVIEW_FILTERS } from "@/components/diff-review/diffReviewModel";
 import type * as WorkingCopyChangesModule from "@/hooks/useWorkingCopyChanges";
 import type { WorkingCopyChanges } from "@/hooks/useWorkingCopyChanges";
 import type { inMemoryCustomComparisons } from "@/lib/commitComparisons";
 import type { RevisionSpec } from "@/lib/customComparison";
 import type * as WorkingCopyComparisonsModule from "@/lib/workingCopyComparisons";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import { BRANCH_RANGE } from "@/lib/branchCommits";
 import type * as BranchCommitsModule from "@/lib/branchCommits";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { openFindForActiveSurface } from "@/lib/findRouting";
@@ -579,7 +583,10 @@ const showCommitCommand = () =>
     .find((command) => command.id === "show-a-commit:s1");
 
 /** A review whose session can compare revisions and lists these commits once asked. */
-function reviewWithCommits(listed = [commitRow(SHOWN_COMMIT, "Fix the build")]) {
+function reviewWithCommits(
+  listed = [commitRow(SHOWN_COMMIT, "Fix the build")],
+  custom: RevisionSpec | null = null,
+) {
   mocks.fetchBranchCommits.mockResolvedValue({
     kind: "listed",
     commits: listed,
@@ -589,6 +596,7 @@ function reviewWithCommits(listed = [commitRow(SHOWN_COMMIT, "Fix the build")]) 
   const shared = changes({
     revisionSupport: { kind: "available" },
     workspace: { hostId: "host_1", root: "/repo" },
+    custom,
   });
   const built = source(shared);
   mocks.source.mockReturnValue(built);
@@ -725,7 +733,7 @@ describe("the Commits and Changes tabs", () => {
     expect(tab("Commits")).toContainElement(
       screen.getByText("2", { selector: "[data-slot=badge]" }),
     );
-    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith("s1", expect.anything());
+    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith("s1", BRANCH_RANGE, expect.anything());
 
     await userEvent.click(tab("Commits"));
     expect(await screen.findByRole("option", { name: /Fix the build/ })).toBeVisible();
@@ -733,6 +741,22 @@ describe("the Commits and Changes tabs", () => {
     const behind = mocks.body.mock.calls.at(-1)![0] as WorkingCopyDiffReviewBodyProps;
     expect(behind.active).toBe(false);
     expect(behind.fileActionsInPalette).toBe(false);
+  });
+
+  it("lists and counts a typed base and head's commits, not the branch's", async () => {
+    reviewWithCommits([commitRow(SHOWN_COMMIT, "Fix the build")], { base: "v1", head: "feature" });
+    renderReview();
+    expect(await screen.findByText("1", { selector: "[data-slot=badge]" })).toBeVisible();
+    expect(mocks.fetchBranchCommits).toHaveBeenCalledWith(
+      "s1",
+      { base: "v1", head: "feature" },
+      expect.anything(),
+    );
+    expect(mocks.fetchBranchCommits).not.toHaveBeenCalledWith(
+      "s1",
+      BRANCH_RANGE,
+      expect.anything(),
+    );
   });
 
   it("opens a picked commit in Commits, keeping the comparison, with focus on its title", async () => {
@@ -759,6 +783,57 @@ describe("the Commits and Changes tabs", () => {
       base: `${SHOWN_COMMIT}~1`,
       head: SHOWN_COMMIT,
     });
+  });
+
+  it("offers Wrap long lines in the Diff options of the changes' and a commit's toolbar", async () => {
+    reviewWithCommits();
+    renderReview();
+    const wrap = vi.fn();
+    const toolbarProps: DiffReviewToolbarProps = {
+      commands: [
+        {
+          id: "toggle-wrap",
+          label: "Wrap lines",
+          icon: () => null,
+          keywords: [],
+          pressed: false,
+          run: wrap,
+        } as unknown as DiffReviewCommand,
+      ],
+      fileCount: 1,
+      filters: DEFAULT_DIFF_REVIEW_FILTERS,
+      dispatchFilter: () => {},
+      languages: [],
+      testCount: 0,
+      generatedCount: 0,
+      filtersOpen: false,
+      setFiltersOpen: () => {},
+      breakdown: {
+        totals: { files: 1, additions: 1, deletions: 0 },
+        notViewed: { files: 1, additions: 1, deletions: 0 },
+        languages: [],
+      },
+      languagesOpen: false,
+      setLanguagesOpen: () => {},
+    };
+    const wrapsFrom = async (props: WorkingCopyDiffReviewBodyProps) => {
+      const toolbar = render(
+        <TooltipProvider>{props.presentation!.toolbar!(toolbarProps)}</TooltipProvider>,
+      );
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Diff options" }), { button: 0 });
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Wrap long lines" }));
+      toolbar.unmount();
+    };
+    const lastBody = () => mocks.body.mock.lastCall![0] as WorkingCopyDiffReviewBodyProps;
+    await wrapsFrom(lastBody());
+    expect(wrap).toHaveBeenCalledTimes(1);
+
+    // A commit's review has its own toolbar, which offers the same.
+    await userEvent.click(tab("Commits"));
+    await userEvent.click(await screen.findByRole("option", { name: /Fix the build/ }));
+    await vi.waitFor(() => expect(lastBody().showComparisonNotes).toBe(false));
+    await wrapsFrom(lastBody());
+    expect(wrap).toHaveBeenCalledTimes(2);
   });
 
   it("compares a root commit with the empty tree, since it has no parent", async () => {

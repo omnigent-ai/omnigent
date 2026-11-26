@@ -34,6 +34,7 @@ const PR = "https://github.com/example-org/widgets/pull/12";
 function renderBody(props: Partial<ComponentProps<typeof PullRequestPageBody>> = {}) {
   const client = new QueryClient();
   const onSectionChange = vi.fn();
+  const onShowAllPullRequests = vi.fn();
   render(
     <QueryClientProvider client={client}>
       <PullRequestPageBody
@@ -42,11 +43,12 @@ function renderBody(props: Partial<ComponentProps<typeof PullRequestPageBody>> =
         section="comments"
         active
         onSectionChange={onSectionChange}
+        onShowAllPullRequests={onShowAllPullRequests}
         {...props}
       />
     </QueryClientProvider>,
   );
-  return { client, onSectionChange };
+  return { client, onSectionChange, onShowAllPullRequests };
 }
 
 beforeEach(() => {
@@ -105,6 +107,12 @@ describe("PullRequestPageBody", () => {
     expect(onSectionChange).not.toHaveBeenCalled();
     act(() => captured.details!.setActiveTab("comments"));
     expect(onSectionChange).toHaveBeenCalledWith("comments");
+  });
+
+  it("shows the session's list of pull requests from its All pull requests button", async () => {
+    const { onShowAllPullRequests } = renderBody();
+    await userEvent.click(screen.getByRole("button", { name: "All pull requests" }));
+    expect(onShowAllPullRequests).toHaveBeenCalledOnce();
   });
 
   it("refreshes the session's pull requests, disabled until the refresh settles", async () => {

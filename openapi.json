@@ -2591,8 +2591,15 @@
             "title": "Project Id"
           },
           "prompt": {
-            "title": "Prompt",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -2654,6 +2661,29 @@
             "default": "UTC",
             "title": "Timezone"
           },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2669,7 +2699,6 @@
         },
         "required": [
           "name",
-          "prompt",
           "rrule",
           "agent_id"
         ],
@@ -8133,6 +8162,11 @@
             "title": "Proactive Agent Available",
             "type": "boolean"
           },
+          "project_mute": {
+            "default": true,
+            "title": "Project Mute",
+            "type": "boolean"
+          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"
@@ -8268,6 +8302,11 @@
             "title": "Scheduled Task Trigger Headers",
             "type": "boolean"
           },
+          "scheduled_task_workflow_id": {
+            "default": true,
+            "title": "Scheduled Task Workflow Id",
+            "type": "boolean"
+          },
           "scheduled_task_worktrees": {
             "default": true,
             "title": "Scheduled Task Worktrees",
@@ -8281,6 +8320,11 @@
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_archive_runner_checks": {
+            "default": false,
+            "title": "Session Archive Runner Checks",
+            "type": "boolean"
           },
           "session_bundle_model_override": {
             "default": true,
@@ -8369,6 +8413,11 @@
           "session_search_scope": {
             "default": true,
             "title": "Session Search Scope",
+            "type": "boolean"
+          },
+          "session_timers": {
+            "default": false,
+            "title": "Session Timers",
             "type": "boolean"
           },
           "session_title_instructions": {
@@ -12050,6 +12099,12 @@
             "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
             "title": "Id"
           },
+          "muted": {
+            "default": false,
+            "description": "Whether the owner muted notifications for every session in the project, read from its `config`; `False` for a label-only folder.",
+            "title": "Muted",
+            "type": "boolean"
+          },
           "name": {
             "description": "Project name (the folder's display name and union key).",
             "title": "Name",
@@ -14269,6 +14324,16 @@
             ],
             "title": "Stdout"
           },
+          "submission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalCommandSubmission"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "type": {
             "const": "terminal_command",
             "title": "Type",
@@ -15344,12 +15409,97 @@
             ],
             "description": "Captured stdout text. Present when `kind=\"output\"`, `None` otherwise.",
             "title": "Stdout"
+          },
+          "submission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalCommandSubmission"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "kind"
         ],
         "title": "TerminalCommandData",
+        "type": "object"
+      },
+      "TerminalCommandSubmission": {
+        "description": "Server-owned identity of the web submission consumed by a shell input.",
+        "properties": {
+          "pending_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Id"
+          },
+          "stable_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stable Id"
+          }
+        },
+        "title": "TerminalCommandSubmission",
+        "type": "object"
+      },
+      "TerminalShellState": {
+        "description": "Whether a session terminal runs anything besides its login shell.\n\nOnly what a close confirmation needs: never a pid, an argument or another process.",
+        "properties": {
+          "background_jobs": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When busy, how many other jobs run. Null when jobs can't be told apart, as in a sandboxed pane.",
+            "title": "Background Jobs"
+          },
+          "foreground": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When busy, the foreground job's command name, e.g. `vim`; cleaned and at most 32 characters. Null when it can't be told.",
+            "title": "Foreground"
+          },
+          "state": {
+            "description": "`idle`: only the login shell runs, with no other process; a loop of shell builtins still reads idle. `busy`: something else does. `unknown`: it couldn't be told in time, or the terminal doesn't run a shell; treat it as busy.",
+            "enum": [
+              "idle",
+              "busy",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "TerminalShellState",
         "type": "object"
       },
       "ToolOutputDeltaEvent": {
@@ -15975,6 +16125,29 @@
               }
             ],
             "title": "Timezone"
+          },
+          "workflow_details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Details"
+          },
+          "workflow_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflow Id"
           },
           "workspace": {
             "anyOf": [
@@ -16899,6 +17072,17 @@
             "title": "Archived",
             "type": "boolean"
           },
+          "automation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkflowRunAutomation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation whose scheduled run started its session, when the caller owns that automation or it is shared with them."
+          },
           "background_work_running": {
             "default": false,
             "description": "Whether background work outlives the session's turn.",
@@ -17056,6 +17240,27 @@
           "progress"
         ],
         "title": "WorkflowRun",
+        "type": "object"
+      },
+      "WorkflowRunAutomation": {
+        "description": "The automation whose scheduled run started a workflow run.",
+        "properties": {
+          "id": {
+            "description": "The automation's ID, e.g. `\"0123456789abcdef0123456789abcdef\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "Its name, e.g. `\"Nightly triage\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WorkflowRunAutomation",
         "type": "object"
       },
       "WorkflowRunList": {
@@ -21281,7 +21486,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders and timers agents\nset for their own sessions stay off the Automations page. The kind filter runs\nin the query, so listing automations never reads an agent's timers. There is no\nreminders-only view; a selective view needs an indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {
@@ -26929,6 +27134,17 @@
               ],
               "title": "Pr Url"
             }
+          },
+          {
+            "description": "Set by a client that polls again soon: the answer may come from the runner's previous read, at most a minute old.",
+            "in": "query",
+            "name": "allow_cached",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Allow Cached",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -28168,6 +28384,93 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/terminals/{terminal_id}/shell": {
+      "get": {
+        "description": "Whether a terminal runs anything besides its login shell, so closing it can skip asking.\n\nOnly a caller who may close the terminal may ask: edit access, as deleting it needs.\nEvery miss answers one fixed 404, and runner failures become fixed messages: the\nrunner's text never reaches the caller, and its answer is rebuilt field by field. A\nrunner tunnel on another replica keeps its routing error, so the client can resend.\n\n**Returns:** `{\"state\", \"foreground\", \"background_jobs\"}`.",
+        "operationId": "get_session_terminal_shell_v1_sessions__session_id__resources_terminals__terminal_id__shell_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Terminal resource id, e.g. `\"terminal_bash_s1\"`.",
+            "in": "path",
+            "name": "terminal_id",
+            "required": true,
+            "schema": {
+              "title": "Terminal Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TerminalShellState"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The caller can't close this terminal"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "No such running terminal in a session the caller can see"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "502": {
+            "description": "The runner failed to inspect the terminal"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The runner is offline, or too old to inspect terminals"
+          }
+        },
+        "summary": "Get Session Terminal Shell",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/{resource_id}": {
       "get": {
         "description": "Return a single resource by id from the unified inventory.\n\n**Returns:** The resource object regardless of type.",
@@ -28544,7 +28847,7 @@
     },
     "/v1/sessions/{session_id}/workspace/{service}/{method}": {
       "post": {
-        "description": "Serve the workspace API to any client, answered by the session's host.\n\nSame read gate as the file routes; the API never takes absolute paths.\nSide chats and sub-agents use the host and workspace of the session that\nowns them. Unconfined sessions only, because the host applies no sandbox's\nhidden paths. A host on another replica gets the REST wrong-replica error,\nso the client's fetch re-addresses it; other refusals are Connect errors.",
+        "description": "Serve the workspace API to any client, answered by the session's host.\n\nEach method has its gate (`omnigent.server.workspace_access`): the file\nmethods the file routes' read gate, the pull request reads their REST routes'\ngates, the pull request changes the session owner's, and an unknown method a\n404. A change from an untrusted `Origin` is refused before any other work.\nThe API never takes absolute paths.\nSide chats and sub-agents use the host and workspace of the session that\nowns them. Unconfined sessions only, because the host applies no sandbox's\nhidden paths. A host on another replica gets the REST wrong-replica error,\nso the client's fetch re-addresses it; other refusals are Connect errors.",
         "operationId": "call_workspace_api_v1_sessions__session_id__workspace__service___method__post",
         "parameters": [
           {

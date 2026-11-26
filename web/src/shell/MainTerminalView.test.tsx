@@ -146,6 +146,7 @@ function viewTree({
   sandboxOffline = false,
   isLoading = false,
   isFetching = false,
+  onShownTerminalKeys,
 }: {
   terminals: TerminalInfo[];
   isNativeWrapper?: boolean;
@@ -161,6 +162,7 @@ function viewTree({
   sandboxOffline?: boolean;
   isLoading?: boolean;
   isFetching?: boolean;
+  onShownTerminalKeys?: (keys: readonly string[]) => void;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading, isFetching, error: null });
   return (
@@ -174,6 +176,7 @@ function viewTree({
         lastTaskError={lastTaskError}
         onResume={onResume}
         sandboxOffline={sandboxOffline}
+        onShownTerminalKeys={onShownTerminalKeys}
       />
     </TerminalFirstContextProvider>
   );
@@ -191,6 +194,114 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+
+describe("MainTerminalView — the terminals it shows", () => {
+  const REPL_KEY = `terminal:${REPL_TERMINAL.id}`;
+  const SHELL_KEY = `terminal:${BASH_SHELL.id}`;
+  const rendered = () =>
+    screen.queryAllByTestId("terminal-view").map((view) => `terminal:${view.dataset.terminalId}`);
+
+  it("reports the shell it was opened on, then the agent's terminal once hidden, then none", async () => {
+    const shown = vi.fn();
+    const props = { terminals: [REPL_TERMINAL, BASH_SHELL], onShownTerminalKeys: shown };
+    const { rerender, unmount } = renderView({ ...props, initialTerminalKey: SHELL_KEY });
+    expect(shown).toHaveBeenLastCalledWith([SHELL_KEY]);
+    await waitFor(() => expect(rendered()).toEqual([SHELL_KEY]));
+
+    rerender(viewTree({ ...props, initialTerminalKey: SHELL_KEY, visible: false }));
+    expect(shown).toHaveBeenLastCalledWith([REPL_KEY]);
+    await waitFor(() => expect(rendered()).toEqual([REPL_KEY]));
+
+    unmount();
+    expect(shown).toHaveBeenLastCalledWith([]);
+  });
+
+  it("reports nothing while the list is empty, and the terminal a late list brings", async () => {
+    const shown = vi.fn();
+    const { rerender } = renderView({
+      terminals: [],
+      initialTerminalKey: SHELL_KEY,
+      onShownTerminalKeys: shown,
+    });
+    expect(shown).toHaveBeenLastCalledWith([]);
+    // Only the agent's terminal is listed yet: the view shows it, not the shell it waits for.
+    rerender(
+      viewTree({
+        terminals: [REPL_TERMINAL],
+        initialTerminalKey: SHELL_KEY,
+        onShownTerminalKeys: shown,
+      }),
+    );
+    expect(shown).toHaveBeenLastCalledWith([REPL_KEY]);
+    await waitFor(() => expect(rendered()).toEqual([REPL_KEY]));
+  });
+
+  it("tells a listener that replaces another the terminals it shows, and the one it replaced none", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const { rerender } = renderView({ terminals: [REPL_TERMINAL], onShownTerminalKeys: first });
+    expect(first).toHaveBeenLastCalledWith([REPL_KEY]);
+
+    rerender(viewTree({ terminals: [REPL_TERMINAL], onShownTerminalKeys: second }));
+    expect(first).toHaveBeenLastCalledWith([]);
+    expect(second).toHaveBeenCalledExactlyOnceWith([REPL_KEY]);
+
+    // Dropping the listener tells it none, too.
+    rerender(viewTree({ terminals: [REPL_TERMINAL] }));
+    expect(second).toHaveBeenLastCalledWith([]);
+    expect(first).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports before a layout effect after it runs, so a view beside it can act before paint", () => {
+    let heard: readonly string[] | null = null;
+    let heardByProbe: readonly string[] | null = null;
+    function Probe() {
+      useLayoutEffect(() => {
+        heardByProbe = heard;
+      });
+      return null;
+    }
+    useTerminalsMock.mockReturnValue({
+      terminals: [REPL_TERMINAL],
+      isLoading: false,
+      isFetching: false,
+      error: null,
+    });
+    render(
+      <>
+        {viewTree({
+          terminals: [REPL_TERMINAL],
+          onShownTerminalKeys: (keys) => {
+            heard = keys;
+          },
+        })}
+        <Probe />
+      </>,
+    );
+    expect(heardByProbe).toEqual([REPL_KEY]);
+  });
+
+  it("tells a listener nothing more while the terminals it shows stay the same", () => {
+    const shown = vi.fn();
+    const { rerender } = renderView({ terminals: [REPL_TERMINAL], onShownTerminalKeys: shown });
+    // A refetched list: new objects, the same terminals.
+    rerender(viewTree({ terminals: [{ ...REPL_TERMINAL }], onShownTerminalKeys: shown }));
+    rerender(viewTree({ terminals: [{ ...REPL_TERMINAL }], onShownTerminalKeys: shown }));
+    expect(shown).toHaveBeenCalledExactlyOnceWith([REPL_KEY]);
+  });
+
+  it("ends on the terminals it shows through StrictMode's mount, unmount and mount again", () => {
+    const shown = vi.fn();
+    render(
+      <StrictMode>
+        {viewTree({ terminals: [REPL_TERMINAL], onShownTerminalKeys: shown })}
+      </StrictMode>,
+    );
+    // The simulated unmount reports none; the remount reports the agent's terminal again.
+    expect(shown.mock.calls.map(([keys]) => keys)).toContainEqual([]);
+    expect(shown).toHaveBeenLastCalledWith([REPL_KEY]);
+  });
 });
 
 describe("MainTerminalView — automatic recovery", () => {
@@ -924,12 +1035,14 @@ describe("MainTerminalView — split panes", () => {
       visible = true,
       readOnly = false,
       onResume,
+      onShownTerminalKeys,
     }: {
       isFetching?: boolean;
       listCompleteAt?: number;
       visible?: boolean;
       readOnly?: boolean;
       onResume?: () => void | Promise<void>;
+      onShownTerminalKeys?: (keys: readonly string[]) => void;
     } = {},
   ) {
     useTerminalsMock.mockReturnValue({
@@ -949,6 +1062,7 @@ describe("MainTerminalView — split panes", () => {
             visible={visible}
             readOnly={readOnly}
             onResume={onResume}
+            onShownTerminalKeys={onShownTerminalKeys}
             splittable
           />
         </TerminalFirstContextProvider>
@@ -966,6 +1080,32 @@ describe("MainTerminalView — split panes", () => {
     expect(agentPane).toHaveAttribute("data-active", "false");
     expect(bashPane).toHaveAttribute("data-active", "true");
     expect(screen.getByRole("separator", { name: "Resize terminal panes" })).toBeInTheDocument();
+  });
+
+  it("reports each pane's terminal, leaving out a pane whose terminal isn't listed", async () => {
+    const GONE_KEY = "terminal:terminal_gone_s9";
+    writeSessionWorkspaceState("conv_split_report", {
+      terminalSplit: {
+        layout: {
+          axis: "columns",
+          ratio: 0.5,
+          children: [AGENT_KEY, { axis: "rows", ratio: 0.5, children: [BASH_KEY, GONE_KEY] }],
+        },
+        focusedKey: BASH_KEY,
+      },
+    });
+    const shown = vi.fn();
+    const { rerender } = render(
+      splitTree("conv_split_report", [REPL_TERMINAL, BASH_SHELL], true, {
+        onShownTerminalKeys: shown,
+      }),
+    );
+    expect(shown).toHaveBeenLastCalledWith([AGENT_KEY, BASH_KEY]);
+    await waitFor(() => expect(screen.getAllByTestId("terminal-view")).toHaveLength(2));
+
+    // The agent's terminal goes while its shell stays: the split keeps showing the shell.
+    rerender(splitTree("conv_split_report", [BASH_SHELL], true, { onShownTerminalKeys: shown }));
+    expect(shown).toHaveBeenLastCalledWith([BASH_KEY]);
   });
 
   it("keeps the split shell mounted and usable while recovering its missing agent", async () => {

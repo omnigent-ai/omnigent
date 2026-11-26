@@ -74,11 +74,19 @@ export function terminalTabWait(
   return inventory === "unknown" && !inputs.listFailed ? "shell_list" : null;
 }
 
+/** How long, in ms, a shell may wait for ``wait`` before its tab stops connecting. */
+export function terminalTabWaitLimit(wait: TerminalTabWait): number {
+  return wait === "shell_list" ? SHELL_LIST_LIMIT_MS : SANDBOX_RESUME_TOTAL_LIMIT_MS;
+}
+
 export function terminalTabConnection(inputs: TerminalTabInputs): TerminalTabConnection {
   const { liveness, sandbox, waited } = inputs;
   if (inputs.inventory === "live") return { kind: "live" };
   if (sandbox.status !== "none") {
-    if (terminalTabWait(inputs) === "reported_stage" && waited >= SANDBOX_RESUME_TOTAL_LIMIT_MS) {
+    if (
+      terminalTabWait(inputs) === "reported_stage" &&
+      waited >= terminalTabWaitLimit("reported_stage")
+    ) {
       return { kind: "sandbox", status: "asleep", failure: null };
     }
     return { kind: "sandbox", status: sandbox.status, failure: sandbox.failure };
@@ -87,7 +95,7 @@ export function terminalTabConnection(inputs: TerminalTabInputs): TerminalTabCon
   if (liveness === "local_stranded") return { kind: "local_stranded" };
   if (liveness === "runner_asleep") return { kind: "runner_asleep", failure: null };
   if (liveness === "starting") {
-    if (waited < SANDBOX_RESUME_TOTAL_LIMIT_MS) return { kind: "connecting" };
+    if (waited < terminalTabWaitLimit("starting")) return { kind: "connecting" };
     return inputs.hostResumable
       ? { kind: "sandbox", status: "failed", failure: WAKE_TIMED_OUT }
       : { kind: "runner_asleep", failure: START_TIMED_OUT };
@@ -95,5 +103,7 @@ export function terminalTabConnection(inputs: TerminalTabInputs): TerminalTabCon
   if (inputs.inventory === "gone") return { kind: "ended" };
   if (inputs.listFailed) return { kind: "unreachable" };
   // Before the list loads, or while a newly opened shell isn't in it yet.
-  return waited >= SHELL_LIST_LIMIT_MS ? { kind: "unreachable" } : { kind: "connecting" };
+  return waited >= terminalTabWaitLimit("shell_list")
+    ? { kind: "unreachable" }
+    : { kind: "connecting" };
 }

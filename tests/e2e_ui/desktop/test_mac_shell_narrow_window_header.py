@@ -1,6 +1,6 @@
 """Narrow-window layout beside the macOS desktop shell's window controls.
 
-Electron lets the window shrink to 720px, below the SPA's 1181px mobile-layout
+Electron lets the window shrink to 480px, below the SPA's 1181px mobile-layout
 breakpoint. The desktop app keeps the desktop layout there. These tests emulate
 the macOS shell in Chromium, as
 ``tests/e2e_ui/sessions/test_session_search.py`` does.
@@ -20,7 +20,7 @@ from tests.e2e_ui.desktop._mac_shell import (
 )
 
 _WIDE_VIEWPORT = {"width": 1280, "height": 860}
-_NARROW_VIEWPORT = {"width": 740, "height": 860}
+_NARROW_VIEWPORT = {"width": 480, "height": 860}
 
 # Electron applies app-region rects in document order, ignoring stacking, opacity
 # and pointer-events, so the last rendered region over a point decides dragging.
@@ -97,7 +97,7 @@ def _expect_docked_sidebar(page: Page, aside: Locator) -> None:
           const rect = document
             .querySelector('aside[aria-label="Conversations"]')
             .getBoundingClientRect();
-          return rect.x === 0 && rect.width > 0 && rect.width < windowWidth / 2;
+          return rect.x === 0 && rect.width > 0 && rect.width <= windowWidth / 2;
         }""",
         arg=_NARROW_VIEWPORT["width"],
     )

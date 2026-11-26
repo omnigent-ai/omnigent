@@ -9,9 +9,9 @@ import type { SandboxResumeNoticeState } from "@/components/SandboxResumeNotice"
 import { refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { useSandboxResume } from "@/hooks/useSandboxResume";
 import { useSession } from "@/hooks/useSession";
+import { abandonSandboxWake, wakeSandboxSession } from "@/hooks/useSessionReconnect";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { getCliServerUrl } from "@/lib/host";
-import { retrySession } from "@/lib/sessionsApi";
 import { terminalsQueryKey } from "@/lib/terminals";
 import { useCommandSession } from "@/shell/commandContext";
 import { buildReconnectCommand } from "@/shell/ReconnectSessionDialog";
@@ -23,6 +23,7 @@ import {
   type TerminalTabInputs,
   terminalTabConnection,
   terminalTabWait,
+  terminalTabWaitLimit,
 } from "./terminalTabConnection";
 
 /** How long a session Resume may wait for the server before it can be tried again. */
@@ -57,8 +58,6 @@ export function resetSessionResumes(): void {
   resumeAttempts.clear();
   notifyResumes();
 }
-
-const TICK_MS = 1_000;
 
 /** A shell tab, by its shell's key and whether the session's shell list has it. */
 export interface TerminalTabShell {
@@ -113,6 +112,7 @@ export function useTerminalTabConnections(
     return wait ? [[shell.key, wait] as const] : [];
   });
   const waitingSignature = JSON.stringify(waiting);
+  const waitOf = new Map<string, string>(waiting);
   const [now, setNow] = useState(() => Date.now());
   // Bumped when the waits start over, which the clock alone may not show.
   const [, setRevision] = useState(0);
@@ -131,7 +131,9 @@ export function useTerminalTabConnections(
     resumeAttempts.set(sessionId, attempt);
     notifyResumes();
     restart();
-    const answered = retrySession(sessionId).then(
+    // Joins a wake already on its way, such as Reconnect host's.
+    const wake = wakeSandboxSession(sessionId);
+    const answered = wake.then(
       () => ({ ok: true as const }),
       (error: unknown) => ({ ok: false as const, error }),
     );
@@ -142,6 +144,7 @@ export function useTerminalTabConnections(
     const outcome = await Promise.race([answered, timedOut]);
     window.clearTimeout(deadline);
     if (outcome === "timed_out") {
+      abandonSandboxWake(sessionId, wake);
       if (endResume(sessionId, attempt)) toast.error(SESSION_RESUME_TIMED_OUT);
       return;
     }
@@ -163,17 +166,36 @@ export function useTerminalTabConnections(
     setNow(Date.now());
   }, [shellWaits, waitingSignature]);
 
-  const anyWaiting = waiting.length > 0;
+  // A tab changes only when a wait reaches its limit, so the clock wakes then and not before.
+  let nextDeadline: number | null = null;
+  for (const [key, wait] of waiting) {
+    // A wait the store hasn't taken in yet, or that waits for something new, starts now.
+    const deadline = (shellWaits.since(key, wait) ?? now) + terminalTabWaitLimit(wait);
+    if (deadline > now && (nextDeadline === null || deadline < nextDeadline))
+      nextDeadline = deadline;
+  }
   useEffect(() => {
-    if (!anyWaiting) return;
-    const timer = window.setInterval(() => setNow(Date.now()), TICK_MS);
-    return () => window.clearInterval(timer);
-  }, [anyWaiting]);
+    if (nextDeadline === null) return;
+    const deadline = nextDeadline;
+    let timer = 0;
+    const wake = () => {
+      // A timer that fires early, or a system clock set back during the wait, leaves time to go.
+      const remaining = deadline - Date.now();
+      if (remaining > 0) {
+        timer = window.setTimeout(wake, remaining);
+        return;
+      }
+      setNow(Date.now());
+    };
+    timer = window.setTimeout(wake, deadline - Date.now());
+    return () => window.clearTimeout(timer);
+  }, [nextDeadline]);
 
   const { resume } = sandbox;
   return {
     connectionOf: ({ key, inventory }) => {
-      const since = shellWaits.since(key);
+      const wait = waitOf.get(key);
+      const since = wait === undefined ? undefined : shellWaits.since(key, wait);
       const waited = since === undefined ? 0 : now - since;
       return terminalTabConnection({ ...facts, inventory, waited });
     },

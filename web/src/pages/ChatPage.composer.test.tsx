@@ -18,6 +18,7 @@ import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as ComposerSectionSettingsModule from "@/components/composer/composerSectionSettings";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
@@ -62,6 +63,8 @@ import {
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { usePaletteCommandsStore } from "@/store/paletteCommands";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
@@ -84,6 +87,18 @@ import {
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
 // to avoid needing a QueryClientProvider around every bare render.
+// Counts renders of the composer's ⌘K settings, which render nothing themselves.
+const composerPaletteSettings = vi.hoisted(() => ({ renders: 0 }));
+vi.mock("@/components/composer/composerSectionSettings", async (importOriginal) => {
+  const original = await importOriginal<typeof ComposerSectionSettingsModule>();
+  return {
+    ...original,
+    ComposerPaletteSettings: (props: Parameters<typeof original.ComposerPaletteSettings>[0]) => {
+      composerPaletteSettings.renders += 1;
+      return original.ComposerPaletteSettings(props);
+    },
+  };
+});
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
@@ -368,6 +383,11 @@ const CLAUDE_MODEL_OPTIONS = [
 /** The composer textarea, located by its aria-label. */
 function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
+}
+
+/** An onSend that queues every message, as ChatPage does while the agent works. */
+function enqueueFromComposer(text: string, files?: File[], replyDraft?: StoredReplyDraft) {
+  useChatStore.getState().enqueueMessage(text, files, replyDraft);
 }
 
 function forceMobileViewport(): () => void {
@@ -842,9 +862,10 @@ describe("Composer send shortcut", () => {
     [true, "metaKey"],
     [true, "ctrlKey"],
   ] as const)(
-    "steers the draft and backlog (alternate send: %s, modifier: %s)",
+    "steers the draft and backlog with Always steer off (alternate send: %s, modifier: %s)",
     (alternate, modifier) => {
       localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(false);
       const onSend = vi.fn((text: string, files?: File[]) => {
         useChatStore.getState().enqueueMessage(text, files);
       });
@@ -889,6 +910,64 @@ describe("Composer send shortcut", () => {
           sendQueued.mock.invocationCallOrder[0]!,
         );
         expect(useChatStore.getState().queuedMessages).toEqual([]);
+      } finally {
+        act(() =>
+          useChatStore.setState({
+            boundAgentId: originalState.boundAgentId,
+            queuedMessages: [],
+            send: originalState.send,
+            sessionStatus: originalState.sessionStatus,
+            status: originalState.status,
+          }),
+        );
+      }
+    },
+  );
+
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "queues the draft behind the turn with Always steer on (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      writeAlwaysSteer(true);
+      const sendNow = vi.fn().mockResolvedValue(undefined);
+      const originalState = useChatStore.getState();
+      setComposerState({
+        boundAgentId: "agent_shortcut",
+        queuedMessages: [{ queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" }],
+        sessionStatus: "running",
+        send: sendNow,
+        status: "streaming",
+      });
+      const onSend = vi.fn();
+
+      try {
+        renderWithTooltips(
+          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+        );
+        fireEvent.change(textarea(), { target: { value: "after this turn" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+
+        expect(onSend).toHaveBeenCalledExactlyOnceWith("after this turn", undefined, undefined, {
+          queue: true,
+        });
+        expect(textarea()).toHaveValue("");
+        // The existing backlog stays queued; nothing is steered into the turn.
+        expect(sendNow).not.toHaveBeenCalled();
+        expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+          "queued first",
+        ]);
+
+        // With nothing to queue, the chord still steers the backlog.
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+        expect(onSend).toHaveBeenCalledOnce();
+        expect(sendNow.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+          ["queued first", "agent_shortcut"],
+        ]);
       } finally {
         act(() =>
           useChatStore.setState({
@@ -7126,9 +7205,7 @@ describe("Composer reply quotes", () => {
   it("does not clear a new identical draft after submitting an edited restored send", async () => {
     const stableId = "f".repeat(32);
     // Submit through the store: the queued path is what a mid-turn Enter takes.
-    renderWithTooltips(
-      <Composer {...composerProps({ onSend: useChatStore.getState().enqueueMessage })} />,
-    );
+    renderWithTooltips(<Composer {...composerProps({ onSend: enqueueFromComposer })} />);
     act(() =>
       useChatStore.setState({
         failedSendDraft: { conversationId: "conv_test", text: "continue", files: [], stableId },
@@ -7722,6 +7799,40 @@ describe("Composer workflow entry point", () => {
     expect(onSendSlashCommand).not.toHaveBeenCalled();
   });
 
+  it("opens the Tasks tab's choice in the dialog: a new workflow's text, or a saved workflow", async () => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: workflowSkills,
+    });
+    const onSendSlashCommand = vi.fn();
+    renderWithWorkflows(<Composer {...composerProps({ onSendSlashCommand })} />);
+    const startWorkflow = useSessionTasksActions.getState().startWorkflow.conv_test;
+
+    act(() => startWorkflow?.("Bump deps"));
+    expect(await screen.findByTestId("workflow-dialog-description")).toHaveValue("Bump deps");
+    fireEvent.keyDown(screen.getByTestId("workflow-dialog-description"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("workflow-dialog")).toBeNull());
+
+    const workflow = {
+      id: "a".repeat(32),
+      name: "Triage flaky tests",
+      description: "Finds and fixes flaky tests.",
+    };
+    act(() => startWorkflow?.("", workflow));
+    expect(
+      await screen.findByRole("heading", { name: "Run Triage flaky tests" }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("workflow-dialog-description"), {
+      target: { value: "The upload tests" },
+    });
+    fireEvent.click(screen.getByTestId("workflow-dialog-run"));
+    expect(onSendSlashCommand).toHaveBeenCalledWith(
+      "workflow",
+      `Run the saved workflow "Triage flaky tests" (ID ${workflow.id}).\n\nThe upload tests`,
+    );
+  });
+
   it("runs or continues a task for the Tasks tab, or says why it can't", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onSend = vi.fn();
@@ -7808,7 +7919,7 @@ describe("Composer workflow entry point", () => {
         usePlanStops.setState({ requests: {}, settledStops: {} });
       });
       const onStop = vi.fn();
-      const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+      const onSend = vi.fn(enqueueFromComposer);
       const error = vi.spyOn(toast, "error");
       const { rerender } = renderWithWorkflows(
         <Composer {...composerProps({ onStop, onSend, isWorking })} />,
@@ -8592,7 +8703,7 @@ describe("Composer — editing queued messages", () => {
 
   it("dequeues the recalled message so re-sending can't duplicate it", async () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     renderWithTooltips(<Composer {...props} />);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
@@ -8665,7 +8776,7 @@ describe("Composer — editing queued messages", () => {
     useChatStore.setState({
       queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
     });
-    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    const onSend = vi.fn(enqueueFromComposer);
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
     const strip = screen.getByTestId("composer-queued-strip");
@@ -8719,7 +8830,7 @@ describe("Composer — editing queued messages", () => {
 
   it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
     useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
-    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const props = composerProps({ onSend: enqueueFromComposer });
     const ref = createRef<ComponentRef<typeof Composer>>();
     renderWithTooltips(<Composer {...props} ref={ref} />);
     act(() =>
@@ -10345,5 +10456,50 @@ describe("Composer with the CodeMirror release flag on", () => {
 
     fireEvent.keyDown(editor, { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git status", undefined);
+  });
+});
+
+describe("Composer model and effort in ⌘K", () => {
+  const settingLabels = () =>
+    registeredPaletteCommands()
+      .filter((command) => command.setting)
+      .map((command) => command.label);
+
+  function renderOpenSessionComposer(quickPickPalette: boolean) {
+    const previous = useChatStore.getState();
+    onTestFinished(() => {
+      useChatStore.setState(previous, true);
+      usePaletteCommandsStore.setState({ groups: {} });
+    });
+    composerPaletteSettings.renders = 0;
+    useChatStore.setState({ conversationId: "conv_models", llmModel: "opus" });
+    render(
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { quick_pick_palette: quickPickPalette } }}
+      >
+        <TooltipProvider>
+          <Composer
+            {...composerProps({
+              showModels: true,
+              showEffort: true,
+              modelPickerKind: "claude",
+              codexModelOptions: CLAUDE_MODEL_OPTIONS,
+            })}
+          />
+        </TooltipProvider>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("offers the open session's Model and Reasoning Effort with quick_pick_palette on", () => {
+    renderOpenSessionComposer(true);
+    expect(settingLabels()).toEqual(expect.arrayContaining(["Model", "Reasoning Effort"]));
+  });
+
+  it("mounts neither with quick_pick_palette off", () => {
+    renderOpenSessionComposer(false);
+    expect(composerPaletteSettings.renders).toBe(0);
+    expect(settingLabels()).not.toContain("Model");
+    expect(settingLabels()).not.toContain("Reasoning Effort");
   });
 });

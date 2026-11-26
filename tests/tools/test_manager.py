@@ -125,11 +125,6 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "memory_list",
         "memory_write",
         "memory_delete",
-        # Session file tools are always auto-registered unless the spec sets
-        # ``tool_groups.files: false``. Runner-dispatched to the session's files.
-        "sys_upload_file",
-        "sys_list_files",
-        "sys_download_file",
     }
     | ADVANCED_BROWSER_TOOL_NAMES
 )
@@ -613,6 +608,38 @@ def test_advise_models_hidden_when_routing_disabled() -> None:
     assert "sys_advise_models" not in names
 
 
+def test_advise_models_hidden_when_the_remote_server_does_not_route() -> None:
+    """A runner whose server reports no routing hides the advisor, as a router-less one does."""
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=None,
+        remote_routing_available=False,
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_list_models" in names
+    assert "sys_advise_models" not in names
+
+
+def test_advise_models_follows_the_routing_stamp_on_each_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each build reads the routing stamp, so a flip shows on the next ToolManager."""
+    from omnigent.runtime import _globals, set_remote_routing_available
+    from omnigent.runtime.caps import RuntimeCaps
+
+    monkeypatch.setattr(_globals, "_caps", RuntimeCaps())
+
+    def advertised() -> set[str]:
+        return {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+
+    assert "sys_advise_models" not in advertised()
+    set_remote_routing_available(True)
+    assert "sys_advise_models" in advertised()
+    set_remote_routing_available(False)
+    assert "sys_advise_models" not in advertised()
+
+
 def test_advise_models_exposed_from_a_backends_only_deployment() -> None:
     """The gate is "some source can answer", not "a legacy client is set".
 
@@ -636,6 +663,22 @@ def test_advise_models_exposed_when_routing_enabled() -> None:
     with patch("omnigent.runtime._globals._caps", new=caps):
         names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_list_models" in names
+    assert "sys_advise_models" in names
+
+
+def test_advise_models_exposed_when_only_the_remote_server_routes() -> None:
+    """Expose the advisor when only the attached server can route.
+
+    The runner has no routing backends of its own, so the server's answer
+    from the session-init envelope decides the gate.
+    """
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=None,
+        remote_routing_available=True,
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_advise_models" in names
 
 
@@ -707,17 +750,18 @@ def test_both_grants_compose() -> None:
 
 def test_session_get_info_schema_has_optional_session_id() -> None:
     """
-    ``sys_session_get_info`` advertises a single optional ``session_id``
-    parameter (omitting it defaults to the caller's own session). If
-    ``session_id`` became required, an agent inspecting its own session
-    would be forced to look up its own id first.
+    ``sys_session_get_info`` advertises only optional parameters: ``session_id``
+    (omitting it defaults to the caller's own session) and the ``include_usage``
+    opt-in. If ``session_id`` became required, an agent inspecting its own
+    session would be forced to look up its own id first.
     """
     mgr = ToolManager(_make_spec([]))
     schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_session_get_info"
     )
     params = schema["function"]["parameters"]
-    assert set(params["properties"]) == {"session_id"}
+    assert set(params["properties"]) == {"session_id", "include_usage"}
+    assert params["properties"]["include_usage"]["type"] == "boolean"
     # No required fields — session_id is optional by design.
     assert params["required"] == []
 
@@ -1501,29 +1545,31 @@ def test_create_builtin_handles_web_fetch() -> None:
 
 
 @pytest.mark.parametrize(
-    "declared", ["upload_file", "list_files", "download_file", "sys_upload_file"]
+    "declared", ["upload_file", "list_files", "download_file", "sys_files_upload"]
 )
-def test_file_tools_register_by_default_and_are_not_declarable_builtins(
+def test_file_tools_register_with_files_on_and_are_not_declarable_builtins(
     declared: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    The file tools register by default under their ``sys_`` names only. A
-    ``tools.builtins`` entry naming a file tool, old or new, is skipped with a
+    With ``files`` on, the file tools register under their ``sys_`` names only.
+    A ``tools.builtins`` entry naming a file tool, old or new, is skipped with a
     warning, and no old name is registered as an alias.
 
     :param declared: The file tool name the spec lists, e.g. ``"upload_file"``.
     :param caplog: Captures the skipped-builtin warning.
     """
     spec = AgentSpec(
-        spec_version=1, tools=ToolsConfig(builtins=[BuiltinToolConfig(name=declared)])
+        spec_version=1,
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name=declared)]),
+        tool_groups=ToolGroupsConfig(files=True),
     )
     with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
         mgr = ToolManager(spec)
 
     names = set(mgr.get_tool_names())
-    assert {"sys_upload_file", "sys_list_files", "sys_download_file"} <= names
+    assert {"sys_files_upload", "sys_files_list", "sys_files_download"} <= names
     assert not {"upload_file", "list_files", "download_file"} & names
-    assert type(mgr.get_tool("sys_upload_file")).__name__ == "UploadFileTool"
+    assert type(mgr.get_tool("sys_files_upload")).__name__ == "UploadFileTool"
     assert f"Unknown built-in tool {declared!r}" in caplog.text
 
 
@@ -1788,7 +1834,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
     "projects": frozenset(
         {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
     ),
-    "files": frozenset({"sys_upload_file", "sys_list_files", "sys_download_file"}),
+    "files": frozenset({"sys_files_upload", "sys_files_list", "sys_files_download"}),
 }
 
 
@@ -1802,17 +1848,21 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
     return AgentSpec(spec_version=1, skills_filter="none", tool_groups=ToolGroupsConfig(**groups))
 
 
-def test_tool_groups_default_registers_every_group() -> None:
-    """An absent ``tool_groups:`` block changes nothing: all 24 register."""
+def test_tool_groups_default_registers_every_group_but_files() -> None:
+    """An absent ``tool_groups:`` block registers every group but ``files``, which is opt-in."""
     names = _tool_names(_grouped_spec())
     for group, members in _TOOL_GROUP_MEMBERS.items():
-        assert members <= names, f"{group} members missing by default: {members - names}"
+        if group == "files":
+            assert not (members & names), f"file tools registered by default: {members & names}"
+        else:
+            assert members <= names, f"{group} members missing by default: {members - names}"
+    assert _TOOL_GROUP_MEMBERS["files"] <= _tool_names(_grouped_spec(files=True))
 
 
 @pytest.mark.parametrize("group", sorted(_TOOL_GROUP_MEMBERS))
 def test_tool_groups_false_drops_only_that_group(group: str) -> None:
-    """Disabling one group removes exactly its tools and nothing else."""
-    names = _tool_names(_grouped_spec(**{group: False}))
+    """Disabling one group removes exactly its tools and nothing else, with ``files`` on."""
+    names = _tool_names(_grouped_spec(**{"files": True, group: False}))
     assert not (_TOOL_GROUP_MEMBERS[group] & names), f"{group} still registered"
     for other, members in _TOOL_GROUP_MEMBERS.items():
         if other != group:

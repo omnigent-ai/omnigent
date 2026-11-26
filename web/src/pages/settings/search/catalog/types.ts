@@ -172,8 +172,12 @@ export interface SettingsAvailability {
   globalShortcut: boolean;
   /** `floating_composer` is on and the shell can change the New Agent panel's shortcut. */
   floatingComposerShortcut: boolean;
+  /** The desktop shell can widen the window when the right sidebar opens. */
+  widenWindowForRightSidebar: boolean;
   /** The shell has an in-app browser for chat links. */
   inAppBrowser: boolean;
+  /** An ordinary desktop browser, which can hand a conversation to the desktop app. */
+  desktopAppHandoff: boolean;
   /** Settings shows the Admin view switch: to an admin-eligible viewer, where the server offers it. */
   adminView: boolean;
   /** The server signs people in with its own accounts, which have a password here. */
@@ -188,6 +192,8 @@ export interface SettingsAvailability {
   projectKanban: boolean;
   /** The server lets people write their own session title instructions. */
   sessionTitleInstructions: boolean;
+  /** Floating panes can show here: sidebar v2 or `floating_panes` on, and no touch. */
+  floatingPanes: boolean;
   /** The server offers the proactive agent. */
   proactiveAgent: boolean;
 }

@@ -4585,6 +4585,8 @@ class HostProcess:
                 str(params.get("after", "")),
                 str(params.get("head_sha", "")),
                 str(params.get("base_sha", "")),
+                # Only a server that hides them from all but the owner asks for them.
+                account_rights=params.get("account_rights") is True,
             )
         if op == "github_review_thread_comments":
             return r.github_review_thread_comments(
@@ -4592,6 +4594,7 @@ class HostProcess:
                 str(params.get("pr_url", "")),
                 str(params.get("thread_id", "")),
                 str(params.get("after", "")),
+                account_rights=params.get("account_rights") is True,
             )
         if op == "github_changes":
             return r.github_changes(

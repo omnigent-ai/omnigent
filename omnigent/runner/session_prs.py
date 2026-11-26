@@ -128,6 +128,21 @@ class SessionPrRegistry:
         except FileLockTimeout as exc:
             raise ValueError("PR tracking is busy; try again.") from exc
 
+    def version(self) -> tuple[tuple[int, int, int] | None, ...]:
+        """Identify the files' current contents without locking or reading them.
+
+        Every write replaces a file, so its inode, modification time or size changes.
+        """
+        versions: list[tuple[int, int, int] | None] = []
+        for path in (self.path, self._providers_path):
+            try:
+                status = path.stat()
+            except OSError:
+                versions.append(None)
+            else:
+                versions.append((status.st_ino, status.st_mtime_ns, status.st_size))
+        return tuple(versions)
+
     def _write(self, state: _Registry, *, legacy_first: bool = False) -> None:
         # Old hosts may rewrite this file; keep foreign associations out of it.
         legacy = state.model_copy(

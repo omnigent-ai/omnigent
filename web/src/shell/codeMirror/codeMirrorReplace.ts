@@ -8,13 +8,13 @@ import { getSearchQuery, type SearchQuery } from "@codemirror/search";
 import type { ChangeSpec, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { FindMatchIndex } from "./codeMirrorFind";
+import { matchContext, matchesIn, NOTHING_FOUND } from "./findMatchCollector";
 import { type FindScheduler, timeoutScheduler } from "./findMatchSource";
+import { type FindRange, findScopeOf } from "./findScope";
+import { withCaseOf } from "./preserveCase";
 
 /** How long one slice of reading matches may run before yielding. */
 const SLICE_MILLISECONDS = 8;
-
-/** CodeMirror's rule for a pattern that can span lines, which it matches across the document. */
-const MULTILINE_PATTERN = /\\[sWDnr]|\n|\r|\[\^/;
 
 interface CursorMatch {
   from: number;
@@ -56,20 +56,25 @@ export function replacementText(query: SearchQuery, match: RegExpExecArray | nul
   });
 }
 
-/**
- * Where to start reading so a match at `from` sees the same text the index saw:
- * its line for a single-line pattern, which is matched line by line, or the
- * top of the document for one that can span lines.
- */
-function contextRange(doc: Text, query: SearchQuery, from: number, to: number) {
-  if (MULTILINE_PATTERN.test(query.search)) return { from: 0, to: doc.length };
-  return { from: doc.lineAt(from).from, to: doc.lineAt(to).to };
+/** How Replace treats each match's text. */
+export interface ReplaceOptions {
+  /** Give each replacement the case of the text it replaces. */
+  preserveCase: boolean;
+}
+
+const KEEP_REPLACEMENT_CASE: ReplaceOptions = { preserveCase: false };
+
+/** The replacement as written, or in `matched`'s case when preserving case. */
+function inCase(replacement: string, matched: string, options: ReplaceOptions): string {
+  return options.preserveCase ? withCaseOf(matched, replacement) : replacement;
 }
 
 /** A Replace or Replace all reading matches, valid while its document and query stay. */
 interface ReplaceJob {
   doc: Text;
   query: SearchQuery;
+  /** The Find in selection scope it started in; replacing stops if that changes. */
+  scope: readonly FindRange[] | null;
   /** The selection a Replace started from; it must still be selected when the edit lands. */
   selection?: { from: number; to: number };
   /** Waits for a complete index before starting. */
@@ -107,7 +112,11 @@ export class FindReplacer {
    * the next one, or null when the selection isn't a match that can be replaced.
    * A replacement that uses groups may finish after this returns.
    */
-  replaceSelected(view: EditorView, onReplaced: (resumeFrom: number | null) => void): void {
+  replaceSelected(
+    view: EditorView,
+    onReplaced: (resumeFrom: number | null) => void,
+    options: ReplaceOptions = KEEP_REPLACEMENT_CASE,
+  ): void {
     this.cancel();
     const { state } = view;
     const { from, to } = state.selection.main;
@@ -117,7 +126,9 @@ export class FindReplacer {
       return;
     }
     const query = getSearchQuery(state);
-    const replace = (insert: string) => {
+    const matched = state.sliceDoc(from, to);
+    const replace = (replacement: string) => {
+      const insert = inCase(replacement, matched, options);
       view.dispatch({
         changes: { from, to, insert },
         selection: { anchor: from + insert.length },
@@ -129,11 +140,12 @@ export class FindReplacer {
       replace(replacementText(query, null));
       return;
     }
-    const range = contextRange(state.doc, query, from, to);
+    const range = matchContext(state.doc, query, from, to);
     const cursor = query.getCursor(state.doc, range.from, range.to) as Iterator<CursorMatch>;
     this.run(view, {
       doc: state.doc,
       query,
+      scope: findScopeOf(state),
       selection: { from, to },
       needsIndex: false,
       step: () => {
@@ -152,23 +164,30 @@ export class FindReplacer {
   }
 
   /** Replaces every match as one edit. A plain replacement waits for the index to finish. */
-  replaceAll(view: EditorView): void {
+  replaceAll(view: EditorView, options: ReplaceOptions = KEEP_REPLACEMENT_CASE): void {
     this.cancel();
     const { state } = view;
     if (state.readOnly) return;
     const query = getSearchQuery(state);
     const changes: ChangeSpec[] = [];
     if (!refersToMatch(query)) {
-      const insert = replacementText(query, null);
+      const replacement = replacementText(query, null);
       this.run(view, {
         doc: state.doc,
         query,
+        scope: findScopeOf(state),
         needsIndex: true,
         step: () => {
           const { froms, tos } = this.index.matches();
           for (let match = 0; match < froms.length; match += 1) {
             const from = froms[match]!;
-            if (this.index.isPrecise(from)) changes.push({ from, to: tos[match]!, insert });
+            if (!this.index.isPrecise(from)) continue;
+            const to = tos[match]!;
+            // Only Preserve case reads the matched text; otherwise every match takes the same text.
+            const insert = options.preserveCase
+              ? inCase(replacement, state.doc.sliceString(from, to), options)
+              : replacement;
+            changes.push({ from, to, insert });
           }
           return { done: true };
         },
@@ -176,17 +195,28 @@ export class FindReplacer {
       });
       return;
     }
-    // Groups come from the index's own full-document cursor, so they match what find counted.
-    const cursor = query.getCursor(state.doc) as Iterator<CursorMatch>;
+    // Groups come from the same cursor the index uses, in the same scope, so they match what find counted.
+    const scope = findScopeOf(state);
+    const cursor = matchesIn(query, state.doc, scope) as Iterator<
+      CursorMatch | typeof NOTHING_FOUND
+    >;
     this.run(view, {
       doc: state.doc,
       query,
+      scope,
       needsIndex: false,
       step: () => {
         const result = cursor.next();
         if (result.done) return { done: true };
+        // A match outside the scope still took time, so the slice can pause after it.
+        if (result.value === NOTHING_FOUND) return { done: false };
         const { from, to, match } = result.value;
-        changes.push({ from, to, insert: replacementText(query, match ?? null) });
+        const insert = inCase(
+          replacementText(query, match ?? null),
+          state.doc.sliceString(from, to),
+          options,
+        );
+        changes.push({ from, to, insert });
         return { done: false };
       },
       finish: () => this.applyAll(view, changes),
@@ -270,7 +300,12 @@ export class FindReplacer {
 
   private stillWanted(view: EditorView, job: ReplaceJob): boolean {
     const { state } = view;
-    if (state.doc !== job.doc || state.readOnly || !getSearchQuery(state).eq(job.query)) {
+    if (
+      state.doc !== job.doc ||
+      state.readOnly ||
+      findScopeOf(state) !== job.scope ||
+      !getSearchQuery(state).eq(job.query)
+    ) {
       return false;
     }
     const selection = state.selection.main;

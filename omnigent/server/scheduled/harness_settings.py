@@ -169,9 +169,9 @@ def _launch_permission_mode(session: Conversation, harness: str) -> str | None:
     options = launch_args[: launch_args.index("--")] if "--" in launch_args else launch_args
     modes = PERMISSION_LAUNCH_ARGS.get(harness, {})
     if harness == "claude-native":
-        from omnigent.runner.native.orchestration import _claude_launch_permission_mode
+        from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
 
-        mode = _claude_launch_permission_mode(options)
+        mode = claude_launch_permission_mode(options)
         return mode if mode in modes else None
     if harness == "codex-native":
         from omnigent.harnesses.codex_native.launch_args import codex_config_profile
@@ -356,10 +356,20 @@ async def inherited_approval_skipping_problem(agent: Any, agent_cache: Any) -> s
 
 
 async def validate_scheduled_permission_support(
-    *, permission_mode: str | None, agent: Any, agent_cache: Any
+    *,
+    permission_mode: str | None,
+    agent: Any,
+    agent_cache: Any,
+    continues_session: bool = False,
 ) -> None:
-    """Reject modes belonging to a different harness, or an inherited approval-skipping mode."""
+    """Reject modes belonging to a different harness, or an inherited approval-skipping mode.
+
+    :param continues_session: Whether the task continues a session. Without a mode of its
+        own, the task wakes that session in the session's mode, so nothing is inherited.
+    """
     if permission_mode is None:
+        if continues_session:
+            return
         problem = await inherited_approval_skipping_problem(agent, agent_cache)
         if problem is not None:
             raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)

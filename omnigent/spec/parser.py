@@ -355,7 +355,6 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         tool_groups,
         raw.get("tool_groups"),
         builtins=tools_config.builtins,
-        agent_name=raw.get("name"),
     )
 
     return AgentSpec(
@@ -541,17 +540,18 @@ def parse_tool_groups(raw: object, *, spawn: bool) -> ToolGroupsConfig:
     Parse the top-level ``tool_groups:`` block into a
     :class:`ToolGroupsConfig`.
 
-    Strict on purpose: the block exists to *remove* tools, so a typo'd
-    group name or a non-boolean value fails the load rather than
-    silently leaving every group registered. Shared by the native parser
-    and the omnigent-dialect adapter so both loaders reject the same input.
+    Strict on purpose: the block mostly exists to *remove* tools, so a
+    typo'd group name or a non-boolean value fails the load rather than
+    silently leaving every group registered (or ``files`` off). Shared by
+    the native parser and the omnigent-dialect adapter so both loaders
+    reject the same input.
 
     :param raw: The raw ``tool_groups:`` value, or ``None`` if absent.
-        Example: ``{"browser": False, "scheduled_tasks": False}``.
+        Example: ``{"browser": False, "files": True}``.
     :param spawn: The spec's top-level ``spawn:`` flag, needed to reject
         disabling agent discovery while ``sys_session_create`` is granted.
-    :returns: A populated :class:`ToolGroupsConfig`; every group on
-        when *raw* is ``None``.
+    :returns: A populated :class:`ToolGroupsConfig`; every group but
+        ``files`` on when *raw* is ``None``.
     :raises OmnigentError: If *raw* is not a mapping, names an unknown
         group, maps a group to a non-boolean, or disables
         ``agent_discovery`` while a tool that needs it stays enabled.
@@ -653,21 +653,20 @@ def resolve_file_tool_group(
     raw_tool_groups: object,
     *,
     builtins: Iterable[BuiltinToolConfig],
-    agent_name: str | None,
 ) -> ToolGroupsConfig:
     """
     Keep the file tools off for an agent that still declares their removed names.
 
-    ``upload_file``, ``list_files`` and ``download_file`` became the default
-    ``sys_upload_file``, ``sys_list_files`` and ``sys_download_file``. A policy
+    ``upload_file``, ``list_files`` and ``download_file`` became the opt-in
+    ``sys_files_upload``, ``sys_files_list`` and ``sys_files_download``. A policy
     written for an old name does not match the new one, so an agent that still
-    lists an old name gets no file tools until those entries are removed.
+    lists an old name cannot turn the file tools on until those entries are
+    removed.
 
     :param tool_groups: The parsed groups.
     :param raw_tool_groups: The raw ``tool_groups:`` value, to tell an explicit
         ``files: true`` from the default.
     :param builtins: The spec's ``tools.builtins`` entries.
-    :param agent_name: The spec's name, for the warning.
     :returns: *tool_groups*, with ``files`` off when a removed name is declared.
     :raises OmnigentError: If ``files: true`` is set alongside a removed name.
     """
@@ -680,15 +679,6 @@ def resolve_file_tool_group(
             "builtins: remove them from tools.builtins, and rename any policy selector "
             "that names them to the sys_ tool.",
             code=ErrorCode.INVALID_INPUT,
-        )
-    if tool_groups.files:
-        _log.warning(
-            "Agent %r declares the removed %s builtins, so its sys_upload_file, "
-            "sys_list_files and sys_download_file tools stay off: a policy written for "
-            "the old names would not apply to them. Remove those tools.builtins entries "
-            "and rename any policy selector that names them.",
-            agent_name,
-            ", ".join(removed),
         )
     return replace(tool_groups, files=False)
 

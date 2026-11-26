@@ -46,11 +46,16 @@ change their layout and type syntax, plus one renamed local variable.
   `orderTreePaths`, which lists paths in the tree's order.
 - Lookups that pass through a file find nothing instead of throwing, and the
   folders a tree starts open are found under any `sort`, not just name order.
+- An ignored entry gives the folders above it no change dot; it isn't a change.
+- `compareTreeEntries`, the default order as a comparator, for custom sorts'
+  ties.
 - `FileTree`'s `renderRowDecoration` and `onRowMenu` props. The menu opens from
   a right-click, Shift+F10, the context menu key, or one actions button that
-  follows the hovered or focused row, using upstream's ellipsis icon.
+  follows the hovered or focused row, using upstream's ellipsis icon. The row
+  under the button keeps room for it and its hover fill.
 - `resolveFileIcon` and `useFileTreeSpriteSheet` as exports, so a file's icon can be
   drawn outside a tree, such as on a workspace tab.
 - Middle truncation of long names, splitting before the extension as
   upstream's `MiddleTruncate` does, with each part's ellipsis drawn by the
-  browser instead of upstream's markers.
+  browser instead of upstream's markers. `splitNameForTruncation` is exported
+  so a name outside a tree can split the same way.

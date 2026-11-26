@@ -35,6 +35,8 @@ interface PrefetchScope {
   /** The browsed location tree paths are relative to; "" for the workspace root. */
   location: string;
   refreshToken: number;
+  /** The tree leaves out what Git ignores, so its folders list without it. */
+  hideIgnored?: boolean;
 }
 
 /** Whether a file is small enough, and of a kind the viewer reads, to load ahead. */
@@ -48,10 +50,10 @@ export function prefetchTarget(
   scope: PrefetchScope,
   target: PrefetchTarget,
 ): Promise<void> {
-  const { conversationId, location, refreshToken } = scope;
+  const { conversationId, location, refreshToken, hideIgnored = false } = scope;
   if (target.kind === "directory") {
     return queryClient.prefetchQuery(
-      workspaceDirectoryQuery(conversationId, target.path, location, refreshToken),
+      workspaceDirectoryQuery(conversationId, target.path, location, refreshToken, hideIgnored),
     );
   }
   if (!prefetchableFile(target.path, target.bytes)) return Promise.resolve();
@@ -69,10 +71,12 @@ export function useWorkspacePrefetch({
   conversationId,
   location,
   refreshToken,
+  hideIgnored = false,
 }: {
   conversationId: string | undefined;
   location: string;
   refreshToken: number;
+  hideIgnored?: boolean;
 }): WorkspacePrefetch {
   const queryClient = useQueryClient();
   // The same gate the tree's own queries use: nothing loads once the runner
@@ -80,8 +84,9 @@ export function useWorkspacePrefetch({
   const enabled = useWorkspaceServeable(conversationId) !== false;
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scope = useMemo<PrefetchScope | null>(
-    () => (enabled && conversationId ? { conversationId, location, refreshToken } : null),
-    [enabled, conversationId, location, refreshToken],
+    () =>
+      enabled && conversationId ? { conversationId, location, refreshToken, hideIgnored } : null,
+    [enabled, conversationId, location, refreshToken, hideIgnored],
   );
 
   const cancel = useCallback(() => {

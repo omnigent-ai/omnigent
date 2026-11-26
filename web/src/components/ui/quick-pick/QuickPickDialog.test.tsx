@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { type CSSProperties, useState } from "react";
+import { type CSSProperties, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
@@ -409,64 +409,136 @@ describe("QuickPickDialog child pages", () => {
   });
 });
 
-describe("QuickPickDialog reopened while closing", () => {
-  it("drops the accepted row's action when reopened during its exit, and keeps the picker focused", async () => {
-    const elsewhere = document.createElement("input");
-    document.body.append(elsewhere);
-    onTestFinished(() => elsewhere.remove());
-    const afterClose = vi.fn(() => {
-      // An action that moves focus, run only once the dialog is gone.
-      expect(document.querySelector("[data-quick-pick-dialog]")).toBeNull();
-      elsewhere.focus();
+/**
+ * Gives the picker's content an enter animation while open and an exit one once closing, so
+ * Radix keeps it mounted until the exit ends, as in the app. Restored when the test finishes.
+ */
+function stubExitAnimation() {
+  let animationName = "enter";
+  const computedStyle = window.getComputedStyle.bind(window);
+  const styleSpy = vi.spyOn(window, "getComputedStyle").mockImplementation((element) => {
+    const style = computedStyle(element);
+    if (!(element instanceof HTMLElement) || !element.hasAttribute("data-quick-pick-dialog")) {
+      return style;
+    }
+    return new Proxy(style, {
+      get: (target, property) =>
+        property === "animationName" ? animationName : Reflect.get(target, property),
     });
-    let setOpen: (open: boolean) => void = () => undefined;
-    function Reopening() {
-      const [open, setOpenState] = useState(true);
-      setOpen = setOpenState;
-      return (
+  });
+  onTestFinished(() => styleSpy.mockRestore());
+  return {
+    exitNext: () => {
+      animationName = "exit";
+    },
+    stop: () => {
+      animationName = "none";
+      styleSpy.mockRestore();
+    },
+  };
+}
+
+describe("QuickPickDialog closing at commit with an exit animation", () => {
+  let setOpen: (open: boolean) => void = () => undefined;
+  function Opener({
+    onAccept,
+    closesAtCommit,
+  }: {
+    onAccept: () => QuickPickAcceptResult;
+    closesAtCommit: boolean;
+  }) {
+    const [open, setOpenState] = useState(false);
+    setOpen = setOpenState;
+    return (
+      <>
+        <textarea aria-label="Editor" />
         <QuickPickDialog
           open={open}
+          closesAtCommit={closesAtCommit}
           onOpenChange={setOpenState}
           label="Pick"
           segments={commands}
           query=""
           onQueryChange={() => undefined}
           emptyMessage="No results found"
-          onAccept={() => ({ afterClose })}
+          onAccept={onAccept}
         />
-      );
-    }
-    // The content's animation changes from its enter to its exit animation as it closes, so
-    // Radix keeps it mounted until the exit ends, as in the app.
-    let animationName = "enter";
-    const computedStyle = window.getComputedStyle.bind(window);
-    const styleSpy = vi.spyOn(window, "getComputedStyle").mockImplementation((element) => {
-      const style = computedStyle(element);
-      if (!(element instanceof HTMLElement) || !element.hasAttribute("data-quick-pick-dialog")) {
-        return style;
-      }
-      return new Proxy(style, {
-        get: (target, property) =>
-          property === "animationName" ? animationName : Reflect.get(target, property),
-      });
-    });
-    // Restored midway, once the exit animation no longer matters, and on any failure before it.
-    onTestFinished(() => styleSpy.mockRestore());
-    render(<Reopening />);
-    const input = await screen.findByRole("combobox", { name: "Pick" });
-    const content = screen.getByRole("dialog");
-    animationName = "exit";
-    await userEvent.keyboard("{Enter}");
-    // Still mounted, closing: the role query skips it once it's hidden from assistive tech.
-    expect(document.querySelector("[data-quick-pick-dialog]")).toBe(content);
-    expect(content.dataset.state).toBe("closed");
+      </>
+    );
+  }
+  async function openFromEditor(onAccept: () => QuickPickAcceptResult, closesAtCommit = true) {
+    const animation = stubExitAnimation();
+    render(<Opener onAccept={onAccept} closesAtCommit={closesAtCommit} />);
+    const editor = screen.getByRole<HTMLTextAreaElement>("textbox", { name: "Editor" });
+    editor.focus();
     act(() => setOpen(true));
+    const input = await screen.findByRole("combobox", { name: "Pick" });
     await waitFor(() => expect(input).toHaveFocus());
+    animation.exitNext();
+    return { editor, input, animation };
+  }
+
+  it("returns focus as an accept closes, so keys typed right after reach where it was", async () => {
+    const { editor, input } = await openFromEditor(() => undefined);
+    await userEvent.keyboard("{Enter}abc");
+    // Still animating out, yet the keys went back to the editor, not the closing picker.
+    expect(document.querySelector("[data-quick-pick-dialog]")?.getAttribute("data-state")).toBe(
+      "closed",
+    );
+    expect(editor).toHaveValue("abc");
+    expect(input).toHaveValue("");
+  });
+
+  it("runs an accepted row's action as it closes, so keys typed right after reach where it moved focus", async () => {
+    const target = document.createElement("textarea");
+    target.setAttribute("aria-label", "Target");
+    document.body.append(target);
+    onTestFinished(() => target.remove());
+    const afterClose = vi.fn(() => target.focus());
+    const { editor } = await openFromEditor(() => ({ afterClose }));
+    await userEvent.keyboard("{Enter}xyz");
+    expect(document.querySelector("[data-quick-pick-dialog]")).not.toBeNull();
+    expect(afterClose).toHaveBeenCalledOnce();
+    expect(target).toHaveValue("xyz");
+    expect(editor).toHaveValue("");
+  });
+
+  it("finishes an accepted close once its exit animation ends, without closesAtCommit", async () => {
+    const afterClose = vi.fn();
+    const { editor } = await openFromEditor(() => ({ afterClose }), false);
+    await userEvent.keyboard("{Enter}");
+    const closing = document.querySelector("[data-quick-pick-dialog]");
+    expect(closing?.getAttribute("data-state")).toBe("closed");
+    expect(afterClose).not.toHaveBeenCalled();
+    // Radix finishes the close, and restores focus, when the exit animation ends.
+    const ended = new Event("animationend", { bubbles: true });
+    Object.defineProperty(ended, "animationName", { value: "exit" });
+    act(() => {
+      closing?.dispatchEvent(ended);
+    });
+    await waitFor(() => expect(afterClose).toHaveBeenCalledOnce());
+    expect(editor).toHaveFocus();
+  });
+
+  it("drops the accepted row's action when reopened during its exit, without closesAtCommit", async () => {
+    const elsewhere = document.createElement("input");
+    document.body.append(elsewhere);
+    onTestFinished(() => elsewhere.remove());
+    // An action that moves focus, run only once the dialog is gone.
+    const afterClose = vi.fn(() => {
+      expect(document.querySelector("[data-quick-pick-dialog]")).toBeNull();
+      elsewhere.focus();
+    });
+    const { animation } = await openFromEditor(() => ({ afterClose }), false);
+    await userEvent.keyboard("{Enter}");
+    const content = document.querySelector<HTMLElement>("[data-quick-pick-dialog]");
+    expect(content?.dataset.state).toBe("closed");
+    act(() => setOpen(true));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Pick" })).toHaveFocus());
     expect(afterClose).not.toHaveBeenCalled();
 
-    // Neither a later cancel nor the next accept's close runs the dropped action.
-    animationName = "none";
-    styleSpy.mockRestore();
+    // Neither a later cancel nor the exit finishing runs the dropped action.
+    animation.stop();
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(afterClose).not.toHaveBeenCalled();
@@ -475,37 +547,96 @@ describe("QuickPickDialog reopened while closing", () => {
     act(() => setOpen(true));
     await screen.findByRole("combobox", { name: "Pick" });
     await userEvent.keyboard("{Enter}");
-    await waitFor(() => expect(afterClose).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(afterClose).toHaveBeenCalledOnce());
     expect(elsewhere).toHaveFocus();
   });
 
-  it("drops an accepted row's action when the dialog stays open and is then cancelled", async () => {
+  it("keeps the picker focused when reopened during its exit, and runs nothing again", async () => {
     const afterClose = vi.fn();
-    function KeptOpen() {
-      const [open, setOpen] = useState(true);
-      const [cancelled, setCancelled] = useState(false);
-      return (
-        <QuickPickDialog
-          open={open && !cancelled}
-          // The parent ignores the accept's close, and closes only on the cancel.
-          onOpenChange={() => setOpen(true)}
-          onCancel={() => setCancelled(true)}
-          label="Pick"
-          segments={commands}
-          query=""
-          onQueryChange={() => undefined}
-          emptyMessage="No results found"
-          onAccept={() => ({ afterClose })}
-        />
-      );
-    }
-    render(<KeptOpen />);
-    await screen.findByRole("combobox", { name: "Pick" });
+    const { animation } = await openFromEditor(() => ({ afterClose }));
     await userEvent.keyboard("{Enter}");
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    const content = document.querySelector<HTMLElement>("[data-quick-pick-dialog]");
+    expect(content?.dataset.state).toBe("closed");
+    expect(afterClose).toHaveBeenCalledOnce();
+    act(() => setOpen(true));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Pick" })).toHaveFocus());
+
+    // Neither a later cancel nor the exit finishing runs the action again.
+    animation.stop();
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(afterClose).not.toHaveBeenCalled();
+    expect(afterClose).toHaveBeenCalledOnce();
+  });
+
+  it("returns to the editor after a cancel, a reopen during its exit and another cancel", async () => {
+    const { editor, animation } = await openFromEditor(() => undefined);
+    await userEvent.keyboard("{Escape}");
+    expect(document.querySelector("[data-quick-pick-dialog]")?.getAttribute("data-state")).toBe(
+      "closed",
+    );
+    act(() => setOpen(true));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Pick" })).toHaveFocus());
+
+    animation.stop();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(editor).toHaveFocus();
+  });
+
+  it("takes the keys when reopened during its exit over the picker its action opened", async () => {
+    const animation = stubExitAnimation();
+    function PaletteAndSuccessor() {
+      const [paletteOpen, setPaletteOpen] = useState(false);
+      const [flagsOpen, setFlagsOpen] = useState(false);
+      setOpen = setPaletteOpen;
+      // The palette opening replaces the other picker, as the app shell does.
+      useEffect(() => {
+        if (paletteOpen) setFlagsOpen(false);
+      }, [paletteOpen]);
+      return (
+        <>
+          <QuickPickDialog
+            open={paletteOpen}
+            closesAtCommit
+            onOpenChange={setPaletteOpen}
+            label="Pick"
+            segments={commands}
+            query=""
+            onQueryChange={() => undefined}
+            emptyMessage="No results found"
+            onAccept={() => ({ afterClose: () => setFlagsOpen(true) })}
+          />
+          {flagsOpen && (
+            <QuickPickDialog
+              open
+              closesAtCommit
+              onOpenChange={setFlagsOpen}
+              label="Flags"
+              segments={commands}
+              query=""
+              onQueryChange={() => undefined}
+              emptyMessage="No results found"
+              onAccept={() => "keepOpen"}
+            />
+          )}
+        </>
+      );
+    }
+    render(<PaletteAndSuccessor />);
+    act(() => setOpen(true));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Pick" })).toHaveFocus());
+    animation.exitNext();
+    // Its row opens the other picker at once, while the palette is still animating out.
+    await userEvent.keyboard("{Enter}");
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Flags" })).toHaveFocus());
+
+    // Reopened straight away, as ⌘K pressed at once: the other picker goes and the palette has the keys.
+    act(() => setOpen(true));
+    await waitFor(() => expect(screen.queryByRole("combobox", { name: "Flags" })).toBeNull());
+    const palette = screen.getByRole("combobox", { name: "Pick" });
+    await waitFor(() => expect(palette).toHaveFocus());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(palette).toHaveFocus();
   });
 });
 
@@ -584,6 +715,35 @@ describe("QuickPickDialog kept open by its owner", () => {
     await userEvent.keyboard("{Enter}");
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     act(() => closeFromOutside());
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(afterClose).not.toHaveBeenCalled();
+  });
+
+  it("drops an accepted row's action when its owner kept it open, then the user cancelled", async () => {
+    const afterClose = vi.fn();
+    function KeptOpen() {
+      const [open, setOpen] = useState(true);
+      const [cancelled, setCancelled] = useState(false);
+      return (
+        <QuickPickDialog
+          open={open && !cancelled}
+          // The owner ignores the accept's close, and closes only on the cancel.
+          onOpenChange={() => setOpen(true)}
+          onCancel={() => setCancelled(true)}
+          label="Pick"
+          segments={commands}
+          query=""
+          onQueryChange={() => undefined}
+          emptyMessage="No results found"
+          onAccept={() => ({ afterClose })}
+        />
+      );
+    }
+    render(<KeptOpen />);
+    await screen.findByRole("combobox", { name: "Pick" });
+    await userEvent.keyboard("{Enter}");
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(afterClose).not.toHaveBeenCalled();
   });

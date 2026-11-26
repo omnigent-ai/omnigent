@@ -15,7 +15,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useContext } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
@@ -23,6 +23,9 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
+import { registeredPaletteCommands } from "@/test/paletteCommands";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { TabsRecord } from "@/components/BrowserPane/agentTools/tabStore";
 import { type BrowserActionOutcome, emitBrowserActionSettled } from "@/lib/browserActionBus";
 import type { AgentBrowserTabRequest } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
@@ -32,7 +35,7 @@ const tabs = vi.hoisted(() => ({
   opened: { ok: true as const, tabId: "tab", created: true, selected: true },
   // The session's open tabs, the selected one first; set per test.
   store: {
-    records: [] as { id: string; binding?: { kind: string } }[],
+    records: [] as { id: string; place: { kind: string }; binding?: { kind: string } }[],
     selectedTabId: null as string | null,
     tabs() {
       return this.records;
@@ -41,6 +44,7 @@ const tabs = vi.hoisted(() => ({
       return this.records.find((tab) => tab.id === this.selectedTabId);
     },
     select: vi.fn((_id: string) => true),
+    subscribe: (_listener: () => void) => () => {},
   },
 }));
 
@@ -69,7 +73,6 @@ vi.mock("@/components/BrowserPane/agentTools/tabStore", async (importOriginal) =
   },
 }));
 
-// A draft typed into the host stands for its editors' unsaved text, which a remount loses.
 // The file action host has its own suite; these tests check that it mounts only with the flag.
 const fileActionHost = vi.hoisted(() => ({ throws: false }));
 vi.mock("./fileCommands/FileActionHost", () => ({
@@ -78,6 +81,8 @@ vi.mock("./fileCommands/FileActionHost", () => ({
     return <div data-testid="file-action-host" />;
   },
 }));
+
+// A draft typed into the host stands for its editors' unsaved text, which a remount loses.
 vi.mock("./workspaceTabs/WorkspaceTabsHost", () => ({
   default: (props: WorkspaceTabsHostProps) => {
     tabs.host = props;
@@ -187,7 +192,9 @@ vi.mock("./TerminalsPanel", () => ({ TerminalsPanel: () => null }));
 import { useSessionAgent } from "@/hooks/useAgents";
 import { TEMP_CONV_ID_PREFIX } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
+import { openTasksTab, showTasksTabBesideChat } from "@/store/sessionTasksActions";
 import { AppShell } from "./AppShell";
+import { setSplitOnScreen } from "./chatPaneToolbarHost";
 import { FileViewerContext, useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
 import * as workspaceTabsSessions from "./workspaceTabs/workspaceTabsSessions";
@@ -207,6 +214,9 @@ function expectTabsUntouched() {
   expect(tabs.host).toBeNull();
   for (const route of tabRoutes()) expect(route).not.toHaveBeenCalled();
 }
+const showAllPullRequestsRows = () =>
+  registeredPaletteCommands().filter((command) => command.label === "Show all pull requests");
+
 const DESKTOP = 1440;
 const NARROW_DESKTOP = 700;
 
@@ -224,13 +234,16 @@ const viewportListeners = new Map<(event: { matches: boolean }) => void, string>
 /** The window is `width` wide: below 1181px the shell shows the sidebar as a drawer. */
 function setViewport(width: number, pointer: "fine" | "coarse" = "fine") {
   vi.spyOn(window, "matchMedia").mockImplementation((query: string) => {
-    const max = /max-width:\s*([\d.]+)px/.exec(query);
-    const min = /min-width:\s*([\d.]+)px/.exec(query);
+    // A media query's rem is the browser's default font size, 16px here.
+    const pixels = (bound: RegExpExecArray | null) =>
+      bound === null ? null : Number(bound[1]) * (bound[2] === "rem" ? 16 : 1);
+    const max = pixels(/max-width:\s*([\d.]+)(px|rem)/.exec(query));
+    const min = pixels(/min-width:\s*([\d.]+)(px|rem)/.exec(query));
     const pointerQuery = /pointer:\s*(\w+)/.exec(query);
     const matches =
       pointerQuery !== null
         ? pointerQuery[1] === pointer
-        : (max === null || width <= Number(max[1])) && (min === null || width >= Number(min[1]));
+        : (max === null || width <= max) && (min === null || width >= min);
     return {
       matches,
       media: query,
@@ -412,9 +425,138 @@ describe("workspace_sidebar_v2", () => {
     expect(screen.getByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
     expect(screen.queryByTestId("tabs-host")).toBeNull();
     expect(screen.queryByTestId("file-action-host")).toBeNull();
+    expect(showAllPullRequestsRows()).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
     fireEvent.click(screen.getByRole("button", { name: "Open cited file" }));
     expectTabsUntouched();
+  });
+
+  it("offers ⌘K's Show all pull requests with the flag on, which opens the session's list", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+
+    await waitFor(() => expect(showAllPullRequestsRows()).toHaveLength(1));
+    const [row] = showAllPullRequestsRows();
+    expect(row).toMatchObject({ id: "workspace:conv_ws:pull-requests:all" });
+    act(() => row!.run());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.showWorkspacePullRequests).toHaveBeenCalledWith("conv_ws", {
+        kind: "overview",
+      }),
+    );
+  });
+
+  it("offers ⌘K's Show all pull requests with the sidebar collapsed, and reveals the list", async () => {
+    writeWorkspacePanelDefault("collapsed");
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse right panel" })).toBeNull();
+
+    await waitFor(() => expect(showAllPullRequestsRows()).toHaveLength(1));
+    act(() => showAllPullRequestsRows()[0]!.run());
+    await waitFor(() =>
+      expect(workspaceTabsSessions.showWorkspacePullRequests).toHaveBeenCalledWith("conv_ws", {
+        kind: "overview",
+      }),
+    );
+    expect(await screen.findByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["keeps it collapsed when the session opens", "session-open", "Expand right panel"],
+    ["reveals it for a click", "click", "Collapse right panel"],
+  ] as const)(
+    "shows the Tasks page in a collapsed sidebar, and %s",
+    async (_, requestedBy, toggle) => {
+      writeWorkspacePanelDefault("collapsed");
+      const initialChatState = useChatStore.getState();
+      useChatStore.setState({
+        todos: [{ content: "Only item", status: "pending", activeForm: "" }],
+      });
+      onTestFinished(() => useChatStore.setState(initialChatState));
+      setViewport(DESKTOP);
+      renderShell(withFlag(true));
+      expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+
+      act(() =>
+        requestedBy === "click"
+          ? openTasksTab("conv_ws")
+          : showTasksTabBesideChat("conv_ws", requestedBy),
+      );
+
+      await waitFor(() =>
+        expect(workspaceTabsSessions.openWorkspacePage).toHaveBeenCalledWith("conv_ws", "tasks"),
+      );
+      expect(await screen.findByRole("button", { name: toggle })).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["follows the flag", { floating_panes: true }, "fine", true],
+    ["stays off when the server says off", { floating_panes: false }, "fine", false],
+    ["stays off on an older server without it", {}, "fine", false],
+    ["stays off on a touch client", { floating_panes: true }, "coarse", false],
+  ] as const)("marks the shell for floating panes: %s", (_, features, pointer, floating) => {
+    setViewport(DESKTOP, pointer);
+    const info = withFlag(true);
+    const { floating_panes: _withoutIt, ...base } = info.features ?? {};
+    renderShell({ ...info, features: { ...base, ...features } });
+
+    const shell = document.querySelector(".app-shell");
+    if (floating) expect(shell).toHaveAttribute("data-floating-panes", "");
+    else expect(shell).not.toHaveAttribute("data-floating-panes");
+    // The session column is marked, so the styling cards its chat page and nothing else.
+    expect(document.querySelector("[data-main-view]")).toHaveAttribute("data-main-view", "chat");
+  });
+
+  // Only floating panes draw a split as cards of its own; without them the chat keeps its card.
+  it.each([
+    ["floats as its own cards", true, "terminal"],
+    ["shows without floating panes", false, "chat"],
+  ] as const)(
+    "gives the column the view it has while a split on screen beside the chat %s",
+    (_case, floating, splitView) => {
+      setViewport(DESKTOP);
+      renderShell({
+        ...withFlag(true),
+        features: { ...withFlag(true).features, floating_panes: floating },
+      });
+      const column = () => document.querySelector("[data-main-view]");
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+
+      act(() => setSplitOnScreen("conv_ws", true));
+      expect(column()).toHaveAttribute("data-main-view", splitView);
+      act(() => setSplitOnScreen("conv_ws", false));
+      expect(column()).toHaveAttribute("data-main-view", "chat");
+    },
+  );
+
+  it("reserves the header's room for the rail only while the rail sits inline", async () => {
+    setViewport(1000);
+    renderShell({
+      ...withFlag(true),
+      features: { ...withFlag(true).features, floating_panes: true },
+    });
+    const column = () => document.querySelector<HTMLElement>("[data-main-view]")!;
+    const offset = () => column().style.getPropertyValue("--workspace-panel-offset");
+    expect(await screen.findByTestId("tabs-host")).toBeInTheDocument();
+    expect(tabs.host).toMatchObject({ placement: "drawer" });
+    expect(offset()).toBe("0px");
+
+    // Opening the drawer and putting it away leaves the rail open, and still out of the header's way.
+    fireEvent.click(screen.getByRole("button", { name: "Open linked PR" }));
+    const drawer = screen.getByTestId("workspace-tabs-drawer");
+    await waitFor(() => expect(drawer).toHaveAttribute("data-state", "open"));
+    expect(offset()).toBe("0px");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close", hidden: true }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(offset()).toBe("0px");
+
+    resizeTo(DESKTOP);
+    await waitFor(() => expect(tabs.host).toMatchObject({ placement: "rail" }));
+    expect(Number.parseFloat(offset())).toBeGreaterThan(0);
   });
 
   it("shows the tabs in the Workspace drawer in a narrow desktop window", async () => {
@@ -489,9 +631,9 @@ describe("workspace_sidebar_v2", () => {
         data: { id: "agent", terminals: [{ name: "shell" }] },
       } as never);
       tabs.store.records = [
-        { id: "file", binding: undefined },
-        { id: "shell", binding: { kind: "terminal" } },
-        { id: "chat", binding: { kind: "chat" } },
+        { id: "file", place: { kind: "files" }, binding: undefined },
+        { id: "shell", place: { kind: "terminal" }, binding: { kind: "terminal" } },
+        { id: "chat", place: { kind: "chat" }, binding: { kind: "chat" } },
       ];
       tabs.store.selectedTabId = "file";
     });
@@ -523,7 +665,7 @@ describe("workspace_sidebar_v2", () => {
     it.each(["Shells", "Side chats"])(
       "%s opens a New tab to choose from when none is open",
       async (entry) => {
-        tabs.store.records = [{ id: "file", binding: undefined }];
+        tabs.store.records = [{ id: "file", place: { kind: "files" }, binding: undefined }];
         await chooseFromMenu(entry);
         expect(tabs.store.select).not.toHaveBeenCalled();
         expect(workspaceTabsSessions.openWorkspaceNewTab).toHaveBeenCalledWith("conv_ws");
@@ -559,7 +701,6 @@ describe("workspace_sidebar_v2", () => {
   );
 
   it("doesn't reopen a file the classic sidebar remembered when the tabs sidebar reopens", async () => {
-    const { writeSessionWorkspaceState } = await import("@/lib/sessionWorkspaceState");
     writeSessionWorkspaceState("conv_ws", { selectedFilePath: "old.ts", open: true });
     setViewport(DESKTOP);
     renderShell(withFlag(true));
@@ -818,5 +959,63 @@ describe("workspace_sidebar_v2", () => {
     } finally {
       delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
     }
+  });
+});
+
+describe("⇧⌘F and ⌘K's full screen row", () => {
+  const pressFullScreen = () => {
+    const mac = isMacPlatform();
+    const event = new KeyboardEvent("keydown", {
+      key: "F",
+      code: "KeyF",
+      metaKey: mac,
+      ctrlKey: !mac,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    return event;
+  };
+  const fullScreenRow = () =>
+    registeredPaletteCommands().find(
+      (command) => command.shortcut === "workspace.toggleFullScreen",
+    );
+
+  it("fills the window from the chord, and leaves it on a second press", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(true));
+    await screen.findByTestId("tabs-host");
+    // The row and the chord load with the tabs sidebar's code.
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    expect(pressFullScreen().defaultPrevented).toBe(true);
+    expect(tabs.host).toMatchObject({ maximized: true });
+    expect(fullScreenRow()?.label).toBe("Exit workspace full screen");
+    pressFullScreen();
+    expect(tabs.host).toMatchObject({ maximized: false });
+    expect(fullScreenRow()?.label).toBe("Make the workspace full screen");
+  });
+
+  it("opens a closed sidebar straight into full screen from ⌘K", async () => {
+    setViewport(DESKTOP);
+    writeSessionWorkspaceState("conv_ws", { open: false });
+    renderShell(withFlag(true));
+    await waitFor(() => expect(fullScreenRow()).toBeDefined());
+    act(() => fullScreenRow()!.run());
+    await waitFor(() => expect(tabs.host).toMatchObject({ maximized: true }));
+  });
+
+  it("leaves the chord alone and offers no row in the classic sidebar", async () => {
+    setViewport(DESKTOP);
+    renderShell(withFlag(false));
+    await screen.findByRole("complementary", { name: "Workspace" });
+    // A row registered late, once some lazy code loads, would still count.
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
+    expect(pressFullScreen().defaultPrevented).toBe(false);
+    expect(fullScreenRow()).toBeUndefined();
   });
 });

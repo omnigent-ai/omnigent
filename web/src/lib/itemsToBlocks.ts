@@ -59,6 +59,7 @@ import {
   isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
+  terminalCommandSubmission,
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
@@ -247,10 +248,31 @@ function answersFromToolResult(
     const at = output.indexOf(`"${question.question}${ANSWER_SEPARATOR}`);
     if (at === -1) continue;
     const from = at + question.question.length + 1 + ANSWER_SEPARATOR.length;
-    const end = output.indexOf('"', from);
-    answers[question.question] = end === -1 ? output.slice(from) : output.slice(from, end);
+    const end = answerEnd(output, from, payload.questions);
+    answers[question.question] = output.slice(from, end);
   }
   return answers;
+}
+
+/**
+ * Where the answer that starts at ``from`` ends. Answers are not escaped, so one can hold
+ * quotes of its own (a session marker's title). It ends at the next answer's
+ * ``", "<question>"=`` boundary; the last answer ends at the last quote, as the trailing
+ * sentence has none.
+ */
+function answerEnd(
+  output: string,
+  from: number,
+  questions: AskUserQuestionPayload["questions"],
+): number {
+  let next = -1;
+  for (const question of questions) {
+    const at = output.indexOf(`", "${question.question}${ANSWER_SEPARATOR}`, from);
+    if (at !== -1 && (next === -1 || at < next)) next = at;
+  }
+  if (next !== -1) return next;
+  const last = output.lastIndexOf('"');
+  return last >= from ? last : output.length;
 }
 
 function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
@@ -520,6 +542,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
 function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock {
   return {
     type: "terminal_command",
+    submission: terminalCommandSubmission(item.submission),
     ctx: ctxFor(item),
     kind: item.kind,
     input: item.input ?? null,

@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.runtime import pending_elicitations
 from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -84,6 +85,10 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Children read before lowering a stored pending count; a full page leaves it as is.
+_PENDING_COUNT_REPAIR_CHILD_LIMIT = 128
+# Sessions one repair may examine, counting the same-runner children it corrects.
+_PENDING_COUNT_REPAIR_SESSION_BUDGET = 32
 # Last parked reason persisted per session (``""`` = not parked), for dedupe.
 _last_blocked_on: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Handoffs to another replica per session. A write queued before a handoff sees
@@ -438,6 +443,170 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
         count,
         on_failure=_evict,
     )
+
+
+def reconcile_pending_count(
+    conversation_id: str, stored_count: int | None, *, runner_id: str | None = None
+) -> Future[Any] | None:
+    """
+    Repair a stored pending count that disagrees with this replica's index.
+
+    Call only on the replica holding the session's runner, where the
+    session's own prompts park. The repair runs on the ordered writer, so a
+    count change made while it reads queues its own write behind the repair,
+    and it writes nothing once the session is handed to another replica.
+    Raising the stored count is always safe. Lowering it is safe only when no
+    child counts a prompt: whichever replica records a child's prompt also
+    mirrors it into this count, and that replica may be another one. A child
+    on the same runner parks its prompts here too, so its own count is
+    repaired first, within a bounded budget.
+
+    :param conversation_id: Session/conversation identifier.
+    :param stored_count: The session's stored count as the caller read it,
+        or ``None`` when never reported.
+    :param runner_id: The session's runner, which this replica holds.
+        ``None`` takes every child's stored count as reported.
+    :returns: Future of ``True`` once the repair ran, of ``None`` when it was
+        skipped or failed; ``None`` without a store.
+    """
+    store = _store
+    if store is None:
+        return None
+    handoffs = _handoffs.get(conversation_id, 0)
+    repair = _PendingCountRepair(store, runner_id)
+    return _submit_while_owned(
+        conversation_id,
+        "pending_count_repair",
+        repair.repair,
+        conversation_id,
+        stored_count or 0,
+        lambda: _handoffs.get(conversation_id, 0) == handoffs,
+        handoffs=handoffs,
+    )
+
+
+class _PendingCountRepair:
+    """One repair of a session's stored pending count and its same-runner children."""
+
+    def __init__(self, store: ConversationStore, runner_id: str | None) -> None:
+        """
+        :param store: Store holding the session and its children.
+        :param runner_id: The runner this replica holds for the session, or ``None``.
+        """
+        self._store = store
+        self._runner_id = runner_id
+        self._budget = _PENDING_COUNT_REPAIR_SESSION_BUDGET
+
+    def repair(self, conversation_id: str, stored: int, owned: Callable[[], bool]) -> int:
+        """
+        Repair one stored count on the writer thread.
+
+        :param conversation_id: Session whose stored count to repair.
+        :param stored: Its stored count as last read.
+        :param owned: Whether this replica still owns the session, checked
+            before every write.
+        :returns: The count the row holds after the repair.
+        """
+        self._budget -= 1
+        live = pending_elicitations.count_for(conversation_id)
+        if live == stored or (
+            live < stored
+            and self._children_may_count_prompts(conversation_id, owned, correct=True)
+        ):
+            return stored
+        # Read again: a prompt published during the child reads is counted now.
+        count = pending_elicitations.count_for(conversation_id)
+        if not self._write(conversation_id, count, owned):
+            return stored
+        if count >= stored:
+            return count
+        # A child prompt published elsewhere after the check wrote the child's
+        # count before its mirror into this row, so a second look finds it.
+        try:
+            restore = self._children_may_count_prompts(conversation_id, owned, correct=False)
+        except Exception:
+            _logger.warning(
+                "pending-count repair could not confirm children; restoring the count",
+                exc_info=True,
+            )
+            restore = True
+        if not restore:
+            return count
+        restored = max(stored, pending_elicitations.count_for(conversation_id))
+        return restored if self._write(conversation_id, restored, owned) else count
+
+    def _write(self, conversation_id: str, count: int, owned: Callable[[], bool]) -> bool:
+        """Store *count* unless the session has been handed off; report whether it did."""
+        if not owned():
+            return False
+        self._store.set_pending_elicitation_count(conversation_id, count)
+        # This replica's last write no longer describes the row, so the next
+        # count change must reach the store even when it repeats that value.
+        _last_pending.pop(conversation_id, None)
+        return True
+
+    def _child_owned(
+        self, child_id: str, handoffs: int, parent_owned: Callable[[], bool]
+    ) -> Callable[[], bool]:
+        """
+        Build the ownership check for a same-runner child being repaired.
+
+        :param child_id: The child session.
+        :param handoffs: The child's handoff count from before its activity was read.
+        :param parent_owned: The ownership check of the session being repaired.
+        :returns: A check that this replica still owns the child.
+        """
+
+        def owned() -> bool:
+            if not parent_owned() or _handoffs.get(child_id, 0) != handoffs:
+                return False
+            # A rebind to another runner can land before this replica notices it.
+            activity = self._store.get_session_activity([child_id]).get(child_id)
+            return activity is not None and activity.runner_id == self._runner_id
+
+        return owned
+
+    def _children_may_count_prompts(
+        self, conversation_id: str, owned: Callable[[], bool], *, correct: bool
+    ) -> bool:
+        """
+        Report whether a child of the session may count an outstanding prompt.
+
+        :param conversation_id: Parent session identifier.
+        :param owned: The parent's ownership check, which every child write also passes.
+        :param correct: Repair the stored counts of same-runner children first.
+        :returns: ``True`` when a child's stored count or this replica's index
+            counts a prompt, or when there are too many children to tell.
+        """
+        children = self._store.list_child_conversation_ids_page(
+            conversation_id, limit=_PENDING_COUNT_REPAIR_CHILD_LIMIT
+        )
+        if len(children) >= _PENDING_COUNT_REPAIR_CHILD_LIMIT:
+            return True
+        child_ids = [child_id for child_id, _ in children]
+        if any(pending_elicitations.counts_for(child_ids).values()):
+            return True
+        # Taken before the activity read, so a handoff during it fences the child.
+        child_handoffs = {child_id: _handoffs.get(child_id, 0) for child_id in child_ids}
+        for child_id, activity in self._store.get_session_activity(child_ids).items():
+            child_stored = activity.pending_elicitation_count or 0
+            if child_stored == 0:
+                continue
+            # A child on another runner may hold a genuine prompt elsewhere.
+            if (
+                not correct
+                or self._runner_id is None
+                or activity.runner_id != self._runner_id
+                or self._budget <= 0
+                or self.repair(
+                    child_id,
+                    child_stored,
+                    self._child_owned(child_id, child_handoffs.get(child_id, 0), owned),
+                )
+                > 0
+            ):
+                return True
+        return False
 
 
 def persist_background_work_running(

@@ -23,9 +23,9 @@ class DownloadFileTool(Tool):
     @classmethod
     def name(cls) -> str:
         """
-        :returns: ``"sys_download_file"``.
+        :returns: ``"sys_files_download"``.
         """
-        return "sys_download_file"
+        return "sys_files_download"
 
     @classmethod
     def description(cls) -> str:
@@ -35,7 +35,7 @@ class DownloadFileTool(Tool):
         return (
             "Read a stored session file by its file_id and return its content as "
             "text. Use it for text files: binary content is not returned intact. "
-            "Use sys_list_files to find available file IDs."
+            "Use sys_files_list to find available file IDs."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -47,7 +47,7 @@ class DownloadFileTool(Tool):
         return {
             "type": "function",
             "function": {
-                "name": "sys_download_file",
+                "name": "sys_files_download",
                 "description": self.description(),
                 "parameters": {
                     "type": "object",
