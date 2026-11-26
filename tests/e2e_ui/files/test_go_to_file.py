@@ -13,12 +13,19 @@ from tests.e2e_ui.files._files_page import is_mac, open_workspace, seeded_worksp
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _FILES = ("widgets/gadget.py", "widgets/gizmo.py", "README.md")
+# gadget.py's own line comes 40th, so opening its match at the top of the file would show.
+_MATCH_LINE = 40
+_CONTENTS = {path: f"contents of {path}\n" for path in _FILES} | {
+    "widgets/gadget.py": "".join(f"filler {line}\n" for line in range(1, _MATCH_LINE))
+    + "contents of widgets/gadget.py\n"
+    + "".join(f"filler {line}\n" for line in range(_MATCH_LINE + 1, 80)),
+}
 
 
 @pytest.fixture
 def go_to_file_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
     # Removes exactly what it wrote from the session's real workspace afterwards.
-    with seeded_workspace(seeded_session, {path: f"contents of {path}\n" for path in _FILES}):
+    with seeded_workspace(seeded_session, _CONTENTS):
         yield seeded_session
 
 
@@ -55,10 +62,8 @@ def test_go_to_file_opens_a_match_from_every_entry_point_and_lists_it_next_time(
     expect(page.get_by_role("option", name=re.compile(r"gizmo\.py"))).to_have_count(0)
     # The finder marks where the typed text occurs.
     expect(match.locator('mark[data-match-highlight="strong"]')).to_have_text(["gadget"])
-    # The active match is previewed beside the list.
-    expect(page.get_by_test_id("go-to-file-preview")).to_contain_text(
-        "contents of widgets/gadget.py", timeout=15_000
-    )
+    # The active match is previewed beside the list, from its first line.
+    expect(page.get_by_test_id("go-to-file-preview")).to_contain_text("filler 1", timeout=15_000)
     query.press("Enter")
     expect(query).to_be_hidden()
     expect(sidebar.get_by_role("tab", name=re.compile(r"^gadget\.py"))).to_have_attribute(
@@ -125,11 +130,18 @@ def test_text_search_finds_a_line_opens_it_there_and_hands_off_to_the_search_pag
     expect(line).to_be_visible(timeout=15_000)
     # The line is listed under its file and previewed at its line.
     expect(page.get_by_role("group", name="widgets/gadget.py")).to_be_visible()
-    expect(page.get_by_test_id("go-to-file-preview")).to_contain_text("Line 1", timeout=15_000)
+    expect(page.get_by_test_id("go-to-file-preview")).to_contain_text(
+        f"Line {_MATCH_LINE}", timeout=15_000
+    )
     query.press("Enter")
     expect(query).to_be_hidden()
     expect(sidebar.get_by_role("tab", name=re.compile(r"^gadget\.py"))).to_have_attribute(
         "aria-selected", "true", timeout=15_000
+    )
+    # The file opens with the cursor on the matched line, not at the top.
+    editor = sidebar.locator('[data-testid="workspace-files-place"]:visible .cm-editor')
+    expect(editor.locator(".cm-activeLine")).to_have_text(
+        "contents of widgets/gadget.py", timeout=15_000
     )
 
     # Open in Search hands the search and its lines to the Search page.
