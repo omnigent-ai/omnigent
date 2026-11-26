@@ -649,14 +649,14 @@ def test_init_requires_bridge_dir_env_when_unset(monkeypatch: pytest.MonkeyPatch
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
 def test_run_turn_valid_effort_is_accepted(
     tmp_path: Path, injected: dict[str, object], effort: str
 ) -> None:
     """
-    A valid Antigravity effort level (low/medium/high) does not block delivery.
+    A valid Antigravity effort level (low/medium/high/xhigh/max) does not block delivery.
 
-    agy's Gemini backend supports these three levels. A valid effort in the
+    agy supports these five levels via ``--effort`` and ``/effort``. A valid effort in the
     config must not surface as an error — the executor validates it and proceeds
     to inject the turn into the TUI.
 
@@ -685,17 +685,16 @@ def test_run_turn_valid_effort_is_accepted(
     assert isinstance(events[0], TurnComplete)
 
 
-@pytest.mark.parametrize("bad_effort", ["xhigh", "max", "none", "minimal"])
+@pytest.mark.parametrize("bad_effort", ["none", "minimal"])
 def test_run_turn_unsupported_effort_surfaces_error(
     tmp_path: Path, injected: dict[str, object], bad_effort: str
 ) -> None:
     """
-    An effort level unsupported by Antigravity/Gemini yields an ExecutorError.
+    An effort level unsupported by Antigravity yields an ExecutorError.
 
-    ``xhigh`` and ``max`` are OpenAI/Anthropic-only; ``none`` and ``minimal``
-    are OpenAI-only. Passing them to an Antigravity turn should surface a
-    clear non-retryable error so the caller does not silently ignore the
-    mismatch.
+    ``none`` and ``minimal`` are not accepted by ``agy --effort`` / ``/effort``.
+    Passing them to an Antigravity turn should surface a clear non-retryable
+    error so the caller does not silently ignore the mismatch.
 
     :param tmp_path: Bridge directory.
     :param injected: Stub recording TUI injects.

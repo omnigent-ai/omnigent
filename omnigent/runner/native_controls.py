@@ -43,6 +43,7 @@ from omnigent.runner.app_support import (
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _SESSION_METADATA_PARAMS,
+    _antigravity_native_bridge_id_for_session,
     _auto_create_opencode_terminal,
     _claude_native_bridge_id_for_session,
     _codex_native_model_from_spec,
@@ -303,6 +304,9 @@ class NativeControls:
     """Native-harness control handlers the runner app's event dispatch calls."""
 
     codex_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
+    handle_antigravity_native_effort_change: Callable[
+        [str, str | None], Coroutine[Any, Any, Response]
+    ]
     handle_claude_native_btw_dismiss: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
@@ -1316,6 +1320,50 @@ def build_native_controls(
             conv_id,
             extra={"session_id": conv_id},
         )
+
+    async def _handle_antigravity_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            bridge_dir_for_bridge_id,
+            inject_slash_command,
+        )
+        from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort
+
+        try:
+            validated_effort = validate_effort(effort, "antigravity", ANTIGRAVITY_EFFORTS)
+        except ValueError:
+            return Response(status_code=204)
+        if validated_effort is None:
+            return Response(status_code=204)
+        bridge_id = (
+            await _antigravity_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=conv_id,
+            )
+            if server_client is not None
+            else conv_id
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        try:
+            await asyncio.to_thread(
+                inject_slash_command,
+                bridge_dir,
+                command=f"/effort {validated_effort}",
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_effort_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="antigravity-native effort change"
+                    ),
+                },
+            )
+        return Response(status_code=204)
 
     async def _handle_claude_native_effort_change(
         conv_id: str,
@@ -2641,6 +2689,7 @@ def build_native_controls(
 
     return NativeControls(
         codex_native_model_options=_codex_native_model_options,
+        handle_antigravity_native_effort_change=_handle_antigravity_native_effort_change,
         handle_claude_native_btw_dismiss=_handle_claude_native_btw_dismiss,
         handle_claude_native_clear=_handle_claude_native_clear,
         handle_claude_native_compact=_handle_claude_native_compact,

@@ -69,7 +69,7 @@ it.each([
 });
 
 it("uses declared effort families only for SDK harnesses", () => {
-  const families = { "claude-sdk": "anthropic", "antigravity-native": "gemini" };
+  const families = { "claude-sdk": "anthropic", "antigravity-native": "antigravity-native" };
   expect(sdkEffortFamilyForHarness("claude-sdk", families)).toBe("anthropic");
   expect(sdkEffortFamilyForHarness("antigravity-native", families)).toBeNull();
   expect(sdkEffortFamilyForHarness(null, families)).toBeNull();
@@ -86,6 +86,12 @@ describe("effortLevelsForConv", () => {
       "xhigh",
       "max",
     ]);
+  });
+
+  it("returns the extended ladder (xhigh, max) for antigravity-native-ui", () => {
+    expect(
+      effortLevelsForConv({ labels: { "omnigent.wrapper": "antigravity-native-ui" } }),
+    ).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   it("returns only the selected model's rungs for devin-native-ui", () => {
@@ -195,6 +201,12 @@ describe("shouldShowEffortPicker", () => {
     // WHY: delegates to supportsEffortControl — only claude-native exposes a
     // Web UI effort dial.
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": NATIVE } })).toBe(true);
+  });
+
+  it("shows effort controls for antigravity-native (live /effort + --effort)", () => {
+    expect(
+      shouldShowEffortPicker({ labels: { "omnigent.wrapper": "antigravity-native-ui" } }),
+    ).toBe(true);
   });
 
   it("shows effort controls for devin-native (effort is a model-variant suffix)", () => {

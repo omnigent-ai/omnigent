@@ -151,6 +151,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort
 
 _logger = logging.getLogger(__name__)
 
@@ -217,6 +218,7 @@ def run_antigravity_native(
     resume_picker: bool = False,
     command: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
     permission_mode: str | None = None,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -259,7 +261,11 @@ def run_antigravity_native(
     if not resolved_command:
         raise click.ClickException("Antigravity command must not be empty.")
     _preflight_local_tools()
-    # Fail early on an invalid selected provider before starting the server.
+    # Fail early on an invalid effort or selected provider before starting the server.
+    try:
+        validated_effort = validate_effort(effort, "antigravity", ANTIGRAVITY_EFFORTS)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     try:
         launch = resolve_native_antigravity_launch(model=model)
     except OmnigentError as exc:
@@ -278,6 +284,7 @@ def run_antigravity_native(
                 antigravity_args=antigravity_args,
                 command=resolved_command,
                 model=launch.model,
+                effort=validated_effort,
                 permission_mode=permission_mode,
                 headless=headless,
                 auto_open_conversation=auto_open_conversation,
@@ -291,6 +298,7 @@ def run_antigravity_native(
                 antigravity_args=antigravity_args,
                 command=resolved_command,
                 model=launch.model,
+                effort=validated_effort,
                 permission_mode=permission_mode,
                 headless=headless,
                 auto_open_conversation=auto_open_conversation,
@@ -349,6 +357,7 @@ def _run_with_local_server(
     antigravity_args: tuple[str, ...],
     command: str,
     model: str | None,
+    effort: str | None = None,
     permission_mode: str | None = None,
     headless: bool = False,
     auto_open_conversation: bool = False,
@@ -411,6 +420,7 @@ def _run_with_local_server(
                     antigravity_args=antigravity_args,
                     command=command,
                     model=model,
+                    effort=effort,
                     permission_mode=permission_mode,
                     headless=headless,
                     startup_progress=progress,
@@ -448,6 +458,7 @@ def _run_with_remote_server(
     antigravity_args: tuple[str, ...],
     command: str,
     model: str | None,
+    effort: str | None = None,
     permission_mode: str | None = None,
     headless: bool = False,
     auto_open_conversation: bool = False,
@@ -514,6 +525,7 @@ def _run_with_remote_server(
                     antigravity_args=antigravity_args,
                     command=command,
                     model=model,
+                    effort=effort,
                     permission_mode=permission_mode,
                     headless=headless,
                     host_id=host_id,
@@ -570,6 +582,7 @@ async def _prepare_antigravity_terminal(
     antigravity_args: tuple[str, ...],
     command: str,
     model: str | None,
+    effort: str | None = None,
     permission_mode: str | None = None,
     headless: bool = False,
     startup_progress: RunnerStartupProgress | None = None,
@@ -613,6 +626,7 @@ async def _prepare_antigravity_terminal(
                 client,
                 session_bundle,
                 bridge_id=bridge_id,
+                effort=effort,
             )
         else:
             _update_progress(startup_progress, "Loading Antigravity session...")
@@ -628,9 +642,9 @@ async def _prepare_antigravity_terminal(
             bridge_id = str(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
             existing = await _find_running_antigravity_terminal(client, session_id)
             if existing is not None:
-                if antigravity_args or model is not None:
+                if antigravity_args or model is not None or effort is not None:
                     click.echo(
-                        "Ignoring Antigravity launch args/model for an already-running "
+                        "Ignoring Antigravity launch args/model/effort for an already-running "
                         "terminal; restart the session terminal to apply them.",
                         err=True,
                     )
@@ -646,6 +660,10 @@ async def _prepare_antigravity_terminal(
             external = payload.get("external_session_id") if isinstance(payload, dict) else None
             conversation_id = external if isinstance(external, str) and external else bridge_id
             resume = isinstance(external, str) and bool(external)
+            if effort is not None:
+                await _patch_antigravity_session_effort(client, session_id, effort)
+            else:
+                effort = _persisted_effort_from_payload(payload)
 
         if runner_id is not None:
             await _bind_session_runner(client, session_id, runner_id)
@@ -692,6 +710,7 @@ async def _prepare_antigravity_terminal(
             antigravity_args=antigravity_args,
             command=command,
             model=model,
+            effort=effort,
             permission_mode=permission_mode,
             headless=headless,
             startup_progress=startup_progress,
@@ -754,6 +773,7 @@ async def _prepare_antigravity_terminal_via_daemon(
     antigravity_args: tuple[str, ...],
     command: str,
     model: str | None,
+    effort: str | None = None,
     permission_mode: str | None = None,
     headless: bool = False,
     host_id: str,
@@ -807,6 +827,7 @@ async def _prepare_antigravity_terminal_via_daemon(
                     client,
                     session_bundle,
                     bridge_id=bridge_id,
+                    effort=effort,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
@@ -833,9 +854,9 @@ async def _prepare_antigravity_terminal_via_daemon(
             # it); a cold resume returns ``None`` and falls through to launch.
             existing = await _find_running_antigravity_terminal(client, session_id)
             if existing is not None:
-                if antigravity_args or model is not None:
+                if antigravity_args or model is not None or effort is not None:
                     click.echo(
-                        "Ignoring Antigravity launch args/model for an already-running "
+                        "Ignoring Antigravity launch args/model/effort for an already-running "
                         "terminal; restart the session terminal to apply them.",
                         err=True,
                     )
@@ -851,6 +872,10 @@ async def _prepare_antigravity_terminal_via_daemon(
             external = payload.get("external_session_id") if isinstance(payload, dict) else None
             conversation_id = external if isinstance(external, str) and external else bridge_id
             resume = isinstance(external, str) and bool(external)
+            if effort is not None:
+                await _patch_antigravity_session_effort(client, session_id, effort)
+            else:
+                effort = _persisted_effort_from_payload(payload)
 
         if not fresh_session:
             await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
@@ -906,6 +931,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             antigravity_args=antigravity_args,
             command=command,
             model=model,
+            effort=effort,
             permission_mode=permission_mode,
             headless=headless,
             startup_progress=startup_progress,
@@ -930,6 +956,7 @@ async def _launch_and_record(
     antigravity_args: tuple[str, ...],
     command: str,
     model: str | None,
+    effort: str | None = None,
     permission_mode: str | None = None,
     headless: bool = False,
     startup_progress: RunnerStartupProgress | None,
@@ -995,6 +1022,7 @@ async def _launch_and_record(
         conversation_id=conversation_id if resume else None,
         model=model,
         resume=resume,
+        effort=effort,
         permission_mode=permission_mode,
         headless=headless,
         extra_args=antigravity_args,
@@ -1428,6 +1456,7 @@ async def _create_antigravity_session(
     bundle: bytes,
     *,
     bridge_id: str,
+    effort: str | None = None,
 ) -> str:
     """
     Create a bundled terminal-first Antigravity session.
@@ -1443,12 +1472,15 @@ async def _create_antigravity_session(
     :param client: HTTP client pointed at the Omnigent server.
     :param bundle: Gzipped Antigravity wrapper agent bundle.
     :param bridge_id: Opaque bridge id to write on the session labels.
+    :param effort: Optional validated reasoning effort to persist on the session.
     :returns: New Omnigent session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If creation fails.
     """
     labels = dict(_SESSION_LABELS)
     labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
     metadata: dict[str, object] = {"labels": labels}
+    if effort is not None:
+        metadata["reasoning_effort"] = effort
     resp = await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
@@ -1466,6 +1498,33 @@ async def _create_antigravity_session(
             "Antigravity session creation response did not include session_id."
         )
     return new_session_id
+
+
+async def _patch_antigravity_session_effort(
+    client: httpx.AsyncClient,
+    session_id: str,
+    effort: str,
+) -> None:
+    """Persist an explicit CLI ``--effort`` before cold-resume runner auto-create."""
+    resp = await client.patch(
+        f"/v1/sessions/{url_component(session_id)}",
+        json={"reasoning_effort": effort, "silent": True},
+    )
+    if resp.status_code >= 400:
+        raise click.ClickException(
+            f"Failed to update Antigravity session effort ({resp.status_code}): {error_text(resp)}"
+        )
+
+
+def _persisted_effort_from_payload(payload: dict[str, object]) -> str | None:
+    """Extract and validate a persisted ``reasoning_effort`` from a session snapshot."""
+    raw = payload.get("reasoning_effort")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return validate_effort(raw, "antigravity", ANTIGRAVITY_EFFORTS)
+    except ValueError:
+        return None
 
 
 async def _fetch_antigravity_session(

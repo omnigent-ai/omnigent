@@ -292,6 +292,64 @@ class TestBuildAgyLaunch:
         assert "--model" not in argv
 
     # ------------------------------------------------------------------
+    # Effort flag
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+    def test_effort_flag_present_when_given(self, fake_agy: str, effort: str) -> None:
+        """--effort <level> is appended when a supported effort is provided."""
+        argv, _ = build_agy_launch(
+            conversation_id=None,
+            model=None,
+            resume=False,
+            effort=effort,
+        )
+        assert "--effort" in argv
+        idx = argv.index("--effort")
+        assert argv[idx + 1] == effort
+
+    def test_effort_flag_absent_when_none(self, fake_agy: str) -> None:
+        """--effort is NOT appended when effort is None."""
+        argv, _ = build_agy_launch(
+            conversation_id=None,
+            model=None,
+            resume=False,
+            effort=None,
+        )
+        assert "--effort" not in argv
+
+    @pytest.mark.parametrize(
+        "extra_args",
+        [("--effort", "low"), ("--effort=low",)],
+    )
+    def test_effort_flag_not_duplicated_from_extra_args(
+        self,
+        fake_agy: str,
+        extra_args: tuple[str, ...],
+    ) -> None:
+        """Explicit --effort in extra_args takes precedence and is not duplicated."""
+        argv, _ = build_agy_launch(
+            conversation_id=None,
+            model=None,
+            resume=False,
+            effort="max",
+            extra_args=extra_args,
+        )
+        effort_args = [arg for arg in argv if arg == "--effort" or arg.startswith("--effort=")]
+        assert len(effort_args) == 1
+        assert "max" not in argv
+
+    def test_effort_flag_rejects_unsupported_value(self, fake_agy: str) -> None:
+        """Unsupported effort values raise ValueError."""
+        with pytest.raises(ValueError, match="not supported"):
+            build_agy_launch(
+                conversation_id=None,
+                model=None,
+                resume=False,
+                effort="bogus",
+            )
+
+    # ------------------------------------------------------------------
     # No env knobs (agy ignores them all)
     # ------------------------------------------------------------------
 

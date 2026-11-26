@@ -3081,3 +3081,77 @@ def test_draft_detected_when_single_long_paragraph_scrolled_with_more_lines() ->
     assert all(needle not in region for needle in needles)
     assert _mod._draft_in_input_region(pane, needles[0], baseline, tuple(needles[1:]))
     assert not _mod._draft_in_input_region(pane, needles[0], region, tuple(needles[1:]))
+
+
+def test_inject_slash_command_types_literally_and_submits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """inject_slash_command clears the draft, types via send-keys -l, and verifies submit."""
+    sep = "─" * 40
+    empty_pane = f"{sep}\n>\n{sep}\n? for shortcuts"
+    draft_pane = f"{sep}\n> /effort xhigh\n{sep}\n? for shortcuts"
+    submitted_pane = f"{sep}\n>\n{sep}\n? for shortcuts"
+    pane_seq = iter([empty_pane, empty_pane, empty_pane, draft_pane, draft_pane, submitted_pane])
+    tmux_calls: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        _mod,
+        "_wait_for_tmux_info",
+        lambda bridge_dir, *, timeout_s: {"socket_path": "/tmp/s", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(_mod, "_session_alive", lambda sock, target: True)
+    monkeypatch.setattr(_mod, "_capture_pane", lambda sock, target: next(pane_seq, submitted_pane))
+    monkeypatch.setattr(_mod, "_run_tmux", lambda sock, *args: tmux_calls.append(args) or "")
+    monkeypatch.setattr(_mod, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(_mod, "_TMUX_POLL_INTERVAL_S", 0.0)
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    _mod.inject_slash_command(bridge_dir, command="/effort xhigh", timeout_s=1.0)
+
+    assert ("send-keys", "-t", "main", "C-a") in tmux_calls
+    assert ("send-keys", "-t", "main", "C-k") in tmux_calls
+    assert ("send-keys", "-l", "-t", "main", "--", "/effort xhigh") in tmux_calls
+    assert ("send-keys", "-t", "main", "Enter") in tmux_calls
+
+
+@pytest.mark.parametrize(
+    "bad_command", ["", "effort high", "/effort high\nwhoami", "/effort\rhigh"]
+)
+def test_inject_slash_command_rejects_invalid_commands(tmp_path: Path, bad_command: str) -> None:
+    """Slash commands must start with '/' and be single-line."""
+    bridge_dir = tmp_path / "bridge"
+    with pytest.raises(ValueError):
+        _mod.inject_slash_command(bridge_dir, command=bad_command, timeout_s=0.1)
+
+
+def test_inject_slash_command_fails_fast_when_tui_exited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exited agy panes fail immediately without sending keys."""
+    monkeypatch.setattr(
+        _mod,
+        "_wait_for_tmux_info",
+        lambda bridge_dir, *, timeout_s: {"socket_path": "/tmp/s", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(_mod, "_session_alive", lambda sock, target: False)
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with pytest.raises(RuntimeError, match="no longer running"):
+        _mod.inject_slash_command(bridge_dir, command="/effort max", timeout_s=0.1)
+
+
+def test_inject_slash_command_times_out_when_bridge_lock_held(tmp_path: Path) -> None:
+    """A contended bridge injection lock raises RuntimeError within timeout_s."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    lock = _mod._bridge_injection_lock(bridge_dir)
+    assert lock.acquire(blocking=False)
+    try:
+        with pytest.raises(RuntimeError, match="timed out waiting"):
+            _mod.inject_slash_command(bridge_dir, command="/effort high", timeout_s=0.05)
+    finally:
+        lock.release()
