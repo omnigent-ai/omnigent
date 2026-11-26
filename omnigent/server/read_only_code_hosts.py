@@ -40,7 +40,9 @@ def is_read_only_pull_request(pr_url: object, patterns: Iterable[str]) -> bool:
 
     Checks the host as written and the host the session's host resolves it to, such as
     ``dev.azure.com`` for a legacy ``*.visualstudio.com`` URL. While any pattern is set, a
-    URL whose host can't be told is read-only too.
+    URL whose host can't be told is read-only too. Resolution uses the providers the server
+    knows, so a provider installed only on the session's host that maps a URL to another
+    host isn't matched against that host.
     """
     patterns = tuple(patterns)
     if not patterns or not isinstance(pr_url, str) or not pr_url:
