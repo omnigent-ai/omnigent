@@ -528,6 +528,9 @@ def gitlab_policy(
             value = args.last(name)
             if value is not None and (not value or value == "-"):
                 return _ask("Provide explicit MR text; editor or empty input requires approval.")
+        description = args.last("description")
+        if description and any(line.lstrip().startswith("/") for line in description.splitlines()):
+            return _ask("Potential GitLab quick actions in MR descriptions require approval.")
         if action == "create":
             if any(args.last(name) is None for name in ("title", "description")):
                 return _ask(

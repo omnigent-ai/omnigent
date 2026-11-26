@@ -794,6 +794,7 @@ _MR_CREATE_FIELDS = (
         f"create {_MR_CREATE_FIELDS}",
         f"new {_MR_CREATE_FIELDS} --draft -y -l bug",
         "update 12 -t Revised -d Details",
+        'update 12 -t /merge -d "Mention /rebase inline"',
         "update 12 --target-branch main",
         "update 12 -r -l bug -u stale -y",
         "update 12 --wip --draft=false --remove-source-branch=false",
@@ -886,6 +887,8 @@ def test_mr_branch_operations_require_authoritative_metadata(action: str) -> Non
         f"create {_MR_CREATE_FIELDS} --head https://gitlab.com/team/other",
         f"create {_MR_CREATE_FIELDS} --allow-collaboration=true",
         f"create {_MR_CREATE_FIELDS} --source-branch=-invalid",
+        f"create {_MR_CREATE_FIELDS} -d /merge",
+        f'new {_MR_CREATE_FIELDS} -d "Details\n  /rebase"',
         "update 12 -b main",
         "update branch -t Fix",
         "update -t Fix",
@@ -893,6 +896,12 @@ def test_mr_branch_operations_require_authoritative_metadata(action: str) -> Non
         "update 12 --fill",
         "update 12 --attach example.png",
         "update 12 -d -",
+        'update 12 -t ""',
+        'update 12 -d ""',
+        "update 12 -d /merge",
+        'update 12 -d "Details\n/rebase"',
+        'update 12 -d "  /remove_source_branch"',
+        'update 12 -d "Details\n\t/unknown_action"',
         "update 12 --description-file example.txt",
         "update 12 --target-branch=../main",
         "edit 12 -t Fix",
@@ -904,10 +913,20 @@ def test_unresolved_mr_arguments_and_secondary_effects_ask(action: str) -> None:
     assert _result(f"glab mr {action} -R {_URL}", write_repos=[_PROJECT]) == "ASK"
 
 
+def test_mr_quick_actions_are_checked_after_project_permissions() -> None:
+    command = f'glab mr update 12 -R {_URL} -d "Details\n/rebase"'
+    response = _response(command, write_repos=[_PROJECT])
+    assert response is not None and response["result"] == "ASK"
+    assert "quick actions" in response["reason"]
+    assert _result(command) == "DENY"
+
+
 def test_mr_options_keep_their_values_and_last_boolean_wins() -> None:
     fields = _MR_CREATE_FIELDS.replace("-t Fix", '-t "--remove-source-branch"')
     assert _result(f"glab mr create -R {_URL} {fields}", write_repos=[_PROJECT]) == "ALLOW"
     fields = _MR_CREATE_FIELDS + " --remove-source-branch=true --remove-source-branch=false"
+    assert _result(f"glab mr create -R {_URL} {fields}", write_repos=[_PROJECT]) == "ALLOW"
+    fields = _MR_CREATE_FIELDS + ' -d /merge -d "Mention /merge inline"'
     assert _result(f"glab mr create -R {_URL} {fields}", write_repos=[_PROJECT]) == "ALLOW"
     response = _response(
         f'glab mr merge 12 -R {_URL} -m "--remove-source-branch"', write_repos=[_PROJECT]
