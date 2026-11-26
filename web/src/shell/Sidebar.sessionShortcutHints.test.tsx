@@ -4,9 +4,13 @@ import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { useConversations } from "@/hooks/useConversations";
 import { COMMAND_HOLD_REVEAL_DELAY_MS, useCommandHoldStore } from "@/hooks/useCommandHold";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { useLocation } from "react-router-dom";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { isCommandAvailable, type PaletteCommand } from "@/store/paletteCommands";
+
+import { useSessionNavigationCommands } from "./sessionNavigationCommands";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -101,6 +105,43 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+});
+
+let navigationCommands: PaletteCommand[] = [];
+/** ⌘K's Next and Previous session as the palette reads them, and where they navigated. */
+function SessionStepProbe() {
+  navigationCommands = useSessionNavigationCommands();
+  return <output data-testid="location">{useLocation().pathname}</output>;
+}
+
+function navigationCommand(id: string): PaletteCommand {
+  const command = navigationCommands.find((candidate) => candidate.id === id);
+  if (!command) throw new Error(`no ${id} command`);
+  return command;
+}
+
+describe("Sidebar session order for ⌘K", () => {
+  it("lets Next and Previous session step through its rows with quick_pick_palette", async () => {
+    renderSidebar({ features: { quick_pick_palette: true }, children: <SessionStepProbe /> });
+    await waitFor(() =>
+      expect(isCommandAvailable(navigationCommand("next-session").availability)).toBe(true),
+    );
+    const rows = renderedRowIds();
+    // From no open session, Next enters at the top row and Previous then wraps to the bottom.
+    act(() => navigationCommand("next-session").run());
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`/c/${rows[0]}`));
+    act(() => navigationCommand("previous-session").run());
+    await waitFor(() =>
+      expect(screen.getByTestId("location")).toHaveTextContent(`/c/${rows.at(-1)}`),
+    );
+  });
+
+  it("offers neither without quick_pick_palette", async () => {
+    renderSidebar({ features: {}, children: <SessionStepProbe /> });
+    await waitFor(() => expect(renderedRowIds()).toHaveLength(5));
+    expect(isCommandAvailable(navigationCommand("next-session").availability)).toBe(false);
+    expect(isCommandAvailable(navigationCommand("previous-session").availability)).toBe(false);
+  });
 });
 
 describe("Sidebar numbered-row shortcut hints", () => {
