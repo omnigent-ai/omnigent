@@ -65,11 +65,10 @@ export interface ChildSessionInfo {
 }
 
 /**
- * Wire shape of a single entry in the ``child_sessions`` response.
+ * A row of a ``child_sessions`` or ``descendants`` listing as the server sends it.
  * Field set matches the server's ``ChildSessionSummary`` Pydantic
  * model. Extra wire fields are silently ignored.
  */
-/** A row of a child or descendant listing as the server sends it. */
 export interface ChildSessionWire {
   id: string;
   title: string | null;

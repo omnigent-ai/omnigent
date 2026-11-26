@@ -37,9 +37,15 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
 }));
 
 import { PINNED_CONVERSATIONS_KEY, useConversations } from "./useConversations";
-import { grantSharePermission, revokeSharePermission } from "@/lib/permissionsApi";
+import {
+  grantSharePermission,
+  LEVEL_EDIT,
+  LEVEL_OWNER,
+  revokeSharePermission,
+} from "@/lib/permissionsApi";
 import { useSession } from "./useSession";
 import {
+  pullRequestChangeAccess,
   useCanEdit,
   useCanStartSideChat,
   useIsSessionOwner,
@@ -251,6 +257,41 @@ describe("share mutations refresh the session lists", () => {
     expect(revokeSharePermission).toHaveBeenCalledWith(target, "bob");
     expect(revoke.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
       automationKeys,
+    );
+  });
+});
+
+describe("pullRequestChangeAccess", () => {
+  it.each([
+    ["is unknown while the session loads", null, true, "unknown"],
+    ["is not the owner's once a missing session settles", null, false, "not_owner"],
+    [
+      "follows the server's answer over the level",
+      { sideChatAllowed: false, permissionLevel: LEVEL_OWNER },
+      false,
+      "not_owner",
+    ],
+    [
+      "takes the server's yes",
+      { sideChatAllowed: true, permissionLevel: LEVEL_EDIT },
+      false,
+      "owner",
+    ],
+    [
+      "falls back to an owner level on older servers",
+      { permissionLevel: LEVEL_OWNER },
+      false,
+      "owner",
+    ],
+    [
+      "falls back to a lesser level on older servers",
+      { permissionLevel: LEVEL_EDIT },
+      false,
+      "not_owner",
+    ],
+  ] as const)("%s", (_label, session, isLoading, access) => {
+    expect(pullRequestChangeAccess(session as Partial<Session> as Session | null, isLoading)).toBe(
+      access,
     );
   });
 });

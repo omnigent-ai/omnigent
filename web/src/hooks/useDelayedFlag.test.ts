@@ -67,3 +67,21 @@ it("starts over when the restart key changes, as a retry of a still-pending read
   });
   expect(result.current).toBe(true);
 });
+
+it("doesn't turn on at the first attempt's deadline when a retry restarts it early", () => {
+  const { result, rerender } = renderHook(({ attempt }) => useDelayedFlag(true, 100, attempt), {
+    initialProps: { attempt: 0 },
+  });
+  act(() => {
+    vi.advanceTimersByTime(60);
+  });
+  rerender({ attempt: 1 });
+  act(() => {
+    vi.advanceTimersByTime(60);
+  });
+  expect(result.current).toBe(false);
+  act(() => {
+    vi.advanceTimersByTime(40);
+  });
+  expect(result.current).toBe(true);
+});

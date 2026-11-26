@@ -37,8 +37,8 @@ export function getBasePath(): string {
 }
 
 /**
- * The base for server API requests: the separate API base when one is
- * injected, else the app's base path.
+ * Where the server's API lives: the separate API base when one is injected,
+ * else the app's base path. Data kept per server is keyed by it.
  */
 export function getApiBasePath(): string {
   if (typeof window === "undefined") return "";

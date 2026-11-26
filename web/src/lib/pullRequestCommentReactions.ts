@@ -157,7 +157,8 @@ export function reactorsSummary(reaction: CommentReaction, viewerLogin: string |
   const names = [
     ...(reaction.viewer_reacted ? ["You"] : []),
     ...others.map((login) => `@${login}`),
-  ].slice(0, NAMED_REACTORS);
+    // Without the viewer's login, GitHub's list may name them again; never name more than reacted.
+  ].slice(0, Math.min(NAMED_REACTORS, reaction.count));
   const unnamed = Math.max(0, reaction.count - names.length);
   const label = REACTIONS[reaction.content].label;
   if (names.length === 0) {

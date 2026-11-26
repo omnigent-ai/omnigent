@@ -141,29 +141,34 @@ export type LinkOpenOutcome = "routed" | "opened" | "blocked";
 
 /**
  * Open `href` as {@link openLink} does, saying how it went, for a caller opening several that
- * must report the ones that didn't open. Call it within the click: a browser allows pop-ups only
- * then. A `noopener` window.open answers null even when it opens, so a plain browser opens a
- * blank tab first, which answers null only when refused, and leads it to `href`.
+ * must report the ones that didn't open. Call it during the click, so a refused pop-up is
+ * reported; most browsers allow one per click. It opens a blank tab first and leads it to
+ * `href`, because a `noopener` window.open answers null even when it opens. A link that isn't
+ * http(s) isn't opened, and reads as blocked.
  */
 export function openLinkWithOutcome(
   conversationId: string | undefined,
   href: string,
 ): LinkOpenOutcome {
-  if (routeLink(conversationId, href)) return "routed";
   const url = parseHttpUrl(href);
-  if (!url) {
-    window.open(href, "_blank", "noopener,noreferrer");
-    return "routed";
-  }
+  if (!url) return "blocked";
+  if (routeLink(conversationId, url.href)) return "routed";
   const tab = window.open("about:blank", "_blank");
   if (!tab) return "blocked";
-  tab.opener = null;
-  const link = tab.document.createElement("a");
-  link.href = url.href;
-  link.target = "_self";
-  link.rel = "noopener noreferrer";
-  link.click();
-  return "opened";
+  try {
+    tab.opener = null;
+    const link = tab.document.createElement("a");
+    link.href = url.href;
+    link.target = "_self";
+    link.rel = "noopener noreferrer";
+    tab.document.body.append(link);
+    link.click();
+    return "opened";
+  } catch {
+    // Don't leave an empty tab behind when it can't be led to the link.
+    tab.close();
+    return "blocked";
+  }
 }
 
 /**
@@ -185,9 +190,8 @@ export function canOpenLinkInSidebar(conversationId: string | undefined, href: s
  * whatever the link-opening preference, as a link menu's Open in Sidebar asks. False when it can't.
  */
 export function openLinkInSidebar(conversationId: string | undefined, href: string): boolean {
-  if (!conversationId || !canOpenLinkInSidebar(conversationId, href)) return false;
   const url = parseHttpUrl(href);
-  if (!url) return false;
+  if (!conversationId || !supportsBrowser() || !url) return false;
   const key = JSON.stringify([conversationId, url.href]);
   if (!pendingLinks.has(key)) {
     pendingLinks.add(key);

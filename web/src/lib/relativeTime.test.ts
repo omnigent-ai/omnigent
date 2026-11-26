@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { absoluteTime, formatMessageTimestamp, relativeTime } from "./relativeTime";
+import {
+  absoluteTime,
+  formatMessageTimestamp,
+  longRelativeTime,
+  relativeTime,
+} from "./relativeTime";
 
 const NOW = new Date("2026-05-28T12:00:00Z").getTime();
 const MIN = 60_000;
@@ -85,5 +90,21 @@ describe("formatMessageTimestamp", () => {
     expect(stamp(new Date(2026, 10, 12, 8, 5))).toBe("8:05 AM");
     expect(stamp(new Date(2026, 10, 11, 20, 56))).toBe("Nov 11, 8:56 PM");
     expect(stamp(new Date(2025, 10, 11, 20, 56))).toBe("Nov 11, 2025, 8:56 PM");
+  });
+});
+
+describe("longRelativeTime", () => {
+  it.each([
+    ["seconds", NOW - 30_000, "30 seconds ago"],
+    ["days", NOW - 4 * DAY, "4 days ago"],
+    ["months", NOW - 90 * DAY, "3 months ago"],
+    ["years, not dozens of months", NOW - 3 * 365 * DAY, "3 years ago"],
+  ])("reads %s in a sentence", (_label, time, label) => {
+    expect(longRelativeTime(time, NOW)).toBe(label);
+  });
+
+  it.each([NaN, Date.parse(""), Infinity])("has no label for the time %s", (time) => {
+    expect(longRelativeTime(time, NOW)).toBe("");
+    expect(longRelativeTime(NOW, time)).toBe("");
   });
 });

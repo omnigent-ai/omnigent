@@ -340,8 +340,9 @@ it.each([false, true])(
 describe("opening a link with its outcome", () => {
   const PR = "https://github.com/acme/app/pull/7";
 
-  it("is routed, never blocked, where the in-app browser or the desktop shell takes it", () => {
+  it("is routed, never blocked, where the in-app browser or the desktop shell takes it", async () => {
     expect(openLinkWithOutcome(CONV, PR)).toBe("routed");
+    await vi.waitFor(() => expect(surfaced).toHaveLength(1));
     expect(window.open).not.toHaveBeenCalled();
     writeOpenLinksInApp(false);
     // The shell's window-open policy answers null though it opens the link.
@@ -372,6 +373,30 @@ describe("opening a link with its outcome", () => {
     expect(openLinkWithOutcome(CONV, PR)).toBe("blocked");
     expect(window.open).toHaveBeenCalledTimes(1);
   });
+
+  it("closes the blank tab and reads as blocked when it can't be led to the link", () => {
+    delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    const close = vi.fn();
+    const opened = {
+      opener: window as unknown,
+      close,
+      get document(): Document {
+        throw new DOMException("Blocked a frame", "SecurityError");
+      },
+    };
+    vi.mocked(window.open).mockReturnValue(opened as unknown as Window);
+    expect(openLinkWithOutcome(CONV, PR)).toBe("blocked");
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["javascript:alert(1)", "data:text/html,hi", "mailto:a@example.com"])(
+    "opens nothing for %s",
+    (href) => {
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+      expect(openLinkWithOutcome(CONV, href)).toBe("blocked");
+      expect(window.open).not.toHaveBeenCalled();
+    },
+  );
 });
 
 it("opens a link in a new window unless the in-app browser takes it", () => {

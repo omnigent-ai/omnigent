@@ -291,7 +291,8 @@ export function githubPullRequestLocation(
   const match = GITHUB_PULL_PATH.exec(parsed.pathname);
   if (!match || !/^https?:$/.test(parsed.protocol)) return null;
   return {
-    host: parsed.hostname.toLowerCase(),
+    // With its port, as the session's own links name it.
+    host: parsed.host.toLowerCase(),
     repository: `${match[1]}/${match[2]}`,
     number: Number(match[3]),
   };

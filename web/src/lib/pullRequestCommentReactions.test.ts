@@ -87,6 +87,10 @@ describe("withViewerReaction", () => {
     expect(reactorsSummary(added!, null)).toBe("You reacted with Rocket");
     const [joined] = withViewerReaction([reaction("ROCKET", 1, false, ["b"])], "ROCKET", true, "");
     expect(reactorsSummary(joined!, null)).toBe("You and @b reacted with Rocket");
+    // GitHub's list may name the viewer too; the tooltip never names more people than reacted.
+    expect(reactorsSummary(reaction("ROCKET", 2, true, ["me", "b"]), null)).toBe(
+      "You and @me reacted with Rocket",
+    );
   });
 
   it("leaves a reaction already as asked alone, so a settled click applies once", () => {
