@@ -3722,6 +3722,7 @@ async def test_events_codex_native_busy_edge_after_turn_ended_settles_idle(
     """
     settles = active_turn_id is None and runner_activity is None
     conv_id = f"c0dec0dec0dec0dec0dec0dec0de{(runner_activity or active_turn_id or 'idle')[:4]}"
+    parent_id = "d72e6c2c5866b0f946739fa5a9f964f8"
     response_id = "codex_turn_codex_ended"
     fake_client = _RecordingCodexAppServerClient(
         transport="ws://127.0.0.1:43222",
@@ -3747,6 +3748,14 @@ async def test_events_codex_native_busy_edge_after_turn_ended_settles_idle(
         assert create_resp.status_code == 201, create_resp.text
         queue = _session_event_queues_ref.get(conv_id)
         _drain_session_event_queue(queue)
+        _session_event_queues_ref.pop(parent_id, None)
+        monkeypatch.setitem(
+            subagent_work._child_session_parents,
+            conv_id,
+            subagent_work._ChildParentMeta(
+                parent_id=parent_id, title="codex:impl", tool="codex", session_name="impl"
+            ),
+        )
         if runner_activity == "active_turn":
             app.state.active_turns[conv_id] = object()
         elif runner_activity == "buffered_message":
@@ -3769,6 +3778,7 @@ async def test_events_codex_native_busy_edge_after_turn_ended_settles_idle(
             },
         )
         events = _drain_session_event_queue(queue)
+        parent_events = _drain_session_event_queue(_session_event_queues_ref.pop(parent_id, None))
         turn_is_active = app.state.session_resource_registry.session_turn_is_active(conv_id)
         app.state.active_turns.pop(conv_id, None)
         app.state.session_message_buffers.pop(conv_id, None)
@@ -3783,6 +3793,11 @@ async def test_events_codex_native_busy_edge_after_turn_ended_settles_idle(
     # The server applies the settlement; a queued runner idle could overtake a newer turn.
     assert [e for e in events if e.get("type") == "session.status"] == []
     assert turn_is_active is not settles
+    assert [
+        e["child"]["busy"]
+        for e in parent_events
+        if e.get("type") == "session.child_session.updated" and e["child_session_id"] == conv_id
+    ] == ([True, False] if settles else [True])
 
 
 @pytest.mark.asyncio
