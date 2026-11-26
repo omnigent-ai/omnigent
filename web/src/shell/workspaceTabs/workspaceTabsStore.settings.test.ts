@@ -80,6 +80,24 @@ describe("a strip following the Workspace settings", () => {
     expect(strip(store)).toEqual(["pulls (pinned)", "tasks (pinned)"]);
   });
 
+  it("reopens a pinned page the user closed pinned, once it's chosen as the first page", async () => {
+    const { store } = makeStore();
+    store.applyTabSettings(settings(["github", "tasks"], "github"), showsAll);
+    const tasks = store.tabs().find((tab) => "place" in tab && tab.place.kind === "tasks")!;
+    await store.close(tasks.id);
+    store.applyTabSettings(settings(["github", "tasks"], "tasks"), showsAll);
+    expect(strip(store)).toEqual(["pulls (pinned)", "tasks (pinned)"]);
+    expect(selectedKind(store)).toBe("tasks");
+  });
+
+  it("opens an unpinned first page without a pin", () => {
+    const { store } = makeStore();
+    store.applyTabSettings(settings(["github"], "github"), showsAll);
+    store.applyTabSettings(settings(["github"], "tasks"), showsAll);
+    expect(strip(store)).toEqual(["pulls (pinned)", "tasks"]);
+    expect(selectedKind(store)).toBe("tasks");
+  });
+
   it("pins an open page, and keeps an unpinned page open without its pin", () => {
     const tasks: WorkspaceTab = { id: "T", place: { kind: "tasks" }, openedBy: "user" };
     const pulls: WorkspaceTab = {

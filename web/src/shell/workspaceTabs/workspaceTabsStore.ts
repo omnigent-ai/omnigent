@@ -1134,7 +1134,10 @@ export function createWorkspaceTabsStore(options: WorkspaceTabsStoreOptions) {
       return rest;
     });
     if (change.select !== null) {
-      const tab = settingsPageTab(change.select) ?? addSettingsPageTab(change.select, false);
+      // A pinned page the user closed comes back pinned, as Settings still shows it.
+      const tab =
+        settingsPageTab(change.select) ??
+        addSettingsPageTab(change.select, settings.pinned.includes(change.select));
       if (tab.id !== selectedTabId) {
         markSelected(tab.id);
         history.recordStep(visitOf(tab));
