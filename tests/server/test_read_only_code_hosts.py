@@ -51,6 +51,19 @@ def test_other_pull_requests_are_writable(pr_url: object) -> None:
     assert not is_read_only_pull_request(pr_url, PATTERNS)
 
 
+@pytest.mark.parametrize(
+    ("pattern", "host", "matches"),
+    [
+        ("git?.example.org", "git1.example.org", False),
+        ("git[12].example.org", "git1.example.org", False),
+        ("*.example.org", "a.b.example.org", True),
+        ("git.example.org", "gitXexample.org", False),
+    ],
+)
+def test_only_a_star_is_a_wildcard(pattern: str, host: str, matches: bool) -> None:
+    assert is_read_only_pull_request(_pr(host), (pattern,)) is matches
+
+
 def test_no_patterns_leave_every_pull_request_writable() -> None:
     assert not is_read_only_pull_request(_pr("one.code.example.com"), ())
 

@@ -3,13 +3,16 @@
 A server can list host patterns, such as ``"*.code.example.com"``, whose pull requests
 it serves for reading only: their overviews offer no write capabilities, and the server
 refuses their writes before they reach the session's host. A pattern is a host name,
-matched case-insensitively, where ``*`` stands for any run of characters.
+matched case-insensitively, where ``*`` stands for any run of characters and every other
+character, ``?`` and ``[`` included, stands for itself. The server reads its list when it
+starts, so a change takes a restart. Only the server's routes are limited: an agent in the
+session that runs ``gh`` itself isn't.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
-from fnmatch import fnmatchcase
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -39,7 +42,13 @@ def is_read_only_pull_request(pr_url: object, patterns: Iterable[str]) -> bool:
         host = urlsplit(pr_url).hostname
     except ValueError:
         return False
-    return bool(host) and any(fnmatchcase(host.casefold(), pattern) for pattern in patterns)
+    return bool(host) and any(_matches(host.casefold(), pattern) for pattern in patterns)
+
+
+def _matches(host: str, pattern: str) -> bool:
+    """Whether ``host`` matches ``pattern``, where only ``*`` is a wildcard."""
+    expression = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(expression, host) is not None
 
 
 def mark_read_only(info: dict[str, Any]) -> dict[str, Any]:
