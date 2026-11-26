@@ -200,4 +200,40 @@ describe("useTextSearchFocus", () => {
     expect(store().textSearchFocus).toBeNull();
     input.remove();
   });
+
+  it("keeps asking while a hidden Search page can't take the keyboard, then focuses it", () => {
+    vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+    const input = document.createElement("input");
+    document.body.append(input);
+    // Hidden behind another tab, the field ignores focus until its page is selected.
+    let shown = false;
+    const focusField = HTMLInputElement.prototype.focus;
+    vi.spyOn(input, "focus").mockImplementation(function (this: HTMLInputElement) {
+      if (shown) focusField.call(this);
+    });
+    renderHook(() => useTextSearchFocus("a", { current: input }));
+    act(() => requestTextSearchFocus("a"));
+    expect(input).not.toHaveFocus();
+    expect(store().textSearchFocus).not.toBeNull();
+
+    shown = true;
+    act(() => vi.advanceTimersToNextFrame());
+    expect(input).toHaveFocus();
+    expect(store().textSearchFocus).toBeNull();
+    input.remove();
+    vi.useRealTimers();
+  });
+
+  it("gives up on a Search page that never shows, so a later visit isn't grabbed", () => {
+    vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+    const input = document.createElement("input");
+    document.body.append(input);
+    vi.spyOn(input, "focus").mockImplementation(() => {});
+    renderHook(() => useTextSearchFocus("a", { current: input }));
+    act(() => requestTextSearchFocus("a"));
+    for (let frame = 0; frame < 60; frame += 1) act(() => vi.advanceTimersToNextFrame());
+    expect(store().textSearchFocus).toBeNull();
+    input.remove();
+    vi.useRealTimers();
+  });
 });

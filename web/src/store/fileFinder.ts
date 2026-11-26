@@ -94,18 +94,38 @@ export function requestTextSearchFocus(sessionId: string): void {
   useFileFinderStore.setState({ textSearchFocus: { sessionId, id: nextRequestId++ } });
 }
 
-/** Focuses `input` when a text search asked `sessionId`'s Search page for the keyboard. */
+/** How many frames a focus request waits for its hidden Search page to show, about a second. */
+const TEXT_SEARCH_FOCUS_FRAMES = 60;
+
+/**
+ * Focuses `input` when a text search asked `sessionId`'s Search page for the keyboard. A page
+ * kept mounted while hidden can't take focus until it's selected, so the request is kept, and
+ * tried again each frame, until the field has focus or the wait ends.
+ */
 export function useTextSearchFocus(
   sessionId: string,
   input: RefObject<HTMLInputElement | null>,
 ): void {
   const focus = useFileFinderStore((state) => state.textSearchFocus);
   useEffect(() => {
-    if (!focus || focus.sessionId !== sessionId || !input.current) return;
-    input.current.focus();
-    useFileFinderStore.setState((state) =>
-      state.textSearchFocus?.id === focus.id ? { textSearchFocus: null } : state,
-    );
+    if (!focus || focus.sessionId !== sessionId) return;
+    const settle = () =>
+      useFileFinderStore.setState((state) =>
+        state.textSearchFocus?.id === focus.id ? { textSearchFocus: null } : state,
+      );
+    let frame = 0;
+    let frames = 0;
+    const attempt = () => {
+      const field = input.current;
+      field?.focus();
+      if ((field && document.activeElement === field) || ++frames >= TEXT_SEARCH_FOCUS_FRAMES) {
+        settle();
+        return;
+      }
+      frame = requestAnimationFrame(attempt);
+    };
+    attempt();
+    return () => cancelAnimationFrame(frame);
   }, [focus, sessionId, input]);
 }
 
