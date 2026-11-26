@@ -594,6 +594,52 @@ def test_shell_failure_and_rollback_do_not_reactivate_retained_correlation(
 
 
 @pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("intervening_prompt", [False, True])
+@pytest.mark.parametrize("elapsed_s", [0.0, 601.0])
+def test_retired_shell_yields_to_live_identical_send(
+    monkeypatch: pytest.MonkeyPatch,
+    hold: bool,
+    intervening_prompt: bool,
+    elapsed_s: float,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    retired = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="a" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", retired, "forward_accepted")
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage="native_turn_failed")
+    now[0] += elapsed_s
+    prompt = (
+        pending_inputs.record("conv_a", [_text_block("next prompt")])
+        if intervening_prompt
+        else None
+    )
+    live = pending_inputs.record("conv_a", [_text_block("!ls")], stable_id="b" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", live, "forward_accepted")
+
+    matched = pending_inputs.resolve_matching_text("conv_a", "ls", shell_command=True, hold=hold)
+    assert matched.matched is not None and matched.matched.pending_id == live
+    assert matched.skipped == [] and matched.uncertain == []
+    if hold:
+        # An append in progress must not expose retired fallback to another mirror.
+        assert pending_inputs.resolve_shell_command("conv_a", "ls") is None
+        pending_inputs.restore("conv_a", matched.matched)
+        replay = pending_inputs.resolve_shell_command("conv_a", "ls", hold=True)
+        assert replay is not None and replay.pending_id == live
+        pending_inputs.release("conv_a", replay)
+
+    expected_pending = [prompt] if prompt is not None else []
+    assert pending_inputs.pending_ids("conv_a") == expected_pending
+    assert [
+        entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")
+    ] == expected_pending
+    assert pending_inputs.has_pending("conv_a") is intervening_prompt
+    assert pending_inputs.pending_id_for_stable_id("conv_a", "a" * 32) == retired
+    delayed = pending_inputs.resolve_shell_command("conv_a", "ls")
+    assert delayed is not None and delayed.pending_id == retired
+    assert pending_inputs.pending_ids("conv_a") == expected_pending
+
+
+@pytest.mark.parametrize("hold", [False, True])
 def test_restoring_expired_shell_preserves_its_active_lease(
     monkeypatch: pytest.MonkeyPatch,
     hold: bool,

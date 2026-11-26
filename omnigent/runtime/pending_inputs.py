@@ -900,6 +900,8 @@ def resolve_matching_text(
     cancelled by interrupting yields to a later live one with the same text
     when no other live input intervenes. Otherwise, a delayed pre-Stop echo
     could incorrectly declare the intervening message lost.
+    Shells prefer non-retired matches, including ones held for persistence;
+    retired correlation is a fallback only when no such match exists.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param text: User-message text mirrored from the native transcript.
@@ -929,7 +931,13 @@ def resolve_matching_text(
         entries = _pending.get(conversation_id)
         if entries is None:
             return MatchedDrain(matched=None, skipped=[])
-        candidates = entries.items() if shell_command else _active_entries(entries, now)
+        candidates = list(entries.items() if shell_command else _active_entries(entries, now))
+        if shell_command and any(
+            not entry.retired and _shell_command_text(entry.content) == exact_needle
+            for _pid, entry in candidates
+        ):
+            # Held matches still own their mirrors while persistence is in progress.
+            candidates = [(pid, entry) for pid, entry in candidates if not entry.retired]
         ordered = [(pid, entry) for pid, entry in candidates if not entry.held]
         texts = [
             _shell_command_text(entry.content)

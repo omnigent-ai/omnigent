@@ -1699,8 +1699,15 @@ Reconnect settlement covers the fetched history window. The fresh-window fallbac
 loads only the newest 100 items; a terminal input older than that window cannot
 acknowledge an outstanding bubble through this recovery path. Paging older history
 currently renders those records without repeating shell settlement. Correlation
-before terminal persistence still uses the existing server command matcher; loss of
-a command followed by identical text can remain ambiguous within that matcher.
+before terminal persistence uses command text. Non-retired identical shell
+submissions take precedence over retired ones, including a match held for
+persistence. Retired entries remain fallback correlation when no non-retired
+match exists. Queue and interruption ordering apply within the non-retired
+group; retired entries do not count as intervening inputs. Age alone does not
+prove command loss. A silently lost command and a delayed one are
+indistinguishable by text, as are a retired command's late
+mirror and a newer identical submission. Persisted identity records that
+matching decision; it does not prove that the named submission executed.
 
 ### Sessions Typical Flow
 
