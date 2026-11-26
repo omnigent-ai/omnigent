@@ -52,12 +52,11 @@ A deployment can replace three pieces without forking:
 | Piece | Default | Interface |
 | --- | --- | --- |
 | Storage | JSON files under `<data_dir>/gadgets` | `GadgetStore` (`omnigent/stores/gadget_store`) — gadget metadata plus a small create-only JSON file interface the record store is built on |
-| Access | owner plus grants in the `PermissionStore`, like sessions and workflows | `GadgetAccess` — a viewer's `read` / `write_data` / `publish` / `manage` on a gadget, and the gadgets shared with them |
+| Access | owner plus grants in the `PermissionStore`, like sessions and workflows; the bundled SQL store keeps none yet, so gadgets stay private to their owners | `GadgetAccess` — a viewer's `read` / `write_data` / `publish` / `manage` on a gadget, and the gadgets shared with them |
 | Frame | sandboxed `srcdoc` iframe | the web host config's gadget frame, for hosts that serve gadgets from an isolated origin |
 
 `create_app(gadget_store=..., gadget_access=...)` takes custom implementations; the CLI passes
-the defaults. Grants live in the server's shared database, but the default store is a local
-directory: replicas that serve the same gadgets need one shared directory that supports its
+the defaults. The default store is a local directory: replicas that serve the same gadgets need one shared directory that supports its
 atomic file operations (create-only `link`, `rename`) and file locks that hold across hosts
 (writers and removers of a record coordinate through them), or a shared custom store.
 
@@ -105,8 +104,12 @@ action ledger, rule state, and each viewer's shelf) is a revisioned JSON documen
   with sessions; deleting a gadget or an account removes its scope in one rename.
 
 The server's relational stores keep what the rest of the server queries across users: the
-grants that share gadgets live in the `PermissionStore` (`gadget_shares`), like session and
-workflow shares. Moving the documents to SQL would be worth it if gadgets needed queries
+grants that share gadgets belong in the `PermissionStore`, like session and workflow shares.
+The bundled SQL store doesn't keep them yet (its table comes in a follow-up), so it reports
+`supports_gadget_grants` false: the server advertises `gadget_sharing: false`, the web UI
+hides Share and the Shared list, and the share routes answer `FORBIDDEN` ("Sharing gadgets is
+not supported by this server"). A `PermissionStore` or `GadgetAccess` that keeps grants
+elsewhere, such as one backed by folder permissions, still shares through the same routes. Moving the documents to SQL would be worth it if gadgets needed queries
 across gadgets or users (search over records, reporting), or transactions across records;
 both are out of scope below.
 

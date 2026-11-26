@@ -27,7 +27,7 @@ User-id-bearing columns rewritten (the full set as of this schema):
 
 Gadgets are not moved: their ownership, shelves and authorship live in the gadget store
 under the old username's registration, outside these tables. A user who holds gadget data
-(owned gadgets, a shelf, or gadget grants made to them) is refused before anything of
+(owned gadgets or a shelf) is refused before anything of
 theirs changes, so the remap never strands it; the operator deletes or hands off those
 gadgets first. Comments and actions the user wrote on other people's gadgets keep their
 text but are no longer theirs to edit after a remap.
@@ -162,17 +162,12 @@ def build_domain_mapping(engine: Engine, domain: str) -> dict[str, str]:
     return mapping
 
 
-def _holds_gadget_data(session: Session, user: SqlUser, gadget_store: GadgetStore | None) -> bool:
+def _holds_gadget_data(user: SqlUser, gadget_store: GadgetStore | None) -> bool:
     """Whether *user* has gadget data a remap would strand.
 
-    Grants made to them are rows in ``gadget_shares``; their own gadgets and shelf are in
-    *gadget_store*, owned under their username's registration. Each check reads at most a
-    page. Without a store only the grants are checked.
+    Their own gadgets and shelf are in *gadget_store*, owned under their username's
+    registration. Each check reads at most a page.
     """
-    from omnigent.stores.permission_store.sqlalchemy_store import holds_gadget_grants
-
-    if holds_gadget_grants(session, user.id):
-        return True
     if gadget_store is None:
         return False
     from omnigent.db.account_authority import account_registration
@@ -223,7 +218,7 @@ def remap_identities(
         and the report reflects what *would* happen. ``False`` commits.
     :param force: Allow merging onto an existing distinct ``new`` user.
     :param gadget_store: The server's gadget store, to refuse users who own gadgets or
-        have a shelf (see the module docstring). ``None`` checks only gadget grants.
+        have a shelf (see the module docstring). ``None`` skips that check.
     :returns: A :class:`RemapReport` describing the outcome.
     """
     report = RemapReport(mapping=dict(mapping))
@@ -243,7 +238,7 @@ def remap_identities(
                 report.skipped_missing.append(old_id)
                 continue
 
-            if _holds_gadget_data(session, old_user, gadget_store):
+            if _holds_gadget_data(old_user, gadget_store):
                 report.refused_gadgets.append(f"{old_id} -> {new_id}")
                 continue
 
