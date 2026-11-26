@@ -2066,6 +2066,65 @@ class SqlSessionJournalHead(OmnigentBase):
     next_position: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
+# Largest stored (compressed) envelope of a workflow answer, per the database guide.
+WORKFLOW_ANSWER_MAX_STORED_BYTES = 16_383
+
+
+class SqlWorkflowAnswer(OmnigentBase):
+    """
+    SQLAlchemy model for the ``workflow_answers`` table.
+
+    How the user answered one ``sys_workflow_request_input`` question set,
+    written by the server when the elicitation resolves and never by the
+    session's agent, so a lane can check who answered and how before acting.
+    Written once: a later resolution of the same request leaves the row as it
+    is. Deleted with the session.
+
+    :param request_id: The question set's elicitation ID, which the tool returns
+        as ``request_id``, e.g. ``"elicit_journal_0123…"``.
+    :param conversation_id: The session that asked (relates to
+        ``conversations.id``; no DB foreign key, Rule R032).
+    :param step: The plan step the questions are about, e.g. ``"deploy"``.
+    :param action: The verdict: ``"accept"``, ``"decline"`` or ``"cancel"``.
+    :param source: How the answer reached the server, one of
+        ``ANSWER_SOURCES`` in ``omnigent.entities.workflow_questions``.
+    :param authenticated_by: What identified the caller: ``"session_cookie"``,
+        ``"bearer"``, ``"proxy_header"`` or ``"none"``.
+    :param answered_by: The authenticated user, e.g. ``"alice@example.com"``;
+        ``None`` in single-user mode.
+    :param answered_at: Unix epoch seconds when the server recorded it.
+    :param content: ``{"questions": [...], "answers": [...]}``: the questions
+        as the form showed them and each answer with its ``input`` kind.
+    """
+
+    __tablename__ = "workflow_answers"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    step: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    authenticated_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    answered_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    answered_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content: Mapped[dict[str, Any]] = mapped_column(
+        EnvelopedJSON(max_stored_bytes=WORKFLOW_ANSWER_MAX_STORED_BYTES), nullable=False
+    )
+
+    __table_args__ = (
+        # Deletes a session's answers with the session.
+        Index(
+            "ix_workflow_answers_session",
+            "workspace_id",
+            "conversation_id",
+            "request_id",
+        ),
+    )
+
+
 class SqlWorkflow(OmnigentBase):
     """
     SQLAlchemy model for the ``workflows`` table.

@@ -48,6 +48,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ElicitationResult,
 )
+from omnigent.server.session_journal import pending_workflow_question, record_workflow_answer
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -132,7 +133,17 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
+        # Read before resolving, which drains the pending question.
+        workflow_question = pending_workflow_question(session_id, elicitation_id)
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        await record_workflow_answer(
+            conversation_store,
+            request,
+            auth_provider,
+            session_id,
+            _resolve_data,
+            workflow_question,
+        )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(

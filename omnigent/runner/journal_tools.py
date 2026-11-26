@@ -447,7 +447,12 @@ async def _request_input(
     if not done:
         if stop_waiting():
             return json.dumps(
-                {"answered": False, "still_open": True, "detail": _STILL_OPEN_DETAIL}
+                {
+                    "answered": False,
+                    "still_open": True,
+                    "request_id": elicitation_id,
+                    "detail": _STILL_OPEN_DETAIL,
+                }
             )
         await asyncio.gather(answer, return_exceptions=True)
         return _error(f"{tool_name} failed: the server didn't take the question in time")
@@ -459,6 +464,7 @@ async def _request_input(
         return json.dumps(
             {
                 "answered": False,
+                "request_id": elicitation_id,
                 "detail": (
                     "No answer: the user dismissed the question. The task stays waiting "
                     "for them; don't ask again this turn."
@@ -466,7 +472,11 @@ async def _request_input(
             }
         )
     return json.dumps(
-        {"answered": True, "answers": answers_from_content(questions, verdict.content)},
+        {
+            "answered": True,
+            "request_id": elicitation_id,
+            "answers": answers_from_content(questions, verdict.content),
+        },
         ensure_ascii=False,
     )
 
@@ -496,7 +506,7 @@ def _deliver_answer_as_message(
                 return
             if verdict.timed_out:
                 return
-            notice = _answer_notice(step, questions, verdict)
+            notice = _answer_notice(step, questions, verdict, elicitation_id)
             for delay_s in _ANSWER_REDELIVERY_DELAYS_S:
                 generation = pending_approvals.current_server_generation()
                 if await _deliver_subagent_wake_post(server_client, conversation_id, notice):
@@ -522,15 +532,25 @@ def _deliver_answer_as_message(
 
 
 def _answer_notice(
-    step: str, questions: list[dict[str, Any]], verdict: pending_approvals.Verdict
+    step: str,
+    questions: list[dict[str, Any]],
+    verdict: pending_approvals.Verdict,
+    request_id: str,
 ) -> str:
-    """The message that brings a question's late answer, or its dismissal, to the agent."""
+    """The message that brings a question's late answer, or its dismissal, to the agent.
+
+    It names the question set's ``request_id``, the one the tool call returned.
+    """
     if not verdict.approved:
         return (
             f'[System: the user dismissed your question on task "{step}"]\n'
+            f"Request ID: {request_id}\n"
             "The task stays waiting for them; don't ask again unless they bring it up."
         )
-    lines = [f'[System: the user answered your question on task "{step}"]']
+    lines = [
+        f'[System: the user answered your question on task "{step}"]',
+        f"Request ID: {request_id}",
+    ]
     for item in answers_from_content(questions, verdict.content):
         lines += [f"Q: {item['question']}", f"A: {item['answer'] or '(no answer)'}"]
     lines.append(

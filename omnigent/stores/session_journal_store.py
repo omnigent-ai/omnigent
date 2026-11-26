@@ -28,6 +28,7 @@ from sqlalchemy import Select, delete, func, select, tuple_, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db import compression
@@ -36,6 +37,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlSessionJournalEntry,
     SqlSessionJournalHead,
+    SqlWorkflowAnswer,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_journal_entry_kind, encode_journal_entry_kind
@@ -939,6 +941,49 @@ class SessionJournalStore:
             ).scalar_one_or_none()
         return None if row is None else self._entries([row])[0]
 
+    def record_workflow_answer(self, answer: Mapping[str, Any]) -> bool:
+        """Record how a workflow question set was answered, once per request.
+
+        :param answer: The record's fields, named as :class:`SqlWorkflowAnswer`'s
+            columns except ``workspace_id``.
+        :returns: Whether this call wrote it; ``False`` when the request already
+            has a record, which stays as it is.
+        """
+        key = answer["request_id"]
+
+        def write(session: Session) -> bool:
+            existing = session.get(SqlWorkflowAnswer, (current_workspace_id(), key))
+            if existing is not None:
+                return False
+            session.add(SqlWorkflowAnswer(workspace_id=current_workspace_id(), **answer))
+            session.flush()
+            return True
+
+        try:
+            return run_write_transaction(self._session_immediate, "record_workflow_answer", write)
+        except IntegrityError:
+            # Another resolution of the same request recorded it first.
+            return False
+
+    def get_workflow_answer(self, request_id: str) -> dict[str, Any] | None:
+        """The recorded answer to a workflow question set, or ``None``."""
+        with self._session("read_workflow_answer") as session:
+            row = session.get(SqlWorkflowAnswer, (current_workspace_id(), request_id))
+            if row is None:
+                return None
+            return {
+                "request_id": row.request_id,
+                "session_id": row.conversation_id,
+                "step": row.step,
+                "action": row.action,
+                "source": row.source,
+                "authenticated_by": row.authenticated_by,
+                "answered_by": row.answered_by,
+                "answered_at": row.answered_at,
+                "questions": row.content.get("questions", []),
+                "answers": row.content.get("answers", []),
+            }
+
     def next_run_starts(self, plans: Sequence[JournalEntry]) -> list[int | None]:
         """When each plan's session began its next run, if it has.
 
@@ -1251,6 +1296,13 @@ def delete_journal_heads(session: Session, conversation_ids: Sequence[str]) -> N
         delete(SqlSessionJournalHead).where(
             SqlSessionJournalHead.workspace_id == current_workspace_id(),
             SqlSessionJournalHead.conversation_id.in_(conversation_ids),
+        )
+    )
+    # The sessions' recorded workflow answers go with them; a session asks few.
+    session.execute(
+        delete(SqlWorkflowAnswer).where(
+            SqlWorkflowAnswer.workspace_id == current_workspace_id(),
+            SqlWorkflowAnswer.conversation_id.in_(conversation_ids),
         )
     )
 

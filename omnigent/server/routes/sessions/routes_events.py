@@ -2473,7 +2473,24 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
+            from omnigent.server.session_journal import (
+                pending_workflow_question,
+                record_workflow_answer,
+            )
+
+            # Read before resolving, which drains the pending question.
+            workflow_question = pending_workflow_question(
+                session_id, (body.data or {}).get("elicitation_id")
+            )
             await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await record_workflow_answer(
+                conversation_store,
+                request,
+                auth_provider,
+                session_id,
+                body.data,
+                workflow_question,
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(

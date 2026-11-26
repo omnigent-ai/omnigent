@@ -902,6 +902,7 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
         await asyncio.sleep(0.01)
     assert await asking == {
         "answered": True,
+        "request_id": event["elicitation_id"],
         "answers": [{"question": "Approve the deploy to prod?", "answer": "Approve"}],
     }
 
@@ -1117,6 +1118,95 @@ async def test_a_retried_workflow_question_reuses_its_status_and_question(
     # Only the session's own runner asks.
     refused = await client.post(url, json=body, headers=_headers())
     assert refused.status_code == 403, refused.text
+
+
+async def _asked(client: httpx.AsyncClient, db_uri: str, key: str = "tool:ask") -> tuple[str, str]:
+    """A session with one open workflow question; returns its ID and the request ID."""
+    session_id = _session(db_uri)
+    journal = f"/v1/sessions/{session_id}/journal"
+    plan = await client.post(
+        journal, json=_write("plan", _ONE_TASK_PLAN, "tool:plan"), headers=_runner(session_id)
+    )
+    assert plan.status_code == 200, plan.text
+    body = {"step": "deploy", "questions": [_DEPLOY_QUESTION], "idempotency_key": key}
+    asked = await client.post(f"{journal}/input-requests", json=body, headers=_runner(session_id))
+    assert asked.status_code == 200, asked.text
+    return session_id, asked.json()["elicitation_id"]
+
+
+async def test_the_server_records_who_answered_a_workflow_question(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id, request_id = await _asked(client, db_uri)
+    question = _DEPLOY_QUESTION["question"]
+    resolved = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{request_id}/resolve",
+        json={"action": "accept", "content": {question: "Hold (recommended)"}},
+        headers=_headers(ALICE),
+    )
+    assert resolved.status_code == 202, resolved.text
+    # A later resolution of the same request leaves the first record as it is.
+    await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{request_id}/resolve",
+        json={"action": "accept", "content": {question: "Approve"}},
+        headers=_headers(ALICE),
+    )
+
+    record = await client.get(f"/v1/workflow-answers/{request_id}", headers=_headers(ALICE))
+    assert record.status_code == 200, record.text
+    body = record.json()
+    assert body["answered_at"] > 0
+    assert {
+        key: value for key, value in body.items() if key not in ("answered_at", "questions")
+    } == {
+        "request_id": request_id,
+        "session_id": session_id,
+        "step": "deploy",
+        "action": "accept",
+        # A proxy-asserted identity names the user but not the app they answered in.
+        "source": "api",
+        "authenticated_by": "proxy_header",
+        "answered_by": ALICE,
+        "answers": [{"question": question, "answer": "Hold", "input": "option"}],
+    }
+    assert [option["label"] for option in body["questions"][0]["options"]] == [
+        "Hold (recommended)",
+        "Approve",
+    ]
+    # Only the session's owner reads it, and an unknown request is not found.
+    bob = await client.get(f"/v1/workflow-answers/{request_id}", headers=_headers(BOB))
+    assert bob.status_code in (403, 404), bob.text
+    missing = await client.get(
+        "/v1/workflow-answers/elicit_journal_unknown", headers=_headers(ALICE)
+    )
+    assert missing.status_code == 404, missing.text
+
+
+async def test_an_answer_relayed_by_the_runner_is_recorded_as_the_harness(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id, request_id = await _asked(client, db_uri)
+    question = _DEPLOY_QUESTION["question"]
+    resolved = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "approval",
+            "data": {
+                "elicitation_id": request_id,
+                "action": "accept",
+                "content": {question: "Ship it after lunch"},
+            },
+        },
+        headers=_runner(session_id),
+    )
+    assert resolved.status_code in (200, 202), resolved.text
+    record = await client.get(f"/v1/workflow-answers/{request_id}", headers=_headers(ALICE))
+    assert record.status_code == 200, record.text
+    body = record.json()
+    assert (body["source"], body["action"]) == ("harness", "accept")
+    assert body["answers"] == [
+        {"question": question, "answer": "Ship it after lunch", "input": "text"}
+    ]
 
 
 async def test_the_workflow_tools_save_and_load_through_the_real_routes(
