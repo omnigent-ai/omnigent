@@ -155,6 +155,7 @@ def startup_failure_stage(error_code: str | None) -> str | None:
         "session_record_failed": "session_record",
         "sandbox_create_failed": "sandbox_create",
         "sandbox_registration_timeout": "sandbox_registration",
+        "sandbox_launch_retries_exhausted": "sandbox_create",
         "runner_start_failed": "runner_start",
         "launch_failed": "launch_or_dispatch",
         "startup_expired": "recovery_unknown",

@@ -12,6 +12,9 @@ session, while session-linked failures keep their existing session Inbox entry.
   its run with `source_session_missing` and pauses itself.
 - `workflow-missing`: an automation that runs a saved workflow its owner can no longer run
   fails its run with `workflow_missing` and pauses itself.
+- `sandbox-launch-retries`: an automation that continues one sandbox session, whose sandbox
+  failed to launch on its last 10 runs, fails its run with `sandbox_launch_retries_exhausted`
+  and pauses itself.
 - `inbox-failure`: Inbox All and Unread show the automation name, time and failure reason.
 - `session-deduplication`: a failure linked to a session creates no automation Inbox item,
   even when the session is already read or outside the loaded session pages.

@@ -601,6 +601,7 @@ describe("describeRunFailure", () => {
     expect(describeRunFailure("session_create_failed", "failed").stage).toBe("Session");
     expect(describeRunFailure("sandbox_create_failed", "failed").stage).toBe("Sandbox");
     expect(describeRunFailure("sandbox_registration_timeout", "failed").stage).toBe("Sandbox");
+    expect(describeRunFailure("sandbox_launch_retries_exhausted", "failed").stage).toBe("Sandbox");
     expect(describeRunFailure("runner_start_failed", "failed").stage).toBe("Runner");
     expect(describeRunFailure("startup_expired", "failed").stage).toBe("Startup");
     expect(describeRunFailure("incomplete", "failed").stage).toBe("Running");

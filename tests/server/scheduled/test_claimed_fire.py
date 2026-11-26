@@ -1417,8 +1417,10 @@ async def test_the_run_after_an_unregistered_sandbox_starts_a_new_session(
     assert conversations.get_conversation(replacement).host_id == continued_sandbox_host_id(
         claimed.task.id, claimed.task.workspace_id
     )
-    # The unstarted session stays, with the reason its prompt never ran.
-    assert conversations.get_conversation(unstarted.session_id).labels[STARTUP_LABEL] == "failed"
+    # Nothing ran in the unstarted session, so the replacement deletes it; its run
+    # keeps the reason its prompt never ran.
+    assert conversations.get_conversation(unstarted.session_id) is None
+    assert "did not register" in (runs[claimed.lease.run.id].error or "")
 
 
 async def test_a_run_during_an_unregistered_sandboxs_teardown_keeps_the_session(

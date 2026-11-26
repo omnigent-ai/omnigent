@@ -273,6 +273,10 @@ const RUN_FAILURES: Readonly<Record<string, RunFailure>> = {
   },
   sandbox_create_failed: { stage: "Sandbox", reason: "Couldn't create the sandbox." },
   sandbox_registration_timeout: { stage: "Sandbox", reason: "The sandbox didn't connect in time." },
+  sandbox_launch_retries_exhausted: {
+    stage: "Sandbox",
+    reason: "The sandbox kept failing to launch, so the automation was paused.",
+  },
   runner_start_failed: { stage: "Runner", reason: "The agent didn't start." },
   launch_failed: { stage: "Launch", reason: "The agent session failed to launch." },
   startup_expired: { stage: "Startup", reason: "The run stopped before the agent started." },

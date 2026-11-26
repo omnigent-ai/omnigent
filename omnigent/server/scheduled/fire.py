@@ -848,7 +848,10 @@ async def _run_fire_for_task(
     if task.continues_session and not is_one_time_rule(task.rrule):
         # A one-time task, such as a reminder, belongs to its session: with the
         # session gone it fails instead of running in a new one without its context.
-        task = await _release_replaceable_session(deps, task)
+        replaceable = await _release_replaceable_session(deps, task, recorder)
+        if replaceable is None:
+            return
+        task = replaceable
     if task.continues_session:
         await _continue_session(
             deps, task, fire_dispatch.reuse or _make_reuse_dispatch(deps), recorder
@@ -1169,16 +1172,21 @@ async def _start_workflow_run(
         ) from exc
 
 
-async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+async def _release_replaceable_session(
+    deps: FireDeps, task: ScheduledTask, recorder: _FireRecorder
+) -> ScheduledTask | None:
     """Drop a continued session that was deleted or never started, so this run starts a new one.
 
     Not called for one-time (``COUNT=1``) tasks, which fail instead. Only a
     session that no longer exists, or the task's sandbox session whose first
-    launch failed, is replaced: nothing ever ran in the latter. One the owner
-    archived or that no longer fits the task still fails the run, so a change
-    they made is never undone silently. The new session is recorded like a first
-    run's, and a managed sandbox is provisioned again when the earlier session's
-    workspace is gone (see :func:`_continued_host_binding`).
+    launch failed, is replaced: nothing ever ran in the latter, so it is deleted.
+    One the owner archived or that no longer fits the task still fails the run,
+    so a change they made is never undone silently. The new session is recorded
+    like a first run's, and a managed sandbox is provisioned again when the
+    earlier session's workspace is gone (see :func:`_continued_host_binding`).
+
+    :returns: The task to run, or ``None`` when this run was recorded and the task
+        paused because its sandbox keeps failing to launch.
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller
@@ -1186,18 +1194,73 @@ async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> S
     conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
     if conv is not None and not await _sandbox_never_started(deps, task, conv):
         return task
+    if conv is not None and await _sandbox_launch_keeps_failing(deps, task):
+        await _pause_for_failing_sandbox_launches(deps, task, recorder, conv.id)
+        return None
     _logger.info(
         "scheduled fire: task %s continues %s session %s; starting a new one",
         task.id,
         "deleted" if conv is None else "unstarted",
         session_id,
     )
-    await asyncio.to_thread(deps.scheduled_task_store.release_session, task.id, session_id)
+    released = await asyncio.to_thread(
+        deps.scheduled_task_store.release_session, task.id, session_id
+    )
+    if released and conv is not None:
+        # Otherwise every failed launch would leave one more empty session behind.
+        await _discard_session(deps, conv)
     # Another run may have recorded its replacement first; continue that one.
     stored = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
     if stored is None or stored.state == "deleted":
         return task
     return replace(task, session_id=stored.session_id)
+
+
+# Failures of a sandbox launch before the sandbox bound to its session.
+_SANDBOX_LAUNCH_FAILURE_CODES = frozenset(
+    {
+        _LEGACY_LAUNCH_ERRORS.before_binding,
+        _STAGED_LAUNCH_ERRORS.before_binding,
+        "sandbox_registration_timeout",
+    }
+)
+# Consecutive runs whose sandbox failed to launch before a continue task is paused.
+MAX_CONSECUTIVE_SANDBOX_LAUNCH_FAILURES = 10
+
+
+async def _sandbox_launch_keeps_failing(deps: FireDeps, task: ScheduledTask) -> bool:
+    """Whether the task's latest finished runs all failed to launch their sandbox."""
+    limit = MAX_CONSECUTIVE_SANDBOX_LAUNCH_FAILURES
+    # One more than the limit, for this run's own unfinished row.
+    runs, _ = await asyncio.to_thread(
+        deps.scheduled_task_store.list_runs, task.id, limit=limit + 1
+    )
+    finished = [run for run in runs if run.status not in ("scheduled", "starting")]
+    return len(finished) >= limit and all(
+        run.status == "failed" and run.error_code in _SANDBOX_LAUNCH_FAILURE_CODES
+        for run in finished[:limit]
+    )
+
+
+async def _pause_for_failing_sandbox_launches(
+    deps: FireDeps, task: ScheduledTask, recorder: _FireRecorder, session_id: str
+) -> None:
+    """Fail this run and pause the task, keeping the latest failed session to show why."""
+    _logger.warning(
+        "scheduled fire: task %s failed to launch its sandbox %d times in a row; pausing it",
+        task.id,
+        MAX_CONSECUTIVE_SANDBOX_LAUNCH_FAILURES,
+    )
+    await recorder.finish(
+        "failed",
+        conversation_id=session_id,
+        error=(
+            f"the sandbox failed to launch on the last {MAX_CONSECUTIVE_SANDBOX_LAUNCH_FAILURES} "
+            "runs, so the automation is paused; resume it to try again"
+        ),
+        error_code="sandbox_launch_retries_exhausted",
+    )
+    await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="paused")
 
 
 async def _sandbox_never_started(deps: FireDeps, task: ScheduledTask, conv: Conversation) -> bool:

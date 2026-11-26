@@ -276,6 +276,17 @@ class FakeScheduledTaskStore:
         self.released.append((scheduled_task_id, session_id))
         return True
 
+    def list_runs(
+        self, scheduled_task_id: str, *, limit: int = 100, after_id: str | None = None
+    ) -> tuple[list[Any], str | None]:
+        # Runs are appended oldest first; the real store returns the newest first.
+        runs = [
+            SimpleNamespace(status=run["status"], error_code=run.get("error_code"))
+            for run in reversed(self.runs)
+            if run.get("scheduled_task_id", scheduled_task_id) == scheduled_task_id
+        ]
+        return runs[:limit], None
+
     def get_running_run_by_conversation(self, conversation_id: str) -> Any:
         if conversation_id in self.running_runs:
             seeded = self.running_runs[conversation_id]
@@ -3702,12 +3713,117 @@ async def test_only_a_sandbox_session_whose_launch_failed_unbound_is_replaced(
         store.runs.append(
             {"run_id": "run_prev", "status": creating_run, "conversation_id": "conv_prev"}
         )
-    deps = _deps(store, conversation_store=_ExistingConversationStore(session))
+    conv_store = _ExistingConversationStore(session)
+    deps = _deps(store, conversation_store=conv_store)
 
-    continued = await fire_mod._release_replaceable_session(deps, task)
+    continued = await fire_mod._release_replaceable_session(
+        deps, task, fire_mod._NewRunRecorder(deps, task, 0)
+    )
 
+    assert continued is not None
     assert store.released == ([(task.id, "conv_prev")] if released else [])
     assert continued.session_id == (None if released else "conv_prev")
+    # Nothing ran in a replaced session, so it does not pile up in the owner's sessions.
+    assert conv_store.deleted == (["conv_prev"] if released else [])
+
+
+def _unstarted_sandbox_session() -> _FakeConversation:
+    """The task's sandbox session, left hostless by a failed first launch."""
+    from omnigent.server.startup_inputs import STARTUP_LABEL
+
+    return _continued_session(
+        host_id=None,
+        workspace=None,
+        labels={
+            fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: _SANDBOX_TASK_ID,
+            STARTUP_LABEL: "failed",
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("earlier_runs", "paused"),
+    [
+        # Newest last, as the runs were recorded.
+        ([("failed", "launch_failed")] * 10, True),
+        (
+            [("failed", "sandbox_create_failed"), ("failed", "sandbox_registration_timeout")] * 5,
+            True,
+        ),
+        ([("failed", "launch_failed")] * 9, False),
+        (
+            [("failed", "launch_failed")] * 5
+            + [("succeeded", None)]
+            + [("failed", "launch_failed")] * 9,
+            False,
+        ),
+        ([("failed", "launch_failed")] * 9 + [("failed", "session_create_failed")], False),
+    ],
+)
+async def test_a_sandbox_continue_task_is_paused_when_its_launch_keeps_failing(
+    earlier_runs: list[tuple[str, str | None]], paused: bool
+) -> None:
+    """Retrying a launch that failed on every recent run only adds failed sessions."""
+    task = _sandbox_continue_task(session_id="conv_prev")
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    store.runs.extend(
+        {"run_id": f"run_{index}", "status": status, "error_code": code, "conversation_id": None}
+        for index, (status, code) in enumerate(earlier_runs)
+    )
+    conv_store = _ExistingConversationStore(_unstarted_sandbox_session())
+    deps = _deps(store, conversation_store=conv_store)
+
+    continued = await fire_mod._release_replaceable_session(
+        deps, task, fire_mod._NewRunRecorder(deps, task, 0)
+    )
+
+    paused_updates = [update for update in store.updates if update.get("state") == "paused"]
+    if paused:
+        assert continued is None
+        assert paused_updates == [{"id": task.id, "state": "paused"}]
+        # The newest failed session stays, so the owner can see why it failed.
+        assert store.released == []
+        assert conv_store.deleted == []
+        latest = store.runs[-1]
+        assert (latest["status"], latest["error_code"], latest["conversation_id"]) == (
+            "failed",
+            "sandbox_launch_retries_exhausted",
+            "conv_prev",
+        )
+        assert "resume it" in latest["error"]
+    else:
+        assert continued is not None and continued.session_id is None
+        assert paused_updates == []
+        assert conv_store.deleted == ["conv_prev"]
+        assert len(store.runs) == len(earlier_runs)
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_sandbox_continue_task_tries_a_new_launch() -> None:
+    """The run that paused the task ends its streak, so resuming retries right away."""
+    task = _sandbox_continue_task(session_id="conv_prev")
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    store.runs.extend(
+        {"run_id": f"run_{index}", "status": "failed", "error_code": "launch_failed"}
+        for index in range(fire_mod.MAX_CONSECUTIVE_SANDBOX_LAUNCH_FAILURES)
+    )
+    conv_store = _ExistingConversationStore(_unstarted_sandbox_session())
+    deps = _deps(store, conversation_store=conv_store)
+    assert (
+        await fire_mod._release_replaceable_session(
+            deps, task, fire_mod._NewRunRecorder(deps, task, 0)
+        )
+        is None
+    )
+
+    resumed = await fire_mod._release_replaceable_session(
+        deps, task, fire_mod._NewRunRecorder(deps, task, 0)
+    )
+
+    assert resumed is not None and resumed.session_id is None
+    assert store.released == [(task.id, "conv_prev")]
+    assert conv_store.deleted == ["conv_prev"]
 
 
 @pytest.mark.asyncio
