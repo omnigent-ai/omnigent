@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
@@ -7,6 +7,7 @@ import type * as rehypeSlugModule from "rehype-slug";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
+import { WorkspacePreviewProvider } from "./WorkspacePreviewContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
@@ -81,7 +82,7 @@ vi.mock("./ModelViewer", () => ({
 
 import * as permissions from "@/hooks/usePermissions";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { saveScrollTop } from "./useScrollRestore";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -189,6 +190,92 @@ function viewerElement(content: string, panelOpen: boolean, path: string, opts: 
     />
   );
 }
+
+describe("hidden workspace Markdown preview", () => {
+  it("defers a newly mounted preview and cancels an intermediate session", () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+    try {
+      const tree = (conversationId: string, showFile: boolean) => (
+        <WorkspacePreviewProvider conversationId={conversationId} visible={false}>
+          {showFile &&
+            viewerElement(`# ${conversationId}`, true, "new.md", {
+              viewMode: "preview",
+              conversationId,
+            })}
+        </WorkspacePreviewProvider>
+      );
+      const { container, rerender } = render(tree("conv_a", false));
+      const parsed = slugRuns.count;
+      rerender(tree("conv_b", true));
+      expect(container.querySelector("[data-preview-scroll]")).toBeEmptyDOMElement();
+      expect(slugRuns.count).toBe(parsed);
+      act(() => vi.advanceTimersToNextFrame());
+      rerender(tree("conv_c", true));
+      act(() => vi.advanceTimersToNextFrame());
+      expect(slugRuns.count).toBe(parsed);
+      act(() => vi.runOnlyPendingTimers());
+      expect(container.querySelector("[data-preview-scroll]")).toHaveTextContent("conv_c");
+      expect(slugRuns.count).toBe(parsed + 1);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("defers parsing and restores scroll without remounting the scroller", () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"],
+    });
+    try {
+      const tree = (conversationId: string, visible: boolean) => (
+        <WorkspacePreviewProvider conversationId={conversationId} visible={visible}>
+          {viewerElement(`# ${conversationId}`, true, "handoff.md", {
+            viewMode: "preview",
+            conversationId,
+          })}
+        </WorkspacePreviewProvider>
+      );
+      const { container, rerender } = render(tree("conv_a", true));
+      const scroller = container.querySelector<HTMLElement>("[data-preview-scroll]")!;
+      scroller.scrollTop = 120;
+      fireEvent.scroll(scroller);
+      rerender(tree("conv_a", false));
+      expect(container.querySelector("[data-preview-scroll]")).toBe(scroller);
+      expect(scroller.scrollTop).toBe(120);
+      expect(scroller).toHaveTextContent("conv_a");
+
+      saveScrollTop("viewer-preview:conv_b:handoff.md", 240);
+      const parsed = slugRuns.count;
+      rerender(tree("conv_b", false));
+      expect(container.querySelector("[data-preview-scroll]")).toBe(scroller);
+      expect(scroller).toBeEmptyDOMElement();
+      expect(slugRuns.count).toBe(parsed);
+      fireEvent.scroll(scroller);
+      act(() => vi.advanceTimersToNextFrame());
+      expect(slugRuns.count).toBe(parsed);
+      act(() => vi.runOnlyPendingTimers());
+      expect(scroller).toHaveTextContent("conv_b");
+      expect(slugRuns.count).toBeGreaterThan(parsed);
+      scroller.scrollTop = 0;
+      fireEvent.scroll(scroller);
+      expect(getSavedScrollTop("viewer-preview:conv_b:handoff.md")).toBe(240);
+      act(() => vi.advanceTimersByTime(2000));
+      rerender(tree("conv_b", true));
+      expect(scroller.scrollTop).toBe(240);
+
+      rerender(tree("conv_a", false));
+      expect(scroller).toBeEmptyDOMElement();
+      rerender(tree("conv_a", true));
+      expect(scroller).toHaveTextContent("conv_a");
+      expect(scroller.scrollTop).toBe(120);
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("Cmd+F on a rendered preview", () => {
   it.each([

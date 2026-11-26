@@ -91,6 +91,7 @@ import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
+import { WorkspacePreviewContext } from "./WorkspacePreviewContext";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isVideoFile } from "@/lib/video";
 
@@ -282,8 +283,10 @@ function MarkdownPreview({
   tocOpen,
   onTocOpenChange,
   deferOffscreen = false,
+  deferred,
 }: {
   content: string;
+  deferred: boolean;
   /** Skip layout of off-screen blocks; large documents otherwise lay out in full on open. */
   deferOffscreen?: boolean;
   /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
@@ -296,16 +299,17 @@ function MarkdownPreview({
   // Rewrite `\(…\)`/`\[…\]` to `$$…$$` as chat does; remark-math only honours `$`.
   // Memoized so resizes and toolbar re-renders skip re-parsing the document.
   const markdown = useMemo(
-    () => (
-      <ReactMarkdown
-        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-        components={MARKDOWN_COMPONENTS}
-      >
-        {normalizeExplicitMathDelimiters(content)}
-      </ReactMarkdown>
-    ),
-    [content],
+    () =>
+      deferred ? null : (
+        <ReactMarkdown
+          remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+          rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+          components={MARKDOWN_COMPONENTS}
+        >
+          {normalizeExplicitMathDelimiters(content)}
+        </ReactMarkdown>
+      ),
+    [content, deferred],
   );
   return (
     <div className="flex h-full">
@@ -382,6 +386,8 @@ function PreviewWithSearch({
   commentHint?: { conversationId: string; onSwitchToEdit: () => void };
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
+  const workspacePreview = useContext(WorkspacePreviewContext);
+  const deferred = workspacePreview.deferred && kind === "markdown";
   // A spreadsheet reads its file before its table (the scroller) mounts.
   const [spreadsheetScroller, setSpreadsheetScroller] = useState(false);
   // The preview div (not the FileViewer content area) is the real scroller
@@ -389,7 +395,9 @@ function PreviewWithSearch({
   const handleScroll = useScrollRestore(
     previewRef,
     scrollKey,
-    scrollReady && (kind !== "spreadsheet" || spreadsheetScroller),
+    scrollReady &&
+      (kind !== "markdown" || (workspacePreview.visible && !deferred)) &&
+      (kind !== "spreadsheet" || spreadsheetScroller),
   );
   // A table re-renders its rows on sort and filter without new content, so it
   // says when find must look again.
@@ -445,6 +453,7 @@ function PreviewWithSearch({
         tocOpen={tocOpen}
         onTocOpenChange={onTocOpenChange}
         deferOffscreen={deferOffscreen}
+        deferred={deferred}
       />
     );
   // The find bar sits above the preview; a truncated preview also shows the

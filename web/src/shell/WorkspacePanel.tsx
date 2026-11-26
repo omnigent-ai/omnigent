@@ -18,17 +18,14 @@ import {
   type ComponentType,
   type CSSProperties,
   type ReactElement,
-  type ReactNode,
   type Ref,
   type RefObject,
   lazy,
   memo,
-  startTransition,
   Suspense,
   useCallback,
   useContext,
   useEffect,
-  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -113,6 +110,7 @@ import { FilesPanel } from "./FilesPanel";
 import { resolveWorkspaceActiveView } from "./workspaceActiveView";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
+import { WorkspacePreviewProvider } from "./WorkspacePreviewContext";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { TasksPanel } from "./TasksPanel";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
@@ -1091,41 +1089,6 @@ interface ReturnPoint {
   focus: { element: HTMLElement } | { browser: "address" | "page" } | { rail: true } | null;
   /** Set once the new tab is on screen; switching away after that forgets the point. */
   shown: boolean;
-}
-
-function DeferredWorkspaceContent({
-  conversationId,
-  visible,
-  children,
-}: {
-  conversationId: string;
-  visible: boolean;
-  children: ReactNode;
-}) {
-  const [renderedConversationId, setRenderedConversationId] = useState(conversationId);
-  const lastContent = useRef(children);
-  const deferred = !visible && renderedConversationId !== conversationId;
-  if (visible && renderedConversationId !== conversationId) {
-    setRenderedConversationId(conversationId);
-  }
-  useLayoutEffect(() => {
-    if (!deferred) lastContent.current = children;
-  });
-  useEffect(() => {
-    if (!deferred) return;
-    // A deferred render alone can start before paint, including synchronous Markdown parsing.
-    let task: ReturnType<typeof setTimeout> | undefined;
-    const frame = requestAnimationFrame(() => {
-      task = setTimeout(() => {
-        startTransition(() => setRenderedConversationId(conversationId));
-      }, 0);
-    });
-    return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(task);
-    };
-  }, [conversationId, deferred]);
-  return deferred ? lastContent.current : children;
 }
 
 /**
@@ -2412,7 +2375,7 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
-          <DeferredWorkspaceContent
+          <WorkspacePreviewProvider
             conversationId={conversationId}
             visible={
               isMobile
@@ -2561,7 +2524,7 @@ function WorkspacePanelImpl({
                 </div>
               ) : null}
             </RenderErrorBoundary>
-          </DeferredWorkspaceContent>
+          </WorkspacePreviewProvider>
         </div>
       </div>
     </aside>
