@@ -27363,7 +27363,7 @@
     },
     "/v1/projects/{project_id}/tickets": {
       "get": {
-        "description": "List a page of tickets.\n\nEach ticket's `latest_comment` is its newest comment by a person or for the\nhuman (`text`, `user_id`, `session_id`, `by_person`, `position`,\n`created_at`), or null. Unlike `latest_update`, stage moves and label edits\ndon't replace it. `completed_at` and `landed_at` come from its stage history:\nits latest move into a completed stage, and into the landed stage or later, while\nit's still there; else null.",
+        "description": "List a page of tickets.\n\nEach ticket's `latest_comment` is its newest comment by a person or for the\nhuman (`text`, `user_id`, `session_id`, `by_person`, `position`,\n`created_at`), or null. Unlike `latest_update`, stage moves and label edits\ndon't replace it. With `include_times` (or `completed_since`), `completed_at`\nand `landed_at` come from one stage-history read for the page: its latest move\ninto a completed stage, and into the landed stage or later, while it's still there;\nelse null. Board lanes don't ask, so they skip that read.",
         "operationId": "list_tickets_v1_projects__project_id__tickets_get",
         "parameters": [
           {
@@ -27461,6 +27461,18 @@
               ],
               "description": "Only tickets now in a completed stage that last entered it at or after this Unix time, e.g. what finished in the last 24 hours.",
               "title": "Completed Since"
+            }
+          },
+          {
+            "description": "Add each row's completed_at and landed_at; implied by completed_since.",
+            "in": "query",
+            "name": "include_times",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Add each row's completed_at and landed_at; implied by completed_since.",
+              "title": "Include Times",
+              "type": "boolean"
             }
           }
         ],

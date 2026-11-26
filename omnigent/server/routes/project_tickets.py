@@ -836,15 +836,20 @@ def create_project_tickets_router(
                 "Unix time, e.g. what finished in the last 24 hours."
             ),
         ),
+        include_times: bool = Query(
+            False,
+            description="Add each row's completed_at and landed_at; implied by completed_since.",
+        ),
     ) -> dict[str, Any]:
         """List a page of tickets.
 
         Each ticket's ``latest_comment`` is its newest comment by a person or for the
         human (``text``, ``user_id``, ``session_id``, ``by_person``, ``position``,
         ``created_at``), or null. Unlike ``latest_update``, stage moves and label edits
-        don't replace it. ``completed_at`` and ``landed_at`` come from its stage history:
-        its latest move into a completed stage, and into the landed stage or later, while
-        it's still there; else null.
+        don't replace it. With ``include_times`` (or ``completed_since``), ``completed_at``
+        and ``landed_at`` come from one stage-history read for the page: its latest move
+        into a completed stage, and into the landed stage or later, while it's still there;
+        else null. Board lanes don't ask, so they skip that read.
         """
         who = await actor(request, project_id)
         finished = (
@@ -864,7 +869,8 @@ def create_project_tickets_router(
             requested_by=who.user_id if mine else None,
             ticket_ids=finished,
         )
-        await asyncio.to_thread(add_ticket_times, project_id, page, who.user_id)
+        if include_times or completed_since is not None:
+            await asyncio.to_thread(add_ticket_times, project_id, page, who.user_id)
         # Project sessions already carry this guidance in their instructions.
         if include_guidance and who.session_id is not None:
             page["agent_guidance"] = PROJECT_TICKET_WORK_INSTRUCTION

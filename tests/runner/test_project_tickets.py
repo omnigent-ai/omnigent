@@ -822,7 +822,7 @@ async def test_ticket_list_passes_completed_since_and_keeps_finish_times_compact
         page = json.loads(
             await execute_ticket_tool("sys_ticket_list", {"completed_since": 100}, client, SOURCE)
         )
-    assert b"completed_since=100" in seen[-1]
+    assert b"completed_since=100" in seen[-1] and b"include_times=true" in seen[-1]
     assert page["data"] == [{"id": TICKET, "title": "T", "completed_at": 5, "landed_at": 4}]
 
 

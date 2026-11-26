@@ -87,15 +87,18 @@ async def test_list_rows_carry_finish_times_and_filter_what_finished_since(
         ids.append(ticket["id"])
     await project_client.patch(f"{path}/tickets/{ids[0]}", json={"stage_id": done})
 
-    rows = {
-        row["title"]: row for row in (await project_client.get(f"{path}/tickets")).json()["data"]
-    }
+    # A board lane load doesn't ask for the times, so it skips the history read.
+    lane = (await project_client.get(f"{path}/tickets")).json()["data"]
+    assert all("completed_at" not in row and "landed_at" not in row for row in lane)
+    timed = await project_client.get(f"{path}/tickets", params={"include_times": True})
+    rows = {row["title"]: row for row in timed.json()["data"]}
     assert rows["Shipped"]["completed_at"] >= before
     assert rows["Open"]["completed_at"] is None and rows["Open"]["landed_at"] is None
     recent = (
         await project_client.get(f"{path}/tickets", params={"completed_since": before})
     ).json()
     assert ([row["title"] for row in recent["data"]], recent["total"]) == (["Shipped"], 1)
+    assert recent["data"][0]["completed_at"] >= before
     later = (
         await project_client.get(f"{path}/tickets", params={"completed_since": now_epoch() + 60})
     ).json()

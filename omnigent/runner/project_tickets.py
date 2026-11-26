@@ -258,7 +258,9 @@ async def execute_ticket_tool(
                     params["after"] = body["after"]
                 result = await request("GET", path + "/search", params=params)
             else:
-                result = await request("GET", path, params={**body, **guidance})
+                # Agents always get finish and land times; the board's own lane loads skip them.
+                params = {**body, **guidance, "include_times": "true"}
+                result = await request("GET", path, params=params)
             if compact:
                 result = _compact_page(result)
         elif name == "sys_ticket_get":
