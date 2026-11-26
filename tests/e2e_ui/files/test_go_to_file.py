@@ -36,13 +36,13 @@ def _mac(page: Page) -> bool:
 
 
 def _go_to_file_chord(page: Page) -> str:
-    """``palette.files``: ⌃⌘P on the Mac, Ctrl+Alt+P elsewhere."""
-    return "Control+Meta+p" if _mac(page) else "Control+Alt+p"
+    """``palette.files``: ⌃⌘P on the Mac, Ctrl+Alt+Shift+P elsewhere."""
+    return "Control+Meta+p" if _mac(page) else "Control+Alt+Shift+p"
 
 
 def _text_search_chord(page: Page) -> str:
-    """``palette.text``: ⌃⌘O on the Mac, Ctrl+Alt+F elsewhere."""
-    return "Control+Meta+o" if _mac(page) else "Control+Alt+f"
+    """``palette.text``: ⌃⌘O on the Mac, Ctrl+Alt+O elsewhere."""
+    return "Control+Meta+o" if _mac(page) else "Control+Alt+o"
 
 
 def _set_content_search(page: Page) -> None:
