@@ -10484,6 +10484,7 @@ async def _auto_create_claude_terminal(
             cwd=launch_cwd,
             env=launch_env,
             active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+            claude_args=claude_args,
         )
         ensure_claude_workspace_trusted(launch_cwd, env=launch_env, added_dirs=trusted_added_dirs)
     except BaseException as seed_error:

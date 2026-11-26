@@ -18376,16 +18376,20 @@ _HOOK_CASES = [
 
 
 @pytest.mark.parametrize(
-    ("active", "saved", "strict", "deferred"),
+    ("active", "saved", "strict", "deferred", "skills_filter"),
     [
-        *((active, saved, strict, False) for active, saved, strict in _HOOK_CASES),
-        (None, False, False, True),
-        (["claude"], True, False, True),
-        (None, False, True, True),
-        (["claude"], True, True, True),
+        *((active, saved, strict, False, "all") for active, saved, strict in _HOOK_CASES),
+        (None, False, False, True, "all"),
+        (["claude"], True, False, True, "all"),
+        (None, False, True, True, "all"),
+        (["claude"], True, True, True, "all"),
+        (None, False, True, False, "none"),
+        (None, False, True, True, "none"),
     ],
 )
-def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict, deferred):
+def test_disabled_mcp_settings_launch_hook(
+    tmp_path, monkeypatch, active, saved, strict, deferred, skills_filter
+):
     """Saved disables and strict policy reach the invocation settings.
 
     A deferred launch reads inherited settings for the launch cwd and environment
@@ -18415,7 +18419,10 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     original_args = augment_claude_args(
-        ("--model", "test-model"), bridge_dir=bridge_dir, workspace=workspace
+        ("--model", "test-model"),
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        skills_filter=skills_filter,
     )
     settings_path = Path(original_args[original_args.index("--settings") + 1])
     original = settings_path.read_bytes()
@@ -18432,11 +18439,16 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
             active_harnesses=active,
             workspace=workspace,
             defer_inherited_mcp_discovery=deferred,
+            skills_filter=skills_filter,
         )
         if deferred:
             launch_env = {"CLAUDE_CONFIG_DIR": "launch-config"}
             apply_claude_launch_mcp_policy(
-                bridge_dir, cwd=launch_cwd, env=launch_env, active_harnesses=active
+                bridge_dir,
+                cwd=launch_cwd,
+                env=launch_env,
+                active_harnesses=active,
+                claude_args=args,
             )
     assert hook.call_args_list[0].kwargs == {
         "executor": "claude-native",
@@ -18444,6 +18456,7 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
         "cwd": workspace,
         "env": None,
         "discover_inherited": not deferred,
+        "setting_sources": [] if skills_filter == "none" else None,
     }
     if deferred:
         assert hook.call_args_list[1].kwargs == {
@@ -18452,12 +18465,13 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
             "cwd": launch_cwd,
             "env": launch_env,
             "discover_inherited": True,
+            "setting_sources": [] if skills_filter == "none" else None,
         }
     assert hook.call_count == 1 + deferred
     assert args == original_args
     expected = json.loads(original)
     denied = [{"serverName": "fixture"}] if active and saved else []
-    if strict:
+    if strict and skills_filter != "none":
         denied.append({"serverName": "launch_inherited" if deferred else "inherited"})
     if denied:
         expected["deniedMcpServers"] = denied

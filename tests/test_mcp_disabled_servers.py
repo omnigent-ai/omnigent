@@ -390,16 +390,6 @@ def test_claude_strict_reads_linked_worktree_and_main_checkout_settings(
 def test_claude_strict_refuses_inherited_command_entries(claude_project, executor, source):
     """Claude then admits stdio servers by command alone, ignoring the name allowlist."""
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
-    # Both servers satisfy the command entry, so neither keeping nor denying it works.
-    _write_json(
-        claude_project.parent / "claude-config/.claude.json",
-        {
-            "mcpServers": {
-                "kept": {"command": "npx", "args": ["server"], "env": {"ROLE": "kept"}},
-                "other": {"command": "npx", "args": ["server"], "env": {"ROLE": "other"}},
-            }
-        },
-    )
     settings = {
         "user": claude_project.parent / "claude-config/settings.json",
         "project": claude_project / ".claude/settings.json",
@@ -507,21 +497,47 @@ def test_claude_strict_logs_unreadable_server_configs(claude_project, caplog):
     ) in caplog.text
 
 
-@pytest.mark.parametrize("config_dir", ["launch-config", ""])
+@pytest.mark.parametrize(
+    "context", ["relative", "empty", "lexical", "unset-home", "empty-home", "cowork"]
+)
 def test_claude_strict_reads_settings_for_the_launch_environment(
-    tmp_path, claude_project, config_dir
+    tmp_path, claude_project, monkeypatch, context
 ):
-    """A relative config directory resolves against the launch cwd, not this process's."""
+    """Discovery uses the settings path and account home of the selected launch."""
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.onboarding import ambient
+
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     _write_json(
         tmp_path / "claude/claude-config/settings.json",
         {"allowedMcpServers": [{"serverName": "process_user"}]},
     )
     launch = tmp_path / "launch"
-    launch_settings = launch / config_dir / "settings.json"
-    _write_json(launch_settings, {"allowedMcpServers": [{"serverName": "launch_user"}]})
+    launch.mkdir()
+    config_dir = "" if context == "empty" else "launch-config"
     user_home = tmp_path / "user-home"
     env = {"CLAUDE_CONFIG_DIR": config_dir, "HOME": str(user_home)}
+    global_dir = launch / config_dir if config_dir else user_home
+    settings_dir = launch / config_dir
+    if context == "lexical":
+        target = tmp_path / "elsewhere/child"
+        target.mkdir(parents=True)
+        (launch / "linked").symlink_to(target, target_is_directory=True)
+        env["CLAUDE_CONFIG_DIR"] = "linked/../launch-config"
+    elif context in {"unset-home", "empty-home"}:
+        env.pop("CLAUDE_CONFIG_DIR")
+        if context == "unset-home":
+            env.pop("HOME")
+        else:
+            env["HOME"] = ""
+        monkeypatch.setattr(ambient, "claude_account_home_dir", lambda: user_home)
+        monkeypatch.setattr(bridge, "_account_home_dir", lambda: user_home)
+        settings_dir, global_dir = user_home / ".claude", user_home
+    if context == "cowork":
+        env["CLAUDE_CODE_USE_COWORK_PLUGINS"] = "1"
+    filename = "cowork_settings.json" if context == "cowork" else "settings.json"
+    launch_settings = settings_dir / filename
+    _write_json(launch_settings, {"allowedMcpServers": [{"serverName": "launch_user"}]})
     result = apply_claude_settings(
         {}, executor="claude-native", active_harnesses=None, cwd=launch, env=env
     )
@@ -529,7 +545,7 @@ def test_claude_strict_reads_settings_for_the_launch_environment(
     # The launch's own global config supplies the allowlisted server's transport.
     url = "https://mcp.example.com/kept"
     _write_json(
-        (launch / config_dir if config_dir else user_home) / ".claude.json",
+        global_dir / ".claude.json",
         {"mcpServers": {"kept": {"type": "http", "url": url}}},
     )
     _write_json(launch_settings, {"allowedMcpServers": [{"serverUrl": url}]})

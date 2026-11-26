@@ -98,6 +98,8 @@ from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.onboarding.ambient import claude_account_home_dir as _account_home_dir
+from omnigent.onboarding.ambient import claude_joined_path as _claude_joined_path
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -2031,41 +2033,6 @@ def claude_global_config_path(
     return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
 
 
-def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
-    """
-    Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
-
-    ``path.join`` removes ``.`` and ``..`` lexically, without following
-    symlinks, before the filesystem resolves a relative result against
-    Claude's working directory.
-
-    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
-    :param directory: The joined directory value, e.g. ``"x/../cfg"``.
-    :param name: The config file name, e.g. ``".claude.json"``.
-    :returns: The file path, e.g. ``Path("/home/user/repo/cfg/.claude.json")``.
-    """
-    joined = os.path.normpath(os.path.join(directory, name))
-    return Path(joined) if os.path.isabs(joined) else cwd / joined
-
-
-def _account_home_dir() -> Path:
-    """
-    Return the account's home directory, as Claude's runtime does without ``HOME``.
-
-    Claude Code's runtime ignores an unset or empty ``HOME`` and reads the
-    password database, so the runner's own ``HOME`` is not a substitute.
-
-    :returns: The passwd home directory, e.g. ``Path("/home/user")``, or
-        :meth:`Path.home` where no password database exists.
-    """
-    try:
-        import pwd  # noqa: FlagLocalImports - POSIX-only module
-
-        return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError):
-        return Path.home()
-
-
 def ensure_claude_workspace_trusted(
     workspace: Path,
     env: Mapping[str, str] | None = None,
@@ -3227,6 +3194,7 @@ def augment_claude_args(
         cwd=workspace,
         env=None,
         discover_inherited=not defer_inherited_mcp_discovery,
+        setting_sources=[] if skills_filter == "none" else _claude_setting_sources(claude_args),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -3268,6 +3236,7 @@ def apply_claude_launch_mcp_policy(
     cwd: Path,
     env: Mapping[str, str],
     active_harnesses: Collection[str] | None,
+    claude_args: Sequence[str] = (),
 ) -> None:
     """
     Apply strict MCP discovery to the invocation settings for Claude's launch context.
@@ -3280,6 +3249,7 @@ def apply_claude_launch_mcp_policy(
     :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
     :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
     :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :param claude_args: Effective CLI arguments, including the selected settings scopes.
     :raises McpStrictModeError: When strict mode cannot narrow the inherited settings.
     """
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
@@ -3290,6 +3260,7 @@ def apply_claude_launch_mcp_policy(
         cwd=cwd,
         env=env,
         discover_inherited=True,
+        setting_sources=_claude_setting_sources(claude_args),
     )
     if updated is not settings:
         _write_json_file(settings_path, updated)
@@ -3302,6 +3273,7 @@ def _apply_native_mcp_settings(
     cwd: Path | None,
     env: Mapping[str, str] | None,
     discover_inherited: bool,
+    setting_sources: Collection[str] | None = None,
 ) -> dict[str, object]:
     """The single claude-native MCP launch hook, shared by both settings passes."""
     from omnigent.mcp_disabled_servers import apply_claude_settings
@@ -3313,7 +3285,22 @@ def _apply_native_mcp_settings(
         cwd=cwd,
         env=env,
         discover_inherited=discover_inherited,
+        setting_sources=setting_sources,
     )
+
+
+def _claude_setting_sources(args: Sequence[str]) -> list[str] | None:
+    """Read the last explicit settings scope selection, including an empty one."""
+    selected = None
+    tokens = iter(args)
+    for token in tokens:
+        if token == "--":
+            break
+        if token == "--setting-sources":
+            selected = next(tokens, "")
+        elif token.startswith("--setting-sources="):
+            selected = token.partition("=")[2]
+    return selected.split(",") if selected else ([] if selected is not None else None)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:

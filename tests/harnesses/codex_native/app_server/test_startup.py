@@ -1361,7 +1361,10 @@ _HOOK_CASES = [
 
 @pytest.mark.parametrize(
     ("active", "saved", "strict", "command_config"),
-    [*((*case, False) for case in _HOOK_CASES), (None, False, True, True)],
+    [
+        *((*case, None) for case in _HOOK_CASES),
+        *((None, False, True, command) for command in ("direct", "env", "env-context", "opaque")),
+    ],
 )
 async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     tmp_path, monkeypatch, active, saved, strict, command_config
@@ -1391,9 +1394,32 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     server.active_harnesses = active
     if command_config:
         server.app_server_command = ("codex", "-c", 'mcp_servers.extra.command="true"')
+        if command_config == "env":
+            server.app_server_command = ("env", "--", *server.app_server_command)
+        elif command_config == "env-context":
+            wrapped_cwd = tmp_path / "wrapped"
+            wrapped_cwd.mkdir()
+            (wrapped_cwd / ".codex").mkdir()
+            (wrapped_cwd / ".codex/config.toml").write_text(
+                '[mcp_servers.wrapped]\ncommand="true"\n'
+            )
+            server.app_server_command = (
+                "env",
+                "-C",
+                str(wrapped_cwd),
+                "WRAPPER_MARKER=1",
+                *server.app_server_command,
+            )
+        elif command_config == "opaque":
+            server.app_server_command = ("env", "-v", *server.app_server_command)
 
     (tmp_path / "source-codex-home/config.toml").write_text(
         '[mcp_servers.fixture]\ncommand="true"\n'
+        + (
+            f'[projects.{json.dumps(str(wrapped_cwd))}]\ntrust_level="trusted"\n'
+            if command_config == "env-context"
+            else ""
+        )
     )
     real_plan = disabled.plan_codex_launch
 
@@ -1401,22 +1427,34 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
         private_home = kwargs["codex_home"]
         assert private_home == server.codex_home
         assert "fixture" in (private_home / "config.toml").read_text()
-        assert kwargs["cwd"] == server.cwd
+        assert kwargs["cwd"] == (wrapped_cwd if command_config == "env-context" else server.cwd)
         return real_plan(*args, **kwargs)
 
     hook = Mock(side_effect=plan)
     monkeypatch.setattr(disabled, "plan_codex_launch", hook)
+    if command_config == "opaque":
+        with pytest.raises(disabled.McpStrictModeError, match="supported env wrapper"):
+            await server.start()
+        hook.assert_not_called()
+        return
     await server.start()
     try:
         hook.assert_called_once()
         assert hook.call_args.kwargs["executor"] == "codex-native"
         assert hook.call_args.kwargs["active_harnesses"] == active
-        assert hook.call_args.kwargs["launch_args"] == server.app_server_command[1:]
+        assert hook.call_args.kwargs["launch_args"] == (
+            ("-c", 'mcp_servers.extra.command="true"') if command_config else ()
+        )
         baseline = tuple(hook.call_args.args[0])
         denied_names = ["extra"] if strict and command_config else []
+        if command_config == "env-context":
+            denied_names.append("wrapped")
         if (active and saved) or strict:
             denied_names.append("fixture")
-        expected = (*baseline, *(f"mcp_servers.{name}.enabled=false" for name in denied_names))
+        expected = (
+            *baseline,
+            *(f"mcp_servers.{name}.enabled=false" for name in sorted(denied_names)),
+        )
         assert tuple(server.config_overrides) == expected
     finally:
         await server.close()

@@ -571,26 +571,43 @@ def read_claude_managed_settings(
     return None
 
 
+def claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
+    """Join a Claude config path lexically before filesystem symlinks are followed."""
+    joined = os.path.normpath(os.path.join(directory, name))
+    return Path(joined) if os.path.isabs(joined) else cwd / joined
+
+
+def claude_account_home_dir() -> Path:
+    """Resolve the account home Claude uses when its launch environment has no HOME."""
+    try:
+        import pwd  # noqa: FlagLocalImports - POSIX-only module
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return Path.home()
+
+
 def claude_user_settings_path(
     cwd: str | Path | None = None, env: Mapping[str, str] | None = None
 ) -> Path:
-    """Return the user ``settings.json`` path Claude Code reads from *cwd*.
+    """Return the user settings path Claude Code reads from *cwd*.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
     :param env: The CLI's launch environment; ``None`` means this process's.
     :returns: ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-        ``~/.claude/settings.json``.
+        ``~/.claude/settings.json``. Cowork mode selects ``cowork_settings.json``.
     """
     env = os.environ if env is None else env
     configured = env.get("CLAUDE_CONFIG_DIR")
-    home = env.get("HOME")
-    config_dir = (
-        Path(configured)
-        if configured is not None
-        else (Path(home) if home else Path.home()) / ".claude"
+    home = env.get("HOME") or str(claude_account_home_dir())
+    config_dir = configured if configured is not None else os.path.join(home, ".claude")
+    filename = (
+        "cowork_settings.json"
+        if env.get("CLAUDE_CODE_USE_COWORK_PLUGINS", "").lower() in {"1", "true", "yes", "on"}
+        else "settings.json"
     )
-    return Path(cwd or "") / config_dir / "settings.json"
+    return claude_joined_path(Path(cwd) if cwd is not None else Path.cwd(), config_dir, filename)
 
 
 def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
