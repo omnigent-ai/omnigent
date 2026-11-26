@@ -24,7 +24,7 @@ from omnigent.runner.github_review_fields import (
 
 # The largest pull request attachment, a video; the runner checks each type's own limit.
 # The call frame carries it base64-encoded, a third larger, under the tunnel's message cap.
-MAX_ATTACHMENT_BYTES = pr_resource._MAX_VIDEO_ATTACHMENT_BYTES
+MAX_ATTACHMENT_BYTES = pr_resource.MAX_VIDEO_ATTACHMENT_BYTES
 # Caps on an upload's other fields, so the largest allowed call still fits one frame.
 MAX_ATTACHMENT_NAME_CHARACTERS = 255
 MAX_PULL_REQUEST_URL_CHARACTERS = 2048
@@ -86,7 +86,9 @@ def refuse_unserved_request(method: str, request: Any) -> None:
         elif len(request.name) > MAX_ATTACHMENT_NAME_CHARACTERS:
             reason = f"The file's name is longer than {MAX_ATTACHMENT_NAME_CHARACTERS} characters"
         elif len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
-            reason = "Expected a pull request URL"
+            reason = (
+                f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
+            )
         elif not request.content:
             reason = "The attachment is empty"
         elif len(request.content) > MAX_ATTACHMENT_BYTES:

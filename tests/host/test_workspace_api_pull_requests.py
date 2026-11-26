@@ -331,7 +331,7 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
         (
             "UploadAttachment",
             pb.UploadAttachmentRequest(pr_url=_PR + "x" * 2048, name="shot.png", content=b"png"),
-            "Expected a pull request URL",
+            "The pull request URL is longer than 2048 characters",
         ),
         (
             "UploadAttachment",

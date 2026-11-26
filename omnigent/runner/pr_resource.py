@@ -90,7 +90,7 @@ _MAX_BODY_CHARS = 65536
 # GitHub's image limit. Videos may be 100 MB there, but the server and host
 # tunnels each carry the file base64-encoded (a third larger) in one 100 MB frame.
 _MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
-_MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
+MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
 # Leading bytes of each media type GitHub accepts as an attachment, with its extension.
 _ATTACHMENT_SIGNATURES: tuple[tuple[int, bytes, str, str], ...] = (
     (0, b"\x89PNG\r\n\x1a\n", "image/png", "png"),
@@ -1463,7 +1463,7 @@ def upload_pr_attachment(
         raise ValueError("Attach a PNG, JPEG, GIF, or WebP image, or an MP4, MOV, or WebM video")
     content_type, extension = media
     limit = (
-        _MAX_VIDEO_ATTACHMENT_BYTES
+        MAX_VIDEO_ATTACHMENT_BYTES
         if content_type.startswith("video/")
         else _MAX_IMAGE_ATTACHMENT_BYTES
     )
