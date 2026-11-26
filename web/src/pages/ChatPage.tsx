@@ -1154,11 +1154,9 @@ export function ChatPage() {
       isTempConvId(urlConvId) &&
       activeConversationId !== null &&
       !isTempConvId(activeConversationId);
-    // A sidebar click under `warm_switch_keep_mounted_ui` has already switched
-    // the store to this navigation's target, one frame before the URL commits.
-    // The mounted surface already shows that target coherently, so keep it
-    // instead of tearing it down behind the placeholder; every path that
-    // doesn't set the marker keeps the placeholder.
+    // A sidebar click under `warm_switch_keep_mounted_ui` switches the store to
+    // the target one frame ahead of the URL; the surface already shows that
+    // target coherently, so keep it mounted instead of the placeholder.
     if (activeConversationId === urlConvId) clearWarmSwitchInFlight();
     const warmSwitchPending = warmSwitchInFlight(activeConversationId);
     if (
