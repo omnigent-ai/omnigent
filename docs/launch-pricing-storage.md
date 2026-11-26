@@ -5,6 +5,12 @@ when an agent bundle is republished. A provider name currently has no length
 limit. Storing it directly in the 512-character session overrides document can
 also prevent a later model switch from fitting.
 
+The existing `inference_snapshot` retains configured provider bindings and the
+model catalog at session creation and remains the source for those sessions.
+It does not capture later provider detection at runner or native launch, and
+legacy or server-bound sessions may have no saved snapshot. The launch reference
+fills those gaps without replacing the saved inference configuration.
+
 The schema proposal adds nullable `launch_pricing_context_id` to
 `omnigent_conversation_metadata`, using the existing `Uuid16` type. It adds no
 pricing reader or writer. The canonical metadata schema declares the column as
@@ -64,7 +70,7 @@ The schema alone does not fix session pricing. Before activating writes:
 Validate the migration on an isolated database with
 `pytest tests/db/test_migration_launch_pricing_context.py --reruns 0 -n 0`.
 The checks render upgrade DDL for SQLite, PostgreSQL and MySQL. SQLite lifecycle
-checks cover existing rows and overrides, older SQL writes, reference round trips
+checks cover existing rows and overrides, older SQL writes, typed ORM reference round trips
 and pre-activation downgrade. A metadata-create/stamp/downgrade scenario also
 covers the initialization boundary used by CockroachDB tests, including ordinary
 ORM reads after downgrade. They do not replace live-engine deployment validation

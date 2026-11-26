@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import ConversationBase, OmnigentBase, SqlConversationMetadata
 from omnigent.db.utils import _build_alembic_config
@@ -73,6 +74,7 @@ def test_launch_pricing_reference_preserves_legacy_rows_and_writes(tmp_path: Pat
     engine = sa.create_engine(uri)
     overrides = '{"model_override":"legacy-model","reasoning_effort":"high"}'
     context_id = bytes.fromhex("fedcba9876543210fedcba9876543210")
+    orm_context_id = "1234567890abcdef1234567890abcdef"
     try:
         _migrate(uri, engine, "upgrade", _PREVIOUS)
         inspector = sa.inspect(engine)
@@ -128,6 +130,17 @@ def test_launch_pricing_reference_preserves_legacy_rows_and_writes(tmp_path: Pat
                 {"id": _SESSION_ID},
             ).one()
             assert tuple(row) == (overrides, 2)
+
+        with Session(engine) as session:
+            metadata = session.get(SqlConversationMetadata, (0, _SESSION_ID.hex()))
+            assert metadata is not None
+            assert metadata.launch_pricing_context_id == context_id.hex()
+            metadata.launch_pricing_context_id = orm_context_id
+            session.commit()
+        with Session(engine) as session:
+            metadata = session.get(SqlConversationMetadata, (0, _SESSION_ID.hex()))
+            assert metadata is not None
+            assert metadata.launch_pricing_context_id == orm_context_id
 
         _migrate(uri, engine, "downgrade", _PREVIOUS)
         inspector = sa.inspect(engine)

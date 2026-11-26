@@ -1,16 +1,9 @@
-"""Add an optional reference to a session's launch pricing context.
+"""Add a nullable launch-pricing artifact reference.
+
+See docs/launch-pricing-storage.md for rollout requirements.
 
 Revision ID: c51f8d9a27b6
 Revises: 47d3e8fc3e25
-
-Only a fixed-size artifact identity is stored on conversation metadata. The
-application follow-up will retain the complete provider name in artifact
-storage, without limiting existing provider names or expanding session_overrides.
-
-This migration adds no application reader, writer, default, index or backfill.
-Running older servers can continue using their known columns, but an older
-build cannot restart against an unknown Alembic revision. Deploy a build that
-knows this migration before applying it; see docs/launch-pricing-storage.md.
 """
 
 from __future__ import annotations
