@@ -10815,6 +10815,36 @@ def test_claude_global_config_path_uses_launch_env_and_cwd(
     )
 
 
+@pytest.mark.parametrize("config_source", ["home", "config", "legacy"])
+def test_absolute_claude_config_paths_do_not_require_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_source: str,
+) -> None:
+    """Absolute config paths remain usable after the runner's cwd is removed."""
+    from omnigent.onboarding.ambient import claude_user_settings_path
+
+    home = tmp_path / "home"
+    env = {"HOME": str(home)}
+    config_dir = home / ".claude"
+    expected_global = home / ".claude.json"
+    if config_source != "home":
+        config_dir = tmp_path / "config"
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+        expected_global = config_dir / ".claude.json"
+    if config_source == "legacy":
+        config_dir.mkdir()
+        expected_global = config_dir / ".config.json"
+        expected_global.write_text("{}")
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(Path, "cwd", missing_cwd)
+    assert claude_global_config_path(env=env) == expected_global
+    assert claude_user_settings_path(env=env) == config_dir / "settings.json"
+
+
 def test_claude_global_config_path_removes_dot_dot_like_path_join(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

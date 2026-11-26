@@ -6,10 +6,12 @@ import os
 from pathlib import Path
 
 
-def claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
+def claude_joined_path(cwd: Path | None, directory: str, name: str) -> Path:
     """Join a Claude config path lexically before filesystem symlinks are followed."""
     joined = os.path.normpath(os.path.join(directory, name))
-    return Path(joined) if os.path.isabs(joined) else cwd / joined
+    if os.path.isabs(joined):
+        return Path(joined)
+    return (cwd if cwd is not None else Path.cwd()) / joined
 
 
 def claude_account_home_dir() -> Path:

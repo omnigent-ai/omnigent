@@ -2013,7 +2013,7 @@ def claude_global_config_path(
     :returns: The config file path, e.g. ``Path("/home/user/.claude.json")``.
     """
     env = os.environ if env is None else env
-    base = cwd if cwd is not None else Path.cwd()
+    base = cwd
     # Claude builds these with ``path.join``: no ``~`` expansion, ``..`` removed
     # lexically, and relative results resolved against its cwd.
     home_value = env.get("HOME") or str(_account_home_dir())
@@ -2023,7 +2023,7 @@ def claude_global_config_path(
         legacy_dir = unicodedata.normalize("NFC", os.path.join(home_value, ".claude"))
         legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")
     elif not config_dir:
-        legacy_path = base / ".config.json"
+        legacy_path = _claude_joined_path(base, "", ".config.json")
     else:
         legacy_dir = unicodedata.normalize("NFC", config_dir)
         legacy_path = _claude_joined_path(base, legacy_dir, ".config.json")

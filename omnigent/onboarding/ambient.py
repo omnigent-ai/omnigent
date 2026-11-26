@@ -592,7 +592,7 @@ def claude_user_settings_path(
         if env.get("CLAUDE_CODE_USE_COWORK_PLUGINS", "").lower() in {"1", "true", "yes", "on"}
         else "settings.json"
     )
-    return claude_joined_path(Path(cwd) if cwd is not None else Path.cwd(), config_dir, filename)
+    return claude_joined_path(Path(cwd) if cwd is not None else None, config_dir, filename)
 
 
 def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
