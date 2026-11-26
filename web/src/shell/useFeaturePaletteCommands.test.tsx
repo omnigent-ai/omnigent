@@ -72,7 +72,9 @@ function setViewport(width: number, pointer: "fine" | "coarse" = "fine") {
 /** Render the hook from a fresh module, so each case starts with nothing loaded. */
 async function renderPaletteCommands(open: boolean) {
   const { useFeaturePaletteCommands } = await import("./useFeaturePaletteCommands");
-  return renderHook(() => useFeaturePaletteCommands(open));
+  return renderHook(({ isOpen }) => useFeaturePaletteCommands(isOpen), {
+    initialProps: { isOpen: open },
+  });
 }
 
 /** Let a started load settle, so a load that shouldn't happen has had its chance. */
@@ -185,6 +187,18 @@ describe("useFeaturePaletteCommands", () => {
       hook.result.current.onCloseAutoFocus();
       await Promise.resolve();
       expect(events).toEqual(["close", "run focus"]);
+    });
+
+    it("drops a focus-moving command when the palette reopens before handing focus back", async () => {
+      const { hook, events, accept } = await acceptingRows();
+      accept("focus");
+      hook.rerender({ isOpen: false });
+      // Reopened during the exit animation: the old content's close never reaches the hook.
+      hook.rerender({ isOpen: true });
+      hook.rerender({ isOpen: false });
+      hook.result.current.onCloseAutoFocus();
+      await Promise.resolve();
+      expect(events).toEqual(["close"]);
     });
 
     it("only closes the palette for a row whose command was withdrawn", async () => {
