@@ -52,8 +52,9 @@ export function openRequestKey(request: {
 }
 
 /**
- * What the dialog shows after `request`: a request for the mode showing toggles it closed,
- * one for the other mode switches to it and keeps what was typed, and otherwise it opens.
+ * What the dialog shows after `request`. One that brings a query, even an empty one, opens
+ * afresh on it. Otherwise a request for the mode showing toggles it closed, and one for the
+ * other mode switches to it and keeps what was typed.
  */
 export function nextOpenRequest(
   current: OpenRequest | null,
@@ -62,7 +63,9 @@ export function nextOpenRequest(
   },
 ): OpenRequest | null {
   const mode: GoToFileMode = request.kind;
-  if (!current) return { key: openRequestKey(request), query: request.query, mode };
+  if (!current || request.query !== undefined) {
+    return { key: openRequestKey(request), query: request.query, mode };
+  }
   if (current.mode !== mode) return { ...current, mode };
   return request.toggle ? null : current;
 }
@@ -80,7 +83,7 @@ export function GoToFileHost({
     (request) => setOpened((current) => nextOpenRequest(current, request)),
     { textSearch },
   );
-  // Search in Sessions… asks here, open session or not; a new query replaces what was typed.
+  // Search in Sessions… asks here, open session or not.
   const sessionSearch = useSessionSearchStore((state) => state.request);
   useEffect(() => {
     if (!sessionSearch) return;
@@ -90,14 +93,7 @@ export function GoToFileHost({
       query: sessionSearch.query,
       toggle: false,
     };
-    setOpened((current) =>
-      nextOpenRequest(
-        current && sessionSearch.query !== undefined
-          ? { ...current, query: sessionSearch.query, key: openRequestKey(sessionRequest) }
-          : current,
-        sessionRequest,
-      ),
-    );
+    setOpened((current) => nextOpenRequest(current, sessionRequest));
     // Taken once, so a host that mounts later, such as on the next session, doesn't reopen it.
     useSessionSearchStore.setState((state) =>
       state.request?.id === sessionSearch.id ? { request: null } : state,

@@ -20,6 +20,20 @@ describe("nextOpenRequest", () => {
     expect(nextOpenRequest(open, { ...text, toggle: true })).toEqual({ ...open, mode: "text" });
   });
 
+  it.each([
+    ["the other mode", text],
+    ["the mode showing", files],
+  ])("opens afresh on a request's text from %s, even empty text", (_case, kind) => {
+    const open = nextOpenRequest(null, { ...files, query: "guide" })!;
+    for (const query of ["needle", ""]) {
+      expect(nextOpenRequest(open, { ...kind, id: 7, query })).toEqual({
+        key: "files:7",
+        query,
+        mode: kind.kind,
+      });
+    }
+  });
+
   it("closes from the showing mode's chord, and stays open for its ⌘K row", () => {
     const open = nextOpenRequest(null, text)!;
     expect(nextOpenRequest(open, { ...text, id: 3, toggle: true })).toBeNull();

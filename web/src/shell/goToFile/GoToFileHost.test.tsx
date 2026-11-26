@@ -194,6 +194,25 @@ describe("GoToFileHost", () => {
     expect(await screen.findByRole("option", { name: /guide\.md/ })).toBeInTheDocument();
   });
 
+  it("takes a later request's text while open, even an empty one, and keeps it on a mode switch", async () => {
+    renderHost();
+    act(() => void requestFileFinder(SESSION, { query: "guide" }));
+    expect(await screen.findByTestId("go-to-file-input")).toHaveValue("guide");
+    // Search Text in Workspace… from a selection, with Go to File already open.
+    act(() => void requestTextSearch(SESSION, { query: "needle" }));
+    await waitFor(() => expect(input()).toHaveValue("needle"));
+    expect(screen.getByRole("tab", { name: /Text/ })).toHaveAttribute("aria-selected", "true");
+    act(() => void requestFileFinder(SESSION, { query: "" }));
+    await waitFor(() => expect(input()).toHaveValue(""));
+    // A chord carries no text, so switching modes keeps what was typed.
+    await userEvent.type(input()!, "widget");
+    act(() => void requestTextSearch(SESSION, { toggle: true }));
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: /Text/ })).toHaveAttribute("aria-selected", "true"),
+    );
+    expect(input()).toHaveValue("widget");
+  });
+
   it("lists the session's recently opened files before a query", async () => {
     recordRecentWorkspaceFile(SESSION, "docs/guide.md");
     recordRecentWorkspaceFile("conv_other", "elsewhere.ts");
