@@ -52,6 +52,7 @@ import {
   IgnoredFilesSearchError,
   listingIgnoredFiles,
   workspaceDirectoryQuery,
+  useTrailingInvalidate,
 } from "./useWorkspaceChangedFiles";
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
@@ -2792,4 +2793,29 @@ it.each([false, true])("gates background workspace activity on grid flag %s", (e
   expect(view.result.current).toBe(false);
   view.unmount();
   conversationRegistry.clear();
+});
+
+describe("useTrailingInvalidate", () => {
+  it("runs an invalidate function once when the session goes idle, or invalidates a key prefix", () => {
+    const queryClient = new QueryClient();
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    const invalidate = vi.fn();
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    type Target = string | ((client: QueryClient, conversationId: string) => void);
+    const { rerender } = renderHook(
+      ({ active, target }: { active: boolean; target: Target }) =>
+        useTrailingInvalidate("conv-1", active, target),
+      { wrapper, initialProps: { active: true, target: invalidate as Target } },
+    );
+    rerender({ active: false, target: invalidate });
+    expect(invalidate).toHaveBeenCalledExactlyOnceWith(queryClient, "conv-1");
+    rerender({ active: true, target: "workspace-changed-files" });
+    rerender({ active: false, target: "workspace-changed-files" });
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["workspace-changed-files", "conv-1"],
+    });
+    expect(invalidate).toHaveBeenCalledTimes(1);
+  });
 });

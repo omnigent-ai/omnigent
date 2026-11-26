@@ -32,6 +32,7 @@ import {
 } from "@/lib/permissionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useSession } from "./useSession";
+import type { Session } from "@/lib/types";
 
 /** Every session's grants list, which also names the automation managing it. */
 const SESSION_PERMISSIONS_KEY = ["permissions"] as const;
@@ -193,3 +194,37 @@ export function useIsSessionOwner(sessionId: string | null | undefined): boolean
 }
 
 export type { GrantList, Permission, ShareGrant, ShareTarget };
+
+/**
+ * Who may change a session's pull requests: on a shared session only its owner, since
+ * every change runs as the owner's code-host account or speaks for the session. "unknown"
+ * while the session loads, so neither the controls nor the owner-only note flash.
+ */
+export type PullRequestChangeAccess = "owner" | "not_owner" | "unknown";
+/**
+ * The server's answer for whether the viewer owns the session's root (its owner grant, never
+ * an admin flag; everyone where permissions are off), sent as `side_chat_allowed`. Older
+ * servers fall back to the viewer's own level.
+ */
+export function pullRequestChangeAccess(
+  session: Pick<Session, "sideChatAllowed" | "permissionLevel"> | null | undefined,
+  isLoading: boolean,
+): PullRequestChangeAccess {
+  if (!session) return isLoading ? "unknown" : "not_owner";
+  const owner = session.sideChatAllowed ?? isOwnerLevel(session.permissionLevel ?? null);
+  return owner ? "owner" : "not_owner";
+}
+/** {@link pullRequestChangeAccess} for `sessionId`. */
+export function usePullRequestChangeAccess(sessionId: string): PullRequestChangeAccess {
+  const { session, isLoading } = useSession(sessionId);
+  return pullRequestChangeAccess(session, isLoading);
+}
+/**
+ * The one gate for changing a session's pull requests here, through its machine or this
+ * Mac alike: edit access, held by the session's owner.
+ */
+export function useCanChangePullRequests(sessionId: string): boolean {
+  const canEdit = useCanEdit(sessionId);
+  const access = usePullRequestChangeAccess(sessionId);
+  return canEdit && access === "owner";
+}
