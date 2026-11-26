@@ -652,13 +652,16 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             fingerprints.set(item.id, fingerprint);
             const parentList = findParentList(item.parent_session_id);
             const seen = childRowFingerprintsRef.current.get(item.id);
-            // Expiry re-reads membership a discovery push may have missed. A failed
-            // list retries on later frames, without restarting a retry in flight.
+            // Expiry re-reads membership a discovery push may have missed. A list not
+            // mounted with data is never skipped (see below), and a failed list retries
+            // on later frames without restarting a retry in flight.
             const retrying = parentList?.state.status === "error";
             if (
               seen?.row === fingerprint &&
               now - seen.at < CHILD_ROW_RECHECK_MS &&
-              (!retrying || parentList?.state.fetchStatus === "fetching")
+              parentList?.isActive() &&
+              parentList.state.data !== undefined &&
+              (!retrying || parentList.state.fetchStatus === "fetching")
             ) {
               continue;
             }

@@ -2147,6 +2147,39 @@ describe("SessionUpdatesProvider sub-agent list refetches that must keep working
     );
   });
 
+  it("refetches a remounted list whose rows were restated while it was unmounted", async () => {
+    // Child lists don't refetch on mount, so the next frame after a remount must.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockResolvedValue([{ id: "child_1" }, { id: "child_2" }]);
+    const unmount = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn: fetchChildren,
+      initialData: [{ id: "child_1" }],
+      staleTime: Infinity,
+      retry: false,
+    }).subscribe(() => {});
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [subagentRow("child_1", "conv_a")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    unmount();
+    act(() => handler({ type: "snapshot", items: [...rows, conv("conv_a")] }));
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1" },
+        { id: "child_2" },
+      ]),
+    );
+  });
+
   it("retries a child list whose refetch failed on the next frame that restates it", async () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a"]);
