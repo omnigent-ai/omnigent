@@ -322,11 +322,11 @@ def inspect_shell(
     children: dict[int, list[_Row]] = {}
     for row in rows:
         children.setdefault(row.ppid, []).append(row)
-    # Closing the terminal ends its whole tmux server: another pane or window there, such as
-    # one ``tmux new-window`` opened, may run work this pane can't account for.
-    # An exited window can leave a zombie until tmux reaps it; no work remains there.
+    # Closing the terminal ends its whole tmux server, including work in other windows.
+    # tmux can retain an exited window's zombie, but a zombie leader may still have live
+    # threads (ps's `l` flag). Only unthreaded zombies are safe to ignore.
     if any(
-        row.pid != pane.pid and not row.stat.startswith("Z")
+        row.pid != pane.pid and (not row.stat.startswith("Z") or "l" in row.stat)
         for row in children.get(tmux_server_pid, [])
     ):
         return UNKNOWN

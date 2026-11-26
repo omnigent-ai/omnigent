@@ -140,6 +140,11 @@ SANDBOX_SLEEP_AND_ADOPTED = (
             ShellInspection(ShellState.IDLE),
         ),
         (
+            PLAIN_IDLE + snapshot((210, TMUX, 210, 210, "Zsl+", "python")).split("\n", 1)[1],
+            (),
+            UNKNOWN,
+        ),
+        (
             PLAIN_IDLE
             + snapshot(
                 (210, TMUX, 210, -1, "Zs", "sleep"),
@@ -161,6 +166,7 @@ SANDBOX_SLEEP_AND_ADOPTED = (
         "another pane beside a sandbox",
         "stopped work in another window",
         "exited window awaiting reap",
+        "zombie leader with live threads",
         "unreaped window beside running work",
     ],
 )
