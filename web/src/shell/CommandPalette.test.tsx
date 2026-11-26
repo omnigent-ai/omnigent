@@ -997,10 +997,21 @@ describe("CommandPalette — title and content groups", () => {
       { wrapper: withQueryClient() },
     );
     const input = screen.getByTestId("command-palette-input");
+    input.focus();
+    const selected = () => screen.getByRole("option", { selected: true }).textContent;
+    expect(selected()).toContain("Fix the parser");
+    fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
+    expect(selected()).toContain("Deploy API");
+    // The arrows and Ctrl-N/Ctrl-P walk the same selection.
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    expect(selected()).toContain("Fix the parser");
     fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
     fireEvent.keyDown(input, { key: "n", code: "KeyN", ctrlKey: true });
     fireEvent.keyDown(input, { key: "p", code: "KeyP", ctrlKey: true });
     fireEvent.keyDown(input, { key: "j", code: "KeyJ", ctrlKey: true });
+    // Neither key types into the field or takes focus from it.
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("");
     fireEvent.keyDown(input, { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/c2");
   });
