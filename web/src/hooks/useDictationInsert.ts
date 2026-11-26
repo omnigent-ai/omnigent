@@ -93,7 +93,11 @@ function splice(
 
 export function useDictationInsert(
   draft: string,
-  setDraft: (next: string) => void,
+  /**
+   * Writes `next`, which is `draft` with `change` made. A setter that writes through the input
+   * itself returns the text the input then holds, since an editor may adjust a write.
+   */
+  setDraft: (next: string, change: { from: number; to: number; insert: string }) => string | void,
   textareaRef?: RefObject<ComposerTextTarget | null>,
 ): {
   /** Pin a final utterance, replacing any pending interim region. */
@@ -199,11 +203,18 @@ export function useDictationInsert(
         return;
       }
 
-      draftRef.current = spliced.next;
-      producedRef.current = settled;
-      wantCaretRef.current = spliced.caret;
-      setInterimPending(settled.region !== null);
-      setDraft(spliced.next);
+      const change = {
+        from: spliced.region.start,
+        to: spliced.region.start + (region?.text.length ?? 0),
+        insert: spliced.region.text,
+      };
+      const written = setDraft(spliced.next, change) ?? spliced.next;
+      // A write the input adjusted or refused leaves nothing here to revise; its text is the base.
+      const kept = written === spliced.next;
+      draftRef.current = written;
+      producedRef.current = kept ? settled : null;
+      wantCaretRef.current = kept ? spliced.caret : null;
+      setInterimPending(kept && settled.region !== null);
     },
     [setDraft, textareaRef],
   );

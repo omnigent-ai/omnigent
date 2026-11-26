@@ -28,6 +28,22 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that leaves the editor (switching sessions, a new-session handoff, a recovered
   send) keeps each chip's file as a tray attachment with its `@name` text
   unchanged.
+- `reply-quote-cards`: with the CodeMirror editor (see `codemirror-input`), the
+  main chat holds a reply in its one editor, each quote a card on a line of its
+  own. Arrow keys step over a card, and the caret never rests on one. Backspace
+  at the start of the line after a card, Delete at the end of the line before
+  it, or the card's X removes it; undo brings it back. After Reply the caret is
+  on the empty line under the new card. Copy, cut and drag give a quote as `> `
+  markdown, and a readline kill (⌃K, ⌃U, ⌃W) stops at a card. Writes from code
+  (clears, `/side`, attachments, recall) change only the text after the last
+  card. Removing a card takes its line and a blank line that only separates it,
+  and keeps the text around it as shown, so the text above and below joins with
+  one line break; the textarea joins them with a blank line, so the sent text
+  can differ. Discarding a dictation puts back the text from before the take
+  only when nothing else edited the draft during it. A draft saved on one engine
+  restores on the other. An engine switch with quotes puts the caret at the end
+  of the draft rather than where it was. Side chats keep one input per quote on
+  both engines.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain

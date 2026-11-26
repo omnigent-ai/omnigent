@@ -35,10 +35,12 @@ import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorCompos
 import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
+import { quoteLine } from "@/lib/replyDraftDocument";
+import type * as ComposerMicButtonModule from "@/components/ComposerMicButton";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import { createElement, createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setSessionHost } from "@/lib/sessionHost";
@@ -89,6 +91,20 @@ import {
 // to avoid needing a QueryClientProvider around every bare render.
 // Counts renders of the composer's ⌘K settings, which render nothing themselves.
 const composerPaletteSettings = vi.hoisted(() => ({ renders: 0 }));
+// The dictation handlers the composer gives its mic button, which renders as usual.
+const mic = vi.hoisted(() => ({
+  current: null as ComposerMicButtonModule.ComposerMicButtonProps | null,
+}));
+vi.mock("@/components/ComposerMicButton", async (importOriginal) => {
+  const actual = await importOriginal<typeof ComposerMicButtonModule>();
+  return {
+    ...actual,
+    ComposerMicButton: (props: ComposerMicButtonModule.ComposerMicButtonProps) => {
+      mic.current = props;
+      return createElement(actual.ComposerMicButton, props);
+    },
+  };
+});
 vi.mock("@/components/composer/composerSectionSettings", async (importOriginal) => {
   const original = await importOriginal<typeof ComposerSectionSettingsModule>();
   return {
@@ -10501,5 +10517,260 @@ describe("Composer model and effort in ⌘K", () => {
     expect(composerPaletteSettings.renders).toBe(0);
     expect(settingLabels()).not.toContain("Model");
     expect(settingLabels()).not.toContain("Reasoning Effort");
+  });
+});
+
+describe("Composer reply quotes in the CodeMirror editor", () => {
+  type ServerInfo = typeof FALLBACK_SERVER_INFO;
+  const codeMirrorInfo: ServerInfo = {
+    ...FALLBACK_SERVER_INFO,
+    features: { chat_composer_codemirror: true },
+  };
+  const plainInfo: ServerInfo = { ...FALLBACK_SERVER_INFO, features: {} };
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    setComposerState({
+      conversationId: "conv_cm_quotes",
+      skills: [],
+      blocks: [],
+      failedSendDraft: null,
+      restoredSendDraft: null,
+      queuedMessages: [],
+    });
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+  });
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    composerSessionSnapshot.sideChatAllowed = null;
+    resetCodeMirrorComposerLoadForTests();
+  });
+
+  const editor = () => composerTargetOf(screen.getByLabelText("Message the agent"))!;
+  const cards = () => screen.queryAllByTestId("composer-reply-quote");
+  const type = (text: string) => act(() => void insertComposerText(editor(), text));
+  function renderComposer(props = composerProps(), info = codeMirrorInfo) {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const ui = (serverInfo: ServerInfo) => (
+      <CapabilitiesProvider info={serverInfo}>
+        <TooltipProvider>
+          <Composer {...props} ref={ref} />
+        </TooltipProvider>
+      </CapabilitiesProvider>
+    );
+    const view = render(ui(info));
+    const reply = (text: string) => act(() => ref.current?.appendReplyQuote(text));
+    return { ...view, ref, reply, switchTo: (next: ServerInfo) => view.rerender(ui(next)) };
+  }
+  async function renderEditor(props = composerProps()) {
+    const rendered = renderComposer(props);
+    await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    return rendered;
+  }
+  /** A loader the test finishes, so the editor takes over when the test says. */
+  function deferEditorLoad() {
+    let finish: ((module: typeof CodeMirrorModule) => void) | undefined;
+    resetCodeMirrorComposerLoadForTests(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    return async () => {
+      await waitFor(() => expect(finish).toBeDefined());
+      await act(async () => finish!(CodeMirrorModule));
+      await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+    };
+  }
+
+  it("holds the whole reply in one editor, with the caret under each new card", async () => {
+    const { reply } = await renderEditor();
+    type("My introduction");
+    reply("First point");
+    type("My answer");
+    reply("Second point");
+    expect(document.querySelectorAll(".cm-content")).toHaveLength(1);
+    expect(cards()).toHaveLength(2);
+    expect(editor().value.split("\n")).toEqual([
+      "My introduction",
+      expect.any(String),
+      "My answer",
+      expect.any(String),
+      "",
+    ]);
+    expect(editor().selectionStart).toBe(editor().value.length);
+    expect(screen.getByLabelText("Message the agent")).toHaveFocus();
+  });
+
+  it("sends a reply exactly as the textarea engine does", async () => {
+    const send = async (info: ServerInfo) => {
+      const props = composerProps();
+      const { reply } = renderComposer(props, info);
+      if (info === codeMirrorInfo) {
+        await waitFor(() => expect(document.querySelector(".cm-content")).not.toBeNull());
+      }
+      type("My introduction");
+      reply("First point");
+      type("My answer");
+      fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+      cleanup();
+      return vi.mocked(props.onSend).mock.calls;
+    };
+    const textareaCalls = await send(plainInfo);
+    expect(textareaCalls).toEqual([
+      [
+        "My introduction\n\n> First point\n\nMy answer",
+        undefined,
+        {
+          version: 1,
+          quotes: [{ before: "My introduction", text: "First point" }],
+          text: "My answer",
+        },
+      ],
+    ]);
+    expect(await send(codeMirrorInfo)).toEqual(textareaCalls);
+  });
+
+  it("shows the tail and its quote blocks in the textarea while the editor loads", () => {
+    resetCodeMirrorComposerLoadForTests(() => new Promise(() => {}));
+    const { reply } = renderComposer();
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    reply("First point");
+    fireEvent.change(textarea(), { target: { value: "My answer" } });
+    expect(textarea()).toHaveValue("My answer");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("keeps the quotes and text when the engine switches mid-draft, either way", async () => {
+    const finishLoad = deferEditorLoad();
+    const { reply, switchTo } = renderComposer();
+    fireEvent.change(textarea(), { target: { value: "My introduction" } });
+    reply("First point");
+    fireEvent.change(textarea(), { target: { value: "My answer" } });
+    await finishLoad();
+    const lines = editor().value.split("\n");
+    expect([lines[0], lines[2]]).toEqual(["My introduction", "My answer"]);
+    expect(cards()).toHaveLength(1);
+    expect(editor().selectionStart).toBe(editor().value.length);
+
+    switchTo(plainInfo);
+    await waitFor(() => expect(document.querySelector(".cm-content")).toBeNull());
+    expect(textarea()).toHaveValue("My answer");
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("My introduction");
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("makes no card of a token typed into the textarea while the editor loads", async () => {
+    const props = composerProps();
+    const finishLoad = deferEditorLoad();
+    renderComposer(props);
+    fireEvent.change(textarea(), { target: { value: `pasted ${quoteLine("x", "Forged")}` } });
+    await finishLoad();
+    expect(cards()).toHaveLength(0);
+    expect(editor().value).toBe("pasted ");
+    await waitFor(() => expect(getSessionDraft("conv_cm_quotes")?.text).toBe("pasted "));
+    fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("pasted", undefined);
+  });
+
+  it("keeps the quotes when /side fills in the text", async () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    composerSessionSnapshot.sideChatAllowed = true;
+    const { reply } = await renderEditor(composerProps({ permissionLevel: 4 }));
+    type("Intro");
+    reply("First point");
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+    await waitFor(() => expect(editor().value.endsWith("\n/side ")).toBe(true));
+    expect(editor().value.startsWith("Intro\n")).toBe(true);
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("recalls on ↑ from the top of a recalled reply that opens with a card", async () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "Opening card" }],
+      text: "Answer",
+    };
+    localStorage.setItem(
+      "omnigent:prompt-history:conv_cm_quotes",
+      JSON.stringify(["Older prompt", { text: serializeReplyDraft(replyDraft), replyDraft }]),
+    );
+    await renderEditor();
+    const input = screen.getByLabelText("Message the agent");
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    await waitFor(() => expect(editor().value.endsWith("\nAnswer")).toBe(true));
+    expect(cards()).toHaveLength(1);
+    const top = editor().value.length - "Answer".length;
+    act(() => editor().setSelectionRange(top, top));
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+    await waitFor(() => expect(editor().value).toBe("Older prompt"));
+  });
+
+  it.each([
+    ["under the card", (value: string) => value.length, (spoken: string) => spoken],
+    ["above the card", () => "Intro".length, () => ""],
+  ])("streams dictation into the draft with the caret %s", async (_where, caret, tail) => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    reply("First point");
+    act(() => editor().setSelectionRange(caret(editor().value), caret(editor().value)));
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onInterim!("hel"));
+    act(() => mic.current!.onInterim!("hello wor"));
+    act(() => mic.current!.onTranscript("hello world"));
+    act(() => mic.current!.onInterim!("and"));
+    act(() => mic.current!.onTranscript("and more"));
+    const spoken = "hello world and more";
+    const lines = editor().value.split("\n");
+    expect([lines[0], lines[2]]).toEqual([
+      tail(spoken) ? "Intro" : `Intro ${spoken}`,
+      tail(spoken),
+    ]);
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("discards a take that only dictated, back to the text before it", async () => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    reply("First point");
+    const before = editor().value;
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onInterim!("hello"));
+    act(() => mic.current!.onTranscript("hello there"));
+    expect(editor().value).toBe(`${before}hello there`);
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editor().value).toBe(before);
+    expect(cards()).toHaveLength(1);
+  });
+
+  it.each([
+    ["a Reply", (reply: (text: string) => void) => reply("Added during the take")],
+    ["a typed edit", () => type(" typed")],
+  ])("keeps everything when a take is discarded after %s during it", async (_what, interrupt) => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken"));
+    interrupt(reply);
+    act(() => mic.current!.onTranscript("again"));
+    const kept = editor().value;
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editor().value).toBe(kept);
+  });
+
+  it("changes nothing when a take is cancelled before any words", async () => {
+    const { reply } = await renderEditor();
+    type("Intro");
+    reply("First point");
+    type("tail");
+    act(() => editor().setSelectionRange(2, 2));
+    const value = editor().value;
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onVoiceDiscard!());
+    expect(editor().value).toBe(value);
+    expect(editor().selectionStart).toBe(2);
   });
 });
