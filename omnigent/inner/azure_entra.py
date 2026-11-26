@@ -13,11 +13,14 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 import httpx
+import openai
 
 AZURE_AI_SCOPE = "https://ai.azure.com/.default"
 
 _OPENAI_V1_SUFFIX = "/openai/v1"
-_PROJECT_PATH_RE = re.compile(r"^/api/projects/[^/]+$")
+# Project names exclude "." and "%" so dot segments (raw or percent-encoded)
+# and encoded slashes cannot redirect the token-bearing path.
+_ALLOWED_PATH_RE = re.compile(r"^(?:/api/projects/[A-Za-z0-9_-]+)?(?:/openai/v1)?$")
 _CONTROL_OR_SPACE_RE = re.compile(r"[\x00-\x20\x7f]")
 # Only official Azure OpenAI / Foundry hosts may receive an Entra token:
 # exactly one resource label in front of an allowed service suffix.
@@ -63,15 +66,13 @@ def normalize_azure_endpoint(endpoint: str) -> str:
     if port not in (None, 443):
         raise ValueError("azure_endpoint must use the default HTTPS port.")
     path = parts.path.rstrip("/")
-    if path == "":
-        path = _OPENAI_V1_SUFFIX
-    elif _PROJECT_PATH_RE.match(path):
-        path = f"{path}{_OPENAI_V1_SUFFIX}"
-    elif not path.endswith(_OPENAI_V1_SUFFIX):
+    if not _ALLOWED_PATH_RE.match(path):
         raise ValueError(
             "azure_endpoint must be a resource root, a /api/projects/<name> URL, "
             "or end in /openai/v1."
         )
+    if not path.endswith(_OPENAI_V1_SUFFIX):
+        path = f"{path}{_OPENAI_V1_SUFFIX}"
     return f"https://{hostname}{path}/"
 
 
@@ -95,7 +96,14 @@ class AzureEntraBearerAuth(httpx.Auth):
     async def async_auth_flow(
         self, request: httpx.Request
     ) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        token = await self._token_provider()
+        try:
+            token = await self._token_provider()
+        except Exception as error:
+            # OpenAIError is not retried by the SDK; the Azure SDK already retries.
+            raise openai.OpenAIError(
+                "Azure Entra token acquisition failed; "
+                "check the execution host identity configuration."
+            ) from error
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 
@@ -132,17 +140,19 @@ def build_azure_entra_http_client() -> AzureEntraAsyncClient:
     """Create an http client authenticated with ``DefaultAzureCredential``.
 
     :returns: An :class:`AzureEntraAsyncClient` that owns its credential.
-    :raises ImportError: If ``azure-identity`` is not installed.
+    :raises ImportError: If ``azure-identity`` or ``aiohttp`` is not installed.
     """
     try:
         from azure.core.credentials_async import AsyncTokenCredential
         from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+
+        # Constructing the async credential imports the aiohttp transport.
+        credential = DefaultAzureCredential()
     except ImportError as exc:
         raise ImportError(
-            "Azure Entra authentication requires the 'azure-identity' package. "
-            "Install it with: pip install 'omnigent[azure]'"
+            "Azure Entra authentication requires 'azure-identity' and 'aiohttp'. "
+            "Install them with: pip install 'omnigent[azure]'"
         ) from exc
-    credential = DefaultAzureCredential()
     return AzureEntraAsyncClient(
         credential=credential,
         token_provider=get_bearer_token_provider(

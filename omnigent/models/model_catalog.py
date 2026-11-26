@@ -88,6 +88,7 @@ _logger = logging.getLogger(__name__)
 
 # Sentinel kind for "no usable provider resolved" rows.
 NONE_KIND = "none"
+_AZURE_ENTRA_DETAIL = "Azure Entra deployment (not enumerable)"
 
 # ~5 min: provider listings change rarely; a turn that fans out many
 # dispatches should never re-fetch per call.
@@ -621,7 +622,7 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     """
     # Imported lazily; workflow.py imports broadly and this module is
     # consumed from the runner's dispatch path.
-    from omnigent.runtime.workflow import _resolve_provider_for_build
+    from omnigent.runtime.workflow import _config_flag_is_true, _resolve_provider_for_build
 
     canonical_harness = canonicalize_harness(harness) or harness
     if (canonical_harness or "") in _CURSOR_HARNESSES:
@@ -639,6 +640,11 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
 
     agent_spec = cast("AgentSpec", spec)
+    # The Azure Entra launch ignores providers and auth; its deployments are not enumerable.
+    if harness_type == "openai-agents-sdk" and _config_flag_is_true(
+        agent_spec.executor.config.get("azure_entra")
+    ):
+        return ResolvedModelProvider(kind=NONE_KIND, detail=_AZURE_ENTRA_DETAIL)
     entry = (
         _acp_provider_entry(agent_spec)
         if harness_type == "acp"
@@ -1128,6 +1134,14 @@ def list_models_for_worker(
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
     provider = resolve_model_provider(spec, harness)
+    if provider.kind == NONE_KIND and provider.detail == _AZURE_ENTRA_DETAIL:
+        model = cast("AgentSpec", spec).executor.model
+        return ModelListing(
+            source="static",
+            verified=False,
+            models=(ModelEntry(id=model, family=model_family_token(model)),) if model else (),
+            note="Azure Entra deployment from executor.model; deployments are not enumerated.",
+        )
     if provider.kind == DATABRICKS_KIND:
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:

@@ -371,6 +371,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/5b/db/325c6d7312d2200251c52323878281045aaffcb5586612296484e4280eaa/azure_core-1.41.0-py3-none-any.whl", hash = "sha256:522b4011e8180b1a3dcd2024396a4e7fe9ac37fb8597db47163d230b5efe892d", size = 220920, upload-time = "2026-05-07T23:30:56.357Z" },
 ]
 
+[package.optional-dependencies]
+aio = [
+    { name = "aiohttp" },
+]
+
 [[package]]
 name = "azure-identity"
 version = "1.27.0"
@@ -3420,6 +3425,7 @@ antigravity = [
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" } },
 ]
 azure = [
+    { name = "azure-core", extra = ["aio"] },
     { name = "azure-identity" },
 ]
 bedrock = [
@@ -3584,6 +3590,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.0,<2" },
     { name = "anyio", specifier = ">=4.0,<5" },
     { name = "argon2-cffi", specifier = ">=23.1,<26" },
+    { name = "azure-core", extras = ["aio"], marker = "extra == 'azure'", specifier = ">=1.31,<2" },
     { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.25,<2" },
     { name = "blaxel", marker = "extra == 'blaxel'", specifier = ">=0.4.1,<0.5" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },

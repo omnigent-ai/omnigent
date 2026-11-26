@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+import tomllib
+from pathlib import Path
+
 import httpx
+import openai
 import pytest
 
 from omnigent.inner import azure_entra
@@ -74,12 +79,33 @@ def test_normalize_azure_endpoint_accepts_supported_shapes(endpoint: str, expect
         "https://res.openai.azure.com:8443/openai/v1",
         "https://[::1]/openai/v1",
         "https://[2001:db8::1]:443/",
+        "https://res.openai.azure.com/evil/openai/v1",
+        "https://res.openai.azure.com/api/projects/./openai/v1",
+        "https://res.openai.azure.com/api/projects/../openai/v1",
+        "https://res.openai.azure.com/api/projects/%2e%2e/openai/v1",
+        "https://res.openai.azure.com/api/projects/a%2Fb/openai/v1",
+        "https://res.openai.azure.com/api/projects/p.q",
+        "https://res.openai.azure.com/api/projects/p/extra/openai/v1",
+        "https://res.openai.azure.com/openai/v1/openai/v1",
     ],
 )
 def test_normalize_azure_endpoint_rejects_unsafe_input(endpoint: str) -> None:
     with pytest.raises(ValueError) as excinfo:
         normalize_azure_endpoint(endpoint)
     assert "secret" not in str(excinfo.value)
+
+
+def test_azure_extra_declares_async_transport() -> None:
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    extras = tomllib.loads(pyproject.read_text())["project"]["optional-dependencies"]
+    assert any(dep.startswith("azure-core[aio]") for dep in extras["azure"])
+
+
+def test_missing_async_transport_raises_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("azure.identity.aio")
+    monkeypatch.setitem(sys.modules, "aiohttp", None)
+    with pytest.raises(ImportError, match=r"omnigent\[azure\]"):
+        azure_entra.build_azure_entra_http_client()
 
 
 async def test_client_refreshes_token_per_request_and_closes_credential_once() -> None:
@@ -115,10 +141,39 @@ async def test_failed_credential_sends_no_request() -> None:
         token_provider=failing_provider,
         transport=httpx.MockTransport(lambda request: sent.append(request) or httpx.Response(200)),
     )
-    with pytest.raises(RuntimeError, match="no Azure credential"):
+    with pytest.raises(openai.OpenAIError, match="token acquisition failed") as excinfo:
         await client.get("https://res.openai.azure.com/openai/v1/models")
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert sent == []
     await client.aclose()
+
+
+async def test_token_failure_is_not_retried_by_openai_sdk() -> None:
+    calls = 0
+    sent: list[httpx.Request] = []
+
+    async def failing_provider() -> str:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("no Azure credential available")
+
+    http_client = AzureEntraAsyncClient(
+        credential=_FakeCredential(),
+        token_provider=failing_provider,
+        transport=httpx.MockTransport(lambda request: sent.append(request) or httpx.Response(200)),
+    )
+    client = openai.AsyncOpenAI(
+        api_key="unused",
+        base_url="https://res.openai.azure.com/openai/v1/",
+        http_client=http_client,
+        max_retries=2,
+    )
+    with pytest.raises(openai.OpenAIError, match="token acquisition failed") as excinfo:
+        await client.models.list()
+    assert not isinstance(excinfo.value, openai.APIConnectionError)
+    assert calls == 1
+    assert sent == []
+    await client.close()
 
 
 async def test_cross_origin_redirect_drops_token() -> None:
