@@ -1137,17 +1137,70 @@ describe("undelivered startup messages", () => {
     ],
   };
 
-  it("sit above the startup failure notice, or last when it isn't loaded", () => {
+  it("sit above the startup failure notice, or last, when the server names no earlier items", () => {
     const user: Bubble = { kind: "user", itemId: "user_1", content: [] };
     const notice = errorBubble("startup_input_failed");
     const [undelivered] = buildUndeliveredBubbles([lost], "alice@example.com");
     expect(undelivered).toMatchObject({ undelivered: true, createdBy: "alice@example.com" });
-    expect(placeUndeliveredBubbles([user, notice], [undelivered!])).toEqual([
+    expect(placeUndeliveredBubbles([user, notice], [lost], "alice@example.com")).toEqual([
       user,
       undelivered,
       notice,
     ]);
-    expect(placeUndeliveredBubbles([user], [undelivered!])).toEqual([user, undelivered]);
+    expect(placeUndeliveredBubbles([user], [lost], "alice@example.com")).toEqual([
+      user,
+      undelivered,
+    ]);
+  });
+
+  it("stay where they were sent, above later activity", () => {
+    const first: Bubble = { kind: "user", itemId: "user_1", content: [] };
+    const reply: Bubble = {
+      ...errorBubble(),
+      lifecycle: "completed",
+      items: [
+        { kind: "text", itemId: "reply_text", text: "Read it.", final: true },
+        { kind: "text", itemId: "reply_tail", text: "Done.", final: true },
+      ],
+    };
+    const later: Bubble = { kind: "user", itemId: "user_2", content: [] };
+    const committed = [first, reply, later];
+    const place = (...precedingItemIds: string[][]) =>
+      withUncommittedUserBubbles(
+        committed,
+        [],
+        precedingItemIds.map((ids, index) => ({
+          ...lost,
+          pendingId: `pending_${index}`,
+          precedingItemIds: ids,
+        })),
+        null,
+      ).map((bubble) => (bubble.kind === "assistant" ? bubble.stableId : bubble.itemId));
+
+    // An item that renders no bubble (a resource event) is passed over.
+    expect(place(["resource_event", "user_1"])).toEqual([
+      "user_1",
+      "pending_0",
+      "error_failed",
+      "user_2",
+    ]);
+    expect(place(["reply_text", "user_1"])).toEqual([
+      "user_1",
+      "error_failed",
+      "pending_0",
+      "user_2",
+    ]);
+    // Sent before anything loaded, or before anything at all.
+    expect(place(["older_item"])).toEqual(["pending_0", "user_1", "error_failed", "user_2"]);
+    expect(place([])).toEqual(["pending_0", "user_1", "error_failed", "user_2"]);
+    // A later message whose earlier items don't render stays below the one sent first.
+    expect(place(["user_1"], ["resource_event"])).toEqual([
+      "user_1",
+      "pending_0",
+      "pending_1",
+      "error_failed",
+      "user_2",
+    ]);
   });
 
   it("start a new session carrying the text and the attachments that download", async () => {

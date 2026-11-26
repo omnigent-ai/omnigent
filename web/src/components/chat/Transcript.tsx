@@ -202,8 +202,8 @@ function TranscriptImpl({
   // cache so a streaming append rebuilds only the active bubble, reusing the
   // finalized prefix by reference. Pending user messages (POSTed but not yet
   // acked) render as trailing user bubbles so the input is visible immediately.
-  // Undelivered startup messages replace their pending bubbles, above the
-  // failure notice that explains them.
+  // Undelivered startup messages replace their pending bubbles, where they
+  // were sent.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(

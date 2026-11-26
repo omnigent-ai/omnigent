@@ -19,7 +19,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from starlette.datastructures import Headers
 
-from omnigent.entities.conversation import ErrorData
+from omnigent.entities.conversation import ErrorData, MessageData, NewConversationItem
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
 from omnigent.host.frames import HostHelloFrame
@@ -1090,6 +1090,47 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
+
+
+async def test_undelivered_inputs_name_the_transcript_items_before_them(
+    startup_env: _Env,
+) -> None:
+    """Clients place each undelivered message after the items saved before it, not last."""
+    env = startup_env
+    session_id = await _create(env)
+    startup = env.app.state.startup_inputs
+    [reply] = env.conv_store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_earlier",
+                data=MessageData(
+                    role="assistant",
+                    agent="startup-probe",
+                    content=[{"type": "output_text", "text": "Earlier reply"}],
+                ),
+            )
+        ],
+    )
+    follow_up = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "Second input"}]},
+    }
+    await startup.enqueue(
+        session_id,
+        SessionEventInput.model_validate(follow_up),
+        user_id=None,
+        headers=Headers(),
+        first=False,
+    )
+    await startup.record_launch_failure(session_id, "spend limit reached")
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    # The failure notice comes after both inputs, so neither names it.
+    assert [entry["preceding_item_ids"] for entry in snapshot["failed_inputs"]] == [
+        [],
+        [reply.id],
+    ]
 
 
 async def test_registration_timeout_fences_prompt_before_provider_hint(

@@ -2576,8 +2576,9 @@ class SessionResponse(BaseModel):
     :param failed_inputs: Durable managed-startup inputs that were never
         delivered, e.g. because the sandbox host did not come online. Same
         shape as ``pending_inputs``, in submission order; their file blocks
-        keep ids that still resolve under this session. Empty when nothing
-        failed.
+        keep ids that still resolve under this session. Each also carries
+        ``preceding_item_ids``: up to 20 ids of the transcript items saved
+        just before it, newest first. Empty when nothing failed.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or

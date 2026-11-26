@@ -341,6 +341,7 @@ interface PendingInputWire {
   pending_id: string;
   content: MessageContentBlock[];
   created_by?: string;
+  preceding_item_ids?: string[];
 }
 
 function pendingInputsFromWire(wire: PendingInputWire[] | undefined): PendingInput[] {
@@ -348,6 +349,7 @@ function pendingInputsFromWire(wire: PendingInputWire[] | undefined): PendingInp
     pendingId: p.pending_id,
     content: p.content,
     ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
+    ...(p.preceding_item_ids !== undefined ? { precedingItemIds: p.preceding_item_ids } : {}),
   }));
 }
 

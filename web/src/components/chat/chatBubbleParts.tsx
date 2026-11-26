@@ -351,15 +351,70 @@ function isStartupFailureBubble(bubble: Bubble): boolean {
   );
 }
 
+/** The committed bubble each transcript item renders in. */
+function bubbleIndexByItemId(committed: Bubble[]): Map<string, number> {
+  const indexes = new Map<string, number>();
+  committed.forEach((bubble, index) => {
+    if (bubble.kind !== "assistant") {
+      indexes.set(bubble.itemId, index);
+      return;
+    }
+    for (const item of bubble.items) {
+      if (item.itemId !== null) indexes.set(item.itemId, index);
+    }
+  });
+  return indexes;
+}
+
 /**
- * Place undelivered messages above the startup failure notice that explains
- * them, or at the end of the transcript when that notice isn't loaded.
+ * The committed bubble index an undelivered message goes before: after the bubble
+ * showing the newest item saved before it, or first when none is shown (they're
+ * older than the loaded history, or nothing preceded it). Without those items
+ * (an older server), it goes above the startup failure notice, or last.
  */
-export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble[]): Bubble[] {
-  if (undelivered.length === 0) return committed;
+function undeliveredIndex(
+  input: PendingInput,
+  rendered: Map<string, number>,
+  notice: number,
+  end: number,
+): number {
+  if (input.precedingItemIds === undefined) return notice === -1 ? end : notice;
+  for (const id of input.precedingItemIds) {
+    const bubble = rendered.get(id);
+    if (bubble !== undefined) return bubble + 1;
+  }
+  return 0;
+}
+
+/**
+ * Place undelivered messages where they were sent, in submission order.
+ *
+ * @param committed - Bubbles built from the transcript.
+ * @param failedInputs - The snapshot's undelivered startup messages, in submission order.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function placeUndeliveredBubbles(
+  committed: Bubble[],
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  if (failedInputs.length === 0) return committed;
+  const bubbles = buildUndeliveredBubbles(failedInputs, selfAuthor);
+  const rendered = bubbleIndexByItemId(committed);
   const notice = committed.findIndex(isStartupFailureBubble);
-  if (notice === -1) return [...committed, ...undelivered];
-  return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
+  const placed = new Map<number, Bubble[]>();
+  let previous = 0;
+  for (const [index, input] of failedInputs.entries()) {
+    const at = Math.max(previous, undeliveredIndex(input, rendered, notice, committed.length));
+    previous = at;
+    placed.set(at, [...(placed.get(at) ?? []), bubbles[index]!]);
+  }
+  const result: Bubble[] = [];
+  for (let index = 0; index <= committed.length; index += 1) {
+    result.push(...(placed.get(index) ?? []));
+    if (index < committed.length) result.push(committed[index]!);
+  }
+  return result;
 }
 
 /** Submission order within one second: the optimistic bubble's sequence number from its temp id. */
@@ -391,10 +446,7 @@ export function withUncommittedUserBubbles(
   selfAuthor: string | null,
   failedUploads: PendingUserMessage[] = [],
 ): Bubble[] {
-  const withUndelivered = placeUndeliveredBubbles(
-    committed,
-    buildUndeliveredBubbles(failedInputs, selfAuthor),
-  );
+  const withUndelivered = placeUndeliveredBubbles(committed, failedInputs, selfAuthor);
   // Pending sends keep their own order; each parked upload goes where its send time falls.
   const uncommitted = [...withoutFailedInputs(pendingUserMessages, failedInputs)];
   for (const failed of failedUploads) {
