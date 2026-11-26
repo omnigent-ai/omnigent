@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import get_mock_requests
@@ -71,12 +74,24 @@ def _seed_claude_home(home: Path) -> Path:
     return review.resolve()
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "sdk",
+        pytest.param(
+            "native",
+            marks=pytest.mark.skipif(os.name == "nt", reason="native PTY capture needs POSIX"),
+        ),
+    ],
+)
 def test_pi_gateway_loads_enabled_claude_plugins(
     omnigent_repo_root: Path,
     omnigent_python: Path,
     mock_credentials_env: dict[str, str],
     mock_llm_server_url: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
 ) -> None:
     """Shared-cache skills, commands and a Pi extension load; a disabled plugin does not."""
     model = f"mock-claude-plugins-{uuid.uuid4().hex[:8]}"
@@ -97,15 +112,82 @@ def test_pi_gateway_loads_enabled_claude_plugins(
     env.pop("PI_CODING_AGENT_DIR", None)
     env.pop("CLAUDE_CONFIG_DIR", None)
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
-    command = [
-        str(omnigent_python), "-m", "omnigent", "run", str(yaml_path),
-        "--model", model, "--harness", "pi", "-p", "/dp:review security please",
-        "--no-log", "--no-session",
-    ]  # fmt: skip
-    result = subprocess.run(
-        command, env=env, cwd=fake_home, capture_output=True, text=True, timeout=180
-    )
-    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    if mode == "sdk":
+        command = [
+            str(omnigent_python), "-m", "omnigent", "run", str(yaml_path),
+            "--model", model, "--harness", "pi", "-p", "/dp:review security please",
+            "--no-log", "--no-session",
+        ]  # fmt: skip
+        result = subprocess.run(
+            command, env=env, cwd=fake_home, capture_output=True, text=True, timeout=180
+        )
+        assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    else:
+        import pexpect
+
+        from omnigent.harnesses.pi_native.credentials import (
+            pi_native_provider_launch,
+            resolve_pi_native_provider,
+        )
+        from tests._helpers.terminal_screen import TerminalScreen
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake_home / ".claude"))
+        monkeypatch.setenv("OMNIGENT_FEATURES", "pi_claude_plugins")
+        provider = resolve_pi_native_provider(
+            model=model,
+            config_loader=lambda: yaml.safe_load((config_home / "config.yaml").read_text()),
+        )
+        assert provider is not None
+        launch = pi_native_provider_launch(
+            tmp_path / "native-agent", provider, global_agent_dir=fake_home / ".pi" / "agent"
+        )
+        executable = shutil.which("pi")
+        assert executable is not None
+        with pexpect.spawn(
+            executable,
+            ["--no-session", *launch.args],
+            cwd=str(fake_home),
+            env={**env, "TERM": "xterm-256color", **launch.env},
+            encoding="utf-8",
+            dimensions=(42, 120),
+        ) as child:
+            screen = TerminalScreen(child)
+            screen.wait_for(
+                lambda text: "ctrl+c/ctrl+d" in text, timeout=30, what="the native Pi prompt"
+            )
+            child.send("/skill:")
+            skills = screen.wait_for(
+                lambda text: _SKILL_MARKER in text,
+                timeout=20,
+                what="the shared-cache skill completion",
+            )
+            child.sendcontrol("c")
+            screen.wait_for(
+                lambda text: _SKILL_MARKER not in text,
+                timeout=10,
+                what="the completion menu to close",
+            )
+            child.send("/dp:review security please\r")
+            expanded_command = screen.wait_for(
+                lambda text: "Reviewed." in text and "Review focus: security please" in text,
+                timeout=60,
+                what="the expanded plugin command and mock reply",
+            )
+        print(
+            "PI_SHARED_CACHE_NATIVE_DEMO "
+            + json.dumps(
+                {
+                    "head": subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"], cwd=omnigent_repo_root, text=True
+                    ).strip(),
+                    "pi_version": subprocess.check_output(
+                        [executable, "--version"], text=True
+                    ).strip(),
+                    "provider": "scripted mock OpenAI-compatible provider",
+                    "screens": {"skill-completion": skills, "expanded-command": expanded_command},
+                }
+            )
+        )
 
     requests = get_mock_requests(mock_llm_server_url, key=model)
     assert requests

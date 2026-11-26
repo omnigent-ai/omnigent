@@ -18,6 +18,7 @@ from omnigent.inner.pi_claude_plugins import (
 from omnigent.server.feature_flags import FEATURES_ENV_VAR
 
 _GENERATED = PI_CLAUDE_PLUGIN_RESOURCES_DIR
+_CACHE_LAYOUTS = ("directory", "symlinked_cache")
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -25,13 +26,13 @@ def _write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-@pytest.fixture(params=["directory", "symlinked_cache"])
+@pytest.fixture
 def claude_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> Path:
     """A Claude config dir with the pi_claude_plugins feature enabled."""
     config = tmp_path / "claude"
-    if request.param == "symlinked_cache":
+    if getattr(request, "param", "directory") == "symlinked_cache":
         shared = tmp_path / "shared-cache"
         shared.mkdir()
         (config / "plugins").mkdir(parents=True)
@@ -88,6 +89,7 @@ def test_flag_off_leaves_settings_untouched(
     assert not (managed / _GENERATED).exists()
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 @pytest.mark.parametrize("install_path", ["resolved", "relative"])
 def test_enabled_plugin_skills_and_namespaced_commands(
     claude_dir: Path, tmp_path: Path, install_path: str
@@ -132,6 +134,7 @@ def test_enabled_plugin_skills_and_namespaced_commands(
     assert "allowed-tools" in review
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_only_enabled_plugins_load(
     claude_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -158,6 +161,7 @@ def test_only_enabled_plugins_load(
     assert names == {"on", "managed"}
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
     claude_dir: Path, tmp_path: Path
 ) -> None:
@@ -185,6 +189,7 @@ def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
     [lambda root: {"source": str(root), "skills": []}, lambda root: str(root)],
     ids=["object", "string"],
 )
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_user_package_entry_claims_the_plugin_skills(
     claude_dir: Path, tmp_path: Path, listed
 ) -> None:
@@ -197,6 +202,7 @@ def test_user_package_entry_claims_the_plugin_skills(
     assert result["packages"] == [listed(root)]
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_user_entries_claim_by_exact_resolved_path(claude_dir: Path, tmp_path: Path) -> None:
     """A skill directory, a command file, or a commands directory the user lists is not added."""
     root = _install(
@@ -239,6 +245,7 @@ def test_same_command_from_two_marketplaces_keeps_the_first(
     assert (_prompts(managed) / "dp:go.md").read_text(encoding="utf-8") == "FIRST\n"
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_relaunch_drops_commands_of_removed_plugins(claude_dir: Path, tmp_path: Path) -> None:
     """Each launch regenerates the command dir, so stale prompts do not survive."""
     _install(claude_dir, "dp@market", files={"commands/go.md": "Go\n"})
@@ -252,6 +259,7 @@ def test_relaunch_drops_commands_of_removed_plugins(claude_dir: Path, tmp_path: 
     assert not (managed / _GENERATED).exists()
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_symlinks_are_never_bridged(claude_dir: Path, tmp_path: Path) -> None:
     """Symlinked command files, commands/ roots and skill dirs pointing elsewhere are skipped."""
     secret = tmp_path / "secret.md"
@@ -278,6 +286,7 @@ def test_symlinks_are_never_bridged(claude_dir: Path, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("name", ["bad name", "../escape"])
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_unsafe_plugin_names_are_not_bridged(claude_dir: Path, tmp_path: Path, name: str) -> None:
     """A plugin name becomes a filename, so names with separators or spaces are skipped."""
     _install(claude_dir, f"{name}@market", files={"commands/go.md": "X\n", **_skill("x")})
@@ -405,6 +414,7 @@ def _loop(tmp_path: Path) -> str:
     return str(loop_a)
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path: Path) -> None:
     """The ``omnigent pi`` terminal launch seeds the same managed settings as the gateway."""
     root = _install(claude_dir, "dp@market", files=_skill("review"))
@@ -532,7 +542,16 @@ _UNUSABLE_KINDS = ("fifo", "symlink", "oversize", "directory")
 
 @pytest.mark.timeout(20)
 @pytest.mark.parametrize("kind", _UNUSABLE_KINDS)
-@pytest.mark.parametrize("consumer", ["package", "installed", "command", "skill"])
+@pytest.mark.parametrize(
+    ("consumer", "claude_dir"),
+    [
+        (consumer, layout)
+        for consumer in ("package", "installed", "command", "skill")
+        for layout in _CACHE_LAYOUTS
+        if layout == "directory" or consumer != "installed"
+    ],
+    indirect=["claude_dir"],
+)
 def test_unusable_metadata_is_skipped_without_blocking(
     consumer: str,
     kind: str,
@@ -604,6 +623,7 @@ def test_fifo_settings_file_skips_the_whole_bridge(claude_dir: Path, tmp_path: P
     assert add_claude_plugin_resources({}, tmp_path / "managed") == {}
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_project_scoped_installs_are_not_loaded(claude_dir: Path, tmp_path: Path) -> None:
     """Only a trusted user install loads; unusable entries do not hide a later valid one."""
     user = _install(claude_dir, "dp@market", files=_skill("user"))
