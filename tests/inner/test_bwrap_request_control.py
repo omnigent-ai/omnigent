@@ -592,6 +592,24 @@ def test_result_parser_enforces_canonical_exit_code_boundaries(
 
 
 @pytest.mark.parametrize(
+    "failure",
+    [None, ProcessLookupError("ended"), PermissionError("lost authority")],
+    ids=["live", "already-exited", "lost-authority"],
+)
+def test_pinned_signaling_keeps_the_descriptor_and_reports_lost_authority(
+    monkeypatch: pytest.MonkeyPatch, failure: OSError | None
+) -> None:
+    send = MagicMock(side_effect=failure)
+    monkeypatch.setattr(request_control.signal, "pidfd_send_signal", send)
+    if isinstance(failure, PermissionError):
+        with pytest.raises(PermissionError, match="lost authority"):
+            request_control._kill_pinned(_INIT_FD)
+    else:
+        request_control._kill_pinned(_INIT_FD)
+    send.assert_called_once_with(_INIT_FD, request_control.signal.SIGKILL)
+
+
+@pytest.mark.parametrize(
     ("flags", "expected"),
     [(None, False), ("POLLIN", True), ("POLLHUP", True), ("POLLNVAL", None)],
 )
