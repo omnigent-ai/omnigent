@@ -229,6 +229,7 @@ def test_a_malformed_lifecycle_change_is_refused_before_github_is_asked(
         change(value)
 
     assert fake.gh_calls == []
+    assert fake.tokens == []
 
 
 def test_a_lifecycle_change_of_a_pull_request_github_cant_load_is_refused(
@@ -374,6 +375,7 @@ def test_a_malformed_auto_merge_batch_is_refused_with_nothing_sent(
         _auto_merge(*items)
 
     assert fake.mutations == []
+    assert fake.tokens == []
 
 
 def test_auto_merge_naming_another_providers_pull_request_sends_none(fake: FakeGitHub) -> None:
