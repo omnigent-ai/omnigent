@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
+from omnigent.claude_paths import claude_account_home_dir, claude_joined_path
 from omnigent.onboarding import codex_auth_readiness
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
@@ -569,22 +570,6 @@ def read_claude_managed_settings(
         if isinstance(payload, dict):
             return payload
     return None
-
-
-def claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
-    """Join a Claude config path lexically before filesystem symlinks are followed."""
-    joined = os.path.normpath(os.path.join(directory, name))
-    return Path(joined) if os.path.isabs(joined) else cwd / joined
-
-
-def claude_account_home_dir() -> Path:
-    """Resolve the account home Claude uses when its launch environment has no HOME."""
-    try:
-        import pwd  # noqa: FlagLocalImports - POSIX-only module
-
-        return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError):
-        return Path.home()
 
 
 def claude_user_settings_path(

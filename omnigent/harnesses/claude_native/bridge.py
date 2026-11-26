@@ -71,6 +71,8 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.claude_paths import claude_account_home_dir as _account_home_dir
+from omnigent.claude_paths import claude_joined_path as _claude_joined_path
 from omnigent.harnesses.claude_native import (
     PEER_MESSAGE_WAKE_KIND,
     PEER_MESSAGE_WAKE_TEXT,
@@ -98,8 +100,6 @@ from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
-from omnigent.onboarding.ambient import claude_account_home_dir as _account_home_dir
-from omnigent.onboarding.ambient import claude_joined_path as _claude_joined_path
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
 
