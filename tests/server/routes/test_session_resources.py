@@ -4804,6 +4804,7 @@ _FAMILY_OTHER_HOST_ID = "e8a1d4c7b2f5469e93c0a7b6d5e4f3a2"
 _FAMILY_ROOT_WORKSPACE_ID = "5a6b7c8d9e0f41a2b3c4d5e6f7a8b9c0"
 _FAMILY_SAME_ROOT_ID = "0d1e2f3a4b5c46d7e8f9a0b1c2d3e4f5"
 _FAMILY_ENCLOSING_ID = "f6e5d4c3b2a1409f8e7d6c5b4a392817"
+_FAMILY_INHERITED_HOST_ID = "1b2c3d4e5f6a47b8c9d0e1f2a3b4c5d6"
 
 
 class _FamilyConversationStore(_ConversationStore):
@@ -4860,6 +4861,19 @@ class _FamilyConversationStore(_ConversationStore):
                 host_id=local_host_id if host_id == "host-main" else host_id,
             )
 
+        # A sub-agent with no host binding of its own runs on its parent worker's host.
+        self._conversations[_FAMILY_INHERITED_HOST_ID] = Conversation(
+            id=_FAMILY_INHERITED_HOST_ID,
+            created_at=1,
+            updated_at=1,
+            root_conversation_id=_FAMILY_WORKER_ID,
+            kind="sub_agent",
+            parent_conversation_id=_FAMILY_WORKER_ID,
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            family_id=_FAMILY_SOURCE_ID,
+            workspace="/workspace/project-worktrees/inherited",
+        )
+
     def get_session_family(self, session_id: str) -> list[Conversation]:
         """
         Return the session's family members, or just the session when it has none.
@@ -4902,6 +4916,7 @@ async def family_client(runner_globals_reset: None) -> AsyncIterator[httpx.Async
             "shot.png",
         ),
         ("/workspace/project/notes/shot.png", _FAMILY_ENCLOSING_ID, "notes/shot.png"),
+        ("/workspace/project-worktrees/inherited/shot.png", _FAMILY_INHERITED_HOST_ID, "shot.png"),
     ],
 )
 async def test_filesystem_family_scope_reads_the_member_workspace(
@@ -4986,6 +5001,25 @@ async def test_filesystem_family_scope_rejects_reads_outside_member_workspaces(
     )
 
     assert response.status_code == status, response.text
+    assert fake_runner.calls == []
+    assert "X-Omnigent-File-Scope" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_filesystem_family_scope_reads_only_the_primary_environment(
+    family_client: httpx.AsyncClient,
+) -> None:
+    """Recorded workspaces root the primary environment, not a terminal's."""
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    response = await family_client.get(
+        f"/v1/sessions/{_FAMILY_SOURCE_ID}/resources/environments/terminal_runner_s1"
+        "/filesystem/workspace/project-worktrees/worker/shot.png",
+        params={"scope": "family", "base": "host"},
+    )
+
+    assert response.status_code == 400, response.text
     assert fake_runner.calls == []
     assert "X-Omnigent-File-Scope" not in response.headers
 

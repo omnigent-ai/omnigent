@@ -37,7 +37,10 @@ from omnigent.entities import (
     Conversation,
     StoredFile,
 )
-from omnigent.entities.session_resources import session_resource_view_to_dict
+from omnigent.entities.session_resources import (
+    DEFAULT_ENVIRONMENT_ID,
+    session_resource_view_to_dict,
+)
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.host.frames import PullRequestVouch
 from omnigent.host.workspace_tokens import mint_token
@@ -3514,7 +3517,14 @@ def register_resources_routes(
         if family_scope:
             # ``base=host`` with the path's leading slash dropped, as the client sends
             # it; checked before browse normalization collapses extra leading slashes.
-            if not absolute or download or requested_path.startswith("/"):
+            # Matching uses recorded workspaces, which root the primary environment;
+            # a terminal environment may be rooted elsewhere.
+            if (
+                not absolute
+                or download
+                or requested_path.startswith("/")
+                or environment_id != DEFAULT_ENVIRONMENT_ID
+            ):
                 raise HTTPException(
                     status_code=400, detail="Family scope reads an absolute file path"
                 )
