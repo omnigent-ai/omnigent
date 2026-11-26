@@ -173,27 +173,15 @@ def test_pi_gateway_loads_enabled_claude_plugins(
                 timeout=60,
                 what="the expanded plugin command and mock reply",
             )
-        evidence: dict[str, object] = {
-            "head": None,
-            "pi_version": None,
-            "provider": "scripted mock OpenAI-compatible provider",
-            "screens": {"skill-completion": skills, "expanded-command": expanded_command},
-        }
-        for label, diagnostic in {
-            "head": ["git", "rev-parse", "HEAD"],
-            "pi_version": [executable, "--version"],
-        }.items():
-            try:
-                evidence[label] = subprocess.check_output(
-                    diagnostic,
-                    cwd=omnigent_repo_root,
-                    text=True,
-                    timeout=10,
-                    stderr=subprocess.PIPE,
-                ).strip()
-            except (OSError, subprocess.SubprocessError) as exc:
-                evidence[label + "_error"] = type(exc).__name__
-        print("PI_SHARED_CACHE_NATIVE_DEMO " + json.dumps(evidence))
+        print(
+            "PI_SHARED_CACHE_NATIVE_DEMO "
+            + json.dumps(
+                {
+                    "provider": "scripted mock OpenAI-compatible provider",
+                    "screens": {"skill-completion": skills, "expanded-command": expanded_command},
+                }
+            )
+        )
 
     requests = get_mock_requests(mock_llm_server_url, key=model)
     assert requests

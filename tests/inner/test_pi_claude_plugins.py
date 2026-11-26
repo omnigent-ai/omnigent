@@ -185,16 +185,20 @@ def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
 
 
 @pytest.mark.parametrize(
-    "listed",
-    [lambda root: {"source": str(root), "skills": []}, lambda root: str(root)],
-    ids=["object", "string"],
+    ("listed", "claude_dir"),
+    [
+        pytest.param(lambda root: {"source": str(root), "skills": []}, "directory", id="object"),
+        pytest.param(str, "directory", id="string"),
+        pytest.param(str, "symlinked_cache", id="cache-alias"),
+    ],
+    indirect=["claude_dir"],
 )
-@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_user_package_entry_claims_the_plugin_skills(
     claude_dir: Path, tmp_path: Path, listed
 ) -> None:
     """A package the user lists for a plugin brings its skills, so they are not added again."""
-    root = _install(claude_dir, "dp@market", files=_skill("review"))
+    _install(claude_dir, "dp@market", files=_skill("review"))
+    root = claude_dir / "plugins" / "cache" / "market" / "dp" / "1.0.0"
 
     result = add_claude_plugin_resources({"packages": [listed(root)]}, tmp_path / "managed")
 
@@ -205,11 +209,12 @@ def test_user_package_entry_claims_the_plugin_skills(
 @pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_user_entries_claim_by_exact_resolved_path(claude_dir: Path, tmp_path: Path) -> None:
     """A skill directory, a command file, or a commands directory the user lists is not added."""
-    root = _install(
+    _install(
         claude_dir,
         "dp@market",
         files={**_skill("review"), "commands/go.md": "GO\n", "commands/keep.md": "KEEP\n"},
     )
+    root = claude_dir / "plugins" / "cache" / "market" / "dp" / "1.0.0"
     managed = tmp_path / "managed"
     settings = {
         "skills": [str(root / "skills" / "review")],
