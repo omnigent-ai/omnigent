@@ -187,6 +187,10 @@ loopback IP, such as a local TLS tunnel. Authenticated URLs cannot contain
 embedded credentials, a query, or a fragment. A TLS-terminating proxy's
 unencrypted upstream connection must stay on a trusted network.
 
+Keep uvicorn's log level at `info` or higher on authenticated workers. Its
+WebSocket server debug logs include raw handshake headers, including the bearer
+token. The main server's remote client disables this header-level debug output.
+
 `RemoteDictationEngine` registers by name like every other engine (no changes
 to the route, protocol, or selection logic). `_RemoteStream` bridges the
 worker's async push events into the synchronous handle interface via a daemon
