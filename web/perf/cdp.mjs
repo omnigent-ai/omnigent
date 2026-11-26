@@ -107,6 +107,8 @@ export function cdpConnect(wsUrl) {
   });
 
   function send(method, params = {}, sessionId) {
+    if (ws.readyState !== WebSocket.OPEN)
+      return Promise.reject(new Error(`CDP socket not open: ${method}`));
     const id = nextId++;
     const envelope = { id, method, params };
     const sid = sessionId ?? defaultSession;
@@ -133,7 +135,12 @@ export function cdpConnect(wsUrl) {
       clearTimeout(timer);
       origReject(e);
     })(pendingEntry.reject);
-    ws.send(JSON.stringify(envelope));
+    try {
+      ws.send(JSON.stringify(envelope));
+    } catch (error) {
+      pending.delete(id);
+      pendingEntry.reject(error);
+    }
     return p;
   }
 
@@ -160,7 +167,7 @@ export function cdpConnect(wsUrl) {
 export async function waitHttp(url, timeoutMs = 15000, start = Date.now()) {
   try {
     const res = await globalThis.fetch(url);
-    if (res.ok) return res.json();
+    if (res.ok) return await res.json();
   } catch {
     // The local server may still be starting.
   }

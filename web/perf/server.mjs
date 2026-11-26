@@ -6,6 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
+import { WorkspaceService } from "../src/gen/omnigent/api/workspace/v1alpha1/workspace_pb.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -27,7 +29,7 @@ fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
 const logStream = fs.createWriteStream(LOG_PATH, { flags: "a" });
 
 // ── Fixtures ─────────────────────────────────────────────────
-const FIX = path.join(here, "fixtures");
+const FIX = path.resolve(argOf("--fixtures", path.join(here, "fixtures")));
 function readJson(name) {
   return JSON.parse(fs.readFileSync(path.join(FIX, name), "utf8"));
 }
@@ -78,8 +80,8 @@ function readBody(req) {
   return new Promise((resolve) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", () => resolve(""));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", () => resolve(Buffer.alloc(0)));
   });
 }
 
@@ -251,21 +253,21 @@ function sessionSnapshot(s) {
 
 // items page: `order=desc` returns newest-first; `after` = oldest already-loaded id.
 function sliceItems(items, url) {
-  const limit = Math.min(Number(url.searchParams.get("limit") ?? 100), 500);
+  const requested = Number(url.searchParams.get("limit") ?? 100);
+  const limit = Number.isFinite(requested)
+    ? Math.max(1, Math.min(Math.floor(requested), 500))
+    : 100;
   const order = url.searchParams.get("order") ?? "desc";
   const after = url.searchParams.get("after");
   let list = items;
   if (after) {
     const idx = list.findIndex((it) => it.id === after);
-    if (idx >= 0) list = order === "desc" ? list.slice(0, idx) : list.slice(idx + 1);
+    if (idx < 0) list = [];
+    else list = order === "desc" ? list.slice(0, idx) : list.slice(idx + 1);
   }
   const ascending = order === "asc";
   const window = ascending ? list.slice(0, limit) : list.slice(-limit).reverse();
-  const hasMore = after
-    ? ascending
-      ? list.length > limit
-      : list.length > limit
-    : items.length > limit;
+  const hasMore = list.length > limit;
   return {
     object: "list",
     data: window,
@@ -280,46 +282,52 @@ function sliceItems(items, url) {
 //   request/response bodies are protojson (camelCase).
 // Server-stream methods (ReadFile, SearchText): Connect streaming envelope —
 //   each message: 1 flag byte (0 = data) + 4-byte BE length + JSON message.
-function connectEnvelope(obj) {
-  const payload = Buffer.from(JSON.stringify(obj));
+function connectEnvelope(payload, flags = 0) {
   const head = Buffer.alloc(5);
-  head.writeUInt8(0, 0);
+  head.writeUInt8(flags, 0);
   head.writeUInt32BE(payload.length, 1);
   return Buffer.concat([head, payload]);
 }
 
-function parseConnectRequest(body) {
-  // Unary Connect-JSON requests carry a plain JSON object; streaming requests
-  // carry envelopes. The harness only needs unary requests plus streamed reads.
-  if (!body) return {};
-  if (body[0] === 0 && body.length > 5) {
-    const len = body.readUInt32BE(1);
-    try {
-      return JSON.parse(body.subarray(5, 5 + len).toString("utf8"));
-    } catch {
-      return {};
-    }
-  }
+function workspaceMethod(res, method, body, contentType) {
+  const descriptor = WorkspaceService.method[method[0].toLowerCase() + method.slice(1)];
+  if (!descriptor) return sendJson(res, 404, { code: "unimplemented" });
+  const binary = contentType.includes("proto");
+  const framed = contentType.startsWith("application/connect+");
+  if (framed && (body.length < 5 || body.readUInt32BE(1) !== body.length - 5))
+    return sendJson(res, 400, { code: "invalid_argument" });
+  const payload = framed ? body.subarray(5) : body;
+  let req;
   try {
-    return JSON.parse(body.toString("utf8"));
+    req = binary
+      ? fromBinary(descriptor.input, payload)
+      : JSON.parse(payload.toString("utf8") || "{}");
   } catch {
-    return {};
+    return sendJson(res, 400, { code: "invalid_argument" });
   }
-}
-
-function workspaceMethod(res, method, body) {
-  const req = parseConnectRequest(body);
+  const encode = (obj) =>
+    binary
+      ? Buffer.from(
+          toBinary(
+            descriptor.output,
+            fromJson(descriptor.output, obj, { ignoreUnknownFields: true }),
+          ),
+        )
+      : Buffer.from(JSON.stringify(obj));
   const json = (obj) => {
-    const buf = Buffer.from(JSON.stringify(obj));
-    res.writeHead(200, { "content-type": "application/json", "content-length": buf.length });
+    const buf = encode(obj);
+    res.writeHead(200, {
+      "content-type": binary ? "application/proto" : "application/json",
+      "content-length": buf.length,
+    });
     res.end(buf);
   };
   const stream = (objs) => {
-    const chunks = objs.map(connectEnvelope);
-    const end = connectEnvelope({}); // end-of-stream marker carries no trailers
+    const chunks = objs.map((obj) => connectEnvelope(encode(obj)));
+    const end = connectEnvelope(Buffer.from("{}"), 2);
     const buf = Buffer.concat([...chunks, end]);
     res.writeHead(200, {
-      "content-type": "application/connect+json",
+      "content-type": binary ? "application/connect+proto" : "application/connect+json",
       "content-length": buf.length,
     });
     res.end(buf);
@@ -327,7 +335,12 @@ function workspaceMethod(res, method, body) {
   switch (method) {
     case "GetCapabilities":
       json({
-        features: [
+        capabilities: [
+          "GetCapabilities",
+          "ListDirectory",
+          "ReadFile",
+          "StatPath",
+          "SearchFiles",
           "git",
           "list_directory.collapse_single_child_directories",
           "search_files.fuzzy",
@@ -379,17 +392,11 @@ function workspaceMethod(res, method, body) {
       stream([
         {
           metadata: {
-            path: req.path ?? "",
-            size: String(content.length),
-            modify_time: { seconds: String(NOW) },
+            size: String(Buffer.byteLength(content)),
+            encoding: "CONTENT_ENCODING_UTF8",
           },
         },
-        {
-          chunk: {
-            data: Buffer.from(content, "utf8").toString("base64"),
-            encoding: "CONTENT_ENCODING_UNSPECIFIED",
-          },
-        },
+        { data: Buffer.from(content, "utf8").toString("base64") },
       ]);
       return;
     }
@@ -482,6 +489,15 @@ function injectStreamTurn(sessionId, opts) {
   if (!set || set.size === 0) return { ok: false, error: "no open stream" };
   const durationMs = opts.durationMs ?? 10000;
   const eventsPerSec = opts.eventsPerSec ?? 20;
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs <= 0 ||
+    !Number.isFinite(eventsPerSec) ||
+    eventsPerSec <= 0 ||
+    Math.round((durationMs / 1000) * eventsPerSec) < 1
+  ) {
+    return { ok: false, error: "invalid stream duration or event rate", invalid: true };
+  }
   const words =
     "queue widget handler pipeline snapshot parser session payload buffer ticker renderer".split(
       " ",
@@ -508,6 +524,31 @@ function injectStreamTurn(sessionId, opts) {
   const textEnd = Math.floor(total * 0.55);
   const toolEnd = Math.floor(total * 0.85);
   let i = 0;
+  let finished = false;
+  const finish = () => {
+    if (finished) return i;
+    finished = true;
+    clearInterval(iv);
+    for (const res of set) {
+      sseWrite(res, "response.output_item.done", {
+        item: {
+          id: `itm_stream_${responseId}`,
+          type: "message",
+          response_id: responseId,
+          status: "completed",
+          role: "assistant",
+          content: [
+            { type: "output_text", text: `Streamed ${i} events for the perf streaming scenario.` },
+          ],
+        },
+      });
+      sseWrite(res, "response.completed", {
+        response: { id: responseId, status: "completed", model: "example-model" },
+      });
+    }
+    setTimeout(() => activeTurns.delete(token), 60000).unref();
+    return i;
+  };
   const iv = setInterval(() => {
     const n = i++;
     for (const res of set) {
@@ -555,32 +596,9 @@ function injectStreamTurn(sessionId, opts) {
         });
       }
     }
-    if (n >= total) {
-      for (const res of set) {
-        sseWrite(res, "response.output_item.done", {
-          item: {
-            id: `itm_stream_${responseId}`,
-            type: "message",
-            response_id: responseId,
-            status: "completed",
-            role: "assistant",
-            content: [
-              {
-                type: "output_text",
-                text: `Streamed ${total} deltas for the perf streaming scenario.`,
-              },
-            ],
-          },
-        });
-        sseWrite(res, "response.completed", {
-          response: { id: responseId, status: "completed", model: "example-model" },
-        });
-      }
-      clearInterval(iv);
-      activeTurns.delete(token);
-    }
+    if (i >= total) finish();
   }, 1000 / eventsPerSec);
-  activeTurns.set(token, { stop: () => clearInterval(iv) });
+  activeTurns.set(token, { stop: finish });
   return { ok: true, token, total_events: total };
 }
 
@@ -648,34 +666,45 @@ const server = http.createServer(async (req, res) => {
             [...sseStreams].map(([id, streams]) => [id, streams.size]),
           ),
         });
+      if (p === "/__perf__/fixture-counts") {
+        const counts = {};
+        for (const [id, items] of itemsBySession) {
+          if (!/^conv_perf_[abcde]$/.test(id)) continue;
+          const window = items.slice(-100);
+          counts[id] = {
+            toolCards: window.filter((item) => item.type === "function_call").length,
+            reasoningBlocks: window.filter((item) => item.type === "reasoning").length,
+            codeBlocks: window
+              .filter((item) => item.type === "message" && item.role === "assistant")
+              .flatMap((item) => item.content ?? [])
+              .reduce((total, block) => total + (block.text?.match(/```/g)?.length ?? 0) / 2, 0),
+          };
+        }
+        return sendJson(res, 200, counts);
+      }
       if (p === "/__perf__/reset") {
         counters.requests = 0;
         counters.unmatched = 0;
         return sendJson(res, 200, { ok: true });
       }
       if (p === "/__perf__/stream/start" && req.method === "POST") {
-        const body = await readBody(req);
-        let opts = {};
-        try {
-          opts = JSON.parse(body || "{}");
-        } catch {
-          opts = {};
-        }
+        const body = (await readBody(req)).toString("utf8");
+        const opts = JSON.parse(body || "{}");
         const out = injectStreamTurn(opts.session ?? "conv_perf_a", {
           durationMs: opts.duration_ms,
           eventsPerSec: opts.events_per_sec,
-          deltaChars: opts.delta_chars,
         });
+        if (out.invalid) return sendJson(res, 400, out);
         return sendJson(res, out.ok ? 200 : 409, out);
       }
       if (p === "/__perf__/stream/stop" && req.method === "POST") {
-        const body = await readBody(req);
+        const body = (await readBody(req)).toString("utf8");
         const { token } = JSON.parse(body || "{}");
         const turn = activeTurns.get(token);
         if (turn) {
-          turn.stop();
+          const emitted = turn.stop();
           activeTurns.delete(token);
-          return sendJson(res, 200, { ok: true });
+          return sendJson(res, 200, { ok: true, emitted });
         }
         return sendJson(res, 404, { ok: false });
       }
@@ -683,7 +712,7 @@ const server = http.createServer(async (req, res) => {
       // stream (the same event a runner sends), so the workspace viewer opens
       // through the app's own handler.
       if (p === "/__perf__/openfile" && req.method === "POST") {
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
         const set = sseStreams.get(body.session);
         if (!set || set.size === 0)
           return sendJson(res, 409, { ok: false, error: "no open stream" });
@@ -776,7 +805,7 @@ const server = http.createServer(async (req, res) => {
       const ws = sub.match(/^\/workspace\/([^/]+)\/([^/]+)$/);
       if (ws) {
         const body = await readBody(req);
-        return workspaceMethod(res, ws[2], Buffer.from(body, "utf8"));
+        return workspaceMethod(res, ws[2], body, req.headers["content-type"] ?? "");
       }
 
       if (sub === "" && req.method === "GET") {
@@ -957,9 +986,11 @@ const server = http.createServer(async (req, res) => {
       error: { code: "not_found", message: `mock: no handler for ${p}` },
     });
   } catch (err) {
+    if (err instanceof SyntaxError)
+      return sendJson(res, 400, { error: { code: "invalid_json", message: "Invalid JSON body" } });
     counters.unmatched++;
     logUnmatched(`ERROR ${req.method}`, `${req.url} ${err?.stack ?? err}`);
-    return sendJson(res, 500, { error: { code: "internal", message: String(err) } });
+    return sendJson(res, 500, { error: { code: "internal", message: "Mock request failed" } });
   }
 });
 

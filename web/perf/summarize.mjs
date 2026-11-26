@@ -255,11 +255,6 @@ if (merged.scenarios.deepHistory) {
   const d = merged.scenarios.deepHistory;
   summary.deepHistory = {
     load: d.load,
-    switchBackPainted: stats((d.switchBack ?? []).map((x) => x.clickToPaintedMs)),
-    switchBackSettled: stats((d.switchBack ?? []).map((x) => x.clickToSettledMs)),
-    switchBackCommits: stats((d.switchBack ?? []).map((x) => x.commits)),
-    switchBackDom: stats((d.switchBack ?? []).map((x) => x.domNodes)),
-    switchBackScriptMs: stats((d.switchBack ?? []).map((x) => (x.cdp?.ScriptDuration ?? 0) * 1000)),
     idleDeep: d.idleDeep,
     streamStats: Object.fromEntries(
       [

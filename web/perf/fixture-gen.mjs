@@ -4,11 +4,16 @@
 //
 // Seeded content uses generic examples; timestamps are relative to generation.
 
-import { mkdirSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const OUT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
+const outIndex = process.argv.indexOf("--out");
+const OUT_DIR =
+  outIndex < 0
+    ? path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures")
+    : path.resolve(process.argv[outIndex + 1]);
+if (outIndex >= 0 && existsSync(OUT_DIR)) throw new Error("--out must name a new directory");
 
 // ── Seeded PRNG ──────────────────────────────────────────────
 function mulberry32(seed) {
@@ -234,7 +239,8 @@ function bigOutput(rng) {
   const lines = [];
   if (kind === 0) {
     // JSON dump
-    for (let i = 0; i < rng.int(60, 160); i++) {
+    const count = rng.int(60, 160);
+    for (let i = 0; i < count; i++) {
       lines.push(
         `{"id":"row_${i.toString().padStart(4, "0")}","name":"${rng.pick(WORDS)}_${i}","size":${rng.int(1, 9999)},"ok":${rng.chance(0.9)}}`,
       );
@@ -243,7 +249,8 @@ function bigOutput(rng) {
   }
   if (kind === 1) {
     // Log stream
-    for (let i = 0; i < rng.int(80, 220); i++) {
+    const count = rng.int(80, 220);
+    for (let i = 0; i < count; i++) {
       lines.push(
         `${String(rng.int(0, 23)).padStart(2, "0")}:${String(rng.int(0, 59)).padStart(2, "0")}:${String(rng.int(0, 59)).padStart(2, "0")} ${rng.pick(["INFO", "DEBUG", "WARN"])} ${rng.pick(WORDS)}.${rng.pick(WORDS)} step=${i} status=${rng.pick(["ok", "retry", "skip"])}`,
       );
@@ -252,7 +259,8 @@ function bigOutput(rng) {
   }
   // Stack trace
   lines.push(`Traceback (most recent call last):`);
-  for (let i = 0; i < rng.int(10, 24); i++) {
+  const count = rng.int(10, 24);
+  for (let i = 0; i < count; i++) {
     lines.push(
       `  File "/home/dev/example-project/src/${rng.pick(WORDS)}/mod_${i}.py", line ${rng.int(1, 900)}, in ${rng.pick(WORDS)}`,
     );
@@ -265,7 +273,7 @@ function bigOutput(rng) {
 
 const TOOL_NAMES = ["read_file", "list_directory", "run_command", "search_codebase", "edit_file"];
 
-function toolCall(rng, sessionId, seq) {
+function toolCall(rng, sessionId, seq, responseId, createdAt) {
   const name = rng.pick(TOOL_NAMES);
   const args = {
     read_file: { path: `src/${rng.pick(WORDS)}/mod_${seq}.ts`, start_line: 1, end_line: 240 },
@@ -281,12 +289,12 @@ function toolCall(rng, sessionId, seq) {
   return {
     id: `itm_${sessionId}_${String(seq).padStart(5, "0")}`,
     type: "function_call",
-    response_id: "",
+    response_id: responseId,
     status: "completed",
     name,
     arguments: JSON.stringify(args),
     call_id: `call_${sessionId}_${seq}`,
-    created_at: 0,
+    created_at: createdAt,
   };
 }
 
@@ -368,7 +376,7 @@ function genSession(spec, seedBase) {
 
     // 5. tool call + output
     if (rng.chance(0.6)) {
-      const call = toolCall(rng, spec.key, ++seq);
+      const call = toolCall(rng, spec.key, ++seq, rid, clock);
       items.push(call);
       const outputBig = rng.chance(spec.big_tool_share);
       items.push({

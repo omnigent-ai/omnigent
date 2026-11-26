@@ -30,6 +30,10 @@ server and benchmark, or an output file for the summarizer. Default output is
 under `web/perf/out/`. The benchmark launches its own headless browser on CDP
 port 9336; select a different port with `--cdp-port` if needed. The server binds
 only to loopback. Run measurements serially on an otherwise quiet machine.
+Before timing, a separate browser opens each hydrated window, expands work
+folds and compares rendered tool cards, code blocks and reasoning blocks to
+fixture counts. A mismatch aborts the run and is recorded in `fixture-check-a.json`
+(and `fixture-check-b.json` for A/B).
 
 Scenarios are `switch` (retained-live rotation and reload-then-switch),
 `switchEvicting` (five-session rotation, HTTP/1.1 cap = three live),

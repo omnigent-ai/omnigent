@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { SourceMap, createRequire } from "node:module";
 import { cdpConnect, ensurePortFree, findChrome, forEachSequential, waitHttp } from "./cdp.mjs";
+import { analyzeTrace } from "./trace-analysis.mjs";
 
 const require = createRequire(import.meta.url);
 const { execFileSync } = require("node:child_process");
@@ -141,7 +142,9 @@ function sourcemapFor(url) {
     if (!fs.existsSync(file)) {
       fs.writeFileSync(
         file,
-        execFileSync("curl", ["-s", "--max-time", "15", mapUrl], { maxBuffer: 1024 * 1024 * 1024 }),
+        execFileSync("curl", ["-fsS", "--max-time", "15", mapUrl], {
+          maxBuffer: 1024 * 1024 * 1024,
+        }),
       );
     }
     const payload = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -198,93 +201,6 @@ function bottomUp(profile) {
   return { totalMs: Math.round(total / 100) / 10, rows };
 }
 
-// Per-switch phase split from the pf:* marks inside a collected trace.
-function analyzeTrace(traceEvents) {
-  const marks = traceEvents
-    .filter((e) => (e.cat ?? "").includes("blink.user_timing") && e.name?.startsWith("pf:"))
-    .sort((a, b) => a.ts - b.ts);
-  const clicks = marks.filter((m) => m.name === "pf:click");
-  const out = [];
-  for (let ci = 0; ci < clicks.length; ci++) {
-    const clickTs = clicks[ci].ts;
-    const nextClick = ci + 1 < clicks.length ? clicks[ci + 1].ts : Infinity;
-    const inWin = marks.filter((m) => m.ts > clickTs && m.ts < nextClick);
-    const painted = inWin.find((m) => m.name === "pf:painted");
-    const settled = inWin.find((m) => m.name === "pf:settled");
-    if (!painted) continue;
-    const paintedTs = painted.ts;
-    const settleTs = settled?.ts ?? paintedTs;
-    const phases = { prePaint: 0, postPaint: 0 };
-    const fnPre = new Map();
-    const fnPost = new Map();
-    const catsPre = {};
-    const catsPost = {};
-    let frames = 0;
-    for (const e of traceEvents) {
-      if (e.pid !== clicks[ci].pid) continue;
-      const dur = e.dur ?? 0;
-      const end = e.ts + dur;
-      if (
-        (e.name === "DrawFrame" || e.name === "Paint" || e.name === "PrePaint") &&
-        e.ts >= clickTs &&
-        e.ts < paintedTs
-      )
-        frames++;
-      if (dur <= 0) continue;
-      if (e.ts < clickTs || e.ts >= Math.min(nextClick, Math.max(settleTs, paintedTs) + 500))
-        continue;
-      const isPre = end <= paintedTs || e.ts < paintedTs;
-      const phase = isPre ? "prePaint" : "postPaint";
-      phases[phase] += dur;
-      if (["FunctionCall", "EventDispatch", "FireAnimationFrame", "TimerFire"].includes(e.name)) {
-        const d = e.args?.data ?? {};
-        const orig = d.url ? mapOrig(d.url, d.lineNumber ?? -1, d.columnNumber ?? 0) : null;
-        const key = `${d.functionName || e.name}|${orig ?? (d.url ? d.url.replace(/^.*assets\//, "assets/") + ":" + ((d.lineNumber ?? -1) + 1) : "native")}`;
-        const target = phase === "postPaint" ? fnPost : fnPre;
-        target.set(key, (target.get(key) ?? 0) + dur);
-      } else if (
-        /(GC|GCEvent|MinorGC|MajorGC)/.test(e.name) ||
-        [
-          "Layout",
-          "UpdateLayoutTree",
-          "ParseHTML",
-          "Paint",
-          "PrePaint",
-          "Layerize",
-          "RasterTask",
-          "CommitLoad",
-        ].includes(e.name) ||
-        e.name.startsWith("v8.compile") ||
-        e.name === "EvaluateScript"
-      ) {
-        const cat = phase === "postPaint" ? catsPost : catsPre;
-        cat[e.name] = (cat[e.name] ?? 0) + dur;
-      }
-    }
-    const top = (m) =>
-      [...m.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 8)
-        .map(([k, us]) => `${k} ${Math.round(us / 10) / 100}ms`);
-    out.push({
-      paintedAfterClickMs: Math.round((paintedTs - clickTs) / 10) / 100,
-      settleAfterClickMs: Math.round((settleTs - clickTs) / 10) / 100,
-      framesBeforePaint: frames,
-      prePaintMs: Math.round(phases.prePaint / 10) / 100,
-      postPaintMs: Math.round(phases.postPaint / 10) / 100,
-      categoriesPre: Object.fromEntries(
-        Object.entries(catsPre).map(([k, v]) => [k, Math.round(v / 10) / 100]),
-      ),
-      categoriesPost: Object.fromEntries(
-        Object.entries(catsPost).map(([k, v]) => [k, Math.round(v / 10) / 100]),
-      ),
-      topPre: top(fnPre),
-      topPost: top(fnPost),
-    });
-  }
-  return out;
-}
-
 async function main() {
   const version = await waitHttp(`http://127.0.0.1:${DBG_PORT}/json/version`);
   const cdp = cdpConnect(version.webSocketDebuggerUrl);
@@ -308,7 +224,7 @@ async function main() {
     // FunctionCall events retain source locations without per-event stacks.
     await cdp.send("Tracing.start", {
       traceConfig: {
-        includedCategories: ["devtools.timeline", "blink.user_timing"],
+        includedCategories: ["toplevel", "devtools.timeline", "blink.user_timing"],
       },
     });
     await cdp.send("Profiler.start");
@@ -341,7 +257,7 @@ async function main() {
     }
     await delay(400);
     const events = traceChunks;
-    const phases = analyzeTrace(events);
+    const phases = analyzeTrace(events, mapOrig);
     fs.writeFileSync(path.join(OUT, `${name}.trace.json`), JSON.stringify({ traceEvents: events }));
     fs.writeFileSync(path.join(OUT, `${name}.cpuprofile`), JSON.stringify(profile));
     fs.writeFileSync(

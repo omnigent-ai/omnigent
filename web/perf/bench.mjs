@@ -15,6 +15,7 @@ import {
   forEachSequential,
   waitHttp,
 } from "./cdp.mjs";
+import { verifyFixtures } from "./verify.mjs";
 
 const args = process.argv.slice(2);
 const argOf = (name, fb) => {
@@ -136,14 +137,17 @@ const INIT_SCRIPT = `
   const placeholderText = "Loading conversation…";
   const mo = new MutationObserver((records) => {
     window.__perf.dirty = true;
-    const containsPlaceholder = (nodes) => [...nodes].some((node) => (node.textContent ?? "").includes(placeholderText));
-    const added = records.some((record) => containsPlaceholder(record.addedNodes));
-    const removed = records.some((record) => containsPlaceholder(record.removedNodes));
+    const matches = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) return node.nodeValue?.trim() === placeholderText;
+      return node.nodeType === Node.ELEMENT_NODE && [...node.childNodes].some((child) => child.nodeType === Node.TEXT_NODE && child.nodeValue?.trim() === placeholderText);
+    };
+    const added = records.flatMap((record) => [...record.addedNodes]).find(matches);
+    const removed = records.some((record) => [...record.removedNodes].some(matches));
     const observedAt = added || removed ? performance.now() : 0;
     if (added) {
       window.__perf.placeholder.push({ kind: "mount", ts: observedAt });
       requestAnimationFrame(() => setTimeout(() => {
-        if ((document.body?.textContent ?? "").includes(placeholderText)) window.__perf.placeholderPainted.push(performance.now());
+        if (added.isConnected) window.__perf.placeholderPainted.push(performance.now());
       }, 0));
     }
     if (removed) window.__perf.placeholder.push({ kind: "unmount", ts: observedAt });
@@ -297,6 +301,9 @@ async function launchBrowser(port) {
   );
   browsers.push({ child, profile });
 }
+await verifyFixtures(BASE, CHROME, DBG_PORT, path.join(OUT, "fixture-check-a.json"));
+if (AB_URL)
+  await verifyFixtures(AB_URL, CHROME, DBG_PORT_B, path.join(OUT, "fixture-check-b.json"));
 await launchBrowser(DBG_PORT);
 process.once("SIGTERM", () => browsers.forEach(({ child }) => child.kill("SIGTERM")));
 process.once("SIGINT", () => browsers.forEach(({ child }) => child.kill("SIGTERM")));
@@ -916,6 +923,8 @@ async function main() {
           `window.__waitSettled(${JSON.stringify(MARKERS[id])}, { timeoutMs: 30000, sinceTs: performance.now() - 1 })`,
           true,
         );
+        if (!settled || settled.timeout || settled.markerTs < 0 || settled.paintedTs < 0)
+          throw new Error(`cold load ${id} failed: ${JSON.stringify(settled)}`);
         const snap = await page.eval(`(() => {
           const nav = performance.getEntriesByType("navigation")[0];
           return {
@@ -931,6 +940,7 @@ async function main() {
         samples.push({
           target: id,
           iter: i,
+          // Chrome resets these duration counters on each document navigation.
           cdp: metricsDelta(after, {}),
           wallMs: Date.now() - navStart,
           markerTs: settled.markerTs,
@@ -1042,20 +1052,23 @@ async function main() {
     })()`,
       true,
     );
-    await globalThis
+    const after = await perfMetrics(cdp);
+    const stopRes = await globalThis
       .fetch(`${BASE}/__perf__/stream/stop`, {
         method: "POST",
         body: JSON.stringify({ token: startRes.token }),
       })
-      .catch(() => {});
-    const after = await perfMetrics(cdp);
+      .then((response) => response.json());
+    if (!stopRes.ok || !Number.isInteger(stopRes.emitted) || stopRes.emitted < 1) {
+      throw new Error(`stream stop failed: ${JSON.stringify(stopRes)}`);
+    }
     const out = {
       target,
       iter,
-      injectedEvents: startRes.total_events,
+      plannedEvents: startRes.total_events,
+      injectedEvents: stopRes.emitted,
       ...sample,
-      commitsPerEvent:
-        Math.round((sample.commits / Math.max(1, startRes.total_events)) * 100) / 100,
+      commitsPerEvent: Math.round((sample.commits / stopRes.emitted) * 100) / 100,
       taskDurationMs: (after.TaskDuration - before.TaskDuration) * 1000,
       scriptDurationMs: (after.ScriptDuration - before.ScriptDuration) * 1000,
       heapMB: await page.eval("(performance.memory?.usedJSHeapSize ?? 0) / 1048576"),
@@ -1102,14 +1115,14 @@ async function main() {
       if (attempt >= 30) await wheelScrollUp(cdp2, 3);
       await delay(attempt < 30 ? 1200 : 900);
       if (await page.eval(`(document.body?.textContent ?? "").includes(${JSON.stringify(marker)})`))
-        return attempt < 30 ? attempt + 1 : attempt + 31;
+        return attempt + 1;
       return waitForOldest(attempt + 1);
     }
     return waitForOldest(0);
   }
 
   if (SCENARIOS.includes("deepHistory")) {
-    const out = { load: [], switchBack: [], stream: [], idleDeep: [] };
+    const out = { load: [], stream: [], idleDeep: [] };
     await forEachSequential(["conv_perf_a", "conv_perf_b"], async (id) => {
       await gotoSession(id);
       await delay(1500);
