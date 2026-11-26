@@ -212,10 +212,9 @@ def test_approval_reason_identifies_the_unresolved_boundary(command: str, reason
     "command",
     [
         "glab mr create -b main -t Fix -d Details",
-        "glab mr merge 12 --remove-source-branch",
         "glab mr accept 12",
         "glab mr rebase 12",
-        "glab mr update 12 --target-branch main",
+        "glab mr update --target-branch main",
         "glab repo fork",
         "glab ci run",
         "glab variable set KEY value",
@@ -781,3 +780,167 @@ def test_protected_environment_names_ignore_case_across_hosts(name: str) -> None
     )
     assert response is not None and response["result"] == "ASK"
     assert "CLI environment" in response["reason"]
+
+
+_MR_CREATE_FIELDS = (
+    f"--head {_URL} -s feature -b main -t Fix -d Details "
+    "--remove-source-branch=false --allow-collaboration=false"
+)
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        f"create {_MR_CREATE_FIELDS}",
+        f"new {_MR_CREATE_FIELDS} --draft -y -l bug",
+        "update 12 -t Revised -d Details",
+        'update 12 -t /merge -d "Mention /rebase inline"',
+        "update 12 --target-branch main",
+        "update 12 -r -l bug -u stale -y",
+        "update 12 --wip --draft=false --remove-source-branch=false",
+    ],
+)
+def test_supported_mr_metadata_writes_check_project_not_branch_content(action: str) -> None:
+    command = f"glab mr {action} -R {_URL}"
+    assert _result(command, write_repos=[_PROJECT], write_branches=["unrelated"]) == "ALLOW"
+    assert _result(command, read_all=True) == "DENY"
+    assert (
+        _result(
+            command.replace(f"-R {_URL}", "-R https://gitlab.com/team/other"),
+            write_repos=[_PROJECT],
+        )
+        == "DENY"
+    )
+
+
+@pytest.mark.parametrize(
+    "omitted",
+    [
+        f"--head {_URL}",
+        "-s feature",
+        "-b main",
+        "-t Fix",
+        "-d Details",
+        "--remove-source-branch=false",
+        "--allow-collaboration=false",
+    ],
+)
+def test_mr_creation_requires_explicit_inputs_and_false_overrides(omitted: str) -> None:
+    fields = _MR_CREATE_FIELDS.replace(omitted, "")
+    assert _result(f"glab mr create -R {_URL} {fields}", write_repos=[_PROJECT]) == "ASK"
+    assert _result(f"glab mr create -R {_URL} {fields}") == "DENY"
+
+
+@pytest.mark.parametrize(
+    ("action", "expected", "opted_in"),
+    [
+        ("create --remove-source-branch", "DENY", "ASK"),
+        ("new --remove-source-branch", "DENY", "ASK"),
+        ("merge 12 -d", "DENY", "ASK"),
+        ("merge 12 -yd", "DENY", "ASK"),
+        ("merge 12 -d --when-pipeline-succeeds", "DENY", "ASK"),
+        ("accept 12 --remove-source-branch=true", "DENY", "ASK"),
+        ("merge --remove-source-branch", "DENY", "ASK"),
+        ("merge 12 -d --remove-source-branch=false", "ASK", "ASK"),
+        ("update 12 --remove-source-branch", "ASK", "ASK"),
+    ],
+)
+def test_mr_source_removal_is_guarded_without_guessing_toggle_state(
+    action: str, expected: str, opted_in: str
+) -> None:
+    command = f"glab mr {action} -R {_URL}"
+    assert _result(command, write_repos=[_PROJECT]) == expected
+    assert _result(command, write_repos=[_PROJECT], allow_destructive=True) == opted_in
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "merge 12 -y",
+        "accept 12 -sy --auto-merge=false",
+        "merge 12 --remove-source-branch=false",
+        "merge 12 -r -m Details",
+        "rebase 12",
+        "rebase 12 --skip-ci",
+    ],
+)
+def test_mr_branch_operations_require_authoritative_metadata(action: str) -> None:
+    response = _response(
+        f"glab mr {action} -R {_URL}", write_repos=[_PROJECT], allow_destructive=True
+    )
+    assert response is not None and response["result"] == "ASK"
+    reason = "source project and branch" if action.startswith("rebase") else "target branch"
+    assert reason in response["reason"]
+    assert _result(f"glab mr {action} -R {_URL}") == (
+        "ASK" if action.startswith("rebase") else "DENY"
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        f"create {_MR_CREATE_FIELDS} --push",
+        f"create {_MR_CREATE_FIELDS} --fill",
+        f"create {_MR_CREATE_FIELDS} --auto-merge",
+        f"create {_MR_CREATE_FIELDS} --create-source-branch",
+        f"create {_MR_CREATE_FIELDS} --target-project team/other",
+        "create " + _MR_CREATE_FIELDS.replace(_URL, "https://gitlab.com/team/other"),
+        f"create {_MR_CREATE_FIELDS} --head https://gitlab.com/team/other",
+        f"create {_MR_CREATE_FIELDS} --allow-collaboration=true",
+        f"create {_MR_CREATE_FIELDS} --source-branch=-invalid",
+        f"create {_MR_CREATE_FIELDS} -d /merge",
+        f'new {_MR_CREATE_FIELDS} -d "Details\n  /rebase"',
+        "update 12 -b main",
+        "update branch -t Fix",
+        "update -t Fix",
+        "update 12",
+        "update 12 --fill",
+        "update 12 --attach example.png",
+        "update 12 -d -",
+        'update 12 -t ""',
+        'update 12 -d ""',
+        "update 12 -d /merge",
+        'update 12 -d "Details\n/rebase"',
+        'update 12 -d "  /remove_source_branch"',
+        'update 12 -d "Details\n\t/unknown_action"',
+        "update 12 --description-file example.txt",
+        "update 12 --target-branch=../main",
+        "edit 12 -t Fix",
+        "merge feature -y",
+        f"merge {_URL}/-/merge_requests/12 -y",
+    ],
+)
+def test_unresolved_mr_arguments_and_secondary_effects_ask(action: str) -> None:
+    assert _result(f"glab mr {action} -R {_URL}", write_repos=[_PROJECT]) == "ASK"
+
+
+def test_mr_quick_actions_are_checked_after_project_permissions() -> None:
+    command = f'glab mr update 12 -R {_URL} -d "Details\n/rebase"'
+    response = _response(command, write_repos=[_PROJECT])
+    assert response is not None and response["result"] == "ASK"
+    assert "quick actions" in response["reason"]
+    assert _result(command) == "DENY"
+
+
+def test_mr_options_keep_their_values_and_last_boolean_wins() -> None:
+    fields = _MR_CREATE_FIELDS.replace("-t Fix", '-t "--remove-source-branch"')
+    assert _result(f"glab mr create -R {_URL} {fields}", write_repos=[_PROJECT]) == "ALLOW"
+    fields = _MR_CREATE_FIELDS + " --remove-source-branch=true --remove-source-branch=false"
+    assert _result(f"glab mr create -R {_URL} {fields}", write_repos=[_PROJECT]) == "ALLOW"
+    fields = _MR_CREATE_FIELDS + ' -d /merge -d "Mention /merge inline"'
+    assert _result(f"glab mr create -R {_URL} {fields}", write_repos=[_PROJECT]) == "ALLOW"
+    response = _response(
+        f'glab mr merge 12 -R {_URL} -m "--remove-source-branch"', write_repos=[_PROJECT]
+    )
+    assert response is not None and response["result"] == "ASK"
+    assert "target branch" in response["reason"]
+
+
+def test_mr_shell_composition_preserves_known_denials() -> None:
+    assert (
+        _result(
+            f"glab mr rebase 12 -R {_URL} && glab mr merge 12 -R {_URL} -d",
+            write_repos=[_PROJECT],
+        )
+        == "DENY"
+    )

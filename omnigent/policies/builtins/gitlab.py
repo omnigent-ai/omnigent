@@ -1,7 +1,7 @@
 """Project permissions for bounded Git transfers and glab activities.
 
 Only explicitly supported command/option combinations can run automatically.
-Unresolved Git destinations, MR writes, and custom API requests require approval.
+Unresolved destinations, MR merges/rebases, and custom API requests require approval.
 The policy examines shell text; existing CLI configuration must be trusted.
 GitLab MCP tools and direct HTTP clients are outside this policy's scope.
 """
@@ -81,6 +81,7 @@ _LOCAL_GIT_COMMANDS = frozenset(
     }
 )
 _ACTION_ALIASES = {"ls": "list", "show": "view", "new": "create", "comment": "note"}
+_MR_WRITE_ACTIONS = frozenset({"create", "update", "merge", "rebase"})
 
 
 def _option_spec(values: str = "", switches: str = "") -> dict[str, tuple[str, bool]]:
@@ -108,6 +109,19 @@ _COMMAND_OPTIONS = {
     ),
     ("mr", "view"): _option_spec("output:F page:p per-page:P", "comments:c system-logs:s"),
     ("mr", "diff"): _option_spec("color", "raw"),
+    ("mr", "create"): _option_spec(
+        "title:t description:d source-branch:s target-branch:b head:H label:l",
+        "draft wip yes:y remove-source-branch allow-collaboration",
+    ),
+    ("mr", "update"): _option_spec(
+        "title:t description:d target-branch label:l unlabel:u",
+        "draft wip ready:r yes:y remove-source-branch",
+    ),
+    ("mr", "merge"): _option_spec(
+        "message:m squash-message sha",
+        "yes:y squash:s rebase:r auto-merge when-pipeline-succeeds remove-source-branch:d",
+    ),
+    ("mr", "rebase"): _option_spec(switches="skip-ci"),
 }
 
 _GIT_OPTIONS = {
@@ -447,10 +461,11 @@ def gitlab_policy(
     :param hosts: Trusted GitLab HTTPS authorities; defaults to gitlab.com.
     :param read_all: Allow supported reads across projects on the configured hosts.
     :param read_repos: Readable project paths or host-pinned HTTPS project URLs.
-    :param write_repos: Projects permitting supported issue writes and Git pushes.
+    :param write_repos: Projects permitting supported issue/MR writes and Git pushes.
     :param write_branches: Exact, case-sensitive push destination branch names;
-        None or empty means unrestricted. Does not apply to issues or tags.
-    :param allow_destructive: Permit explicit ref deletions through write checks.
+        None or empty means unrestricted. Does not apply to issues, tags, or MR metadata.
+    :param allow_destructive: Permit explicit Git ref deletions through write checks;
+        explicit MR source-removal requests still require approval.
     :param deny_tag_push: Deny tag pushes, including bulk tag flags, by default.
     :param deny_force_push: Deny force flags and force-prefixed refspecs by default.
     :param shell_tools: Tools whose command argument is checked; defaults to all shell tools.
@@ -490,6 +505,74 @@ def gitlab_policy(
                 f"{deny_reason} Project {project[0]}/{project[1]} is not permitted "
                 f"for this {'write' if write else 'read'}."
             )
+        return None
+
+    def check_mr_write(
+        action: str, args: _GlabArguments, project: _Project
+    ) -> PolicyResponse | None:
+        if action == "rebase":
+            return _ask(
+                "MR rebasing changes a source project and branch not established by its ID."
+            )
+        decision = gate_project(project, write=True)
+        if decision is not None:
+            return decision
+        if action == "merge":
+            return _ask(
+                "MR merges change an unresolved target branch and may apply stored "
+                "source-branch removal; approval is required."
+            )
+        if args.enabled("remove-source-branch"):
+            return _ask("The resulting source-branch removal setting requires approval.")
+        for name in ("title", "description"):
+            value = args.last(name)
+            if value is not None and (not value or value == "-"):
+                return _ask("Provide explicit MR text; editor or empty input requires approval.")
+        description = args.last("description")
+        if description and any(line.lstrip().startswith("/") for line in description.splitlines()):
+            return _ask("Potential GitLab quick actions in MR descriptions require approval.")
+        if action == "create":
+            if any(args.last(name) is None for name in ("title", "description")):
+                return _ask(
+                    "Provide explicit MR title and description; "
+                    "interactive input requires approval."
+                )
+            if any(
+                not _valid_branch(args.last(name) or "")
+                for name in ("source-branch", "target-branch")
+            ):
+                return _ask(
+                    "MR creation requires explicit literal source and target branch names."
+                )
+            heads = args.values("head")
+            if not heads or len(set(heads)) != 1 or _project_ref(heads[0], owned_hosts) != project:
+                return _ask("Pin --head to the same explicit server and project as --repo.")
+            if any(
+                args.last(name) != "false"
+                for name in ("remove-source-branch", "allow-collaboration")
+            ):
+                return _ask(
+                    "Explicitly disable source-branch removal and collaboration for MR creation."
+                )
+        else:
+            branch = args.last("target-branch")
+            if branch is not None and not _valid_branch(branch):
+                return _ask("MR target-branch metadata must name a literal branch.")
+            if not any(
+                name
+                in {
+                    "title",
+                    "description",
+                    "target-branch",
+                    "label",
+                    "unlabel",
+                    "draft",
+                    "wip",
+                    "ready",
+                }
+                for name, _ in args.options
+            ):
+                return _ask("Choose an explicit supported MR metadata change.")
         return None
 
     def check(tokens: list[str]) -> PolicyResponse | None:
@@ -542,6 +625,8 @@ def gitlab_policy(
             return _ask("Choose a supported glab action and an explicit project. Approve?")
         group, action = tokens[1:3]
         action = _ACTION_ALIASES.get(action, action)
+        if group == "mr" and action == "accept":
+            action = "merge"
         options = _COMMAND_OPTIONS.get((group, action))
         if options is None:
             if group in {"issue", "mr", "repo", "project"} and action in {"delete", "del", "rm"}:
@@ -558,12 +643,22 @@ def gitlab_policy(
         project = _project_ref(selectors[0], owned_hosts)
         if project is None or project[0] is None:
             return _ask("The GitLab server and project could not be established. Approve?")
-        needs_number = action in {"view", "diff", "note"}
+        mr_write = group == "mr" and action in _MR_WRITE_ACTIONS
+        if (
+            mr_write
+            and action in {"create", "merge"}
+            and args.enabled("remove-source-branch")
+            and not allow_destructive
+        ):
+            return _deny(f"{deny_reason} MR source-branch removal is not permitted.")
+        needs_number = action in {"view", "diff", "note", "update", "merge", "rebase"}
         if (
             needs_number
             and (len(args.operands) != 1 or not re.fullmatch(r"[1-9][0-9]*", args.operands[0]))
         ) or (not needs_number and args.operands):
             return _ask("Unsupported glab operands require approval; use a numeric issue/MR ID.")
+        if mr_write:
+            return check_mr_write(action, args, project)
         write = (group, action) in {("issue", "create"), ("issue", "note")}
         decision = gate_project(project, write)
         if decision is not None:
@@ -596,7 +691,8 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
         "name": "GitLab Project Access",
         "description": (
             "Project permissions for explicit Git downloads and pushes, glab issue and MR "
-            "reads, and issue writes. Unresolved operations require approval."
+            "reads, issue writes, and explicit MR creation/metadata updates. "
+            "Unresolved operations require approval."
         ),
         "params_schema": {
             "type": "object",
@@ -620,20 +716,23 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                 "write_repos": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Projects permitting supported issue writes and Git pushes.",
+                    "description": "Projects permitting supported issue/MR writes and Git pushes.",
                 },
                 "write_branches": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
                         "Exact push destination branch names; empty permits all. "
-                        "Does not restrict tags or issues."
+                        "Does not restrict tags, issues, or MR metadata."
                     ),
                 },
                 "allow_destructive": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Permit explicit remote ref deletions through write checks.",
+                    "description": (
+                        "Permit explicit Git ref deletions through write checks; "
+                        "MR source-removal requests still need approval."
+                    ),
                 },
                 "deny_tag_push": {
                     "type": "boolean",
