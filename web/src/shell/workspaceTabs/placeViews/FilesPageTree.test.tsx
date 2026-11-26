@@ -11,6 +11,7 @@ import {
   type WorkspaceListing,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
+  useWorkspaceDirectories,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
@@ -52,13 +53,18 @@ const captured = vi.hoisted(() => ({
   real: false,
 }));
 
-vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
-  ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
-  useWorkspaceAllFiles: vi.fn(),
-  useWorkspaceChangedFiles: vi.fn(),
-  useWorkspaceEnvironment: vi.fn(),
-  useWorkspaceFileSearch: vi.fn(),
-}));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
+  const actual = await importOriginal<typeof WorkspaceChangedFilesModule>();
+  return {
+    ...actual,
+    // The real tree's opened folders list through this; a case may serve them itself.
+    useWorkspaceDirectories: vi.fn(actual.useWorkspaceDirectories),
+    useWorkspaceAllFiles: vi.fn(),
+    useWorkspaceChangedFiles: vi.fn(),
+    useWorkspaceEnvironment: vi.fn(),
+    useWorkspaceFileSearch: vi.fn(),
+  };
+});
 vi.mock("@/shell/fileTree/FilesTreeMatches", () => ({
   FilesTreeMatches: (props: {
     matches: { path: string }[];
@@ -355,6 +361,38 @@ describe("FilesPageTree", () => {
     await userEvent.click(options());
     await userEvent.click(screen.getByRole("menuitem", { name: "Go to parent folder" }));
     expect(rememberedBrowseLocation("conv_1")).toBe("/work/repo/src");
+  });
+
+  it("lists an opened folder again on Refresh, showing what it holds now", async () => {
+    captured.real = true;
+    // Each refresh's listing is one object, as the query cache holds it.
+    const before = [entry("src/old.ts"), entry("src/kept.ts")];
+    const after = [entry("src/kept.ts"), entry("src/new.ts")];
+    vi.mocked(useWorkspaceDirectories).mockImplementation(
+      (_conversationId, folders, _location, refreshToken = 0) =>
+        new Map(
+          folders.map((folder) => [
+            folder,
+            { data: refreshToken === 0 ? before : after, isLoading: false, isError: false },
+          ]),
+        ),
+    );
+    renderTree(
+      {
+        ...listed([{ ...entry("src"), type: "directory", bytes: null }]),
+        refetch: vi.fn(),
+      } as never,
+      false,
+      { activePath: "README.md" },
+    );
+    await userEvent.click(await screen.findByRole("treeitem", { name: /^src/ }));
+    expect(await screen.findByRole("treeitem", { name: /old\.ts/ })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Tree options" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Refresh files" }));
+    expect(await screen.findByRole("treeitem", { name: /new\.ts/ })).toBeInTheDocument();
+    expect(screen.queryByRole("treeitem", { name: /old\.ts/ })).toBeNull();
+    expect(screen.getByRole("treeitem", { name: /kept\.ts/ })).toBeInTheDocument();
   });
 
   it("checks the tree options it's given, and follows each change the ⋯ makes", async () => {
