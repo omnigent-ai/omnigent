@@ -425,10 +425,21 @@ async def test_a_non_owners_upload_is_refused_before_any_body_is_read(
     monkeypatch.setattr(server_prs, "open_store", lambda _conversations: _Store(_linked(_PR)))
     request = pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png", content=b"png")
     headers = {"Content-Type": "application/proto"}
+    body_read: list[bytes] = []
 
-    response = await _post(app, "UploadAttachment", request.SerializeToString(), headers)
+    async def unread_body(scope: Any, receive: Any, send: Any) -> None:
+        async def receive_noting_the_body() -> Any:
+            message = await receive()
+            if message.get("type") == "http.request" and message.get("body"):
+                body_read.append(message["body"])
+            return message
+
+        await app(scope, receive_noting_the_body, send)
+
+    response = await _post(unread_body, "UploadAttachment", request.SerializeToString(), headers)
 
     assert response.status_code == 403, response.text
+    assert body_read == []
     assert read_limits == []
     assert host_calls == []
 
