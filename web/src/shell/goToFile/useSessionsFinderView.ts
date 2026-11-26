@@ -25,6 +25,7 @@ export const SESSION_SEARCH_COPY = {
   searching: "Searching sessions…",
   failed: "Couldn't search sessions. Check your connection and try again.",
   failedMore: "Couldn't load more sessions.",
+  failedRecent: "Couldn't load sessions.",
 } as const;
 
 export const RECENT_SESSIONS_GROUP = "Recent sessions";
@@ -104,19 +105,15 @@ export function useSessionsFinderView(active: boolean, query: string): SessionsF
     contentSearch,
   ]);
 
-  // Name matches can outlive a failed message search or page, so the failure never hides.
-  const failure =
-    typed && loadError
-      ? {
-          message: loadMoreError ? SESSION_SEARCH_COPY.failedMore : SESSION_SEARCH_COPY.failed,
-          retrying,
-          retry: retryLoad,
-        }
-      : null;
+  // Rows can outlive a failed search, page or recent list, so the failure never hides.
+  let failureMessage: string = SESSION_SEARCH_COPY.failedRecent;
+  if (loadMoreError) failureMessage = SESSION_SEARCH_COPY.failedMore;
+  else if (typed) failureMessage = SESSION_SEARCH_COPY.failed;
+  const failure = loadError ? { message: failureMessage, retrying, retry: retryLoad } : null;
   let emptyMessage: string | null = SESSION_SEARCH_COPY.idle;
-  if (typed) {
-    if (failure) emptyMessage = null;
-    else if (searchFetching || searchedQuery !== debouncedQuery) {
+  if (failure) emptyMessage = null;
+  else if (typed) {
+    if (searchFetching || searchedQuery !== debouncedQuery) {
       emptyMessage = SESSION_SEARCH_COPY.searching;
     } else emptyMessage = SESSION_SEARCH_COPY.empty;
   }

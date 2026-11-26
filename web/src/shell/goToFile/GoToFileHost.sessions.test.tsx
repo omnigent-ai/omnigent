@@ -200,6 +200,20 @@ describe("the finder's Sessions tab", () => {
     expect(searches.retries).toBe(1);
   });
 
+  it.each([
+    ["the recent sessions", { more: false }, "Couldn't load sessions."],
+    ["more recent sessions", { more: true }, "Couldn't load more sessions."],
+  ])("shows a failure to load %s before a query, with Retry", async (_, failed, notice) => {
+    searches.failed = failed;
+    renderHost();
+    const dialog = openSessions();
+
+    expect(within(dialog).getByRole("option")).toHaveTextContent("Recent work");
+    expect(within(dialog).getByText(notice)).toHaveAttribute("role", "status");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+    expect(searches.retries).toBe(1);
+  });
+
   it("lists name matches above message matches, starting on the query it was given", () => {
     renderHost();
     const dialog = openSessions("upload");
