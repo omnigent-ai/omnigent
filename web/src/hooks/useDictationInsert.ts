@@ -91,6 +91,28 @@ function splice(
   };
 }
 
+/**
+ * Where *region* of *requested* lies in *written*, found from their longest common prefix and
+ * suffix: null when the span between them reaches into the region, which leaves its bounds unknown.
+ */
+function regionAfterEdit(
+  requested: string,
+  written: string,
+  region: { start: number; text: string },
+): [number, number] | null {
+  const shortest = Math.min(requested.length, written.length);
+  let prefix = 0;
+  while (prefix < shortest && requested[prefix] === written[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < shortest - prefix && requested.at(-1 - suffix) === written.at(-1 - suffix))
+    suffix += 1;
+  const end = region.start + region.text.length;
+  if (prefix >= end) return [region.start, end];
+  const shift = written.length - requested.length;
+  if (requested.length - suffix <= region.start) return [region.start + shift, end + shift];
+  return null;
+}
+
 export function useDictationInsert(
   draft: string,
   /**
@@ -219,21 +241,28 @@ export function useDictationInsert(
       // A refused write changed nothing, so what this hook owned still stands.
       if (written === current) return;
       // An editor may adjust a write, as it keeps a card's line its own. What it wrote between
-      // the text on either side is then the region; anything else leaves nothing to revise.
+      // the text on either side is then the region.
       const head = base.slice(0, spliced.region.start);
       const rest = base.slice(spliced.region.start);
-      const end = written.length - rest.length;
-      if (end < head.length || !written.startsWith(head) || !written.endsWith(rest)) {
-        producedRef.current = null;
-        wantCaretRef.current = null;
-        setInterimPending(false);
-        return;
+      let from = head.length;
+      let end = written.length - rest.length;
+      if (end < from || !written.startsWith(head) || !written.endsWith(rest)) {
+        // It changed text beside the region too. A partial keeps a region that change missed;
+        // anything else leaves nothing to revise.
+        const moved = pin ? null : regionAfterEdit(spliced.next, written, spliced.region);
+        if (moved === null) {
+          producedRef.current = null;
+          wantCaretRef.current = null;
+          setInterimPending(false);
+          return;
+        }
+        [from, end] = moved;
       }
-      const body = written.slice(head.length, end);
+      const body = written.slice(from, end);
       // The caret stays as far before the region's end as the splice put it, within the region.
       const gap = spliced.region.start + spliced.region.text.length - spliced.caret;
-      const caret = Math.min(Math.max(end - gap, head.length), end);
-      const owned = settled.region && body ? { start: head.length, text: body } : null;
+      const caret = Math.min(Math.max(end - gap, from), end);
+      const owned = settled.region && body ? { start: from, text: body } : null;
       producedRef.current = { value: written, region: owned, tail: caret };
       wantCaretRef.current = caret;
       setInterimPending(owned !== null);

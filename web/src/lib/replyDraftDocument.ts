@@ -11,6 +11,7 @@ const TOKEN_SPLIT = /(\uFDD0[\w-]*\uFDD1)/;
 const TOKEN_LINE = /^\uFDD0[\w-]*\uFDD1$/;
 const MARK = /[\uFDD0\uFDD1]/;
 const MARKS = /[\uFDD0\uFDD1]/g;
+const TOKEN_OR_MARK = /\uFDD0[\w-]*\uFDD1|[\uFDD0\uFDD1]/g;
 
 function encode(payload: string): string {
   let binary = "";
@@ -59,9 +60,16 @@ export function hasQuoteMark(text: string): boolean {
   return MARK.test(text);
 }
 
-/** `text` without tokens or stray marks, so plain text can't pose as a quote. */
+/** `text` keeping only its cards' marks: a stray mark goes, and a damaged token keeps its text. */
+function dropStrayMarks(text: string): string {
+  return text.replace(TOKEN_OR_MARK, (match) =>
+    parseQuoteLine(match) === null ? match.replace(MARKS, "") : match,
+  );
+}
+
+/** `text` without cards or stray marks, so plain text can't pose as a quote. */
 export function stripQuoteMarks(text: string): string {
-  return text.replace(TOKEN, "").replace(MARKS, "");
+  return dropStrayMarks(text).replace(TOKEN, "");
 }
 
 /** The document for `draft`: each quote's text before it, its token line, then the tail. */
@@ -90,13 +98,12 @@ export function unweaveReplyDraft(document: string): ReplyDraft {
   return { quotes, text: text.join("\n") };
 }
 
-/** `document` with each token on a line of its own, and a text line after the last card. */
+/** `document` with each card on a line of its own, other marks dropped, and a text line after. */
 export function settleQuoteLines(document: string): string {
-  const lines = document
-    .split("\n")
-    .flatMap((line) =>
-      hasQuoteMark(line) ? line.split(TOKEN_SPLIT).filter((part) => part !== "") : [line],
-    );
+  const lines = document.split("\n").flatMap((line) => {
+    const kept = dropStrayMarks(line);
+    return hasQuoteMark(kept) ? kept.split(TOKEN_SPLIT).filter((part) => part !== "") : [kept];
+  });
   if (parseQuoteLine(lines.at(-1) ?? "") !== null) lines.push("");
   return lines.join("\n");
 }
@@ -114,8 +121,8 @@ export function quoteTextStart(document: string): number {
 /** `document` with its tail, the text after the last card, replaced by `tail`. Every card stays. */
 export function replaceQuoteTail(document: string, tail: string): string {
   const lines = document.split("\n");
-  // Only cards hold marks, so the last card is the last token line, found without decoding it.
-  const lastCard = lines.findLastIndex((line) => TOKEN_LINE.test(line));
+  // A damaged token's line is text, as unweaveReplyDraft reads it.
+  const lastCard = lines.findLastIndex((line) => parseQuoteLine(line) !== null);
   const text = stripQuoteMarks(tail.replace(/\r\n?/g, "\n"));
   return [...lines.slice(0, lastCard + 1), text].join("\n");
 }

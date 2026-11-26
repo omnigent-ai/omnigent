@@ -47,7 +47,7 @@ describe("weaveReplyDraft and unweaveReplyDraft", () => {
     expect(weaveReplyDraft({ quotes: [], text: pasted })).toBe("xyz");
     expect(unweaveReplyDraft(doc(pasted, "\uFDD0bad\uFDD1", "tail"))).toEqual({
       quotes: [],
-      text: "xyz\n\ntail",
+      text: "xyz\nbad\ntail",
     });
     expect(parseQuoteLine("\uFDD0bm90IGpzb24\uFDD1")).toBeNull();
   });
@@ -119,6 +119,17 @@ describe("document edits", () => {
   it("puts each token on its own line and keeps a tail line", () => {
     expect(settleQuoteLines(`before${a}after`)).toBe(doc("before", a, "after"));
     expect(settleQuoteLines(`${a}${b}`)).toBe(doc(a, b, ""));
+  });
+
+  it("keeps a damaged token as text without its marks, so a tail write writes it once", () => {
+    const damaged = "\uFDD0bad\uFDD1";
+    expect(settleQuoteLines(doc(`X${damaged}${a}${damaged}`, "\uFDD1"))).toBe(
+      doc("Xbad", a, "bad", ""),
+    );
+    const document = doc("X", a, "Y", damaged, "Z");
+    const tail = unweaveReplyDraft(document).text;
+    expect(tail).toBe(doc("Y", "bad", "Z"));
+    expect(replaceQuoteTail(document, `${tail}!`)).toBe(doc("X", a, "Y", "bad", "Z!"));
   });
 
   it("finds where the text starts after the cards that open a document", () => {
