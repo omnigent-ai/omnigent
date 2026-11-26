@@ -32,8 +32,18 @@ export interface HostWorktree {
   updated_at?: number | null;
 }
 
-/** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
-const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
+/** Windows absolute path: a drive (``C:\repo`` / ``C:/repo``) or a UNC share (``\\server\share``). */
+const WINDOWS_ABS_PATH = /^(?:[A-Za-z]:[/\\]|\\\\)/;
+
+/** Whether ``path`` is absolute on its host: POSIX, a Windows drive, or a UNC share. */
+export function isAbsoluteHostPath(path: string): boolean {
+  return path.startsWith("/") || WINDOWS_ABS_PATH.test(path);
+}
+
+/** ``path`` without trailing separators, where ``\`` is one only on Windows; a root keeps one. */
+export function trimHostPath(path: string): string {
+  return path.replace(WINDOWS_ABS_PATH.test(path) ? /(.)[/\\]+$/ : /(.)\/+$/, "$1");
+}
 
 /**
  * Canonicalize a path for comparison, mirroring the backend boundary check in
@@ -65,9 +75,20 @@ export function isWorktreeRoot(root: string, path: string): boolean {
   return matchKind(root, path).kind === "exact";
 }
 
-/** Whether ``path`` is worktree ``root`` or lies inside it, compared as {@link matchWorktree} does. */
-export function isInWorktreeRoot(root: string, path: string): boolean {
-  return matchKind(root, path).kind !== "none";
+/**
+ * ``path`` relative to worktree ``root``, compared as {@link matchWorktree} does: ``/``
+ * separators and the path's own spelling, ``""`` for the root itself, null outside it.
+ */
+export function pathInWorktree(root: string, path: string): string | null {
+  const match = matchKind(root, path);
+  if (match.kind !== "contains") return match.kind === "exact" ? "" : null;
+  const windows = WINDOWS_ABS_PATH.test(root) || WINDOWS_ABS_PATH.test(path);
+  const slashed = (text: string) => (windows ? text.replace(/\\/g, "/") : text);
+  // A filesystem root (``/``, ``C:\``) already ends in the separator the slice skips.
+  const base = slashed(root).replace(/\/+$/, "");
+  return slashed(path)
+    .slice(base.length)
+    .replace(/^\/+|\/+$/g, "");
 }
 
 /**

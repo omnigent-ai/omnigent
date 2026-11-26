@@ -19,6 +19,8 @@ const WORKTREES = [
   worktree("/repo/.worktrees/feature"),
   worktree("/repo/.worktrees/feature-two/"),
   worktree("/elsewhere/sibling"),
+  // On POSIX a backslash is part of a name, here the last character of one.
+  worktree("/repo/worktree\\"),
 ];
 
 // A workspace that is a folder of a larger repository, which has a worktree inside it too.
@@ -46,11 +48,15 @@ describe("workspaceInsideLargerRepository", () => {
 });
 
 describe("diffRootFor", () => {
-  it("stays on a workspace inside a larger repository, even for a worktree in it", () => {
-    expect(diffRootFor("/monorepo/app/.worktrees/feature/src", "/monorepo/app", LARGER)).toBe(
-      "/monorepo/app",
-    );
-  });
+  it.each([
+    ["a worktree in it", "/monorepo/app/.worktrees/feature/src", "/monorepo/app", LARGER],
+    ["another folder of the worktree holding it", "/repo/docs", "/repo/src", WORKTREES],
+  ])(
+    "stays on a workspace inside a larger repository, even for %s",
+    (_case, directory, workspace, worktrees) => {
+      expect(diffRootFor(directory, workspace, worktrees)).toBe(workspace);
+    },
+  );
 
   it.each([
     ["no directory chosen", null, "/repo"],
@@ -75,12 +81,9 @@ describe("diffRootFor", () => {
     ["a sibling whose name only shares a prefix", "/repo/.worktrees/feature-three", "/repo"],
     ["a folder no worktree holds", "/tmp/scratch", "/repo"],
     ["a worktree outside the workspace", "/elsewhere/sibling/src", "/elsewhere/sibling"],
+    ["a worktree whose POSIX name ends in a backslash", "/repo/worktree\\/src", "/repo/worktree\\"],
   ])("reviews the right root for %s", (_case, directory, expected) => {
     expect(diffRootFor(directory, "/repo", WORKTREES)).toBe(expected);
-  });
-
-  it("keeps the workspace when it is a subfolder of the worktree that holds the directory", () => {
-    expect(diffRootFor("/repo/docs", "/repo/src", WORKTREES)).toBe("/repo/src");
   });
 
   it("keeps the workspace while the worktrees are unknown", () => {
@@ -145,6 +148,25 @@ describe("paths between a worktree's review and its session", () => {
     );
     expect(repositoryPathOf("C:/repo/src/a.ts", "", "C:/repo")).toBe("src/a.ts");
     expect(repositoryPathOf("/src/a.ts", "", "/")).toBe("src/a.ts");
+    // A Windows host's case doesn't matter, and the file keeps its own spelling.
+    expect(repositoryPathOf("C:\\repo\\.WORKTREES\\Feature\\src\\A.ts", FOLDER, "C:\\repo")).toBe(
+      "src/A.ts",
+    );
+    expect(repositoryPathOf(".WORKTREES/Feature/src/a.ts", FOLDER, "C:\\repo")).toBe("src/a.ts");
+    expect(
+      repositoryPathOf("\\\\server\\share\\repo\\src\\a.ts", "", "\\\\server\\share\\repo"),
+    ).toBe("src/a.ts");
+    expect(
+      repositoryPathOf(
+        "\\\\server\\share\\repo\\.worktrees\\feature\\a.ts",
+        FOLDER,
+        "\\\\server\\share\\repo",
+      ),
+    ).toBe("a.ts");
+    expect(repositoryPathOf("\\\\server\\other\\a.ts", "", "\\\\server\\share\\repo")).toBeNull();
+    expect(
+      repositoryPathOf("\\\\server\\other\\a.ts", FOLDER, "\\\\server\\share\\repo"),
+    ).toBeNull();
     expect(repositoryPathOf(".worktrees/feature", FOLDER, "/repo")).toBeNull();
     expect(repositoryPathOf("/elsewhere/a.ts", FOLDER, "/repo")).toBeNull();
     expect(repositoryPathOf("/repo/src/a.ts", "", "/repo")).toBe("src/a.ts");

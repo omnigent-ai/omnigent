@@ -3,7 +3,13 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isInWorktreeRoot, isWorktreeRoot, useHostWorktrees } from "./useHostWorktrees";
+import {
+  isAbsoluteHostPath,
+  isWorktreeRoot,
+  pathInWorktree,
+  trimHostPath,
+  useHostWorktrees,
+} from "./useHostWorktrees";
 
 const authenticatedFetchMock = vi.fn();
 vi.mock("@/lib/identity", () => ({
@@ -152,16 +158,44 @@ describe("isWorktreeRoot", () => {
   });
 });
 
-describe("isInWorktreeRoot", () => {
+describe("pathInWorktree", () => {
   it.each([
-    ["the root itself", "/repo", "/repo/", true],
-    ["a folder inside it", "/repo", "/repo/src", true],
-    ["a sibling sharing the name's start", "/repo", "/repository", false],
-    ["a folder of the filesystem root", "/", "/repo", true],
-    ["a folder of a Windows drive's root", "C:\\", "c:/repo", true],
-    ["a Windows folder with mixed separators", "c:/repo", "C:\\repo\\app", true],
-    ["POSIX case", "/Repo", "/repo/src", false],
-  ])("places %s", (_case, root, path, inside) => {
-    expect(isInWorktreeRoot(root, path)).toBe(inside);
+    ["the root itself", "/repo", "/repo/", ""],
+    ["a folder inside it", "/repo", "/repo/src/", "src"],
+    ["a sibling sharing the name's start", "/repo", "/repository", null],
+    ["a folder of the filesystem root", "/", "/repo", "repo"],
+    ["a POSIX name holding a backslash", "/repo", "/repo/a\\b", "a\\b"],
+    ["a POSIX sibling whose name holds a backslash", "/repo", "/repo\\other/src", null],
+    ["POSIX case", "/Repo", "/repo/src", null],
+    ["a folder of a Windows drive's root", "C:\\", "c:/repo", "repo"],
+    ["a Windows folder with mixed separators", "c:/repo", "C:\\repo\\app\\", "app"],
+    ["a Windows folder in another case, in its own spelling", "C:/repo", "c:\\REPO\\Src", "Src"],
+    ["a folder of a UNC share", "\\\\server\\share\\repo", "//server/share/repo/src", "src"],
+    ["outside a UNC share", "\\\\server\\share\\repo", "\\\\server\\other\\src", null],
+  ])("places %s", (_case, root, path, relative) => {
+    expect(pathInWorktree(root, path)).toBe(relative);
+  });
+});
+
+describe("isAbsoluteHostPath and trimHostPath", () => {
+  it.each([
+    ["/repo", true],
+    ["C:\\repo", true],
+    ["c:/repo", true],
+    ["\\\\server\\share", true],
+    ["src/a.ts", false],
+    ["C:repo", false],
+  ])("reads %s as absolute: %s", (path, absolute) => {
+    expect(isAbsoluteHostPath(path)).toBe(absolute);
+  });
+
+  it.each([
+    ["/repo//", "/repo"],
+    ["/", "/"],
+    ["/repo/worktree\\", "/repo/worktree\\"],
+    ["C:\\repo\\", "C:\\repo"],
+    ["\\\\server\\share\\", "\\\\server\\share"],
+  ])("trims %s to %s", (path, trimmed) => {
+    expect(trimHostPath(path)).toBe(trimmed);
   });
 });
