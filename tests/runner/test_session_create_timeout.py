@@ -47,3 +47,5 @@ async def test_create_waits_for_a_server_slower_than_30s(placement):
     assert "error" not in result, result
     assert result["conversation_id"] == session_id
     assert len(creates) == 1
+    timeout = creates[0].extensions["timeout"]
+    assert (timeout["connect"], timeout["read"]) == (30.0, 120.0)

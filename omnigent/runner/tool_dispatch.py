@@ -253,10 +253,9 @@ _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 # still fails out promptly. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
-# Read budget for sys_session_create's create POST. A busy server can take over
-# 30s to create a session, and a client that gives up first may leave it without
-# its first task or host, with no safe retry. Managed sandboxes are provisioned
-# after the response, so this covers only the server's own create work.
+# A busy server can take over 30s to create a session, and giving up first may
+# strand it with no safe retry. Managed sandboxes are provisioned after the
+# response, so this covers only the server's own create work.
 _SESSION_CREATE_READ_TIMEOUT_S = 120.0
 _SESSION_CREATE_TIMEOUT = httpx.Timeout(_SESSION_CREATE_READ_TIMEOUT_S, connect=30.0)
 
