@@ -1337,6 +1337,18 @@ _PR_OWNER_METHODS = {
         "account": "octocat",
     },
     "DisableAutoMerge": {},
+    "SetPullRequestState": {"state": "closed"},
+    "SetPullRequestDraft": {"draft": True},
+    # A batch names its pull requests in its list, not in ``prUrl``.
+    "EnableAutoMerge": {
+        "pullRequests": [
+            {
+                "prUrl": "https://github.com/example/app/pull/7",
+                "mergeMethod": "squash",
+                "expectedHeadOid": "a" * 40,
+            }
+        ]
+    },
     "GetPendingReview": {},
     "StartPendingReview": {"commitOid": "a" * 40},
     "AddPendingReviewComment": {
@@ -1457,7 +1469,9 @@ async def test_workspace_api_pull_request_changes_are_the_session_owners_alone(
     headers = {"Content-Type": "application/json"}
     if caller is not None:
         headers["X-Forwarded-Email"] = caller
-    body = {"prUrl": "https://github.com/example/app/pull/7", **_PR_OWNER_METHODS[method]}
+    fields = _PR_OWNER_METHODS[method]
+    pr_url = {} if "pullRequests" in fields else {"prUrl": "https://github.com/example/app/pull/7"}
+    body = {**pr_url, **fields}
     resp = await client.post(
         f"/v1/sessions/{session}/workspace"
         f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",

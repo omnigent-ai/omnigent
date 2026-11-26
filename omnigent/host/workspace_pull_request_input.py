@@ -21,6 +21,7 @@ from omnigent.runner.github_review_fields import (
     SHA256,
     VERDICT_STATES,
 )
+from omnigent.runner.pr_actions import AUTO_MERGE_BATCH_LIMIT
 
 # The largest pull request attachment, a video; the runner checks each type's own limit.
 # The call frame carries it base64-encoded, a third larger, under the tunnel's message cap.
@@ -62,6 +63,20 @@ class PullRequestRefused(ConnectError):
         self.reason = reason
 
 
+def _auto_merge_refusal(request: Any) -> str | None:
+    """Why an auto-merge batch can't be vouched for, before the server checks each PR."""
+    if not 1 <= len(request.pull_requests) <= AUTO_MERGE_BATCH_LIMIT:
+        return f"Enable auto-merge for 1 to {AUTO_MERGE_BATCH_LIMIT} pull requests at once"
+    for item in request.pull_requests:
+        if not item.pr_url:
+            return "Name each pull request to merge automatically"
+        if len(item.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+            return (
+                f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
+            )
+    return None
+
+
 def refuse_unserved_request(method: str, request: Any) -> None:
     """Refuse a request for something this API doesn't do, before any other work.
 
@@ -82,6 +97,8 @@ def refuse_unserved_request(method: str, request: Any) -> None:
             reason = "Expected an account to merge as"
     elif method == "ListLabels" and len(request.text) > MAX_LABEL_SEARCH_CHARACTERS:
         reason = f"The label search is longer than {MAX_LABEL_SEARCH_CHARACTERS} characters"
+    elif method == "EnableAutoMerge":
+        reason = _auto_merge_refusal(request)
     elif method == "UploadAttachment":
         if not request.name.strip():
             reason = "Expected the file's name"
