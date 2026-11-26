@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import {
   Select,
   SelectContent,
@@ -24,9 +25,11 @@ const DEFAULT_ROUTER = "__default__";
 export function ProjectRoutingSection({
   projectId,
   personas,
+  className,
 }: {
   projectId: string;
   personas: ProjectIdentity[];
+  className?: string;
 }) {
   const client = useQueryClient();
   const project = useProjectRecord(projectId).data;
@@ -65,7 +68,7 @@ export function ProjectRoutingSection({
   return (
     <section
       aria-label="Routing"
-      className="flex flex-col gap-2 border-t pt-3 text-sm"
+      className={cn("flex flex-col gap-2 border-t pt-3 text-sm", className)}
       data-testid="project-routing"
     >
       <div className="flex flex-wrap items-center gap-2">

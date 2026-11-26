@@ -29,8 +29,12 @@ vi.mock("./useProjectIdentities", () => ({
 vi.mock("./useProjectAgentSession", () => ({
   useProjectRecord: () => ({ data: { shared: false, config: {} } }),
 }));
-vi.mock("./IdentityModelEffortFields", () => ({ IdentityModelEffortFields: () => null }));
-vi.mock("./ProjectRoutingSection", () => ({ ProjectRoutingSection: () => null }));
+vi.mock("./IdentityModelEffortFields", () => ({
+  IdentityModelEffortFields: () => <div data-testid="runtime-fields" />,
+}));
+vi.mock("./ProjectRoutingSection", () => ({
+  ProjectRoutingSection: () => <div data-testid="routing-controls" />,
+}));
 
 afterEach(() => {
   identities.extra = [];
@@ -47,7 +51,7 @@ describe("ProjectTeamDialog", () => {
     expect(within(nav).getByRole("button", { name: "New team member" })).toBeInTheDocument();
     expect(screen.getByText("Instructions")).toBeInTheDocument();
     expect(screen.getByTestId("project-team-persona")).toHaveValue("");
-    const templates = screen.getByRole("group", { name: "Team member templates" });
+    const templates = screen.getByRole("group", { name: "Start with a role" });
     fireEvent.click(within(templates).getByRole("button", { name: "Designer" }));
     const designer = ROLE_TEMPLATES.find((template) => template.name === "Designer")!;
     expect(screen.getByTestId("project-team-name")).toHaveValue("Designer");
@@ -64,7 +68,7 @@ describe("ProjectTeamDialog", () => {
         }),
       ),
     );
-    expect(screen.queryByRole("group", { name: "Team member templates" })).toBeNull();
+    expect(screen.queryByRole("group", { name: "Start with a role" })).toBeNull();
   });
 
   it("says a team member runs its own copy, and links the owner to its tools", () => {
@@ -94,5 +98,26 @@ describe("ProjectTeamDialog", () => {
         name: "Edit Platform Engineer's tools and permissions",
       }),
     ).toHaveAttribute("href", "/settings/custom-agents/agent-copy");
+  });
+
+  it("keeps agent and model collapsed and routing in its own section", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    const toggle = screen.getByTestId("project-team-runtime-toggle");
+    expect(toggle).toHaveTextContent("Project defaults");
+    expect(screen.queryByTestId("runtime-fields")).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByTestId("runtime-fields")).toBeInTheDocument();
+    expect(screen.queryByTestId("routing-controls")).toBeNull();
+    fireEvent.click(screen.getByTestId("project-team-routing"));
+    expect(screen.getByRole("heading", { name: "Routing" })).toBeInTheDocument();
+    expect(screen.getByTestId("routing-controls")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-team-save")).toBeNull();
+    const nav = screen.getByRole("navigation", { name: "Team members" });
+    fireEvent.click(within(nav).getByRole("button", { name: "New team member" }));
+    expect(screen.getByTestId("project-team-save")).toHaveTextContent("Add member");
   });
 });

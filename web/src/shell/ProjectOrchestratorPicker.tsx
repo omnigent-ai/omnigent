@@ -159,6 +159,21 @@ function ProjectLaunchControl({
   );
 }
 
+/** One-line summary of the Lead's agent, model and effort, e.g. "Codex · Model A · High". */
+export function projectOrchestratorSummary(
+  choices: ReturnType<typeof useProjectOrchestratorChoices>,
+): string {
+  if (choices.loading) return "Loading…";
+  if (!choices.selected) return "No agent available";
+  const model = choices.options.models.find((option) => option.id === choices.model);
+  const parts = [
+    choices.selected.display_name,
+    model ? nativeModelLabel(model) : choices.model || "Default model",
+  ];
+  if (choices.effort) parts.push(normalizeEffortLabel(choices.effort));
+  return parts.join(" · ");
+}
+
 export function ProjectOrchestratorPicker({
   choices,
   host,

@@ -138,6 +138,11 @@ function projectButton(hostId: string | null, hosts: Host[] = []) {
   );
 }
 
+/** The Lead's agent, model and effort sit under a collapsed defaults disclosure. */
+function openLeadDefaults() {
+  fireEvent.click(screen.getByTestId("new-project-defaults-toggle"));
+}
+
 function renderButton(hosts: Host[] = [laptop]) {
   const view = render(projectButton("host_1", hosts));
   fireEvent.click(screen.getByRole("button", { name: "New project" }));
@@ -430,6 +435,11 @@ describe("NewProjectButton", () => {
     expect(
       screen.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
     ).toEqual(["Run on", "Lead"]);
+    expect(screen.queryByRole("button", { name: "Agent" })).toBeNull();
+    expect(screen.getByTestId("new-project-defaults-toggle")).toHaveTextContent(
+      "Agent & modelClaude Code",
+    );
+    openLeadDefaults();
     expect(screen.getByRole("button", { name: "Agent" })).toHaveTextContent("Claude Code");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Agent" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Codex" }));
@@ -470,6 +480,7 @@ describe("NewProjectButton", () => {
   it("offers registered native agents with composer icons and ignores a remembered SDK choice", async () => {
     writeLastHarness("claude-id", "codex");
     renderButton();
+    openLeadDefaults();
     expect(screen.getByRole("button", { name: "Agent" })).toHaveTextContent("Claude Code");
     expect(
       screen.getByRole("button", { name: "Agent" }).querySelector('[data-harness-icon="claude"]'),
@@ -534,6 +545,7 @@ describe("NewProjectButton", () => {
     renderButton([
       { ...laptop, configured_harnesses: { "claude-native": false, "codex-native": true } },
     ]);
+    openLeadDefaults();
     expect(screen.getByRole("button", { name: "Agent" })).toHaveTextContent("Codex");
     fireEvent.change(screen.getByPlaceholderText("Project name…"), { target: { value: "Garden" } });
     fireEvent.click(screen.getByTestId("new-project-confirm"));
@@ -548,6 +560,7 @@ describe("NewProjectButton", () => {
   it("does not silently change an explicit agent when its host becomes unavailable", () => {
     const view = render(projectButton("host_1", [laptop]));
     fireEvent.click(screen.getByRole("button", { name: "New project" }));
+    openLeadDefaults();
     fireEvent.pointerDown(screen.getByRole("button", { name: "Agent" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Codex" }));
     view.rerender(

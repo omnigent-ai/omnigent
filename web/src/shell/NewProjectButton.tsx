@@ -66,6 +66,7 @@ import { HostOption } from "./NewChatDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
   ProjectOrchestratorPicker,
+  projectOrchestratorSummary,
   useProjectOrchestratorChoices,
 } from "./ProjectOrchestratorPicker";
 
@@ -202,6 +203,7 @@ export function NewProjectButton({
   // Where the project runs: a host id, or a sandbox choice (see sandboxHostChoice).
   const [runOn, setRunOn] = useState<string | null>(null);
   const [hostMenuOpen, setHostMenuOpen] = useState(false);
+  const [leadDefaultsOpen, setLeadDefaultsOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const creationAttempt = useRef<CreationAttempt | undefined>(undefined);
   const dropdownOpen = useRef(false);
@@ -911,12 +913,33 @@ export function NewProjectButton({
           </section>
           <section aria-label="Lead" className="space-y-3 border-t pt-4">
             <h3 className="text-xs font-medium text-muted-foreground">Lead</h3>
-            <ProjectOrchestratorPicker
-              choices={orchestrator}
-              host={selectedHost}
-              sandbox={runsOnSandbox}
-              onOpenChange={onDropdownOpenChange}
-            />
+            {/* Quiet project defaults; opens by itself when no agent is usable. */}
+            <Collapsible
+              open={leadDefaultsOpen || (!orchestrator.loading && !orchestrator.selected)}
+              onOpenChange={setLeadDefaultsOpen}
+            >
+              <CollapsibleTrigger
+                data-testid="new-project-defaults-toggle"
+                className={cn(
+                  PROJECT_CONTROL_CLASS,
+                  "group flex w-full cursor-pointer items-center gap-2 border border-input text-left outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50",
+                )}
+              >
+                <span className="shrink-0">Agent &amp; model</span>
+                <span className="min-w-0 truncate font-normal text-muted-foreground">
+                  {projectOrchestratorSummary(orchestrator)}
+                </span>
+                <ChevronRightIcon className="ml-auto size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="mt-3">
+                <ProjectOrchestratorPicker
+                  choices={orchestrator}
+                  host={selectedHost}
+                  sandbox={runsOnSandbox}
+                  onOpenChange={onDropdownOpenChange}
+                />
+              </CollapsibleContent>
+            </Collapsible>
           </section>
           {descriptionEnabled && (
             <section aria-label="Description" className="border-t pt-4">
@@ -964,7 +987,8 @@ export function NewProjectButton({
             </p>
           )}
         </fieldset>
-        <DialogFooter className="border-t-0 bg-transparent">
+        {/* Sticky so Create stays on screen on phones. */}
+        <DialogFooter className="sticky -bottom-6 z-10 border-t-0 bg-white dark:bg-(--menu-surface-bg)">
           <Button
             type="button"
             variant="ghost"
@@ -1029,6 +1053,7 @@ export function NewProjectButton({
               setCheckout(null);
               setRepositorySubmitting(false);
               setSubmitError(null);
+              setLeadDefaultsOpen(false);
               setOpen(true);
             }}
           >

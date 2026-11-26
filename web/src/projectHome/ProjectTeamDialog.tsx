@@ -1,9 +1,10 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { PlusIcon, Trash2Icon } from "lucide-react";
+import { ChevronRightIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { PersonaAvatar } from "@/components/PersonaAvatar";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   Dialog,
   DialogContent,
@@ -136,6 +137,8 @@ export function ProjectTeamDialog({
   const shared = project?.shared === true;
   // `null` is the new-identity form; an id edits that identity.
   const [selected, setSelected] = useState<string | null>(null);
+  // Routing replaces the member form while open; only the owner sees it.
+  const [routingOpen, setRoutingOpen] = useState(false);
   const [draft, setDraft] = useState<IdentityDraft>(EMPTY_DRAFT);
   const client = useQueryClient();
   const refresh = () => client.invalidateQueries({ queryKey: projectIdentitiesKey(projectId) });
@@ -171,9 +174,12 @@ export function ProjectTeamDialog({
   const choose = (identity: ProjectIdentity | null) => {
     save.reset();
     remove.reset();
+    setRoutingOpen(false);
     setSelected(identity?.id ?? null);
     setDraft(identity ? draftOf(identity) : EMPTY_DRAFT);
   };
+  const canRoute = project !== undefined && !shared;
+  const customRuntime = Boolean(draft.agentId || draft.model || draft.effort);
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
     if (draft.name.trim() && !tooLarge) save.mutate(inputOf(draft, isLead));
@@ -192,251 +198,316 @@ export function ProjectTeamDialog({
         <DialogHeader>
           <DialogTitle>Team</DialogTitle>
           <DialogDescription>
-            Agent team members in <span className="font-medium">{projectName}</span> you can talk
-            to, including the built-in Lead, whose charter you can edit. Agents can add team members
-            too. Each works in one session at a time and follows the project mandate. Assign a
-            ticket to a team member from the ticket&apos;s Assignee picker.
+            Add specialists to <span className="font-medium">{projectName}</span> and assign them
+            tickets from a ticket&apos;s Assignee picker.
           </DialogDescription>
         </DialogHeader>
         {identities.isLoading ? (
           <Spinner aria-label="Loading team" />
         ) : (
-          <>
-            <div className="flex flex-col gap-4 sm:flex-row">
-              <nav className="flex shrink-0 flex-col gap-1 sm:w-44" aria-label="Team members">
+          <div className="flex flex-col gap-4 sm:flex-row">
+            <nav className="flex shrink-0 flex-col gap-1 sm:w-44" aria-label="Team members">
+              <Button
+                type="button"
+                variant={selected === null && !routingOpen ? "secondary" : "ghost"}
+                size="sm"
+                className="justify-start"
+                data-testid="project-team-new"
+                onClick={() => choose(null)}
+              >
+                <PlusIcon />
+                New team member
+              </Button>
+              {lead && (
                 <Button
                   type="button"
-                  variant={selected === null ? "secondary" : "ghost"}
+                  variant={selected === lead.id && !routingOpen ? "secondary" : "ghost"}
                   size="sm"
                   className="justify-start"
-                  data-testid="project-team-new"
-                  onClick={() => choose(null)}
+                  data-testid="project-team-lead"
+                  onClick={() => choose(lead)}
                 >
-                  <PlusIcon />
-                  New team member
+                  <PersonaAvatar name={lead.name} size="xs" />
+                  <span className="truncate">{lead.name}</span>
+                  <span className="ml-auto text-xs text-muted-foreground">Built-in</span>
                 </Button>
-                {lead && (
+              )}
+              {roles.map((identity) => (
+                <Button
+                  key={identity.id}
+                  type="button"
+                  variant={selected === identity.id && !routingOpen ? "secondary" : "ghost"}
+                  size="sm"
+                  className="justify-start"
+                  onClick={() => choose(identity)}
+                >
+                  <PersonaAvatar name={identity.name} size="xs" />
+                  <span className="truncate">{identity.name}</span>
+                </Button>
+              ))}
+              {canRoute && (
+                <div className="mt-2 flex flex-col border-t border-border/60 pt-2">
                   <Button
                     type="button"
-                    variant={selected === lead.id ? "secondary" : "ghost"}
+                    variant={routingOpen ? "secondary" : "ghost"}
                     size="sm"
-                    className="justify-start"
-                    data-testid="project-team-lead"
-                    onClick={() => choose(lead)}
+                    className="justify-start text-muted-foreground"
+                    data-testid="project-team-routing"
+                    aria-pressed={routingOpen}
+                    onClick={() => setRoutingOpen(true)}
                   >
-                    <PersonaAvatar name={lead.name} size="xs" />
-                    <span className="truncate">{lead.name}</span>
-                    <span className="ml-auto text-xs text-muted-foreground">Built-in</span>
+                    Routing settings
+                    <ChevronRightIcon className="ml-auto" />
                   </Button>
-                )}
-                {roles.map((identity) => (
-                  <Button
-                    key={identity.id}
-                    type="button"
-                    variant={selected === identity.id ? "secondary" : "ghost"}
-                    size="sm"
-                    className="justify-start"
-                    onClick={() => choose(identity)}
-                  >
-                    <PersonaAvatar name={identity.name} size="xs" />
-                    <span className="truncate">{identity.name}</span>
-                  </Button>
-                ))}
-              </nav>
-              <div className="flex min-w-0 flex-1 flex-col">
-                <form onSubmit={onSubmit} className="flex min-w-0 flex-col gap-3">
-                  {selected === null && (
-                    <div
-                      role="group"
-                      aria-label="Team member templates"
-                      className="flex flex-wrap items-center gap-1.5 text-sm"
-                    >
-                      <span className="text-muted-foreground">Start from a template:</span>
-                      {ROLE_TEMPLATES.map((template) => (
-                        <Button
-                          key={template.name}
-                          type="button"
-                          variant="outline"
-                          size="xs"
-                          disabled={busy}
-                          onClick={() => setDraft({ ...draft, ...template })}
-                        >
-                          {template.name}
-                        </Button>
-                      ))}
-                    </div>
-                  )}
-                  <label className="flex flex-col gap-1 text-sm">
-                    Name
-                    <Input
-                      data-testid="project-team-name"
-                      value={draft.name}
-                      maxLength={60}
-                      placeholder="e.g. PM, Designer"
-                      onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                      disabled={busy || isLead}
-                    />
-                  </label>
-                  <label className="flex flex-col gap-1 text-sm">
-                    {isLead ? "Charter" : "Instructions"}
-                    <Textarea
-                      data-testid="project-team-persona"
-                      value={draft.instructions}
-                      placeholder={
-                        isLead
-                          ? "e.g. Batch reviews into one daily summary. Prefer fewer, larger tickets."
-                          : "e.g. You are the product manager. Own scope, priorities and acceptance criteria; write tickets, don't write code."
-                      }
-                      className="min-h-36 max-h-[45dvh] text-sm"
-                      aria-invalid={tooLarge || undefined}
-                      onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
-                      disabled={busy || charterReadOnly}
-                    />
-                    <span
-                      className={
-                        tooLarge ? "text-xs text-destructive" : "text-xs text-muted-foreground"
-                      }
-                    >
-                      {bytes.toLocaleString()} /{" "}
-                      {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
-                    </span>
-                  </label>
-                  {!isLead && (
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <label className="flex flex-col gap-1 text-sm">
-                        Owns
-                        <Textarea
-                          data-testid="project-team-owns"
-                          value={draft.owns}
-                          placeholder={"One per line, e.g.\nVisual design\nUX reviews"}
-                          className="min-h-20 text-sm"
-                          onChange={(event) => setDraft({ ...draft, owns: event.target.value })}
-                          disabled={busy}
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1 text-sm">
-                        Doesn&apos;t own
-                        <Textarea
-                          data-testid="project-team-excludes"
-                          value={draft.excludes}
-                          placeholder={"One per line, e.g.\nThe roadmap\nCode review"}
-                          className="min-h-20 text-sm"
-                          onChange={(event) => setDraft({ ...draft, excludes: event.target.value })}
-                          disabled={busy}
-                        />
-                      </label>
-                    </div>
-                  )}
-                  <IdentityModelEffortFields
-                    config={project?.config}
-                    agentId={draft.agentId}
-                    model={draft.model}
-                    effort={draft.effort}
-                    disabled={busy}
-                    agentLocked={shared}
-                    defaultLabel={isLead ? "Default" : "Project default"}
-                    onChange={(next) => setDraft({ ...draft, ...next })}
+                </div>
+              )}
+            </nav>
+            <div className="flex min-w-0 flex-1 flex-col">
+              {routingOpen && canRoute ? (
+                <section
+                  className="flex flex-col gap-1"
+                  aria-labelledby="project-team-routing-title"
+                >
+                  <h3 id="project-team-routing-title" className="text-sm font-medium">
+                    Routing
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Who receives ticket events, digests and escalations, and whether the project
+                    keeps its built-in Lead.
+                  </p>
+                  <ProjectRoutingSection
+                    projectId={projectId}
+                    personas={roles}
+                    className="mt-2 border-t-0 pt-0"
                   />
-                  {!isLead && (
-                    <p
-                      className="text-xs text-muted-foreground"
-                      data-testid="project-team-own-copy"
-                    >
-                      This team member gets its own copy, so you can change its tools without
-                      touching the original.
-                    </p>
-                  )}
-                  {!isLead && !shared && selectedIdentity?.project_agent_id && (
-                    <div
-                      className="flex flex-col gap-1 rounded-md border border-border/60 p-3 text-sm"
-                      data-testid="project-team-tools"
-                    >
-                      <span className="font-medium">Tools and permissions</span>
-                      <span className="text-xs text-muted-foreground">
-                        Give this team member its own MCP servers or permission mode. Only you can
-                        change them; they apply from its next session.
-                      </span>
-                      <Link
-                        className="text-xs underline underline-offset-2"
-                        to={`/settings/custom-agents/${encodeURIComponent(selectedIdentity.project_agent_id)}`}
+                </section>
+              ) : (
+                <>
+                  <form onSubmit={onSubmit} className="flex min-w-0 flex-col gap-3">
+                    {selected === null && (
+                      <div
+                        role="group"
+                        aria-labelledby="project-team-templates-label"
+                        className="flex flex-col gap-1.5 text-sm"
                       >
-                        Edit {selectedIdentity.name}&apos;s tools and permissions
-                      </Link>
+                        <span id="project-team-templates-label">Start with a role</span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {ROLE_TEMPLATES.map((template) => (
+                            <Button
+                              key={template.name}
+                              type="button"
+                              variant="outline"
+                              size="xs"
+                              disabled={busy}
+                              onClick={() => setDraft({ ...draft, ...template })}
+                            >
+                              {template.name}
+                            </Button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <label className="flex flex-col gap-1 text-sm">
+                      Name
+                      <Input
+                        data-testid="project-team-name"
+                        value={draft.name}
+                        maxLength={60}
+                        placeholder="e.g. Designer"
+                        onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                        disabled={busy || isLead}
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-sm">
+                      {isLead ? "Charter" : "Instructions"}
+                      <Textarea
+                        data-testid="project-team-persona"
+                        value={draft.instructions}
+                        placeholder={
+                          isLead
+                            ? "e.g. Batch reviews into one daily summary. Prefer fewer, larger tickets."
+                            : "e.g. You are the product manager. Own scope, priorities and acceptance criteria; write tickets, don't write code."
+                        }
+                        className="min-h-36 max-h-[45dvh] text-sm"
+                        aria-invalid={tooLarge || undefined}
+                        onChange={(event) =>
+                          setDraft({ ...draft, instructions: event.target.value })
+                        }
+                        disabled={busy || charterReadOnly}
+                      />
+                      <span
+                        className={
+                          tooLarge ? "text-xs text-destructive" : "text-xs text-muted-foreground"
+                        }
+                      >
+                        {bytes.toLocaleString()} /{" "}
+                        {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
+                      </span>
+                    </label>
+                    {!isLead && (
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <label className="flex flex-col gap-1 text-sm">
+                          Owns
+                          <Textarea
+                            data-testid="project-team-owns"
+                            value={draft.owns}
+                            placeholder={"One per line, e.g.\nVisual design\nUX reviews"}
+                            className="min-h-20 text-sm"
+                            onChange={(event) => setDraft({ ...draft, owns: event.target.value })}
+                            disabled={busy}
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1 text-sm">
+                          Doesn&apos;t own
+                          <Textarea
+                            data-testid="project-team-excludes"
+                            value={draft.excludes}
+                            placeholder={"One per line, e.g.\nThe roadmap\nCode review"}
+                            className="min-h-20 text-sm"
+                            onChange={(event) =>
+                              setDraft({ ...draft, excludes: event.target.value })
+                            }
+                            disabled={busy}
+                          />
+                        </label>
+                      </div>
+                    )}
+                    {/* Keyed by member so each starts collapsed. */}
+                    <Collapsible
+                      key={selected ?? "new"}
+                      className="rounded-lg border border-border/60"
+                    >
+                      <CollapsibleTrigger
+                        data-testid="project-team-runtime-toggle"
+                        className="group flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-left text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+                      >
+                        <span>
+                          Agent &amp; model{" "}
+                          <span className="text-muted-foreground">
+                            · {customRuntime ? "Custom" : "Project defaults"}
+                          </span>
+                        </span>
+                        <ChevronRightIcon className="ml-auto size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
+                      </CollapsibleTrigger>
+                      <CollapsibleContent className="px-3 pb-3">
+                        <IdentityModelEffortFields
+                          config={project?.config}
+                          agentId={draft.agentId}
+                          model={draft.model}
+                          effort={draft.effort}
+                          disabled={busy}
+                          agentLocked={shared}
+                          defaultLabel={isLead ? "Default" : "Project default"}
+                          onChange={(next) => setDraft({ ...draft, ...next })}
+                        />
+                      </CollapsibleContent>
+                    </Collapsible>
+                    {!isLead && (
+                      <p
+                        className="text-xs text-muted-foreground"
+                        data-testid="project-team-own-copy"
+                      >
+                        This team member gets its own copy, so you can change its tools without
+                        touching the original.
+                      </p>
+                    )}
+                    {!isLead && !shared && selectedIdentity?.project_agent_id && (
+                      <div
+                        className="flex flex-col gap-1 rounded-md border border-border/60 p-3 text-sm"
+                        data-testid="project-team-tools"
+                      >
+                        <span className="font-medium">Tools and permissions</span>
+                        <span className="text-xs text-muted-foreground">
+                          Give this team member its own MCP servers or permission mode. Only you can
+                          change them; they apply from its next session.
+                        </span>
+                        <Link
+                          className="text-xs underline underline-offset-2"
+                          to={`/settings/custom-agents/${encodeURIComponent(selectedIdentity.project_agent_id)}`}
+                        >
+                          Edit {selectedIdentity.name}&apos;s tools and permissions
+                        </Link>
+                      </div>
+                    )}
+                    {shared && (
+                      <p
+                        className="text-xs text-muted-foreground"
+                        data-testid="project-team-agent-owner"
+                      >
+                        Only the project owner chooses the agent, since these sessions run as them.
+                      </p>
+                    )}
+                    {isLead && (
+                      <p
+                        className="text-xs text-muted-foreground"
+                        data-testid="project-team-lead-note"
+                      >
+                        The Lead is the project's built-in coordinator and can't be renamed or
+                        deleted.
+                        {charterReadOnly
+                          ? " Only the project owner edits its charter."
+                          : " Only you can edit its charter; agents can't."}{" "}
+                        The charter applies on its next turn or session start. Its agent, model and
+                        effort are also the project's defaults for new sessions, and they apply from
+                        the Lead's next session or rollover.
+                      </p>
+                    )}
+                    {selectedIdentity?.created_by_session_id && (
+                      <p
+                        className="text-xs text-muted-foreground"
+                        data-testid="project-team-agent-made"
+                      >
+                        Created by an agent, so agents can also edit it. Team members you create
+                        stay yours to edit.
+                      </p>
+                    )}
+                    <TicketError error={save.error ?? remove.error ?? identities.error} />
+                    {selected === null && (
+                      <p className="text-xs text-muted-foreground">
+                        All team members follow the project mandate.
+                      </p>
+                    )}
+                    {/* Sticky so Add stays reachable on phones while the form scrolls. */}
+                    <DialogFooter className="sticky -bottom-6 z-10 mb-0 border-t-0 bg-white pt-3 pb-6 sm:mx-0 sm:px-0 dark:bg-(--menu-surface-bg)">
+                      {selected !== null && !isLead && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          className="mr-auto text-destructive"
+                          loading={remove.isPending}
+                          disabled={busy}
+                          onClick={() => remove.mutate(selected)}
+                        >
+                          <Trash2Icon />
+                          Remove
+                        </Button>
+                      )}
+                      <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+                        Close
+                      </Button>
+                      <Button
+                        type="submit"
+                        data-testid="project-team-save"
+                        loading={save.isPending}
+                        disabled={!draft.name.trim() || tooLarge || remove.isPending}
+                      >
+                        {selected === null ? "Add member" : "Save"}
+                      </Button>
+                    </DialogFooter>
+                  </form>
+                  {selectedIdentity && !isLead && (
+                    <div className="mt-4 border-t border-border/60 pt-4">
+                      <ProjectKpiTiles
+                        projectId={projectId}
+                        identityId={selectedIdentity.id}
+                        title={`${selectedIdentity.name} KPIs`}
+                      />
                     </div>
                   )}
-                  {shared && (
-                    <p
-                      className="text-xs text-muted-foreground"
-                      data-testid="project-team-agent-owner"
-                    >
-                      Only the project owner chooses the agent, since these sessions run as them.
-                    </p>
-                  )}
-                  {isLead && (
-                    <p
-                      className="text-xs text-muted-foreground"
-                      data-testid="project-team-lead-note"
-                    >
-                      The Lead is the project's built-in coordinator and can't be renamed or
-                      deleted.
-                      {charterReadOnly
-                        ? " Only the project owner edits its charter."
-                        : " Only you can edit its charter; agents can't."}{" "}
-                      The charter applies on its next turn or session start. Its agent, model and
-                      effort are also the project's defaults for new sessions, and they apply from
-                      the Lead's next session or rollover.
-                    </p>
-                  )}
-                  {selectedIdentity?.created_by_session_id && (
-                    <p
-                      className="text-xs text-muted-foreground"
-                      data-testid="project-team-agent-made"
-                    >
-                      Created by an agent, so agents can also edit it. Team members you create stay
-                      yours to edit.
-                    </p>
-                  )}
-                  <TicketError error={save.error ?? remove.error ?? identities.error} />
-                  <DialogFooter className="border-t-0 bg-transparent">
-                    {selected !== null && !isLead && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        className="mr-auto text-destructive"
-                        loading={remove.isPending}
-                        disabled={busy}
-                        onClick={() => remove.mutate(selected)}
-                      >
-                        <Trash2Icon />
-                        Remove
-                      </Button>
-                    )}
-                    <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
-                      Close
-                    </Button>
-                    <Button
-                      type="submit"
-                      data-testid="project-team-save"
-                      loading={save.isPending}
-                      disabled={!draft.name.trim() || tooLarge || remove.isPending}
-                    >
-                      {selected === null ? "Add" : "Save"}
-                    </Button>
-                  </DialogFooter>
-                </form>
-                {selectedIdentity && !isLead && (
-                  <div className="mt-4 border-t border-border/60 pt-4">
-                    <ProjectKpiTiles
-                      projectId={projectId}
-                      identityId={selectedIdentity.id}
-                      title={`${selectedIdentity.name} KPIs`}
-                    />
-                  </div>
-                )}
-              </div>
+                </>
+              )}
             </div>
-            <ProjectRoutingSection projectId={projectId} personas={roles} />
-          </>
+          </div>
         )}
       </DialogContent>
     </Dialog>
