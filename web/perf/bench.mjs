@@ -481,9 +481,11 @@ await withLifecycle(async (scope) => {
           : null;
       if (warm && !beforeStreams.activeStreams[target])
         throw new WarmSampleInvalid(`target ${target} has no retained stream before warm switch`);
+      const marker = extraMarker ?? MARKERS[target];
+      if (await page.eval(`(document.body?.textContent ?? "").includes(${JSON.stringify(marker)})`))
+        throw new Error(`target marker was present before switching to ${target}`);
       await page.eval(`window.__resetPerf()`);
       const before = await perfMetrics(cdp);
-      const marker = extraMarker ?? MARKERS[target];
       // Armed BEFORE the click; anchors on the click itself.
       const settlePromise = page.eval(
         `window.__waitSettled(${JSON.stringify(marker)}, { timeoutMs: 25000 })`,
