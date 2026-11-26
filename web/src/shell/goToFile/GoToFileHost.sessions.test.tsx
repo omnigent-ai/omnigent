@@ -44,7 +44,13 @@ const MESSAGED = conversation("conv_messaged", "Storage cleanup", "…the upload
 const RECENT = conversation("conv_recent", "Recent work");
 
 // ⌘K's session search, as the finder calls it: what it was asked for, and its answer.
-const searches = vi.hoisted(() => ({ options: [] as unknown[], remembered: [] as string[] }));
+const searches = vi.hoisted(() => ({
+  options: [] as unknown[],
+  remembered: [] as string[],
+  // A failed group or page, as the search reports it; none by default.
+  failed: null as null | { more: boolean },
+  retries: 0,
+}));
 vi.mock("../usePaletteSessionSearch", () => ({
   usePaletteSessionSearch: (options: { open: boolean }) => {
     searches.options.push(options);
@@ -71,7 +77,12 @@ vi.mock("../usePaletteSessionSearch", () => ({
       titleSearch: paging,
       contentSearch: paging,
       searchFetching: false,
-      loadError: false,
+      loadError: searches.failed !== null,
+      loadMoreError: searches.failed?.more === true,
+      retrying: false,
+      retryLoad: () => {
+        searches.retries += 1;
+      },
       rememberSearchRow: (id: string) => searches.remembered.push(id),
     };
   },
@@ -137,6 +148,8 @@ function openSessions(query?: string) {
 beforeEach(() => {
   searches.options.length = 0;
   searches.remembered.length = 0;
+  searches.failed = null;
+  searches.retries = 0;
   fetchSessionItemsPage.mockReset();
   fetchSessionItemsPage.mockImplementation(async (sessionId: string) => ({
     hasMore: false,
@@ -167,6 +180,24 @@ describe("the finder's Sessions tab", () => {
       matchLoaded: true,
       includeArchived: false,
     });
+  });
+
+  it.each([
+    [
+      "a failed message search",
+      { more: false },
+      "Couldn't search sessions. Check your connection and try again.",
+    ],
+    ["a failed next page", { more: true }, "Couldn't load more sessions."],
+  ])("shows %s beside the matches it left, with Retry", async (_, failed, notice) => {
+    searches.failed = failed;
+    renderHost();
+    const dialog = openSessions("upload");
+
+    expect(within(dialog).getAllByRole("option")).toHaveLength(2);
+    expect(within(dialog).getByText(notice)).toHaveAttribute("role", "status");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+    expect(searches.retries).toBe(1);
   });
 
   it("lists name matches above message matches, starting on the query it was given", () => {

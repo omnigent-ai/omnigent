@@ -228,7 +228,7 @@ function OpenGoToFileDialog({
 
   const views: Record<
     GoToFileMode,
-    { items: QuickPickItem<FinderTarget>[]; emptyMessage: string; status: string | null }
+    { items: QuickPickItem<FinderTarget>[]; emptyMessage: string | null; status: string | null }
   > = {
     files: filesView,
     text: textView,
@@ -257,6 +257,11 @@ function OpenGoToFileDialog({
       // The rows come ranked: recent files first, then the best matches, or lines as found.
       segments={[{ sourceId: `go-to-file:${mode}`, ranking: "provider", items: view.items }]}
       emptyMessage={view.emptyMessage}
+      status={
+        sessions && sessionsView.failure ? (
+          <SessionsSearchFailure {...sessionsView.failure} />
+        ) : undefined
+      }
       summary={() => view.status}
       inputEnd={
         text ? (
@@ -314,5 +319,25 @@ function OpenGoToFileDialog({
         };
       }}
     />
+  );
+}
+
+/** A failed session search or page above the rows it left, with Retry, as in ⌘K's palette. */
+function SessionsSearchFailure({
+  message,
+  retrying,
+  retry,
+}: {
+  message: string;
+  retrying: boolean;
+  retry: () => void;
+}) {
+  return (
+    <p className="px-3 py-2 text-xs text-muted-foreground">
+      <span role="status">{message}</span>
+      <button type="button" className="ml-2 underline" disabled={retrying} onClick={retry}>
+        Retry
+      </button>
+    </p>
   );
 }

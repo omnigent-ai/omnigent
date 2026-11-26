@@ -24,6 +24,7 @@ export const SESSION_SEARCH_COPY = {
   empty: "No sessions match. Try other words from a message or the session's name.",
   searching: "Searching sessions…",
   failed: "Couldn't search sessions. Check your connection and try again.",
+  failedMore: "Couldn't load more sessions.",
 } as const;
 
 export const RECENT_SESSIONS_GROUP = "Recent sessions";
@@ -34,7 +35,10 @@ export type SessionsFinderTarget = SessionRowTarget | MoreRowTarget;
 
 export interface SessionsFinderView {
   items: QuickPickItem<SessionsFinderTarget>[];
-  emptyMessage: string;
+  /** Null while `failure` speaks for the list. */
+  emptyMessage: string | null;
+  /** A failed search or page, shown with Retry above whatever rows it left; null otherwise. */
+  failure: { message: string; retrying: boolean; retry: () => void } | null;
   /** The listed session behind a row, for its preview; undefined for a paging row. */
   sessionFor: (id: string) => Conversation | undefined;
   /** Keeps a found session's row so the sidebar can list it once it opens. */
@@ -65,6 +69,9 @@ export function useSessionsFinderView(active: boolean, query: string): SessionsF
     contentSearch,
     searchFetching,
     loadError,
+    loadMoreError,
+    retrying,
+    retryLoad,
   } = search;
   const typed = searchedQuery.trim() !== "";
   const items = useMemo(() => {
@@ -97,9 +104,18 @@ export function useSessionsFinderView(active: boolean, query: string): SessionsF
     contentSearch,
   ]);
 
-  let emptyMessage: string = SESSION_SEARCH_COPY.idle;
+  // Name matches can outlive a failed message search or page, so the failure never hides.
+  const failure =
+    typed && loadError
+      ? {
+          message: loadMoreError ? SESSION_SEARCH_COPY.failedMore : SESSION_SEARCH_COPY.failed,
+          retrying,
+          retry: retryLoad,
+        }
+      : null;
+  let emptyMessage: string | null = SESSION_SEARCH_COPY.idle;
   if (typed) {
-    if (loadError) emptyMessage = SESSION_SEARCH_COPY.failed;
+    if (failure) emptyMessage = null;
     else if (searchFetching || searchedQuery !== debouncedQuery) {
       emptyMessage = SESSION_SEARCH_COPY.searching;
     } else emptyMessage = SESSION_SEARCH_COPY.empty;
@@ -108,6 +124,7 @@ export function useSessionsFinderView(active: boolean, query: string): SessionsF
   return {
     items,
     emptyMessage,
+    failure,
     sessionFor: (id) =>
       [...visibleSessions, ...contentSessions].find((session) => session.id === id)?.conversation,
     rememberRow: search.rememberSearchRow,
