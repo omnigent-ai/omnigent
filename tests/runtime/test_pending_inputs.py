@@ -511,6 +511,41 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize(
+    "text,stage,interrupted,retained",
+    [
+        ("!ls", "forward_accepted", False, True),
+        ("!ls", "native_turn_started", False, True),
+        ("!ls", "native_turn_completed", False, True),
+        ("!ls", "native_turn_cancelled", False, False),
+        ("!ls", "forward_requested", False, False),
+        ("plain prompt", "forward_accepted", False, False),
+        ("!ls", "forward_accepted", True, False),
+    ],
+)
+def test_only_forwarded_uncancelled_shells_survive_pending_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    stage: str,
+    interrupted: bool,
+    retained: bool,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    pid = pending_inputs.record("conv_a", [_text_block(text)], stable_id="a" * 32)
+    pending_inputs.mark_delivery_stage("conv_a", pid, "forward_requested")
+    if stage == "forward_accepted":
+        pending_inputs.mark_delivery_stage("conv_a", pid, "forward_accepted")
+    elif stage.startswith("native_turn_"):
+        pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage=stage)  # type: ignore[arg-type]
+    if interrupted:
+        pending_inputs.mark_interrupted("conv_a", [pid])
+    now[0] += pending_inputs._TTL_S + 1
+    assert pending_inputs.pending_id_for_stable_id("conv_a", "a" * 32) == (
+        pid if retained else None
+    )
+
+
 def test_restore_returns_a_drained_entry_to_the_front() -> None:
     """A restored entry reclaims the head of the FIFO.
 
@@ -630,10 +665,16 @@ def test_stable_id_dedup_scoped_per_conversation() -> None:
     assert id_a != id_b
 
 
-def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap() -> None:
+@pytest.mark.parametrize("shell", [False, True])
+def test_record_evicts_the_oldest_entry_beyond_the_per_conversation_cap(shell: bool) -> None:
     """The queue is bounded: recording past the cap drops the oldest entry."""
     cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
-    ids = [pending_inputs.record("conv_a", [_text_block(f"m{i}")]) for i in range(cap + 2)]
+    ids = []
+    for i in range(cap + 2):
+        pid = pending_inputs.record("conv_a", [_text_block(f"{'!' if shell else ''}m{i}")])
+        if shell:
+            pending_inputs.mark_delivery_stage("conv_a", pid, "forward_accepted")
+        ids.append(pid)
 
     snapshot = pending_inputs.snapshot_for("conv_a")
 

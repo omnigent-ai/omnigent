@@ -5329,6 +5329,51 @@ async def test_post_external_assistant_message_rejects_over_length_response_id(
     assert [item["response_id"] for item in items] == [at_limit]
 
 
+@pytest.mark.parametrize("kind", ["input", "output"])
+async def test_direct_terminal_event_cannot_claim_pending_submission(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """Client-authored terminal history cannot acknowledge another queued input."""
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    pending_id = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "!ls"}], stable_id="a" * 32
+    )
+    try:
+        async with _runtime_runner(
+            lambda _request: httpx.Response(202, json={"queued": True})
+        ) as runner:
+            _route_to_runner(monkeypatch, runner)
+            response = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "terminal_command",
+                    "data": {
+                        "kind": kind,
+                        "input": "unrelated",
+                        "stdout": "result",
+                        "submission": {"pending_id": pending_id, "stable_id": "a" * 32},
+                    },
+                },
+            )
+        assert response.status_code == 202, response.text
+        history = await client.get(f"/v1/sessions/{sid}/items")
+        assert history.status_code == 200
+        [item] = [item for item in history.json()["data"] if item["type"] == "terminal_command"]
+        if kind == "input":
+            assert item["submission"] == {}
+        else:
+            assert "submission" not in item
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [pending_id]
+    finally:
+        pending_inputs.resolve(sid, pending_id)
+
+
 async def test_post_external_conversation_item_persists_and_streams_visible_items(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

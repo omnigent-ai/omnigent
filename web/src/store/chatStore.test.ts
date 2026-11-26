@@ -12163,6 +12163,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       },
     );
 
+    it.each([true, false])(
+      "settles already-restored send drafts only by stable ID (match: %s)",
+      (matches) => {
+        const stableId = "a".repeat(32);
+        const failed = { conversationId: "conv_existing", stableId, text: "!ls", files: [] };
+        const restored = { ...failed, delivered: false };
+        useChatStore.setState({
+          failedSendDraft: failed,
+          restoredSendDraft: restored,
+          pendingRetryStableId: stableId,
+        });
+        handleSessionEvent({
+          ...shellEvent("input"),
+          submission: { pendingId: "pending_shell", stableId: matches ? stableId : "b".repeat(32) },
+        });
+        const state = useChatStore.getState();
+        expect(state.failedSendDraft).toEqual(matches ? null : failed);
+        expect(state.restoredSendDraft).toEqual({ ...restored, delivered: matches });
+        expect(state.pendingRetryStableId).toBe(matches ? null : stableId);
+      },
+    );
+
     it("does not give a later same-text receipt credit for a modern shell", () => {
       useChatStore.setState({ pendingUserMessages: [sent(1, "!ls")] });
       handleSessionEvent({ ...shellEvent("input"), submission: { pendingId: "pending_1" } });

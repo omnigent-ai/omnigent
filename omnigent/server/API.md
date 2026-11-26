@@ -1680,6 +1680,8 @@ remove only the submission named by the input's server-owned `submission`:
 `stable_id`, when supplied by the sender, also correlates an optimistic bubble
 before the POST response arrives. This identity is persisted with the item and
 included in live events and history, so reconnect can acknowledge a missed input.
+Forwarded shell submissions retain correlation beyond the pending-entry cleanup
+timeout while awaiting their mirror; cancellation and the existing queue cap still apply.
 An empty `submission: {}` explicitly means no web entry was consumed. Missing
 `submission` means a legacy record; clients must not infer history acknowledgements
 from command text. Output items carry no submission identity. During a mixed-version

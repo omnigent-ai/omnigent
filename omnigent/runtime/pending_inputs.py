@@ -99,6 +99,9 @@ persist site records it as undelivered; :data:`_TTL_S` bounds a ghost no
 later message follows: stale entries are evicted lazily on the next
 :func:`record` / :func:`snapshot_for` / :func:`resolve_oldest` for the
 same conversation.
+
+Forwarded shell commands can wait behind a native turn longer than the TTL.
+Their identities remain matchable until a mirror, cancellation, or cap eviction.
 """
 
 from __future__ import annotations
@@ -117,10 +120,9 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
-# A pending entry is evicted this many seconds after it was recorded
-# if it was never drained by a matching persisted message. Covers the
-# vendor-TUI-never-accepted-the-message ghost; long enough that a slow
-# transcript round-trip on a busy session still drains normally.
+# Expire ghost inputs after ten minutes. Forwarded shells can wait behind
+# a native turn longer; retain their identities until settled or cancelled.
+# The per-conversation cap still applies.
 _TTL_S: float = 600.0
 
 # Hard cap on unheld queued entries per conversation, enforced by
@@ -337,9 +339,25 @@ _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
+def _awaits_shell_mirror(entry: _Entry) -> bool:
+    """Expiry cannot recall a shell already queued behind a native turn."""
+    return (
+        not entry.interrupted
+        and bool(_shell_command_text(entry.content))
+        and entry.last_delivery_stage
+        in {
+            "forward_accepted",
+            "native_turn_started",
+            "native_turn_accepted",
+            "native_turn_completed",
+        }
+        and entry.cause_class not in {"rejected_before_handoff", "rejected_by_native"}
+    )
+
+
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
     """
-    Drop entries older than :data:`_TTL_S` for one conversation.
+    Drop expired entries, except forwarded shells still awaiting their mirror.
 
     Caller must hold :data:`_lock`. Pops the conversation key entirely
     once its last entry is evicted so :func:`snapshot_for` returns an
@@ -352,7 +370,11 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
     entries = _pending.get(conversation_id)
     if entries is None:
         return
-    stale = [pid for pid, entry in entries.items() if now - entry.created_at > _TTL_S]
+    stale = [
+        pid
+        for pid, entry in entries.items()
+        if now - entry.created_at > _TTL_S and not _awaits_shell_mirror(entry)
+    ]
     for pid in stale:
         entries.pop(pid, None)
     if not entries:
