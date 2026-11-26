@@ -1,12 +1,5 @@
-"""E2E: Go to File finds a workspace file from the keyboard and opens it in the tabs sidebar.
-
-With ``workspace_sidebar_v2`` on, the Files page's "Go to file" button, ⌘K's "Go to File in
-Workspace…" row and its chord open one dialog. The workspace's own search answers each
-query, and the active match is previewed beside the list; a file opened from anywhere is
-listed first the next time. Its Text tab, which the text-search chord opens, finds lines and
-opens a file at one, or hands the search to the sidebar's Search page. Ranking and the
-dialog's states are in the unit tests (``goToFileView``, ``textSearchView``, ``GoToFileHost``).
-"""
+"""E2E: Go to File and its Text tab search the session runner's real workspace from the browser,
+and open what they find in the tabs sidebar."""
 
 from __future__ import annotations
 
@@ -14,14 +7,12 @@ import re
 from collections.abc import Iterator
 
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail
-from tests.e2e_ui.files._files_page import seeded_workspace
-from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app, _set_flag
+from tests.e2e_ui.files._files_page import is_mac, open_workspace, seeded_workspace
+from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _open_app
 
 _FILES = ("widgets/gadget.py", "widgets/gizmo.py", "README.md")
-_DESKTOP = {"width": 1440, "height": 900}
 
 
 @pytest.fixture
@@ -31,36 +22,21 @@ def go_to_file_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, s
         yield seeded_session
 
 
-def _mac(page: Page) -> bool:
-    return bool(page.evaluate("() => /Mac|iPhone|iPad/.test(navigator.platform)"))
-
-
 def _go_to_file_chord(page: Page) -> str:
     """``palette.files``: ⌃⌘P on the Mac, Ctrl+Alt+Shift+P elsewhere."""
-    return "Control+Meta+p" if _mac(page) else "Control+Alt+Shift+p"
+    return "Control+Meta+p" if is_mac(page) else "Control+Alt+Shift+p"
 
 
 def _text_search_chord(page: Page) -> str:
     """``palette.text``: ⌃⌘O on the Mac, Ctrl+Alt+O elsewhere."""
-    return "Control+Meta+o" if _mac(page) else "Control+Alt+o"
-
-
-def _open_workspace(page: Page, base_url: str, session_id: str) -> Locator:
-    # The server answers with content search on, and `_set_flag` keeps the rest as it is.
-    _set_flag(page, True)
-    page.set_viewport_size(_DESKTOP)
-    page.goto(f"{base_url}/c/{session_id}")
-    open_right_rail(page)
-    sidebar = page.get_by_role("complementary", name="Workspace")
-    expect(sidebar.get_by_role("group", name="Workspace history")).to_be_visible(timeout=60_000)
-    return sidebar
+    return "Control+Meta+o" if is_mac(page) else "Control+Alt+o"
 
 
 def test_go_to_file_opens_a_match_from_every_entry_point_and_lists_it_next_time(
     page: Page, go_to_file_session: tuple[str, str]
 ) -> None:
     base_url, session_id = go_to_file_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     query = page.get_by_role("combobox", name="Go to a file")
 
     # A narrow Files tab with no file open is the tree; hidden, the page offers Go to file,
@@ -120,7 +96,7 @@ def test_text_search_finds_a_line_opens_it_there_and_hands_off_to_the_search_pag
     """Where the session's files can be searched for text, Go to File's Text tab searches what was
     typed in Files, and the text-search chord opens it on Text."""
     base_url, session_id = go_to_file_session
-    sidebar = _open_workspace(page, base_url, session_id)
+    sidebar = open_workspace(page, base_url, session_id)
     query = page.get_by_role("combobox", name="Search text in files")
 
     # Typed in Files, the same text searches the files' contents once the Text tab is clicked.
