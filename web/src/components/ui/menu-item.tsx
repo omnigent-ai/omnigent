@@ -73,11 +73,7 @@ export function withMenuShortcut(
   };
 }
 
-/**
- * A menu row's content with `description` as a quieter line under it, such as why a disabled
- * row can't run, then `shortcut`'s chord, with the `aria-describedby` and `aria-keyshortcuts`
- * that read them. Rows with neither render their content unchanged.
- */
+/** Adds an accessible description and optional shortcut to a menu row. */
 export function describedWithShortcut(
   children: ReactNode,
   description: ReactNode,
