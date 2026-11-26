@@ -1664,16 +1664,19 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
         pages.clear()
         with pytest.raises(RuntimeError, match="NULL rrule"):
             command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
+        assert len(pages) == 2
+        assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
+        assert not ddl_statements, "The guard changed the schema before finding a ruleless task"
+        with engine.begin() as conn:
+            conn.execute(tasks.delete().where(tasks.c.rrule.is_(None)))
+        pages.clear()
+        command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
+        assert len(pages) == 2
+        assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
     finally:
         sa.event.remove(sa.engine.Engine, "commit", boundary)
         sa.event.remove(sa.engine.Engine, "rollback", boundary)
         sa.event.remove(sa.engine.Engine, "before_cursor_execute", observe)
-    assert len(pages) == 2
-    assert len(set(pages)) == 2, "The guard accumulated pages in one transaction"
-    assert not ddl_statements, "The guard changed the schema before finding a ruleless task"
-    with engine.begin() as conn:
-        conn.execute(tasks.delete().where(tasks.c.id != b"a" * 16))
-    command.downgrade(config, _TRIGGER_CONFIG_PREVIOUS)
     inspector = sa.inspect(engine)
     task_columns = {c["name"]: c for c in inspector.get_columns("scheduled_tasks")}
     assert "trigger_config" not in task_columns
@@ -1684,10 +1687,19 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
         i["name"] for i in inspector.get_indexes("scheduled_tasks")
     }
     assert "scheduled_task_event_receipts" not in inspector.get_table_names()
-    # The rebuilt tables keep the scheduled task and its run.
+    # The rebuilt tables keep every valid task, including deleted tasks, and both runs.
     with engine.connect() as conn:
-        assert conn.execute(sa.select(before.c.id, before.c.rrule)).all() == [
-            (b"a" * 16, "FREQ=DAILY")
+        assert conn.execute(
+            sa.select(before.c.id, before.c.rrule).order_by(before.c.id)
+        ).all() == [(index.to_bytes(16, "big"), "FREQ=DAILY") for index in range(1, 501)] + [
+            ((10**6).to_bytes(16, "big"), "FREQ=DAILY"),
+            (b"a" * 16, "FREQ=DAILY"),
         ]
+        assert (
+            conn.execute(
+                sa.select(before.c.state).where(before.c.id == (10**6).to_bytes(16, "big"))
+            ).scalar_one()
+            == 3
+        )
         old_runs = sa.Table("scheduled_task_runs", sa.MetaData(), autoload_with=engine)
         assert sorted(conn.execute(sa.select(old_runs.c.id)).scalars()) == [b"k" * 16, b"r" * 16]
