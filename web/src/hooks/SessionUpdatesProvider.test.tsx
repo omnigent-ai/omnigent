@@ -2053,6 +2053,32 @@ describe("SessionUpdatesProvider sub-agent list refetches that must keep working
     await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
   });
 
+  it("does not restart a failed list's retry while it is in flight", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockRejectedValueOnce(new Error("503 Service Unavailable"))
+      .mockImplementation(() => new Promise(() => {}));
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const running = subagentRow("child_1", "conv_a", "running");
+
+    act(() => handler({ type: "snapshot", items: [subagentRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [running] }));
+    await waitFor(() =>
+      expect(client.getQueryState(childSessionsQueryKey("conv_a"))?.status).toBe("error"),
+    );
+    act(() => handler({ type: "snapshot", items: [running] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(3));
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), running] }));
+    await act(async () => {});
+    expect(fetchChildren).toHaveBeenCalledTimes(3);
+  });
+
   it("refetches a list whose first fetch was in flight when its child's row changed", async () => {
     // Invalidation joins a first fetch instead of restarting it, so the next
     // frame restating the row must refetch past the older response.

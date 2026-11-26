@@ -648,12 +648,13 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
               .getQueryCache()
               .find({ queryKey: childSessionsQueryKey(item.parent_session_id), exact: true });
             const seen = childRowFingerprintsRef.current.get(item.id);
-            // Expiry re-reads membership a discovery push may have missed;
-            // a failed list keeps retrying on later frames.
+            // Expiry re-reads membership a discovery push may have missed. A failed
+            // list retries on later frames, without restarting a retry in flight.
+            const retrying = parentList?.state.status === "error";
             if (
               seen?.row === fingerprint &&
               now - seen.at < CHILD_ROW_RECHECK_MS &&
-              parentList?.state.status !== "error"
+              (!retrying || parentList?.state.fetchStatus === "fetching")
             ) {
               continue;
             }
