@@ -49,7 +49,6 @@ import {
   saveAskUserQuestionDraft,
 } from "@/lib/askUserQuestionDrafts";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
-import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
   isConversationUnseen,
