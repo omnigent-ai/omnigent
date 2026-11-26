@@ -8134,6 +8134,25 @@ def _native_startup_instructions_from_spec(
     return build_native_startup_instructions(spec)
 
 
+async def _antigravity_startup_agent_spec(
+    session_id: str,
+    resolve: Callable[[str], Awaitable[AgentSpec | None]],
+) -> AgentSpec | None:
+    """Keep Antigravity recovery available during a transient bundle-fetch failure."""
+    from omnigent.runner._entry import AgentSpecFetchError
+
+    try:
+        return await resolve(session_id)
+    except AgentSpecFetchError:
+        _logger.warning(
+            "Could not fetch Antigravity startup instructions; continuing with framework "
+            "guidance: session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
+
+
 async def _native_startup_instructions(
     agent_spec: AgentSpec | ResolvedSpec | None,
     server_client: httpx.AsyncClient | None,

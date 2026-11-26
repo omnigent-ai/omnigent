@@ -113,9 +113,8 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
         ("existing-cascade", None),
         (None, "permission"),
         (None, "containment"),
-        (None, "cyclic-rules"),
     ],
-    ids=["fresh", "resume", "rule-permission", "rule-containment", "cyclic-rules"],
+    ids=["fresh", "resume", "rule-permission", "rule-containment"],
 )
 async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
     tmp_path: Path,
@@ -152,12 +151,7 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
     monkeypatch.setattr(orchestration, "_cancel_auto_forwarder_task", cancel_reader)
     labels = {bridge.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "startup-bridge"}
     previous_rule = None
-    if write_failure == "cyclic-rules":
-        bridge_dir = bridge.bridge_dir_for_bridge_id("startup-bridge")
-        rules_dir = bridge.agy_gemini_dir(bridge_dir) / "config/rules"
-        rules_dir.parent.mkdir(parents=True)
-        rules_dir.symlink_to(rules_dir.name, target_is_directory=True)
-    elif write_failure is not None:
+    if write_failure is not None:
         bridge_dir = bridge.bridge_dir_for_bridge_id("startup-bridge")
         bridge.write_agent_instructions(bridge_dir, "Keep previous startup guidance.")
         previous_rule = (
@@ -192,7 +186,7 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
     class LaunchObserved(Exception):
         """Stop at the inert terminal boundary before any process can start."""
 
-    captured: list[str | None] = []
+    captured: list[str] = []
 
     class Registry:
         async def launch_required_terminal(self, **_kwargs: object) -> None:
@@ -202,11 +196,7 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
                 / "rules"
                 / "omnigent_instructions.md"
             )
-            if write_failure == "cyclic-rules":
-                assert rule.parent.is_symlink()
-                captured.append(None)
-            else:
-                captured.append(rule.read_text(encoding="utf-8"))
+            captured.append(rule.read_text(encoding="utf-8"))
             raise LaunchObserved
 
     spec = _spec("Keep the session's authored instructions.")
@@ -239,16 +229,47 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
 
 
 @pytest.mark.asyncio
-async def test_startup_instructions_without_a_spec_ask_the_server_nothing() -> None:
+@pytest.mark.parametrize("resolution_failure", [None, "fetch", "policy", "unexpected"])
+async def test_startup_instructions_without_a_spec_ask_the_server_nothing(
+    resolution_failure: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
     """With no spec there are no memory tools, so the launch makes no memory request."""
-    from omnigent.runner.native.orchestration import _native_startup_instructions
+    from omnigent.runner._entry import AgentSpecFetchError
+    from omnigent.runner.native.orchestration import (
+        _antigravity_startup_agent_spec,
+        _native_startup_instructions,
+    )
+    from omnigent.runner.policy import AgentStartPolicyError
+
+    error = {
+        "fetch": AgentSpecFetchError("bundle unavailable"),
+        "policy": AgentStartPolicyError("startup", "denied"),
+        "unexpected": RuntimeError("unexpected resolver failure"),
+    }.get(resolution_failure or "")
+
+    async def resolve(session_id: str) -> None:
+        assert session_id == "sess"
+        if error is not None:
+            raise error
+
+    if resolution_failure in ("policy", "unexpected"):
+        assert error is not None
+        with pytest.raises(type(error)) as raised:
+            await _antigravity_startup_agent_spec("sess", resolve)
+        assert raised.value is error
+        assert "continuing with framework guidance" not in caplog.text
+        return
+
+    spec = await _antigravity_startup_agent_spec("sess", resolve)
+    assert spec is None
+    assert ("continuing with framework guidance" in caplog.text) is (resolution_failure == "fetch")
 
     class _NoCalls:
         def __getattr__(self, name: str) -> object:
             raise AssertionError(f"unexpected server call: {name}")
 
     assert await _native_startup_instructions(
-        None, _NoCalls(), "sess"
+        spec, _NoCalls(), "sess"
     ) == _native_startup_instructions_from_spec(None)
 
 

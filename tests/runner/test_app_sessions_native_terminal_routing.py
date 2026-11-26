@@ -955,13 +955,16 @@ async def test_create_session_repl_terminal_dispatch(
 
 
 @pytest.mark.parametrize(
-    ("terminal_name", "cached_predecessor", "sub_agent_name"),
+    ("terminal_name", "cached_predecessor", "sub_agent_name", "resolution_failure"),
     [
-        pytest.param("claude", False, "worker", id="claude-False"),
-        pytest.param("claude", True, "worker", id="claude-True"),
-        pytest.param("antigravity", False, "worker", id="antigravity-False"),
-        pytest.param("antigravity", True, "worker", id="antigravity-True"),
-        pytest.param("antigravity", False, "missing-worker", id="antigravity-missing-child"),
+        pytest.param("claude", False, "worker", None, id="claude-False"),
+        pytest.param("claude", True, "worker", None, id="claude-True"),
+        pytest.param("antigravity", False, "worker", None, id="antigravity-False"),
+        pytest.param("antigravity", True, "worker", None, id="antigravity-True"),
+        pytest.param("antigravity", False, "missing-worker", None, id="antigravity-missing-child"),
+        pytest.param("antigravity", False, "worker", "fetch", id="antigravity-fetch-failure"),
+        pytest.param("antigravity", False, "worker", "auth", id="antigravity-auth-failure"),
+        pytest.param("antigravity", False, "worker", "policy", id="antigravity-policy-failure"),
     ],
 )
 @pytest.mark.asyncio
@@ -971,6 +974,8 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     cached_predecessor: bool,
     terminal_name: str,
     sub_agent_name: str,
+    resolution_failure: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Ensure route detects a dead-but-registered pane and auto-creates.
 
@@ -1004,7 +1009,28 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
 
     async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
         assert (agent_id, session_id) == ("agent-root", sid)
+        if resolution_failure in ("fetch", "auth"):
+            from omnigent.runner._entry import _AgentSpecCache, _resolve_agent_spec_from_server
+
+            async with httpx.AsyncClient(
+                base_url="http://server.invalid",
+                transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(503 if resolution_failure == "fetch" else 403)
+                ),
+            ) as client:
+                await _resolve_agent_spec_from_server(
+                    client, _AgentSpecCache(tmp_path / "bundle-cache"), agent_id, session_id
+                )
+            raise AssertionError("The bundle fetch must fail")
         return root
+
+    if resolution_failure == "policy":
+        from omnigent.runner.policy import AgentStartPolicyError
+
+        async def reject_start(*_args: object, **_kwargs: object) -> None:
+            raise AgentStartPolicyError("startup", "denied")
+
+        monkeypatch.setattr("omnigent.runner.app._apply_agent_start_gate", reject_start)
 
     class SnapshotClient(NullServerClient):
         async def get(self, url: str, **kwargs: Any):
@@ -1028,10 +1054,13 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         auto_create_calls.append(session_id)
         if terminal_name == "antigravity":
             selected = kwargs["agent_spec"]
-            assert isinstance(selected, AgentSpec)
-            expected = child if sub_agent_name == "worker" else root
-            assert selected.name == expected.name
-            assert selected.instructions == expected.instructions
+            if resolution_failure == "fetch":
+                assert selected is None
+            else:
+                assert isinstance(selected, AgentSpec)
+                expected = child if sub_agent_name == "worker" else root
+                assert selected.name == expected.name
+                assert selected.instructions == expected.instructions
 
         return SessionResourceView(
             id=f"terminal_{terminal_name}_main",
@@ -1099,6 +1128,13 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
             },
         )
 
+    if resolution_failure in ("auth", "policy"):
+        assert resp.status_code == 500, resp.text
+        assert auto_create_calls == []
+        assert "continuing with framework guidance" not in caplog.text
+        return
+    if resolution_failure == "fetch":
+        assert "Could not fetch Antigravity startup instructions" in caplog.text
     assert resp.status_code == 200, resp.text
     assert resp.json()["name"] == "re-created", (
         f"Expected ensure to auto-create after dead pane; got {resp.json()['name']!r}"
