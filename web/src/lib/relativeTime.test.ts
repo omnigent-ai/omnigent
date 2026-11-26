@@ -96,6 +96,11 @@ describe("formatMessageTimestamp", () => {
 describe("longRelativeTime", () => {
   it.each([
     ["seconds", NOW - 30_000, "30 seconds ago"],
+    ["a minute at 60 seconds", NOW - MIN, "1 minute ago"],
+    ["minutes", NOW - 5 * MIN, "5 minutes ago"],
+    ["an hour at 60 minutes", NOW - HR, "1 hour ago"],
+    ["hours", NOW - 3 * HR, "3 hours ago"],
+    ["yesterday", NOW - DAY, "yesterday"],
     ["days", NOW - 4 * DAY, "4 days ago"],
     ["months", NOW - 90 * DAY, "3 months ago"],
     ["years, not dozens of months", NOW - 3 * 365 * DAY, "3 years ago"],
@@ -103,7 +108,8 @@ describe("longRelativeTime", () => {
     expect(longRelativeTime(time, NOW)).toBe(label);
   });
 
-  it.each([NaN, Date.parse(""), Infinity])("has no label for the time %s", (time) => {
+  // `Date.parse("")`, a missing timestamp, is NaN.
+  it.each([NaN, Infinity])("has no label for the time %s", (time) => {
     expect(longRelativeTime(time, NOW)).toBe("");
     expect(longRelativeTime(NOW, time)).toBe("");
   });

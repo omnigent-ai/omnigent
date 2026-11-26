@@ -41,11 +41,13 @@ import {
   grantSharePermission,
   LEVEL_EDIT,
   LEVEL_OWNER,
+  LEVEL_READ,
   revokeSharePermission,
 } from "@/lib/permissionsApi";
 import { useSession } from "./useSession";
 import {
   pullRequestChangeAccess,
+  useCanChangePullRequests,
   useCanEdit,
   useCanStartSideChat,
   useIsSessionOwner,
@@ -293,5 +295,25 @@ describe("pullRequestChangeAccess", () => {
     expect(pullRequestChangeAccess(session as Partial<Session> as Session | null, isLoading)).toBe(
       access,
     );
+  });
+});
+
+describe("useCanChangePullRequests", () => {
+  it.each([
+    ["allows an owner who can edit", { ...makeSession(LEVEL_OWNER), sideChatAllowed: true }, true],
+    [
+      "refuses the server's owner with read-only access",
+      { ...makeSession(LEVEL_READ), sideChatAllowed: true },
+      false,
+    ],
+    [
+      "refuses an editor the server says isn't the owner",
+      { ...makeSession(LEVEL_EDIT), sideChatAllowed: false },
+      false,
+    ],
+    ["allows a single-user server with no levels", makeSession(null), true],
+  ] as const)("%s", (_label, session, allowed) => {
+    setHooks({ session: session as Session, conversations: [makeConv(session.permissionLevel)] });
+    expect(renderHook(() => useCanChangePullRequests("conv_1")).result.current).toBe(allowed);
   });
 });
