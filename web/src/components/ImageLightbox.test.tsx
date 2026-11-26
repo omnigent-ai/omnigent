@@ -518,4 +518,22 @@ describe("closeLightboxShowing", () => {
     renderWithProvider().unmount();
     expect(() => closeLightboxShowing("/pic.png")).not.toThrow();
   });
+
+  it("still closes the newer provider's lightbox after an older one unmounts", () => {
+    const older = render(
+      <ImageLightboxProvider>
+        <ZoomableImage src="/old.png" alt="older" />
+      </ImageLightboxProvider>,
+    );
+    render(
+      <ImageLightboxProvider>
+        <ZoomableImage src="/new.png" alt="newer" />
+      </ImageLightboxProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Zoom image: newer" }));
+    older.unmount();
+
+    act(() => closeLightboxShowing("/new.png"));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
 });

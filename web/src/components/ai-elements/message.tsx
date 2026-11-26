@@ -344,7 +344,9 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
   renderLocalReviewComment?: (comment: Comment) => ReactNode;
   /**
    * Rehype plugins that run once sanitizing and hardening are done, for markup the caller's own
-   * components draw, such as GitHub's alerts in a pull request comment. Pass a stable array.
+   * components draw, such as GitHub's alerts in a pull request comment. Their output isn't
+   * sanitized or hardened again, so a plugin must vet any URL or attribute it takes from the
+   * Markdown. Pass a stable array.
    */
   rehypePluginsAfterSanitizing?: NonNullable<StreamdownProps["rehypePlugins"]>;
 };

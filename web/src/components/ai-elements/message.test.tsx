@@ -155,12 +155,10 @@ describe("MessageResponse", () => {
       );
     });
 
-    it.each([
-      ["omitted", undefined],
-      ["empty", []],
-    ])("keeps blocking external images with the plugins %s", async (_case, plugins) => {
+    // Without the prop, "blocks external image markdown and renders a placeholder" covers this.
+    it("keeps blocking external images with an empty list", async () => {
       render(
-        <MessageResponse rehypePluginsAfterSanitizing={plugins}>
+        <MessageResponse rehypePluginsAfterSanitizing={[]}>
           {"![leak](https://attacker.example/pixel.png) IMAGE"}
         </MessageResponse>,
       );
