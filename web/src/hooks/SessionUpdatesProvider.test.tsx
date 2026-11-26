@@ -1948,3 +1948,108 @@ describe("SessionUpdatesProvider sub-agent tree refetches", () => {
     expect(childListInvalidations(invalidate, "conv_a")).toHaveLength(2);
   });
 });
+
+describe("SessionUpdatesProvider sub-agent list refetches that must keep working", () => {
+  function subagentRow(id: string, parentId: string, status = "idle") {
+    return { ...conv(id), parent_session_id: parentId, status };
+  }
+
+  // An observed child list for `parentId`, as a mounted tree view holds it.
+  function observeChildList(
+    client: QueryClient,
+    parentId: string,
+    fetchChildren: () => Promise<{ id: string }[]>,
+    childIds: string[],
+  ) {
+    const stop = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey(parentId),
+      queryFn: fetchChildren,
+      initialData: childIds.map((id) => ({ id })),
+      staleTime: Infinity,
+      retry: false,
+    }).subscribe(() => {});
+    onTestFinished(stop);
+  }
+
+  it("refetches each time a child's row changes, including back to an earlier value", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "snapshot", items: [subagentRow("child_1", "conv_a")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "changed", items: [subagentRow("child_1", "conv_a", "running")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+    act(() => handler({ type: "changed", items: [subagentRow("child_1", "conv_a", "idle")] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(3));
+  });
+
+  it("refetches only the list of the parent whose child changed", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a", "conv_b"]);
+    const fetchA = vi.fn(async () => [{ id: "child_a" }]);
+    const fetchB = vi.fn(async () => [{ id: "child_b" }]);
+    observeChildList(client, "conv_a", fetchA, ["child_a"]);
+    observeChildList(client, "conv_b", fetchB, ["child_b"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+
+    act(() => handler({ type: "changed", items: [subagentRow("child_a", "conv_a", "running")] }));
+    await waitFor(() => expect(fetchA).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fetchB).not.toHaveBeenCalled();
+  });
+
+  it("refetches the parent of a child that left the watch-set and came back", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const row = subagentRow("child_1", "conv_a");
+
+    act(() => handler({ type: "snapshot", items: [row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    // A watch-set without the child, then with it again, unchanged.
+    act(() => handler({ type: "snapshot", items: [conv("conv_a")] }));
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches the parent of a removed child that is streamed again", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const row = subagentRow("child_1", "conv_a");
+
+    act(() => handler({ type: "snapshot", items: [row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    act(() => handler({ type: "removed", ids: ["child_1"] }));
+    act(() => handler({ type: "changed", items: [row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(2));
+  });
+
+  it("refetches a list mounted after its rows were first streamed", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const row = subagentRow("child_1", "conv_a");
+
+    // Streamed while no tree view shows conv_a's children.
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
+    const fetchChildren = vi.fn(async () => [{ id: "child_1" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+  });
+});
