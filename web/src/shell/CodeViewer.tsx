@@ -82,6 +82,8 @@ import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { PreviewCommentBanner } from "./PreviewCommentBanner";
+import { rehypeSourceOffsets } from "./markdownPreviewSource";
+import { useMarkdownPreviewComments } from "./useMarkdownPreviewComments";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
@@ -176,6 +178,11 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   // `language-math` code nodes as plain text; KaTeX then renders that trusted
   // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
   MATH_PLUGIN.rehypePlugin,
+];
+// Last, so only text that came from the source (not KaTeX output) is tagged.
+const COMMENTABLE_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+  ...(MARKDOWN_REHYPE_PLUGINS ?? []),
+  rehypeSourceOffsets,
 ];
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
@@ -279,8 +286,11 @@ function MarkdownPreview({
   tocOpen,
   onTocOpenChange,
   deferOffscreen = false,
+  sourceOffsets = false,
 }: {
   content: string;
+  /** Tag rendered text with source offsets so comments can anchor to it. */
+  sourceOffsets?: boolean;
   /** Skip layout of off-screen blocks; large documents otherwise lay out in full on open. */
   deferOffscreen?: boolean;
   /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
@@ -296,13 +306,13 @@ function MarkdownPreview({
     () => (
       <ReactMarkdown
         remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        rehypePlugins={sourceOffsets ? COMMENTABLE_REHYPE_PLUGINS : MARKDOWN_REHYPE_PLUGINS}
         components={MARKDOWN_COMPONENTS}
       >
         {normalizeExplicitMathDelimiters(content)}
       </ReactMarkdown>
     ),
-    [content],
+    [content, sourceOffsets],
   );
   return (
     <div className="flex h-full">
@@ -352,7 +362,15 @@ function PreviewWithSearch({
   onTocOpenChange,
   commentHint,
   deferOffscreen,
+  comments,
 }: {
+  /** Saved comments and the selection, so the Markdown preview itself takes comments. */
+  comments?: {
+    comments: readonly Comment[];
+    activeSelection: ActiveSelection | null;
+    onSetActiveSelection: (selection: ActiveSelection | null) => void;
+    canEdit: boolean;
+  };
   content: string;
   deferOffscreen?: boolean;
   /** Workspace path of the previewed file, for resolving relative links. */
@@ -379,6 +397,24 @@ function PreviewWithSearch({
   // The preview div (not the FileViewer content area) is the real scroller
   // here, so scroll persistence attaches to it directly.
   const handleScroll = useScrollRestore(previewRef, scrollKey, scrollReady);
+  // Offsets are only exact when the rendered source is the file itself; math
+  // delimiter rewriting and truncation shift them, and very large files skip the
+  // per-run tagging, so those keep the Edit hint.
+  const commentable =
+    !!comments &&
+    !isNotebook &&
+    !truncated &&
+    !deferOffscreen &&
+    normalizeExplicitMathDelimiters(content) === content;
+  const addCommentButton = useMarkdownPreviewComments({
+    rootRef: previewRef,
+    content,
+    enabled: commentable,
+    canEdit: comments?.canEdit ?? false,
+    comments: comments?.comments ?? EMPTY_COMMENTS,
+    activeSelection: comments?.activeSelection ?? null,
+    onSetActiveSelection: comments?.onSetActiveSelection,
+  });
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
@@ -399,6 +435,7 @@ function PreviewWithSearch({
       tocOpen={tocOpen}
       onTocOpenChange={onTocOpenChange}
       deferOffscreen={deferOffscreen}
+      sourceOffsets={commentable}
     />
   );
   // The find bar sits above the preview; a truncated preview also shows the
@@ -409,13 +446,14 @@ function PreviewWithSearch({
       {truncated && <TruncatedBanner />}
       {/* A truncated file can't be edited (or commented on) in the editor
           either, so the hint would send the user to a dead end — suppress it. */}
-      {commentHint && !truncated && (
+      {commentHint && !truncated && !commentable && (
         <PreviewCommentBanner
           conversationId={commentHint.conversationId}
           onSwitchToEdit={commentHint.onSwitchToEdit}
         />
       )}
       <div className="min-h-0 flex-1">{preview}</div>
+      {addCommentButton}
     </div>
   );
 }
@@ -1030,6 +1068,12 @@ export function CodeViewer({
             ? { conversationId, onSwitchToEdit: onRequestEditMode }
             : undefined
         }
+        comments={{
+          comments: previewComments,
+          activeSelection,
+          onSetActiveSelection,
+          canEdit,
+        }}
       />
     );
   }

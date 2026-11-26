@@ -144,6 +144,7 @@ interface ViewerOptions {
   mediaActive?: boolean;
   position?: { line: number; endLine?: number };
   onRequestEditMode?: () => void;
+  onSetActiveSelection?: (selection: { start_index: number; end_index: number } | null) => void;
 }
 
 function renderViewer(
@@ -169,7 +170,7 @@ function viewerElement(content: string, panelOpen: boolean, path: string, opts: 
       fileQuery={makeFileQuery(content, opts.truncated)}
       comments={[]}
       activeSelection={null}
-      onSetActiveSelection={() => {}}
+      onSetActiveSelection={opts.onSetActiveSelection ?? (() => {})}
       panelOpen={panelOpen}
       mediaActive={opts.mediaActive}
       searchOpen={false}
@@ -533,12 +534,12 @@ describe("CodeViewer markdown preview links", () => {
       ["cdn", "//cdn.example.com/docs"],
       ["mail", "mailto:docs@example.com"],
     ]) {
-      const link = screen.getByText(text);
+      const link = screen.getByText(text).closest("a")!;
       expect(link.getAttribute("href")).toBe(href);
       expect(link.getAttribute("target")).toBe("_blank");
       expect(link.getAttribute("rel")).toBe("noopener noreferrer");
     }
-    const anchor = screen.getByText("below");
+    const anchor = screen.getByText("below").closest("a")!;
     expect(anchor.getAttribute("href")).toBe("#usage");
     expect(anchor.getAttribute("target")).toBeNull();
     expect(openFile).not.toHaveBeenCalled();
@@ -568,17 +569,44 @@ describe("CodeViewer markdown preview links", () => {
   });
 });
 
+describe("CodeViewer markdown preview comments", () => {
+  it("takes a comment on a preview selection, anchored to the source", () => {
+    const source = "# Plan\n\nShip the **weekly** report today.\n";
+    const onSetActiveSelection = vi.fn();
+    renderViewer(source, true, "notes.md", {
+      viewMode: "preview",
+      onRequestEditMode: () => {},
+      onSetActiveSelection,
+    });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+    const weekly = screen.getByText("weekly").firstChild!;
+    const range = document.createRange();
+    range.setStart(weekly, 0);
+    range.setEnd(weekly, "weekly".length);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseUp(weekly.parentElement!);
+    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
+    expect(onSetActiveSelection).toHaveBeenCalledWith({
+      start_index: source.indexOf("weekly"),
+      end_index: source.indexOf("weekly") + "weekly".length,
+      anchor_content: "weekly",
+    });
+  });
+});
+
 describe("CodeViewer markdown preview comment hint", () => {
-  // The rendered preview can't anchor text-selection comments, so it points the
-  // user at the editor instead of offering a second, fuzzier comment surface.
-  it("shows the switch-to-edit hint in markdown preview", () => {
-    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+  // `\(…\)` math is rewritten before rendering, so offsets would drift; such a
+  // preview points the user at the editor instead of taking comments itself.
+  const MATH_DOC = "Euler: \\(e^{i\\pi} = -1\\)";
+  it("shows the switch-to-edit hint when the preview can't map to source", () => {
+    renderViewer(MATH_DOC, true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
     expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeDefined();
   });
 
   it("switches to the editor when the hint is clicked", () => {
     const onRequestEditMode = vi.fn();
-    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode });
+    renderViewer(MATH_DOC, true, "notes.md", { viewMode: "preview", onRequestEditMode });
     fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
     expect(onRequestEditMode).toHaveBeenCalledOnce();
   });
