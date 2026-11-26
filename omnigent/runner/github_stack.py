@@ -13,9 +13,10 @@ from omnigent.runner.session_prs import PullRequestRef
 MAX_DEPTH = 10
 # Every ``gh`` call one stack read makes, the reads before the walk included.
 MAX_GH_CALLS = 20
-# Before the walk: the account's token, a sign-in check on a host other than github.com,
-# the pull request's read and the default branch's. Reserved whether or not each runs.
-_CALLS_BEFORE_THE_WALK = 4
+# Before the walk, at most: the account's token, two for the sign-in check on a host other
+# than github.com (its global listing, then the host itself), the pull request's read and
+# the default branch's. All are reserved, whether or not each runs.
+_CALLS_BEFORE_THE_WALK = 5
 # One deadline for the whole walk, inside the server's 30 s wait for a read.
 WALK_SECONDS = 20.0
 _LIST_LIMIT = 30

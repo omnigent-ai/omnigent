@@ -68,6 +68,12 @@ class StackGraph:
         if argv[:2] == ["auth", "token"]:
             self.token_lookups += 1
             return 0, TOKEN + "\n", ""
+        if argv[:3] == ["auth", "status", "--json"]:
+            # The global listing shows github.com only, as for a host gh signs in per command.
+            listing = {"hosts": {"github.com": [{"login": "octocat", "state": "success"}]}}
+            return 0, json.dumps(listing), ""
+        if argv[:2] == ["auth", "status"]:
+            return 0, "", ""
         self.tokens.append(token)
         if argv[:2] == ["pr", "view"]:
             return 0, json.dumps(self.current), ""
@@ -88,8 +94,9 @@ class StackGraph:
         return 0, json.dumps([pr for pr in self.prs if pr[field] == branch]), ""
 
 
-def _reference(number: int = 1) -> PullRequestRef:
-    return PullRequestRef.from_url(PR_URL.format(number=number))
+def _reference(number: int = 1, host: str = "github.com") -> PullRequestRef:
+    url = PR_URL.format(number=number).replace("github.com", host, 1)
+    return PullRequestRef.from_url(url)
 
 
 def _chain(length: int) -> list[dict[str, Any]]:
@@ -170,6 +177,21 @@ def test_the_whole_read_stays_within_the_gh_call_cap(monkeypatch: pytest.MonkeyP
     assert stack["truncated"] is True
     # The account lookup and the reads before the walk count too.
     assert graph.calls[0][:2] == ["auth", "token"]
+    assert len(graph.calls) <= github_stack.MAX_GH_CALLS
+
+
+def test_a_read_on_an_enterprise_host_stays_within_the_gh_call_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sign-in check there asks for the host directly, after the global listing."""
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "github.example.com")
+    monkeypatch.setattr(github_stack, "MAX_DEPTH", 50)
+    graph = StackGraph(monkeypatch, _chain(github_stack.MAX_GH_CALLS + 5), current=1)
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(1, "github.example.com"))
+
+    assert stack["truncated"] is True
+    assert ["auth", "status", "-h", "github.example.com"] in graph.calls
     assert len(graph.calls) <= github_stack.MAX_GH_CALLS
 
 
