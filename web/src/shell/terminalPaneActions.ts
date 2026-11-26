@@ -311,7 +311,7 @@ export function useTerminalPaneActions(
       removePaneFocusingNeighbor(target, key);
       return;
     }
-    // With floating panes an idle shell closes at once; anything else asks, naming the job.
+    // An idle shell closes at once; anything else asks, naming the job.
     checkShellClose([terminal.id], "pane_close", (check) => {
       const agentTerminal = findAgentTerminal([...latestTerminals.current]);
       if (!target.canClosePane(key) || !isLivePane(target, key, agentTerminal)) return;

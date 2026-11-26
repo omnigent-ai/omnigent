@@ -6,6 +6,15 @@ export interface RichTextPayload {
   text: string;
 }
 
+/** The clipboard's text, or null when the page may not read it. */
+export async function readClipboardText(): Promise<string | null> {
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    return null;
+  }
+}
+
 export async function copyText(text: string): Promise<void> {
   if (await writeTextWithClipboardApi(text)) return;
 

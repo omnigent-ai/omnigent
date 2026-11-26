@@ -363,9 +363,9 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         await runner.aclose()
 
 
-@pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize(("bundled", "cancelled"), [(False, False), (True, False), (False, True)])
 async def test_multipart_input_keeps_attachment_in_session_namespace(
-    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch, bundled: bool
+    startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch, bundled: bool, cancelled: bool
 ) -> None:
     env = startup_env
     agent = await create_test_agent(env.client)
@@ -391,15 +391,36 @@ async def test_multipart_input_keeps_attachment_in_session_namespace(
         )
     else:
         metadata["agent_id"] = agent["id"]
-    response = await env.client.post(
+    create = env.client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
         files=files,
     )
-    assert response.status_code == 201, response.text
+    if cancelled:
+        uploading: list[str] = []
+        release_upload = asyncio.Event()
+        upload = env.app.state.initial_file_upload
+
+        async def held_upload(request: Any, session_id: str, file: Any) -> dict[str, Any]:
+            uploading.append(session_id)
+            await release_upload.wait()
+            return await upload(request, session_id, file)
+
+        monkeypatch.setattr(env.app.state, "initial_file_upload", held_upload)
+        request = asyncio.create_task(create)
+        await poll_until_async(lambda: uploading, timeout_s=5)
+        # The client gives up before the parsed upload is stored.
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        release_upload.set()
+        [session_id] = uploading
+    else:
+        response = await create
+        assert response.status_code == 201, response.text
+        session_id = response.json()["session_id" if bundled else "id"]
     await poll_until_async(lambda: bool(launches), timeout_s=5)
     assert [repo.url for repo in launches[0]["repos"]] == repositories
-    session_id = response.json()["session_id" if bundled else "id"]
     snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
     blocks = snapshot["pending_inputs"][0]["content"]
     assert blocks[0]["type"] == "input_file" and blocks[0]["filename"] == "context.txt"

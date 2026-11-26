@@ -2226,6 +2226,82 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         await auth_app.state.startup_inputs.shutdown()
 
 
+@pytest.mark.parametrize("placement", ["managed", "child"])
+async def test_cancelled_request_still_finishes_an_independent_create(
+    auth_client, auth_app, peers, db_uri, monkeypatch, placement
+):
+    """A create cancelled once its session is stored still saves the first task and launches.
+
+    A runner reconciles and retries its own timed-out child create, so that one stops instead.
+    """
+    import asyncio
+
+    from omnigent.server.routes.sessions import routes_core
+    from tests._helpers.polling import poll_until_async
+
+    source, _, _ = peers
+    launched = asyncio.Event()
+    release_launch = asyncio.Event()
+
+    async def launch(**kwargs):
+        launched.set()
+        await release_launch.wait()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    startup = auth_app.state.startup_inputs
+    save = startup.enqueue
+    saving, interrupted = [], []
+    release_save = asyncio.Event()
+
+    async def held_save(session_id, *args, **kwargs):
+        saving.append(session_id)
+        try:
+            await release_save.wait()
+        except asyncio.CancelledError:
+            interrupted.append(session_id)
+            raise
+        return await save(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(startup, "enqueue", held_save)
+    if placement == "managed":
+        create = _launch_worker(auth_client, source["agent_id"], source["id"], message="Go")
+    else:
+        first = {"role": "user", "content": [{"type": "input_text", "text": "Go"}]}
+        create = auth_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": source["agent_id"],
+                "parent_session_id": source["id"],
+                "host_type": "managed",
+                "initial_input": {"type": "message", "data": first},
+            },
+        )
+    request = asyncio.create_task(create)
+    try:
+        await poll_until_async(lambda: saving, timeout_s=5)
+        # The client gives up while the stored session's first task is being saved.
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        [session_id] = saving
+        store = SqlAlchemyConversationStore(db_uri)
+        if placement == "child":
+            assert interrupted == [session_id]
+            assert store.list_pending_inputs(session_id) == []
+            return
+        assert interrupted == []
+        release_save.set()
+        await asyncio.wait_for(launched.wait(), timeout=2)
+        pending = store.list_pending_inputs(session_id)
+        assert [item.data.content[0]["text"] for item in pending] == [
+            f"[Message from session {source['id']}]\nGo"
+        ]
+    finally:
+        release_save.set()
+        release_launch.set()
+        await auth_app.state.startup_inputs.shutdown()
+
+
 class _ListLabelSelection:
     """A deployment that records the whole selection in one JSON label."""
 

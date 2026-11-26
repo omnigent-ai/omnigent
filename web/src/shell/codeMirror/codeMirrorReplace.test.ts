@@ -219,3 +219,47 @@ describe("FindReplacer", () => {
     expect(setup.view.state.doc.toString()).toBe(`y${doc}`);
   });
 });
+
+describe("FindReplacer preserving case", () => {
+  it("gives every replacement its match's case in Replace all, as one edit", () => {
+    const { view, indexing, replacer } = editor("foobar FOOBAR Foobar", "foobar", "bazQux");
+    indexing.drain();
+    replacer.replaceAll(view, { preserveCase: true });
+    expect(view.state.doc.toString()).toBe("bazqux BAZQUX BazQux");
+    undo(view);
+    expect(view.state.doc.toString()).toBe("foobar FOOBAR Foobar");
+  });
+
+  it("applies the case after a regular expression's groups are filled", () => {
+    const { view, indexing, preparing, replacer } = editor(
+      "get_NAME get_name",
+      "get_(\\w+)",
+      "set_$1",
+      true,
+    );
+    indexing.drain();
+    replacer.replaceAll(view, { preserveCase: true });
+    preparing.drain();
+    expect(view.state.doc.toString()).toBe("set_NAME set_name");
+  });
+
+  it("replaces the selected match in its case", () => {
+    const { view, indexing, preparing, replacer } = editor("a FOOBAR", "foobar", "bazQux");
+    indexing.drain();
+    view.dispatch({ selection: { anchor: 2, head: 8 } });
+    const resumed: (number | null)[] = [];
+    replacer.replaceSelected(view, (resumeFrom) => resumed.push(resumeFrom), {
+      preserveCase: true,
+    });
+    preparing.drain();
+    expect(view.state.doc.toString()).toBe("a BAZQUX");
+    expect(resumed).toEqual([8]);
+  });
+
+  it("keeps the replacement as written by default", () => {
+    const { view, indexing, replacer } = editor("FOOBAR", "foobar", "bazQux");
+    indexing.drain();
+    replacer.replaceAll(view);
+    expect(view.state.doc.toString()).toBe("bazQux");
+  });
+});

@@ -1,5 +1,5 @@
-// Whether closing shells needs confirmation: with floating panes, a shell its runner just read
-// idle closes at once. Anything else asks, naming the job a busy shell runs.
+// Whether closing shells needs confirmation: a shell its runner just read idle closes at once.
+// Anything else asks, naming the job a busy shell runs; an older server always asks.
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -7,7 +7,7 @@ import { authenticatedFetch } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { lastTerminalInputAt } from "@/lib/terminalInputTimes";
 
-import { useFloatingPanes } from "./useFloatingPanes";
+import type { ShellCloseCallbacks } from "./WorkspacePanel";
 
 /** How long a close waits for the runner's reading before it asks anyway. */
 export const SHELL_CLOSE_CHECK_MS = 500;
@@ -116,15 +116,22 @@ export async function readTerminalShell(
   }
 }
 
+/** How one check runs: from `started`, until `signal` stops reads nobody will use. */
+export interface ShellCloseCheckOptions {
+  started?: number;
+  signal?: AbortSignal;
+  /** When each shell's close was first asked, if earlier than `started`: input since then asks. */
+  askedAt?: ReadonlyMap<string, number>;
+}
+
 /**
  * Whether closing `terminalIds` in `sessionId` can go ahead without asking, and why. It answers
- * within the budget even when a read ignores its signal; `signal` stops reads nobody will use.
+ * within the budget even when a read ignores its signal.
  */
 export async function checkShellClose(
   sessionId: string,
   terminalIds: readonly string[],
-  started: number = performance.now(),
-  signal?: AbortSignal,
+  { started = performance.now(), signal, askedAt }: ShellCloseCheckOptions = {},
 ): Promise<{ check: ShellCloseCheck; reason: ShellCloseReason }> {
   if (terminalIds.length === 0) return { check: CONFIRM, reason: "unknown" };
   const controller = new AbortController();
@@ -154,7 +161,9 @@ export async function checkShellClose(
   if (readings === "timeout" || performance.now() - started > SHELL_CLOSE_CHECK_MS) {
     return { check: CONFIRM, reason: "timeout" };
   }
-  if (terminalIds.some((terminalId) => lastTerminalInputAt(sessionId, terminalId) >= started)) {
+  const typedInto = (terminalId: string) =>
+    lastTerminalInputAt(sessionId, terminalId) >= (askedAt?.get(terminalId) ?? started);
+  if (terminalIds.some(typedInto)) {
     return { check: CONFIRM, reason: "typed" };
   }
   const notIdle = readings.find((reading) => reading.state !== "idle");
@@ -175,8 +184,8 @@ interface RunningCheck {
 
 /**
  * `checkShellClose` for one surface showing `sessionId`'s shells, recording each answer. A newer
- * check, or the surface going, drops a running one silently. Floating panes turning off makes it
- * ask, as every close then does. A new server or session drops it and calls its `dropped`.
+ * check, or the surface going, drops a running one silently. A new server or session drops it
+ * and calls its `dropped`.
  */
 export function useShellCloseCheck(
   sessionId: string | null | undefined,
@@ -185,28 +194,24 @@ export function useShellCloseCheck(
   trigger: ShellCloseTrigger,
   decide: (check: ShellCloseCheck) => void,
   dropped?: () => void,
+  askedAt?: ReadonlyMap<string, number>,
 ) => void {
-  const floatingPanes = useFloatingPanes();
   const place = JSON.stringify([getOmnigentServerIdentity(), sessionId ?? null]);
-  const current = useRef<{ place: string; floatingPanes: boolean; running: RunningCheck | null }>({
+  const current = useRef<{ place: string; running: RunningCheck | null }>({
     place,
-    floatingPanes,
     running: null,
   });
-  // Settle a running check for a new server, session or gate before anything shows.
+  // Drop a running check for a new server or session before anything shows.
   useLayoutEffect(() => {
     const state = current.current;
     const running = state.running;
-    const moved = state.place !== place;
-    const gateClosed = state.floatingPanes && !floatingPanes;
+    if (state.place === place) return;
     state.place = place;
-    state.floatingPanes = floatingPanes;
-    if (!running || (!moved && !gateClosed)) return;
+    if (!running) return;
     state.running = null;
     running.stop.abort();
-    if (moved) running.dropped?.();
-    else running.decide(CONFIRM);
-  }, [place, floatingPanes]);
+    running.dropped?.();
+  }, [place]);
   useEffect(() => {
     const state = current.current;
     return () => {
@@ -215,18 +220,18 @@ export function useShellCloseCheck(
     };
   }, []);
   return useCallback(
-    (terminalIds, trigger, decide, dropped) => {
+    (terminalIds, trigger, decide, dropped, askedAt) => {
       const state = current.current;
       state.running?.stop.abort();
       state.running = null;
-      if (!floatingPanes || !sessionId || terminalIds.length === 0) {
+      if (!sessionId || terminalIds.length === 0) {
         decide(CONFIRM);
         return;
       }
       const running: RunningCheck = { decide, dropped, stop: new AbortController() };
       const askedPlace = state.place;
       state.running = running;
-      void checkShellClose(sessionId, terminalIds, performance.now(), running.stop.signal).then(
+      void checkShellClose(sessionId, terminalIds, { signal: running.stop.signal, askedAt }).then(
         ({ check, reason }) => {
           if (state.running !== running) return;
           state.running = null;
@@ -246,24 +251,32 @@ export function useShellCloseCheck(
         },
       );
     },
-    [floatingPanes, sessionId],
+    [sessionId],
   );
 }
 
-/** A close a surface's dialog is asking about, and what the shell runs when its runner said. */
+/** The closes a surface's dialog is asking about, and what the shell runs when its runner said. */
 export interface PendingShellClose<Item> {
-  item: Item;
+  items: readonly Item[];
   busy: ShellBusy | null;
 }
 
+/** The closes a surface is still checking, their shells, and when each shell's close was asked. */
+interface CheckingShellClose<Item> {
+  items: readonly Item[];
+  terminalIds: readonly string[];
+  askedAt: ReadonlyMap<string, number>;
+}
+
 /**
- * One surface's "Close shell?" flow: `request` closes an idle shell at once through `close`, and
- * otherwise holds `pending` for the dialog, whose `confirm` then closes it.
+ * One surface's "Close shell?" flow: `request` closes idle shells at once through `close`, and
+ * otherwise holds `pending` for the dialog, whose `confirm` then closes them. A close requested
+ * while another is still checking joins it, so the two close or ask together.
  */
 export function useShellCloseRequest<Item>(
   sessionId: string | null | undefined,
   trigger: ShellCloseTrigger,
-  close: (item: Item) => void,
+  close: (items: readonly Item[]) => void,
 ): {
   pending: PendingShellClose<Item> | null;
   /** Close `item`, asking first unless its shells, `terminalIds`, are idle; null always asks. */
@@ -272,29 +285,85 @@ export function useShellCloseRequest<Item>(
   cancel: () => void;
 } {
   const [pending, setPending] = useState<PendingShellClose<Item> | null>(null);
+  // Another session discards the question, so returning can't show it or close its shells.
+  const [askedSessionId, setAskedSessionId] = useState(sessionId);
+  if (askedSessionId !== sessionId) {
+    setAskedSessionId(sessionId);
+    setPending(null);
+  }
   const latestClose = useRef(close);
   latestClose.current = close;
   const latestPending = useRef(pending);
   latestPending.current = pending;
+  const checking = useRef<CheckingShellClose<Item> | null>(null);
   const checkClose = useShellCloseCheck(sessionId);
   const request = useCallback(
     (item: Item, terminalIds: readonly string[] | null) => {
+      const earlier = checking.current;
+      checking.current = null;
+      const items = [...(earlier?.items ?? []), item];
       if (terminalIds === null) {
-        setPending({ item, busy: null });
+        setPending({ items, busy: null });
         return;
       }
-      checkClose(terminalIds, trigger, (check) => {
-        if (check.close === "now") latestClose.current(item);
-        else setPending({ item, busy: check.busy });
-      });
+      // A joined shell keeps the time its own close was asked, so input since then still asks.
+      const askedAt = new Map(earlier?.askedAt);
+      const now = performance.now();
+      for (const terminalId of terminalIds)
+        if (!askedAt.has(terminalId)) askedAt.set(terminalId, now);
+      const joined: CheckingShellClose<Item> = {
+        items,
+        terminalIds: [...new Set([...(earlier?.terminalIds ?? []), ...terminalIds])],
+        askedAt,
+      };
+      checking.current = joined;
+      checkClose(
+        joined.terminalIds,
+        trigger,
+        (check) => {
+          if (checking.current !== joined) return;
+          checking.current = null;
+          if (check.close === "now") latestClose.current(items);
+          else setPending({ items, busy: check.busy });
+        },
+        // Another server or session: these shells aren't the ones it shows any more.
+        () => {
+          if (checking.current === joined) checking.current = null;
+        },
+        askedAt,
+      );
     },
-    [checkClose, trigger],
+    [checkClose, trigger, setPending],
   );
   const confirm = useCallback(() => {
-    const asked = latestPending.current;
+    const confirmed = latestPending.current;
     setPending(null);
-    if (asked) latestClose.current(asked.item);
-  }, []);
-  const cancel = useCallback(() => setPending(null), []);
+    if (confirmed) latestClose.current(confirmed.items);
+  }, [setPending]);
+  const cancel = useCallback(() => setPending(null), [setPending]);
   return { pending, request, confirm, cancel };
+}
+
+/** A request to close shell tabs by key, and what to tell its caller. */
+export interface ShellTabsClose {
+  keys: readonly string[];
+  callbacks?: ShellCloseCallbacks;
+}
+
+/** Closes that were asked about together, as one close telling each caller about its own tabs. */
+export function joinShellTabsCloses(closes: readonly ShellTabsClose[]): {
+  keys: string[];
+  callbacks: ShellCloseCallbacks;
+} {
+  return {
+    keys: [...new Set(closes.flatMap((each) => each.keys))],
+    callbacks: {
+      onConfirmed: () => {
+        for (const each of closes) each.callbacks?.onConfirmed?.();
+      },
+      onFailed: (key) => {
+        for (const each of closes) if (each.keys.includes(key)) each.callbacks?.onFailed?.(key);
+      },
+    },
+  };
 }

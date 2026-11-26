@@ -24,6 +24,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
 import { useFileContent } from "@/hooks/useFileContent";
+import { useStickyScroll } from "@/lib/fileViewPreferences";
 import { fileContentText } from "@/lib/workspaceSidebarSource";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { cn } from "@/lib/utils";
@@ -213,6 +214,7 @@ function TextFile({
 }) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const stickyScroll = useStickyScroll();
   const leave = useUnsavedChangesQuestion();
   useEffect(() => {
     if (!dirty || !registerLeaveGuard) return undefined;
@@ -228,6 +230,7 @@ function TextFile({
         isSettled={settled}
         position={position}
         wrapLines={false}
+        stickyScroll={stickyScroll}
         searchOpen={searchOpen}
         onSearchOpened={() => setSearchOpen(true)}
         onSearchHandled={() => setSearchOpen(false)}

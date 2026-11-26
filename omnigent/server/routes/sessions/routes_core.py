@@ -10,7 +10,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from itertools import batched
 from typing import Any
 
@@ -50,6 +50,7 @@ from omnigent.entities import (
     Agent,
     CommentsFingerprint,
     Conversation,
+    ScheduledTask,
     StoredFile,
     synthesize_conversation_title,
 )
@@ -264,6 +265,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SessionCreateInput,
     SessionCreateRequest,
     SessionEventInput,
     SessionFamily,
@@ -657,6 +659,32 @@ class _SessionPageReads:
     family_info: dict[str, SessionFamily] = dataclasses.field(default_factory=dict)
     user_is_admin: bool = False
     batches: list[_SessionBatchReads] = dataclasses.field(default_factory=list)
+
+
+# Request work running on after its request was cancelled.
+# custom-lint: disable-next=workspace-scoped-cache -- holds globally unique task objects
+_unattended_work: set[asyncio.Task[Any]] = set()
+
+
+def _forget_unattended(done: asyncio.Task[Any]) -> None:
+    """Drop finished work, logging a failure no request is left to report."""
+    _unattended_work.discard(done)
+    if not done.cancelled() and (error := done.exception()) is not None:
+        _logger.warning(
+            "%s failed after its request was cancelled", done.get_name(), exc_info=error
+        )
+
+
+async def _finish_despite_cancellation[T](work: Coroutine[Any, Any, T], *, name: str) -> T:
+    """Await *work*, letting it run to its end if the request is cancelled."""
+    task = asyncio.create_task(work, name=name)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Work that failed just before the cancellation landed still needs its failure logged.
+        _unattended_work.add(task)
+        task.add_done_callback(_forget_unattended)
+        raise
 
 
 def register_core_routes(
@@ -1772,6 +1800,32 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 scheduled_task_store=getattr(request.app.state, "scheduled_task_store", None),
             )
+        create = _create_validated_session(
+            request,
+            user_id,
+            body,
+            source=source,
+            orchestration_source=orchestration_source,
+            launching_task=launching_task,
+        )
+        if body.parent_session_id is not None:
+            # A runner reconciles and retries its own timed-out child create, so
+            # finishing an abandoned one would leave a duplicate child.
+            return await create
+        # A stored session gets its first input and launch even if the client
+        # gives up, so a cancelled request never strands it half-made.
+        return await _finish_despite_cancellation(create, name="create-session")
+
+    async def _create_validated_session(
+        request: Request,
+        user_id: str | None,
+        body: SessionCreateInput,
+        *,
+        source: Conversation | None,
+        orchestration_source: str | None,
+        launching_task: ScheduledTask | None,
+    ) -> SessionResponse:
+        """Store, grant, and launch a session from a validated JSON create *body*."""
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv, resolved_body = await _create_session_from_existing_agent(
             conversation_store,
@@ -6013,15 +6067,6 @@ def register_core_routes(
 
     # ── Continuing a session's work in another session ──────────
 
-    # Moves into a continuation still running after their request was cancelled.
-    _continuation_tasks: set[asyncio.Task[str]] = set()
-
-    def _forget_continuation(done: asyncio.Task[str]) -> None:
-        """Drop a finished move; its failure was reported to a waiting request."""
-        _continuation_tasks.discard(done)
-        if not done.cancelled():
-            done.exception()  # Retrieved, so an abandoned request's failure is not re-logged.
-
     async def _continue_session_in_fork(
         request: Request,
         source: Conversation,
@@ -6323,10 +6368,7 @@ def register_core_routes(
         # back) even if the request is cancelled, e.g. by a client disconnect,
         # so a cancellation never strands a half-made successor; meanwhile the
         # move guard refuses a retry.
-        task = asyncio.create_task(move(), name=f"continue-{source.id}")
-        _continuation_tasks.add(task)
-        task.add_done_callback(_forget_continuation)
-        return await asyncio.shield(task)
+        return await _finish_despite_cancellation(move(), name=f"continue-{source.id}")
 
     async def clear_session_into_fresh_session(
         request: Request,

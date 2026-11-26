@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette
 from tests.e2e_ui.conftest import open_right_rail
 from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag
 
@@ -75,9 +76,17 @@ def is_mac(page: Page) -> bool:
     return bool(page.evaluate("() => /Mac|iPhone|iPad/.test(navigator.platform)"))
 
 
-def open_workspace(page: Page, base_url: str, session_id: str) -> Locator:
-    """Open the session with ``workspace_sidebar_v2`` on; returns its Workspace sidebar."""
-    _set_flag(page, True)
+def open_workspace(
+    page: Page, base_url: str, session_id: str, *, quick_pick: bool = False
+) -> Locator:
+    """Open the session with ``workspace_sidebar_v2`` on; returns its Workspace sidebar.
+
+    ``quick_pick`` also turns on the QuickPick ⌘K palette, for journeys that run its settings.
+    """
+    if quick_pick:
+        enable_quick_pick_palette(page, "workspace_sidebar_v2")
+    else:
+        _set_flag(page, True)
     page.set_viewport_size(_DESKTOP)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)

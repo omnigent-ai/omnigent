@@ -118,7 +118,9 @@ Reports reuse the existing versioned benchmark schema (`harness=chromium-ui`,
 `backend=chromium`) and retain **all raw keystroke samples**, DOM counts,
 browser version, throttle settings, fixture size, and UI/backend revisions.
 A successful sample records `page_errors: []`; browser errors reject the sample
-and are retained in `error.txt` and a failure screenshot.
+and are retained in `error.txt`. The benchmark attempts a failure screenshot,
+retrying once if Chromium's capture request fails. If it cannot save the
+screenshot, the job log contains the error and page state.
 An interrupted run may leave partial JSON; incomplete data cannot pass.
 
 To verify sensitivity to the document-wide restyle regression, copy a built

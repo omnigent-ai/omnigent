@@ -2,6 +2,7 @@
 
 import { Text } from "@codemirror/state";
 import { type FindQuerySpec, MatchCollector } from "./findMatchCollector";
+import { rememberDocumentText } from "./plainTextMatches";
 
 export type FindWorkerRequest =
   | { type: "document"; documentId: number; text: string }
@@ -34,6 +35,7 @@ export function createFindWorkerHandler(
     if (request.type === "document") {
       documentId = request.documentId;
       doc = Text.of(request.text.split("\n"));
+      rememberDocumentText(doc, request.text);
       return;
     }
     if (request.type === "cancel") {
