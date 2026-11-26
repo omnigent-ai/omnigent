@@ -86,6 +86,7 @@ from omnigent.server.schemas import (
     UpdateProjectShareRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.server.stale_runner_refresh import TextChange, recycle_stale_sessions_soon
 from omnigent.server.usage_events import record_usage_event
 from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -628,6 +629,12 @@ def create_projects_router(
             session_id = await validate_main_assignment(
                 current, body.main_session_id, conversation_store, permission_store
             )
+        # A Mandate edit reaches sessions on older runners only by relaunching them.
+        mandate_before = (
+            await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+            if body.mandate is not None
+            else None
+        )
         project = await asyncio.to_thread(
             project_store.update,
             project_id,
@@ -649,6 +656,10 @@ def create_projects_router(
                 user_id=user_id,
                 description=body.description,
             )
+        if mandate_before is not None and (mandate_before.mandate or "") != (
+            project.mandate or ""
+        ):
+            refresh_stale_sessions(request, project, TextChange())
         # A rename/config change is only ever seen by other connected clients
         # (another tab, the mobile app) if it is pushed; nothing else refreshes
         # their projects cache until a full reload.
@@ -697,6 +708,13 @@ def create_projects_router(
             "project": await response(project, user_id),
         }
 
+    def refresh_stale_sessions(request: Request, project: Project, change: TextChange) -> None:
+        """Relaunch, once idle, sessions whose runner can't bring them this edit."""
+        if conversation_store is not None:
+            recycle_stale_sessions_soon(
+                request.app, project, change, conversations=conversation_store, template=request
+            )
+
     async def resolve_proposal(
         request: Request, project_id: str, proposal_id: str, *, accept: bool
     ) -> dict[str, Any]:
@@ -715,6 +733,8 @@ def create_projects_router(
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if accept:
+            refresh_stale_sessions(request, project, TextChange())
         announce_projects_changed(user_id)
         return await response(project, user_id)
 
@@ -921,6 +941,7 @@ def create_projects_router(
                 user_id=user_id,
                 charter=body.instructions or "",
             )
+            refresh_stale_sessions(request, project, TextChange(lead=True))
         if defaults:
             updated = await asyncio.to_thread(
                 project_store.set_lead_session_defaults,
@@ -982,6 +1003,10 @@ def create_projects_router(
         )
         if identity is None:
             raise OmnigentError("Identity not found", code=ErrorCode.NOT_FOUND)
+        if body.instructions is not None and (
+            current is None or (current.instructions or "") != (identity.instructions or "")
+        ):
+            refresh_stale_sessions(request, project, TextChange(identity_id=identity.id))
         if identity.project_agent_id and identity.agent_id != base_before:
             # A new base means a new copy, which the role's next session makes.
             stale = identity.project_agent_id

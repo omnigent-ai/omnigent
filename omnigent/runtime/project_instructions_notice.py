@@ -27,6 +27,9 @@ import secrets
 from pathlib import Path
 from typing import Any
 
+#: Runner hello capability: the runner carries project-text edits into running sessions.
+CAP_PROJECT_INSTRUCTION_REFRESH = "project_instruction_refresh"
+
 _TAG = "omnigent-project-instructions"
 _CLOSE = f"</{_TAG}>"
 _KEY_FILE = "project-instructions.key"

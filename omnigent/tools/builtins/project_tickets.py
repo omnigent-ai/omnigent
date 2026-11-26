@@ -370,14 +370,15 @@ class SysTicketLandTool(_TicketTool):
     help_text = (
         "Submit a Reviewer-approved commit to the project's landing queue. The server lands "
         "it only if the ticket's `approved` label is exactly this full SHA, any `risk` label "
-        "has an owner `risk-ok`, an imported PR has the owner's `owner-ok`, a `kind=feature` "
+        "has a `risk-ok` from a product approver (the owner counts as one), an imported PR has "
+        "the owner's `owner-ok`, a `kind=feature` "
         "ticket the owner didn't request has a product approver's `product-ok`, the SHA "
         "fast-forwards the integration branch and, when the project requires it, the "
         "`verified` label is that SHA (or the identical patch rebased over commits that don't "
         "touch its files); otherwise it refuses and says why (for example, "
         "rebase and get re-approval). Accepted lands are batched: fast-forward, web rebuild if "
-        "needed, one server restart. The ticket then moves to the landed stage (Implemented) and "
-        "you're told to verify live. Never pushes. Refused when the project's landing queue is "
+        "needed, one server restart. The ticket then moves to the landed stage. Never pushes. "
+        "Refused when the project's landing queue is "
         "off; then hand the branch and SHA to your coordinator. With dry_run it only runs "
         "those gates and reports, even when the queue is off: run it before landing by hand."
     )
