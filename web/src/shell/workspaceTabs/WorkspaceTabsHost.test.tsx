@@ -225,7 +225,7 @@ describe("WorkspaceTabsHost", () => {
       const bridge = desktopBridge();
       const { rerender } = host({ placement: "drawer" });
       expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
-      rerender({ contained: true });
+      rerender({ placement: "rail", contained: true });
       expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
     });
 
