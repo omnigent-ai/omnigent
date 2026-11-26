@@ -288,6 +288,28 @@ describe("finding shortcuts by chord", () => {
       new Set(["palette.commands"]),
     );
   });
+
+  it("keeps the browser's Pin key off a page that doesn't list Pin", () => {
+    // A Mac browser tab: ⌘⌥P is Pin's chord there only with quick_pick_palette, which the
+    // page doesn't list, so Settings search can't surface it either.
+    const browserPage = shortcutPageGroups(
+      {
+        ...PAGE_CONTEXT,
+        native: false,
+        electron: false,
+        desktopCommands: false,
+      },
+      true,
+    );
+    const listed = new Set(
+      browserPage.flatMap((group) => group.items.map((row) => row.shortcutId)),
+    );
+    const macBrowser: ShortcutEnvironment = { ...MAC_DESKTOP, native: false, desktopMenu: false };
+    const input = parseChordQuery("cmd opt p", true)!;
+    expect(listed.has("session.pin")).toBe(false);
+    expect(rowsForChord(input, macBrowser, ALL_LISTED)).toContain("session.pin");
+    expect(rowsForChord(input, macBrowser, listed)).not.toContain("session.pin");
+  });
 });
 
 const PAGE_CONTEXT: ShortcutPageContext = {
