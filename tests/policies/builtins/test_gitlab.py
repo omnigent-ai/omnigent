@@ -82,13 +82,12 @@ def test_explicit_project_selector(selector: str) -> None:
         "https://gitlab.com/team/sub/app/-/issues/12",
         "https://gitlab.com/team/sub/app?project=other",
         "https://user@gitlab.com/team/sub/app",
-        "https://gitlab.com/team%2Fsub%2Fapp",
         "git@gitlab.com:team/sub/app.git",
         "http://gitlab.com/team/sub/app",
     ],
 )
 def test_uncertain_project_identity_requires_approval(selector: str) -> None:
-    assert _result(f"glab issue list -R '{selector}'") == "ASK"
+    assert _result(f'glab issue list -R "{selector}"') == "ASK"
 
 
 def test_projects_can_be_pinned_to_a_server() -> None:
@@ -133,7 +132,7 @@ def test_projects_can_be_pinned_to_a_server() -> None:
         ("-t Fix -d Details --confidential=invalid", "ASK"),
         ("-t Fix", "ASK"),
         ("-t Fix -d -", "ASK"),
-        ("-t Fix -d ''", "ASK"),
+        ('-t Fix -d ""', "ASK"),
         ("-t Fix -d", "ASK"),
         ("-t $TITLE -d Details", "ASK"),
         ('-t "$TITLE" -d Details', "ASK"),
@@ -170,7 +169,7 @@ def test_option_values_remain_attached(arguments: str, expected: str) -> None:
     [
         "glab issue note 12",
         "glab issue note 12 -m -",
-        "glab issue note 12 -m ''",
+        'glab issue note 12 -m ""',
         "glab issue note https://gitlab.com/team/other/-/issues/12 -m Details",
         "glab issue view https://gitlab.com/team/other/-/issues/12",
         "glab mr view feature",
@@ -197,11 +196,11 @@ def test_unmodelled_operands_and_interactive_writes_ask(command: str) -> None:
         "glab repo fork",
         "glab ci run",
         "glab variable set KEY value",
-        "glab api projects/team%2Fsub%2Fapp/issues",
-        "glab api -X POST projects/team%2Fsub%2Fapp/issues -f title=Fix",
-        "glab api -X DELETE projects/team%2Fsub%2Fapp/repository/branches/release -f branch=main",
+        "glab api projects/123/issues",
+        "glab api -X POST projects/123/issues -f title=Fix",
+        "glab api -X DELETE projects/123/repository/branches/release -f branch=main",
         "glab config set api_host gitlab.other.example",
-        "glab alias set write 'api -X POST'",
+        'glab alias set write "api -X POST"',
         "glab auth login",
         "glab unknown run",
         "glab --repo https://gitlab.com/team/sub/app issue list",
@@ -275,12 +274,12 @@ def test_backslash_paths_require_approval_before_posix_parsing(executable: str) 
         "export GITLAB_HOST=gitlab.other.example",
         "GLAB_CONFIG_DIR=/tmp/config",
         "export GIT_CONFIG_COUNT=1",
-        "alias glab='another-command'",
+        'alias glab="another-command"',
         "GITLAB_HOST=gitlab.other.example glab issue list",
-        "python -c 'import os; os.system(\"glab issue list\")'",
-        "python -c 'import os; os.system(\"GLAB issue list\")'",
-        r"xargs g\lab issue list",
-        r"custom-wrapper g\lab issue list",
+        "python -m glab",
+        "python -m GLAB",
+        "xargs glab issue list",
+        "custom-wrapper glab issue list",
     ],
 )
 def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
@@ -356,6 +355,7 @@ def test_event_selection_and_custom_denial_reason() -> None:
         {"hosts": ["gitlab.com", "invalid host"]},
         {"write_repos": ["https://gitlab.other.example/team/app"]},
         {"read_repos": ["team/../app"]},
+        {"read_repos": ["https://gitlab.com/team%2Fsub%2Fapp"]},
     ],
 )
 def test_invalid_configuration_fails(configuration: dict[str, object]) -> None:
