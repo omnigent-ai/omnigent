@@ -101,6 +101,7 @@ describe("repositoryFolderOf", () => {
     ],
     ["a sibling sharing the name's start", "/repository/x", "/repo", null],
     ["a folder outside", "/elsewhere/sibling", "/repo", null],
+    ["a POSIX sibling whose name holds a backslash", "/repo\\other", "/repo", null],
     ["a folder of a workspace at the filesystem root", "/repo/src", "/", "repo/src"],
     ["the filesystem root itself", "/", "/", ""],
     [
@@ -139,6 +140,11 @@ describe("paths between a worktree's review and its session", () => {
       "src/a.ts",
     );
     expect(repositoryPathOf("C:\\elsewhere\\a.ts", FOLDER, "C:\\repo")).toBeNull();
+    expect(repositoryPathOf("C:/repo/.worktrees/feature/src/a.ts", FOLDER, "C:/repo")).toBe(
+      "src/a.ts",
+    );
+    expect(repositoryPathOf("C:/repo/src/a.ts", "", "C:/repo")).toBe("src/a.ts");
+    expect(repositoryPathOf("/src/a.ts", "", "/")).toBe("src/a.ts");
     expect(repositoryPathOf(".worktrees/feature", FOLDER, "/repo")).toBeNull();
     expect(repositoryPathOf("/elsewhere/a.ts", FOLDER, "/repo")).toBeNull();
     expect(repositoryPathOf("/repo/src/a.ts", "", "/repo")).toBe("src/a.ts");
