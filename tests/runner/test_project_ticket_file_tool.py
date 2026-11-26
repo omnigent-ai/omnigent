@@ -1,12 +1,16 @@
-"""sys_project_ticket_file and sys_project_lead_message find the other project first."""
+"""Tools that reach another project (file, message, board read) find it first."""
 
 import json
 
 import pytest
 from pydantic import ValidationError
 
-from omnigent.runner.project_tickets import _file_in_other_project, _message_other_lead
-from omnigent.tools.builtins.project_tickets import MessageOtherLead
+from omnigent.runner.project_tickets import (
+    _file_in_other_project,
+    _message_other_lead,
+    _read_other_board,
+)
+from omnigent.tools.builtins.project_tickets import MessageOtherLead, ReadOtherBoard
 
 OWN, OTHER, TWIN = "a" * 32, "b" * 32, "c" * 32
 
@@ -84,3 +88,39 @@ def test_lead_message_takes_exactly_one_of_project_or_reply_to():
     for args in ({"message": "x"}, {"project": "Hers", "reply_to": "d" * 32, "message": "x"}):
         with pytest.raises(ValidationError):
             MessageOtherLead.model_validate(args)
+
+
+async def test_board_read_maps_each_action_to_the_other_projects_read_path():
+    base = f"/v1/projects/{OTHER}/board-reads"
+    for args, path, params in (
+        ({"stage_id": "open", "limit": 5}, f"{base}/tickets", {"stage_id": "open", "limit": 5}),
+        ({"action": "get", "ticket_id": "t1"}, f"{base}/tickets/t1", None),
+        (
+            {"action": "comments", "ticket_id": "t1", "after": 3},
+            f"{base}/tickets/t1/comments",
+            None,
+        ),
+        ({"action": "stages"}, f"{base}/stages", None),
+    ):
+        seen: list[tuple[str, dict | None]] = []
+
+        async def request(method, url, seen=seen, **kwargs):
+            if url == "/v1/projects":
+                return {"data": [{"id": OWN, "name": "Mine"}, {"id": OTHER, "name": "Hers"}]}
+            seen.append((url, kwargs.get("params")))
+            return {"object": "project.board_read"}
+
+        body = ReadOtherBoard.model_validate({"project": "hers", **args}).model_dump(
+            exclude_none=True
+        )
+        ticket_id = body.pop("ticket_id", None)
+        await _read_other_board(body, ticket_id, OWN, request)
+        assert seen[0][0] == path
+        if params is not None:
+            assert seen[0][1] == {**params}
+
+
+def test_board_read_needs_a_ticket_for_get_and_comments():
+    for action in ("get", "comments"):
+        with pytest.raises(ValidationError):
+            ReadOtherBoard(project="Hers", action=action)

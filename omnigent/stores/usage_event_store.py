@@ -27,9 +27,12 @@ EVENT_PROPERTIES: dict[str, frozenset[str]] = {
     "role.created": frozenset(),
     "role.updated": frozenset({"fields"}),
     "role.deleted": frozenset(),
+    "board.read": frozenset({"action"}),
 }
 #: Role fields an edit may name; their values are never stored.
 ROLE_FIELDS = frozenset({"name", "instructions", "agent_id", "model", "effort", "scope"})
+#: What another project's Lead read of a board.
+BOARD_READ_ACTIONS = frozenset({"list", "get", "comments", "stages"})
 SURFACES = CLIENT_SURFACES | {"agent", "unknown"}
 
 
@@ -60,6 +63,8 @@ def clean_properties(name: str, props: dict[str, Any] | None) -> dict[str, Any] 
             fields = sorted({field for field in value if field in ROLE_FIELDS})
             if fields:
                 cleaned[key] = fields
+        elif key == "action" and value in BOARD_READ_ACTIONS:
+            cleaned[key] = value
     return cleaned or None
 
 

@@ -120,6 +120,51 @@ def lead_message_text(
     )
 
 
+async def calling_lead(
+    request: Request,
+    action: str,
+    *,
+    refusal: str,
+    people_hint: str,
+    auth_provider: AuthProvider | None,
+    conversations: ConversationStore,
+    projects: ProjectStore,
+    permissions: PermissionStore | None,
+) -> tuple[str, Any, Project]:
+    """The caller's user, session and project; it must be that project's router.
+
+    The call must come from the router's own private runner, not a role's side chat.
+    """
+    from omnigent.server.project_router import router_session_ids
+
+    user_id = require_user(request, auth_provider)
+    raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if raw_source is None:
+        raise OmnigentError(people_hint, code=ErrorCode.FORBIDDEN)
+    await asyncio.to_thread(
+        refuse_role_side_chat,
+        request,
+        action=action,
+        user_id=user_id,
+        conversations=conversations,
+        projects=projects,
+    )
+    await asyncio.to_thread(
+        require_named_source_private, request, user_id, conversations, permissions
+    )
+    try:
+        source_id = uuid_to_bytes(raw_source).hex()
+    except InvalidUuidError:
+        raise OmnigentError("Invalid calling session", code=ErrorCode.FORBIDDEN) from None
+    source = await asyncio.to_thread(conversations.get_conversation, source_id)
+    if source is None or source.archived or not source.project_id:
+        raise OmnigentError(refusal, code=ErrorCode.FORBIDDEN)
+    project = await asyncio.to_thread(projects.get, source.project_id, user_id=user_id)
+    if project is None or source.id not in await router_session_ids(request.app, project):
+        raise OmnigentError(refusal, code=ErrorCode.FORBIDDEN)
+    return user_id, source, project
+
+
 def create_project_lead_messages_router(
     conversations: ConversationStore,
     projects: ProjectStore,
@@ -129,45 +174,17 @@ def create_project_lead_messages_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/projects/{project_id}/lead-messages")
 
-    async def calling_lead(request: Request, action: str) -> tuple[str, Any, Project]:
-        """The caller's user, session and project; it must be that project's router."""
-        from omnigent.server.project_router import router_session_ids
-
-        user_id = require_user(request, auth_provider)
-        raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
-        if raw_source is None:
-            raise OmnigentError(
-                "Lead messages come from a project's Lead; people use the board or chat",
-                code=ErrorCode.FORBIDDEN,
-            )
-        await asyncio.to_thread(
-            refuse_role_side_chat,
+    async def lead(request: Request, action: str) -> tuple[str, Any, Project]:
+        return await calling_lead(
             request,
-            action=action,
-            user_id=user_id,
+            action,
+            refusal="Only a project's Lead can message another project's Lead",
+            people_hint="Lead messages come from a project's Lead; people use the board or chat",
+            auth_provider=auth_provider,
             conversations=conversations,
             projects=projects,
+            permissions=permissions,
         )
-        await asyncio.to_thread(
-            require_named_source_private, request, user_id, conversations, permissions
-        )
-        try:
-            source_id = uuid_to_bytes(raw_source).hex()
-        except InvalidUuidError:
-            raise OmnigentError("Invalid calling session", code=ErrorCode.FORBIDDEN) from None
-        source = await asyncio.to_thread(conversations.get_conversation, source_id)
-        if source is None or source.archived or not source.project_id:
-            raise OmnigentError(
-                "Only a project's Lead can message another project's Lead",
-                code=ErrorCode.FORBIDDEN,
-            )
-        project = await asyncio.to_thread(projects.get, source.project_id, user_id=user_id)
-        if project is None or source.id not in await router_session_ids(request.app, project):
-            raise OmnigentError(
-                "Only a project's Lead can message another project's Lead",
-                code=ErrorCode.FORBIDDEN,
-            )
-        return user_id, source, project
 
     async def deliver(
         request: Request,
@@ -220,7 +237,7 @@ def create_project_lead_messages_router(
         project, and the response returns only its ID, for matching a reply. Each
         project may send :data:`LEAD_MESSAGES_PER_HOUR` per hour to one project.
         """
-        user_id, source, sender = await calling_lead(request, "Messaging another project")
+        user_id, source, sender = await lead(request, "Messaging another project")
         try:
             target_id = uuid_to_bytes(project_id).hex()
         except InvalidUuidError:
@@ -244,7 +261,7 @@ def create_project_lead_messages_router(
         project is shared with this caller. Each message takes one reply, which can
         itself be replied to.
         """
-        _, source, own = await calling_lead(request, "Replying to another project")
+        _, source, own = await lead(request, "Replying to another project")
         try:
             path_project_id = uuid_to_bytes(project_id).hex()
             thread_id = uuid_to_bytes(message_id).hex()

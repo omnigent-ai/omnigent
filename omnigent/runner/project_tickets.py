@@ -99,6 +99,33 @@ async def _message_other_lead(
     )
 
 
+async def _read_other_board(
+    body: dict[str, Any],
+    ticket_id: str | None,
+    own_project_id: str,
+    request: Callable[..., Awaitable[dict[str, Any]]],
+) -> str:
+    """Read another project's board, when its owner lists this project as a reader."""
+    target_id = await _other_project_id(
+        body.pop("project"), own_project_id, request, "use sys_ticket_list"
+    )
+    if isinstance(target_id, dict):
+        return json.dumps(target_id)
+    action = body.pop("action", "list")
+    base = f"/v1/projects/{target_id}/board-reads"
+    params = {key: value for key, value in body.items() if key in ("stage_id", "after", "limit")}
+    if action == "stages":
+        result = await request("GET", f"{base}/stages")
+    elif action == "list":
+        result = await request("GET", f"{base}/tickets", params=params)
+    elif action == "get":
+        result = await request("GET", f"{base}/tickets/{ticket_id}")
+    else:
+        params.pop("stage_id", None)
+        result = await request("GET", f"{base}/tickets/{ticket_id}/comments", params=params)
+    return json.dumps(result, ensure_ascii=False)
+
+
 async def execute_ticket_tool(
     name: str,
     args: dict[str, Any],
@@ -194,6 +221,8 @@ async def execute_ticket_tool(
             return await _file_in_other_project(body, project_id, request)
         if name == "sys_project_lead_message":
             return await _message_other_lead(body, project_id, request)
+        if name == "sys_project_board_read":
+            return await _read_other_board(body, ticket_id, project_id, request)
         path = f"/v1/projects/{project_id}/tickets"
         if ticket_id is not None:
             path += f"/{ticket_id}"
