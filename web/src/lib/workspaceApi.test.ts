@@ -33,6 +33,7 @@ import {
   callPullRequestWrite,
   PullRequestMaybeSentError,
   pullRequestFailureReason,
+  servingRoutes,
   listDirectoryViaWorkspaceApi,
   readFileViaWorkspaceApi,
   listBranchCommitsViaWorkspaceApi,
@@ -1886,6 +1887,31 @@ describe("callPullRequestWrite", () => {
     expect(capabilityChecks).toBe(2);
   });
 
+  it("throws a second refused token, without trying another route", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    let sends = 0;
+    socket.mockImplementation(async (request) => {
+      if (methodOf((request as { path: string }).path) === "GetCapabilities") {
+        return unaryFromSocket(capabilitiesBody("CreateComment"));
+      }
+      sends += 1; // a fresh token is refused too
+      return fromSocket(new TextEncoder().encode('{"code":"unauthenticated"}'), 401);
+    });
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
+      CreateComment: () => new Response(commentPosted(), { headers: PROTO_HEADERS }),
+    });
+
+    const refused = await comment("s-pr-refused-twice").catch((error: unknown) => error);
+
+    expect((refused as ConnectError).code).toBe(Code.Unauthenticated);
+    expect(sends).toBe(2);
+    expect(grantRequests()).toBe(2);
+    expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+
   it("gets one fresh grant for a pull request the token doesn't list, then posts once", async () => {
     enable("workspace_direct_access", "workspace_api_server_access");
     let sends = 0;
@@ -2048,8 +2074,8 @@ describe("callPullRequestWrite", () => {
         new Response(capabilitiesBody("CreateComment"), { headers: PROTO_HEADERS }),
     });
 
-    await expect(comment("s-pr-cancelled-early", controller.signal)).rejects.not.toBeInstanceOf(
-      PullRequestMaybeSentError,
+    await expect(comment("s-pr-cancelled-early", controller.signal)).rejects.toBe(
+      controller.signal.reason,
     );
     expect(methodCalls("CreateComment")).toHaveLength(0);
   });
@@ -2063,5 +2089,45 @@ describe("callPullRequestWrite", () => {
 
     expect(await comment("s-pr-write-unlisted")).toBeNull();
     expect(methodCalls("CreateComment")).toHaveLength(0);
+  });
+});
+
+describe("servingRoutes", () => {
+  it("lists the routes that answered, in call order, and why the rest didn't", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    const away = new Error("not a workspace socket on this machine");
+    socket.mockRejectedValue(away);
+    serveMethods({
+      "direct-access": directGrantResponse,
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest", "CreateComment"), {
+          headers: PROTO_HEADERS,
+        }),
+    });
+
+    const answers = await servingRoutes("s-routes-partial");
+
+    expect(answers.serving.map(({ route }) => route)).toEqual(["server"]);
+    expect([...answers.serving[0]!.served].sort()).toEqual(["CreateComment", "GetPullRequest"]);
+    expect(answers.failures).toHaveLength(1);
+  });
+
+  it("answers nothing where no route is turned on", async () => {
+    enable();
+    expect(await servingRoutes("s-routes-none")).toEqual({ serving: [], failures: [] });
+  });
+
+  it("throws the cancel instead of counting it as a failed route", async () => {
+    enable("workspace_api_server_access");
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("GetPullRequest"), { headers: PROTO_HEADERS }),
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(servingRoutes("s-routes-cancelled", controller.signal)).rejects.toBe(
+      controller.signal.reason,
+    );
   });
 });
