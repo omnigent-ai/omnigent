@@ -253,6 +253,11 @@ _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 # still fails out promptly. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
+# A busy server can take over 30s to create a session, and giving up first may
+# strand it with no safe retry. Managed sandboxes are provisioned after the
+# response, so this covers only the server's own create work.
+_SESSION_CREATE_READ_TIMEOUT_S = 120.0
+_SESSION_CREATE_TIMEOUT = httpx.Timeout(30.0, read=_SESSION_CREATE_READ_TIMEOUT_S)
 
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
@@ -4096,10 +4101,17 @@ async def _execute_session_create(
             from omnigent.runner.session_requests import post_on_host
 
             resp = await post_on_host(
-                server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
+                server_client,
+                endpoint,
+                host_id=host_id,
+                json=body,
+                headers=headers,
+                timeout=_SESSION_CREATE_TIMEOUT,
             )
         else:
-            resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
+            resp = await server_client.post(
+                endpoint, json=body, headers=headers, timeout=_SESSION_CREATE_TIMEOUT
+            )
     except Exception as exc:  # noqa: BLE001
         if placement != "child" and create_requested:
             return json.dumps(unconfirmed_creation)
