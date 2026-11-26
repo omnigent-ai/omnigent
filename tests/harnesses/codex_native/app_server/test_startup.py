@@ -1363,7 +1363,17 @@ _HOOK_CASES = [
     ("active", "saved", "strict", "command_config"),
     [
         *((*case, None) for case in _HOOK_CASES),
-        *((None, False, True, command) for command in ("direct", "env", "env-context", "opaque")),
+        *(
+            (None, False, True, command)
+            for command in (
+                "direct",
+                "env",
+                "env-context",
+                "opaque",
+                "changed-home",
+                "removed-home",
+            )
+        ),
     ],
 )
 async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
@@ -1412,6 +1422,14 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
             )
         elif command_config == "opaque":
             server.app_server_command = ("env", "-v", *server.app_server_command)
+        elif command_config == "changed-home":
+            server.app_server_command = (
+                "env",
+                f"CODEX_HOME={tmp_path / 'foreign-home'}",
+                *server.app_server_command,
+            )
+        elif command_config == "removed-home":
+            server.app_server_command = ("env", "-u", "CODEX_HOME", *server.app_server_command)
 
     (tmp_path / "source-codex-home/config.toml").write_text(
         '[mcp_servers.fixture]\ncommand="true"\n'
@@ -1432,7 +1450,7 @@ async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
 
     hook = Mock(side_effect=plan)
     monkeypatch.setattr(disabled, "plan_codex_launch", hook)
-    if command_config == "opaque":
+    if command_config in {"opaque", "changed-home", "removed-home"}:
         with pytest.raises(disabled.McpStrictModeError, match="supported env wrapper"):
             await server.start()
         hook.assert_not_called()

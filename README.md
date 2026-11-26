@@ -583,6 +583,9 @@ that layer outranks the override. For host-launched native Claude sessions,
 Claude's settings are read for the launched CLI's working directory and
 environment, including a configured `env -C` or `CLAUDE_CONFIG_DIR` wrapper.
 Strict mode refuses `env` wrapper forms whose launch environment cannot be resolved.
+Arbitrary Claude launcher scripts can change that context or discard injected settings;
+strict discovery does not inspect them. Use Claude directly or a supported `env` wrapper
+when relying on the allowlist.
 If one of those Claude settings or
 Codex config files exists but cannot be read or parsed, or a `-c mcp_servers`
 override is not a TOML table, the launch stops with an error naming it. A malformed `inherit` or `allow` value is

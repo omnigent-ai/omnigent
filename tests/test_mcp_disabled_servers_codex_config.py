@@ -486,16 +486,29 @@ def test_strict_refuses_uninterpretable_server_override(launch, caplog, override
     assert "[1]" not in caplog.text
 
 
-def test_strict_with_switch_retry_keeps_strict_overrides(launch):
+@pytest.mark.parametrize("blocked_name", ["other", "other.with.dot"])
+def test_strict_with_switch_retry_keeps_strict_overrides(launch, blocked_name):
     home, repo = launch
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     set_disabled(ServerKey("codex", "kept"), True)
-    set_disabled(ServerKey("codex", "other"), True)
+    set_disabled(ServerKey("codex", blocked_name), True)
     _write(
         home / "config.toml",
-        '[mcp_servers.kept]\ncommand="true"\n[mcp_servers.other]\ncommand="true"\n',
+        '[mcp_servers.kept]\ncommand="true"\n'
+        f'[mcp_servers.{json.dumps(blocked_name)}]\ncommand="true"\n',
     )
     plan = _plan(home, repo, ["base=true"])
+    if "." in blocked_name:
+        assert plan.config_overrides[0] == "base=true"
+        assert tomllib.loads(plan.config_overrides[-1])["mcp_servers"] == {
+            blocked_name: {"enabled": False},
+            "kept": {"enabled": False},
+        }
+        fallback = plan.overrides_after_early_exit()
+        assert fallback is not None and fallback[0] == "base=true"
+        assert tomllib.loads(fallback[-1])["mcp_servers"] == {blocked_name: {"enabled": False}}
+        assert plan.outcome == "applied"
+        return
     assert plan.config_overrides == (
         "base=true",
         "mcp_servers.other.enabled=false",

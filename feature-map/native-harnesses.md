@@ -415,7 +415,9 @@ unreadable, or whose `-c mcp_servers` override is not a table, raises
 ignored per field; an unreadable or non-mapping `config.yaml` inherits. Claude 2.1.283 matches allowlisted
 names against configured servers only, so strict mode always blocks Claude
 plugin MCP servers. Codex plugin MCPs and macOS-managed preferences are not
-discovered.
+discovered. Arbitrary Claude launcher scripts that change context or discard
+injected settings are outside strict discovery; use direct Claude or a supported
+`env` wrapper when relying on the allowlist.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal

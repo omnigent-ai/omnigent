@@ -246,7 +246,7 @@ def test_claude_loaded_anyway_reports_names_outside_strict_allowlist():
     ) == ("kept", "extra", "plugin:tools:notion")
 
 
-@pytest.mark.parametrize("settings", ["[]", '{"deniedMcpServers": {}}'])
+@pytest.mark.parametrize("settings", ["{", "null", "[]", '{"deniedMcpServers": {}}'])
 def test_malformed_sdk_settings_refuse_strict_launch(settings, caplog):
     write_mcp_inheritance({"inherit": False})
     with pytest.raises(McpStrictModeError, match="claude-sdk launch"):
