@@ -66,7 +66,11 @@ the header menu), and each place is a separate entry point.
   sidebar on a desktop window, ⌘K's **Search in Sessions…** opens Go to File on
   its **Sessions** tab, with or without an open session: the same search, with a
   preview of the matching message beside the list; a failed search or page
-  shows with Retry.
+  shows with Retry. Ctrl-N and Ctrl-P step the palette's rows as the arrows do,
+  except that in the Windows and Linux desktop app the menu's New Session
+  accelerator still takes Ctrl+N first (see `composer.md`'s new-session hotkey).
+  Closing it with Escape, or with a command that leaves focus alone, returns the
+  keyboard to the field it was opened from.
 - `palette-ui-feature-overrides`: in QuickPick, **Override UI feature flag…**
   sets a reported UI-only flag to Automatic, On, or Off. Choices stay on this
   device for this server; changing one reloads the page. **Clear all flag overrides**
