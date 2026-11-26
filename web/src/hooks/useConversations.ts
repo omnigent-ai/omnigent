@@ -2084,6 +2084,97 @@ function patchPinnedCaches(
 }
 
 /**
+ * Overlay `family` onto every cached member of that family; `headLabels`, when
+ * given, replaces the labels of the family's head (`headId`). Unpinning a nest
+ * clears the pin every member carries, and a failed unpin puts it back.
+ */
+function overlayFamilyIntoCaches(
+  queryClient: QueryClient,
+  family: SessionFamily,
+  headId: string,
+  headLabels?: Record<string, string>,
+) {
+  const overlay = (row: Conversation): SessionListWireItem => ({
+    id: row.id,
+    family,
+    ...(row.id === headId && headLabels ? { labels: headLabels } : {}),
+  });
+  for (const [listKey, filtersOf] of [
+    [["conversations"], filtersFromConversationQueryKey],
+    [["project-sessions"], filtersFromProjectQueryKey],
+  ] as const) {
+    for (const [cacheKey, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: listKey,
+    })) {
+      const members = data?.pages
+        .flatMap((page) => page.data)
+        .filter((row) => row.family?.id === family.id);
+      if (!members?.length) continue;
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        new Map(members.map((row) => [row.id, overlay(row)])),
+        filtersOf(cacheKey),
+      );
+      if (next !== data) queryClient.setQueryData(cacheKey, next);
+    }
+  }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old
+      ? {
+          ...old,
+          conversations: old.conversations.map((row) =>
+            row.family?.id === family.id ? { ...row, ...overlay(row) } : row,
+          ),
+        }
+      : old,
+  );
+  for (const [key, row] of queryClient.getQueriesData<Conversation | null>({
+    queryKey: ["conversation-backfill"],
+  })) {
+    if (row?.family?.id === family.id) queryClient.setQueryData(key, { ...row, ...overlay(row) });
+  }
+  queryClient.setQueryData<Session>(["session", headId], (old) =>
+    old ? { ...old, family, ...(headLabels ? { labels: headLabels } : {}) } : old,
+  );
+}
+
+/**
+ * Optimistically unpin a nest. Its members leave the Pinned section unless they
+ * carry a pin of their own, the same rows `?pinned=true` keeps after the write.
+ */
+function unpinFamilyInCaches(
+  queryClient: QueryClient,
+  headId: string,
+  headLabels: Record<string, string>,
+  family: SessionFamily,
+) {
+  const unpinned = { ...family, pinned: false, pinned_at: null };
+  const leavesPinned = (row: Conversation) =>
+    row.family?.id === family.id && (row.id === headId || row.labels?.[PINNED_LABEL_KEY] == null);
+  const listedOnlyAsPinned =
+    queryClient
+      .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+      ?.conversations.filter(
+        (row) => leavesPinned(row) && !findCachedListRow(queryClient, row.id),
+      ) ?? [];
+  overlayFamilyIntoCaches(queryClient, unpinned, headId, headLabels);
+  // An open session the Pinned section alone listed is fetched once it leaves;
+  // seed its row so a fetch before the write commits can't restore the pin.
+  for (const row of listedOnlyAsPinned) {
+    const key = ["conversation-backfill", row.id];
+    if (queryClient.getQueryData(key) !== undefined) continue;
+    queryClient.setQueryData<Conversation>(key, {
+      ...row,
+      family: unpinned,
+      ...(row.id === headId ? { labels: headLabels } : {}),
+    });
+  }
+  queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+    old ? { ...old, conversations: old.conversations.filter((row) => !leavesPinned(row)) } : old,
+  );
+}
+
+/**
  * Pin / unpin a session via `PATCH /v1/sessions/{id}` (the `omnigent.pinned`
  * label). Overlays only the `labels` field onto cached rows and patches the
  * pinned-list query directly (adding the row on pin, removing it on unpin)
@@ -2191,23 +2282,33 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
-      if (!existing?.family) patch(id, labels, pinned);
-      return { prevPinned, prevPin: base[PINNED_LABEL_KEY] };
+      // A nest's pin is server-derived across its members, so only the head's
+      // unpin is applied up front; other nest writes wait for the refetch.
+      const family = existing?.family ?? undefined;
+      const prevFamily =
+        !pinned && family?.pinned && family.representative_id === id ? family : undefined;
+      if (!family) patch(id, labels, pinned);
+      else if (prevFamily) unpinFamilyInCaches(queryClient, id, labels, prevFamily);
+      return { prevPinned, prevPin: base[PINNED_LABEL_KEY], prevFamily };
     },
     onError: (_err, { id, pinned }, ctx) => {
       // No context: `onMutate` refused the write and already said why.
       if (!ctx) return;
       // Restore this row's pin and membership without reverting other preferences.
       restorePinLabelInCaches(queryClient, id, ctx.prevPin);
+      const prevFamily = ctx.prevFamily;
+      if (prevFamily) overlayFamilyIntoCaches(queryClient, prevFamily, id);
+      const restoring = (row: Conversation) =>
+        row.id === id || (prevFamily !== undefined && row.family?.id === prevFamily.id);
       if (ctx.prevPinned !== undefined) {
         const previousPinned = ctx.prevPinned;
-        const previousIndex = previousPinned.conversations.findIndex((row) => row.id === id);
-        const previousRow = previousPinned.conversations[previousIndex];
-        const restoredRow = findRow(id) ?? previousRow;
+        const restoredRows = previousPinned.conversations.flatMap((previousRow, index) =>
+          restoring(previousRow) ? [{ index, row: findRow(previousRow.id) ?? previousRow }] : [],
+        );
         queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (current) => {
-          const conversations = (current?.conversations ?? []).filter((row) => row.id !== id);
-          if (previousRow && restoredRow) {
-            conversations.splice(Math.min(previousIndex, conversations.length), 0, restoredRow);
+          const conversations = (current?.conversations ?? []).filter((row) => !restoring(row));
+          for (const { index, row } of restoredRows) {
+            conversations.splice(Math.min(index, conversations.length), 0, row);
           }
           return {
             filterHonored: current?.filterHonored ?? previousPinned.filterHonored,
@@ -2215,10 +2316,21 @@ export function useTogglePinnedConversation() {
           };
         });
       }
+      if (prevFamily) invalidateFamilyLists(queryClient);
       // The row snaps back, so say why (e.g. an Undo re-pin that didn't save).
       showToast(pinned ? "Couldn't pin the session." : "Couldn't unpin the session.");
     },
-    onSuccess: (updated, { pinned }) => {
+    onSuccess: (updated, { pinned }, ctx) => {
+      // Like a plain unpin, reconcile rows fetched mid-write instead of
+      // refetching `?pinned=true`, whose index can still list the nest.
+      if (ctx?.prevFamily) {
+        const base = findRow(updated.id)?.labels ?? updated.labels;
+        const labels = Object.fromEntries(
+          Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY),
+        );
+        unpinFamilyInCaches(queryClient, updated.id, labels, ctx.prevFamily);
+        return;
+      }
       if (updated.family || findRow(updated.id)?.family) {
         invalidateFamilyLists(queryClient);
         return;

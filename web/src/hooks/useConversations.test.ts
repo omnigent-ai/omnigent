@@ -2170,6 +2170,134 @@ it.each(["pin", "reorder"])("refreshes every family list after a %s", async (act
   }
 });
 
+describe("useTogglePinnedConversation nest unpin", () => {
+  const family = { id: "family", representative_id: "head", pinned: true, pinned_at: "1000" };
+  const unpinnedFamily = { ...family, pinned: false, pinned_at: null };
+  const listKey = ["conversations", "", false];
+  function seedNest({ unpinId = "head", listed = ["head", "member", "own_pin"] } = {}) {
+    const head = conversation({ id: "head", labels: { [PINNED_LABEL_KEY]: "1000" }, family });
+    const member = conversation({ id: "member", family });
+    const ownPin = conversation({ id: "own_pin", labels: { [PINNED_LABEL_KEY]: "500" }, family });
+    const other = conversation({ id: "other", labels: { [PINNED_LABEL_KEY]: "2000" } });
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      listKey,
+      infinitePage([head, member, ownPin].filter((row) => listed.includes(row.id))),
+    );
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: [other, head, member, ownPin],
+      filterHonored: true,
+    });
+    let settlePatch!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settlePatch = resolve;
+        }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useTogglePinnedConversation(), { wrapper });
+    act(() => result.current.mutate({ id: unpinId, pinned: false }));
+    const pinnedIds = () =>
+      queryClient
+        .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+        ?.conversations.map((row) => row.id);
+    const listRows = () =>
+      queryClient.getQueryData<ConversationsInfiniteData>(listKey)?.pages.flatMap((p) => p.data);
+    const backfillRow = (id: string) =>
+      queryClient.getQueryData<Conversation>(["conversation-backfill", id]);
+    return {
+      queryClient,
+      result,
+      head,
+      member,
+      settlePatch: (r: Response) => settlePatch(r),
+      pinnedIds,
+      listRows,
+      backfillRow,
+    };
+  }
+
+  it("leaves the Pinned section while the PATCH is still in flight", async () => {
+    const { queryClient, result, settlePatch, pinnedIds, listRows } = seedNest();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    // The nest moves before a slow PATCH returns; a member with its own pin stays.
+    expect(pinnedIds()).toEqual(["other", "own_pin"]);
+    expect(listRows()?.map((row) => row.family)).toEqual([
+      unpinnedFamily,
+      unpinnedFamily,
+      unpinnedFamily,
+    ]);
+    expect(listRows()?.[0].labels).toEqual({});
+
+    settlePatch(mockResponse({ id: "head", labels: {}, family: unpinnedFamily }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // The lagging `?pinned=true` index could still list the nest, so it isn't refetched.
+    expect(queryClient.getQueryState(PINNED_CONVERSATIONS_KEY)?.isInvalidated).toBe(false);
+    expect(pinnedIds()).toEqual(["other", "own_pin"]);
+  });
+
+  it("keeps an open session unpinned when its row is fetched before the write commits", async () => {
+    const { queryClient, result, head, member, settlePatch, pinnedIds, backfillRow } = seedNest({
+      listed: ["own_pin"],
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    // Only the Pinned section listed the head and member, so their open-session rows are seeded.
+    for (const id of ["head", "member"]) {
+      expect(backfillRow(id)).toMatchObject({ family: unpinnedFamily });
+    }
+    expect(backfillRow("head")?.labels).toEqual({});
+    // Fetches that read the sessions before the PATCH committed still show the pin.
+    queryClient.setQueryData(["conversation-backfill", "head"], head);
+    queryClient.setQueryData(["conversation-backfill", "member"], member);
+
+    settlePatch(mockResponse({ id: "head", labels: {}, family: unpinnedFamily }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    for (const id of ["head", "member"]) {
+      expect(backfillRow(id)).toMatchObject({ family: unpinnedFamily });
+    }
+    expect(backfillRow("head")?.labels).toEqual({});
+    expect(pinnedIds()).toEqual(["other", "own_pin"]);
+  });
+
+  it("leaves the nest pinned when a member drops only its own pin", async () => {
+    const { queryClient, result, settlePatch, pinnedIds, listRows } = seedNest({
+      unpinId: "own_pin",
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    expect(pinnedIds()).toEqual(["other", "head", "member", "own_pin"]);
+    expect(listRows()?.map((row) => row.family)).toEqual([family, family, family]);
+
+    settlePatch(mockResponse({ id: "own_pin", labels: {}, family }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(queryClient.getQueryState(PINNED_CONVERSATIONS_KEY)?.isInvalidated).toBe(true);
+  });
+
+  it("restores the nest's pin when the PATCH fails", async () => {
+    const toasts: string[] = [];
+    const onToast = (e: Event) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    };
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    const { queryClient, result, settlePatch, pinnedIds, listRows } = seedNest();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+    settlePatch(mockResponse({}, { ok: false, status: 504 }));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(pinnedIds()).toEqual(["other", "head", "member", "own_pin"]);
+    expect(listRows()?.map((row) => row.family)).toEqual([family, family, family]);
+    expect(listRows()?.[0].labels).toEqual({ [PINNED_LABEL_KEY]: "1000" });
+    expect(queryClient.getQueryState(PINNED_CONVERSATIONS_KEY)?.isInvalidated).toBe(true);
+    expect(toasts).toEqual(["Couldn't unpin the session."]);
+  });
+});
+
 describe("useTogglePinnedConversation failure rollback", () => {
   it.each([
     ["unpin", "3000", false, "Couldn't unpin the session."],
