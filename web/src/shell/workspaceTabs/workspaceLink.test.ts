@@ -163,6 +163,15 @@ describe("parseWorkspaceLink / formatWorkspaceLink", () => {
     expect(parsed("omnigent://files#ignored")).toEqual({ place: { kind: "files" } });
   });
 
+  it.each(["0", "true", "", "11"])(
+    "leaves a pull request out of list mode for list=%j",
+    (value) => {
+      expect(parsed(`omnigent://pull?url=${encodeURIComponent(PR)}&list=${value}`)).toEqual({
+        place: { kind: "pull", url: PR, view: "summary" },
+      });
+    },
+  );
+
   it("drops and reports parameters a kind doesn't take", () => {
     const result = parseWorkspaceLink("omnigent://pulls?path=a.ts&zoom=2&tab=t1");
     expect(result).toEqual({
