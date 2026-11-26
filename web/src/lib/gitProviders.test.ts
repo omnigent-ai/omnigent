@@ -123,4 +123,32 @@ describe("gitProviderCopy for a registered named host", () => {
     expect(hostedOnGitHub("github")).toBe(true);
     expect(hostedOnGitHub(undefined)).toBe(true);
   });
+
+  it("finds a host by its provider id, even when its copy names another", () => {
+    const host = { ...EXAMPLE_NAMED_HOST, copy: { ...EXAMPLE_NAMED_HOST.copy, id: "shown-id" } };
+    registerPullRequestIntegrations({ namedCodeHosts: [host] });
+    expect(gitProviderCopy("named-host")).toBe(host.copy);
+    expect(hostedOnGitHub("named-host")).toBe(true);
+    expect(hostedOnGitHub("shown-id")).toBe(false);
+  });
+
+  it("says GitHub doesn't host a registered host's pull requests when it says so", () => {
+    registerPullRequestIntegrations({
+      namedCodeHosts: [{ ...EXAMPLE_NAMED_HOST, hostedOnGitHub: false }],
+    });
+    expect(gitProviderCopy("named-host")).toBe(EXAMPLE_NAMED_HOST.copy);
+    expect(hostedOnGitHub("named-host")).toBe(false);
+  });
+});
+
+describe("hostedOnGitHub", () => {
+  it("agrees with gitProviderCopy on which ids are GitHub", () => {
+    for (const id of [undefined, "", "github"]) {
+      expect(gitProviderCopy(id)).toBe(GIT_PROVIDERS.github);
+      expect(hostedOnGitHub(id)).toBe(true);
+    }
+    expect(gitProviderCopy(null)).not.toBe(GIT_PROVIDERS.github);
+    expect(hostedOnGitHub(null)).toBe(false);
+    expect(hostedOnGitHub("unknown-host")).toBe(false);
+  });
 });

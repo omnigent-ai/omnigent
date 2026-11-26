@@ -73,9 +73,9 @@ const NEUTRAL: GitProviderCopy = {
   cliLabel: "Git provider CLI",
 };
 
-/** The copy a registered named code host brings for its provider. */
-function namedHostCopy(id: string): GitProviderCopy | undefined {
-  return pullRequestIntegrations().namedCodeHosts.find((host) => host.copy.id === id)?.copy;
+/** The registered named code host with provider id `id`, keyed as the registry keys it. */
+function namedHost(id: string) {
+  return pullRequestIntegrations().namedCodeHosts.find((host) => host.provider === id);
 }
 
 /**
@@ -83,10 +83,10 @@ function namedHostCopy(id: string): GitProviderCopy | undefined {
  * GitHub's own page to hand off to. No id is a host that predates the field.
  */
 export function hostedOnGitHub(id: string | null | undefined): boolean {
-  if (id === undefined || id === "github") return true;
-  return pullRequestIntegrations().namedCodeHosts.some(
-    (host) => host.copy.id === id && host.hostedOnGitHub,
-  );
+  // The same ids gitProviderCopy reads as GitHub: none, an empty one, and "github" itself.
+  if (id === null) return false;
+  if (!id || id === "github") return true;
+  return namedHost(id)?.hostedOnGitHub === true;
 }
 
 /** Copy for each known provider id. */
@@ -107,7 +107,7 @@ export function gitProviderCopy(
   if (id === null) return NEUTRAL;
   if (!id) return GITHUB;
   if (Object.hasOwn(GIT_PROVIDERS, id)) return GIT_PROVIDERS[id];
-  const named = namedHostCopy(id);
+  const named = namedHost(id)?.copy;
   if (named) return named;
   const metadata = display?.id === id ? display : undefined;
   const label = metadata?.display_name || id;
