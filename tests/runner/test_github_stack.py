@@ -46,13 +46,20 @@ class StackGraph:
         self.default_branch: str | None = "main"
         self.deadlines: list[float | None] = []
         self.current = next(pr for pr in prs if pr["number"] == current)
-        monkeypatch.setattr(github, "_pr_token", self._token)
+        # The real token lookup runs, for an account the workspace chose.
+        monkeypatch.setattr(github, "_in_sandbox", lambda: False)
+        monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: "octocat")
+        monkeypatch.setattr(github, "_gh_auth_token", self._token)
         monkeypatch.setattr(github, "_gh", self._gh)
-        monkeypatch.setattr(github, "_pr_json", lambda _root, _reference, _fields: self.current)
+        monkeypatch.setattr(github, "_pr_json", self._pr_json)
 
-    def _token(self, _root: str, _reference: PullRequestRef) -> str:
+    def _token(self, _root: str, _login: str, _host: str) -> str:
         self.token_lookups += 1
         return TOKEN
+
+    def _pr_json(self, root: str, reference: PullRequestRef, _fields: str) -> dict[str, Any]:
+        self.tokens.append(github._pr_token(root, reference))  # As the real read does.
+        return self.current
 
     def _gh(
         self, argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
@@ -124,8 +131,9 @@ def test_every_list_runs_as_the_account_looked_up_once(monkeypatch: pytest.Monke
 
     github_stack.pull_request_stack("/workspace", _reference(2))
 
+    # The pull request's read and every list share one lookup.
     assert graph.token_lookups == 1
-    assert graph.tokens and set(graph.tokens) == {TOKEN}
+    assert len(graph.tokens) > 1 and set(graph.tokens) == {TOKEN}
 
 
 def test_a_cycle_marks_the_stack_truncated_instead_of_looping(
@@ -283,3 +291,16 @@ def test_without_the_default_branch_the_walk_still_runs(monkeypatch: pytest.Monk
     stack = github_stack.pull_request_stack("/workspace", _reference(2))
 
     assert _numbers(stack) == [1, 2, 3]
+
+
+def test_a_contributors_pull_request_built_on_a_branch_here_is_in_the_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Pull request 2 comes from a contributor's repository but targets this one's branch-1.
+    prs = [*_chain(1), _pr(2, "their-branch", "branch-1", cross_repository=True)]
+    graph = StackGraph(monkeypatch, prs, current=1)
+
+    stack = github_stack.pull_request_stack("/workspace", _reference(1))
+
+    assert _numbers(stack) == [1, 2]
+    assert ("--base", "their-branch") not in graph.lists

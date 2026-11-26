@@ -93,12 +93,17 @@ def pull_request_stack(root: str, reference: PullRequestRef) -> dict[str, Any]:
     one pull request, such as a long-lived ``develop``, is a base rather than a member.
     """
     with github._gh_deadline_scope(time.monotonic() + WALK_SECONDS):
-        current = github._pr_json(root, reference, _FIELDS)
-        if current is None:
-            raise ValueError(_UNLOADED)
+        # One account for the whole walk: the pull request's read and every list.
         token = github._pr_token(root, reference)
-        default_branch = _default_branch(root, reference, token)
-        members, truncated = _walk(root, reference, token, current, default_branch)
+        binding = github._bound_pr_token.set((reference.url, token))
+        try:
+            current = github._pr_json(root, reference, _FIELDS)
+            if current is None:
+                raise ValueError(_UNLOADED)
+            default_branch = _default_branch(root, reference, token)
+            members, truncated = _walk(root, reference, token, current, default_branch)
+        finally:
+            github._bound_pr_token.reset(binding)
     members.append(_member(current, current=True))
     return {
         "object": "session.github.pr_stack",
@@ -144,12 +149,13 @@ def _walk(
         if github._gh_timed_out.get():
             return members, True
         truncated = truncated or not complete
-        # Another repository's branch only shares the name of the one walked here.
-        found = [other for other in found if other.get("isCrossRepository") is False]
-        if direction == "up" and (len(found) > 1 or not complete):
-            # A stacked branch heads one pull request; one that heads several, such as
-            # ``develop`` with its past release PRs, is a long-lived base.
-            continue
+        if direction == "up":
+            # Another repository's branch only shares the name of the base walked here.
+            found = [other for other in found if other.get("isCrossRepository") is False]
+            if len(found) > 1 or not complete:
+                # A stacked branch heads one pull request; one that heads several, such as
+                # ``develop`` with its past release PRs, is a long-lived base.
+                continue
         for other in found:
             number, head = other.get("number"), other.get("headRefOid")
             if number in seen_numbers or head in seen_heads:
