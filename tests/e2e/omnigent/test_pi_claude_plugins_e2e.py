@@ -192,14 +192,20 @@ def test_pi_gateway_loads_enabled_claude_plugins(
     requests = get_mock_requests(mock_llm_server_url, key=model)
     assert requests
     for request in requests:
+        messages = request.get("messages", request.get("input", []))
+        assert isinstance(messages, list)
         system = json.dumps(
-            [m["content"] for m in request["messages"] if m["role"] in ("system", "developer")]
+            [
+                request.get("instructions"),
+                *[m["content"] for m in messages if m.get("role") in ("system", "developer")],
+            ]
         )
         assert _EXTENSION_MARKER in system
         assert _DISABLED_MARKER not in system
         # Two listings in one request would mean the plugin skill loaded twice.
         assert system.count(_SKILL_MARKER) == 1
-    user_texts = json.dumps([m["content"] for m in requests[0]["messages"] if m["role"] == "user"])
+    messages = requests[0].get("messages", requests[0].get("input", []))
+    user_texts = json.dumps([m["content"] for m in messages if m.get("role") == "user"])
     assert "Review focus: security please" in user_texts
     assert f"Plugin root: {review_root}" in user_texts
     assert "${CLAUDE_PLUGIN_ROOT}" not in user_texts
