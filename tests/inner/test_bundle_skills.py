@@ -8,6 +8,7 @@ lockstep).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -293,6 +294,25 @@ def test_claude_native_skill_args_bundle_without_skills_dir(tmp_path: Path) -> N
     """
     (tmp_path / "no_skills").mkdir()
     assert "--plugin-dir" not in claude_native_skill_args(tmp_path / "no_skills")
+
+
+def test_claude_native_skill_args_respects_managed_sideload_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A managed sideload ban suppresses the fatal ``--plugin-dir`` flag."""
+    from omnigent.onboarding import ambient
+
+    bundle = _make_bundle_with_skill(tmp_path)
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text('{"disableSideloadFlags": true}')
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.bundle_skills"):
+        args = claude_native_skill_args(bundle, agent_name="researcher")
+
+    assert "--plugin-dir" not in args
+    assert not (bundle / ".claude-plugin" / "plugin.json").exists()
+    assert any("without bundled skills" in record.getMessage() for record in caplog.records)
 
 
 def test_claude_agents_skill_args_without_portable_skills_skips_native_reads(
