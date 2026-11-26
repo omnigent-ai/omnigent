@@ -572,16 +572,18 @@ checkout); Claude would otherwise combine those
 lists with Omnigent's. Servers other than allowed ones in `managed-mcp.json` are
 denied by name, since Claude does not apply the allowlist to them. This also covers
 `managedMcpServers` in managed settings and their drop-ins. A `serverUrl`
-entry is denied too, but one matching an allowed server's URL (in Claude's
-global config, the project's `.mcp.json`, `managed-mcp.json` or managed settings) stops the
-launch, as does any `serverCommand` entry: Claude then admits stdio servers by
-command alone, which would bypass the names or reject Omnigent's relay. Codex
+entry stops the launch when an allowed server uses HTTP or SSE, even if the
+URL pattern differs: Claude then admits remote servers by URL alone and ignores
+their names. Any `serverCommand` entry also stops the launch: Claude admits stdio
+servers by command alone, which would bypass the names or reject Omnigent's relay. Codex
 receives `-c mcp_servers.<name>.enabled=false` for every other server it would
 load from the system, user, trusted project, command-line, and managed config
 layers; a managed `enabled = true` for any other server stops the launch, since
 that layer outranks the override. For host-launched native Claude sessions,
 Claude's settings are read for the launched CLI's working directory and
-environment, including a configured `env -C` or `CLAUDE_CONFIG_DIR` wrapper. If one of those Claude settings or
+environment, including a configured `env -C` or `CLAUDE_CONFIG_DIR` wrapper.
+Strict mode refuses `env` wrapper forms whose launch environment cannot be resolved.
+If one of those Claude settings or
 Codex config files exists but cannot be read or parsed, or a `-c mcp_servers`
 override is not a TOML table, the launch stops with an error naming it. A malformed `inherit` or `allow` value is
 ignored with a warning, so `inherit: false` with an invalid `allow` allows only

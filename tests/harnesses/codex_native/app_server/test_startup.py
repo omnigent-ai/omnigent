@@ -1359,8 +1359,10 @@ _HOOK_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
-@pytest.mark.parametrize("command_config", [False, True])
+@pytest.mark.parametrize(
+    ("active", "saved", "strict", "command_config"),
+    [*((*case, False) for case in _HOOK_CASES), (None, False, True, True)],
+)
 async def test_disabled_mcp_launch_hook_uses_prepared_private_config(
     tmp_path, monkeypatch, active, saved, strict, command_config
 ):

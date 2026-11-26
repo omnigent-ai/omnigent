@@ -400,10 +400,12 @@ environment (`apply_claude_launch_mcp_policy`); SDK launches use the executor cw
 and CLI env with the SDK's selected setting scopes (managed policy always
 applies), and `omnigent claude` its own cwd and env (a `CLAUDE_LAUNCHER`
 plugin's wrapper is not modeled).
-Any inherited `serverCommand` entry, or a `serverUrl` entry matching an
-allowlisted server's URL, raises `McpStrictModeError`: Claude 2.1.283 admits stdio
-(or remote) servers only by command (or URL) once such an entry exists, so a name
-allowlist cannot narrow it and the stdio relay would be rejected. Codex
+Any inherited `serverCommand` entry, or a `serverUrl` entry when an allowlisted
+server uses HTTP or SSE, raises `McpStrictModeError`: Claude 2.1.283 admits stdio
+(or remote) servers only by command (or URL) once such an entry exists, even when
+the URL pattern differs. The error names the settings file and affected server
+without printing the URL. Host-launched Claude sessions also refuse `env` wrapper
+forms whose launch environment cannot be resolved before trust seeding. Codex
 gets an `enabled=false` override for every other discovered server (TOML 1.1
 layers and `-c` values are read with `tomlkit`) and no relaunch without them; a
 managed-layer `enabled = true` for any other server raises `McpStrictModeError`. A

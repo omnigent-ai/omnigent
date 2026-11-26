@@ -1,7 +1,7 @@
 """Public contract for host-owned MCP disable state and launch planning."""
 
 import json
-import re
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -289,7 +289,7 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
             "allowedMcpServers": [{"serverName": "managed_only"}],
             "managedMcpServers": {
                 "policy_only": {"type": "http", "url": "https://mcp.example.com/policy"},
-                "kept": {"type": "sse", "url": "https://kept.example.com/mcp"},
+                "kept": {"command": "kept"},
             },
         },
     )
@@ -436,23 +436,25 @@ def test_claude_strict_refuses_inherited_command_entries(claude_project, executo
 
 
 @pytest.mark.parametrize(
-    ("pattern", "source"),
+    ("pattern", "source", "transport"),
     [
-        ("https://mcp.example.com/kept", "user"),
-        ("https://mcp.example.com/kept", "project_key"),
-        ("https://mcp.example.com/*", "mcp_json"),
-        ("https://mcp.example.com/kept", "managed_settings"),
-        ("https://mcp.example.com/*", "managed_drop_in"),
+        ("https://mcp.example.com/synthetic-capability-token", "user", "http"),
+        ("https://mcp.example.com/kept", "project_key", "http"),
+        ("https://mcp.example.com/*", "mcp_json", "http"),
+        ("https://mcp.example.com/kept", "managed_settings", "http"),
+        ("https://mcp.example.com/*", "managed_drop_in", "http"),
+        ("https://other.example.com/mcp", "user", "http"),
+        ("https://other.example.com/mcp", "user", "sse"),
     ],
 )
-def test_claude_strict_refuses_url_entries_matching_allowlisted_servers(
-    claude_project, pattern, source
+def test_claude_strict_refuses_url_admissions_with_allowlisted_remote_servers(
+    claude_project, caplog, pattern, source, transport
 ):
-    """Denying such an entry blocks the server; keeping it admits others at that URL."""
+    """URL admissions override name-based admission even when their patterns differ."""
     from omnigent.onboarding import ambient
 
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
-    servers = {"mcpServers": {"kept": {"type": "http", "url": "https://mcp.example.com/kept"}}}
+    servers = {"mcpServers": {"kept": {"type": transport, "url": "https://mcp.example.com/kept"}}}
     if source == "mcp_json":
         _write_json(claude_project / ".mcp.json", servers)
     elif source.startswith("managed_"):
@@ -470,20 +472,23 @@ def test_claude_strict_refuses_url_entries_matching_allowlisted_servers(
             claude_project.parent / "claude-config/.claude.json",
             servers if source == "user" else user,
         )
-    other = {"serverUrl": "https://other.example.com/mcp"}
     settings = claude_project / ".claude/settings.json"
-    _write_json(settings, {"allowedMcpServers": [other, {"serverUrl": pattern}]})
+    _write_json(settings, {"allowedMcpServers": [{"serverUrl": pattern}]})
     launch = claude_project.parent / "linked-project"
     launch.symlink_to(claude_project, target_is_directory=True)
     with pytest.raises(
         McpStrictModeError,
-        match=re.escape(f"serverUrl {pattern}, which matches allowlisted server kept"),
+        match=r"serverUrl.*allowlisted remote server kept",
     ) as raised:
         apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
     assert raised.value.path == launch / ".claude/settings.json"
-    _write_json(settings, {"allowedMcpServers": [other]})
+    assert pattern not in str(raised.value)
+    assert pattern not in "".join(traceback.format_exception(raised.value))
+    assert pattern not in caplog.text
+    _write_json(settings, {"allowedMcpServers": [{"serverName": "kept"}]})
     result = apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
-    assert result["deniedMcpServers"] == [other]
+    assert result["allowedMcpServers"] == [{"serverName": "omnigent"}, {"serverName": "kept"}]
+    assert "deniedMcpServers" not in result
 
 
 def test_claude_strict_logs_unreadable_server_configs(claude_project, caplog):
@@ -528,7 +533,7 @@ def test_claude_strict_reads_settings_for_the_launch_environment(
         {"mcpServers": {"kept": {"type": "http", "url": url}}},
     )
     _write_json(launch_settings, {"allowedMcpServers": [{"serverUrl": url}]})
-    with pytest.raises(McpStrictModeError, match="matches allowlisted server kept"):
+    with pytest.raises(McpStrictModeError, match="allowlisted remote server kept"):
         apply_claude_settings(
             {}, executor="claude-native", active_harnesses=None, cwd=launch, env=env
         )

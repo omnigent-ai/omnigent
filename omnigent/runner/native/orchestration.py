@@ -8731,7 +8731,9 @@ def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
     )
 
 
-def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
+def _claude_terminal_launch_env(
+    spec: TerminalEnvSpec, *, require_resolved: bool = False
+) -> dict[str, str]:
     """
     Return the environment the native Claude terminal process starts with.
 
@@ -8742,12 +8744,26 @@ def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
 
     :param spec: The Claude terminal launch spec, e.g. one with
         ``command="env"`` and ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
+    :param require_resolved: Refuse unmodeled wrappers for strict MCP discovery.
     :returns: The effective environment, e.g.
         ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
     """
     env = _claude_terminal_pre_wrapper_env(spec)
     wrapper = env_wrapper_environment(spec.command or "", list(spec.args), env)
     if wrapper is None and Path(spec.command or "").name == "env":
+        if require_resolved:
+            from omnigent.config import global_config_path
+            from omnigent.mcp_disabled_servers import McpStrictModeError
+
+            raise McpStrictModeError(
+                "claude-native",
+                global_config_path(),
+                "unresolved env wrapper",
+                problem=(
+                    "the configured env wrapper cannot be resolved for strict MCP discovery; "
+                    "use a supported env wrapper or launch Claude directly"
+                ),
+            )
         _logger.info(
             "Claude terminal env wrapper form is not modeled; trust seeding uses the "
             "pre-wrapper environment"
@@ -10457,8 +10473,12 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
+        from omnigent.mcp_inheritance import resolve_mcp_inheritance
+
         launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
-        launch_env = _claude_terminal_launch_env(env_spec)
+        launch_env = _claude_terminal_launch_env(
+            env_spec, require_resolved=not resolve_mcp_inheritance("claude-native").inherit
+        )
         apply_claude_launch_mcp_policy(
             bridge_dir,
             cwd=launch_cwd,

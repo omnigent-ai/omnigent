@@ -1297,6 +1297,14 @@ def test_claude_terminal_launch_env_keeps_pre_wrapper_env_for_unparsed_env_forms
     ]
     assert values and all(value not in caplog.text for value in values)
 
+    from omnigent.mcp_disabled_servers import McpStrictModeError
+
+    with pytest.raises(McpStrictModeError, match="configured env wrapper") as refused:
+        orchestration._claude_terminal_launch_env(
+            TerminalEnvSpec(command="env", args=args), require_resolved=True
+        )
+    assert all(value not in str(refused.value) for value in values)
+
 
 def test_unparsed_env_wrapper_seeds_the_runner_config_not_a_literal_path(
     tmp_path: Path,
@@ -1744,6 +1752,39 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     # ``workspace`` is the launch cwd's Git root, which Claude also reads.
     denied = ["launch_user", "launch_project", "workspace_project"]
     assert settings["deniedMcpServers"] == [{"serverName": name} for name in denied]
+
+
+async def test_auto_create_claude_terminal_refuses_unresolved_strict_mcp_wrapper(
+    bridge_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strict discovery refuses an unresolved wrapper before seeding or launching."""
+    from unittest.mock import Mock
+
+    from omnigent.mcp_disabled_servers import McpStrictModeError
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from tests._helpers.mcp_disabled_servers import write_mcp_inheritance
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    write_mcp_inheritance({"inherit": False})
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
+    )
+    monkeypatch.setattr(
+        "omnigent.harness_startup_config.resolve_harness_args",
+        lambda _harness, cli_args, cfg=None: ["-v", "claude", *cli_args],
+    )
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {}
+
+    with pytest.raises(McpStrictModeError, match="configured env wrapper"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="strict_unresolved_wrapper",
+            workspace=bridge_dir,
+            registry=registry,
+        )
+
+    registry.launch_required_terminal.assert_not_called()
 
 
 @pytest.mark.parametrize(

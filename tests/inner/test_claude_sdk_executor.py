@@ -8644,8 +8644,10 @@ _HOOK_CASES = [
 ]
 
 
-@pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
-@pytest.mark.parametrize("hermetic", [False, True])
+@pytest.mark.parametrize(
+    ("active", "saved", "strict", "hermetic"),
+    [*((*case, False) for case in _HOOK_CASES), (None, False, True, True)],
+)
 async def test_disabled_mcp_settings_launch_hook(
     tmp_path, monkeypatch, active, saved, strict, hermetic
 ):

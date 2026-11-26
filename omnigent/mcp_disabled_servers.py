@@ -60,7 +60,7 @@ class ServerKey:
 
 
 class McpStrictModeError(RuntimeError):
-    """Strict MCP mode refused a launch because a config layer the CLI reads is unreadable."""
+    """The CLI's launch configuration cannot honor the strict MCP policy."""
 
     def __init__(
         self, executor: str, path: Path, reason: str, *, problem: str | None = None
@@ -323,14 +323,6 @@ def _claude_allowlisted_servers(
     ]
 
 
-def _claude_url_matches(value: str, config: Mapping[str, object]) -> bool:
-    """Whether a ``serverUrl`` allow entry matches a server's URL, as Claude does."""
-    url = config.get("url")
-    if not isinstance(url, str):
-        return False
-    return re.fullmatch(".*".join(re.escape(part) for part in value.split("*")), url) is not None
-
-
 def _claude_inherited_denials(
     cwd: Path,
     inheritance: McpInheritance,
@@ -399,24 +391,24 @@ def _claude_inherited_denials(
                         allowlisted = _claude_allowlisted_servers(
                             cwd, inheritance, env, managed_settings
                         )
-                    matched = next(
+                    remote = next(
                         (
                             name
                             for name, config in allowlisted
-                            if _claude_url_matches(value, config)
+                            if isinstance(config.get("url"), str)
                         ),
                         None,
                     )
-                    if matched is not None:
+                    if remote is not None:
                         raise McpStrictModeError(
                             executor,
                             path,
-                            "serverUrl matches an allowlisted server",
+                            "serverUrl overrides name-based remote admission",
                             problem=(
-                                f"{path} allows the serverUrl {value}, which matches allowlisted "
-                                f"server {matched}: denying it blocks that server and keeping "
-                                "it admits any other server at that URL. Replace it with "
-                                "serverName entries"
+                                f"{path} contains a serverUrl allow entry, so Claude uses "
+                                "URL-only admission and cannot enforce the name allowlist "
+                                f"for allowlisted remote server {remote}. Replace serverUrl "
+                                "entries with serverName entries"
                             ),
                         )
                     mirrored = True
