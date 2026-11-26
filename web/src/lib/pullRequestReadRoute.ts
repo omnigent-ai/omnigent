@@ -3,6 +3,7 @@
 // and the effective route apart; the store in desktopReadPath holds the choices.
 
 import type { CodeHostPullRequest } from "@/lib/codeHosts";
+import { pullRequestIntegrations } from "@/lib/pullRequestIntegrations";
 
 /** The user's choice for one PR. Nothing chosen means Automatic. */
 export type ReadChoice = "automatic" | "mac" | "session";
@@ -74,8 +75,12 @@ export function pullRequestPageUrl(url: string | null | undefined): string | nul
 
 /** The key one PR's choice is kept under, the same for every spelling of its URL. */
 export function readChoiceKey(url: string | null | undefined): string | null {
-  // GitHub owners and repositories don't differ by case alone.
-  return pullRequestPageUrl(url)?.toLowerCase() ?? null;
+  const pageUrl = pullRequestPageUrl(url);
+  if (!pageUrl) return null;
+  // GitHub owners and repositories don't differ by case alone; a host GitHub doesn't run may.
+  const host = new URL(pageUrl).hostname;
+  const named = pullRequestIntegrations().namedCodeHosts.find((entry) => entry.matchesHost(host));
+  return named && !named.hostedOnGitHub ? pageUrl : pageUrl.toLowerCase();
 }
 
 /** Part of a read's query key while the route is blocked, so no host answer is reused. */

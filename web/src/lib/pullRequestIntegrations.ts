@@ -160,14 +160,34 @@ const NONE: PullRequestIntegrations = {
 
 let current: PullRequestIntegrations = NONE;
 
+/** `list` with `added` merged in: an entry with a key already there takes its place. */
+function mergeByKey<Entry>(
+  list: readonly Entry[],
+  added: readonly Entry[] | undefined,
+  key: (entry: Entry) => string,
+): readonly Entry[] {
+  const merged = [...list];
+  for (const entry of added ?? []) {
+    const at = merged.findIndex((existing) => key(existing) === key(entry));
+    if (at === -1) merged.push(entry);
+    else merged[at] = entry;
+  }
+  return merged;
+}
+
 /**
  * Adds a build's integrations, once at startup before the page renders: hooks they carry are
  * called on every render, so they must not change while it shows.
  */
 export function registerPullRequestIntegrations(added: Partial<PullRequestIntegrations>): void {
   current = {
-    namedCodeHosts: [...current.namedCodeHosts, ...(added.namedCodeHosts ?? [])],
-    stackFormats: [...current.stackFormats, ...(added.stackFormats ?? [])],
+    // Registering again, as a hot reload does, replaces entries rather than repeating them.
+    namedCodeHosts: mergeByKey(
+      current.namedCodeHosts,
+      added.namedCodeHosts,
+      (host) => host.provider,
+    ),
+    stackFormats: mergeByKey(current.stackFormats, added.stackFormats, (format) => format.id),
     reviewSite: added.reviewSite ?? current.reviewSite,
     mergeReadiness: added.mergeReadiness ?? current.mergeReadiness,
     reviewerPings: added.reviewerPings ?? current.reviewerPings,

@@ -186,13 +186,13 @@ export function presentMergeReadinessView(
       : "";
   switch (status) {
     case "checks_failing":
-      return { ...base, detail: `${failingJobs} ${failingRequirements}`.trim() };
+      return { ...base, detail: `${failingJobs} ${failingRequirements}`.trim() || undefined };
     case "ci_failing":
       return { ...base, detail: failingJobs || undefined };
     case "policy_failing":
       return { ...base, detail: failingRequirements || undefined };
     default:
-      return { ...base, detail: wording.details[status] };
+      return { ...base, detail: wording.details[status] ?? MERGE_READINESS_DETAILS[status] };
   }
 }
 

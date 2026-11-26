@@ -1,7 +1,5 @@
-// The desktop shell's code-host, GitHub sign-in and workspace fast-track bridges.
-// Shells without them answer "unsupported", so callers take their server path.
-// They read and write linked GitHub data through the Mac's own gh, without a running session
-// host, so a closed session can still show whether its pull request merged.
+// The desktop shell's code-host, GitHub sign-in and workspace fast-track bridges, through this
+// Mac's gh; shells without them answer "unsupported", so callers take their server path.
 
 import { z } from "zod";
 
@@ -171,7 +169,6 @@ export interface WorkspaceFastTrackRequest {
   requestId?: string;
 }
 
-/** The shell's answer: the runner's JSON, or why the request takes HTTPS instead. */
 /** A streamed content search: a `content-search` URL, named so the page can cancel it. */
 export interface WorkspaceContentSearchRequest {
   url: string;
@@ -336,7 +333,8 @@ export interface LocalPullRequestLink {
   host: string;
   repository: string;
   number: number;
-  linked_at: number;
+  /** When it was linked, in seconds; a shell may leave it out. */
+  linked_at?: number;
   /** The link's session, in `list_user` answers. */
   session_id?: string;
 }
@@ -1018,9 +1016,14 @@ async function sendCodeHostWrite<Data, Request extends CodeHostWriteRequest = Co
     results?: unknown;
   };
   if (answer.ok === true) {
-    return typeof answer.actor?.login === "string" && answer.actor.login.length > 0
-      ? { ok: true, data: answer.data as Data, actor: { login: answer.actor.login } }
-      : unknown;
+    if (typeof answer.actor?.login !== "string" || answer.actor.login.length === 0) return unknown;
+    const steps = parseWriteSteps(answer.steps);
+    return {
+      ok: true,
+      data: answer.data as Data,
+      actor: { login: answer.actor.login },
+      ...(steps ? { steps } : {}),
+    };
   }
   if (
     answer.ok === false &&
@@ -1233,7 +1236,8 @@ export function onWorkspaceAccessReady(callback: (sessionId: string) => void): (
   const electron = codeHostDesktopApi();
   if (!electron?.onWorkspaceAccessReady) return () => {};
   try {
-    return electron.onWorkspaceAccessReady(callback);
+    const unsubscribe = electron.onWorkspaceAccessReady(callback);
+    return typeof unsubscribe === "function" ? unsubscribe : () => {};
   } catch (err) {
     console.warn("[nativeBridge] electron onWorkspaceAccessReady failed:", err);
     return () => {};

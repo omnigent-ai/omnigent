@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   desktopCodeHostQuery,
+  desktopCodeHostWrite,
   githubFastTrackQuery,
+  onWorkspaceAccessReady,
+  type WorkspaceFastTrackRequest,
   workspaceFastTrackRequest,
 } from "./nativeBridgeCodeHost";
 
@@ -110,6 +113,124 @@ describe("desktopCodeHostQuery", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("unsupported");
   });
+
+  it("never sends a read aborted already", async () => {
+    const query = vi.fn(async () => ({ ok: true, data: {} }));
+    installShell({ codeHostQuery: query });
+    const aborted = new AbortController();
+    aborted.abort();
+    expect(await desktopCodeHostQuery(REQUEST, aborted.signal)).toMatchObject({
+      ok: false,
+      error: { code: "cancelled" },
+    });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("lets go of a read aborted in flight by its readId, and only while it's in flight", async () => {
+    let answer!: (value: unknown) => void;
+    const cancel = vi.fn(async () => ({ ok: true }));
+    installShell({
+      codeHostQuery: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            answer = resolve;
+          }),
+      ),
+      codeHostQueryCancel: cancel,
+    });
+    const controller = new AbortController();
+    const pending = desktopCodeHostQuery({ ...REQUEST, readId: "read_1" }, controller.signal);
+    controller.abort();
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith({ readId: "read_1" }));
+    answer({ ok: true, data: {} });
+    await pending;
+
+    const settled = new AbortController();
+    const second = desktopCodeHostQuery({ ...REQUEST, readId: "read_2" }, settled.signal);
+    answer({ ok: true, data: {} });
+    await second;
+    settled.abort();
+    await Promise.resolve();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("has nothing to let go of for a read without a readId", async () => {
+    let answer!: (value: unknown) => void;
+    const cancel = vi.fn(async () => ({ ok: true }));
+    installShell({
+      codeHostQuery: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            answer = resolve;
+          }),
+      ),
+      codeHostQueryCancel: cancel,
+    });
+    const controller = new AbortController();
+    const pending = desktopCodeHostQuery(REQUEST, controller.signal);
+    controller.abort();
+    answer({ ok: true, data: {} });
+    await pending;
+    expect(cancel).not.toHaveBeenCalled();
+  });
+});
+
+describe("desktopCodeHostWrite", () => {
+  const write = {
+    requestId: "write_1",
+    provider: "github",
+    host: "github.com",
+    actor: { login: "octo", generation: 1 },
+    operation: "start_review",
+    params: {},
+  };
+
+  it("keeps a successful several-step write's steps, with the review it started", async () => {
+    const steps = {
+      completed: [{ step: "start_review", review_id: "PRR_1" }],
+      not_attempted: [{ step: "submit_review", index: 1 }],
+    };
+    installShell({
+      codeHostWrite: vi.fn(async () => ({ ok: true, data: null, actor: { login: "octo" }, steps })),
+    });
+    expect(await desktopCodeHostWrite(write)).toEqual({
+      ok: true,
+      data: null,
+      actor: { login: "octo" },
+      steps,
+    });
+  });
+
+  it("leaves out steps it can't read, and keeps the write", async () => {
+    installShell({
+      codeHostWrite: vi.fn(async () => ({
+        ok: true,
+        data: null,
+        actor: { login: "octo" },
+        steps: { completed: "all" },
+      })),
+    });
+    expect(await desktopCodeHostWrite(write)).toEqual({
+      ok: true,
+      data: null,
+      actor: { login: "octo" },
+    });
+  });
+});
+
+describe("onWorkspaceAccessReady", () => {
+  it("gives a no-op unsubscribe when the shell returns something else", () => {
+    installShell({ onWorkspaceAccessReady: vi.fn(() => "subscribed") });
+    const unsubscribe = onWorkspaceAccessReady(() => {});
+    expect(() => unsubscribe()).not.toThrow();
+  });
+
+  it("returns the shell's own unsubscribe", () => {
+    const shellUnsubscribe = vi.fn();
+    installShell({ onWorkspaceAccessReady: vi.fn(() => shellUnsubscribe) });
+    onWorkspaceAccessReady(() => {})();
+    expect(shellUnsubscribe).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("githubFastTrackQuery", () => {
@@ -121,8 +242,9 @@ describe("githubFastTrackQuery", () => {
     });
   });
 
-  it.each(MALFORMED)("answers unsupported for a malformed answer %j", async (answer) => {
-    installShell({ githubQuery: vi.fn(async () => answer) });
+  // The parser's whole matrix runs through desktopCodeHostQuery above.
+  it("answers unsupported for a malformed answer", async () => {
+    installShell({ githubQuery: vi.fn(async () => ({ ok: true })) });
     const result = await githubFastTrackQuery("pull_request_details", ACCOUNT, {});
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("unsupported");
@@ -136,9 +258,7 @@ function cyclic() {
 }
 
 describe("workspaceFastTrackRequest", () => {
-  const request = { sessionId: "conv_1", method: "GET", path: "/files" } as unknown as Parameters<
-    typeof workspaceFastTrackRequest
-  >[0];
+  const request: WorkspaceFastTrackRequest = { url: "/v1/sessions/conv_1/filesystem/src" };
 
   it("returns a capable shell's answer and refusal as they are", async () => {
     for (const [body, bodyText] of [
@@ -153,7 +273,8 @@ describe("workspaceFastTrackRequest", () => {
         route: "workspace-helper",
         ignoredFiles: "hidden",
       };
-      installShell({ workspaceRequest: vi.fn(async () => answer) });
+      const send = vi.fn(async () => answer);
+      installShell({ workspaceRequest: send });
       // oxlint-disable-next-line no-await-in-loop -- each shell in turn
       expect(await workspaceFastTrackRequest(request)).toEqual({
         ok: true,
@@ -162,6 +283,7 @@ describe("workspaceFastTrackRequest", () => {
         route: "workspace-helper",
         ignoredFiles: "hidden",
       });
+      expect(send).toHaveBeenCalledWith(request);
     }
     installShell({ workspaceRequest: vi.fn(async () => ({ ok: false, reason: "offline" })) });
     expect(await workspaceFastTrackRequest(request)).toEqual({ ok: false, reason: "offline" });

@@ -66,17 +66,28 @@ export class PullRequestTiming {
    * order is accepted: a child view's effect can report its header before the
    * panel's own effect marks the state in the same render.
    */
-  mark(milestone: PullRequestTimingMilestone, at: number, outcome?: string): void {
-    if (this.reported || this.marks.has(milestone)) return;
-    this.marks.set(milestone, at);
-    if (milestone === "state" && outcome) this.outcome = outcome;
+  mark(
+    milestone: Exclude<PullRequestTimingMilestone, "changesShown">,
+    at: number,
+    outcome?: string,
+  ): void {
+    // A state without its outcome is ignored, so a later mark can still name it.
+    if (milestone === "state" && !outcome) return;
+    if (this.record(milestone, at) && milestone === "state") this.outcome = outcome ?? null;
   }
 
   /** Changes started or stopped showing; its first showing is the `changesShown` milestone. */
   showChanges(showing: boolean, at: number): void {
     if (this.reported) return;
     this.changesShowing = showing;
-    if (showing) this.mark("changesShown", at);
+    if (showing) this.record("changesShown", at);
+  }
+
+  /** Whether this was the milestone's first time. */
+  private record(milestone: PullRequestTimingMilestone, at: number): boolean {
+    if (this.reported || this.marks.has(milestone)) return false;
+    this.marks.set(milestone, at);
+    return true;
   }
 
   /**

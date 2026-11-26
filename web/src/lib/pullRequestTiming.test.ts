@@ -108,6 +108,20 @@ describe("PullRequestTiming", () => {
     expect(run.takeReport()).toMatchObject({ stateMs: 100, headerMs: 100, diffMs: 500 });
   });
 
+  it("waits for a state that names its outcome", () => {
+    const run = timing();
+    run.mark("state", 1200);
+    expect(run.complete).toBe(false);
+    run.mark("state", 1500, "error");
+    expect(run.takeReport()).toMatchObject({ outcome: "error", stateMs: 500 });
+  });
+
+  it("takes Changes showing only through showChanges", () => {
+    const run = timing();
+    // @ts-expect-error -- marking it directly would skip waiting for the diff to show
+    run.mark("changesShown", 1100);
+  });
+
   it("drops a duration from a suspended window", () => {
     const run = timing();
     run.mark("state", 1000 + 10 * 60_000 + 1, "ready");
