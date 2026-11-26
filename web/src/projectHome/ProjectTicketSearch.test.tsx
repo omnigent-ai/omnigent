@@ -83,7 +83,7 @@ describe("ticket search", () => {
     ]);
     expect(results[0].textContent).toContain("Comment: same login crash");
     expect(results[0].textContent).toContain("Pending");
-    expect(screen.getByText("2 tickets, most recently updated first")).toBeTruthy();
+    expect(screen.getByText("2 tickets · newest first")).toBeTruthy();
     expect(api.searchTickets).toHaveBeenCalledWith("project", "login", { after: undefined });
 
     fireEvent.click(screen.getByRole("button", { name: "Back to board" }));

@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { SearchIcon, XIcon } from "lucide-react";
+import { ArrowLeftIcon, SearchIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
@@ -180,10 +180,11 @@ export function TicketSearchResults({
               ? hasNextPage
                 ? `No matches in the ${scanned} most recently updated tickets`
                 : `No tickets match “${query}”`
-              : `${results.length}${hasNextPage ? "+" : ""} ${results.length === 1 ? "ticket" : "tickets"}, most recently updated first`}
+              : `${results.length}${hasNextPage ? "+" : ""} ${results.length === 1 ? "ticket" : "tickets"} · newest first`}
           </span>
         )}
-        <Button variant="ghost" size="sm" className="ml-auto" onClick={onClear}>
+        <Button variant="ghost" size="sm" className="ml-auto shrink-0" onClick={onClear}>
+          <ArrowLeftIcon aria-hidden />
           Back to board
         </Button>
       </div>

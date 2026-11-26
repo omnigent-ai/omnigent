@@ -250,24 +250,27 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
             trailing={
               <div className="flex items-center gap-2 max-sm:w-full max-sm:flex-col max-sm:items-stretch">
                 {ticketSearch && <TicketSearchBox value={searchQuery} onChange={setSearchQuery} />}
-                <TicketBoardRequesterFilter
-                  mine={boardMine}
-                  onChange={(mine) => {
-                    if (needsYou || stalledOnly) setBoardFilter(null);
-                    setBoardMine(mine);
-                  }}
-                  needsYou={{
-                    count: needsYouIds.length,
-                    active: needsYou,
-                    onSelect: () => setBoardFilter("needs-you"),
-                  }}
-                  stalled={{
-                    count: stalledIds.length,
-                    active: stalledOnly,
-                    onSelect: () => setBoardFilter("stalled"),
-                  }}
-                  compact
-                />
+                {/* The chips don't narrow search results, so they hide while it shows. */}
+                {!searching && (
+                  <TicketBoardRequesterFilter
+                    mine={boardMine}
+                    onChange={(mine) => {
+                      if (needsYou || stalledOnly) setBoardFilter(null);
+                      setBoardMine(mine);
+                    }}
+                    needsYou={{
+                      count: needsYouIds.length,
+                      active: needsYou,
+                      onSelect: () => setBoardFilter("needs-you"),
+                    }}
+                    stalled={{
+                      count: stalledIds.length,
+                      active: stalledOnly,
+                      onSelect: () => setBoardFilter("stalled"),
+                    }}
+                    compact
+                  />
+                )}
               </div>
             }
           />
