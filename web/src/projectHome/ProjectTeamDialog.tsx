@@ -32,6 +32,8 @@ import { useProjectRecord } from "./useProjectAgentSession";
 import { projectIdentitiesKey, useProjectIdentities } from "./useProjectIdentities";
 
 const encoder = new TextEncoder();
+// Show the byte count once the instructions near their limit.
+const BYTES_SHOWN_FROM = Math.floor(PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES * 0.8);
 
 interface IdentityDraft extends IdentitySessionChoice {
   name: string;
@@ -170,6 +172,7 @@ export function ProjectTeamDialog({
   const charterReadOnly = isLead && shared;
   const bytes = encoder.encode(draft.instructions.trim()).length;
   const tooLarge = bytes > PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES;
+  const editing = selectedIdentity !== undefined;
   const busy = save.isPending || remove.isPending;
   const choose = (identity: ProjectIdentity | null) => {
     save.reset();
@@ -180,6 +183,20 @@ export function ProjectTeamDialog({
   };
   const canRoute = project !== undefined && !shared;
   const customRuntime = Boolean(draft.agentId || draft.model || draft.effort);
+  // The Lead keeps its name, so only other roles show this field.
+  const nameField = (
+    <label className="flex flex-col gap-1 text-sm">
+      Name
+      <Input
+        data-testid="project-team-name"
+        value={draft.name}
+        maxLength={60}
+        placeholder="e.g. Designer"
+        onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+        disabled={busy}
+      />
+    </label>
+  );
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
     if (draft.name.trim() && !tooLarge) save.mutate(inputOf(draft, isLead));
@@ -307,19 +324,38 @@ export function ProjectTeamDialog({
                         </div>
                       </div>
                     )}
+                    {selectedIdentity && (
+                      <div
+                        className="flex items-center gap-2.5"
+                        data-testid="project-team-identity"
+                      >
+                        <PersonaAvatar name={selectedIdentity.name} size="md" />
+                        <div className="flex min-w-0 flex-col">
+                          <h3 className="truncate text-base font-semibold">
+                            {selectedIdentity.name}
+                          </h3>
+                          <span className="text-xs text-muted-foreground">
+                            {isLead
+                              ? "Built-in coordinator · can't be renamed"
+                              : "Team member"}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    {!editing && nameField}
                     <label className="flex flex-col gap-1 text-sm">
-                      Name
-                      <Input
-                        data-testid="project-team-name"
-                        value={draft.name}
-                        maxLength={60}
-                        placeholder="e.g. Designer"
-                        onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                        disabled={busy || isLead}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-1 text-sm">
-                      {isLead ? "Charter" : "Instructions"}
+                      <span className="flex flex-col">
+                        <span className={editing ? "font-medium" : undefined}>
+                          {isLead ? "Charter" : "Instructions"}
+                        </span>
+                        {editing && (
+                          <span className="text-xs font-normal text-muted-foreground">
+                            {isLead
+                              ? "How the Lead coordinates this project."
+                              : `What ${selectedIdentity.name} is responsible for and how it works.`}
+                          </span>
+                        )}
+                      </span>
                       <Textarea
                         data-testid="project-team-persona"
                         value={draft.instructions}
@@ -335,14 +371,32 @@ export function ProjectTeamDialog({
                         }
                         disabled={busy || charterReadOnly}
                       />
-                      <span
-                        className={
-                          tooLarge ? "text-xs text-destructive" : "text-xs text-muted-foreground"
-                        }
-                      >
-                        {bytes.toLocaleString()} /{" "}
-                        {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
-                      </span>
+                      {bytes >= BYTES_SHOWN_FROM && (
+                        <span
+                          data-testid="project-team-bytes"
+                          className={
+                            tooLarge ? "text-xs text-destructive" : "text-xs text-muted-foreground"
+                          }
+                        >
+                          {bytes.toLocaleString()} /{" "}
+                          {PROJECT_IDENTITY_INSTRUCTIONS_MAX_BYTES.toLocaleString()} bytes
+                          {tooLarge ? ". Shorten it to save." : ""}
+                        </span>
+                      )}
+                      {editing && (
+                        <span
+                          className="text-xs text-muted-foreground"
+                          data-testid={isLead ? "project-team-lead-note" : "project-team-timing"}
+                        >
+                          {isLead
+                            ? `The project mandate also applies. Charter changes apply on the Lead's next turn or session start; agent and model changes from its next session or rollover. ${
+                                charterReadOnly
+                                  ? "Only the project owner edits the charter."
+                                  : "Only you can edit the charter; agents can't."
+                              }`
+                            : `The project mandate also applies. Changes apply from ${selectedIdentity.name}'s next session.`}
+                        </span>
+                      )}
                     </label>
                     {!isLead && (
                       <div className="grid gap-3 sm:grid-cols-2">
@@ -372,6 +426,7 @@ export function ProjectTeamDialog({
                         </label>
                       </div>
                     )}
+                    {editing && !isLead && nameField}
                     {/* Keyed by member so each starts collapsed. */}
                     <Collapsible
                       key={selected ?? "new"}
@@ -389,7 +444,13 @@ export function ProjectTeamDialog({
                         </span>
                         <ChevronRightIcon className="ml-auto size-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-out group-data-[state=open]:rotate-90" />
                       </CollapsibleTrigger>
-                      <CollapsibleContent className="px-3 pb-3">
+                      <CollapsibleContent className="flex flex-col gap-2 px-3 pb-3">
+                        {isLead && (
+                          <span className="text-xs text-muted-foreground">
+                            The Lead&apos;s agent, model and effort are also the project&apos;s
+                            defaults for new sessions.
+                          </span>
+                        )}
                         <IdentityModelEffortFields
                           config={project?.config}
                           agentId={draft.agentId}
@@ -435,21 +496,6 @@ export function ProjectTeamDialog({
                         data-testid="project-team-agent-owner"
                       >
                         Only the project owner chooses the agent, since these sessions run as them.
-                      </p>
-                    )}
-                    {isLead && (
-                      <p
-                        className="text-xs text-muted-foreground"
-                        data-testid="project-team-lead-note"
-                      >
-                        The Lead is the project's built-in coordinator and can't be renamed or
-                        deleted.
-                        {charterReadOnly
-                          ? " Only the project owner edits its charter."
-                          : " Only you can edit its charter; agents can't."}{" "}
-                        The charter applies on its next turn or session start. Its agent, model and
-                        effort are also the project's defaults for new sessions, and they apply from
-                        the Lead's next session or rollover.
                       </p>
                     )}
                     {selectedIdentity?.created_by_session_id && (

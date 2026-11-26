@@ -106,6 +106,11 @@ describe("ProjectTeamDialog", () => {
         <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
       </QueryClientProvider>,
     );
+    expect(screen.queryByTestId("project-team-bytes")).toBeNull();
+    fireEvent.change(screen.getByTestId("project-team-persona"), {
+      target: { value: "x".repeat(6400) },
+    });
+    expect(screen.getByTestId("project-team-bytes")).toHaveTextContent("6,400 / 8,000 bytes");
     const toggle = screen.getByTestId("project-team-runtime-toggle");
     expect(toggle).toHaveTextContent("Project defaults");
     expect(screen.queryByTestId("runtime-fields")).toBeNull();
@@ -119,5 +124,53 @@ describe("ProjectTeamDialog", () => {
     const nav = screen.getByRole("navigation", { name: "Team members" });
     fireEvent.click(within(nav).getByRole("button", { name: "New team member" }));
     expect(screen.getByTestId("project-team-save")).toHaveTextContent("Add member");
+  });
+
+  it("heads the Lead with its identity instead of a disabled name field", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByTestId("project-team-lead"));
+    expect(screen.getByRole("heading", { name: "Lead" })).toBeInTheDocument();
+    expect(screen.getByTestId("project-team-identity")).toHaveTextContent("Built-in coordinator");
+    expect(screen.queryByTestId("project-team-name")).toBeNull();
+    expect(screen.getByText("Charter")).toBeInTheDocument();
+    expect(screen.getByTestId("project-team-lead-note")).toHaveTextContent(
+      "Only you can edit the charter; agents can't.",
+    );
+    expect(screen.queryByTestId("project-team-bytes")).toBeNull();
+  });
+
+  it("keeps a custom role renamable and shows the byte count only near the limit", () => {
+    identities.extra = [
+      { id: "planner", name: "Planner", builtin: false, instructions: "Own scope." },
+    ];
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={new QueryClient()}>
+          <ProjectTeamDialog projectId="project" projectName="Shipping" onClose={vi.fn()} />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    const nav = screen.getByRole("navigation", { name: "Team members" });
+    fireEvent.click(within(nav).getByText("Planner"));
+    expect(screen.getByRole("heading", { name: "Planner" })).toBeInTheDocument();
+    expect(screen.getByTestId("project-team-name")).toBeEnabled();
+    expect(screen.getByTestId("project-team-timing")).toHaveTextContent(
+      "Changes apply from Planner's next session.",
+    );
+    expect(screen.queryByTestId("project-team-bytes")).toBeNull();
+    const persona = screen.getByTestId("project-team-persona");
+    fireEvent.change(persona, { target: { value: "x".repeat(6400) } });
+    expect(screen.getByTestId("project-team-bytes")).toHaveTextContent("6,400 / 8,000 bytes");
+    expect(screen.getByTestId("project-team-save")).toBeEnabled();
+    fireEvent.change(persona, { target: { value: "x".repeat(8001) } });
+    expect(screen.getByTestId("project-team-bytes")).toHaveTextContent(
+      "8,001 / 8,000 bytes. Shorten it to save.",
+    );
+    expect(persona).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByTestId("project-team-save")).toBeDisabled();
   });
 });
