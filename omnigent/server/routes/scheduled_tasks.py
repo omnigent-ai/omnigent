@@ -2699,9 +2699,21 @@ def create_scheduled_tasks_router(
                 # A loop the session can't find could never be stopped.
                 await asyncio.to_thread(store.delete, task.id)
                 raise
-            replaced = await _running_loop(conv, user_id, previous_id)
-            if replaced is not None:
-                await asyncio.to_thread(store.delete, replaced.id)
+            # The label names the new loop, so it is armed whatever happens next. Retiring
+            # the loop it replaced is best-effort: one the label no longer names retires
+            # itself at its next firing, which never sends.
+            try:
+                replaced = await _running_loop(conv, user_id, previous_id)
+                if replaced is not None:
+                    await asyncio.to_thread(store.delete, replaced.id)
+            except Exception:
+                _logger.warning(
+                    "loop %s replaced %s in session %s, which its next firing retires instead",
+                    task.id,
+                    previous_id,
+                    conv.id,
+                    exc_info=True,
+                )
         return {
             "durable": True,
             "timer_id": task.id,
@@ -2752,11 +2764,21 @@ def create_scheduled_tasks_router(
                 value=None,
             )
             if cleared:
-                running = await _running_loop(conv, user_id, timer_id)
-                if running is None:
-                    return {"timer_id": None, "status": "none"}
-                await asyncio.to_thread(store.delete, running.id)
-                return {"timer_id": running.id, "status": "cancelled"}
+                # The label no longer names the loop, so it is stopped: a firing it still
+                # gets retires it without sending. Deleting it now is best-effort.
+                try:
+                    running = await _running_loop(conv, user_id, timer_id)
+                    if running is None:
+                        return {"timer_id": None, "status": "none"}
+                    await asyncio.to_thread(store.delete, running.id)
+                except Exception:
+                    _logger.warning(
+                        "loop %s stopped in session %s but not deleted; its firing retires it",
+                        timer_id,
+                        conv.id,
+                        exc_info=True,
+                    )
+                return {"timer_id": timer_id, "status": "cancelled"}
         raise OmnigentError("The loop kept changing; try again", code=ErrorCode.CONFLICT)
 
     @timers.delete("/sessions/{session_id}/timers/{timer_id}", include_in_schema=False)

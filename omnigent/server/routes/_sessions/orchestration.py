@@ -7460,6 +7460,22 @@ async def _persist_native_terminal_failure(
     return consumed.id
 
 
+def _host_launch_failure_message(host_error: str | None, host_error_code: str) -> str:
+    """The reason shown when a host categorically refused to launch the session's runner.
+
+    :param host_error: The host's refusal text, when it is safe to show.
+    :param host_error_code: Allowlisted structured host failure category.
+    """
+    if host_error:
+        return host_error
+    if host_error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE:
+        return (
+            "the agent's harness is not configured on the selected host — "
+            f"run `{cli_invocation()} setup`"
+        )
+    return "The session workspace no longer exists on the selected host."
+
+
 async def _persist_host_launch_failure_turn(
     session_id: str,
     conv: Conversation,
@@ -7506,16 +7522,10 @@ async def _persist_host_launch_failure_turn(
         _WORKSPACE_MISSING_ERROR_CODE,
     }:
         raise ValueError(f"unsafe host launch error code: {host_error_code!r}")
-    fallback_message = (
-        "the agent's harness is not configured on the selected host — "
-        f"run `{cli_invocation()} setup`"
-        if host_error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
-        else "The session workspace no longer exists on the selected host."
-    )
     error = ErrorData(
         source="execution",
         code=host_error_code,
-        message=host_error if host_error else fallback_message,
+        message=_host_launch_failure_message(host_error, host_error_code),
     )
     turn_id = generate_task_id()
     user_item = _build_new_item(body, turn_id, created_by=created_by)
@@ -15724,6 +15734,7 @@ __all__ = [
     "_handle_mcp_tools_call",
     "_heal_subagent_runner_binding_via_parent",
     "_hold_native_ask_gate",
+    "_host_launch_failure_message",
     "_is_native_terminal_session",
     "_kick_managed_relaunch",
     "_kick_managed_wake",

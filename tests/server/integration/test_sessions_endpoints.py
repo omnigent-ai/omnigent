@@ -14069,11 +14069,13 @@ async def test_native_message_persisted_when_runner_offline(
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
         },
     )
-    # Queued (not RUNNER_UNAVAILABLE) and the persisted user item is returned.
+    # Queued (not RUNNER_UNAVAILABLE) and the persisted user item is returned, marked
+    # rejected: the turn failed before any harness ran, so nothing will deliver it.
     assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["queued"] is True
     assert body.get("item_id"), f"expected a persisted item_id, got {body}"
+    assert body["rejected"] is True
 
     items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
     # The user's message is durable history — the whole point of the fix.
@@ -14087,6 +14089,7 @@ async def test_native_message_persisted_when_runner_offline(
     error_items = [i for i in items if i["type"] == "error"]
     assert len(error_items) == 1, f"expected one error item, got {items}"
     assert error_items[0]["code"] == "runner_failed_to_start"
+    assert body["reason"] == error_items[0]["message"]
 
     # The turn settles failed (not 5xx); the durable error item above is
     # what the web re-renders on reload via itemsToBlocks. (The separate

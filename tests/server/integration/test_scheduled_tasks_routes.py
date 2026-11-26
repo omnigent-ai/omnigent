@@ -8259,9 +8259,9 @@ async def test_a_loop_a_failed_replace_or_stop_leaves_behind_is_one_the_session_
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    """Once the label has moved, a failure can leave the old loop's timer behind, but the
-    session no longer names it: a stop never finds it and its next firing retires it
-    (``test_claimed_fire``), so no loop ticks on that ``/loop stop`` cannot reach."""
+    """Once the label has moved the arm or stop has happened, and the reply says so even
+    when retiring the old loop's timer fails: the session no longer names that timer, so
+    a stop never finds it and its next firing retires it (``test_claimed_fire``)."""
     session_id = _owned_session(db_uri)
     store = SqlAlchemyScheduledTaskStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
@@ -8302,15 +8302,17 @@ async def test_a_loop_a_failed_replace_or_stop_leaves_behind_is_one_the_session_
         expected_stop = {"timer_id": None, "status": "none"}
     elif failure == "retiring the replaced loop":
         monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "delete", refuse_delete)
-        with pytest.raises(RuntimeError, match="task store down"):
-            await arm("again")
+        armed = await arm("again")
+        # The new loop is armed and named, so the arm succeeded and says what it replaced.
+        assert armed.status_code == 201, armed.text
+        assert armed.json()["replaced_timer_id"] == first
         named = conversations.get_conversation(session_id).labels.get(label)
-        assert named not in (None, first) and store.get(named).state == "active"
+        assert named == armed.json()["timer_id"] and store.get(named).state == "active"
         expected_stop = {"timer_id": named, "status": "cancelled"}
     else:
         monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "delete", refuse_delete)
-        with pytest.raises(RuntimeError, match="task store down"):
-            await stop()
+        # The label no longer names the loop, so it is stopped: its firings never send.
+        assert (await stop()).json() == {"timer_id": first, "status": "cancelled"}
         assert label not in conversations.get_conversation(session_id).labels
         expected_stop = {"timer_id": None, "status": "none"}
     # The first loop's timer row is still active, but only its next firing will see it.

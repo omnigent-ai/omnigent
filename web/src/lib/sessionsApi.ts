@@ -71,9 +71,10 @@ export interface PostEventResponse {
    *  denial text via SSE but did not start a turn or persist the
    *  user message, so no `session.input.consumed` will follow. */
   denied?: boolean;
-  /** True when the session could not take the message: its native terminal
-   *  cannot start, so the message was consumed into a failed turn and
-   *  nothing will deliver it. `reason` says why. */
+  /** True when the session could not take the message: its harness cannot
+   *  start (a native terminal or runner failed to launch, or the host refused
+   *  the launch), so the message was consumed into a failed turn and nothing
+   *  will deliver it. `reason` says why. */
   rejected?: boolean;
   /** Why the input was denied or rejected, for the user. */
   reason?: string;
