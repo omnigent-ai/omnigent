@@ -80,9 +80,25 @@ describe("ProjectRules", () => {
     expect(stages[1]).toContain("2. Verified");
     expect(stages[1]).toContain("Attach a demo.");
     const signOffs = screen.getAllByTestId("project-rules-sign-off").map((row) => row.textContent);
-    expect(
-      signOffs.map((text) => text?.match(/approved|product-ok|risk-ok|owner-ok/)?.[0]),
-    ).toEqual(["approved", "product-ok", "risk-ok", "owner-ok"]);
+    expect(signOffs.map((text) => text?.match(/^[A-Z][a-z]+( approval)?/)?.[0])).toEqual([
+      "Review",
+      "Product approval",
+      "Risk approval",
+      "Owner approval",
+    ]);
+    // The technical label names sit behind a disclosure, still in order.
+    const labels = within(screen.getByTestId("project-rules-label-details"))
+      .getAllByTestId("project-rules-sign-off-label")
+      .map((row) => row.textContent?.match(/approved|product-ok|risk-ok|owner-ok/)?.[0]);
+    expect(labels).toEqual(["approved", "product-ok", "risk-ok", "owner-ok"]);
+    const nav = within(screen.getByRole("navigation", { name: "Rules sections" }));
+    expect(nav.getAllByRole("link").map((link) => link.textContent)).toEqual([
+      "Mandate",
+      "Stages",
+      "Who approves what",
+      "People",
+      "Advanced",
+    ]);
     expect(screen.getByTestId("approvers-section")).toBeTruthy();
     expect(screen.getByTestId("sharing-section")).toBeTruthy();
 
