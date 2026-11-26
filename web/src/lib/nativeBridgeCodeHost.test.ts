@@ -5,6 +5,9 @@ import {
   desktopCodeHostWrite,
   githubFastTrackQuery,
   onWorkspaceAccessReady,
+  reportPullRequestCommentWrites,
+  reportPullRequestDialog,
+  reportPullRequestTiming,
   type WorkspaceFastTrackRequest,
   workspaceFastTrackRequest,
 } from "./nativeBridgeCodeHost";
@@ -215,6 +218,40 @@ describe("desktopCodeHostWrite", () => {
       data: null,
       actor: { login: "octo" },
     });
+  });
+});
+
+describe("diagnostics reports", () => {
+  const reporters = [
+    ["reportPullRequestTiming", () => reportPullRequestTiming({} as never)],
+    ["reportPullRequestDialog", () => reportPullRequestDialog({ dialog: "d", outcome: "shown" })],
+    [
+      "reportPullRequestCommentWrites",
+      () => reportPullRequestCommentWrites({ reason: "r", outcome: "shown" }),
+    ],
+  ] as const;
+
+  it.each(reporters)("%s hands the record to the shell", (name, report) => {
+    const send = vi.fn();
+    installShell({ [name]: send });
+    report();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(reporters)("%s ignores an older shell, a throw and a rejection", async (name, report) => {
+    installShell({});
+    expect(report).not.toThrow();
+    installShell({
+      [name]: () => {
+        throw new Error("boom");
+      },
+    });
+    expect(report).not.toThrow();
+    const rejection = Promise.reject(new Error("boom"));
+    installShell({ [name]: () => rejection });
+    expect(report).not.toThrow();
+    // A rejection left unhandled would fail the run.
+    await rejection.catch(() => {});
   });
 });
 

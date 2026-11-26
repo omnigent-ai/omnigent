@@ -665,17 +665,21 @@ function workspaceResult(answer: unknown): WorkspaceFastTrackResult {
 }
 
 /**
- * Tell a capable desktop shell how long the Pull Requests panel took to answer.
- * Never waits and never fails the caller: an older shell, a throw, or a rejection is ignored.
+ * Hand a diagnostics record to the shell. Never waits and never fails the caller: an older
+ * shell, a throw, or a rejection is ignored, and what reported works the same either way.
  */
-export function reportPullRequestTiming(report: PullRequestTimingReport): void {
-  const send = codeHostDesktopApi()?.reportPullRequestTiming;
+function sendDiagnostics<Report>(send: ((report: Report) => unknown) | undefined, report: Report) {
   if (typeof send !== "function") return;
   try {
     void Promise.resolve(send(report)).catch(() => {});
   } catch {
-    // Diagnostics are best-effort; the panel works the same either way.
+    // Best-effort: nothing to recover.
   }
+}
+
+/** Tell a capable desktop shell how long the Pull Requests panel took to answer. */
+export function reportPullRequestTiming(report: PullRequestTimingReport): void {
+  sendDiagnostics(codeHostDesktopApi()?.reportPullRequestTiming, report);
 }
 
 /** A pull request dialog's diagnostics record: which dialog, and what happened to it. */
@@ -684,18 +688,9 @@ export interface PullRequestDialogReport {
   outcome: "shown" | "continued" | "dismissed";
 }
 
-/**
- * Tell a capable desktop shell that a pull request dialog showed or ended. Never waits and
- * never fails the caller: an older shell, a throw, or a rejection is ignored.
- */
+/** Tell a capable desktop shell that a pull request dialog showed or ended. */
 export function reportPullRequestDialog(report: PullRequestDialogReport): void {
-  const send = codeHostDesktopApi()?.reportPullRequestDialog;
-  if (typeof send !== "function") return;
-  try {
-    void Promise.resolve(send(report)).catch(() => {});
-  } catch {
-    // Diagnostics are best-effort; the dialog works the same either way.
-  }
+  sendDiagnostics(codeHostDesktopApi()?.reportPullRequestDialog, report);
 }
 
 /** Why a comment box couldn't post, and what the user did about it, for diagnostics. */
@@ -711,18 +706,9 @@ export interface PullRequestCommentWritesReport {
     | "resolved";
 }
 
-/**
- * Tell a capable desktop shell why a comment box couldn't post. Never waits and never fails
- * the caller: an older shell, a throw, or a rejection is ignored.
- */
+/** Tell a capable desktop shell why a comment box couldn't post. */
 export function reportPullRequestCommentWrites(report: PullRequestCommentWritesReport): void {
-  const send = codeHostDesktopApi()?.reportPullRequestCommentWrites;
-  if (typeof send !== "function") return;
-  try {
-    void Promise.resolve(send(report)).catch(() => {});
-  } catch {
-    // Diagnostics are best-effort; the comment box works the same either way.
-  }
+  sendDiagnostics(codeHostDesktopApi()?.reportPullRequestCommentWrites, report);
 }
 
 /** Whether this shell has the GitHub fast-track bridge; also check `githubFastTrack`. */
