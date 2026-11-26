@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from tests._helpers.mock_llm import captured_tool_result
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -91,52 +93,6 @@ def _user_text(request: dict) -> str:
                 if isinstance(block, (str, dict))
             )
     return "\n".join(texts)
-
-
-def _tool_result(requests: list[dict], call_id: str) -> str:
-    """The newest captured result payload for *call_id*, or a note when none exists.
-
-    Covers the Messages ``tool_result`` block and the Responses
-    ``function_call_output`` item, so every harness row reports it. Returns the
-    result's own text verbatim — the runner's JSON — not a re-encoded copy.
-    """
-    for request in reversed(requests):
-        for message in request.get("messages", []):
-            if message.get("role") != "user":
-                continue
-            content = message.get("content")
-            blocks = content if isinstance(content, list) else []
-            for block in blocks:
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") == "tool_result"
-                    and block.get("tool_use_id") == call_id
-                ):
-                    return _result_text(block.get("content"), error=block.get("is_error"))
-        for entry in request.get("input", []):
-            if (
-                isinstance(entry, dict)
-                and entry.get("type") == "function_call_output"
-                and entry.get("call_id") == call_id
-            ):
-                return _result_text(entry.get("output"), error=None)
-    return f"no captured tool result for {call_id!r}"
-
-
-def _result_text(payload: object, *, error: object) -> str:
-    """A tool result's own text, prefixed with its error flag when set."""
-    if isinstance(payload, str):
-        text = payload
-    elif isinstance(payload, list):
-        text = "\n".join(
-            block.get("text", "")
-            for block in payload
-            if isinstance(block, dict) and isinstance(block.get("text"), str)
-        )
-    else:
-        text = "" if payload is None else str(payload)
-    prefix = "is_error=True " if error else ""
-    return f"{prefix}{text}"
 
 
 def _tool_call(harness: str, name: str, arguments: dict, call_id: str) -> dict:
@@ -299,11 +255,13 @@ def test_nested_agent_runs_unattended_like_its_creator(
                 send_user_text(client, session_id=run, text=probe)
                 resend_until_tools_listed(run, probe, lambda: False)
                 if spec.mode_label is not None:
-                    # The CLI itself reports the run's mode.
+                    # The CLI itself reports the run's mode; the reported value
+                    # is compared by name so a mismatch shows both values.
                     poll_until(
-                        lambda: session(run)["labels"].get(spec.mode_label) == spec.run_mode,
+                        lambda: session(run)["labels"].get(spec.mode_label) is not None,
                         timeout_s=30,
                     )
+                    assert session(run)["labels"].get(spec.mode_label) == spec.run_mode
                 run_snapshot = session(run)
 
                 # The run hands a step to a nested agent of its own agent without a
@@ -358,7 +316,7 @@ def test_nested_agent_runs_unattended_like_its_creator(
                     f"expected one 'Review step' worker; listed: "
                     f"{[(row['id'], row['title']) for row in rows]}; "
                     f"create-worker tool result: "
-                    f"{_tool_result(get_mock_requests(mock), 'create-worker')}"
+                    f"{captured_tool_result(get_mock_requests(mock), 'create-worker')}"
                 )
                 (worker,) = workers
                 assert session(worker)["labels"]["omnigent.created_by_session_id"] == run
@@ -375,12 +333,17 @@ def test_nested_agent_runs_unattended_like_its_creator(
                 resend_until_tools_listed(worker, _WORKER_TASK, worker_settled)
                 poll_until(worker_settled, timeout_s=120)
                 if spec.mode_label is not None:
-                    # The worker's CLI reports its mode like the run's does; that
-                    # report can land after the settled turn ends.
-                    poll_until(
-                        lambda: session(worker)["labels"].get(spec.mode_label) == spec.run_mode,
-                        timeout_s=30,
-                    )
+                    # The worker's mode report can land after its settled turn
+                    # ends. Wait only for it to appear: the observed comparison
+                    # below diagnoses a wrong or missing value with the full
+                    # worker state, so a timeout falls through.
+                    deadline = time.monotonic() + 30
+                    while (
+                        latest["labels"].get(spec.mode_label) is None
+                        and time.monotonic() < deadline
+                    ):
+                        time.sleep(0.5)
+                        latest.update(session(worker))
                     latest.update(session(worker))
                 run_snapshot = session(run)
                 observed = {
