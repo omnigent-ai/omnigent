@@ -1,11 +1,16 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { toast } from "sonner";
 import { type ComponentProps, type ReactNode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { useComparisonFileDiff } from "@/hooks/useComparisonFileDiff";
-import { type FileContentResponse, useFileContent } from "@/hooks/useFileContent";
+import {
+  downloadWorkspaceFile,
+  type FileContentResponse,
+  useFileContent,
+} from "@/hooks/useFileContent";
 import type { CodeMirrorFileEditor } from "@/shell/codeMirror/CodeMirrorFileEditor";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { FileViewer } from "@/shell/FileViewer";
@@ -18,7 +23,11 @@ const captured = vi.hoisted(() => ({
   viewer: null as ComponentProps<typeof FileViewer> | null,
 }));
 
-vi.mock("@/hooks/useFileContent", () => ({ useFileContent: vi.fn() }));
+vi.mock("@/hooks/useFileContent", () => ({
+  useFileContent: vi.fn(),
+  downloadWorkspaceFile: vi.fn(),
+}));
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 const comparison = vi.hoisted(() => ({
   diff: { base: "head" } as ReturnType<typeof useComparisonFileDiff>,
   useDiff: vi.fn(),
@@ -190,6 +199,23 @@ describe("FilesPageViewer", () => {
     expect(captured.editor!.searchFocusNonce).not.toBe(firstRequest);
     act(() => captured.editor!.onSearchHandled!());
     expect(captured.editor!.searchOpen).toBe(false);
+  });
+
+  it.each([
+    ["downloads the file for its own session", () => Promise.resolve(), false],
+    ["says so when the download fails", () => Promise.reject(new Error("offline")), true],
+  ])("File actions' Download file %s", async (_case, download, fails) => {
+    vi.mocked(downloadWorkspaceFile).mockReset().mockImplementation(download);
+    vi.mocked(toast.error).mockClear();
+    renderViewer("src/a.ts", { data: file("src/a.ts", "x") });
+    await userEvent.click(screen.getByRole("button", { name: "File actions" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Download file" }));
+    expect(downloadWorkspaceFile).toHaveBeenCalledExactlyOnceWith("conv_1", "src/a.ts");
+    if (fails) await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Download failed"));
+    else {
+      await act(() => Promise.resolve());
+      expect(toast.error).not.toHaveBeenCalled();
+    }
   });
 
   it("leaves the finders out of File actions while the session can't search", async () => {
