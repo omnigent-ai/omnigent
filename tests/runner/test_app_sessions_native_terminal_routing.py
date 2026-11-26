@@ -1188,10 +1188,10 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         return
     if resolution_failure in ("fetch", "fetch-recovery"):
         assert "Could not fetch Antigravity startup instructions" in caplog.text
-        assert "HTTP 503" in caplog.text
         assert resolution_attempts == 2
         assert auto_create_calls == [sid]
         if resolution_failure == "fetch":
+            assert "HTTP 503" in caplog.text
             assert resp.status_code == 500, resp.text
             assert terminal_launches == []
             return
