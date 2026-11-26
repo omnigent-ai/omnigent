@@ -115,6 +115,7 @@ class _Row:
     ppid: int
     pgid: int
     tpgid: int
+    stat: str
     comm: str
 
 
@@ -153,7 +154,7 @@ def _parse(snapshot: str) -> list[_Row] | None:
             pid, ppid, pgid, tpgid = (int(value) for value in fields[:4])
         except ValueError:
             return None
-        rows.append(_Row(pid, ppid, pgid, tpgid, fields[5] if len(fields) == 6 else ""))
+        rows.append(_Row(pid, ppid, pgid, tpgid, fields[4], fields[5] if len(fields) == 6 else ""))
     return rows
 
 
@@ -286,7 +287,7 @@ def inspect_shell(
     :data:`ELIGIBLE_SHELLS` shell, and the pane must hold exactly the framework's
     ``launchers`` and then that shell, running the very file the command resolves to. Any
     other layout answers unknown, such as a program that replaced the shell, even one that
-    renamed itself ``bash`` or a copy of another program named bash. So does any other
+    renamed itself ``bash`` or a copy of another program named bash. So does any other live
     process on the pane's tmux server, in another pane or window, since closing the terminal
     ends the whole server. The shell is idle when nothing runs under it and nothing else runs
     anywhere under the pane. A sandbox's namespace init adopts work its shell left running,
@@ -321,9 +322,13 @@ def inspect_shell(
     children: dict[int, list[_Row]] = {}
     for row in rows:
         children.setdefault(row.ppid, []).append(row)
-    # Closing the terminal ends its whole tmux server: another pane or window there, such as
-    # one ``tmux new-window`` opened, may run work this pane can't account for.
-    if any(row.pid != pane.pid for row in children.get(tmux_server_pid, [])):
+    # Closing the terminal ends its whole tmux server, including work in other windows.
+    # tmux can retain an exited window's zombie, but a zombie leader may still have live
+    # threads (ps's `l` flag). Only unthreaded zombies are safe to ignore.
+    if any(
+        row.pid != pane.pid and (not row.stat.startswith("Z") or "l" in row.stat)
+        for row in children.get(tmux_server_pid, [])
+    ):
         return UNKNOWN
 
     wanted = _shell_name(shell_command)

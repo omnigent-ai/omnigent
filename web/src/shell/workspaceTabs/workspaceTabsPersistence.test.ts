@@ -51,6 +51,22 @@ describe("workspace tab storage", () => {
     expect(readWorkspaceTabsSession("s2")).toEqual({ status: "missing" });
   });
 
+  it("restores the Workspace settings a strip took, and drops a malformed record", () => {
+    const tabSettings = { pinned: ["files" as const, "tasks" as const], initial: "tasks" as const };
+    expect(saveWorkspaceTabsSession("s1", { ...state, tabSettings })).toBe("saved");
+    expect(readWorkspaceTabsSession("s1")).toEqual({
+      status: "saved",
+      state: { ...state, tabSettings },
+    });
+    expect(
+      saveWorkspaceTabsSession("s2", {
+        ...state,
+        tabSettings: { pinned: "files", initial: null } as never,
+      }),
+    ).toBe("saved");
+    expect(readWorkspaceTabsSession("s2")).toEqual({ status: "saved", state });
+  });
+
   it("never overwrites a store a newer version wrote, and reads nothing from it", () => {
     const newer = JSON.stringify({ version: 2, sessions: [{ id: "s1", tabs: [] }] });
     window.localStorage.setItem(WORKSPACE_TABS_STORAGE_KEY, newer);

@@ -1,5 +1,5 @@
-// The Files tree's name filter, under its header: a name to search for, and globs
-// that narrow the search to some files. The tree shows the matches while a name is set.
+// The Files tree's filter, under its header: a name to search for, and globs that
+// narrow it. The tree shows the matches while a name is set, else only what the globs let through.
 
 import { ChevronDownIcon, XIcon } from "lucide-react";
 import { type RefObject, useState } from "react";
@@ -16,13 +16,10 @@ export const FILE_GLOBS_LABEL = "Files to include or exclude";
 
 export function FilesTreeFilterBar({
   filters,
-  inertGlobs,
   inputRef,
   onClose,
 }: {
   filters: TreeFilters;
-  /** Globs are set without a name, so they don't filter yet. */
-  inertGlobs: boolean;
   inputRef: RefObject<HTMLInputElement | null>;
   /** Clears the filters and closes the bar. */
   onClose: () => void;
@@ -95,9 +92,6 @@ export function FilesTreeFilterBar({
             onChange={(event) => filters.change({ exclude: event.target.value })}
           />
         </>
-      ) : null}
-      {inertGlobs ? (
-        <p className="px-0.5 text-xs text-muted-foreground">Applies once a name is set.</p>
       ) : null}
     </div>
   );

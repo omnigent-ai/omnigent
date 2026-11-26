@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   normalizeDefaultWorkspaceTab,
+  notifyWorkspaceTabPreferencesChanged,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
   readInitialWorkspaceTab,
   readPinnedWorkspaceTabs,
+  subscribeWorkspaceTabPreferences,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
@@ -143,6 +145,30 @@ describe("workspaceTabPreferences — read/write", () => {
 
     writeDefaultWorkspaceTab("files");
     expect(readSessionWorkspaceState("conv_files").rightRailTab).toBeUndefined();
+  });
+});
+
+describe("workspaceTabPreferences — change notifications", () => {
+  it("tells subscribers about a changed setting here or in another window, until they stop", () => {
+    const heard = vi.fn();
+    const stop = subscribeWorkspaceTabPreferences(heard);
+    writePinnedWorkspaceTabs(["github"]);
+    writeDefaultWorkspaceTab("github");
+    expect(heard).toHaveBeenCalledTimes(2);
+    // Writing the same default again changes nothing.
+    writeDefaultWorkspaceTab("github");
+    expect(heard).toHaveBeenCalledTimes(2);
+    window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY }));
+    window.dispatchEvent(new StorageEvent("storage", { key: PINNED_WORKSPACE_TABS_STORAGE_KEY }));
+    window.dispatchEvent(new StorageEvent("storage", { key: null }));
+    expect(heard).toHaveBeenCalledTimes(5);
+    window.dispatchEvent(new StorageEvent("storage", { key: "omnigent:something-else" }));
+    expect(heard).toHaveBeenCalledTimes(5);
+    notifyWorkspaceTabPreferencesChanged();
+    expect(heard).toHaveBeenCalledTimes(6);
+    stop();
+    notifyWorkspaceTabPreferencesChanged();
+    expect(heard).toHaveBeenCalledTimes(6);
   });
 });
 

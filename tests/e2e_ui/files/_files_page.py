@@ -17,7 +17,7 @@ from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui._quick_pick_palette import enable_quick_pick_palette
 from tests.e2e_ui.conftest import open_right_rail
-from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag
+from tests.e2e_ui.sessions.test_workspace_sidebar_v2 import _set_flag, _start_with_no_pinned_pages
 
 _DESKTOP = {"width": 1440, "height": 900}
 
@@ -85,6 +85,7 @@ def open_workspace(
     """
     if quick_pick:
         enable_quick_pick_palette(page, "workspace_sidebar_v2")
+        _start_with_no_pinned_pages(page)
     else:
         _set_flag(page, True)
     page.set_viewport_size(_DESKTOP)

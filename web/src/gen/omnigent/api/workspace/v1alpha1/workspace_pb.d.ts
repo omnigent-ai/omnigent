@@ -3854,6 +3854,26 @@ export declare type ReadPullRequestImageResponse = Message<"omnigent.api.workspa
 export declare const ReadPullRequestImageResponseSchema: GenMessage<ReadPullRequestImageResponse>;
 
 /**
+ * Attached to a refused pull request call's error: why it was refused, for a client to act on.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.PullRequestFailure
+ */
+export declare type PullRequestFailure = Message<"omnigent.api.workspace.v1alpha1.PullRequestFailure"> & {
+  /**
+   * One of "comment_changed", "pull_request_changed" or "invalid_input".
+   *
+   * @generated from field: string reason = 1;
+   */
+  reason: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PullRequestFailure.
+ * Use `create(PullRequestFailureSchema)` to create a new message.
+ */
+export declare const PullRequestFailureSchema: GenMessage<PullRequestFailure>;
+
+/**
  * @generated from enum omnigent.api.workspace.v1alpha1.EntryType
  */
 export enum EntryType {
@@ -4724,8 +4744,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof DisableAutoMergeResponseSchema;
   },
   /**
-   * Adds a draft comment on a line or range to the pending review, starting one if needed,
-   * or a draft reply in a review conversation to the viewer's pending review.
+   * Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+   * viewer's pending review; it must already exist, so start one with StartPendingReview.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.AddPendingReviewComment
    */

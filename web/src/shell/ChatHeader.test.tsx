@@ -98,6 +98,7 @@ function renderHeader(props: {
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
   rightPanelOpen?: boolean;
+  rightPanelCollapsesItself?: boolean;
   showFilesPanel?: boolean;
   pending?: boolean;
   mobileMenu?: typeof mobileMenu;
@@ -141,6 +142,7 @@ function renderHeader(props: {
             hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
+            rightPanelCollapsesItself={props.rightPanelCollapsesItself}
             pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
@@ -1301,5 +1303,39 @@ describe("ChatHeader — UI feature overrides", () => {
       serverInfo: { ...serverInfo, features },
     });
     expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
+  });
+});
+
+describe("ChatHeader — right panel toggle beside a sidebar that collapses itself", () => {
+  const toggle = (name: string) => screen.queryByRole("button", { name });
+
+  it("hides while the sidebar is open, so its own Collapse button is the only one", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_floating",
+      rightPanelOpen: true,
+      rightPanelCollapsesItself: true,
+    });
+    expect(toggle("Collapse right panel")).toBeNull();
+    expect(toggle("Expand right panel")).toBeNull();
+    // Nothing sits in the corner, so the header keeps its usual end padding.
+    expect(document.querySelector("header")).not.toHaveAttribute("data-corner-toggle");
+  });
+
+  it("shows Expand right panel while the sidebar is collapsed", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv_floating",
+      rightPanelOpen: false,
+      rightPanelCollapsesItself: true,
+    });
+    expect(toggle("Expand right panel")).not.toBeNull();
+    // The row ends where the open sidebar's Collapse button sits, so the toggle keeps its spot.
+    expect(document.querySelector("header")).toHaveAttribute("data-corner-toggle");
+  });
+
+  it("keeps Collapse right panel when the sidebar has no corner button of its own", () => {
+    renderHeader({ sidebarOpen: true, conversationId: "conv_floating", rightPanelOpen: true });
+    expect(toggle("Collapse right panel")).not.toBeNull();
   });
 });

@@ -58,6 +58,9 @@ import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useFloatingComposerSupport } from "@/hooks/useFloatingComposerSupport";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+import { useWorkspaceFullScreenCommand } from "@/shell/workspaceCommands/useWorkspaceFullScreenCommand";
+import { rightPanelCollapsesItself } from "./rightPanelCollapse";
+import { useRailControlsWidth } from "./workspaceTabs/railControlsWidth";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
@@ -540,6 +543,7 @@ function AppShellImpl() {
   const mobileViewport = useIsMobileViewport();
   // The tabs host sits in the Workspace drawer once a narrow window has mounted it.
   const tabsInDrawer = mobileViewport && tabsDrawerTarget !== null;
+  const railControlsWidth = useRailControlsWidth(conversationId);
   const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
@@ -3290,6 +3294,24 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // ⇧⌘F and its ⌘K row: a hidden workspace opens straight into full screen.
+  const toggleWorkspaceFullScreen = useCallback(() => {
+    if (!workspacePanelVisible) {
+      revealRightPanel();
+      if (!rightPanelMaximized) toggleRightPanelMaximized();
+      return;
+    }
+    toggleRightPanelMaximized();
+  }, [workspacePanelVisible, revealRightPanel, rightPanelMaximized, toggleRightPanelMaximized]);
+  // Only the tabs sidebar fills the window; a phone shows the workspace as its own screen, and
+  // a grid route has its own rail.
+  const workspaceCanFillWindow =
+    tabsSidebar && !!conversationId && hasRailContent && !gridRoute && !mobileViewport;
+  useWorkspaceFullScreenCommand({
+    conversationId: conversationId ?? null,
+    fullScreen: workspaceCanFillWindow ? rightPanelMaximized && workspacePanelVisible : null,
+    toggle: toggleWorkspaceFullScreen,
+  });
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
   // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
@@ -3546,6 +3568,15 @@ function AppShellImpl() {
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
+                    // The floating tabs sidebar collapses from its own corner button, where the toggle sits.
+                    rightPanelCollapsesItself={rightPanelCollapsesItself({
+                      floatingPanesShown,
+                      tabsSidebar,
+                      tabsInDrawer,
+                      rightPanelOpen,
+                      railWidth: inlinePanelWidth,
+                      controlsWidth: railControlsWidth,
+                    })}
                     pending={pendingConversation}
                     mobileMenu={{
                       fileViewerOpen,

@@ -68,6 +68,9 @@ from omnigent.server.pull_request_viewers import (
     OWNER_ONLY_CHANGES_MESSAGE,
     PullRequestViewer,
     info_for_viewer,
+    review_comments_for_viewer,
+    review_read_params,
+    review_threads_for_viewer,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -2992,6 +2995,7 @@ def register_resources_routes(
         from omnigent.host.workspace_methods import WORKSPACE_METHODS
         from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
         from omnigent.server.workspace_api import (
+            VIEWER_SHAPED_METHODS,
             ConnectCallResponse,
             HostTarget,
             HostWorkspaceService,
@@ -3011,15 +3015,15 @@ def register_resources_routes(
             conv = await _validate_session(session_id, request, LEVEL_READ)
         # The owner grant itself, with no admin pass: only the owner acts as the host's account.
         # Only an owner-gated method and GetCapabilities, which lists them, need it.
-        session_owner = (
-            gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities"
-        ) and await asyncio.to_thread(
-            _is_session_owner,
-            _get_user_id(request, auth_provider),
-            conv,
-            auth_provider=auth_provider,
-            permission_store=permission_store,
-        )
+        if gate is WorkspaceGate.SESSION_OWNER or method == "GetCapabilities":
+            session_owner = await _caller_is_session_owner(conv, request)
+        elif method in VIEWER_SHAPED_METHODS:
+            # The thread reads show the host account's rights to the owner alone; as on REST,
+            # a failed lookup reads them as anyone else would rather than failing the read.
+            viewer = await _pull_request_viewer(conv, request)
+            session_owner = viewer is PullRequestViewer.OWNER
+        else:
+            session_owner = False
         if gate is WorkspaceGate.SESSION_OWNER and not session_owner:
             raise OmnigentError(
                 "Only the session's owner can use this through the workspace API",
@@ -3048,6 +3052,7 @@ def register_resources_routes(
                 overview=lambda payload, sent_at: _with_server_pull_requests(
                     session_id, payload, sent_at
                 ),
+                viewer=PullRequestViewer.OWNER if session_owner else PullRequestViewer.VIEWER,
             ),
             # Only GetCapabilities lists methods, and it needs the browse gate.
             callable_methods=callable_methods(
@@ -4573,7 +4578,10 @@ def register_resources_routes(
                 "base_sha": base_sha,
             },
         )
-        return await _fs_get_with_host_fallback(
+        # The host account's rights in each conversation are the owner's to see.
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        threads = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_threads",
@@ -4581,6 +4589,7 @@ def register_resources_routes(
             runner_params=params,
             runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
         )
+        return review_threads_for_viewer(threads, viewer)
 
     @router.get(
         "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
@@ -4596,7 +4605,9 @@ def register_resources_routes(
         """Load additional replies in a published PR review conversation."""
         conv = await _validate_session(session_id, request, LEVEL_READ)
         params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
-        return await _fs_get_with_host_fallback(
+        viewer = await _pull_request_viewer(conv, request)
+        params = review_read_params(params, viewer)
+        comments = await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_review_thread_comments",
@@ -4607,6 +4618,7 @@ def register_resources_routes(
                 f"{urllib.parse.quote(thread_id, safe='')}/comments"
             ),
         )
+        return review_comments_for_viewer(comments, viewer)
 
     @router.post(
         "/sessions/{session_id}/resources/github/review-threads",

@@ -186,8 +186,8 @@ service WorkspaceService {
   // Turns off the pull request's auto-merge.
   rpc DisableAutoMerge(DisableAutoMergeRequest) returns (DisableAutoMergeResponse);
 
-  // Adds a draft comment on a line or range to the pending review, starting one if needed,
-  // or a draft reply in a review conversation to the viewer's pending review.
+  // Adds a draft comment on a line or range, or a draft reply in a review conversation, to the
+  // viewer's pending review; it must already exist, so start one with StartPendingReview.
   rpc AddPendingReviewComment(AddPendingReviewCommentRequest) returns (AddPendingReviewCommentResponse);
 
   // Adds the session user's reaction to a comment.
@@ -1570,4 +1570,10 @@ message ReadPullRequestImageResponse {
   PullRequestImageMetadata metadata = 1;
   // The next part of the image. Concatenate every message's `data`.
   bytes data = 2;
+}
+
+// Attached to a refused pull request call's error: why it was refused, for a client to act on.
+message PullRequestFailure {
+  // One of "comment_changed", "pull_request_changed" or "invalid_input".
+  string reason = 1;
 }

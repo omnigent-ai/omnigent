@@ -241,10 +241,20 @@ describe("WorkspaceTabsHost", () => {
         store.open({ place: { kind: "changes" } }, { opener: "user", disposition: "new" }),
       );
       host();
-      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyF"]);
 
       await act(() => store.close(store.selectedTab()!.id, {}));
-      await vi.waitFor(() => expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyT"]));
+      await vi.waitFor(() =>
+        expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW", "KeyT", "KeyF"]),
+      );
+    });
+
+    it("leave full screen's chord with the page where the sidebar can't fill the window", () => {
+      const bridge = desktopBridge();
+      const { rerender } = host({ placement: "drawer" });
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
+      rerender({ placement: "rail", contained: true });
+      expect(bridge.listedCodes()).toEqual(["KeyN", "KeyW"]);
     });
 
     it("are left with the page by a cell that doesn't bind history", () => {

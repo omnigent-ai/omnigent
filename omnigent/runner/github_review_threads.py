@@ -7,16 +7,19 @@ import time
 from typing import Any
 
 from omnigent.runner import github_resource as github
+from omnigent.runner.github_review_fields import database_id, reactions
 from omnigent.runner.session_prs import PullRequestRef
 
 _COMMENT_FIELDS = """
   id fullDatabaseId author { login } body createdAt url isMinimized state
   diffHunk originalLine originalStartLine
+  viewerCanReact viewerCanUpdate viewerCanDelete viewerDidAuthor
+  reactionGroups { content viewerHasReacted reactors { totalCount } }
 """
 _PAGE_FIELDS = "pageInfo { hasNextPage endCursor }"
 _THREAD_FIELDS = f"""
   id path diffSide line startLine startDiffSide originalLine originalStartLine
-  subjectType isResolved isOutdated viewerCanReply
+  subjectType isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve
   comments(first: 20) {{ nodes {{ {_COMMENT_FIELDS} }} {_PAGE_FIELDS} }}
 """
 
@@ -64,11 +67,17 @@ def _comment(comment: dict[str, Any]) -> dict[str, Any] | None:
     minimized = bool(comment.get("isMinimized"))
     return {
         "id": str(comment["id"]),
+        "database_id": database_id(comment.get("fullDatabaseId")),
         "author": author.get("login") if isinstance(author, dict) else None,
         "body": "" if minimized else comment.get("body") or "",
         "minimized": minimized,
         "created_at": comment.get("createdAt"),
         "url": comment.get("url"),
+        "reactions": reactions(comment.get("reactionGroups")),
+        "can_react": bool(comment.get("viewerCanReact")),
+        "can_update": bool(comment.get("viewerCanUpdate")),
+        "can_delete": bool(comment.get("viewerCanDelete")),
+        "viewer_did_author": comment.get("viewerDidAuthor") is True,
     }
 
 
@@ -90,6 +99,8 @@ def _thread(thread: dict[str, Any]) -> dict[str, Any] | None:
         "resolved": bool(thread.get("isResolved")),
         "outdated": bool(thread.get("isOutdated")),
         "can_reply": bool(thread.get("viewerCanReply")),
+        "can_resolve": thread.get("viewerCanResolve") is True,
+        "can_unresolve": thread.get("viewerCanUnresolve") is True,
         "diff_hunk": raw_comments[0].get("diffHunk") or "",
         "comments": {"data": comments, **_page(thread.get("comments"))},
     }

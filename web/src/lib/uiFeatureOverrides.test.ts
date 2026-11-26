@@ -7,6 +7,7 @@ import {
   activeUiFeatureOverrides,
   canBootstrapQuickPick,
   canOverrideUiFeatures,
+  clearUiFeatureOverrides,
   readUiFeatureOverrides,
   resetUiFeatureOverridesForTests,
   writeUiFeatureOverride,
@@ -46,6 +47,22 @@ describe("UI feature overrides", () => {
     expect(readUiFeatureOverrides()).toEqual({ session_overview: false });
     expect(writeUiFeatureOverride("session_overview", null)).toBe(true);
     expect(localStorage.getItem(key)).toBeNull();
+  });
+
+  it("clears this server's entire entry and cached choices", () => {
+    const otherKey = 'omnigent:ui-feature-overrides:v1:"server-b"';
+    localStorage.setItem(
+      key,
+      JSON.stringify({ quick_pick_palette: true, canvas: false, unknown: true }),
+    );
+    localStorage.setItem(otherKey, '{"canvas":true}');
+    expect(readUiFeatureOverrides()).toEqual({ quick_pick_palette: true, canvas: false });
+    expect(clearUiFeatureOverrides()).toBe(true);
+    expect(localStorage.getItem(key)).toBeNull();
+    expect(localStorage.getItem(otherKey)).toBe('{"canvas":true}');
+    expect(readUiFeatureOverrides()).toEqual({});
+    localStorage.setItem(key, '{"canvas":true}');
+    expect(readUiFeatureOverrides()).toEqual({});
   });
 
   it.each(["{", "null", "[]", '"true"'])("ignores malformed or non-object storage %s", (raw) => {
@@ -125,6 +142,7 @@ describe("UI feature overrides", () => {
     expect(canOverrideUiFeatures()).toBe(false);
     expect(readUiFeatureOverrides()).toEqual({});
     expect(writeUiFeatureOverride("canvas", false)).toBe(false);
+    expect(clearUiFeatureOverrides()).toBe(false);
     expect(localStorage.getItem(key)).toBe('{"canvas":true}');
   });
 
@@ -149,6 +167,8 @@ describe("UI feature overrides", () => {
       throw new Error("denied");
     });
     expect(writeUiFeatureOverride("canvas", null)).toBe(false);
+    expect(clearUiFeatureOverrides()).toBe(false);
+    expect(localStorage.getItem(key)).toBe(saved);
     expect(readUiFeatureOverrides()).toEqual({ canvas: true });
   });
 

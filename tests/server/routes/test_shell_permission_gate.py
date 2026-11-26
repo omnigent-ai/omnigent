@@ -1337,7 +1337,46 @@ _PR_OWNER_METHODS = {
         "account": "octocat",
     },
     "DisableAutoMerge": {},
+    "GetPendingReview": {},
+    "StartPendingReview": {"commitOid": "a" * 40},
+    "AddPendingReviewComment": {
+        "body": "Why?",
+        "inReplyToThreadId": "PRRT_1",
+        "pendingReviewId": "PRR_1",
+        "expectedHeadOid": "a" * 40,
+    },
+    "UpdatePendingReviewComment": {
+        "commentNodeId": "PRRC_1",
+        "body": "Better",
+        "expectedBodySha256": "c" * 64,
+        "pendingReviewId": "PRR_1",
+    },
+    "DeletePendingReviewComment": {"commentNodeId": "PRRC_1", "pendingReviewId": "PRR_1"},
+    "SubmitPendingReview": {
+        "event": "APPROVE",
+        "commitOid": "a" * 40,
+        "pendingReviewId": "PRR_1",
+    },
+    "DiscardPendingReview": {"pendingReviewId": "PRR_1"},
+    "SubmitReview": {"event": "COMMENT", "body": "Nit", "commitOid": "a" * 40},
+    "SubmitReviewVerdict": {"event": "APPROVE", "commitOid": "a" * 40},
+    "SetReviewThreadResolved": {"threadId": "PRRT_1", "resolved": True},
+    "EditComment": {
+        "kind": "issue",
+        "commentId": "5",
+        "body": "Mine",
+        "expectedBodySha256": "c" * 64,
+    },
+    "DeleteComment": {"kind": "review", "commentId": "5"},
+    "AddReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
+    "RemoveReaction": {"kind": "issue", "commentId": "5", "content": "HEART"},
 }
+
+
+def test_every_owner_method_has_a_gate_case() -> None:
+    from tests.host.test_workspace_methods import _PULL_REQUEST_OWNER_METHODS
+
+    assert set(_PR_OWNER_METHODS) == _PULL_REQUEST_OWNER_METHODS
 
 
 def _pull_request_call_passes(method: str, caller: str | None, session: str) -> int:

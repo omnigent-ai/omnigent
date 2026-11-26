@@ -3149,6 +3149,38 @@ def test_a_workspace_call_from_an_older_server_has_no_session_or_vouch() -> None
     assert decoded.session_id is None and decoded.vouch is None
 
 
+def test_a_review_read_carries_the_servers_ask_for_the_accounts_rights() -> None:
+    from omnigent.host.frames import HostWorkspaceCallFrame
+
+    asked = HostWorkspaceCallFrame(
+        "r", "~/p", "ListReviewThreads", b"", "conv_1", None, account_rights=True
+    )
+    assert decode_host_frame(encode_host_frame(asked)) == asked
+    # Unasked, it encodes as before, and an older server's frame reads as unasked.
+    unasked = HostWorkspaceCallFrame("r", "~/p", "ListReviewThreads", b"", "conv_1")
+    assert "account_rights" not in json.loads(encode_host_frame(unasked))
+    older = {"kind": "host.workspace_call", "request_id": "r", "workspace": "~/p", "method": "X"}
+    decoded = decode_host_frame(json.dumps(older))
+    assert isinstance(decoded, HostWorkspaceCallFrame)
+    assert decoded.account_rights is False
+
+
+@pytest.mark.parametrize("account_rights", ["true", 1, ["yes"]])
+def test_a_workspace_call_whose_account_rights_are_mistyped_is_refused(
+    account_rights: object,
+) -> None:
+    frame = {
+        "kind": "host.workspace_call",
+        "request_id": "r",
+        "workspace": "~/p",
+        "method": "ListReviewThreads",
+        "session_id": "conv_1",
+        "account_rights": account_rights,
+    }
+    with pytest.raises(ValueError, match="account_rights"):
+        decode_host_frame(json.dumps(frame))
+
+
 @pytest.mark.parametrize(
     "vouch",
     [
