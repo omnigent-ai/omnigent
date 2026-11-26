@@ -11,6 +11,7 @@ from typing import Any
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 
+from omnigent.runner import pr_resource
 from omnigent.runner.github_review_fields import (
     COMMENT_KINDS,
     COMMENT_REVIEW_EVENT,
@@ -20,6 +21,13 @@ from omnigent.runner.github_review_fields import (
     SHA256,
     VERDICT_STATES,
 )
+
+# The largest pull request attachment, a video; the runner checks each type's own limit.
+# The call frame carries it base64-encoded, a third larger, under the tunnel's message cap.
+MAX_ATTACHMENT_BYTES = pr_resource.MAX_VIDEO_ATTACHMENT_BYTES
+# Caps on an upload's other fields, so the largest allowed call still fits one frame.
+MAX_ATTACHMENT_NAME_CHARACTERS = 255
+MAX_PULL_REQUEST_URL_CHARACTERS = 2048
 
 # Each review method's allowed events; the others carry none.
 _EVENTS: dict[str, frozenset[str]] = {
@@ -72,6 +80,19 @@ def refuse_unserved_request(method: str, request: Any) -> None:
             reason = "Expected an account to merge as"
     elif method == "ListLabels" and request.text:
         reason = "Label search isn't available on this host"
+    elif method == "UploadAttachment":
+        if not request.name.strip():
+            reason = "Expected the file's name"
+        elif len(request.name) > MAX_ATTACHMENT_NAME_CHARACTERS:
+            reason = f"The file's name is longer than {MAX_ATTACHMENT_NAME_CHARACTERS} characters"
+        elif len(request.pr_url) > MAX_PULL_REQUEST_URL_CHARACTERS:
+            reason = (
+                f"The pull request URL is longer than {MAX_PULL_REQUEST_URL_CHARACTERS} characters"
+            )
+        elif not request.content:
+            reason = "The attachment is empty"
+        elif len(request.content) > MAX_ATTACHMENT_BYTES:
+            reason = f"The attachment is larger than {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB"
     else:
         reason = _review_refusal(method, request)
     if reason is not None:

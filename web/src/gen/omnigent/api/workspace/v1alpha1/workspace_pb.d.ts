@@ -5046,7 +5046,8 @@ export declare const WorkspaceService: GenService<{
     output: typeof UpdatePendingReviewCommentResponseSchema;
   },
   /**
-   * Uploads a file to link from a comment.
+   * Uploads a file to link from a comment, up to 70 MiB. Send it with the binary protobuf
+   * encoding: JSON's base64 makes the body a third larger, past the request limit.
    *
    * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.UploadAttachment
    */

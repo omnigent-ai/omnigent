@@ -215,6 +215,8 @@ _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
 # The largest PR attachment, a video; the runner checks each type's limit. Both
 # the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
 _MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
+# Room in a workspace API upload's body for its URL, name and protobuf framing.
+_UPLOAD_FIELDS_MARGIN_BYTES = 64 * 1024
 
 # Automatic previews can require this acknowledgement when talking to older servers.
 _WORKSPACE_FILE_SCOPE_HEADERS = {
@@ -2987,12 +2989,14 @@ def register_resources_routes(
                 status_code=501, detail="The workspace API needs `omnigent[workspace-api]`"
             ) from None
         from connectrpc.errors import ConnectError
+        from connectrpc.server import DEFAULT_READ_MAX_BYTES
 
         from omnigent.api.workspace.v1alpha1.workspace_connect import (
             WorkspaceServiceASGIApplication,
         )
         from omnigent.host.frames import CAP_WORKSPACE_API
         from omnigent.host.workspace_methods import WORKSPACE_METHODS
+        from omnigent.host.workspace_pull_request_input import MAX_ATTACHMENT_BYTES
         from omnigent.server.workspace_access import WorkspaceGate, callable_methods, gate_for
         from omnigent.server.workspace_api import (
             VIEWER_SHAPED_METHODS,
@@ -3059,7 +3063,14 @@ def register_resources_routes(
                 browse=gate is WorkspaceGate.BROWSE, session_owner=session_owner
             ),
         )
-        app = WorkspaceServiceASGIApplication(forwarder)
+        # An upload may be as large as an attachment, but only once the owner gate has passed;
+        # every other call, and anyone else's, keeps connectrpc's default read limit.
+        read_max_bytes = (
+            MAX_ATTACHMENT_BYTES + _UPLOAD_FIELDS_MARGIN_BYTES
+            if method == "UploadAttachment" and session_owner
+            else DEFAULT_READ_MAX_BYTES
+        )
+        app = WorkspaceServiceASGIApplication(forwarder, read_max_bytes=read_max_bytes)
         # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
         return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 

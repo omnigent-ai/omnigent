@@ -51,6 +51,7 @@ from omnigent.server.pull_request_viewers import (
     review_comments_for_viewer,
     review_threads_for_viewer,
 )
+from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 # Each reply must arrive within this; a whole ReadFile can take longer.
 _REPLY_TIMEOUT_S = 30.0
@@ -58,6 +59,9 @@ _REPLY_TIMEOUT_S = 30.0
 _FEATURE_NAME = re.compile(r"[a-z0-9_.]+")
 # A pull request change's answer must arrive within this, as long as REST waits for one.
 _WRITE_REPLY_TIMEOUT_S = 20.0
+# An upload's answer may take as long as REST's attachment route waits for it.
+_UPLOAD_REPLY_TIMEOUT_S = 120.0
+_UPLOAD_METHOD = "UploadAttachment"
 # The pull request methods that answer with its overview, which lists the session's PRs.
 _OVERVIEW_METHODS = frozenset({"GetPullRequest", "SetPullRequestAccount"})
 _COMMENT_WRITES = frozenset({"CreateComment", "CreateReviewThread", "ReplyToReviewThread"})
@@ -210,7 +214,7 @@ class HostWorkspaceService(WorkspaceServiceMethods):
             # The host sends its account's rights in a review read only when asked.
             account_rights=shape is not None and owner,
             unconfirmed=_unconfirmed_change(method.name) if changes else None,
-            timeout=_WRITE_REPLY_TIMEOUT_S if changes else _REPLY_TIMEOUT_S,
+            timeout=_reply_timeout(method.name, changes=changes),
         )
         # Every pull request response is one ``payload`` Struct, the REST route's JSON.
         response: Any = method.response_type.FromString(message)
@@ -291,8 +295,14 @@ class HostWorkspaceService(WorkspaceServiceMethods):
                 vouch=vouch,
                 account_rights=account_rights,
             )
+            frame = encode_host_frame(call)
+            # A message over the tunnel's cap would close the host's whole connection. The
+            # frame is ASCII JSON, so its length is its size in bytes.
+            if len(frame) > RUNNER_TUNNEL_MAX_MESSAGE_BYTES:
+                too_large = "The request is too large to send to the session's host"
+                raise ConnectError(Code.RESOURCE_EXHAUSTED, too_large)
             try:
-                target.registry.send_text(target.host, encode_host_frame(call))
+                target.registry.send_text(target.host, frame)
             except ConnectionError as exc:
                 raise ConnectError(Code.UNAVAILABLE, "The session's host disconnected") from exc
             while True:
@@ -352,8 +362,18 @@ for _method in WORKSPACE_METHODS.values():
         setattr(HostWorkspaceService, _method.python_name, _host_forwarder(_method))
 
 
+def _reply_timeout(method: str, *, changes: bool) -> float:
+    """How long each reply of a pull request call may take."""
+    if method == _UPLOAD_METHOD:
+        return _UPLOAD_REPLY_TIMEOUT_S
+    return _WRITE_REPLY_TIMEOUT_S if changes else _REPLY_TIMEOUT_S
+
+
 def _unconfirmed_change(method: str) -> str:
     """What a client is told when a change may have been made but its answer was lost."""
+    if method == _UPLOAD_METHOD:
+        # GitHub keeps an unlinked file and nothing else, so attaching again is safe.
+        return "Could not confirm the upload. Try attaching the file again."
     if method in _COMMENT_WRITES:
         return "Could not confirm comment posting. Check GitHub before retrying."
     if method in _REVIEW_WRITES:

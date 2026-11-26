@@ -56,6 +56,7 @@ _PULL_REQUEST_OWNER_METHODS = frozenset(
         "DeleteComment",
         "AddReaction",
         "RemoveReaction",
+        "UploadAttachment",
     }
 )
 # The owner methods that change the pull request; a lost answer may hide a change.

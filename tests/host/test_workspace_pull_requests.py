@@ -279,6 +279,8 @@ def _pr_target(**fields: Any) -> dict[str, Any]:
     return {"session_id": _SESSION, "pr_url": _PR, **fields}
 
 
+# A PNG signature: the runner refuses an upload whose bytes are no image or video.
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 8
 # Each owner method: a valid request, the pr_resource function it runs, and its arguments.
 _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
     "ListLabels": (pb.ListLabelsRequest(pr_url=_PR), "pr_labels", _pr_target()),
@@ -366,6 +368,11 @@ _OWNER_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
         pb.DisableAutoMergeRequest(pr_url=_PR),
         "disable_pr_auto_merge",
         _pr_target(),
+    ),
+    "UploadAttachment": (
+        pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png", content=_PNG),
+        "upload_pr_attachment",
+        _pr_target(name="shot.png", content=_PNG),
     ),
 }
 
@@ -832,6 +839,29 @@ async def test_a_review_failure_reaches_the_server_with_its_code_and_reason(
     assert await _reason(
         _frame(tmp_path, "EditComment", request.SerializeToString(), vouch=_VOUCHED)
     ) == (code.value, reason)
+
+
+@pytest.mark.parametrize(
+    ("fields", "refusal"),
+    [
+        ({"name": "a" * 256, "content": b"png"}, "The file's name is longer than 255 characters"),
+        ({"name": "shot.png"}, "The attachment is empty"),
+    ],
+    ids=["long-name", "empty"],
+)
+async def test_the_host_refuses_an_upload_the_server_would_have(
+    tmp_path: Path,
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+    fields: dict[str, Any],
+    refusal: str,
+) -> None:
+    request = pb.UploadAttachmentRequest(pr_url=_PR, **fields)
+    _messages, code, message = await _answer(
+        _frame(tmp_path, "UploadAttachment", request.SerializeToString())
+    )
+
+    assert (code, message) == (Code.INVALID_ARGUMENT.value, refusal)
+    assert owner_calls == []
 
 
 @pytest.fixture

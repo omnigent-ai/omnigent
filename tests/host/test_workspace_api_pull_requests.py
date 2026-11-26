@@ -19,6 +19,7 @@ import pytest
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from connectrpc.protocol import ProtocolType
+from connectrpc.server import DEFAULT_READ_MAX_BYTES
 
 from omnigent.api.workspace.v1alpha1 import workspace_pb2 as pb
 from omnigent.host import workspace_service
@@ -28,9 +29,15 @@ from omnigent.host.frames import (
     HostWorkspaceReplyFrame,
     PullRequestVouch,
     decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict, payload_struct
+from omnigent.host.workspace_pull_request_input import (
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_NAME_CHARACTERS,
+    MAX_PULL_REQUEST_URL_CHARACTERS,
+)
 from omnigent.runner import pr_resource
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server import workspace_access, workspace_api
@@ -38,6 +45,7 @@ from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_
 from omnigent.server.pull_request_viewers import PullRequestViewer
 from omnigent.server.workspace_access import METHOD_GATES, WorkspaceGate, callable_methods
 from omnigent.stores.session_pull_request_store import SessionPullRequests
+from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 from omnigent.workspace_fs import WorkspaceReader
 from tests._helpers.polling import poll_until_async
 from tests.host import test_workspace_pull_requests as host_tests
@@ -310,8 +318,37 @@ def owner_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[st
             pb.ListLabelsRequest(pr_url=_PR, text="bug"),
             "Label search isn't available on this host",
         ),
+        (
+            "UploadAttachment",
+            pb.UploadAttachmentRequest(pr_url=_PR, name=" ", content=b"png"),
+            "Expected the file's name",
+        ),
+        (
+            "UploadAttachment",
+            pb.UploadAttachmentRequest(pr_url=_PR, name="a" * 256, content=b"png"),
+            "The file's name is longer than 255 characters",
+        ),
+        (
+            "UploadAttachment",
+            pb.UploadAttachmentRequest(pr_url=_PR + "x" * 2048, name="shot.png", content=b"png"),
+            "The pull request URL is longer than 2048 characters",
+        ),
+        (
+            "UploadAttachment",
+            pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png"),
+            "The attachment is empty",
+        ),
     ],
-    ids=["account-without-pr", "account-with-remote", "merge-as-no-account", "label-search"],
+    ids=[
+        "account-without-pr",
+        "account-with-remote",
+        "merge-as-no-account",
+        "label-search",
+        "upload-no-name",
+        "upload-long-name",
+        "upload-long-url",
+        "upload-empty",
+    ],
 )
 async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(
     tmp_path: Path,
@@ -328,6 +365,119 @@ async def test_a_request_the_api_doesnt_serve_is_refused_before_the_vouch(
         await getattr(client, WORKSPACE_METHODS[method].python_name)(request_message)
 
     assert (refused.value.code, refused.value.message) == (Code.INVALID_ARGUMENT, refusal)
+    assert store.reads == 0
+    assert host_calls == []
+
+
+# -- An upload reads past connectrpc's 4 MB default only for the session's owner. ---------
+
+_OVER_DEFAULT_READ = 5 * 1024 * 1024
+
+
+@pytest.fixture
+def read_limits(monkeypatch: pytest.MonkeyPatch) -> list[int | None]:
+    """The read limit of each Connect app the route built, one per call that passed its gates."""
+    from omnigent.api.workspace.v1alpha1 import workspace_connect
+
+    built: list[int | None] = []
+    real = workspace_connect.WorkspaceServiceASGIApplication
+
+    def recording(service: Any, *, read_max_bytes: int | None) -> Any:
+        built.append(read_max_bytes)
+        return real(service, read_max_bytes=read_max_bytes)
+
+    monkeypatch.setattr(workspace_connect, "WorkspaceServiceASGIApplication", recording)
+    return built
+
+
+async def test_an_owners_upload_larger_than_the_default_read_limit_reaches_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    owner_calls: list[tuple[str, str, dict[str, Any]]],
+    read_limits: list[int | None],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+    content = b"\x89PNG" + b"\0" * _OVER_DEFAULT_READ
+
+    response = await client.upload_attachment(
+        pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png", content=content)
+    )
+
+    assert payload_dict(response.payload) == {"object": "test"}
+    assert [call.method for call in host_calls] == ["UploadAttachment"]
+    assert [(call[0], call[2]["content"] == content) for call in owner_calls] == [
+        ("upload_pr_attachment", True)
+    ]
+    assert read_limits == [MAX_ATTACHMENT_BYTES + 64 * 1024]
+
+
+async def test_a_non_owners_upload_is_refused_before_any_body_is_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    read_limits: list[int | None],
+) -> None:
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(routes_resources, "_is_session_owner", lambda *_args, **_kwargs: False)
+    app = service_tests._server_app(tmp_path, monkeypatch)
+    monkeypatch.setattr(server_prs, "open_store", lambda _conversations: _Store(_linked(_PR)))
+    request = pb.UploadAttachmentRequest(pr_url=_PR, name="shot.png", content=b"png")
+    headers = {"Content-Type": "application/proto"}
+    body_read: list[bytes] = []
+
+    async def unread_body(scope: Any, receive: Any, send: Any) -> None:
+        async def receive_noting_the_body() -> Any:
+            message = await receive()
+            if message.get("type") == "http.request" and message.get("body"):
+                body_read.append(message["body"])
+            return message
+
+        await app(scope, receive_noting_the_body, send)
+
+    response = await _post(unread_body, "UploadAttachment", request.SerializeToString(), headers)
+
+    assert response.status_code == 403, response.text
+    assert body_read == []
+    assert read_limits == []
+    assert host_calls == []
+
+
+async def test_any_other_call_keeps_the_default_read_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_calls: list[HostWorkspaceCallFrame],
+    read_limits: list[int | None],
+) -> None:
+    client = _client(tmp_path, monkeypatch, _Store(_linked(_PR)))
+
+    with pytest.raises(ConnectError) as refused:
+        await client.create_comment(
+            pb.CreateCommentRequest(pr_url=_PR, body="x" * _OVER_DEFAULT_READ)
+        )
+
+    assert refused.value.code == Code.RESOURCE_EXHAUSTED
+    assert read_limits == [DEFAULT_READ_MAX_BYTES]
+    assert host_calls == []
+
+
+async def test_an_upload_larger_than_an_attachment_is_refused_before_the_vouch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_calls: list[HostWorkspaceCallFrame]
+) -> None:
+    store = _Store(_linked(_PR))
+    client = _client(tmp_path, monkeypatch, store)
+    content = b"\0" * (MAX_ATTACHMENT_BYTES + 1)
+
+    with pytest.raises(ConnectError) as refused:
+        await client.upload_attachment(
+            pb.UploadAttachmentRequest(pr_url=_PR, name="clip.mp4", content=content)
+        )
+
+    assert (refused.value.code, refused.value.message) == (
+        Code.INVALID_ARGUMENT,
+        "The attachment is larger than 70 MB",
+    )
     assert store.reads == 0
     assert host_calls == []
 
@@ -516,7 +666,14 @@ def _tunnel(
 _MERGE = host_tests._OWNER_CALLS["MergePullRequest"][0]
 _COMMENT_UNCONFIRMED = "Could not confirm comment posting. Check GitHub before retrying."
 _CHANGE_UNCONFIRMED = "Could not confirm the pull request change. Check GitHub before retrying."
+_UPLOAD_UNCONFIRMED = "Could not confirm the upload. Try attaching the file again."
 _COMMENT_METHODS = {"CreateComment", "CreateReviewThread", "ReplyToReviewThread"}
+
+
+def _unconfirmed_for(method: str) -> str:
+    if method == "UploadAttachment":
+        return _UPLOAD_UNCONFIRMED
+    return _COMMENT_UNCONFIRMED if method in _COMMENT_METHODS else _CHANGE_UNCONFIRMED
 
 
 @pytest.mark.parametrize(
@@ -589,7 +746,7 @@ async def _end_after_frame(tunnel: _Tunnel, method: str, request: Any, code: str
 
 def test_every_write_has_a_request_case() -> None:
     assert set(_WRITES) <= set(host_tests._OWNER_CALLS)
-    assert len(_WRITES) == 10
+    assert len(_WRITES) == 11
 
 
 @pytest.mark.parametrize("method", _WRITES)
@@ -597,11 +754,10 @@ async def test_a_host_failure_after_a_change_was_sent_is_unconfirmed(
     tmp_path: Path, method: str
 ) -> None:
     """A host error shaping GitHub's answer may follow a change GitHub made."""
-    unconfirmed = _COMMENT_UNCONFIRMED if method in _COMMENT_METHODS else _CHANGE_UNCONFIRMED
     tunnel = _tunnel(tmp_path)
     error = await _end_after_frame(tunnel, method, host_tests._OWNER_CALLS[method][0], "internal")
 
-    assert (error.code, error.message) == (Code.UNKNOWN, unconfirmed)
+    assert (error.code, error.message) == (Code.UNKNOWN, _unconfirmed_for(method))
 
 
 @pytest.mark.parametrize("method", ["GetMergeOptions", "ListPullRequestFiles"])
@@ -624,6 +780,54 @@ async def test_a_change_whose_answer_times_out_is_unconfirmed(
 
     assert (lost.value.code, lost.value.message) == (Code.DEADLINE_EXCEEDED, _COMMENT_UNCONFIRMED)
     assert len(tunnel.sent) == 1
+
+
+async def test_an_upload_waits_as_long_as_the_rest_route_for_its_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large upload outlasts a change's 20 s; only the upload gets the longer wait."""
+    monkeypatch.setattr(workspace_api, "_WRITE_REPLY_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(workspace_api, "_UPLOAD_REPLY_TIMEOUT_S", 0.05)
+    tunnel = _tunnel(tmp_path)
+    upload = host_tests._OWNER_CALLS["UploadAttachment"][0]
+
+    with pytest.raises(ConnectError) as lost:
+        await tunnel.call("UploadAttachment", upload)
+
+    assert (lost.value.code, lost.value.message) == (Code.DEADLINE_EXCEEDED, _UPLOAD_UNCONFIRMED)
+    assert workspace_api._reply_timeout("UploadAttachment", changes=True) == 0.05
+    assert workspace_api._reply_timeout("CreateComment", changes=True) == 60.0
+
+
+async def test_a_frame_over_the_tunnels_cap_is_never_sent_and_the_host_stays_connected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A message over the cap would close the host's connection, for every session on it."""
+    monkeypatch.setattr(workspace_api, "RUNNER_TUNNEL_MAX_MESSAGE_BYTES", 4096)
+    tunnel = _tunnel(tmp_path)
+
+    with pytest.raises(ConnectError) as refused:
+        await tunnel.call("CreateComment", pb.CreateCommentRequest(pr_url=_PR, body="x" * 4096))
+
+    assert refused.value.code == Code.RESOURCE_EXHAUSTED
+    assert tunnel.sent == []
+    assert tunnel.registry.get("host_ws") is tunnel.host
+    assert not tunnel.host.pending_workspace_calls
+
+
+async def test_the_largest_upload_allowed_fits_in_one_frame(tmp_path: Path) -> None:
+    """The longest name and URL, the name in characters JSON escapes, with a full file."""
+    longest = pb.UploadAttachmentRequest(
+        pr_url="https://github.com/" + "o" * (MAX_PULL_REQUEST_URL_CHARACTERS - 19),
+        name="\U0001f600" * MAX_ATTACHMENT_NAME_CHARACTERS,
+        content=b"\xff" * MAX_ATTACHMENT_BYTES,
+    )
+    tunnel = _tunnel(tmp_path)
+
+    error = await _end_after_frame(tunnel, "UploadAttachment", longest, "internal")
+
+    assert (error.code, error.message) == (Code.UNKNOWN, _UPLOAD_UNCONFIRMED)
+    assert len(encode_host_frame(tunnel.sent[0])) <= RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
 
 async def test_a_change_that_was_never_sent_is_safe_to_retry(tmp_path: Path) -> None:

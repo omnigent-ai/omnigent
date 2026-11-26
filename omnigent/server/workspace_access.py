@@ -76,6 +76,7 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "DeleteComment": WorkspaceGate.SESSION_OWNER,
     "AddReaction": WorkspaceGate.SESSION_OWNER,
     "RemoveReaction": WorkspaceGate.SESSION_OWNER,
+    "UploadAttachment": WorkspaceGate.SESSION_OWNER,
 }
 
 
