@@ -2,6 +2,7 @@ import {
   cursorCharLeft,
   cursorCharRight,
   deleteCharBackward,
+  deleteCharForward,
   redo,
   selectCharRight,
   undo,
@@ -12,7 +13,8 @@ import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
-import { insertComposerText } from "@/lib/composerText";
+import { insertComposerText, insertPastedText } from "@/lib/composerText";
+import { quoteLine } from "@/lib/replyDraftDocument";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
@@ -651,5 +653,207 @@ describe("leadingCommandSpan", () => {
     // The bare-string rule would refuse both: no word break after `!`, and \x01 isn't whitespace.
     expect(leadingCommandSpan("!ls", "!")).toBeNull();
     expect(leadingCommandSpan("\x01! ls", "!")).toBeNull();
+  });
+});
+
+describe("CodeMirrorComposerInput reply quotes", () => {
+  // CodeMirror measures text for caret motion; jsdom has no layout.
+  const originalRangeRects = {
+    getClientRects: Range.prototype.getClientRects,
+    getBoundingClientRect: Range.prototype.getBoundingClientRect,
+  };
+  beforeAll(() => {
+    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => new DOMRect();
+  });
+  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+
+  const a = quoteLine("a", "Alpha");
+  const b = quoteLine("b", "Beta\nmore");
+  const lines = (...parts: string[]) => parts.join("\n");
+  function mountQuotes(value: string, props: Partial<Parameters<typeof mount>[0]> = {}) {
+    const mounted = mount({ value, replyQuotes: true, ...props });
+    const editor = EditorView.findFromDOM(mounted.content)!;
+    const caretAt = (anchor: number, head = anchor) =>
+      act(() => editor.dispatch({ selection: { anchor, head } }));
+    const run = (command: (view: EditorView) => boolean) => act(() => void command(editor));
+    const edit = (from: number, to: number, insert: string, userEvent = "input.type") =>
+      act(() =>
+        editor.dispatch({
+          changes: { from, to, insert },
+          selection: { anchor: from + insert.length },
+          userEvent,
+        }),
+      );
+    const removeButtons = () =>
+      Array.from(
+        mounted.container.querySelectorAll<HTMLButtonElement>("[aria-label='Remove quote']"),
+      );
+    return { ...mounted, editor, caretAt, run, edit, removeButtons };
+  }
+
+  it("paints each quote as a card with a truncated preview and an X that follows read-only", () => {
+    const long = "x".repeat(130);
+    const value = lines("Intro", quoteLine("long", long), "");
+    const { container, rerender, setTarget, removeButtons } = mountQuotes(value);
+    const card = container.querySelector("[data-testid='composer-reply-quote']")!;
+    expect(card.querySelector("blockquote")).toHaveAttribute("title", long);
+    expect(card.querySelector("[aria-hidden='true']")!.textContent).toBe(`${"x".repeat(120)}…`);
+    expect(card.querySelector(".sr-only")!.textContent).toBe(long);
+    expect(removeButtons()[0]).toBeEnabled();
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={value}
+        replyQuotes
+        readOnly
+        ref={setTarget}
+      />,
+    );
+    expect(removeButtons()[0]).toBeDisabled();
+  });
+
+  it("steps the caret over a card with ← and →", () => {
+    const { content, editor, caretAt } = mountQuotes(lines("Intro", a, "Reply"));
+    caretAt("Intro".length);
+    fireEvent.keyDown(content, { key: "ArrowRight" });
+    expect(editor.state.selection.main.head).toBe(lines("Intro", a, "").length);
+    fireEvent.keyDown(content, { key: "ArrowLeft" });
+    expect(editor.state.selection.main.head).toBe("Intro".length);
+  });
+
+  it.each([
+    ["at the start of the document", 0, lines("#", a, "Mid", b, "")],
+    ["at a card's end", a.length, lines(a, "#", "Mid", b, "")],
+    ["at a card's start", lines(a, "Mid", "").length, lines(a, "Mid", "#", b, "")],
+  ])("moves text typed or pasted %s to a line of its own", (_where, at, expected) => {
+    const { target, edit } = mountQuotes(lines(a, "Mid", b, ""));
+    edit(at, at, "#");
+    expect(target().value).toBe(expected);
+    expect(target().selectionStart).toBe(expected.indexOf("#") + 1);
+
+    const pasted = mountQuotes(lines(a, "Mid", b, ""));
+    pasted.edit(at, at, `${quoteLine("z", "Zed")}#`, "input.paste");
+    expect(pasted.target().value).toBe(expected);
+  });
+
+  it("deletes a quote typed over whole, and keeps one beside a typed-over break", () => {
+    const value = lines("Intro", a, "Reply");
+    const { target, edit, run } = mountQuotes(value);
+    edit("Intro\n".length, "Intro\n".length + a.length, "x");
+    expect(target().value).toBe(lines("Intro", "x", "Reply"));
+    run(undo);
+    expect(target().value).toBe(value);
+    edit("Intro".length, "Intro\n".length, "x");
+    expect(target().value).toBe(lines("Introx", a, "Reply"));
+  });
+
+  it("keeps a card when only the break after it is selected and deleted", () => {
+    const value = lines("Intro", a, "Reply");
+    const { target, caretAt, run } = mountQuotes(value);
+    caretAt(lines("Intro", a).length, lines("Intro", a, "").length);
+    run(deleteCharBackward);
+    expect(target().value).toBe(value);
+  });
+
+  it("drops only the part of an edit inside a token", () => {
+    const { target, editor } = mountQuotes(lines("Intro", a, "Reply"));
+    act(() =>
+      editor.dispatch({
+        changes: [
+          { from: 0, insert: "Hi " },
+          { from: "Intro\n".length + 3, insert: "zz" },
+        ],
+        userEvent: "input.type",
+      }),
+    );
+    expect(target().value).toBe(lines("Hi Intro", a, "Reply"));
+    // An insert whose range ends inside the token still lands, and the token stays whole.
+    act(() => insertComposerText(target(), "abc", 2, "Hi Intro\n".length + 3));
+    expect(target().value).toBe(lines("Hiabc", a, "Reply"));
+  });
+
+  it.each([
+    [
+      "Backspace under the last card",
+      lines("Opener", a, "", b, "").length,
+      deleteCharBackward,
+      lines("Opener", a, ""),
+    ],
+    ["Delete before the first card", "Opener".length, deleteCharForward, lines("Opener", b, "")],
+  ])("removes a card with %s, which undo brings back exactly", (_key, caret, command, removed) => {
+    const value = lines("Opener", a, "", b, "");
+    const { target, caretAt, run, removeButtons } = mountQuotes(value);
+    caretAt(caret);
+    run(command);
+    expect(target().value).toBe(removed);
+    run(undo);
+    expect(target().value).toBe(value);
+    run(redo);
+    expect(target().value).toBe(removed);
+    run(undo);
+    fireEvent.click(removeButtons()[1]!);
+    expect(target().value).toBe(lines("Opener", a, ""));
+    run(undo);
+    fireEvent.click(removeButtons()[0]!);
+    expect(target().value).toBe(lines("Opener", b, ""));
+    run(undo);
+    expect(target().value).toBe(value);
+  });
+
+  it("removes adjacent cards one per keystroke", () => {
+    const { target, caretAt, run } = mountQuotes(lines(a, b, "Reply"));
+    caretAt(lines(a, b, "").length);
+    run(deleteCharBackward);
+    expect(target().value).toBe(lines(a, "Reply"));
+    run(deleteCharBackward);
+    expect(target().value).toBe("Reply");
+
+    const separated = mountQuotes(lines(a, "", b, "Reply"));
+    separated.caretAt(lines(a, "").length);
+    separated.run(deleteCharBackward);
+    expect(separated.target().value).toBe(lines(b, "Reply"));
+  });
+
+  it("copies quotes as markdown", () => {
+    const value = lines("Intro", b, "Reply");
+    const { content, caretAt, target } = mountQuotes(value);
+    act(() => target().focus());
+    caretAt(0, value.length);
+    const setData = vi.fn();
+    fireEvent.copy(content, { clipboardData: { setData, clearData: vi.fn() } });
+    expect(setData).toHaveBeenCalledWith("text/plain", lines("Intro", "> Beta", "> more", "Reply"));
+  });
+
+  it("strips tokens from a paste the composer inserts itself", () => {
+    const onPaste = (event: ComposerPasteEvent) => void insertPastedText(event);
+    const { content, target, caretAt } = mountQuotes(lines("Intro", a, ""), { onPaste });
+    caretAt(lines("Intro", a, "").length);
+    const clipboardData = { getData: () => `pasted ${b} text`, files: [], items: [], types: [] };
+    fireEvent.paste(content, { clipboardData });
+    expect(target().value).toBe(lines("Intro", a, "pasted  text"));
+  });
+
+  it("takes a controlled value that removes a middle card as it is", () => {
+    const c = quoteLine("c", "Gamma");
+    const { target, rerender, setTarget } = mountQuotes(lines("A", a, "B", b, "C", c, ""));
+    const removed = lines("A", a, "B", "C", c, "");
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={removed}
+        replyQuotes
+        ref={setTarget}
+      />,
+    );
+    expect(target().value).toBe(removed);
+  });
+
+  it("keeps token text literally in a composer without reply quotes", () => {
+    const value = lines("Intro", a, "");
+    const { container, target } = mount({ value });
+    expect(container.querySelector("[data-testid='composer-reply-quote']")).toBeNull();
+    act(() => insertComposerText(target(), b, 0, 0));
+    expect(target().value).toBe(b + value);
   });
 });

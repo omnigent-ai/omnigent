@@ -3,6 +3,7 @@
 import { history, historyKeymap, isolateHistory, standardKeymap } from "@codemirror/commands";
 import {
   Annotation,
+  ChangeSet,
   Compartment,
   EditorSelection,
   EditorState,
@@ -11,6 +12,7 @@ import {
   StateField,
   Transaction,
   type Extension,
+  type Text,
   type TransactionSpec,
 } from "@codemirror/state";
 import {
@@ -18,6 +20,7 @@ import {
   EditorView,
   keymap,
   placeholder as placeholderText,
+  WidgetType,
   type DecorationSet,
   type KeyBinding,
 } from "@codemirror/view";
@@ -34,6 +37,15 @@ import {
 } from "react";
 
 import type { ComposerInsert, ComposerInsertAdjustment } from "@/lib/composerMentions";
+import {
+  hasQuoteMark,
+  parseQuoteLine,
+  quoteRemovalRange,
+  quotesAsMarkdown,
+  removeQuoteFromDocument,
+  settleQuoteLines,
+  stripQuoteMarks,
+} from "@/lib/replyDraftDocument";
 import { cn } from "@/lib/utils";
 
 import type {
@@ -45,7 +57,7 @@ import type {
   ComposerTextTarget,
   ComposerTokenAt,
 } from "./composerInput";
-import { readlineKeys } from "./codeMirrorReadline";
+import { killStops, readlineKeys } from "./codeMirrorReadline";
 
 /** What the editor takes from the app, handed in by the loader. */
 export interface CodeMirrorComposerEnvironment {
@@ -237,6 +249,203 @@ function commandTokenField(environment: CodeMirrorComposerEnvironment): Extensio
     false,
   );
 }
+
+/** How much of a quote a card shows; the full quote is its title and is read to screen readers. */
+const QUOTE_PREVIEW_LENGTH = 120;
+const REMOVE_QUOTE_ICON =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="size-3.5" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
+
+/** A reply quote's card, with an X that removes it. */
+class QuoteCardWidget extends WidgetType {
+  readonly id: string;
+  readonly text: string;
+  readonly readOnly: boolean;
+
+  constructor(id: string, text: string, readOnly: boolean) {
+    super();
+    this.id = id;
+    this.text = text;
+    this.readOnly = readOnly;
+  }
+
+  override eq(other: QuoteCardWidget): boolean {
+    return other.id === this.id && other.text === this.text && other.readOnly === this.readOnly;
+  }
+
+  override toDOM(view: EditorView): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "flex w-full min-w-0 max-w-full items-start gap-2 py-1.5";
+    row.setAttribute("data-testid", "composer-reply-quote");
+    const card = document.createElement("blockquote");
+    card.className =
+      "min-w-0 max-w-full flex-1 overflow-hidden bg-muted/40 rounded-md border-l-2 border-l-primary/60 px-2 py-1.5 text-sm text-muted-foreground";
+    card.title = this.text;
+    const preview = document.createElement("span");
+    preview.className = "block min-w-0 truncate";
+    preview.setAttribute("aria-hidden", "true");
+    preview.textContent =
+      this.text.length > QUOTE_PREVIEW_LENGTH
+        ? `${this.text.slice(0, QUOTE_PREVIEW_LENGTH)}…`
+        : this.text;
+    const full = document.createElement("span");
+    full.className = "sr-only";
+    full.textContent = this.text;
+    card.append(preview, full);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className =
+      "mt-0.5 shrink-0 rounded-full text-muted-foreground hover:text-foreground disabled:opacity-60";
+    remove.setAttribute("aria-label", "Remove quote");
+    remove.disabled = this.readOnly;
+    remove.innerHTML = REMOVE_QUOTE_ICON;
+    // Keeps the editor's focus and caret where they are.
+    remove.addEventListener("mousedown", (event) => event.preventDefault());
+    const { id } = this;
+    remove.addEventListener("click", () => {
+      const range = quoteRemovalRange(view.state.doc.toString(), id);
+      if (range && !view.state.readOnly) view.dispatch({ changes: range, userEvent: "delete" });
+    });
+    row.append(card, remove);
+    return row;
+  }
+}
+
+function quoteCards(state: EditorState): DecorationSet {
+  const cards = [];
+  for (let number = 1; number <= state.doc.lines; number += 1) {
+    const line = state.doc.line(number);
+    const quote = parseQuoteLine(line.text);
+    if (!quote) continue;
+    const widget = new QuoteCardWidget(quote.id, quote.text, state.readOnly);
+    // Only the token's own line is replaced, so the line after the last card stays reachable.
+    cards.push(Decoration.replace({ block: true, widget }).range(line.from, line.to));
+  }
+  return Decoration.set(cards);
+}
+
+/** Each quote's atomic card, rebuilt on an edit and when read-only changes, which its X follows. */
+const quoteCardField = StateField.define<DecorationSet>({
+  create: quoteCards,
+  update: (cards, transaction) =>
+    transaction.docChanged || transaction.startState.readOnly !== transaction.state.readOnly
+      ? quoteCards(transaction.state)
+      : cards,
+  provide: (field) => [
+    EditorView.decorations.from(field),
+    EditorView.atomicRanges.of((view) => view.state.field(field)),
+  ],
+});
+
+/** Whether the owner or the history made `transaction`, whose document is taken as it is. */
+function isSyncOrHistory(transaction: Transaction): boolean {
+  return (
+    transaction.annotation(controlledUpdate) === true ||
+    historyDirectionOfTransactions([transaction]) !== undefined
+  );
+}
+
+/** Suppresses an edit inside each token it reaches without covering; covering one deletes it. */
+function keepQuoteTokensWhole(transaction: Transaction): boolean | readonly number[] {
+  if (isSyncOrHistory(transaction)) return true;
+  const changed: [number, number][] = [];
+  transaction.changes.iterChangedRanges((from, to) => changed.push([from, to]));
+  const suppressed: number[] = [];
+  const { doc } = transaction.startState;
+  transaction.startState.field(quoteCardField).between(0, doc.length, (from, to) => {
+    if (changed.some(([start, end]) => start < to && end > from && (start > from || end < to))) {
+      suppressed.push(from, to);
+    }
+  });
+  return suppressed.length > 0 ? suppressed : true;
+}
+
+/** The quote a caret's Backspace after its card, or Delete before it, removes: a lone break. */
+function removedQuote(transaction: Transaction): string | null {
+  const caret = transaction.startState.selection.main;
+  const { doc } = transaction.startState;
+  const changes: { from: number; to: number; inserted: number }[] = [];
+  transaction.changes.iterChanges((from, to, _fromB, _toB, inserted) =>
+    changes.push({ from, to, inserted: inserted.length }),
+  );
+  const [only] = changes;
+  if (!caret.empty || changes.length !== 1 || !only || only.inserted > 0) return null;
+  if (only.to - only.from !== 1 || doc.sliceString(only.from, only.to) !== "\n") return null;
+  let card: number | null = null;
+  if (only.to === caret.head) card = only.from;
+  else if (only.from === caret.head) card = only.to;
+  return card === null ? null : (parseQuoteLine(doc.lineAt(card).text)?.id ?? null);
+}
+
+/** `selection` with a caret that lands on a card moved past it, the way the caret was going. */
+function caretOffCards(doc: Text, selection: EditorSelection, previous: number): EditorSelection {
+  const { head, empty } = selection.main;
+  if (!empty || parseQuoteLine(doc.lineAt(head).text) === null) return selection;
+  const textLineEdge = (direction: 1 | -1): number | null => {
+    const first = doc.lineAt(head).number + direction;
+    for (let number = first; number >= 1 && number <= doc.lines; number += direction) {
+      const line = doc.line(number);
+      if (parseQuoteLine(line.text) === null) return direction > 0 ? line.from : line.to;
+    }
+    return null;
+  };
+  const backward = head < previous ? textLineEdge(-1) : null;
+  const target = backward ?? textLineEdge(1) ?? textLineEdge(-1);
+  return target === null ? selection : EditorSelection.single(target);
+}
+
+/**
+ * Keeps every token whole on its own line, whatever made the edit, with one fix after the user's
+ * transaction: see `removedQuote`, `settleQuoteLines` and `caretOffCards`.
+ */
+function settleQuoteCards(transaction: Transaction): Transaction | readonly TransactionSpec[] {
+  if (isSyncOrHistory(transaction)) return transaction;
+  const inserts: { from: number; to: number; text: string }[] = [];
+  transaction.changes.iterChanges((_fromA, _toA, from, to, text) =>
+    inserts.push({ from, to, text: text.toString() }),
+  );
+  const start = transaction.startState.doc.toString();
+  if (!hasQuoteMark(start) && !inserts.some((insert) => hasQuoteMark(insert.text))) {
+    return transaction;
+  }
+  const after = transaction.newDoc.toString();
+  const removed = removedQuote(transaction);
+  let settled = after;
+  if (removed !== null) settled = removeQuoteFromDocument(start, removed);
+  else if (transaction.docChanged) {
+    // Inserted text loses its tokens; the last insert goes first, so earlier offsets hold.
+    for (const insert of inserts.reverse()) {
+      const text = stripQuoteMarks(insert.text);
+      settled = settled.slice(0, insert.from) + text + settled.slice(insert.to);
+    }
+    settled = settleQuoteLines(settled);
+  }
+  const fix = ChangeSet.of(settled === after ? [] : minimalChange(after, settled), after.length);
+  const selection = caretOffCards(
+    fix.apply(transaction.newDoc),
+    transaction.newSelection.map(fix),
+    transaction.startState.selection.main.head,
+  );
+  if (fix.empty && selection.eq(transaction.newSelection)) return transaction;
+  return [transaction, { changes: fix, selection, sequential: true }];
+}
+
+/** Reply quotes as cards, for an input whose document is a reply draft's; see replyDraftDocument. */
+const replyQuoteCards: Extension = [
+  quoteCardField,
+  EditorState.changeFilter.of(keepQuoteTokensWhole),
+  EditorState.transactionFilter.of(settleQuoteCards),
+  // No readline kill reaches into a card or the line breaks beside it.
+  killStops.of((state) => {
+    const stops: { from: number; to: number }[] = [];
+    state.field(quoteCardField).between(0, state.doc.length, (from, to) => {
+      stops.push({ from: Math.max(0, from - 1), to: Math.min(state.doc.length, to + 1) });
+    });
+    return stops;
+  }),
+  EditorView.clipboardOutputFilter.of((text) => quotesAsMarkdown(text)),
+  // Without it a long card stretches the content past the editor, and its X out of view.
+  EditorView.theme({ ".cm-content": { minWidth: "0" } }),
+];
 
 /** Whether `binding` claims a chord with both Control and Option, which VoiceOver owns. */
 function bindsControlOption(binding: KeyBinding): boolean {
@@ -477,7 +686,15 @@ function CodeMirrorComposer({
   environment: CodeMirrorComposerEnvironment;
   forwardedRef: Ref<ComposerTextTarget>;
 }) {
-  const { value, placeholder, autoFocus, heightMode = "compact", className, mentionTokens } = props;
+  const {
+    value,
+    placeholder,
+    autoFocus,
+    heightMode = "compact",
+    className,
+    mentionTokens,
+    replyQuotes,
+  } = props;
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const surfaceRef = useRef<ComposerEditorSurface | null>(null);
@@ -495,6 +712,7 @@ function CodeMirrorComposer({
       theme: new Compartment(),
       mentionTokens: new Compartment(),
       commandToken: new Compartment(),
+      replyQuotes: new Compartment(),
     }),
     [],
   );
@@ -578,6 +796,7 @@ function CodeMirrorComposer({
           mentionTokenField(environment),
           compartments.commandToken.of(commandTokenFacet.of(documentCommandToken(initial))),
           commandTokenField(environment),
+          compartments.replyQuotes.of(initial.replyQuotes ? replyQuoteCards : []),
           EditorView.updateListener.of((update) => {
             const fromUser = !update.transactions.some((transaction) =>
               transaction.annotation(controlledUpdate),
@@ -686,6 +905,11 @@ function CodeMirrorComposer({
       ),
     });
   }, [compartments, commandTokenKey]);
+  useLayoutEffect(() => {
+    viewRef.current?.dispatch({
+      effects: compartments.replyQuotes.reconfigure(replyQuotes ? replyQuoteCards : []),
+    });
+  }, [compartments, replyQuotes]);
   useEffect(() => {
     if (autoFocus) viewRef.current?.focus();
   }, [autoFocus]);
