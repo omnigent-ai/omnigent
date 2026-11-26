@@ -1,4 +1,5 @@
 import { useCallback, useEffect } from "react";
+import { ArrowLeftIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
@@ -8,7 +9,7 @@ import {
   projectFileApiPath,
   projectFileScopeId,
 } from "@/lib/projectFileScope";
-import { useReplaceSearchParams, useSearchParams } from "@/lib/routing";
+import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
 import { FileViewer } from "@/shell/FileViewer";
 import { TicketLoadError } from "./TicketControls";
 import { ApiError } from "@/lib/sessionsApi";
@@ -22,24 +23,33 @@ export const PROJECT_FILE_PARAM = "artifact";
  */
 export function ProjectFileViewerHost({ projectId }: { projectId: string | null }) {
   const [searchParams] = useSearchParams();
-  const replaceSearchParams = useReplaceSearchParams();
+  const navigate = useNavigate();
+  const location = useLocation();
   const fileId = searchParams.get(PROJECT_FILE_PARAM);
+  const backToFileId = projectFileBackTarget(location.state);
 
+  const setFile = useCallback(
+    (id: string | null, options: { push: boolean; backTo?: string }) => {
+      const next = new URLSearchParams(location.search);
+      if (id) next.set(PROJECT_FILE_PARAM, id);
+      else next.delete(PROJECT_FILE_PARAM);
+      next.delete("comment");
+      const state = options.backTo ? { [PROJECT_FILE_BACK_STATE]: options.backTo } : null;
+      navigate({ search: next.toString(), hash: location.hash }, { replace: !options.push, state });
+    },
+    [navigate, location.search, location.hash],
+  );
+  // A link from one open file to another is a step forward, so Back returns to the first.
   const openFile = useCallback(
     (id: string) => {
-      const next = new URLSearchParams(window.location.search);
-      next.set(PROJECT_FILE_PARAM, id);
-      next.delete("comment");
-      replaceSearchParams(next);
+      if (id === fileId) return;
+      if (fileId) setFile(id, { push: true, backTo: fileId });
+      else setFile(id, { push: false });
     },
-    [replaceSearchParams],
+    [setFile, fileId],
   );
-  const close = useCallback(() => {
-    const next = new URLSearchParams(window.location.search);
-    next.delete(PROJECT_FILE_PARAM);
-    next.delete("comment");
-    replaceSearchParams(next);
-  }, [replaceSearchParams]);
+  const close = useCallback(() => setFile(null, { push: false }), [setFile]);
+  const back = useCallback(() => navigate(-1), [navigate]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -72,7 +82,51 @@ export function ProjectFileViewerHost({ projectId }: { projectId: string | null 
   }, [projectId, openFile]);
 
   if (!projectId || !fileId) return null;
-  return <ProjectFileDialog projectId={projectId} fileId={fileId} onClose={close} />;
+  return (
+    <ProjectFileDialog
+      projectId={projectId}
+      fileId={fileId}
+      onClose={close}
+      backToFileId={backToFileId}
+      onBack={back}
+    />
+  );
+}
+
+const PROJECT_FILE_BACK_STATE = "projectFileBack";
+
+function projectFileBackTarget(state: unknown): string | null {
+  const value = (state as Record<string, unknown> | null)?.[PROJECT_FILE_BACK_STATE];
+  return typeof value === "string" ? value : null;
+}
+
+/** "Back to <file>", shown after following a link from one project file to another. */
+function ProjectFileBackBar({
+  projectId,
+  fileId,
+  onBack,
+}: {
+  projectId: string;
+  fileId: string;
+  onBack: () => void;
+}) {
+  const previous = useQuery({
+    queryKey: ["project-file", projectId, fileId],
+    queryFn: () => getProjectFile(projectFileApiPath({ projectId, fileId })),
+    retry: false,
+  });
+  return (
+    <div className="flex shrink-0 items-center border-b px-2 py-1">
+      <button
+        type="button"
+        onClick={onBack}
+        className="inline-flex min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      >
+        <ArrowLeftIcon className="size-4 shrink-0" aria-hidden />
+        <span className="truncate">Back to {previous.data?.title ?? "previous file"}</span>
+      </button>
+    </div>
+  );
 }
 
 /** A project file in the session FileViewer, in a dialog; access is checked by the server. */
@@ -80,10 +134,14 @@ export function ProjectFileDialog({
   projectId,
   fileId,
   onClose,
+  backToFileId = null,
+  onBack,
 }: {
   projectId: string;
   fileId: string;
   onClose: () => void;
+  backToFileId?: string | null;
+  onBack?: () => void;
 }) {
   const file = useQuery({
     queryKey: ["project-file", projectId, fileId],
@@ -98,6 +156,9 @@ export function ProjectFileDialog({
         className="flex h-[85vh] max-h-[85vh] w-[min(72rem,95vw)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none"
       >
         <DialogTitle className="sr-only">{file.data?.title ?? "Project file"}</DialogTitle>
+        {backToFileId && onBack ? (
+          <ProjectFileBackBar projectId={projectId} fileId={backToFileId} onBack={onBack} />
+        ) : null}
         {file.data ? (
           <FileViewer
             open

@@ -32,6 +32,13 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
   return { ...actual, fetchFileContent: vi.fn() };
 });
 import { fetchFileContent } from "@/hooks/useFileContent";
+import type * as IdentityModule from "@/lib/identity";
+
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return { ...actual, authenticatedFetch: vi.fn() };
+});
+import { authenticatedFetch } from "@/lib/identity";
 
 // jsdom has no createObjectURL/revokeObjectURL; the node view needs both.
 // Unique URL per call (like the real API) so identity assertions can't pass
@@ -266,6 +273,19 @@ describe("node view", () => {
     const img = editor.view.dom.querySelector("img");
     expect(img!.getAttribute("src")).toBe("https://img.shields.io/badge/l.svg");
     expect(fetchFileContent).not.toHaveBeenCalled();
+  });
+
+  it("fetches another project file's image with the viewer's credentials", async () => {
+    const path = `/v1/projects/${"a".repeat(32)}/files/${"b".repeat(32)}/content`;
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(new Blob(["png"], { type: "image/png" })),
+    );
+    editor = makeEditor(`![Weekly chart](${path})`, "report.md");
+    const img = editor.view.dom.querySelector("img");
+    await vi.waitFor(() => expect(img!.getAttribute("src")).toMatch(/^blob:mock-/));
+    expect(authenticatedFetch).toHaveBeenCalledWith(path);
+    expect(fetchFileContent).not.toHaveBeenCalled();
+    expect(editor.getMarkdown()).toContain(`![Weekly chart](${path})`);
   });
 
   it("leaves src unset when the workspace fetch fails (alt-text fallback)", async () => {

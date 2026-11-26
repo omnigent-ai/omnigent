@@ -19,6 +19,9 @@ import { Link } from "@tiptap/extension-link";
 import type { AnyExtension } from "@tiptap/core";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
 import { escapeHtmlAttr } from "@/lib/html";
+import { withBasePath } from "@/lib/basePath";
+import { authenticatedFetch } from "@/lib/identity";
+import { parseProjectContentLink } from "@/lib/projectFileScope";
 import { referenceAttributes, referenceSuffix } from "./TipTapLinkReferences";
 
 /**
@@ -82,6 +85,13 @@ export const ImageAwareLink = Link.extend({
  */
 export function isWorkspaceRelativeSrc(src: string): boolean {
   return !/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(src);
+}
+
+/** Fetch a project file or ticket attachment image with the viewer's credentials. */
+export async function fetchProjectContentBlob(contentPath: string): Promise<Blob> {
+  const response = await authenticatedFetch(withBasePath(contentPath));
+  if (!response.ok) throw new Error(`${response.status}`);
+  return response.blob();
 }
 
 /**
@@ -275,10 +285,22 @@ export function createWorkspaceImageExtension(
         const src: string = node.attrs.src ?? "";
         let cancelled = false;
         let objectUrl: string | null = null;
+        const projectContent = src === "" ? null : parseProjectContentLink(src);
         if (src === "") {
           // No src (e.g. `![]()`): leave the img srcless — the alt text
           // renders as the fallback. Fetching would request the file's
           // own directory, a guaranteed-failing call.
+        } else if (projectContent) {
+          // Another project file (`/v1/projects/…/content`) is an API path, not a workspace one.
+          fetchProjectContentBlob(projectContent.contentPath)
+            .then((blob) => {
+              if (cancelled) return;
+              objectUrl = URL.createObjectURL(blob);
+              img.src = objectUrl;
+            })
+            .catch(() => {
+              // Missing or forbidden: the alt text shows, as for workspace images.
+            });
         } else if (isWorkspaceRelativeSrc(src)) {
           // Srcs with no path component (`![](#frag)`, `![](?raw=true)`) or
           // that resolve to the workspace root (`![](/)`) never name a
