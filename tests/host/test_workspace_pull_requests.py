@@ -23,7 +23,7 @@ from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_payloads import payload_dict
 from omnigent.host.workspace_service import serve_tunnel_call, start_workspace_socket
 from omnigent.host.workspace_tokens import mint_token
-from omnigent.runner import github_resource, github_reviews, pr_resource
+from omnigent.runner import github_merge_queue, github_resource, github_reviews, pr_resource
 from omnigent.runner.pull_request_errors import (
     CommentChangedError,
     PullRequestChangedError,
@@ -489,20 +489,35 @@ _REVIEW_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
 }
 
 
+# Each merge queue method: a valid request, the github_merge_queue function, and its arguments.
+_QUEUE_CALLS: dict[str, tuple[Any, str, dict[str, Any]]] = {
+    "GetMergeQueue": (pb.GetMergeQueueRequest(pr_url=_PR), "get_merge_queue", {}),
+    "EnqueuePullRequest": (
+        pb.EnqueuePullRequestRequest(pr_url=_PR, expected_head_oid=_HEAD),
+        "enqueue",
+        {"expected_head_oid": _HEAD},
+    ),
+    "DequeuePullRequest": (pb.DequeuePullRequestRequest(pr_url=_PR), "dequeue", {}),
+}
+# The methods that act on GitHub for the session's selected pull request.
+_SELECTED_PR_CALLS = {**_REVIEW_CALLS, **_QUEUE_CALLS}
+
+
 def record_review_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Each GitHub review call a method made: the function, its root, PR and arguments."""
+    """Each GitHub review or merge queue call a method made: function, root, PR and arguments."""
     calls: list[tuple[str, str, str, dict[str, Any]]] = []
-    for function in {name for _request, name, _kwargs in _REVIEW_CALLS.values()}:
+    for table, module in ((_REVIEW_CALLS, github_reviews), (_QUEUE_CALLS, github_merge_queue)):
+        for function in {name for _request, name, _kwargs in table.values()}:
 
-        def record(
-            root: str, reference: PullRequestRef, *, _function: str = function, **kwargs: Any
-        ) -> dict[str, Any]:
-            calls.append((_function, root, reference.url, kwargs))
-            return {"object": "test"}
+            def record(
+                root: str, reference: PullRequestRef, *, _function: str = function, **kwargs: Any
+            ) -> dict[str, Any]:
+                calls.append((_function, root, reference.url, kwargs))
+                return {"object": "test"}
 
-        monkeypatch.setattr(github_reviews, function, record)
+            monkeypatch.setattr(module, function, record)
     return calls
 
 
@@ -542,8 +557,9 @@ def providers(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
 
 
 def test_every_owner_method_has_a_call_case() -> None:
-    assert not set(_OWNER_CALLS) & set(_REVIEW_CALLS)
-    assert set(_OWNER_CALLS) | set(_REVIEW_CALLS) == _PULL_REQUEST_OWNER_METHODS
+    assert not set(_OWNER_CALLS) & set(_SELECTED_PR_CALLS)
+    assert not set(_REVIEW_CALLS) & set(_QUEUE_CALLS)
+    assert set(_OWNER_CALLS) | set(_SELECTED_PR_CALLS) == _PULL_REQUEST_OWNER_METHODS
 
 
 @pytest.mark.parametrize("method", sorted(_OWNER_CALLS))
@@ -680,11 +696,11 @@ async def _reason(frame: HostWorkspaceCallFrame) -> tuple[str | None, str | None
     raise AssertionError("the call never ended")
 
 
-@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
-async def test_a_review_method_runs_its_github_change_with_the_requests_fields(
+@pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))
+async def test_a_github_method_runs_its_github_change_with_the_requests_fields(
     tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
 ) -> None:
-    request, function, kwargs = _REVIEW_CALLS[method]
+    request, function, kwargs = _SELECTED_PR_CALLS[method]
     messages, code, message = await _answer(
         _frame(tmp_path, method, request.SerializeToString(), vouch=_VOUCHED)
     )
@@ -732,11 +748,11 @@ async def test_a_draft_reply_goes_in_its_conversation_without_lines(
     ]
 
 
-@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
-async def test_a_review_method_refuses_a_pr_the_session_never_recorded(
+@pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))
+async def test_a_github_method_refuses_a_pr_the_session_never_recorded(
     tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
 ) -> None:
-    request, _function, _kwargs = _REVIEW_CALLS[method]
+    request, _function, _kwargs = _SELECTED_PR_CALLS[method]
     _messages, code, message = await _answer(_frame(tmp_path, method, request.SerializeToString()))
 
     assert code == Code.FAILED_PRECONDITION.value
@@ -744,11 +760,11 @@ async def test_a_review_method_refuses_a_pr_the_session_never_recorded(
     assert review_calls == []
 
 
-@pytest.mark.parametrize("method", sorted(_REVIEW_CALLS))
-async def test_a_review_method_naming_no_pr_changes_none_the_server_offers_by_default(
+@pytest.mark.parametrize("method", sorted(_SELECTED_PR_CALLS))
+async def test_a_github_method_naming_no_pr_changes_none_the_server_offers_by_default(
     tmp_path: Path, method: str, review_calls: list[tuple[str, str, str, dict[str, Any]]]
 ) -> None:
-    request, _function, _kwargs = _REVIEW_CALLS[method]
+    request, _function, _kwargs = _SELECTED_PR_CALLS[method]
     unnamed = type(request)()
     unnamed.CopyFrom(request)
     unnamed.ClearField("pr_url")

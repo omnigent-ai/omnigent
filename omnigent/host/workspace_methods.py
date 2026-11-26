@@ -49,10 +49,7 @@ def _snake_case(name: str) -> str:
 # have no host op and no server gate, so a call is refused and GetCapabilities never lists them.
 DECLARED_NOT_SERVED: frozenset[str] = frozenset(
     {
-        "DequeuePullRequest",
         "EnableAutoMerge",
-        "EnqueuePullRequest",
-        "GetMergeQueue",
         "GetMergeReadiness",
         "GetPullRequestListStats",
         "GetPullRequestStack",

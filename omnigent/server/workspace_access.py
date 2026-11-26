@@ -77,6 +77,10 @@ METHOD_GATES: dict[str, WorkspaceGate] = {
     "AddReaction": WorkspaceGate.SESSION_OWNER,
     "RemoveReaction": WorkspaceGate.SESSION_OWNER,
     "UploadAttachment": WorkspaceGate.SESSION_OWNER,
+    # The queue acts as the host's account, and its state is read for the owner's controls.
+    "GetMergeQueue": WorkspaceGate.SESSION_OWNER,
+    "EnqueuePullRequest": WorkspaceGate.SESSION_OWNER,
+    "DequeuePullRequest": WorkspaceGate.SESSION_OWNER,
 }
 
 
