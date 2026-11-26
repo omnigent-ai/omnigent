@@ -889,7 +889,7 @@ export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest 
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
-function electronApi(): ElectronDesktopApi | undefined {
+export function electronApi(): ElectronDesktopApi | undefined {
   if (typeof window === "undefined") return undefined;
   const api = (window as unknown as { omnigentDesktop?: ElectronDesktopApi }).omnigentDesktop;
   return api?.kind === "electron" ? api : undefined;
