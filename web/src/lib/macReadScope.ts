@@ -9,7 +9,10 @@ import { useSyncExternalStore } from "react";
 
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 
-export type MacReadProvider = "github" | "gitspoke";
+import type { CodeHostProviderId } from "@/lib/codeHosts";
+
+/** GitHub, or a registered named host this Mac reads as its own identity. */
+export type MacReadProvider = CodeHostProviderId;
 
 /** The query-key prefix for Mac reads of `host`, as `userId` (the current workspace user). */
 export function macReadScopeKey(

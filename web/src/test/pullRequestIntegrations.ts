@@ -36,22 +36,28 @@ export function withPullRequestIntegrations(added: Partial<PullRequestIntegratio
   });
 }
 
-/** A GitSpoke stand-in: numbered servers under `spoke.example.com`, read-only from the Mac. */
-export const EXAMPLE_SPOKE_HOST: NamedCodeHost = {
-  provider: "gitspoke",
-  matchesHost: (host) => /^[1-9][0-9]*\.spoke\.example\.com$/.test(host.toLowerCase()),
+/**
+ * A named host this Mac reads as its own identity: numbered servers under `host.example.com`,
+ * read-only from the app, with links kept on this Mac.
+ */
+export const EXAMPLE_DEVICE_HOST: NamedCodeHost = {
+  provider: "named-host",
+  matchesHost: (host) => /^[1-9][0-9]*\.host\.example\.com$/.test(host.toLowerCase()),
   copy: {
-    id: "gitspoke",
-    label: "GitSpoke",
+    id: "named-host",
+    label: "Example Host",
     requestName: "pull request",
     Icon: GithubMono,
     prNumberPrefix: "#",
-    prUrlPlaceholder: "https://1.spoke.example.com/owner/repo/pull/123",
+    prUrlPlaceholder: "https://1.host.example.com/owner/repo/pull/123",
     defaultHost: null,
     authHint: "Renew this Mac's certificate, then try again.",
-    cliLabel: "spoke CLI",
+    cliLabel: "host CLI",
   },
   hostedOnGitHub: true,
+  readsAsDevice: true,
+  readOnly: true,
+  linksOnDevice: true,
 };
 
 /** A review site at `review.example.com` that takes a PR's owner, repository and number. */

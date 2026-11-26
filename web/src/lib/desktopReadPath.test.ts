@@ -45,6 +45,7 @@ import {
   readScope,
   useDesktopReadPathVersion,
   readsOnSessionMachine,
+  readsHostOnThisMac,
   readsOnThisMac,
   rememberGitHubHosts,
   resetDesktopReadPathForTests,
@@ -64,10 +65,10 @@ import {
   macReadScopeKey,
   onMacReadScopeAdvanced,
 } from "./macReadScope";
-import { EXAMPLE_SPOKE_HOST, withPullRequestIntegrations } from "@/test/pullRequestIntegrations";
+import { EXAMPLE_DEVICE_HOST, withPullRequestIntegrations } from "@/test/pullRequestIntegrations";
 
-// GitSpoke stand-in hosts are recognized by name, as a build that registers GitSpoke does.
-withPullRequestIntegrations({ namedCodeHosts: [EXAMPLE_SPOKE_HOST] });
+// Example Host stand-in hosts are recognized by name, as a build that registers Example Host does.
+withPullRequestIntegrations({ namedCodeHosts: [EXAMPLE_DEVICE_HOST] });
 
 // How many times a scope advanced in this test, i.e. how often reads had to start over.
 let advances = 0;
@@ -76,13 +77,13 @@ const subscriptions: (() => void)[] = [];
 
 const GITHUB_PR = "https://github.com/example-org/universe/pull/42";
 const GHES_PR = "https://ghe.example.com/team/project/pull/7";
-const SPOKE_PR = "https://2.spoke.example.com/example-org/universe/pull/20002346";
+const DEVICE_HOST_PR = "https://2.host.example.com/example-org/universe/pull/20002346";
 const GITLAB_MR = "https://gitlab.com/team/project/-/merge_requests/3";
 const UNKNOWN_PR = "https://code.example.org/team/project/pull/9";
 
 const CAPABLE: DesktopReadSupport = {
   github: { id: "github", operations: [...GITHUB_MAC_READ_OPERATIONS], accounts: true },
-  gitspoke: { id: "gitspoke", operations: [...PANEL_READ_OPERATIONS] },
+  named: { "named-host": { id: "named-host", operations: [...PANEL_READ_OPERATIONS] } },
 };
 
 function installShell(bridge: Record<string, unknown> | undefined) {
@@ -96,7 +97,7 @@ function capableShell({
   signedInHosts = ["github.com"],
   codeHosts = [
     { id: "github", operations: [...GITHUB_MAC_READ_OPERATIONS], accounts: true },
-    { id: "gitspoke", operations: [...PANEL_READ_OPERATIONS] },
+    { id: "named-host", operations: [...PANEL_READ_OPERATIONS] },
   ] as unknown[],
   accountsBridge = true,
 }: { signedInHosts?: string[]; codeHosts?: unknown[]; accountsBridge?: boolean } = {}) {
@@ -166,9 +167,9 @@ describe("classifyPullRequestRead", () => {
     classifyPullRequestRead(url, { support: CAPABLE, githubReadsEnabled: true, ...options })
       ?.provider ?? "host";
 
-  it("reads github.com and GitSpoke on this Mac, and an Enterprise host only with evidence", () => {
+  it("reads github.com and Example Host on this Mac, and an Enterprise host only with evidence", () => {
     expect(classify(GITHUB_PR, {})).toBe("github");
-    expect(classify(SPOKE_PR, {})).toBe("gitspoke");
+    expect(classify(DEVICE_HOST_PR, {})).toBe("named-host");
     expect(classify(GHES_PR, {})).toBe("host");
     expect(classify(GHES_PR, { githubHosts: ["ghe.example.com"] })).toBe("github");
   });
@@ -178,9 +179,9 @@ describe("classifyPullRequestRead", () => {
     expect(classify(UNKNOWN_PR, {})).toBe("host");
   });
 
-  it("follows the setting for GitHub only; GitSpoke has no other way to be read", () => {
+  it("follows the setting for GitHub only; Example Host has no other way to be read", () => {
     expect(classify(GITHUB_PR, { githubReadsEnabled: false })).toBe("host");
-    expect(classify(SPOKE_PR, { githubReadsEnabled: false })).toBe("gitspoke");
+    expect(classify(DEVICE_HOST_PR, { githubReadsEnabled: false })).toBe("named-host");
   });
 
   it.each([
@@ -212,7 +213,28 @@ describe("the live read path", () => {
     githubMacReadsPreference.write("on");
     expect(await desktopReadTarget(GITHUB_PR)).toMatchObject({ provider: "github" });
     expect(readsOnThisMac(GITHUB_PR)).toBe(true);
-    expect(await desktopReadTarget(SPOKE_PR)).toMatchObject({ provider: "gitspoke" });
+    expect(await desktopReadTarget(DEVICE_HOST_PR)).toMatchObject({ provider: "named-host" });
+  });
+
+  it("reads a named host on this Mac only where this build registered it", async () => {
+    const UNREGISTERED_PR = "https://1.unregistered.example.com/acme/app/pull/4";
+    // A shell offering a host nobody registered, and not the registered one.
+    capableShell({
+      codeHosts: [
+        { id: "github", operations: [...GITHUB_MAC_READ_OPERATIONS], accounts: true },
+        { id: "unregistered-host", operations: [...PANEL_READ_OPERATIONS] },
+      ],
+    });
+    expect(await desktopReadTarget(UNREGISTERED_PR)).toBeNull();
+    expect(
+      readsHostOnThisMac(
+        "unregistered-host",
+        "1.unregistered.example.com",
+        PANEL_READ_OPERATIONS[0]!,
+      ),
+    ).toBe(false);
+    expect(await desktopReadTarget(DEVICE_HOST_PR)).toBeNull();
+    expect(readsOnThisMac(DEVICE_HOST_PR)).toBe(false);
   });
 
   it("hears the rollout anew after a reset, not the flag's last value", async () => {
@@ -279,9 +301,9 @@ describe("the live read path", () => {
     await vi.waitFor(() => expect(readPathSettled(GHES_PR)).toBe(true));
     expect(macReadTarget(GHES_PR)).toMatchObject({ host: "ghe.example.com" });
     expect(query).toHaveBeenCalledTimes(1);
-    // github.com, GitSpoke and a host the Mac isn't signed in to settle without waiting.
+    // github.com, Example Host and a host the Mac isn't signed in to settle without waiting.
     expect(readPathSettled(GITHUB_PR)).toBe(true);
-    expect(readPathSettled(SPOKE_PR)).toBe(true);
+    expect(readPathSettled(DEVICE_HOST_PR)).toBe(true);
     expect(readPathSettled(UNKNOWN_PR)).toBe(false);
     await vi.waitFor(() => expect(readPathSettled(UNKNOWN_PR)).toBe(true));
     expect(macReadTarget(UNKNOWN_PR)).toBeNull();
@@ -298,14 +320,14 @@ describe("the live read path", () => {
     capableShell({ accountsBridge: false });
     githubMacReadsPreference.write("on");
     expect(await desktopReadTarget(GITHUB_PR)).toBeNull();
-    expect(await desktopReadTarget(SPOKE_PR)).toMatchObject({ provider: "gitspoke" });
+    expect(await desktopReadTarget(DEVICE_HOST_PR)).toMatchObject({ provider: "named-host" });
   });
 
   it("uses the host path in browsers", async () => {
     installShell(undefined);
     githubMacReadsPreference.write("on");
     expect(await desktopReadTarget(GITHUB_PR)).toBeNull();
-    expect(await desktopReadTarget(SPOKE_PR)).toBeNull();
+    expect(await desktopReadTarget(DEVICE_HOST_PR)).toBeNull();
     expect(readScope(GITHUB_PR)).toEqual([]);
   });
 
@@ -343,11 +365,11 @@ describe("binding Mac answers to their account and workspace user", () => {
   it("keys every Mac read by user, provider and host, never by account", async () => {
     await readyStore();
     expect(readScope(GITHUB_PR)).toEqual(["mac-read", "user-1", "github", "github.com"]);
-    expect(macReadScopeKey("gitspoke", "2.spoke.example.com")).toEqual([
+    expect(macReadScopeKey("named-host", "2.host.example.com")).toEqual([
       "mac-read",
       "user-1",
-      "gitspoke",
-      "2.spoke.example.com",
+      "named-host",
+      "2.host.example.com",
     ]);
     acceptMacAnswer(ticket(), answer("alice", 1));
     acceptMacAnswer(ticket(), answer("bob", 2));
@@ -509,15 +531,17 @@ describe("binding Mac answers to their account and workspace user", () => {
 });
 
 describe("checking who read a Mac answer", () => {
-  const SPOKE = "2.spoke.example.com";
-  const provenance = (provider: "github" | "gitspoke", host: string, viewer: string) => ({
+  const DEVICE_HOST = "2.host.example.com";
+  const provenance = (provider: "github" | "named-host", host: string, viewer: string) => ({
     version: 1 as const,
     provider,
     host,
     viewer,
   });
-  const spoke = (viewer: string) => ({ provenance: provenance("gitspoke", SPOKE, viewer) });
-  const spokeTicket = () => macReadTicket("gitspoke", SPOKE);
+  const deviceHost = (viewer: string) => ({
+    provenance: provenance("named-host", DEVICE_HOST, viewer),
+  });
+  const deviceHostTicket = () => macReadTicket("named-host", DEVICE_HOST);
 
   async function provingShell() {
     capableShell({
@@ -528,7 +552,7 @@ describe("checking who read a Mac answer", () => {
           accounts: true,
           answerProvenance: 1,
         },
-        { id: "gitspoke", operations: [...PANEL_READ_OPERATIONS], answerProvenance: 1 },
+        { id: "named-host", operations: [...PANEL_READ_OPERATIONS], answerProvenance: 1 },
       ],
     });
     githubMacReadsPreference.write("on");
@@ -536,71 +560,71 @@ describe("checking who read a Mac answer", () => {
     advances = 0;
   }
 
-  it("establishes a spoke's viewer from its first answer", async () => {
+  it("establishes a deviceHost's viewer from its first answer", async () => {
     await provingShell();
-    expect(acceptMacAnswer(spokeTicket(), spoke("alice"))).toBe("accepted");
-    expect(acceptMacAnswer(spokeTicket(), spoke("alice"))).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("alice"))).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("alice"))).toBe("accepted");
     expect(advances).toBe(0);
   });
 
   it("moves to a newer viewer, and refuses a late answer from the previous one", async () => {
     await provingShell();
-    acceptMacAnswer(spokeTicket(), spoke("alice"));
-    const late = spokeTicket();
-    const newer = spokeTicket();
+    acceptMacAnswer(deviceHostTicket(), deviceHost("alice"));
+    const late = deviceHostTicket();
+    const newer = deviceHostTicket();
     // B answers before the late A read: kept, and what was cached as A goes.
-    expect(acceptMacAnswer(newer, spoke("bob"))).toBe("accepted");
+    expect(acceptMacAnswer(newer, deviceHost("bob"))).toBe("accepted");
     expect(advances).toBe(1);
-    expect(acceptMacAnswer(late, spoke("alice"))).toBe("moved");
-    expect(acceptMacAnswer(spokeTicket(), spoke("bob"))).toBe("accepted");
+    expect(acceptMacAnswer(late, deviceHost("alice"))).toBe("moved");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("bob"))).toBe("accepted");
     expect(advances).toBe(1);
   });
 
   it("shares one scope with list stats, so neither keeps a read from before the other's switch", async () => {
     await provingShell();
-    const key = macReadScopeKey("gitspoke", SPOKE);
+    const key = macReadScopeKey("named-host", DEVICE_HOST);
     const listRead = beginMacRead(key);
     expect(acceptMacRead(beginMacRead(key), "alice")).toBe("accepted");
     // A newer panel read as bob changes the reader the list stats share.
-    expect(acceptMacAnswer(spokeTicket(), spoke("bob"))).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("bob"))).toBe("accepted");
     expect(acceptMacRead(listRead, "alice")).toBe("rejected");
     // And a list read as carol after that refuses the panel's earlier read.
-    const panelRead = spokeTicket();
+    const panelRead = deviceHostTicket();
     expect(acceptMacRead(beginMacRead(key), "carol")).toBe("transition");
-    expect(acceptMacAnswer(panelRead, spoke("bob"))).toBe("moved");
-    expect(acceptMacAnswer(spokeTicket(), spoke("carol"))).toBe("accepted");
+    expect(acceptMacAnswer(panelRead, deviceHost("bob"))).toBe("moved");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("carol"))).toBe("accepted");
   });
 
   it("follows A, then B, then A again, one move each", async () => {
     await provingShell();
-    expect(acceptMacAnswer(spokeTicket(), spoke("alice"))).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("alice"))).toBe("accepted");
     // Each newer answer from another viewer is kept, and moves the scope to it.
-    expect(acceptMacAnswer(spokeTicket(), spoke("bob"))).toBe("accepted");
-    expect(acceptMacAnswer(spokeTicket(), spoke("alice"))).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("bob"))).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("alice"))).toBe("accepted");
     expect(advances).toBe(2);
-    expect(acceptMacAnswer(spokeTicket(), spoke("alice"))).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("alice"))).toBe("accepted");
     expect(advances).toBe(2);
   });
 
   it("refuses a late answer from another viewer without moving the scope", async () => {
     await provingShell();
-    const older = spokeTicket();
-    acceptMacAnswer(spokeTicket(), spoke("alice"));
-    expect(acceptMacAnswer(older, spoke("bob"))).toBe("moved");
+    const older = deviceHostTicket();
+    acceptMacAnswer(deviceHostTicket(), deviceHost("alice"));
+    expect(acceptMacAnswer(older, deviceHost("bob"))).toBe("moved");
     expect(advances).toBe(0);
   });
 
   it("refuses an answer a proving shell sent without provenance, or for another host", async () => {
     await provingShell();
-    expect(acceptMacAnswer(spokeTicket(), {})).toBe("unproven");
+    expect(acceptMacAnswer(deviceHostTicket(), {})).toBe("unproven");
     expect(
-      acceptMacAnswer(spokeTicket(), {
-        provenance: provenance("gitspoke", "3.spoke.example.com", "a"),
+      acceptMacAnswer(deviceHostTicket(), {
+        provenance: provenance("named-host", "3.host.example.com", "a"),
       }),
     ).toBe("unproven");
     expect(
-      acceptMacAnswer(spokeTicket(), {
-        provenance: { ...provenance("gitspoke", SPOKE, "a"), version: 2 as 1 },
+      acceptMacAnswer(deviceHostTicket(), {
+        provenance: { ...provenance("named-host", DEVICE_HOST, "a"), version: 2 as 1 },
       }),
     ).toBe("unproven");
     // Not a change of identity: the scope stays.
@@ -629,7 +653,7 @@ describe("checking who read a Mac answer", () => {
     capableShell();
     githubMacReadsPreference.write("on");
     await desktopReadTarget(GITHUB_PR);
-    expect(acceptMacAnswer(spokeTicket(), {})).toBe("accepted");
+    expect(acceptMacAnswer(deviceHostTicket(), {})).toBe("accepted");
     expect(
       acceptMacAnswer(macReadTicket("github", "github.com"), {
         identity: { host: "github.com", login: "alice", generation: 1 },
@@ -639,19 +663,19 @@ describe("checking who read a Mac answer", () => {
 
   it("advances every scope when the workspace user changes", async () => {
     await provingShell();
-    acceptMacAnswer(spokeTicket(), spoke("alice"));
+    acceptMacAnswer(deviceHostTicket(), deviceHost("alice"));
     const advanced: (readonly unknown[])[] = [];
     subscriptions.push(onMacReadScopeAdvanced((scope) => advanced.push(scope)));
     currentUser.id = "user-2";
     for (const listener of identityListeners) listener();
     // The previous user's reads are the ones dropped.
-    expect(advanced).toContainEqual(["mac-read", "user-1", "gitspoke", SPOKE]);
-    // The new user's first spoke read establishes its own viewer.
-    expect(acceptMacAnswer(spokeTicket(), spoke("carol"))).toBe("accepted");
+    expect(advanced).toContainEqual(["mac-read", "user-1", "named-host", DEVICE_HOST]);
+    // The new user's first deviceHost read establishes its own viewer.
+    expect(acceptMacAnswer(deviceHostTicket(), deviceHost("carol"))).toBe("accepted");
   });
 
   it.each([
-    ["a spoke", () => spokeTicket(), spoke("alice")],
+    ["a deviceHost", () => deviceHostTicket(), deviceHost("alice")],
     [
       "GitHub",
       () => macReadTicket("github", "github.com"),
@@ -678,7 +702,7 @@ describe("checking who read a Mac answer", () => {
 });
 
 describe("a pull request's read choice", () => {
-  const GITSPOKE_ONLY = [{ id: "gitspoke", operations: [...PANEL_READ_OPERATIONS] }];
+  const DEVICE_HOST_ONLY = [{ id: "named-host", operations: [...PANEL_READ_OPERATIONS] }];
 
   it.each([
     // Settings, shell, choice → the route's kind.
@@ -690,13 +714,13 @@ describe("a pull request's read choice", () => {
     ["on", "capable", "session", "host"],
     ["automatic", "capable", "automatic", "host"],
     ["automatic", "capable", "mac", "mac"],
-    ["on", "gitspoke-only", "automatic", "host"],
-    ["on", "gitspoke-only", "mac", "blocked"],
-    ["on", "gitspoke-only", "session", "host"],
+    ["on", "example-host-only", "automatic", "host"],
+    ["on", "example-host-only", "mac", "blocked"],
+    ["on", "example-host-only", "session", "host"],
   ] as const)(
     "with Settings %s and a %s shell, choosing %s reads on: %s",
     async (setting, shell, choice, kind) => {
-      capableShell(shell === "capable" ? {} : { codeHosts: GITSPOKE_ONLY });
+      capableShell(shell === "capable" ? {} : { codeHosts: DEVICE_HOST_ONLY });
       githubMacReadsPreference.write(setting);
       await desktopReadTarget(GITHUB_PR);
       chooseReadSource(GITHUB_PR, choice);
@@ -759,7 +783,7 @@ describe("a pull request's read choice", () => {
     ["a query and a fragment", (url: string) => `${url}?w=1#discussion_r1`],
     ["a trailing slash", (url: string) => `${url}/`],
   ])("keeps one choice and one route per PR, with %s", async (_name, spell) => {
-    capableShell({ codeHosts: [{ id: "gitspoke", operations: [...PANEL_READ_OPERATIONS] }] });
+    capableShell({ codeHosts: [{ id: "named-host", operations: [...PANEL_READ_OPERATIONS] }] });
     await desktopReadTarget(GITHUB_PR);
     chooseReadSource(spell(GITHUB_PR), "mac");
     for (const url of [GITHUB_PR, spell(GITHUB_PR)]) {
@@ -796,9 +820,9 @@ describe("a pull request's read choice", () => {
   });
 
   it.each([
-    // Automatic would still read both on this Mac: GitHub with Mac reads on, and GitSpoke.
+    // Automatic would still read both on this Mac: GitHub with Mac reads on, and Example Host.
     ["GitHub with Mac reads on", (): string => GITHUB_PR, "github", "github.com"],
-    ["GitSpoke", (): string => SPOKE_PR, "gitspoke", "2.spoke.example.com"],
+    ["Example Host", (): string => DEVICE_HOST_PR, "named-host", "2.host.example.com"],
   ] as const)(
     "keeps a Mac choice on %s through Classic, which reads it on the session's machine, and applies it again under Tabs",
     async (_label, prUrl, provider, host) => {
@@ -857,9 +881,9 @@ describe("a pull request's read choice", () => {
     await desktopReadTarget(GITHUB_PR);
     setAcceptedWorkspaceDesign("classic");
     // Classic shows the session-machine choice, so it still applies there.
-    chooseReadSource(SPOKE_PR, "session");
-    expect(readsOnSessionMachine(SPOKE_PR)).toBe(true);
-    expect(readRouteFor(SPOKE_PR).kind).toBe("host");
+    chooseReadSource(DEVICE_HOST_PR, "session");
+    expect(readsOnSessionMachine(DEVICE_HOST_PR)).toBe(true);
+    expect(readRouteFor(DEVICE_HOST_PR).kind).toBe("host");
     // Nothing chosen: Automatic keeps reading on this Mac where it would.
     expect(readRouteFor(GITHUB_PR).kind).toBe("mac");
   });
@@ -877,7 +901,7 @@ describe("a pull request's read choice", () => {
   });
 
   it("keeps an unsupported Mac choice blocked under Tabs, and reads it on the session's machine under Classic", async () => {
-    capableShell({ codeHosts: [{ id: "gitspoke", operations: [...PANEL_READ_OPERATIONS] }] });
+    capableShell({ codeHosts: [{ id: "named-host", operations: [...PANEL_READ_OPERATIONS] }] });
     await desktopReadTarget(GITHUB_PR);
     setAcceptedWorkspaceDesign("tabs");
     chooseReadSource(GITHUB_PR, "mac");
@@ -910,11 +934,11 @@ describe("a pull request's read choice", () => {
     capableShell();
     await desktopReadTarget(GITHUB_PR);
     chooseReadSource(GITHUB_PR, "mac");
-    chooseReadSource(SPOKE_PR, "session");
+    chooseReadSource(DEVICE_HOST_PR, "session");
     currentUser.id = "user-2";
     for (const listener of identityListeners) listener();
     expect(readChoiceFor(GITHUB_PR)).toBe("automatic");
-    expect(readChoiceFor(SPOKE_PR)).toBe("automatic");
+    expect(readChoiceFor(DEVICE_HOST_PR)).toBe("automatic");
   });
 
   it("lets an explicit Mac choice find an Enterprise host Settings leave off", async () => {
@@ -943,7 +967,7 @@ describe("a pull request's read choice", () => {
 });
 
 describe("macViewerLogin", () => {
-  const SPOKE = "2.spoke.example.com";
+  const DEVICE_HOST = "2.host.example.com";
   const github = (login: string, host = "github.com", generation = 1) => ({
     identity: { host, login, generation },
   });
@@ -958,7 +982,7 @@ describe("macViewerLogin", () => {
           accounts: true,
           ...(namedReads ? { readAs: 1 } : {}),
         },
-        { id: "gitspoke", operations: [...PANEL_READ_OPERATIONS], answerProvenance: 1 },
+        { id: "named-host", operations: [...PANEL_READ_OPERATIONS], answerProvenance: 1 },
       ],
     });
     githubMacReadsPreference.write("on");
@@ -971,12 +995,12 @@ describe("macViewerLogin", () => {
     expect(macViewerLogin(GITHUB_PR)).toBeNull();
     acceptMacAnswer(macReadTicket("github", "github.com"), github("Guido-B_data"));
     acceptMacAnswer(macReadTicket("github", "ghe.example.com"), github("guido", "ghe.example.com"));
-    acceptMacAnswer(macReadTicket("gitspoke", SPOKE), {
-      provenance: { version: 1, provider: "gitspoke", host: SPOKE, viewer: "gbo" },
+    acceptMacAnswer(macReadTicket("named-host", DEVICE_HOST), {
+      provenance: { version: 1, provider: "named-host", host: DEVICE_HOST, viewer: "gbo" },
     });
     expect(macViewerLogin(GITHUB_PR)).toBe("Guido-B_data");
     expect(macViewerLogin(GHES_PR)).toBe("guido");
-    expect(macViewerLogin(SPOKE_PR)).toBe("gbo");
+    expect(macViewerLogin(DEVICE_HOST_PR)).toBe("gbo");
     readOnSessionMachine(GITHUB_PR);
     expect(macViewerLogin(GITHUB_PR)).toBeNull();
     expect(macViewerLogin(GITLAB_MR)).toBeNull();

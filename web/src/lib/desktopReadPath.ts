@@ -1,6 +1,6 @@
 // Which path reads a pull request: this Mac, through the desktop shell as the
-// Mac's own identity, or the session's host. The Mac reads GitSpoke whenever the
-// shell can, and github.com or GitHub Enterprise when the shell picks Mac accounts
+// Mac's own identity, or the session's host. The Mac reads a named host registered to
+// read as the Mac whenever the shell can, and github.com or GitHub Enterprise when the shell picks Mac accounts
 // and the user's setting allows it. Everything else, including browsers and
 // mobile, uses the host. The store here also keeps the identity behind Mac reads
 // so a cached answer never outlives a change of account or workspace user.
@@ -27,14 +27,17 @@ import {
 
 import {
   codeHostProvider,
-  isGitSpokeHost,
+  isDeviceReadProvider,
+  isMacReadProvider as isMacReadProviderId,
+  namedCodeHost,
   parseCodeHostPullRequestUrl,
   type CodeHostPullRequest,
+  type CodeHostProviderId,
 } from "@/lib/codeHosts";
 import {
-  createDatabricksLaptopFeaturePreference,
-  type DatabricksLaptopFeatureIntent,
-} from "@/lib/databricksLaptopFeature";
+  type AutomaticFeatureIntent,
+  createAutomaticFeaturePreference,
+} from "@/lib/automaticFeaturePreference";
 import { subscribeDesktopFeatureFlag } from "@/lib/desktopFeatureFlags";
 import { resolveAutomaticGitHubReaderWith } from "@/lib/githubCooldown";
 import { getCurrentUserId, subscribeIdentity } from "@/lib/identity";
@@ -84,11 +87,11 @@ export const GITHUB_MAC_READ_OPERATIONS = [...PANEL_READ_OPERATIONS, "account_li
 export const DESKTOP_CODE_HOST_READS_FLAG = "desktop-code-host-reads";
 
 /** The user's choice for reading github.com and GitHub Enterprise PRs on this Mac. */
-export const githubMacReadsPreference = createDatabricksLaptopFeaturePreference(
+export const githubMacReadsPreference = createAutomaticFeaturePreference(
   "omnigent:desktop-code-host-reads",
 );
 
-export const GITHUB_MAC_READS_CHOICE_LABELS: Record<DatabricksLaptopFeatureIntent, string> = {
+export const GITHUB_MAC_READS_CHOICE_LABELS: Record<AutomaticFeatureIntent, string> = {
   automatic: "Automatic",
   on: "On",
   off: "Off",
@@ -96,7 +99,7 @@ export const GITHUB_MAC_READS_CHOICE_LABELS: Record<DatabricksLaptopFeatureInten
 
 /** Whether GitHub PRs are read on this Mac: On and Off override; Automatic follows the flag. */
 export function githubMacReadsEnabled(
-  intent: DatabricksLaptopFeatureIntent,
+  intent: AutomaticFeatureIntent,
   automaticPolicy: boolean,
 ): boolean {
   if (intent === "on") return true;
@@ -107,10 +110,11 @@ export function githubMacReadsEnabled(
 /** The providers this shell reads PRs from on the Mac, from its `codeHosts` feature. */
 export interface DesktopReadSupport {
   github: DesktopCodeHost | null;
-  gitspoke: DesktopCodeHost | null;
+  /** Every other host the shell offers, by id; only a registered device-read host uses one. */
+  named: Readonly<Record<string, DesktopCodeHost>>;
 }
 
-export const NO_DESKTOP_READS: DesktopReadSupport = { github: null, gitspoke: null };
+export const NO_DESKTOP_READS: DesktopReadSupport = { github: null, named: {} };
 
 const offers = (host: DesktopCodeHost | null, operations: readonly string[]) =>
   !!host && operations.every((operation) => host.operations.includes(operation));
@@ -120,7 +124,9 @@ export function desktopReadsProvider(
   support: DesktopReadSupport,
   provider: CodeHostPullRequest["provider"],
 ): boolean {
-  if (provider === "gitspoke") return offers(support.gitspoke, PANEL_READ_OPERATIONS);
+  if (isDeviceReadProvider(provider)) {
+    return offers(support.named[provider] ?? null, PANEL_READ_OPERATIONS);
+  }
   if (provider === "github") {
     return support.github?.accounts === true && offers(support.github, GITHUB_MAC_READ_OPERATIONS);
   }
@@ -188,7 +194,13 @@ function supportFrom(codeHosts: unknown): DesktopReadSupport {
   return {
     // A shell that lists accounts without the bridge to pick them can't read GitHub as the Mac.
     github: github && (!github.accounts || hasCodeHostAccountsBridge()) ? github : null,
-    gitspoke: entry("gitspoke"),
+    named: Object.fromEntries(
+      hosts.flatMap((host) => {
+        const id = host?.id;
+        const offered = typeof id === "string" && id !== "github" ? entry(id) : null;
+        return offered ? [[id, offered] as const] : [];
+      }),
+    ),
   };
 }
 
@@ -708,17 +720,20 @@ export function branchDiscoverySettled(host: string | null): boolean {
   return false;
 }
 
-/** The provider `host` is known to be: GitSpoke, github.com, or an Enterprise host with evidence. */
-export function knownCodeHostProvider(host: string): "github" | "gitspoke" | null {
+/**
+ * The provider `host` is known to be: a named host read as the Mac, github.com, or an
+ * Enterprise host with evidence.
+ */
+export function knownCodeHostProvider(host: string): CodeHostProviderId | null {
   const provider = codeHostProvider(host.toLowerCase(), githubHosts);
-  return provider === "github" || provider === "gitspoke" ? provider : null;
+  return provider && isMacReadProviderId(provider) ? provider : null;
 }
 
 /**
  * The provider a checkout's remote host serves, "pending" while this Mac is still
  * asking its gh about an Enterprise host, or null when its links aren't known.
  */
-export function contextHostProvider(host: string): "github" | "gitspoke" | "pending" | null {
+export function contextHostProvider(host: string): CodeHostProviderId | "pending" | null {
   return knownCodeHostProvider(host) ?? (branchDiscoverySettled(host) ? null : "pending");
 }
 
@@ -881,7 +896,7 @@ export function macReadTargetAs(
 /**
  * The login this Mac reads `url` as, on the PR's own provider and host: the page's named
  * reader where it reads that host by name, else the reader the host's scope last accepted
- * (GitSpoke's proven viewer, or GitHub's account). Null off this Mac or before a read says.
+ * (a device-read host's proven viewer, or GitHub's account). Null off this Mac or before a read says.
  */
 export function macViewerLogin(
   url: string | null | undefined,
@@ -905,7 +920,7 @@ export function blockedReadScope(url: string | null | undefined): readonly unkno
 }
 
 const isMacReadProvider = (provider: Provider): provider is MacReadProvider =>
-  provider === "github" || provider === "gitspoke";
+  isMacReadProviderId(provider);
 
 /** The account this Mac last read `host` as, or null before its first read. */
 export function macIdentity(host: string): Pick<MacAccountIdentity, "login" | "generation"> | null {
@@ -968,7 +983,7 @@ export function macReadTicket(provider: MacReadProvider, host: string): MacAnswe
 
 /** Whether this shell's Mac answers for `provider` carry provenance to check. */
 export function macAnswersCarryProvenance(provider: MacReadProvider): boolean {
-  const entry = support?.[provider];
+  const entry = provider === "github" ? support?.github : support?.named[provider];
   return entry?.answerProvenance === 1;
 }
 
@@ -1115,13 +1130,13 @@ export function macAccountChoiceSaved(host: string, choice: MacAccountChoice): v
 /** The shell said the account changed mid-read: move the host's scope and re-read it. */
 export function macAccountChanged(provider: MacReadProvider, host: string): void {
   if (provider === "github") accountChanged(host);
-  // A spoke has no account events: who reads is whoever the next read sees.
+  // A device-read host has no account events: who reads is whoever the next read sees.
   else advance(scopeState(provider, host));
 }
 
 /**
- * Whether this Mac runs `operation` against `host` as its own identity: GitSpoke
- * hosts, and GitHub hosts known to serve GitHub while the setting allows it.
+ * Whether this Mac runs `operation` against `host` as its own identity: registered
+ * device-read hosts, and GitHub hosts known to serve GitHub while the setting allows it.
  */
 export function readsHostOnThisMac(
   provider: CodeHostPullRequest["provider"] | null,
@@ -1130,14 +1145,19 @@ export function readsHostOnThisMac(
 ): boolean {
   if (!support || !provider || !host || !macOffers(provider, operation)) return false;
   if (!desktopReadsProvider(support, provider)) return false;
-  if (provider === "gitspoke") return isGitSpokeHost(host);
+  if (provider !== "github") return namedCodeHost(host)?.provider === provider;
   const name = host.toLowerCase();
   return githubReadsEnabledNow() && (name === "github.com" || githubHosts.has(name));
 }
 
 /** Whether this shell runs `operation` for `provider` on the Mac, beyond the panel's basics. */
 export function macOffers(provider: CodeHostPullRequest["provider"], operation: string): boolean {
-  const host = provider === "github" || provider === "gitspoke" ? support?.[provider] : null;
+  const host =
+    provider === "github"
+      ? support?.github
+      : isDeviceReadProvider(provider)
+        ? support?.named[provider]
+        : null;
   return !!host?.operations.includes(operation);
 }
 

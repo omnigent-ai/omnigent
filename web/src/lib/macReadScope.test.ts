@@ -15,10 +15,10 @@ import {
   showsMacReader,
   useMacReadScopeVersion,
 } from "@/lib/macReadScope";
-import { EXAMPLE_SPOKE_HOST, withPullRequestIntegrations } from "@/test/pullRequestIntegrations";
+import { EXAMPLE_DEVICE_HOST, withPullRequestIntegrations } from "@/test/pullRequestIntegrations";
 
-// GitSpoke stand-in hosts are recognized by name, as a build that registers GitSpoke does.
-withPullRequestIntegrations({ namedCodeHosts: [EXAMPLE_SPOKE_HOST] });
+// Example Host stand-in hosts are recognized by name, as a build that registers Example Host does.
+withPullRequestIntegrations({ namedCodeHosts: [EXAMPLE_DEVICE_HOST] });
 
 const currentUser = vi.hoisted(() => ({
   id: "user-1" as string | null,
@@ -39,8 +39,8 @@ function switchUser(id: string) {
   for (const listener of [...currentUser.listeners]) listener();
 }
 
-const SPOKE = "2.spoke.example.com";
-const scope = () => macReadScopeKey("gitspoke", SPOKE);
+const DEVICE_HOST = "2.host.example.com";
+const scope = () => macReadScopeKey("named-host", DEVICE_HOST);
 
 beforeEach(() => {
   currentUser.id = "user-1";
@@ -50,11 +50,11 @@ afterEach(resetMacReadScopesForTests);
 
 describe("macReadScopeKey", () => {
   it("keys reads by workspace user, provider and host, read when asked", () => {
-    expect(macReadScopeKey("gitspoke", "2.Spoke.example.com")).toEqual([
+    expect(macReadScopeKey("named-host", "2.Host.example.com")).toEqual([
       "mac-read",
       "user-1",
-      "gitspoke",
-      SPOKE,
+      "named-host",
+      DEVICE_HOST,
     ]);
     currentUser.id = "user-2";
     expect(scope()[1]).toBe("user-2");
@@ -118,7 +118,7 @@ describe("acceptMacRead", () => {
     const list = beginMacRead(scope());
     const tooltip = beginMacRead(scope());
     expect(tooltip.sequence).toBe(list.sequence + 1);
-    expect(beginMacRead(macReadScopeKey("gitspoke", "3.spoke.example.com")).sequence).toBe(1);
+    expect(beginMacRead(macReadScopeKey("named-host", "3.host.example.com")).sequence).toBe(1);
   });
 
   it("shows only answers cached as the scope's reader", () => {
@@ -211,7 +211,7 @@ describe("a workspace user switch", () => {
     stop();
     expect(advanced).toEqual([
       [github, "advanced"],
-      [macReadScopeKey("gitspoke", SPOKE, "user-1"), "advanced"],
+      [macReadScopeKey("named-host", DEVICE_HOST, "user-1"), "advanced"],
     ]);
     // The new user's scopes start fresh.
     expect(acceptedMacReader(macReadScopeKey("github", "github.com"))).toBeNull();
