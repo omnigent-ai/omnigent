@@ -268,6 +268,32 @@ export function listTickets(
     data: page.data.map(normalizeTicket),
   }));
 }
+/** Where a search word hit a ticket, with a short excerpt; empty for a title hit. */
+export interface TicketSearchMatch {
+  field: "title" | "description" | "comment" | "label" | "id";
+  snippet: string;
+}
+
+export interface TicketSearchPage extends TicketPage<ProjectTicket & { match: TicketSearchMatch }> {
+  stages: TicketStage[];
+  /** Tickets this page read; a page stops after a bounded number, matched or not. */
+  scanned: number;
+}
+
+/** Tickets holding every word of *query*, most recently updated first. */
+export function searchTickets(
+  projectId: string,
+  query: string,
+  options: { after?: string; limit?: number } = {},
+) {
+  const params = new URLSearchParams({ q: query, limit: String(options.limit ?? 20) });
+  if (options.after) params.set("after", options.after);
+  return request<TicketSearchPage>(`${path(projectId)}/search?${params}`).then((page) => ({
+    ...page,
+    data: page.data.map((ticket) => ({ ...normalizeTicket(ticket), match: ticket.match })),
+  }));
+}
+
 export function getTicket(projectId: string, ticketId: string) {
   return request<ProjectTicket>(path(projectId, ticketId)).then(normalizeTicket);
 }

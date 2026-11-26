@@ -10399,6 +10399,11 @@
             "title": "Project Ticket Lifecycle",
             "type": "boolean"
           },
+          "project_ticket_search": {
+            "default": false,
+            "title": "Project Ticket Search",
+            "type": "boolean"
+          },
           "project_ticket_stages": {
             "default": false,
             "title": "Project Ticket Stages",
@@ -27079,6 +27084,92 @@
           }
         },
         "summary": "Push Prefix",
+        "tags": [
+          "project tickets"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/tickets/search": {
+      "get": {
+        "description": "Find the project's tickets holding every word of *q*, most recently updated first.\n\nMatches titles, descriptions, label keys and values, ticket ID prefixes, and each\nticket's newest comments, case-insensitively. A page reads a bounded number of\ntickets, so it can hold fewer than *limit* matches, or none, with `has_more`\nstill true: pass `last_id` as *after* to keep searching older tickets.",
+        "operationId": "search_tickets_v1_projects__project_id__tickets_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Words to find.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "description": "Words to find.",
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Search Tickets V1 Projects  Project Id  Tickets Search Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Tickets",
         "tags": [
           "project tickets"
         ]

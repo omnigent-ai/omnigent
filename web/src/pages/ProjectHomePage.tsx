@@ -46,6 +46,12 @@ import {
 } from "@/projectHome/TicketBoardRequesterFilter";
 import { useProjectTicketsEnabled, useTicketProject } from "@/projectHome/useProjectTickets";
 import {
+  TicketSearchBox,
+  TicketSearchResults,
+  useSettledTicketSearch,
+  useTicketSearchEnabled,
+} from "@/projectHome/ProjectTicketSearch";
+import {
   NEEDS_YOU_PARAM,
   NEEDS_YOU_VALUE,
   useNeedsYouTicketIds,
@@ -180,6 +186,10 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
     navigate(`${projectHomePath(projectName)}${next.size ? `?${next}` : ""}`);
   };
 
+  // Ticket boards reuse the session board's search store, so each project starts empty.
+  const ticketSearch = useTicketSearchEnabled() && tickets;
+  const settledSearch = useSettledTicketSearch(ticketSearch ? searchQuery : "");
+  const searching = settledSearch !== "";
   const rulesBadge = usePendingMandateProposals(tickets ? (projectId ?? null) : null);
   // Phones keep these tools in the top bar.
   const viewTools = isMobile ? undefined : <ProjectViewTools projectName={projectName} />;
@@ -208,12 +218,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
         <ProjectFileViewerHost projectId={projectId} />
         <PageScroll maxWidthClassName="max-w-none" extraTop={isMobile ? "0.25rem" : "0.5rem"}>
           {phoneActions}
-          <ProjectHomeTabs
-            view={view}
-            onChange={showTab}
-            end={viewTools}
-            rulesBadge={rulesBadge}
-          />
+          <ProjectHomeTabs view={view} onChange={showTab} end={viewTools} rulesBadge={rulesBadge} />
           {view === "summary" ? (
             <ProjectSummary key={projectName} projectName={projectName} />
           ) : (
@@ -243,24 +248,27 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
             end={viewTools}
             rulesBadge={rulesBadge}
             trailing={
-              <TicketBoardRequesterFilter
-                mine={boardMine}
-                onChange={(mine) => {
-                  if (needsYou || stalledOnly) setBoardFilter(null);
-                  setBoardMine(mine);
-                }}
-                needsYou={{
-                  count: needsYouIds.length,
-                  active: needsYou,
-                  onSelect: () => setBoardFilter("needs-you"),
-                }}
-                stalled={{
-                  count: stalledIds.length,
-                  active: stalledOnly,
-                  onSelect: () => setBoardFilter("stalled"),
-                }}
-                compact
-              />
+              <div className="flex items-center gap-2 max-sm:w-full max-sm:flex-col max-sm:items-stretch">
+                {ticketSearch && <TicketSearchBox value={searchQuery} onChange={setSearchQuery} />}
+                <TicketBoardRequesterFilter
+                  mine={boardMine}
+                  onChange={(mine) => {
+                    if (needsYou || stalledOnly) setBoardFilter(null);
+                    setBoardMine(mine);
+                  }}
+                  needsYou={{
+                    count: needsYouIds.length,
+                    active: needsYou,
+                    onSelect: () => setBoardFilter("needs-you"),
+                  }}
+                  stalled={{
+                    count: stalledIds.length,
+                    active: stalledOnly,
+                    onSelect: () => setBoardFilter("stalled"),
+                  }}
+                  compact
+                />
+              </div>
             }
           />
         )}
@@ -273,15 +281,29 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
               hidden={hideBoard}
               className={hideBoard ? "hidden" : "flex min-h-0 min-w-0 flex-1"}
             >
-              <ProjectTicketBoard
-                projectName={projectName}
-                selectedTicketId={panelTicketId}
-                isNewTicket={isNewTicket}
-                ticketIds={needsYou ? needsYouIds : ticketSelectionIds(searchParams)}
-                requesterFilterInHeader={!ticketFillsPage}
-                stalledOnly={stalledOnly}
-                overlayClearance={composerOpen ? "10rem" : undefined}
-              />
+              {searching && (
+                <TicketSearchResults
+                  projectId={projectId}
+                  query={settledSearch}
+                  selectedTicketId={panelTicketId}
+                  onClear={() => setSearchQuery("")}
+                />
+              )}
+              {/* Search keeps the board mounted, so clearing it restores the lanes at once. */}
+              <div
+                hidden={searching}
+                className={searching ? "hidden" : "flex min-h-0 min-w-0 flex-1"}
+              >
+                <ProjectTicketBoard
+                  projectName={projectName}
+                  selectedTicketId={panelTicketId}
+                  isNewTicket={isNewTicket}
+                  ticketIds={needsYou ? needsYouIds : ticketSelectionIds(searchParams)}
+                  requesterFilterInHeader={!ticketFillsPage}
+                  stalledOnly={stalledOnly}
+                  overlayClearance={composerOpen ? "10rem" : undefined}
+                />
+              </div>
             </div>
           ) : (
             <ProjectKanbanBoard

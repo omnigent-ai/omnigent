@@ -1102,6 +1102,26 @@ def create_project_tickets_router(
         wake(request)
         return configuration
 
+    @router.get("/search")
+    async def search_tickets(
+        request: Request,
+        project_id: str,
+        q: str = Query(..., min_length=1, max_length=200, description="Words to find."),
+        after: str | None = None,
+        limit: int = Query(20, ge=1, le=100),
+    ) -> dict[str, Any]:
+        """Find the project's tickets holding every word of *q*, most recently updated first.
+
+        Matches titles, descriptions, label keys and values, ticket ID prefixes, and each
+        ticket's newest comments, case-insensitively. A page reads a bounded number of
+        tickets, so it can hold fewer than *limit* matches, or none, with ``has_more``
+        still true: pass ``last_id`` as *after* to keep searching older tickets.
+        """
+        who = await actor(request, project_id)
+        return await asyncio.to_thread(
+            store.search, project_id, q, user_id=who.user_id, after=after, limit=limit
+        )
+
     @router.get("/summary")
     async def ticket_summary(
         request: Request,

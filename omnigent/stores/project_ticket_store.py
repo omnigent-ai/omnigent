@@ -89,6 +89,70 @@ ASK_QUESTION_SCAN = 20
 # A card's latest comment reads only each ticket's newest comments, then clips it.
 LATEST_COMMENT_SCAN = 10
 LATEST_COMMENT_MAX_CHARS = 300
+# Ticket search reads the board in batches, up to a bound per page, and each unmatched
+# ticket's newest comments; see ``ProjectTicketStore.search``.
+SEARCH_PAGE_DEFAULT = 20
+SEARCH_BATCH = 100
+SEARCH_SCAN_MAX = 1000
+SEARCH_COMMENT_SCAN = 50
+SEARCH_TERMS_MAX = 8
+SEARCH_SNIPPET_CHARS = 160
+
+
+def search_terms(query: str) -> builtins.list[str]:
+    """The distinct case-folded words of a search, at most ``SEARCH_TERMS_MAX``."""
+    terms: builtins.list[str] = []
+    for word in query.split():
+        term = word.casefold()
+        if term not in terms:
+            terms.append(term)
+    return terms[:SEARCH_TERMS_MAX]
+
+
+def search_snippet(text: str, term: str) -> str:
+    """A one-line excerpt of *text* around the first *term*, clipped with ellipses."""
+    flat = " ".join(text.split())
+    at = flat.casefold().find(term)
+    if at < 0 or len(flat) <= SEARCH_SNIPPET_CHARS:
+        return flat[:SEARCH_SNIPPET_CHARS]
+    start = max(0, at - SEARCH_SNIPPET_CHARS // 3)
+    end = min(len(flat), start + SEARCH_SNIPPET_CHARS)
+    start = max(0, end - SEARCH_SNIPPET_CHARS)
+    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+
+def _ticket_match(row: SqlProjectTicket, terms: builtins.list[str]) -> dict[str, str] | None:
+    """Where every term hits the ticket's own fields, or None if one is missing.
+
+    The ID matches a prefix, so a pasted short ID finds its ticket; labels match on
+    their keys and values.
+    """
+    labels = " ".join(
+        f"{label.get('key', '')} {label.get('value') or ''}"
+        for label in row.labels or []
+        if isinstance(label, dict)
+    )
+    fields = (
+        ("title", row.title),
+        ("description", row.description),
+        ("label", labels),
+    )
+    folded = [(name, text, text.casefold()) for name, text in fields]
+    ticket_id = row.id.casefold()
+    first: dict[str, str] | None = None
+    for term in terms:
+        hit = next(((name, text) for name, text, low in folded if term in low), None)
+        if hit is None and ticket_id.startswith(term):
+            hit = ("id", row.id)
+        if hit is None:
+            return None
+        if first is None:
+            name, text = hit
+            first = {
+                "field": name,
+                "snippet": "" if name == "title" else search_snippet(text, term),
+            }
+    return first
 
 
 @dataclass(frozen=True)
@@ -1376,6 +1440,171 @@ class ProjectTicketStore:
                     else len(page["data"])
                 )
             return page
+
+    def search(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        user_id: str | None,
+        after: str | None = None,
+        limit: int = SEARCH_PAGE_DEFAULT,
+        scan_limit: int = SEARCH_SCAN_MAX,
+    ) -> dict[str, Any]:
+        """A page of the project's tickets matching every word of *query*, newest first.
+
+        Titles, descriptions and comments are encrypted at rest, so the database can't
+        match them: tickets are read in ``updated_at`` order, newest first, in bounded
+        batches, and matched here. A page stops after *limit* matches or *scan_limit*
+        tickets read, whichever comes first, so a search of a large board stays bounded.
+        ``last_id`` resumes the walk after the last ticket the page read; ``has_more``
+        says older tickets are left, even when this page matched none of them.
+
+        Each match carries ``match``: where the first word hit (``title``,
+        ``description``, ``comment``, ``label`` or ``id``) and a short ``snippet``.
+        """
+        terms = search_terms(query)
+        if not terms:
+            raise OmnigentError("Search needs at least one word", code=ErrorCode.INVALID_INPUT)
+        limit = max(1, min(limit, TICKET_PAGE_MAX))
+        scan_limit = max(1, min(scan_limit, SEARCH_SCAN_MAX))
+        with self._session("search_tickets") as session:
+            project = self._project(session, project_id, user_id)
+            cursor = self._row(session, project_id, after) if after is not None else None
+            order = (SqlProjectTicket.updated_at, SqlProjectTicket.id)
+            matches: builtins.list[dict[str, Any]] = []
+            scanned = 0
+            last: SqlProjectTicket | None = cursor
+            exhausted = False
+            while len(matches) < limit and scanned < scan_limit:
+                stmt = select(SqlProjectTicket).where(
+                    SqlProjectTicket.workspace_id == project.workspace_id,
+                    SqlProjectTicket.project_id == project.id,
+                )
+                if last is not None:
+                    stmt = stmt.where(
+                        keyset_after(
+                            self._dialect_name,
+                            order,
+                            (last.updated_at, last.id),
+                            descending=True,
+                        )
+                    )
+                size = min(SEARCH_BATCH, scan_limit - scanned)
+                batch = builtins.list(
+                    session.scalars(
+                        stmt.order_by(*(column.desc() for column in order)).limit(size)
+                    )
+                )
+                if not batch:
+                    exhausted = True
+                    break
+                misses: dict[str, SqlProjectTicket] = {}
+                found: dict[str, dict[str, str]] = {}
+                for row in batch:
+                    hit = _ticket_match(row, terms)
+                    if hit is None:
+                        misses[row.id] = row
+                    else:
+                        found[row.id] = hit
+                found.update(self._comment_matches(session, project, misses, terms))
+                for row in batch:
+                    scanned += 1
+                    last = row
+                    if row.id in found:
+                        matches.append({**_ticket(row), "match": found[row.id]})
+                        if len(matches) >= limit:
+                            break
+                if len(batch) < size and last is batch[-1]:
+                    # A short batch, read to its end, reached the board's oldest ticket.
+                    exhausted = True
+                    break
+            has_more = not exhausted
+            if has_more and last is not None:
+                # Peek: a page that ended on the oldest ticket has nothing left.
+                has_more = (
+                    session.scalar(
+                        select(SqlProjectTicket.id)
+                        .where(
+                            SqlProjectTicket.workspace_id == project.workspace_id,
+                            SqlProjectTicket.project_id == project.id,
+                            keyset_after(
+                                self._dialect_name,
+                                order,
+                                (last.updated_at, last.id),
+                                descending=True,
+                            ),
+                        )
+                        .limit(1)
+                    )
+                    is not None
+                )
+            return {
+                **_stages(project).model_dump(),
+                "data": matches,
+                "has_more": has_more,
+                "last_id": last.id if has_more and last is not None else None,
+                "scanned": scanned,
+            }
+
+    @staticmethod
+    def _comment_matches(
+        session: Session,
+        project: SqlProject,
+        tickets: dict[str, SqlProjectTicket],
+        terms: builtins.list[str],
+    ) -> dict[str, dict[str, str]]:
+        """The tickets whose title, description and comments together hold every term.
+
+        Reads comments only for tickets their own fields didn't already match, at most
+        ``SEARCH_COMMENT_SCAN`` per ticket, newest first.
+        """
+        if not tickets:
+            return {}
+        event = SqlProjectTicketEvent
+        newest_first = (
+            func.row_number()
+            .over(partition_by=event.ticket_id, order_by=event.position.desc())
+            .label("rank")
+        )
+        ranked = (
+            select(event.ticket_id, event.payload, newest_first)
+            .where(
+                event.workspace_id == project.workspace_id,
+                event.project_id == project.id,
+                event.ticket_id.in_(builtins.list(tickets)),
+                event.kind.in_(NEW_COMMENT_KINDS),
+            )
+            .subquery()
+        )
+        comments: dict[str, builtins.list[str]] = {}
+        for ticket_id, payload in session.execute(
+            select(ranked.c.ticket_id, ranked.c.payload).where(
+                ranked.c.rank <= SEARCH_COMMENT_SCAN
+            )
+        ):
+            text = payload.get("text") if isinstance(payload, dict) else None
+            if isinstance(text, str) and text:
+                comments.setdefault(ticket_id, []).append(text)
+        found: dict[str, dict[str, str]] = {}
+        for ticket_id, texts in comments.items():
+            row = tickets[ticket_id]
+            fields = [row.title, row.description, *texts]
+            folded = [field.casefold() for field in fields]
+            if all(any(term in field for field in folded) for term in terms):
+                # Point at a comment holding a word the ticket's own fields lack.
+                for term in terms:
+                    if term in row.title.casefold() or term in row.description.casefold():
+                        continue
+                    for text in texts:
+                        if term in text.casefold():
+                            found[ticket_id] = {
+                                "field": "comment",
+                                "snippet": search_snippet(text, term),
+                            }
+                            break
+                    break
+        return found
 
     def summary(
         self,

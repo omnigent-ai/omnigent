@@ -877,3 +877,52 @@ def test_scope_lists_fold_into_the_api_scope_and_keep_the_list_left_out() -> Non
     assert _with_scope(
         {"does_not_own": ["code review"]}, {"owns": ["plans"], "excludes": ["old"]}
     ) == {"scope": {"owns": ["plans"], "excludes": ["code review"]}}
+
+
+async def test_ticket_list_query_searches_and_keeps_the_match():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{SOURCE}":
+            return httpx.Response(200, json={"project_id": PROJECT})
+        seen.append(request)
+        row = {"id": TICKET, "title": "Login bug", "description": "Long", "stage_id": "open"}
+        return httpx.Response(
+            200,
+            json={
+                "stages": [],
+                "data": [{**row, "match": {"field": "title", "snippet": ""}}],
+                "has_more": True,
+                "last_id": TICKET,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        found = json.loads(
+            await execute_ticket_tool(
+                "sys_ticket_list",
+                {"query": "login", "after": SOURCE, "limit": 5},
+                client,
+                SOURCE,
+            )
+        )
+        refused = json.loads(
+            await execute_ticket_tool(
+                "sys_ticket_list", {"query": "login", "stage_id": "open"}, client, SOURCE
+            )
+        )
+    assert len(seen) == 1
+    assert seen[0].url.path == f"/v1/projects/{PROJECT}/tickets/search"
+    assert dict(seen[0].url.params) == {"q": "login", "limit": "5", "after": SOURCE}
+    assert found["data"] == [
+        {
+            "id": TICKET,
+            "title": "Login bug",
+            "stage_id": "open",
+            "match": {"field": "title", "snippet": ""},
+        }
+    ]
+    assert found["has_more"] is True and found["last_id"] == TICKET
+    assert "stage_id" in refused["error"]

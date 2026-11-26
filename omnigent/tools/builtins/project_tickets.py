@@ -34,6 +34,14 @@ class ListTickets(BaseModel):
     stage_id: TicketStageId | None = Field(
         default=None, description="Filter by a stage ID from this project's definitions."
     )
+    query: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description="Keywords: lists only tickets holding every word in their title, "
+        "description, labels, ID prefix or recent comments, most recently updated first, "
+        "each with a match snippet. Searches every stage, so omit stage_id.",
+    )
     after: str | None = Field(default=None, description="Previous page's last_id.")
     limit: int = Field(default=50, ge=1, le=100)
     completed_since: int | None = Field(
@@ -263,7 +271,9 @@ class SysTicketListTool(_TicketTool):
         "descriptions and full stage definitions, or read one with sys_ticket_get. "
         "The first stage starts new tickets; the last means complete. Read these before choosing "
         "a stage; do not assume fixed names. Filtering by the last stage lists newest first. "
-        "Use last_id as after while has_more is true."
+        "Use last_id as after while has_more is true. With query, it searches instead, newest "
+        "update first; a search page reads a bounded slice of the board, so it may match "
+        "few or none with has_more still true."
     )
     arguments = ListTickets
 

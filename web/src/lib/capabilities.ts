@@ -138,6 +138,8 @@ export interface ServerInfo {
   project_ticket_stages?: boolean;
   /** Bounded project-wide counts of tickets needing a response. */
   project_ticket_summary?: boolean;
+  /** Keyword search over a board's tickets. */
+  project_ticket_search?: boolean;
   /** Projects store a mandate loaded into every project session. */
   project_mandate?: boolean;
   /** Projects store a description (charter) for people, written by the owner or Lead. */
@@ -712,6 +714,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           project_ticket_agent_involvement: data.project_ticket_agent_involvement === true,
           project_ticket_stages: data.project_ticket_stages === true,
           project_ticket_summary: data.project_ticket_summary === true,
+          project_ticket_search: data.project_ticket_search === true,
           project_mandate: data.project_mandate === true,
           project_description: data.project_description === true,
           sandbox_provider:

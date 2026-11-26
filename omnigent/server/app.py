@@ -305,6 +305,8 @@ class ServerInfoResponse(BaseModel):
     project_ticket_agent_involvement: bool = False
     project_ticket_stages: bool = False
     project_ticket_summary: bool = False
+    # ``GET /v1/projects/{id}/tickets/search`` finds a board's tickets by keyword.
+    project_ticket_search: bool = False
     # Projects store an owner-written mandate loaded into every project session.
     project_mandate: bool = False
     # Projects store a description (charter) for people; the owner or Lead writes it.
@@ -4278,6 +4280,7 @@ def create_app(
                 "project_ticket_agent_involvement": ticket_store is not None,
                 "project_ticket_stages": ticket_store is not None,
                 "project_ticket_summary": ticket_store is not None,
+                "project_ticket_search": ticket_store is not None,
                 "project_mandate": project_store is not None,
                 "project_description": project_store is not None,
                 "sandbox_provider": sandbox_provider,

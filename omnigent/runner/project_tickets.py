@@ -237,7 +237,18 @@ async def execute_ticket_tool(
         guidance = {"include_guidance": "true"} if body.pop("include_guidance", False) else {}
         if name == "sys_ticket_list":
             compact = body.pop("compact", True)
-            result = await request("GET", path, params={**body, **guidance})
+            query = body.pop("query", None)
+            if query is not None:
+                if body.get("stage_id") is not None:
+                    return json.dumps(
+                        {"error": "query searches every stage; omit stage_id with it"}
+                    )
+                params = {"q": query, "limit": min(body.get("limit", 20), 100)}
+                if body.get("after") is not None:
+                    params["after"] = body["after"]
+                result = await request("GET", path + "/search", params=params)
+            else:
+                result = await request("GET", path, params={**body, **guidance})
             if compact:
                 result = _compact_page(result)
         elif name == "sys_ticket_get":
@@ -315,6 +326,7 @@ _COMPACT_TICKET_FIELDS = (
     "comment_count",
     "has_running_agents",
     "needs_final_update",
+    "match",
 )
 _COMPACT_STAGE_FIELDS = ("id", "name", "is_complete")
 _LATEST_UPDATE_MAX_CHARS = 160
