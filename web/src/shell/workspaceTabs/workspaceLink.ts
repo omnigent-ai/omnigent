@@ -58,6 +58,16 @@ export function normalizeLinkPath(raw: string): string {
   return (absolute ? "/" : "") + segments.join("/");
 }
 
+/** `raw` as a link reads it, or null for a path a link refuses. */
+export function linkPathOrNull(raw: string): string | null {
+  try {
+    return normalizeLinkPath(raw);
+  } catch (error) {
+    if (error instanceof LinkError) return null;
+    throw error;
+  }
+}
+
 function parsePositive(value: string, name: string): number {
   const number = Number(value);
   if (!POSITIVE_INTEGER.test(value) || !Number.isSafeInteger(number)) {
