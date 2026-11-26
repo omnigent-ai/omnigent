@@ -112,11 +112,38 @@ describe("switchSessionBeforeNavigate", () => {
       expect(useChatStore.getState().conversationId).toBe(targets.at(-1));
       vi.runOnlyPendingTimers();
 
-      expect(switchTo).toHaveBeenCalledTimes(targets.length * 2);
-      expect(switchTo.mock.calls.slice(targets.length).every(([id]) => id === "conv_a")).toBe(true);
+      expect(switchTo.mock.calls).toEqual([...targets.map((target) => [target]), ["conv_a"]]);
       expect(useChatStore.getState().conversationId).toBe("conv_a");
     },
   );
+
+  it("does not let a canceled click overwrite a newer store switch", () => {
+    spyFeatures({ warm_switch_keep_mounted_ui: true });
+    seedLive("conv_a", "conv_b", "conv_c");
+    useChatStore.setState({ conversationId: "conv_a" });
+    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+
+    switchSessionBeforeNavigate("conv_b");
+    void useChatStore.getState().switchTo("conv_c");
+    vi.runOnlyPendingTimers();
+
+    expect(switchTo.mock.calls).toEqual([["conv_b"], ["conv_c"]]);
+    expect(useChatStore.getState().conversationId).toBe("conv_c");
+  });
+
+  it("skips the fast path while the browser still identifies a temporary source", () => {
+    spyFeatures({ warm_switch_keep_mounted_ui: true });
+    seedLive("conv_a", "conv_b");
+    useChatStore.setState({ conversationId: "conv_a" });
+    window.history.replaceState({}, "", "/c/temp:source");
+    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+
+    switchSessionBeforeNavigate("conv_b");
+    vi.runOnlyPendingTimers();
+
+    expect(switchTo).not.toHaveBeenCalled();
+    expect(useChatStore.getState().conversationId).toBe("conv_a");
+  });
 
   it("leaves the store alone when the flag is off", () => {
     useChatStore.setState({ conversationId: "conv_a" });

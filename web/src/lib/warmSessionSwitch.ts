@@ -38,8 +38,12 @@ export function switchSessionBeforeNavigate(conversationId: string): void {
     return;
   const fromPathname = window.location.pathname;
   const sourceConversationId = conversationIdFromPath(fromPathname) ?? fromConversationId;
+  if (isTempConvId(sourceConversationId)) return;
   window.setTimeout(() => {
-    if (window.location.pathname === fromPathname) {
+    if (
+      window.location.pathname === fromPathname &&
+      useChatStore.getState().conversationId === conversationId
+    ) {
       void useChatStore.getState().switchTo(sourceConversationId);
     }
   }, 0);
