@@ -8,6 +8,10 @@ export function warmSwitchKeepMountedEnabled(): boolean {
   return isFeatureEnabled(getCachedServerInfo() ?? "loading", "warm_switch_keep_mounted_ui");
 }
 
+function conversationIdFromPath(pathname: string): string | undefined {
+  return matchPath(`${getBasePath()}/c/:conversationId`, pathname)?.params.conversationId;
+}
+
 export function isWarmSwitchPending(
   activeConversationId: string | null,
   urlConvId: string | null | undefined,
@@ -17,8 +21,7 @@ export function isWarmSwitchPending(
     warmSwitchKeepMountedEnabled() &&
     activeConversationId !== null &&
     activeConversationId !== urlConvId &&
-    matchPath(`${getBasePath()}/c/:conversationId`, window.location.pathname)?.params
-      .conversationId === activeConversationId
+    conversationIdFromPath(window.location.pathname) === activeConversationId
   );
 }
 
@@ -34,9 +37,10 @@ export function switchSessionBeforeNavigate(conversationId: string): void {
   )
     return;
   const fromPathname = window.location.pathname;
+  const sourceConversationId = conversationIdFromPath(fromPathname) ?? fromConversationId;
   window.setTimeout(() => {
     if (window.location.pathname === fromPathname) {
-      void useChatStore.getState().switchTo(fromConversationId);
+      void useChatStore.getState().switchTo(sourceConversationId);
     }
   }, 0);
   void useChatStore.getState().switchTo(conversationId);

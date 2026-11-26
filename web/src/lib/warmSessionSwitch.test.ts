@@ -99,20 +99,24 @@ describe("switchSessionBeforeNavigate", () => {
     expect(useChatStore.getState().conversationId).toBe("conv_b");
   });
 
-  it("restores a canceled click on the next task even if search parameters changed", () => {
-    spyFeatures({ warm_switch_keep_mounted_ui: true });
-    seedLive("conv_a", "conv_b");
-    useChatStore.setState({ conversationId: "conv_a" });
-    const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
+  it.each([{ targets: ["conv_b"] }, { targets: ["conv_b", "conv_c"] }])(
+    "restores canceled clicks to the browser source on the next task: $targets",
+    ({ targets }) => {
+      spyFeatures({ warm_switch_keep_mounted_ui: true });
+      seedLive("conv_a", "conv_b", "conv_c");
+      useChatStore.setState({ conversationId: "conv_a" });
+      const switchTo = vi.spyOn(useChatStore.getState(), "switchTo");
 
-    switchSessionBeforeNavigate("conv_b");
-    window.history.replaceState({}, "", "/c/conv_a?diff=1");
-    expect(useChatStore.getState().conversationId).toBe("conv_b");
-    vi.runOnlyPendingTimers();
+      for (const target of targets) switchSessionBeforeNavigate(target);
+      window.history.replaceState({}, "", "/c/conv_a?diff=1");
+      expect(useChatStore.getState().conversationId).toBe(targets.at(-1));
+      vi.runOnlyPendingTimers();
 
-    expect(switchTo.mock.calls).toEqual([["conv_b"], ["conv_a"]]);
-    expect(useChatStore.getState().conversationId).toBe("conv_a");
-  });
+      expect(switchTo).toHaveBeenCalledTimes(targets.length * 2);
+      expect(switchTo.mock.calls.slice(targets.length).every(([id]) => id === "conv_a")).toBe(true);
+      expect(useChatStore.getState().conversationId).toBe("conv_a");
+    },
+  );
 
   it("leaves the store alone when the flag is off", () => {
     useChatStore.setState({ conversationId: "conv_a" });
