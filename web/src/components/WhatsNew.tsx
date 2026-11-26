@@ -133,12 +133,16 @@ export function WhatsNewSidebarCard() {
   );
 }
 
-export function WhatsNew({
-  phoneAtBottom = false,
-}: {
-  /** Phones: sit at the bottom, for pages whose toolbar is right under the header. */
-  phoneAtBottom?: boolean;
-}) {
+/** Where the phone pill sits: under the header, above a chat composer, or at the screen's foot. */
+export type WhatsNewPhonePlacement = "top" | "above-composer" | "bottom";
+
+const PHONE_PLACEMENT_CLASS: Record<WhatsNewPhonePlacement, string> = {
+  top: "top-[calc(4.25rem+var(--omnigent-safe-top,0px))]",
+  "above-composer": "bottom-[calc(6.5rem+var(--omnigent-safe-bottom,0px))]",
+  bottom: "bottom-[calc(1rem+var(--omnigent-safe-bottom,0px))]",
+};
+
+export function WhatsNew({ phonePlacement = "top" }: { phonePlacement?: WhatsNewPhonePlacement }) {
   const unseen = useWhatsNewStore((state) => state.unseen);
   const entries = useWhatsNewStore((state) => state.entries);
   const noticeVisible = useWhatsNewStore((state) => state.noticeVisible);
@@ -155,14 +159,12 @@ export function WhatsNew({
       {noticeVisible && (
         <div
           role="status"
-          // Phones only (desktop shows the sidebar card): a one-line pill under the header,
-          // or on project pages (toolbar under the header) above the chat composer.
+          // Phones only (desktop shows the sidebar card): a one-line pill placed so it
+          // doesn't cover the page's own toolbar or content.
           data-testid="whats-new"
           className={cn(
             "fixed left-1/2 z-50 flex -translate-x-1/2 items-center gap-0.5 rounded-full border bg-card py-0.5 pr-0.5 pl-3 text-sm text-foreground shadow-md md:hidden",
-            phoneAtBottom
-              ? "bottom-[calc(6.5rem+var(--omnigent-safe-bottom,0px))]"
-              : "top-[calc(4.25rem+var(--omnigent-safe-top,0px))]",
+            PHONE_PLACEMENT_CLASS[phonePlacement],
           )}
         >
           <button
@@ -176,7 +178,10 @@ export function WhatsNew({
           <DismissButton className="size-8" />
         </div>
       )}
-      <Dialog open={notesOpen} onOpenChange={(open) => useWhatsNewStore.setState({ notesOpen: open })}>
+      <Dialog
+        open={notesOpen}
+        onOpenChange={(open) => useWhatsNewStore.setState({ notesOpen: open })}
+      >
         <DialogContent className="max-h-[80dvh] overflow-y-auto sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>What&apos;s new</DialogTitle>

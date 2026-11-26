@@ -216,19 +216,19 @@ const INBOX_TABS: { value: InboxFilter; label: string }[] = [
 const EMPTY_STATES: Record<InboxFilter, { title: string; body: string }> = {
   all: {
     title: "Nothing waiting on you",
-    body: "When an agent replies or needs your input, or someone comments on a file, it will show up here.",
+    body: "Replies, decisions and file comments will appear here.",
   },
   unread: {
     title: "You’re all caught up",
-    body: "New agent replies and unseen file comments will show up here.",
+    body: "New replies and unseen file comments will appear here.",
   },
   awaiting: {
     title: "No approvals waiting",
-    body: "When an agent needs your input, it will show up here.",
+    body: "Questions and approvals for you will appear here.",
   },
   advisor: {
     title: `No suggestions from ${PROACTIVE_AGENT_DISPLAY_NAME}`,
-    body: "Follow-ups, related information, and reminders about your recent work will show up here.",
+    body: "Follow-ups and reminders about your recent work will appear here.",
   },
 };
 
@@ -1290,6 +1290,11 @@ export function InboxPage() {
     );
   };
 
+  const moreToLoad =
+    (!advisorOnly && hasNextPage) ||
+    (showUnread && automationInbox.hasNextPage) ||
+    (showSuggestions && proactiveInbox.hasNextPage);
+
   return (
     <PageScroll maxWidthClassName="max-w-[960px]" contentClassName="px-4 md:px-10">
       <div className="mb-4 flex items-center gap-3">
@@ -1305,7 +1310,7 @@ export function InboxPage() {
         )}
       </div>
 
-      <div className="mb-4 flex flex-wrap items-center gap-2">
+      <div className="mb-4 flex flex-wrap items-center gap-2 border-b pb-3">
         <Tabs
           value={filter}
           onValueChange={(value) => {
@@ -1424,18 +1429,29 @@ export function InboxPage() {
         !(advisorOnly && advisorSettingsFailed) &&
         !(showSuggestions && proactiveInbox.isError) &&
         visibleCount === 0 && (
-          <div className="flex flex-col items-center gap-2 py-16 text-center">
-            <InboxIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-ui font-medium">
+          <div
+            data-testid="inbox-empty"
+            className="flex flex-col items-center gap-2 px-4 pt-16 pb-20 text-center"
+          >
+            {/* A quiet tile: a check only when nothing is waiting anywhere in this view. */}
+            <div
+              aria-hidden
+              className="mb-2 flex size-12 items-center justify-center rounded-xl border bg-muted text-muted-foreground"
+            >
+              {(selectedProject && tabEntries.length > 0) || moreToLoad ? (
+                <InboxIcon className="size-5" />
+              ) : (
+                <CheckIcon className="size-5" />
+              )}
+            </div>
+            <h2 className="text-lg font-semibold tracking-tight text-balance">
               {selectedProject
                 ? `Nothing here from ${selectedProject.name}`
-                : (!advisorOnly && hasNextPage) ||
-                    (showUnread && automationInbox.hasNextPage) ||
-                    (showSuggestions && proactiveInbox.hasNextPage)
+                : moreToLoad
                   ? "Nothing waiting in the loaded items"
                   : emptyState.title}
-            </p>
-            <p className="text-sm text-muted-foreground">
+            </h2>
+            <p className="max-w-xs text-sm leading-relaxed text-pretty text-muted-foreground">
               {selectedProject
                 ? tabEntries.length > 0
                   ? "Other projects have items waiting."

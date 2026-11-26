@@ -3518,6 +3518,7 @@ function AppShellImpl() {
             serverConversationId={serverConversationId}
             updateOverlayHeight={updateOverlayHeight}
             projectPage={projectHomeName !== null}
+            inboxPage={location.pathname.replace(/\/$/, "") === rebasePath("/inbox")}
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>

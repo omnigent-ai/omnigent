@@ -2,18 +2,24 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { parseEntries, WHATS_NEW_LAST_SEEN_KEY } from "@/whatsNew/whatsNew";
-import { loadWhatsNew, openWhatsNew, WhatsNew, WhatsNewSidebarCard } from "./WhatsNew";
+import {
+  loadWhatsNew,
+  openWhatsNew,
+  WhatsNew,
+  type WhatsNewPhonePlacement,
+  WhatsNewSidebarCard,
+} from "./WhatsNew";
 
 const today = new Date().toISOString().slice(0, 10);
 const entries = parseEntries({
   [`./entries/${today}.md`]: "# Fresh things\n\n- **Shiny.** It works.",
 });
 
-function renderWhatsNew(phoneAtBottom = false) {
+function renderWhatsNew(phonePlacement: WhatsNewPhonePlacement = "top") {
   return render(
     <>
       <WhatsNewSidebarCard />
-      <WhatsNew phoneAtBottom={phoneAtBottom} />
+      <WhatsNew phonePlacement={phonePlacement} />
     </>,
   );
 }
@@ -56,16 +62,21 @@ describe("WhatsNew", () => {
     expect(screen.getByRole("dialog")).toHaveTextContent("Fresh things");
   });
 
-  it("keeps the phone pill off desktop and at the bottom of project pages", () => {
+  it("keeps the phone pill off desktop and above project composers and at the Inbox's foot", () => {
     const { unmount } = renderWhatsNew();
     const top = screen.getByTestId("whats-new");
     expect(top.className).toContain("md:hidden");
     expect(top.className).toMatch(/(^| )top-\[calc\(4\.25rem/);
     unmount();
-    renderWhatsNew(true);
+    const aboveComposer = renderWhatsNew("above-composer");
     const bottom = screen.getByTestId("whats-new");
     expect(bottom.className).toMatch(/(^| )bottom-\[calc\(6\.5rem/);
     expect(bottom.className).not.toMatch(/(^| )top-\[/);
+    aboveComposer.unmount();
+    renderWhatsNew("bottom");
+    const foot = screen.getByTestId("whats-new");
+    expect(foot.className).toMatch(/(^| )bottom-\[calc\(1rem/);
+    expect(foot.className).not.toMatch(/(^| )top-\[/);
   });
 
   it("shows nothing when the shell doesn't mount the notes", () => {
