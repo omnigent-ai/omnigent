@@ -75,8 +75,7 @@ describe("isNewSessionHotkey", () => {
     ]) {
       expect(isNewSessionHotkey(event({ ...command, ...init }), isMac)).toBe(false);
     }
-    // AltGr off macOS; on macOS, Option, which Firefox reports as AltGr.
-    const altGraph = event({ ...command, key: "O", code: "KeyO", shiftKey: true, altKey: isMac });
+    const altGraph = event({ ...command, key: "O", code: "KeyO", shiftKey: true });
     vi.spyOn(altGraph, "getModifierState").mockImplementation((key) => key === "AltGraph");
     expect(isNewSessionHotkey(altGraph, isMac)).toBe(false);
   });
@@ -187,6 +186,16 @@ describe("useNewSessionHotkey", () => {
 });
 
 describe("useNewSessionHotkey with an open pick list (native Windows/Linux)", () => {
+  it("leaves a chord a focused field already handled, even outside a pick list", () => {
+    shell.native = true;
+    renderHook(() => useNewSessionHotkey(true, false));
+    const field = document.createElement("input");
+    field.addEventListener("keydown", (keydown) => keydown.preventDefault());
+    document.body.append(field);
+    press({ key: "n", code: "KeyN", ctrlKey: true }, field);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("leaves Ctrl-N to the list's field, and still starts a session elsewhere", () => {
     shell.native = true;
     renderHook(() => useNewSessionHotkey(true, false));
