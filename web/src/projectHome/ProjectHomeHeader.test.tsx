@@ -10,7 +10,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import * as ticketsApi from "@/lib/projectTicketsApi";
 import type * as ConversationsModule from "@/hooks/useConversations";
-import { ProjectViewTools } from "./ProjectBoardActions";
+import { ProjectBoardActions, ProjectViewTools } from "./ProjectBoardActions";
 import {
   ProjectBoardSearch,
   ProjectHomeHeaderActions,
@@ -22,6 +22,7 @@ import {
 
 const mocks = vi.hoisted(() => ({
   isMobile: false,
+  isPhone: false,
   projectsLoading: false,
   projectsError: null as Error | null,
   menuArgs: [] as unknown[],
@@ -38,6 +39,10 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
+}));
+
+vi.mock("@/hooks/useIsPhoneViewport", () => ({
+  useIsPhoneViewport: () => mocks.isPhone,
 }));
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => {
@@ -178,6 +183,7 @@ function renderNavigation(
 
 beforeEach(() => {
   mocks.isMobile = false;
+  mocks.isPhone = false;
   mocks.mandateProposals = [];
   mocks.projectsLoading = false;
   mocks.projectsError = null;
@@ -254,6 +260,38 @@ describe("ProjectHomeTitle", () => {
     expect(
       within(header).getByRole("button", { name: "Project actions for Billing & Payments" }),
     ).toBeVisible();
+  });
+
+  it("names the project on phones and moves the actions into a labelled row", () => {
+    mocks.isMobile = true;
+    mocks.isPhone = true;
+    renderNavigation(
+      "board",
+      true,
+      false,
+      false,
+      "?view=board",
+      <ProjectBoardActions
+        projectName="Billing & Payments"
+        newSessionPath="/?project=Billing%20%26%20Payments"
+        phoneRow
+      />,
+    );
+    const header = screen.getByRole("banner");
+    expect(within(header).getByRole("heading", { name: "Billing & Payments" })).not.toHaveClass(
+      "sr-only",
+    );
+    // The header keeps only the project menu.
+    expect(
+      [...header.querySelectorAll("button")].map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["Project actions for Billing & Payments"]);
+    const row = screen.getByRole("group", { name: "Project actions" });
+    expect(within(row).getByRole("button", { name: "Team" })).toHaveTextContent("Team");
+    expect(within(row).getByRole("link", { name: "New ticket" })).toHaveTextContent("New ticket");
+    fireEvent.pointerDown(within(row).getByRole("button", { name: "More ways to start" }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitem", { name: "New session" })).toBeVisible();
   });
 
   it("opens the project's Rules page and offers only rename and delete in the overflow menu", () => {

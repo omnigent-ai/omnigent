@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
 import { PageScroll } from "@/components/PageScroll";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsPhoneViewport } from "@/hooks/useIsPhoneViewport";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { isKeyOwningOverlayOpen } from "@/lib/hotkeys";
 import { useNavigate, useParams, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import {
+  projectNewSessionPath,
   useProjectBoardSearchStore,
   useProjectComposerStore,
 } from "@/projectHome/ProjectHomeHeader";
@@ -34,7 +36,7 @@ import {
 } from "@/projectHome/ProjectOrchestrator";
 import { useProjectIdentities } from "@/projectHome/useProjectIdentities";
 import { ProjectFileViewerHost } from "@/projectHome/ProjectFileViewer";
-import { ProjectViewTools } from "@/projectHome/ProjectBoardActions";
+import { ProjectBoardActions, ProjectViewTools } from "@/projectHome/ProjectBoardActions";
 import { ProjectRules } from "@/projectHome/ProjectRules";
 import { ProjectHomeTabs, ProjectSummary } from "@/projectHome/ProjectSummary";
 import {
@@ -166,6 +168,16 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
 
   // Phones keep these tools in the top bar.
   const viewTools = isMobile ? undefined : <ProjectViewTools projectName={projectName} />;
+  // Phones hold the project's actions in a labelled row of their own, above the tabs.
+  const isPhone = useIsPhoneViewport();
+  const phoneActions =
+    tickets && isPhone ? (
+      <ProjectBoardActions
+        projectName={projectName}
+        newSessionPath={projectNewSessionPath(projectName)}
+        phoneRow
+      />
+    ) : null;
 
   if (panelSessionId) return <ProjectSessionPanel sessionId={panelSessionId} />;
   if (tickets && !orchestrator && !panelTicketId && isLegacyOrchestratorLink(searchParams))
@@ -180,6 +192,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
       <div className="relative flex min-h-0 flex-1 flex-col">
         <ProjectFileViewerHost projectId={projectId} />
         <PageScroll maxWidthClassName="max-w-none" extraTop={isMobile ? "0.25rem" : "0.5rem"}>
+          {phoneActions}
           <ProjectHomeTabs view={view} onChange={showTab} end={viewTools} />
           {view === "summary" ? (
             <ProjectSummary key={projectName} projectName={projectName} />
@@ -202,6 +215,7 @@ export function ProjectHomePage({ orchestrator = false }: { orchestrator?: boole
         extraTop={isMobile ? "0.25rem" : "0.5rem"}
         extraBottom="0px"
       >
+        {!ticketFillsPage && phoneActions}
         {tickets && !ticketFillsPage && (
           <ProjectHomeTabs
             view="board"

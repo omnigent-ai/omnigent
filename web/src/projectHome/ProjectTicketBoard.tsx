@@ -1,4 +1,12 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   DndContext,
   DragOverlay,
@@ -19,7 +27,10 @@ import {
 } from "lucide-react";
 import { RunningDot } from "@/components/RunningDot";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useIsPhoneViewport } from "@/hooks/useIsPhoneViewport";
 import { useNow } from "@/hooks/useNow";
 import { Link, useSearchParams } from "@/lib/routing";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
@@ -136,9 +147,27 @@ function TicketBoard({
       setLaneCounts((current) => (current[stageId] === count ? current : { ...current, [stageId]: count })),
     [],
   );
+  // Phones show one lane at a time, picked from tabs that carry each lane's shown count.
+  const isPhone = useIsPhoneViewport();
+  const [shownCounts, setShownCounts] = useState<Record<string, string>>({});
+  const reportShownCount = useCallback(
+    (stageId: string, count: string) =>
+      setShownCounts((current) =>
+        current[stageId] === count ? current : { ...current, [stageId]: count },
+      ),
+    [],
+  );
+  const [chosenLane, setChosenLane] = useState<string | null>(null);
   const stageIds = configuration.data?.stages.map((stage) => stage.id) ?? [];
   const projectEmpty = stageIds.length > 0 && stageIds.every((id) => laneCounts[id] === 0);
   const stages = configuration.data?.stages ?? [];
+  // Until every lane has a count, the first stage; then the first lane with tickets.
+  const allCounted = stageIds.length > 0 && stageIds.every((id) => id in shownCounts);
+  const phoneLane =
+    (chosenLane !== null && stageIds.includes(chosenLane) ? chosenLane : null) ??
+    (allCounted ? stageIds.find((id) => parseInt(shownCounts[id], 10) > 0) : undefined) ??
+    configuration.data?.initial_stage_id ??
+    stageIds[0];
   const boardRef = useRef<HTMLDivElement>(null);
   const boardWidth = useContentWidth(boardRef);
   const [lanePreferences, setLaneCollapsed] = useLanePreferences(projectId);
@@ -222,6 +251,14 @@ function TicketBoard({
           update.mutate({ id: ticket.id, changes: { stage_id: stage.id } });
         }}
       >
+        {isPhone && stages.length > 0 && (
+          <PhoneLaneTabs
+            stages={stages}
+            lane={phoneLane}
+            counts={shownCounts}
+            onLaneChange={setChosenLane}
+          />
+        )}
         <div
           ref={boardRef}
           role="region"
@@ -234,7 +271,9 @@ function TicketBoard({
               key={stage.id}
               stage={stage}
               initial={stage.id === configuration.data?.initial_stage_id}
-              collapsedByLayout={collapsed.has(stage.id)}
+              collapsedByLayout={!isPhone && collapsed.has(stage.id)}
+              phone={isPhone ? { shown: stage.id === phoneLane } : undefined}
+              onShownCountChange={isPhone ? reportShownCount : undefined}
               onCollapsedChange={(next) => setLaneCollapsed(stage.id, next)}
               projectId={projectId}
               selectedTicketId={selectedTicketId}
@@ -272,6 +311,66 @@ function TicketBoard({
   );
 }
 
+// Keeps the selected tab clear of the strip's edge when scrolled into view.
+const LANE_TAB_EDGE_PX = 16;
+
+/** The phone board's stage switcher: one underline tab per stage, with its count. */
+function PhoneLaneTabs({
+  stages,
+  lane,
+  counts,
+  onLaneChange,
+}: {
+  stages: TicketStage[];
+  lane: string | undefined;
+  counts: Record<string, string>;
+  onLaneChange: (lane: string) => void;
+}) {
+  const stripRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const strip = stripRef.current;
+    const tab = strip?.querySelector<HTMLElement>('[role="tab"][data-state="active"]');
+    if (!strip || !tab) return;
+    const stripBox = strip.getBoundingClientRect();
+    const tabBox = tab.getBoundingClientRect();
+    if (tabBox.left < stripBox.left) {
+      strip.scrollLeft -= stripBox.left - tabBox.left + LANE_TAB_EDGE_PX;
+    } else if (tabBox.right > stripBox.right) {
+      strip.scrollLeft += tabBox.right - stripBox.right + LANE_TAB_EDGE_PX;
+    }
+  }, [lane]);
+  return (
+    <Tabs value={lane} onValueChange={onLaneChange} className="shrink-0 gap-0">
+      <div
+        ref={stripRef}
+        className="no-scrollbar mx-4 mb-3 shrink-0 overflow-x-auto overflow-y-hidden border-b border-border"
+      >
+        <TabsList
+          variant="line"
+          aria-label="Stages"
+          className="h-10 w-max min-w-full justify-start gap-3.5 rounded-none p-0"
+        >
+          {stages.map((stage) => (
+            <TabsTrigger
+              key={stage.id}
+              value={stage.id}
+              data-testid={`ticket-lane-tab-${stage.id}`}
+              className="h-full flex-none gap-1 rounded-none border-0 border-b-2 border-transparent px-0 after:hidden focus-visible:border-foreground focus-visible:ring-0 focus-visible:outline-none data-[state=active]:border-foreground data-[state=active]:text-foreground dark:data-[state=active]:text-foreground"
+            >
+              {stage.name}
+              {counts[stage.id] !== undefined && (
+                <Badge className="border-transparent bg-muted text-muted-foreground tabular-nums">
+                  {counts[stage.id]}
+                </Badge>
+              )}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </div>
+    </Tabs>
+  );
+}
+
 function TicketColumn({
   projectId,
   stage,
@@ -291,6 +390,8 @@ function TicketColumn({
   mine,
   projectEmpty = false,
   onCountChange,
+  phone,
+  onShownCountChange,
 }: {
   projectId: string | null;
   stage: TicketStage;
@@ -314,6 +415,10 @@ function TicketColumn({
   projectEmpty?: boolean;
   /** This lane's ticket count, or null while unknown or filtered. */
   onCountChange?: (stageId: string, count: number | null) => void;
+  /** Phones: one lane fills the board, named by its tab; the others stay loaded but hidden. */
+  phone?: { shown: boolean };
+  /** The count the lane shows, once loaded; phones put it on the lane's tab. */
+  onShownCountChange?: (stageId: string, count: string) => void;
 }) {
   const [search] = useSearchParams();
   const playful = usePlayfulTouches();
@@ -328,6 +433,10 @@ function TicketColumn({
   // The server's total for the lane; older servers only report what has loaded, plus "+".
   const total = filteredTickets === undefined ? query.data?.pages[0]?.total : undefined;
   const count = total ?? `${tickets.length}${hasNextPage ? "+" : ""}`;
+  const countKnown = filteredTickets !== undefined || query.data !== undefined;
+  useEffect(() => {
+    if (countKnown) onShownCountChange?.(stage.id, String(count));
+  }, [onShownCountChange, stage.id, count, countKnown]);
   const { setNodeRef, isOver } = useDroppable({ id: stage.id, disabled });
   // A filtered board opens every lane that has a match.
   const collapsed = collapsedByLayout && !filteredTickets?.length;
@@ -386,18 +495,25 @@ function TicketColumn({
     <section
       ref={setNodeRef}
       aria-label={stage.name}
+      hidden={phone !== undefined && !phone.shown}
       className={cn(
         "group/lane flex min-w-52 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/30 px-2 pt-2 transition-colors",
         dragging && "border-dashed border-muted-foreground/50",
         dragging && isOver && "border-primary bg-primary/10",
+        phone && !phone.shown && "hidden",
       )}
     >
-      <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
+      <h2
+        className={cn(
+          "flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground",
+          phone && "sr-only",
+        )}
+      >
         <TicketStageBadge stage={stage} showInstructionsOnHover />
         {/* Pinned to the badge's height so a complete stage's collapse button can't lower its row. */}
         <span className="flex h-5 items-center gap-1 tabular-nums">
           {count}
-          {!filteredTickets && (
+          {!filteredTickets && !phone && (
             <Button
               variant="ghost"
               size="icon"

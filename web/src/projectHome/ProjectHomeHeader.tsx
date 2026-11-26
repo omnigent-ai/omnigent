@@ -25,6 +25,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsPhoneViewport } from "@/hooks/useIsPhoneViewport";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -71,12 +72,19 @@ function useProjectHomeConfig(projectName: string) {
 
 /**
  * The project home's header title: its editable icon tile and name, with the
- * project actions beside it. Phones have no room for it, so they keep the name
- * for screen readers only; their actions sit in the header's right-hand group.
+ * project actions beside it. Phones show the name on one line; tablets keep it for
+ * screen readers only. Their actions sit in the header's right-hand group.
  */
 export function ProjectHomeTitle({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
+  const isPhone = useIsPhoneViewport();
   const { projectId, config, projectsLoading } = useProjectHomeConfig(projectName);
+  if (isPhone)
+    return (
+      <h1 className="min-w-0 truncate px-1 text-base font-semibold text-foreground">
+        {projectName}
+      </h1>
+    );
   if (isMobile) return <h1 className="sr-only">{projectName}</h1>;
   return (
     <div className="flex min-w-0 items-center gap-2.5">
@@ -101,7 +109,10 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
 /** The header's right-hand actions; phones add the project actions as the session page's icon buttons. */
 export function ProjectHomeHeaderActions({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
+  const isPhone = useIsPhoneViewport();
   const tickets = useProjectTicketsEnabled();
+  // Phone ticket boards keep only the menu here; the page's action row holds the rest.
+  if (tickets && isPhone) return <ProjectHomeActions projectName={projectName} />;
   return (
     <>
       {tickets ? (
@@ -409,7 +420,7 @@ export function ProjectBoardSearch() {
   );
 }
 
-function projectNewSessionPath(projectName: string) {
+export function projectNewSessionPath(projectName: string) {
   return `/?project=${encodeURIComponent(projectName)}`;
 }
 

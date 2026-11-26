@@ -31,9 +31,12 @@ export function ProjectIdentityRoster({
   projectId,
   projectName,
   leadPath,
+  labelled = false,
 }: {
   projectId: string | null;
   projectName: string;
+  /** Phones: the Team menu's trigger names itself, beside the Lead's avatar. */
+  labelled?: boolean;
   /** The Lead leads the avatar stack (on phones, the Team menu); omit when the project has no Lead. */
   leadPath?: string;
 }) {
@@ -69,18 +72,24 @@ export function ProjectIdentityRoster({
             <Button
               type="button"
               variant="ghost"
-              size="icon"
+              size={labelled ? "sm" : "icon"}
               aria-label="Team"
               data-testid="project-team-menu"
               loading={open.isPending}
+              className={cn(labelled && "-ml-2 h-10 gap-2 px-2")}
             >
-              <UsersIcon />
+              {labelled && leadPath !== undefined ? (
+                <PersonaAvatar name={leadName ?? "Lead"} size="xs" />
+              ) : (
+                <UsersIcon />
+              )}
+              {labelled && <span className="text-optical">Team</span>}
               {ordered.some((identity) => identity.active_session_state === "busy") && (
                 <RunningDot />
               )}
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
+          <DropdownMenuContent align={labelled ? "start" : "end"}>
             {leadPath !== undefined && (
               <DropdownMenuItem className="gap-2" onSelect={() => navigate(leadPath)}>
                 <PersonaAvatar name={leadName ?? "Lead"} size="xs" />

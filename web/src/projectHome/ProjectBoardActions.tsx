@@ -32,11 +32,14 @@ export function ProjectBoardActions({
   projectName,
   newSessionPath,
   children,
+  phoneRow = false,
 }: {
   projectName: string;
   newSessionPath: string;
   /** Phone-only extra buttons, before New ticket. */
   children?: ReactNode;
+  /** The phone page's own action row: a labelled Team entry, the tools and a labelled New ticket. */
+  phoneRow?: boolean;
 }) {
   const isMobile = useIsMobileViewport();
   const navigate = useNavigate();
@@ -54,11 +57,44 @@ export function ProjectBoardActions({
   const newTicket = ticketPanelSearch("new", newTicketSearch);
   // A modal dialog's overlay covers these buttons; pressing one closes it, then acts.
   const newTicketRef = useRef<HTMLAnchorElement>(null);
-  const createMenuRef = useRef<HTMLButtonElement>(null);
-  const [createMenuOpen, setCreateMenuOpen] = useState(false);
   useClickThroughDialog(newTicketRef, () => navigate(newTicket));
-  useClickThroughDialog(createMenuRef, () => setCreateMenuOpen(true));
   const toolsElsewhere = useViewToolsHostStore((state) => state.hosts > 0);
+  if (phoneRow)
+    return (
+      <div
+        // Named like the top bar so the tools drop their labels as they do there.
+        className="@container/topbar mx-4 mb-2 flex shrink-0 items-center gap-1"
+        role="group"
+        aria-label="Project actions"
+      >
+        {rosterReady ? (
+          <ProjectIdentityRoster
+            projectId={projectId}
+            projectName={projectName}
+            leadPath={leadPath}
+            labelled
+          />
+        ) : (
+          leadPath !== undefined && (
+            <Button asChild variant="ghost" size="sm">
+              <Link to={leadPath}>
+                <PersonaAvatar name={leadName} size="xs" />
+                {leadName}
+              </Link>
+            </Button>
+          )
+        )}
+        <div className="ml-auto flex items-center gap-1">
+          {!projects.isLoading && !projects.isError && (
+            <>
+              <ProjectTicketSources projectId={projectId} projectName={projectName} />
+              <ProjectFiles projectId={projectId} />
+            </>
+          )}
+          <NewTicketButtons newTicket={newTicket} newSessionPath={newSessionPath} touch />
+        </div>
+      </div>
+    );
   return (
     <div
       className="flex shrink-0 items-center gap-1 md:gap-3"
@@ -99,41 +135,63 @@ export function ProjectBoardActions({
       ) : (
         <>
           {!toolsElsewhere && <ProjectViewTools projectName={projectName} host={false} />}
-          <ButtonGroup aria-label="Create">
-            <Button asChild>
-              <Link ref={newTicketRef} to={newTicket}>
-                <PlusIcon />
-                New ticket
-              </Link>
-            </Button>
-            <DropdownMenu open={createMenuOpen} onOpenChange={setCreateMenuOpen}>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  ref={createMenuRef}
-                  size="icon"
-                  aria-label="More ways to start"
-                  data-testid="project-create-menu"
-                  // A hairline in the button's own text color separates the two halves.
-                  className="border-l! border-primary-foreground/20"
-                >
-                  <ChevronDownIcon />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem
-                  className="gap-2"
-                  data-testid="project-new-session-button"
-                  onSelect={() => navigate(newSessionPath)}
-                >
-                  <MessageCirclePlusIcon className="size-4" />
-                  New session
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </ButtonGroup>
+          <NewTicketButtons newTicket={newTicket} newSessionPath={newSessionPath} />
         </>
       )}
     </div>
+  );
+}
+
+/** New ticket, with a menu of other ways to start; a covered button still works through a dialog. */
+function NewTicketButtons({
+  newTicket,
+  newSessionPath,
+  touch = false,
+}: {
+  newTicket: string;
+  newSessionPath: string;
+  /** Phones: New ticket matches the menu half's touch height. */
+  touch?: boolean;
+}) {
+  const navigate = useNavigate();
+  const newTicketRef = useRef<HTMLAnchorElement>(null);
+  const createMenuRef = useRef<HTMLButtonElement>(null);
+  const [createMenuOpen, setCreateMenuOpen] = useState(false);
+  useClickThroughDialog(newTicketRef, () => navigate(newTicket));
+  useClickThroughDialog(createMenuRef, () => setCreateMenuOpen(true));
+  return (
+    <ButtonGroup aria-label="Create">
+      <Button asChild className={touch ? "h-10" : undefined}>
+        <Link ref={newTicketRef} to={newTicket}>
+          <PlusIcon />
+          New ticket
+        </Link>
+      </Button>
+      <DropdownMenu open={createMenuOpen} onOpenChange={setCreateMenuOpen}>
+        <DropdownMenuTrigger asChild>
+          <Button
+            ref={createMenuRef}
+            size="icon"
+            aria-label="More ways to start"
+            data-testid="project-create-menu"
+            // A hairline in the button's own text color separates the two halves.
+            className="border-l! border-primary-foreground/20"
+          >
+            <ChevronDownIcon />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem
+            className="gap-2"
+            data-testid="project-new-session-button"
+            onSelect={() => navigate(newSessionPath)}
+          >
+            <MessageCirclePlusIcon className="size-4" />
+            New session
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </ButtonGroup>
   );
 }
 

@@ -614,8 +614,8 @@ export function ProjectHomeTabs({
     <div
       className={cn(
         // Named like the top bar so tools moved here collapse at the same widths.
-        // One line at any width: on phones it scrolls sideways instead of wrapping labels.
-        "@container/topbar mx-4 mb-3 flex shrink-0 items-center gap-3 overflow-x-auto border-b border-border/70 pt-0.5 pb-2.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+        // One line from `sm` up; phones give the filters their own row below the tabs.
+        "@container/topbar mx-4 mb-3 flex shrink-0 items-center gap-3 overflow-x-auto border-b border-border/70 pt-0.5 pb-2.5 [scrollbar-width:none] max-sm:flex-wrap max-sm:gap-y-2.5 [&::-webkit-scrollbar]:hidden",
         className,
       )}
     >
@@ -655,8 +655,10 @@ export function ProjectHomeTabs({
       </div>
       {trailing && (
         <>
-          <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
-          <div className="flex shrink-0 items-center">{trailing}</div>
+          <span aria-hidden className="h-4 w-px shrink-0 bg-border max-sm:hidden" />
+          <div className="flex shrink-0 items-center max-sm:order-last max-sm:basis-full">
+            {trailing}
+          </div>
         </>
       )}
       {end && <div className="ml-auto flex min-w-0 items-center gap-1">{end}</div>}
