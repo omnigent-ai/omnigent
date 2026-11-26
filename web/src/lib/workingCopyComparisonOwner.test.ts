@@ -15,6 +15,7 @@ import {
   CONNECT_FALLBACK_MS,
   IDLE_GRACE_MS,
   IDLE_TTL_MS,
+  LAST_COMMIT_SPEC,
   POLL_MS,
   SLOW_LIST_MS,
   SLOW_POLL_MS,
@@ -65,7 +66,10 @@ const typedKey = (sessionId: string, workspace: ComparisonWorkspace = REPO) =>
   JSON.stringify([sessionId, workspace.hostId, workspace.root]);
 
 /** An owner over fakes: lists wait until the test answers them. */
-function harness({ route = AVAILABLE as WorkspaceGitRoute | null } = {}) {
+function harness({
+  route = AVAILABLE as WorkspaceGitRoute | null,
+  repository = "",
+}: { route?: WorkspaceGitRoute | null; repository?: string } = {}) {
   const lists: PendingList[] = [];
   const watches: {
     onRoute: (route: WorkspaceGitRoute) => void;
@@ -81,6 +85,7 @@ function harness({ route = AVAILABLE as WorkspaceGitRoute | null } = {}) {
   const typedListeners = new Set<() => void>();
   const forgotten: string[] = [];
   const owner = new WorkingCopyComparisonOwner({
+    repository,
     forgetListings: (sessionId) => forgotten.push(sessionId),
     fetchListing: (_sessionId, { refresh, signal, spec }) =>
       new Promise((resolve, reject) => {
@@ -812,5 +817,81 @@ describe("a typed base and head", () => {
     test.owner.register(SESSION, consumer("surface"));
     await settle();
     expect(test.open(test.lists).map((list) => list.spec)).toEqual([V1]);
+  });
+});
+
+describe("a review of a repository folder", () => {
+  const FOLDER = ".worktrees/feature";
+  const atFolder = (kind: ComparisonConsumer["kind"] = "surface"): ComparisonConsumer => ({
+    ...consumer(kind),
+    root: `/repo/${FOLDER}`,
+  });
+  const lastCommit = (id: string): BranchPointListing => ({
+    kind: "comparison",
+    comparison: {
+      ...comparison(id),
+      revisions: {
+        spec: LAST_COMMIT_SPEC,
+        baseDisplay: "HEAD",
+        headDisplay: "",
+        headIsWorkingCopy: true,
+      },
+    },
+  });
+
+  it("lists the last commit from the host, where the workspace's owner lists nothing", async () => {
+    const test = harness({ repository: FOLDER });
+    test.setIntent("head");
+    test.owner.register(SESSION, atFolder());
+    await settle();
+    expect(test.owner.repository).toBe(FOLDER);
+    expect(test.open(test.lists).map((list) => list.spec)).toEqual([LAST_COMMIT_SPEC]);
+    await answer(test.lists[0], lastCommit("cmp_head"));
+    expect(test.snapshot().established?.id).toBe("cmp_head");
+
+    const workspace = harness();
+    workspace.setIntent("head");
+    workspace.owner.register(SESSION, consumer("surface"));
+    await settle();
+    expect(workspace.lists).toHaveLength(0);
+  });
+
+  it("drops what the branch point listed on Show uncommitted changes, and back", async () => {
+    const test = harness({ repository: FOLDER });
+    test.owner.register(SESSION, atFolder());
+    await settle();
+    expect(test.lists.map((list) => list.spec)).toEqual([null]);
+    await answer(test.lists[0], listed("cmp_branch"));
+
+    test.owner.showLastCommit(SESSION);
+    await settle();
+    expect(test.snapshot().established).toBeNull();
+    expect(test.lists.map((list) => list.spec)).toEqual([null, LAST_COMMIT_SPEC]);
+    await answer(test.lists.at(-1), lastCommit("cmp_head"));
+    expect(test.snapshot()).toMatchObject({ headOverride: true, established: { id: "cmp_head" } });
+
+    test.owner.chose(SESSION);
+    await settle();
+    expect(test.snapshot().established).toBeNull();
+    expect(test.lists.at(-1)!.spec).toBeNull();
+  });
+
+  it("never times Automatic out into the runner's changes", async () => {
+    const test = harness({ repository: FOLDER });
+    test.owner.register(SESSION, atFolder());
+    await settle();
+    await vi.advanceTimersByTimeAsync(CONNECT_FALLBACK_MS * 2);
+    expect(test.snapshot().connectTimedOut).toBe(false);
+  });
+
+  it("keeps a typed comparison per folder", async () => {
+    const test = harness({ repository: FOLDER });
+    test.owner.register(SESSION, atFolder());
+    await settle();
+    test.owner.compareRevisions(SESSION, { base: "v1", head: "" });
+    expect(
+      test.typed.get(typedKey(SESSION, { hostId: "host_1", root: `/repo/${FOLDER}` })),
+    ).toEqual({ base: "v1", head: "" });
+    expect(test.typed.has(typedKey(SESSION))).toBe(false);
   });
 });

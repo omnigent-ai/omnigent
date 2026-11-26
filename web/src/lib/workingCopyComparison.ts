@@ -7,6 +7,7 @@
 
 import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { type RevisionField, type RevisionSpec, sameRevisions } from "@/lib/customComparison";
+import { workspacePathInRepository } from "@/lib/repositoryFolder";
 import type { WorkingCopyBaseIntent } from "@/lib/workingCopyBasePreference";
 import {
   ChangedFileProblem,
@@ -86,6 +87,26 @@ export type BranchPointListing =
   | { kind: "comparison"; comparison: BranchPointComparison }
   | { kind: "unavailable"; problem: ComparisonProblem };
 
+/** The session's host predates comparing a repository folder inside the workspace. */
+export const FOLDER_NOT_SERVED = "folder_not_served";
+/** The host refused the folder, as one outside the workspace or in a Git directory. */
+export const FOLDER_REFUSED = "folder_refused";
+
+/** Connect's code for a request the host refuses as invalid. */
+const INVALID_ARGUMENT = 3;
+
+/** Why a repository folder's listing failed, where the folder itself is the reason. */
+function folderProblemFrom(error: unknown): ComparisonProblem | null {
+  if (error instanceof WorkspaceMethodUnavailableError) {
+    return { reason: FOLDER_NOT_SERVED, transient: false };
+  }
+  if (error instanceof Error && error.name === "ConnectError") {
+    const code = (error as Error & { code?: number }).code;
+    if (code === INVALID_ARGUMENT) return { reason: FOLDER_REFUSED, transient: false };
+  }
+  return null;
+}
+
 /** Reasons a whole comparison can't be made that won't pass on their own. */
 const DEFINITIVE_REASONS = new Set([
   "not_a_repository",
@@ -95,6 +116,8 @@ const DEFINITIVE_REASONS = new Set([
   "multiple_repositories",
   "partial_clone_needs_newer_git",
   "not_served",
+  FOLDER_NOT_SERVED,
+  FOLDER_REFUSED,
   // A typed base or head: only a different revision helps.
   "invalid_revision",
   "base_not_found",
@@ -199,6 +222,8 @@ interface ListedComparison {
   baseOid: string;
   headOid: string;
   files: Map<string, ComparedFile>;
+  /** The folder relative to the workspace the files were listed in; empty for the workspace. */
+  repository: string;
 }
 
 /** The latest listings by session and comparison, newest last; old ones go past the limit. */
@@ -291,6 +316,7 @@ export function branchPointListingFrom(
   response: ListWorkingCopyChangesResponse,
   listedAt: number,
   spec: RevisionSpec | null = null,
+  repository = "",
 ): BranchPointListing | null {
   const base = response.base;
   if (!base) return null;
@@ -301,7 +327,13 @@ export function branchPointListingFrom(
   if (base.kind !== expected || !base.base) return null;
   const headIsWorkingCopy = spec ? base.headIsWorkingCopy : true;
   // The same commits name the same comparison; a newer listing of them replaces its files.
-  const id = JSON.stringify([base.kind, base.base, headIsWorkingCopy ? "" : base.head]);
+  // A worktree shares its commits with the workspace, so its folder is part of the name.
+  const id = JSON.stringify([
+    base.kind,
+    base.base,
+    headIsWorkingCopy ? "" : base.head,
+    ...(repository ? [repository] : []),
+  ]);
   const files = new Map<string, ComparedFile>();
   for (const file of response.files) {
     files.set(file.path, {
@@ -319,7 +351,7 @@ export function branchPointListingFrom(
             : null,
     });
   }
-  remember(sessionId, id, { baseOid: base.base, headOid: base.head, files });
+  remember(sessionId, id, { baseOid: base.base, headOid: base.head, files, repository });
   return {
     kind: "comparison",
     comparison: {
@@ -352,14 +384,29 @@ export async function fetchBranchPointListing(
   {
     signal,
     spec = null,
-  }: { refresh?: boolean; signal?: AbortSignal; spec?: RevisionSpec | null } = {},
+    repository = "",
+  }: {
+    refresh?: boolean;
+    signal?: AbortSignal;
+    spec?: RevisionSpec | null;
+    /** A folder relative to the workspace, such as a worktree; empty lists the workspace. */
+    repository?: string;
+  } = {},
 ): Promise<BranchPointListing> {
-  const response = await workspaceSidebarSource().listWorkingCopyChanges(
-    sessionId,
-    comparisonRequest(spec),
-    signal,
-  );
-  const listing = branchPointListingFrom(sessionId, response, Date.now(), spec);
+  let response: ListWorkingCopyChangesResponse;
+  try {
+    response = await workspaceSidebarSource().listWorkingCopyChanges(
+      sessionId,
+      comparisonRequest(spec),
+      signal,
+      repository,
+    );
+  } catch (error) {
+    const problem = repository && !signal?.aborted ? folderProblemFrom(error) : null;
+    if (problem) return { kind: "unavailable", problem };
+    throw error;
+  }
+  const listing = branchPointListingFrom(sessionId, response, Date.now(), spec, repository);
   if (!listing) return { kind: "unavailable", problem: { reason: "git_failed", transient: true } };
   return listing;
 }
@@ -377,8 +424,9 @@ export interface RepositoryRefs {
 export async function fetchRepositoryRefs(
   sessionId: string,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<RepositoryRefs> {
-  const response = await workspaceSidebarSource().listRepositoryRefs(sessionId, signal);
+  const response = await workspaceSidebarSource().listRepositoryRefs(sessionId, signal, repository);
   return {
     refs: response.refs,
     truncated: response.truncated,
@@ -455,12 +503,14 @@ async function blobText(
   path: string,
   object: string,
   signal: AbortSignal | undefined,
+  repository: string,
 ): Promise<string | null> {
   if (!object) return null;
   const file = await workspaceSidebarSource().readBaseFile(
     sessionId,
     { commit, path, object },
     signal,
+    repository,
   );
   if (file.truncated) throw new ComparisonFileError("too_large_text");
   const text = fileContentText(file);
@@ -490,12 +540,32 @@ export async function fetchComparisonFileText(
   }
   if (file.binary) throw new ComparisonFileError("binary");
   try {
-    const before = await blobText(sessionId, listed.baseOid, path, file.baseObject, signal);
+    const { repository } = listed;
+    const before = await blobText(
+      sessionId,
+      listed.baseOid,
+      path,
+      file.baseObject,
+      signal,
+      repository,
+    );
     let after: string | null = null;
     if (file.committedObject !== null) {
-      after = await blobText(sessionId, listed.headOid, path, file.committedObject, signal);
+      after = await blobText(
+        sessionId,
+        listed.headOid,
+        path,
+        file.committedObject,
+        signal,
+        repository,
+      );
     } else if (!file.deleted) {
-      const working = await workspaceSidebarSource().readFile(sessionId, path, signal);
+      // Working files are read by their workspace path, inside the repository's folder.
+      const working = await workspaceSidebarSource().readFile(
+        sessionId,
+        workspacePathInRepository(path, repository),
+        signal,
+      );
       if (working.truncated) throw new ComparisonFileError("too_large_text");
       after = fileContentText(working);
       if (after === null) throw new ComparisonFileError("binary");
@@ -561,6 +631,10 @@ export function comparisonProblemMessage(problem: ComparisonProblem): string {
       return "Git isn't available on this session's machine.";
     case "not_served":
       return BRANCH_POINT_NOT_SERVED;
+    case FOLDER_NOT_SERVED:
+      return "Update Omnigent on this session's machine to see Diffs for this folder.";
+    case FOLDER_REFUSED:
+      return "Diffs can't show this folder. Choose a folder inside the workspace.";
     default:
       return problem.detail
         ? `Couldn't compare with the branch point: ${problem.detail}`
@@ -598,6 +672,8 @@ export function revisionProblemMessage(problem: ComparisonProblem, spec: Revisio
       return "This partial clone needs Git 2.44 or later to compare revisions.";
     case "not_a_repository":
     case "no_commits":
+    case FOLDER_NOT_SERVED:
+    case FOLDER_REFUSED:
     case "timeout":
     case "too_many_files":
     case "listing_too_large":
@@ -670,6 +746,8 @@ export function revisionSupport({
 export type EffectiveComparison =
   | {
       base: "head";
+      /** The host's listing of the last commit's changes, in a repository folder. */
+      listing?: BranchPointComparison;
       /** Why Automatic, or the person, chose the last commit here; null for an explicit choice. */
       note: string | null;
       /** The person chose to see uncommitted changes for this session only. */
@@ -720,6 +798,11 @@ export interface EffectiveComparisonInput {
   custom?: RevisionSpec | null;
   /** Whether typed comparisons work for this session. */
   revisionSupport?: BranchPointSupport;
+  /**
+   * The review is of a repository folder, whose last commit only the host lists, as
+   * `lastCommitSpec`: the last commit shows that listing, and nothing falls back to the runner.
+   */
+  lastCommitSpec?: RevisionSpec | null;
 }
 
 /**
@@ -782,6 +865,45 @@ function typedComparison(
  * showing uncommitted changes, until the person chooses to.
  */
 export function effectiveComparison(input: EffectiveComparisonInput): EffectiveComparison {
+  const effective = workspaceComparison(input);
+  const spec = input.lastCommitSpec;
+  return spec && effective.base === "head" ? hostLastCommit(input, spec, effective) : effective;
+}
+
+/**
+ * The last commit in a repository folder, which only the host lists: its listing once
+ * made, and otherwise why not, never the workspace's changes from the runner.
+ */
+function hostLastCommit(
+  input: EffectiveComparisonInput,
+  spec: RevisionSpec,
+  shown: Extract<EffectiveComparison, { base: "head" }>,
+): EffectiveComparison {
+  const support = input.revisionSupport ?? { kind: "checking" };
+  const { problem } = input;
+  if (support.kind === "unsupported") {
+    return { base: "unavailable", message: support.message, retry: false };
+  }
+  if (problem && !problem.transient) {
+    return { base: "unavailable", message: comparisonProblemMessage(problem), retry: false };
+  }
+  const listing =
+    input.established?.revisions && sameRevisions(input.established.revisions.spec, spec)
+      ? input.established
+      : null;
+  if (listing) return { ...shown, listing };
+  const reconnecting = problem !== null && isReconnectingReason(problem.reason);
+  const transient =
+    support.kind === "unreachable"
+      ? support.message
+      : problem
+        ? comparisonProblemMessage(problem)
+        : null;
+  if (transient && !reconnecting) return { base: "unavailable", message: transient, retry: true };
+  return { base: "pending", message: COMPARING };
+}
+
+function workspaceComparison(input: EffectiveComparisonInput): EffectiveComparison {
   const { intent, support, problem } = input;
   if (input.custom) return typedComparison(input, input.custom);
   // A typed comparison's listing never shows under the branch point.
@@ -790,7 +912,9 @@ export function effectiveComparison(input: EffectiveComparisonInput): EffectiveC
   if (input.headOverride) {
     return { base: "head", note: `${SHOWING_UNCOMMITTED}.`, override: true, retry: false };
   }
-  const automatic = intent === "automatic";
+  // Automatic shows uncommitted changes in place of the branch point, except in a repository
+  // folder, whose uncommitted changes the runner can't list.
+  const fallsBack = intent === "automatic" && !input.lastCommitSpec;
   const definitive =
     support.kind === "unsupported"
       ? support.message
@@ -800,7 +924,7 @@ export function effectiveComparison(input: EffectiveComparisonInput): EffectiveC
           ? comparisonProblemMessage(problem)
           : null;
   if (definitive) {
-    return automatic
+    return fallsBack
       ? { base: "head", note: definitive, override: false, retry: false }
       : { base: "unavailable", message: definitive, retry: false };
   }
@@ -825,7 +949,7 @@ export function effectiveComparison(input: EffectiveComparisonInput): EffectiveC
     };
   }
   if (transient && !(problem && isReconnectingReason(problem.reason))) {
-    return automatic
+    return fallsBack
       ? {
           base: "head",
           note: `${SHOWING_UNCOMMITTED}: ${transient}`,
@@ -834,7 +958,7 @@ export function effectiveComparison(input: EffectiveComparisonInput): EffectiveC
         }
       : { base: "unavailable", message: transient, retry: true };
   }
-  if (automatic && input.connectTimedOut) {
+  if (fallsBack && input.connectTimedOut) {
     return {
       base: "head",
       note: `${SHOWING_UNCOMMITTED}: ${COULD_NOT_REACH}`,
@@ -843,6 +967,16 @@ export function effectiveComparison(input: EffectiveComparisonInput): EffectiveC
     };
   }
   return { base: "pending", message: COMPARING };
+}
+
+/**
+ * The host's listing a comparison shows, whose files are read through it: the branch point
+ * or a typed comparison, or the last commit in a repository folder. Null when the runner
+ * lists the changes, or nothing is listed yet.
+ */
+export function hostListing(comparison: EffectiveComparison): BranchPointComparison | null {
+  if (comparison.base === "branch-point") return comparison.comparison;
+  return comparison.base === "head" ? (comparison.listing ?? null) : null;
 }
 
 /** The toolbar's short name for a comparison, and its tooltip. */
