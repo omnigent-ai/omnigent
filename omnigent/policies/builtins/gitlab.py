@@ -31,7 +31,7 @@ from omnigent.policies.builtins.github import _ask, _deny, _git_subcommand_index
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
 
 _Project = tuple[str | None, str]
-_GATED_COMMAND = re.compile(r"\b(?:git|glab)\b")
+_GATED_COMMAND = re.compile(r"\b(?:git|glab)\b", re.IGNORECASE)
 _CLI_ENVIRONMENT = frozenset(
     {
         "GITLAB_HOST",
@@ -180,8 +180,8 @@ def _project_ref(value: str, hosts: frozenset[str]) -> _Project | None:
     return (host, path.lower()) if _valid_project(path) and "-" not in path.split("/") else None
 
 
-def _has_expansions(command: str) -> bool:
-    """Shell expansion can introduce options or targets absent from the command text."""
+def _has_unmodelled_shell_effects(command: str) -> bool:
+    """Expansion and redirection can change the arguments delivered to a command."""
     quote = ""
     escaped = False
     for char in command:
@@ -193,7 +193,7 @@ def _has_expansions(command: str) -> bool:
             quote = ""
         elif char in {"'", '"'} and not quote:
             quote = char
-        elif quote != "'" and (char in {"$", "`"} or (not quote and char in "*?[]{}~")):
+        elif quote != "'" and (char in {"$", "`"} or (not quote and char in "*?[]{}~<>")):
             return True
     return False
 
@@ -235,15 +235,17 @@ def _evaluate_shell(
                     decision, _ask("The git/glab invocation is unresolved. Approve?")
                 )
             continue
+        if _GATED_COMMAND.search(segment) and _has_unmodelled_shell_effects(segment):
+            decision = _worse(
+                decision,
+                _ask("Shell expansion or redirection obscures the git/glab arguments. Approve?"),
+            )
+            continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
             decision = _worse(decision, _evaluate_shell(inner, check, depth + 1))
         elif is_shell_interpreter(tokens):
             decision = _worse(decision, _ask("This shell program requires approval."))
-        elif _GATED_COMMAND.search(segment) and _has_expansions(segment):
-            decision = _worse(
-                decision, _ask("Shell expansions obscure the git/glab arguments. Approve?")
-            )
         elif tokens[0] in {"alias", "function"} and _GATED_COMMAND.search(segment):
             decision = _worse(decision, _ask("Changing git/glab commands requires approval."))
         else:
@@ -290,7 +292,9 @@ def gitlab_policy(
     tools = SHELL_TOOLS if shell_tools is None else frozenset(shell_tools)
 
     def check(tokens: list[str]) -> PolicyResponse | None:
-        executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".exe")
+        executable = (
+            tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold().removesuffix(".exe")
+        )
         if executable == "git":
             try:
                 index = _git_subcommand_index(tokens)

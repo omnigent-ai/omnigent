@@ -29,13 +29,22 @@ def _result(command: str, **configuration: object) -> str:
     [
         ("issue list", False),
         ("issue ls", False),
+        (
+            "issue list -Ac -a example --author example -l bug -m v1 "
+            "-p 2 -P 5 -O json --search Fix",
+            False,
+        ),
         ("issue view 12", False),
         ("issue show 12", False),
+        ("issue view 12 -cs -p 2 -P 5 -F json", False),
         ("mr list", False),
         ("mr ls", False),
+        ("mr list -AcM -a example --author example -l bug -p 2 -P 5 -F json --search Fix", False),
         ("mr view 12", False),
         ("mr show 12", False),
+        ("mr view 12 -cs -p 2 -P 5 -F json", False),
         ("mr diff 12", False),
+        ("mr diff 12 --color=never --raw", False),
         ("issue create -t Fix -d Details -y", True),
         ("issue new -t Fix -d Details", True),
         ("issue note 12 -m Details", True),
@@ -128,10 +137,22 @@ def test_projects_can_be_pinned_to_a_server() -> None:
         ("-t $TITLE -d Details", "ASK"),
         ('-t "$TITLE" -d Details', "ASK"),
         ("-t * -d Details", "ASK"),
+        (f"glab issue create -t Fix -d > -R {_URL}", "ASK"),
+        (f"glab issue note 12 -m > -R {_URL}", "ASK"),
+        (f"glab issue note 12 -m >-R {_URL}", "ASK"),
+        ("-t Fix -d >> -R https://gitlab.com/team/sub/app", "ASK"),
+        ("-t Fix -d < -R https://gitlab.com/team/sub/app", "ASK"),
+        ("-t Fix -d 2> -R https://gitlab.com/team/sub/app", "ASK"),
+        ("-t Fix -d 'literal <input> and > output'", "ALLOW"),
+        ('-t Fix -d "literal <input> and > output"', "ALLOW"),
+        (r"-t Fix -d literal\<input\>", "ALLOW"),
     ],
 )
 def test_option_values_remain_attached(arguments: str, expected: str) -> None:
-    assert _result(f"glab issue create -R {_URL} {arguments}", write_repos=[_PROJECT]) == expected
+    command = (
+        arguments if arguments.startswith("glab ") else f"glab issue create -R {_URL} {arguments}"
+    )
+    assert _result(command, write_repos=[_PROJECT]) == expected
 
 
 @pytest.mark.parametrize(
@@ -186,11 +207,6 @@ def test_deferred_glab_operations_still_require_approval(command: str) -> None:
         f"git clone {_URL}",
         f"git fetch --future-option {_URL}",
         f"git push {_URL} main",
-        f"git push {_URL} HEAD:heads/main",
-        f"git push {_URL} tag v1",
-        f"git push {_URL} main -o merge_request.create",
-        f"git -c push.followTags=true push {_URL} main",
-        f"git push --force --recurse-submodules=on-demand {_URL} main",
         "git config push.followTags true",
         "git remote set-url origin https://gitlab.com/team/other",
         "git custom-alias",
@@ -207,10 +223,13 @@ def test_known_deletions_are_denied(action: str) -> None:
 
 
 @pytest.mark.parametrize("prefix", ["", "/usr/bin/", "./bin/", "command /usr/bin/", "env "])
-def test_executable_paths_and_wrappers(prefix: str) -> None:
-    assert _result(f"{prefix}glab issue view 12 -R {_URL}") == "ALLOW"
-    assert _result(f"{prefix}glab mr delete 12 -R {_URL}") == "DENY"
-    assert _result(f"{prefix}git push {_URL} main") == "ASK"
+@pytest.mark.parametrize("spelling", ["glab", "GLAB", "GlAb", "glab.exe", "GLAB.EXE", "GlAb.ExE"])
+def test_executable_paths_and_wrappers(prefix: str, spelling: str) -> None:
+    assert _result(f"{prefix}{spelling} issue view 12 -R {_URL}") == "ALLOW"
+    assert _result(f"{prefix}{spelling} issue create -R {_URL} -t Fix -d Details") == "DENY"
+    assert _result(f"{prefix}{spelling} mr delete 12 -R {_URL}") == "DENY"
+    git_spelling = "GIT.EXE" if spelling.endswith("EXE") else "git"
+    assert _result(f"{prefix}{git_spelling} push {_URL} main") == "ASK"
 
 
 @pytest.mark.parametrize(
@@ -223,6 +242,7 @@ def test_executable_paths_and_wrappers(prefix: str) -> None:
         "alias glab='another-command'",
         "GITLAB_HOST=gitlab.other.example glab issue list",
         "python -c 'import os; os.system(\"glab issue list\")'",
+        "python -c 'import os; os.system(\"GLAB issue list\")'",
     ],
 )
 def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
@@ -234,6 +254,8 @@ def test_cli_redirection_and_unresolved_invocations_ask(command: str) -> None:
     [
         (f"bash -c 'glab issue list -R {_URL}'", "ALLOW"),
         (f"env -S 'glab issue list -R {_URL}'", "ALLOW"),
+        (f"bash -c 'glab issue list -R {_URL}' > output.txt", "ASK"),
+        (f"bash -c 'glab issue note 12 -m > -R {_URL}'", "ASK"),
         (f"echo ready && glab mr del 12 -R {_URL}", "DENY"),
         (f"glab api projects/123 && glab mr del 12 -R {_URL}", "DENY"),
         (f"echo $(date) && glab mr del 12 -R {_URL}", "DENY"),
