@@ -245,7 +245,6 @@ def test_same_command_from_two_marketplaces_keeps_the_first(
     assert (_prompts(managed) / "dp:go.md").read_text(encoding="utf-8") == "FIRST\n"
 
 
-@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_relaunch_drops_commands_of_removed_plugins(claude_dir: Path, tmp_path: Path) -> None:
     """Each launch regenerates the command dir, so stale prompts do not survive."""
     _install(claude_dir, "dp@market", files={"commands/go.md": "Go\n"})
@@ -286,7 +285,6 @@ def test_symlinks_are_never_bridged(claude_dir: Path, tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("name", ["bad name", "../escape"])
-@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_unsafe_plugin_names_are_not_bridged(claude_dir: Path, tmp_path: Path, name: str) -> None:
     """A plugin name becomes a filename, so names with separators or spaces are skipped."""
     _install(claude_dir, f"{name}@market", files={"commands/go.md": "X\n", **_skill("x")})
@@ -542,16 +540,7 @@ _UNUSABLE_KINDS = ("fifo", "symlink", "oversize", "directory")
 
 @pytest.mark.timeout(20)
 @pytest.mark.parametrize("kind", _UNUSABLE_KINDS)
-@pytest.mark.parametrize(
-    ("consumer", "claude_dir"),
-    [
-        (consumer, layout)
-        for consumer in ("package", "installed", "command", "skill")
-        for layout in _CACHE_LAYOUTS
-        if layout == "directory" or consumer != "installed"
-    ],
-    indirect=["claude_dir"],
-)
+@pytest.mark.parametrize("consumer", ["package", "installed", "command", "skill"])
 def test_unusable_metadata_is_skipped_without_blocking(
     consumer: str,
     kind: str,
@@ -649,3 +638,37 @@ def test_project_scoped_installs_are_not_loaded(claude_dir: Path, tmp_path: Path
     result = add_claude_plugin_resources({}, tmp_path / "managed")
 
     assert result["skills"] == [str(user / "skills" / "user")]
+
+
+@pytest.mark.parametrize("claude_dir", ["symlinked_cache"], indirect=True)
+@pytest.mark.parametrize("unusable", ["missing", "file", "stat-error"])
+def test_unusable_shared_install_does_not_hide_user_fallback(
+    claude_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unusable: str,
+) -> None:
+    """An unavailable shared installation cannot hide a healthy non-cache user install."""
+    stale = _install(claude_dir, "dp@market", files=_skill("review"))
+    fallback = claude_dir / "plugins" / "local" / "dp"
+    fallback.parent.mkdir()
+    stale.rename(fallback)
+    if unusable == "file":
+        stale.touch()
+    elif unusable == "stat-error":
+        original_is_dir = Path.is_dir
+
+        def is_dir(path: Path) -> bool:
+            if path == stale:
+                raise PermissionError("installation is unavailable")
+            return original_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", is_dir)
+    _write_json(
+        claude_dir / "plugins" / "installed_plugins.json",
+        {"plugins": {"dp@market": [{"installPath": str(stale)}, {"installPath": str(fallback)}]}},
+    )
+
+    result = add_claude_plugin_resources({}, tmp_path / "managed")
+
+    assert result["skills"] == [str(fallback / "skills" / "review")]

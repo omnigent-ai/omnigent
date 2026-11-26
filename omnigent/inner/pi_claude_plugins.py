@@ -210,7 +210,15 @@ def _user_install_path(
         candidate = Path(raw)
         resolved = _resolve(candidate if candidate.is_absolute() else plugins_root / candidate)
         if resolved is not None and any(resolved.is_relative_to(root) for root in trusted_roots):
-            return resolved
+            try:
+                if resolved.is_dir():
+                    return resolved
+            except OSError:
+                pass
+            _logger.warning(
+                "Not bridging Claude plugin %s: installation directory is unavailable", key
+            )
+            continue
         _logger.warning("Not bridging Claude plugin %s: install path is outside the plugins", key)
     return None
 
