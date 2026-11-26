@@ -2173,4 +2173,32 @@ describe("SessionUpdatesProvider sub-agent list refetches that must keep working
       expect(client.getQueryState(childSessionsQueryKey("conv_a"))?.status).toBe("success"),
     );
   });
+
+  it("re-reads an unchanged list once per recheck window, however far apart its rows were first seen", async () => {
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    onTestFinished(() => clock.mockRestore());
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const ids = Array.from({ length: 10 }, (_, i) => `child_${i}`);
+    const fetchChildren = vi.fn(async () => ids.map((id) => ({ id })));
+    observeChildList(client, "conv_a", fetchChildren, []);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    // Ten sub-agents spawned 30 s apart: each first sight records its row then.
+    for (const id of ids) {
+      act(() => handler({ type: "changed", items: [subagentRow(id, "conv_a")] }));
+      now += 30_000;
+    }
+    const rows = ids.map((id) => subagentRow(id, "conv_a"));
+    await act(async () => {});
+    const before = fetchChildren.mock.calls.length;
+    // Ten more minutes of snapshots every 30 s (a watch-set change elsewhere), rows unchanged.
+    for (let i = 0; i < 20; i += 1) {
+      act(() => handler({ type: "snapshot", items: [conv("conv_a"), ...rows] }));
+      now += 30_000;
+    }
+    // Two windows: one re-read at 5 min, one at 10 min, not one per snapshot.
+    expect(fetchChildren.mock.calls.length - before).toBe(2);
+  });
 });
