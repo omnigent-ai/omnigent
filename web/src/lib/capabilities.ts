@@ -317,6 +317,8 @@ export interface ServerInfo {
   scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
+  /** A sandbox starting a new session each run also accepts ten-minute schedules. */
+  scheduled_task_subhour_new_sandbox?: boolean;
   /** Runs drop a trigger prompt's header line before dispatch, so the form can save one. */
   scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
@@ -578,6 +580,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_workflow_id: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
+  scheduled_task_subhour_new_sandbox: false,
   scheduled_task_trigger_headers: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
@@ -780,6 +783,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_workflow_id: data.scheduled_task_workflow_id === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
+          scheduled_task_subhour_new_sandbox: data.scheduled_task_subhour_new_sandbox === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
           session_message_max_chars:
             typeof data.session_message_max_chars === "number" &&

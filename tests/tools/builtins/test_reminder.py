@@ -122,7 +122,7 @@ def test_rule_fires_once_at_the_requested_minute(created: datetime, delay: timed
     when = resolve_reminder_time({"delay_seconds": delay.total_seconds()}, created)
     assert isinstance(when, datetime)
     rule = reminder_rrule(when)
-    validate_rrule(rule, session_mode="continue", allow_single_fire=True)
+    validate_rrule(rule, allow_single_fire=True)
     # The task is created a moment after the time is resolved.
     anchor = created + timedelta(seconds=2)
     assert get_next_fire_time(rule, anchor, UTC, anchor=anchor) == when

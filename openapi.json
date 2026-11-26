@@ -8297,6 +8297,11 @@
             "title": "Scheduled Task Subhour",
             "type": "boolean"
           },
+          "scheduled_task_subhour_new_sandbox": {
+            "default": true,
+            "title": "Scheduled Task Subhour New Sandbox",
+            "type": "boolean"
+          },
           "scheduled_task_trigger_headers": {
             "default": true,
             "title": "Scheduled Task Trigger Headers",

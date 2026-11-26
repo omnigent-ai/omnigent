@@ -354,6 +354,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_workflow_id: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    # A sandbox that starts a new session each run also accepts ten-minute schedules;
+    # older servers require an hour.
+    scheduled_task_subhour_new_sandbox: bool = True
     # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
     # a reminder, and ``first_run_at``. Needs the database scheduler and the
     # ``one_time_automations`` release feature; absent on older servers.
