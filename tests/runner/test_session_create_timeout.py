@@ -47,5 +47,10 @@ async def test_create_waits_for_a_server_slower_than_30s(placement):
     assert "error" not in result, result
     assert result["conversation_id"] == session_id
     assert len(creates) == 1
-    timeout = creates[0].extensions["timeout"]
-    assert (timeout["connect"], timeout["read"]) == (30.0, 120.0)
+    # Only the read budget grows; connecting, writing and pool waits still fail fast.
+    assert creates[0].extensions["timeout"] == {
+        "connect": 30.0,
+        "read": 120.0,
+        "write": 30.0,
+        "pool": 30.0,
+    }

@@ -257,7 +257,7 @@ _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, co
 # strand it with no safe retry. Managed sandboxes are provisioned after the
 # response, so this covers only the server's own create work.
 _SESSION_CREATE_READ_TIMEOUT_S = 120.0
-_SESSION_CREATE_TIMEOUT = httpx.Timeout(_SESSION_CREATE_READ_TIMEOUT_S, connect=30.0)
+_SESSION_CREATE_TIMEOUT = httpx.Timeout(30.0, read=_SESSION_CREATE_READ_TIMEOUT_S)
 
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
