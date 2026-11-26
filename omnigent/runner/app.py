@@ -4863,6 +4863,35 @@ def create_runner_app(
         _publish_event(conv_id, {"type": "session.status", "status": "idle"})
         resource_registry.note_external_session_status(conv_id, "idle")
 
+    async def _settle_codex_native_busy_edge(conv_id: str, activity_epoch: int) -> None:
+        """
+        Publish ``idle`` when a forwarded busy edge arrives after its Codex turn ended.
+
+        The forwarder records the active turn before posting ``running`` and clears it
+        before ``idle``, so a busy edge with no active turn is stale.
+
+        :param conv_id: Codex-native session that reported ``running`` or ``waiting``.
+        :param activity_epoch: Session activity epoch recorded when the edge arrived.
+        """
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="busy edge reconcile", missing_state_log_level=logging.DEBUG
+        )
+        if state is None or state.active_turn_id is not None:
+            return
+        if (
+            conv_id in _active_turns
+            or _session_message_buffers.get(conv_id)
+            or resource_registry.session_activity_epoch(conv_id) != activity_epoch
+        ):
+            return
+        _logger.info(
+            "Codex-native busy edge for %s has no active turn; publishing idle.",
+            conv_id,
+            extra={"session_id": conv_id},
+        )
+        _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        resource_registry.note_external_session_status(conv_id, "idle")
+
     def _on_proxy_stream_end(
         conv_id: str,
         *,
@@ -8591,6 +8620,16 @@ def create_runner_app(
                         if isinstance(data, dict) and isinstance(data.get("response_id"), str)
                         else None,
                     )
+                    if _session_harness_name(conversation_id) == "codex-native":
+                        _busy_reconcile = asyncio.create_task(
+                            _settle_codex_native_busy_edge(
+                                conversation_id,
+                                resource_registry.session_activity_epoch(conversation_id),
+                            ),
+                            name=f"codex-native-busy-edge:{conversation_id}",
+                        )
+                        _background_tasks.add(_busy_reconcile)
+                        _busy_reconcile.add_done_callback(_background_tasks.discard)
                 elif status in ("idle", "failed"):
                     note_subagent_child_turn_settled(
                         conversation_id,
