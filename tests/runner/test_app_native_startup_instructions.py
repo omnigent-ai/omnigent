@@ -108,8 +108,14 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
 
 @pytest.mark.parametrize(
     ("external_id", "write_failure"),
-    [(None, None), ("existing-cascade", None), (None, "permission"), (None, "containment")],
-    ids=["fresh", "resume", "rule-permission", "rule-containment"],
+    [
+        (None, None),
+        ("existing-cascade", None),
+        (None, "permission"),
+        (None, "containment"),
+        (None, "cyclic-rules"),
+    ],
+    ids=["fresh", "resume", "rule-permission", "rule-containment", "cyclic-rules"],
 )
 async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
     tmp_path: Path,
@@ -146,7 +152,12 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
     monkeypatch.setattr(orchestration, "_cancel_auto_forwarder_task", cancel_reader)
     labels = {bridge.ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "startup-bridge"}
     previous_rule = None
-    if write_failure is not None:
+    if write_failure == "cyclic-rules":
+        bridge_dir = bridge.bridge_dir_for_bridge_id("startup-bridge")
+        rules_dir = bridge.agy_gemini_dir(bridge_dir) / "config/rules"
+        rules_dir.parent.mkdir(parents=True)
+        rules_dir.symlink_to(rules_dir.name, target_is_directory=True)
+    elif write_failure is not None:
         bridge_dir = bridge.bridge_dir_for_bridge_id("startup-bridge")
         bridge.write_agent_instructions(bridge_dir, "Keep previous startup guidance.")
         previous_rule = (
@@ -181,7 +192,7 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
     class LaunchObserved(Exception):
         """Stop at the inert terminal boundary before any process can start."""
 
-    captured: list[str] = []
+    captured: list[str | None] = []
 
     class Registry:
         async def launch_required_terminal(self, **_kwargs: object) -> None:
@@ -191,7 +202,11 @@ async def test_antigravity_startup_rule_is_ready_before_terminal_launch(
                 / "rules"
                 / "omnigent_instructions.md"
             )
-            captured.append(rule.read_text(encoding="utf-8"))
+            if write_failure == "cyclic-rules":
+                assert rule.parent.is_symlink()
+                captured.append(None)
+            else:
+                captured.append(rule.read_text(encoding="utf-8"))
             raise LaunchObserved
 
     spec = _spec("Keep the session's authored instructions.")

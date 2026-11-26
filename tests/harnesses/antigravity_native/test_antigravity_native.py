@@ -554,8 +554,9 @@ async def test_launch_and_record_advertises_tmux_target_when_pane_exposed(
         (None, True, "Parent instructions."),
         ("worker", True, "Child instructions."),
         (None, False, None),
+        ("missing-worker", True, None),
     ],
-    ids=["root", "sub-agent", "missing-legacy-bundle"],
+    ids=["root", "sub-agent", "missing-legacy-bundle", "missing-named-child"],
 )
 async def test_cli_fallback_delivers_effective_session_startup_instructions(
     tmp_path: Path,
@@ -615,7 +616,43 @@ async def test_cli_fallback_delivers_effective_session_startup_instructions(
         assert "MEMORY GUIDANCE" not in text
     assert ("Parent instructions." in text) is (available and sub_agent_name is None)
     assert ("Child instructions." in text) is (available and sub_agent_name == "worker")
-    assert selected == [child if sub_agent_name == "worker" else root if available else None]
+    assert selected == [
+        child
+        if sub_agent_name == "worker"
+        else root
+        if available and sub_agent_name is None
+        else None
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure", ["bundle-error", "invalid-archive", "invalid-root", "invalid-yaml"]
+)
+async def test_cli_bundle_failures_preserve_framework_startup_guidance(
+    tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Optional bundle failures share the real loader and framework fallback."""
+    from tests._helpers.session import bundle_files
+
+    content = b"not an archive"
+    if failure in {"invalid-root", "invalid-yaml"}:
+        content = bundle_files(
+            {"config.yaml": b"[]\n" if failure == "invalid-root" else b"executor: [\n"}
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/agent/contents"):
+            return httpx.Response(500 if failure == "bundle-error" else 200, content=content)
+        assert request.url.path == "/v1/sessions/sess"
+        return httpx.Response(200, json={"agent_id": "agent"})
+
+    bridge_dir = tmp_path / "bridge"
+    async with _mock_client(handler) as client:
+        await _mod._write_cli_startup_instructions(client, "sess", bridge_dir)
+
+    rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
+    assert WORKSPACE_IMAGE_INSTRUCTION in rule.read_text(encoding="utf-8")
+    assert "Warning: Could not load your agent's startup instructions" in capsys.readouterr().err
 
 
 class _FakeStream:
@@ -699,7 +736,7 @@ async def test_launch_and_record_threads_headless_skip_flag(
 
 @pytest.mark.parametrize(
     "startup_case",
-    ["authored", "bundle-error", "invalid-archive", "invalid-root", "invalid-yaml", "write-error"],
+    ["authored", "bundle-error", "write-error", "cyclic-rules"],
 )
 async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     monkeypatch: pytest.MonkeyPatch,
@@ -734,12 +771,6 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
             ).encode(),
         }
     )
-    if startup_case == "invalid-archive":
-        bundle = b"not an archive"
-    elif startup_case == "invalid-root":
-        bundle = bundle_files({"config.yaml": b"[]\n"})
-    elif startup_case == "invalid-yaml":
-        bundle = bundle_files({"config.yaml": b"executor: [\n"})
     previous_rule = None
     if startup_case == "write-error":
         bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
@@ -752,6 +783,11 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
             raise PermissionError("read-only rules")
 
         monkeypatch.setattr(_mod, "write_agent_instructions", fail_write)
+    elif startup_case == "cyclic-rules":
+        bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+        rules_dir = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules"
+        rules_dir.parent.mkdir(parents=True)
+        rules_dir.symlink_to(rules_dir.name, target_is_directory=True)
 
     captured_args: list[str] = []
     captured_env: dict[str, str] = {}
@@ -773,6 +809,8 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
         rule = bridge_mod.agy_gemini_dir(bridge_dir) / "config/rules/omnigent_instructions.md"
         if startup_case == "write-error":
             assert rule.read_bytes() == previous_rule
+        elif startup_case == "cyclic-rules":
+            assert rule.parent.is_symlink()
         else:
             text = rule.read_text(encoding="utf-8")
             assert WORKSPACE_IMAGE_INSTRUCTION in text

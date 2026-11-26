@@ -1632,7 +1632,9 @@ def test_inject_user_message_via_tui_short_message_raises_when_not_submitted(
 # ---------------------------------------------------------------------------
 
 
-def test_write_agent_instructions_refreshes_only_the_owned_rule(tmp_path: Path) -> None:
+def test_write_agent_instructions_refreshes_only_the_owned_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Always-on startup text is private and coexists with the user's rules."""
     bridge_dir = tmp_path / "bridge"
     rules_dir = agy_gemini_dir(bridge_dir) / "config" / "rules"
@@ -1651,12 +1653,23 @@ def test_write_agent_instructions_refreshes_only_the_owned_rule(tmp_path: Path) 
     assert write_agent_instructions(bridge_dir, "Updated on resume.") == path
     assert "Updated on resume." in path.read_text(encoding="utf-8")
     assert "Authored instructions." not in path.read_text(encoding="utf-8")
+    previous = path.read_bytes()
+
+    def fail_replace(*_args: object) -> None:
+        raise PermissionError("read-only startup rule")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.harnesses.antigravity_native.bridge.os.replace", fail_replace)
+        with pytest.raises(PermissionError, match="read-only startup rule"):
+            write_agent_instructions(bridge_dir, "Replacement must not be visible.")
+    assert path.read_bytes() == previous
+    assert {entry.name for entry in rules_dir.iterdir()} == {path.name, user_rule.name}
     assert write_agent_instructions(bridge_dir, None) is None
     assert not path.exists()
     assert user_rule.read_text(encoding="utf-8") == "Keep the user's rule."
 
 
-@pytest.mark.parametrize("linked_dir", ["gemini", "rules"])
+@pytest.mark.parametrize("linked_dir", ["gemini", "rules", "cyclic-rules"])
 def test_write_agent_instructions_never_follows_rules_outside_the_bridge(
     tmp_path: Path, linked_dir: str
 ) -> None:
@@ -1667,7 +1680,9 @@ def test_write_agent_instructions_never_follows_rules_outside_the_bridge(
     real_rules.mkdir()
     link = gemini_dir if linked_dir == "gemini" else gemini_dir / "config" / "rules"
     link.parent.mkdir(parents=True)
-    link.symlink_to(real_rules, target_is_directory=True)
+    link.symlink_to(
+        link.name if linked_dir == "cyclic-rules" else real_rules, target_is_directory=True
+    )
 
     with pytest.raises(ValueError, match="isolated Gemini dir"):
         write_agent_instructions(bridge_dir, "Startup text.")

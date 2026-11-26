@@ -717,11 +717,15 @@ Cross-harness journeys:
   session's isolated `config/rules/omnigent_instructions.md`. Existing user rules
   remain alongside it. Automatic launch, terminal re-creation and the CLI
   fallback resolve the session's agent before composing the rule.
+  If a named child is unavailable, automatic launch and terminal re-creation
+  retain the shared resolver's parent-agent fallback; the CLI uses framework
+  guidance only. Existing fallback behavior is preserved in each path.
   `tests/runner/test_app_native_startup_instructions.py::test_antigravity_startup_rule_is_ready_before_terminal_launch`
   checks authored instructions, image guidance and memory before a mocked
   terminal boundary, for fresh and resumed sessions.
   `tests/harnesses/antigravity_native/test_antigravity_native.py::test_cli_fallback_delivers_effective_session_startup_instructions`
-  covers the CLI fallback, child-agent selection and missing legacy bundles.
+  covers the CLI fallback, child-agent selection, missing children and missing
+  legacy bundles.
   These component checks do not prove a native CLI consumed the rule.
 - **`long-term-memory`, Claude, Codex, Pi and Antigravity native:** start the instance's
   server with `OMNIGENT_FEATURES=memory`. The shared startup composer used by

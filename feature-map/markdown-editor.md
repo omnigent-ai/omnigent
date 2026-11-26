@@ -8,6 +8,10 @@ and the recording protocol for comparing revisions.
 ## Sub-features
 
 - `read`: headings, lists, tasks, tables, links, quotes, and fenced code render.
+- `mermaid`: in Edit, a Mermaid block shows only its diagram. Its own
+  Diagram/Source toggle (separate from the file's Source mode) adds the editable
+  source above a live diagram. The source also shows while the block is empty or
+  holds the caret, the current find match, or the active comment.
 - `edit-save`: typing preserves the caret and autosave survives reopening.
 - `find`: search finds edited content without typing into the document.
 - `modes`: Edit, Source, and Preview retain the same saved content.

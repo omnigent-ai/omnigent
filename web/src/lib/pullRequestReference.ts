@@ -1,6 +1,8 @@
 // Turns what a user types or pastes into the pull request to link: a full
 // link, or a number such as `#123` resolved against the session's repository.
 
+import type { CodeHostProviderId } from "@/lib/codeHosts";
+
 /** A PR already associated with this session, with the identity its host reported. */
 export interface SessionPullRequestIdentity {
   url: string;
@@ -34,7 +36,7 @@ export interface PullRequestReferenceContext {
 /** A repository the session's checkout names, on a host whose PR links are known. */
 export interface ContextRepository {
   /** Null while it's still unknown whether the host serves GitHub. */
-  provider: "github" | null;
+  provider: CodeHostProviderId | null;
   host: string;
   /** `owner/repo`. */
   repository: string;
@@ -273,4 +275,25 @@ export function parsePullRequestReference(
   if (/^[a-z][\w+.-]*:\/\//i.test(input)) return parseLink(input, context);
   if (SCHEMELESS_LINK.test(input)) return parseLink(`https://${input}`, context);
   return null;
+}
+
+/** The host, `owner/repo`, and number in a GitHub pull request link, or null. */
+export function githubPullRequestLocation(
+  url: string | null | undefined,
+): { host: string; repository: string; number: number } | null {
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const match = GITHUB_PULL_PATH.exec(parsed.pathname);
+  if (!match || !/^https?:$/.test(parsed.protocol)) return null;
+  return {
+    // With its port, as the session's own links name it.
+    host: parsed.host.toLowerCase(),
+    repository: `${match[1]}/${match[2]}`,
+    number: Number(match[3]),
+  };
 }

@@ -520,9 +520,13 @@ def write_agent_instructions(bridge_dir: Path, instructions: str | None) -> Path
     """Write composed startup text as a private, always-on agy rule."""
     gemini_dir = agy_gemini_dir(bridge_dir)
     path = gemini_dir / "config" / "rules" / "omnigent_instructions.md"
-    if not gemini_dir.resolve().is_relative_to(bridge_dir.resolve()) or not (
-        path.parent.resolve().is_relative_to(gemini_dir.resolve())
-    ):
+    try:
+        contained = gemini_dir.resolve().is_relative_to(bridge_dir.resolve()) and (
+            path.parent.resolve().is_relative_to(gemini_dir.resolve())
+        )
+    except RuntimeError:
+        contained = False
+    if not contained:
         raise ValueError("Antigravity startup rules must stay inside the isolated Gemini dir.")
     if instructions is None or not instructions.strip():
         path.unlink(missing_ok=True)

@@ -954,14 +954,23 @@ async def test_create_session_repl_terminal_dispatch(
     assert created_sessions == (["5eef02d60f39cba3fbd0ae188348643f"] if expect_created else [])
 
 
-@pytest.mark.parametrize("cached_predecessor", [False, True])
-@pytest.mark.parametrize("terminal_name", ["claude", "antigravity"])
+@pytest.mark.parametrize(
+    ("terminal_name", "cached_predecessor", "sub_agent_name"),
+    [
+        pytest.param("claude", False, "worker", id="claude-False"),
+        pytest.param("claude", True, "worker", id="claude-True"),
+        pytest.param("antigravity", False, "worker", id="antigravity-False"),
+        pytest.param("antigravity", True, "worker", id="antigravity-True"),
+        pytest.param("antigravity", False, "missing-worker", id="antigravity-missing-child"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_ensure_terminal_route_recreates_dead_registered_pane(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     cached_predecessor: bool,
     terminal_name: str,
+    sub_agent_name: str,
 ) -> None:
     """Ensure route detects a dead-but-registered pane and auto-creates.
 
@@ -1004,7 +1013,7 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
                     200,
                     json={
                         "agent_id": "agent-root",
-                        "sub_agent_name": "worker",
+                        "sub_agent_name": sub_agent_name,
                         "harness": f"{terminal_name}-native",
                     },
                 )
@@ -1020,8 +1029,9 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         if terminal_name == "antigravity":
             selected = kwargs["agent_spec"]
             assert isinstance(selected, AgentSpec)
-            assert selected.name == "worker"
-            assert selected.instructions == "Child startup guidance."
+            expected = child if sub_agent_name == "worker" else root
+            assert selected.name == expected.name
+            assert selected.instructions == expected.instructions
 
         return SessionResourceView(
             id=f"terminal_{terminal_name}_main",
