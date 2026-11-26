@@ -1110,14 +1110,15 @@ def test_a_comment_change_for_a_signed_out_chosen_login_is_never_sent(
     assert _rest_writes(fake) == []
 
 
-@pytest.mark.parametrize("chosen", [None, "octocat"], ids=["no-login-chosen", "sandbox"])
-def test_a_write_without_a_token_runs_where_no_login_is_chosen_or_in_a_sandbox(
+@pytest.mark.parametrize("chosen", [None, "octocat"])
+def test_a_write_without_a_token_runs_only_in_a_sandbox(
     fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, chosen: str | None
 ) -> None:
-    """With no login chosen gh's active account is the one meant; a sandbox has only its own."""
+    """A sandbox has only its own identity, so gh's own account is the one meant."""
     monkeypatch.setattr(github, "_pr_token", lambda _root, _reference: None)
-    monkeypatch.setattr(github, "_in_sandbox", lambda: chosen is not None)
+    monkeypatch.setattr(github, "_in_sandbox", lambda: True)
     monkeypatch.setattr(github._config, "github_account_preference", lambda _repository: chosen)
+    monkeypatch.setattr(github, "_gh_active_token", _never_looked_up, raising=False)
     tokens: list[str | None] = []
 
     def json_write(root: str, **kwargs: Any) -> tuple[int, str, str]:
@@ -1127,7 +1128,72 @@ def test_a_write_without_a_token_runs_where_no_login_is_chosen_or_in_a_sandbox(
     monkeypatch.setattr(github, "_pr_json_write", json_write)
     _resolve()
     assert len(fake.mutations("resolveReviewThread")) == 1
-    assert tokens[-1] is None
+    assert tokens and set(tokens) == {None}
+
+
+def _never_looked_up(*_args: Any, **_kwargs: Any) -> str | None:
+    raise AssertionError("a sandbox has one identity; there is no active account to pin")
+
+
+_OTHER_TOKEN = "ghp_other_account_token"
+
+
+def _no_login_chosen(monkeypatch: pytest.MonkeyPatch, *active: str | None) -> list[str]:
+    """A local host with no login chosen; each active-account lookup answers the next token."""
+    lookups: list[str] = []
+    monkeypatch.setattr(github, "_pr_token", _REAL_PR_TOKEN)
+    monkeypatch.setattr(github, "_in_sandbox", lambda: False)
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repository: None)
+
+    def lookup(_root: str, host: str = "github.com") -> str | None:
+        lookups.append(host)
+        return active[min(len(lookups), len(active)) - 1]
+
+    monkeypatch.setattr(github, "_gh_active_token", lookup, raising=False)
+    return lookups
+
+
+@pytest.mark.parametrize("action", ["edit", "delete"])
+def test_a_comment_change_with_no_login_chosen_stays_the_account_active_when_it_began(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    """Switching gh's active account after the authorship check must not change who writes."""
+    # The first lookup answers the account active at the start; any later one, another.
+    lookups = _no_login_chosen(monkeypatch, TOKEN, _OTHER_TOKEN)
+
+    _change_comment(action)
+
+    assert lookups == ["github.com"]
+    # The fake answers a JSON write only with TOKEN; a delete is a plain gh call.
+    assert len(_rest_writes(fake)) == 1
+    # The comment read and authorship check before it ran as that account too.
+    assert {token for _argv, token in fake.gh_calls} == {TOKEN}
+
+
+def test_a_mutation_with_no_login_chosen_stays_the_account_active_when_it_began(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lookups = _no_login_chosen(monkeypatch, TOKEN, _OTHER_TOKEN)
+
+    _resolve()
+
+    # The fake GraphQL endpoint refuses any token but TOKEN.
+    assert lookups == ["github.com"]
+    assert len(fake.mutations("resolveReviewThread")) == 1
+
+
+@pytest.mark.parametrize("action", ["edit", "delete", "resolve"])
+def test_a_change_whose_active_account_cant_be_read_is_never_sent(
+    fake: FakeGitHub, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    """Without the active account's token, each call could run as a different account."""
+    _no_login_chosen(monkeypatch, None, TOKEN)
+
+    with pytest.raises(ValueError, match="Nothing was sent") as refused:
+        _resolve() if action == "resolve" else _change_comment(action)
+
+    assert not isinstance(refused.value, UnknownOutcomeError)
+    assert fake.gh_calls == [] and fake.json_calls == []
 
 
 _ENTERPRISE_PR = PullRequestRef.from_url("https://ghe.example.com/example-org/example-repo/pull/7")

@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.runner import github_pending_reviews as pending_reviews
-from omnigent.runner import github_reviews
+from omnigent.runner import github_resource, github_reviews
 from omnigent.runner.pull_request_errors import PullRequestError
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -375,6 +375,8 @@ def test_a_pending_write_drops_the_kept_answer_even_when_it_fails(
         raise PullRequestError("GitHub didn't answer.")
 
     monkeypatch.setattr(github_reviews, "mutate", refuse)
+    # The host's active account is signed in, so the change gets as far as GitHub.
+    monkeypatch.setattr(github_resource, "_gh_active_token", lambda *_args, **_kwargs: "token")
     with pytest.raises(PullRequestError):
         github_reviews.discard_pending_review("/workspace", PR, pending_review_id=REVIEW)
 

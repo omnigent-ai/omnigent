@@ -66,7 +66,9 @@ _PULL_REQUEST_WRITES = _PULL_REQUEST_OWNER_METHODS - {
     "GetPendingReview",
 }
 # Only the server's call frame carries these; a request message never does.
-_SERVER_ONLY_FIELDS = frozenset({"session_id", "vouch", "server_tracked", "default_pr_url"})
+_SERVER_ONLY_FIELDS = frozenset(
+    {"session_id", "vouch", "server_tracked", "default_pr_url", "account_rights"}
+)
 
 
 def test_every_pull_request_method_is_a_reviewed_read_or_owner_method() -> None:
