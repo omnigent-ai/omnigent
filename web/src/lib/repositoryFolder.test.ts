@@ -169,9 +169,13 @@ describe("paths between a worktree's review and its session", () => {
     expect(repositoryPathOf(path, repository, null)).toBe(expected);
   });
 
-  it("leaves UNC shares unmapped, since the worktree matcher doesn't read them as Windows paths", () => {
+  it("maps a UNC share's files, written with either separator and in another case", () => {
     const share = "\\\\server\\share\\repo";
-    expect(repositoryPathOf(`${share}\\.worktrees\\feature\\a.ts`, FOLDER, share)).toBeNull();
-    expect(repositoryFolderOf(`${share}\\.worktrees\\feature`, share)).toBeNull();
+    expect(repositoryPathOf(`${share}\\.worktrees\\feature\\a.ts`, FOLDER, share)).toBe("a.ts");
+    expect(repositoryPathOf("//Server/Share/Repo/.worktrees/feature/a.ts", FOLDER, share)).toBe(
+      "a.ts",
+    );
+    expect(repositoryFolderOf(`${share}\\.worktrees\\feature`, share)).toBe(".worktrees/feature");
+    expect(repositoryPathOf("\\\\server\\other\\a.ts", FOLDER, share)).toBeNull();
   });
 });
