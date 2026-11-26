@@ -1632,6 +1632,8 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
             ]
             + [{"id": (10**6).to_bytes(16, "big"), "rrule": None, **values}],
         )
+        # Retained deleted tasks also prevent restoring the NOT NULL constraint.
+        conn.execute(tasks.update().where(tasks.c.rrule.is_(None)).values(state=3))
     boundaries: dict[sa.Connection, int] = {}
     pages: list[tuple[sa.Connection, int]] = []
     ddl_statements: list[str] = []
