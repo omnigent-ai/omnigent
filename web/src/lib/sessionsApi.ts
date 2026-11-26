@@ -1689,6 +1689,115 @@ export async function getSessionUsage(
   };
 }
 
+/** How an attachment reaches the model: sent inline, saved to disk, or not delivered. */
+export type ContextAttachmentDelivery = "inline" | "workspace" | "missing";
+
+export interface ContextBreakdownAttachment {
+  fileId: string | null;
+  filename: string | null;
+  contentType: string | null;
+  bytes: number | null;
+  delivery: ContextAttachmentDelivery;
+  /** Estimated tokens; null when the type has no reliable estimate or it is not inline. */
+  estimatedTokens: number | null;
+}
+
+export type ContextCategoryKind =
+  "system_prompt" | "skills" | "tools" | "attachments" | "history" | "message" | "other" | "free";
+
+/** Whether a figure is the provider's report, a size-based estimate, or absent. */
+export type ContextCategorySource = "measured" | "estimated" | "unknown";
+
+/** One row of the breakdown, resolved by the server. */
+export interface ContextBreakdownCategory {
+  kind: ContextCategoryKind;
+  /** Null when the row has no figure. */
+  tokens: number | null;
+  source: ContextCategorySource;
+  /** Who produced the row: the server from stored content, or the runner from its request. */
+  origin: "runner" | "server";
+  /** Items the row covers, e.g. attachments; null when a count does not apply. */
+  count: number | null;
+  detail: string | null;
+}
+
+/** What fills a session's context window: the measured total and the rows it splits into. */
+export interface SessionContextBreakdown {
+  /** The provider-reported usage read with this breakdown; null before any report. */
+  measured: { totalTokens: number; contextWindow: number | null } | null;
+  /** Rows in display order, including the remainder and free space. */
+  categories: ContextBreakdownCategory[];
+  /** The itemized estimates add up to more than the measured total. */
+  estimatesExceedMeasured: boolean;
+  attachments: ContextBreakdownAttachment[];
+  /** Ratio behind the text estimates, e.g. 4. */
+  bytesPerToken: number;
+}
+
+interface ContextBreakdownAttachmentWire {
+  file_id?: string | null;
+  filename?: string | null;
+  content_type?: string | null;
+  bytes?: number | null;
+  delivery: ContextAttachmentDelivery;
+  estimated_tokens?: number | null;
+}
+
+interface ContextBreakdownCategoryWire {
+  kind: ContextCategoryKind;
+  tokens?: number | null;
+  source: ContextCategorySource;
+  origin?: "runner" | "server";
+  count?: number | null;
+  detail?: string | null;
+}
+
+interface SessionContextBreakdownWire {
+  measured?: { total_tokens: number; context_window?: number | null } | null;
+  categories?: ContextBreakdownCategoryWire[];
+  estimates_exceed_measured?: boolean;
+  attachments?: ContextBreakdownAttachmentWire[];
+  bytes_per_token?: number;
+}
+
+/** Fetch what fills a session's context window (system prompt, tools, attachments, history). */
+export async function getSessionContextBreakdown(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<SessionContextBreakdown> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/context-breakdown`,
+    { signal: options.signal },
+  );
+  const wire = await readJsonOrThrow<SessionContextBreakdownWire>(res);
+  return {
+    measured: wire.measured
+      ? {
+          totalTokens: wire.measured.total_tokens,
+          contextWindow: wire.measured.context_window ?? null,
+        }
+      : null,
+    categories: (wire.categories ?? []).map((category) => ({
+      kind: category.kind,
+      tokens: category.tokens ?? null,
+      source: category.source,
+      origin: category.origin ?? "server",
+      count: category.count ?? null,
+      detail: category.detail ?? null,
+    })),
+    estimatesExceedMeasured: wire.estimates_exceed_measured ?? false,
+    attachments: (wire.attachments ?? []).map((attachment) => ({
+      fileId: attachment.file_id ?? null,
+      filename: attachment.filename ?? null,
+      contentType: attachment.content_type ?? null,
+      bytes: attachment.bytes ?? null,
+      delivery: attachment.delivery,
+      estimatedTokens: attachment.estimated_tokens ?? null,
+    })),
+    bytesPerToken: wire.bytes_per_token ?? 4,
+  };
+}
+
 /** One page of a session's committed items, in chronological order. */
 export interface SessionItemsPage {
   /** Items oldest-to-newest, ready to feed `itemsToBlocks`. */

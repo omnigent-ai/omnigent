@@ -21,6 +21,7 @@ from omnigent.inner.native_attachments import (
     attachment_cache_dir,
     attachment_reference_line,
     codex_resize_metadata_path,
+    decode_data_uri,
     filesystem_attachment_capability,
     has_unresolved_file_id,
     inline_filesystem_attachment_name,
@@ -85,6 +86,24 @@ def test_parse_data_uri_without_comma_raises() -> None:
     """
     with pytest.raises(ValueError, match="no comma separator"):
         parse_data_uri("data:image/png;base64")
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        (_PNG_DATA_URI, (base64.b64decode(_PNG_B64), "image/png")),
+        # No payload after the comma.
+        ("data:image/png;base64,", None),
+        # Not valid base64.
+        ("data:image/png;base64,A", None),
+        ("data:image/png;base64", None),
+    ],
+)
+def test_decode_data_uri_returns_bytes_or_none(
+    uri: str, expected: tuple[bytes, str] | None
+) -> None:
+    """decode_data_uri decodes a usable payload and reports an unusable one as None."""
+    assert decode_data_uri(uri) == expected
 
 
 def test_materialize_attachment_writes_decoded_bytes(tmp_path: Path) -> None:

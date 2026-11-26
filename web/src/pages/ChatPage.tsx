@@ -4506,6 +4506,8 @@ function ComposerImpl(
               <ComposerContextRing
                 contextWindow={composerContextWindow}
                 tokensUsed={composerTokensUsed}
+                sessionId={conversationId}
+                turnActive={computeIsTurnActive(sessionStatus, isStreaming)}
               />
             </div>
           </ComposerWorkspaceBar>

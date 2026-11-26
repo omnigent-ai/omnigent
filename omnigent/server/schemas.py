@@ -3301,6 +3301,108 @@ class SessionRewindResponse(BaseModel):
     attachments_incomplete: bool = False
 
 
+class ContextBreakdownAttachment(BaseModel):
+    """
+    One attachment still in a session's live conversation history.
+
+    :param file_id: Uploaded file id, e.g. ``"file_abc123"``; ``None`` for
+        bytes sent inline in the message.
+    :param filename: Display name, e.g. ``"report.pdf"``; ``None`` when unknown.
+    :param content_type: Stored MIME type, e.g. ``"image/png"``.
+    :param bytes: Stored or inline-decoded size in bytes; ``None`` when
+        unknown (the file is gone or the block is a remote URL).
+    :param delivery: ``"inline"`` (sent to the model), ``"workspace"``
+        (saved to disk, as a native harness does with each attachment it can
+        decode; only its path reaches the model) or ``"missing"`` (not
+        delivered: the file record is gone, or a native harness could not
+        write the block to disk).
+    :param estimated_tokens: Estimated prompt tokens for an inline
+        attachment; ``None`` when its type has no reliable estimate (e.g. a
+        PDF) or it is not inline.
+    """
+
+    file_id: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+    bytes: int | None = None
+    delivery: Literal["inline", "workspace", "missing"]
+    estimated_tokens: int | None = None
+
+
+class ContextBreakdownMeasured(BaseModel):
+    """
+    The provider-reported usage a breakdown is relative to.
+
+    :param total_tokens: Tokens the last turn's request used, e.g. ``48200``.
+    :param context_window: The model's window in tokens, e.g. ``200000``;
+        ``None`` when it is not known.
+    """
+
+    total_tokens: int
+    context_window: int | None = None
+
+
+class ContextBreakdownCategory(BaseModel):
+    """
+    One row of a context breakdown.
+
+    :param kind: What the row covers: ``"system_prompt"`` (instructions
+        Omnigent composes), ``"skills"`` (the skill listing inside them),
+        ``"tools"`` (tool schemas), ``"attachments"`` (inline attachments),
+        ``"history"`` (earlier messages and tool calls/results),
+        ``"message"`` (the current message, itemized only by a runner),
+        ``"other"`` (the measured total minus the itemized rows) or
+        ``"free"`` (the window minus the measured total).
+    :param tokens: The row's size in tokens; ``None`` when it has no figure.
+    :param source: ``"measured"`` (from the provider's report),
+        ``"estimated"`` (from content size, or derived from an estimate) or
+        ``"unknown"`` (no figure).
+    :param origin: Who produced the row: the ``"server"`` from stored
+        content, or the ``"runner"`` from the request it sent.
+    :param count: Items the row covers, e.g. ``2`` attachments; ``None``
+        when a count does not apply.
+    :param detail: A short explanation to show under the row, e.g.
+        ``"12 messages and tool calls"``.
+    """
+
+    kind: Literal[
+        "system_prompt", "skills", "tools", "attachments", "history", "message", "other", "free"
+    ]
+    tokens: int | None = None
+    source: Literal["measured", "estimated", "unknown"]
+    origin: Literal["runner", "server"] = "server"
+    count: int | None = None
+    detail: str | None = None
+
+
+class SessionContextBreakdown(BaseModel):
+    """
+    Response for ``GET /v1/sessions/{session_id}/context-breakdown``.
+
+    One resolved view: the server picks each row's figure and computes the
+    remainder, so clients only render ``categories`` in order. Content a
+    harness adds itself (its own system prompt, tool schemas, project
+    instructions) is only visible as part of the ``"other"`` row.
+
+    :param session_id: The session, e.g. ``"conv_abc123"``.
+    :param measured: The provider-reported usage read with this breakdown;
+        ``None`` when the harness has reported none, in which case there is
+        no ``"other"`` or ``"free"`` row.
+    :param categories: The rows, in display order.
+    :param estimates_exceed_measured: The itemized estimates add up to more
+        than the measured total, so they run high and ``"other"`` is ``0``.
+    :param attachments: Attachments in the live history, oldest first.
+    :param bytes_per_token: Ratio behind the text estimates, e.g. ``4``.
+    """
+
+    session_id: str
+    measured: ContextBreakdownMeasured | None = None
+    categories: list[ContextBreakdownCategory] = Field(default_factory=list)
+    estimates_exceed_measured: bool = False
+    attachments: list[ContextBreakdownAttachment] = Field(default_factory=list)
+    bytes_per_token: int
+
+
 class ReadStatePutRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{session_id}/read-state``.

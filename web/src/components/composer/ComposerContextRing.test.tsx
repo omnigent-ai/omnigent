@@ -1,19 +1,76 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { getSessionContextBreakdown, type SessionContextBreakdown } from "@/lib/sessionsApi";
+import type { AnyBlock } from "@/lib/blocks";
+import { useChatStore } from "@/store/chatStore";
 import { ComposerContextRing } from "./ComposerContextRing";
 
-function renderRing(contextWindow: number | null, tokensUsed: number | null) {
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionContextBreakdown: vi.fn(),
+}));
+
+function renderRing(
+  contextWindow: number | null,
+  tokensUsed: number | null,
+  sessionId: string | null = null,
+) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <TooltipProvider>
-      <ComposerContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />
-    </TooltipProvider>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <ComposerContextRing
+          contextWindow={contextWindow}
+          tokensUsed={tokensUsed}
+          sessionId={sessionId}
+        />
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
-afterEach(cleanup);
+function breakdownWithHistory(
+  historyTokens: number,
+  contextWindow = 200_000,
+): SessionContextBreakdown {
+  return {
+    measured: { totalTokens: 50_000, contextWindow },
+    categories: [
+      {
+        kind: "history",
+        tokens: historyTokens,
+        source: "estimated",
+        origin: "server",
+        count: 12,
+        detail: "12 messages and tool calls",
+      },
+      {
+        kind: "free",
+        tokens: contextWindow - 50_000,
+        source: "measured",
+        origin: "server",
+        count: null,
+        detail: null,
+      },
+    ],
+    estimatesExceedMeasured: false,
+    attachments: [],
+    bytesPerToken: 4,
+  };
+}
+
+const BREAKDOWN = breakdownWithHistory(40_000);
+
+afterEach(() => {
+  cleanup();
+  useChatStore.setState({ conversationId: null, blocks: [] });
+  vi.mocked(getSessionContextBreakdown).mockReset();
+});
 
 describe("ComposerContextRing", () => {
   it("renders nothing when the context window is unknown or zero", () => {
@@ -57,6 +114,112 @@ describe("ComposerContextRing", () => {
     renderRing(1000, 4000);
     expect(screen.getByLabelText("100% of context used")).toBeInTheDocument();
     expect(screen.getByTestId("composer-context-ring")).not.toHaveTextContent("100%");
+  });
+
+  it("opens the session's context breakdown on click", async () => {
+    vi.mocked(getSessionContextBreakdown).mockResolvedValue(BREAKDOWN);
+    const user = userEvent.setup();
+    renderRing(200_000, 50_000, "conv_1");
+
+    await user.click(screen.getByTestId("composer-context-ring"));
+
+    const dialog = await screen.findByRole("dialog", { name: "Context window breakdown" });
+    expect(await within(dialog).findByTestId("context-row-history")).toHaveTextContent("~40K");
+    expect(getSessionContextBreakdown).toHaveBeenCalledWith("conv_1", expect.anything());
+    // The hover summary stays closed while its breakdown is open.
+    expect(screen.queryByText("25% context used")).not.toBeInTheDocument();
+  });
+
+  it("refreshes an open breakdown at turn boundaries and on a new total or window only", async () => {
+    vi.mocked(getSessionContextBreakdown)
+      .mockResolvedValueOnce(BREAKDOWN)
+      .mockResolvedValueOnce(breakdownWithHistory(45_000))
+      .mockResolvedValueOnce(breakdownWithHistory(60_000))
+      .mockResolvedValueOnce(breakdownWithHistory(60_000, 100_000))
+      .mockResolvedValueOnce(breakdownWithHistory(61_000, 100_000))
+      .mockResolvedValueOnce(breakdownWithHistory(62_000, 100_000))
+      .mockResolvedValueOnce(breakdownWithHistory(63_000, 100_000))
+      .mockReturnValueOnce(new Promise(() => {}));
+    const entry = (itemId: string) => ({ ctx: { itemId } }) as unknown as AnyBlock;
+    useChatStore.setState({ conversationId: "conv_1", blocks: [entry("msg_1")] });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const ring = (turnActive: boolean, tokensUsed = 50_000, contextWindow = 200_000) => (
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <ComposerContextRing
+            contextWindow={contextWindow}
+            tokensUsed={tokensUsed}
+            sessionId="conv_1"
+            turnActive={turnActive}
+          />
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const user = userEvent.setup();
+    const { rerender } = render(ring(false));
+    await user.click(screen.getByTestId("composer-context-ring"));
+    const dialog = await screen.findByRole("dialog", { name: "Context window breakdown" });
+    const history = () => within(dialog).getByTestId("context-row-history");
+    const free = () => within(dialog).getByTestId("context-row-free");
+    await waitFor(() => expect(history()).toHaveTextContent("~40K"));
+
+    // A turn starting refetches once; entries streamed during it don't.
+    rerender(ring(true));
+    await waitFor(() => expect(history()).toHaveTextContent("~45K"));
+    act(() => useChatStore.setState({ blocks: [entry("msg_1"), entry("msg_2")] }));
+    await act(async () => {});
+    expect(getSessionContextBreakdown).toHaveBeenCalledTimes(2);
+
+    // Finishing the turn refetches, even with the same measured total.
+    rerender(ring(false));
+    await waitFor(() => expect(history()).toHaveTextContent("~60K"));
+
+    // Transcript entries between turns leave the breakdown alone.
+    act(() => useChatStore.setState({ blocks: [entry("msg_1"), entry("msg_2"), entry("msg_3")] }));
+    rerender(ring(false));
+    await act(async () => {});
+    expect(getSessionContextBreakdown).toHaveBeenCalledTimes(3);
+    expect(within(dialog).getByText("25% used")).toBeInTheDocument();
+    expect(free()).toHaveTextContent("150K");
+
+    // A new window with the same total and no turn change refetches too.
+    rerender(ring(false, 50_000, 100_000));
+    await waitFor(() => expect(within(dialog).getByText("50% used")).toBeInTheDocument());
+    expect(within(dialog).getByText(/50K \/ 100K tokens/)).toBeInTheDocument();
+    expect(free()).toHaveTextContent("50K");
+    expect(free()).not.toHaveTextContent("150K");
+    expect(getSessionContextBreakdown).toHaveBeenCalledTimes(4);
+
+    // A new measured total fetches again, keeping the last figure until it lands.
+    rerender(ring(false, 51_000, 100_000));
+    expect(history()).toHaveTextContent("~60K");
+    await waitFor(() => expect(history()).toHaveTextContent("~61K"));
+    expect(getSessionContextBreakdown).toHaveBeenCalledTimes(5);
+
+    // A second turn with the same total never falls back to an earlier figure.
+    rerender(ring(true, 51_000, 100_000));
+    expect(history()).toHaveTextContent("~61K");
+    await waitFor(() => expect(history()).toHaveTextContent("~62K"));
+
+    // Reopening shows the latest breakdown while it refreshes.
+    rerender(ring(false, 51_000, 100_000));
+    await waitFor(() => expect(getSessionContextBreakdown).toHaveBeenCalledTimes(7));
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByTestId("composer-context-ring"));
+    const reopened = await screen.findByRole("dialog", { name: "Context window breakdown" });
+    // The refresh never settles here, so this is the cached latest figure.
+    expect(within(reopened).getByTestId("context-row-history")).toHaveTextContent("~63K");
+  });
+
+  it("does not fetch a breakdown without a session or before it opens", async () => {
+    renderRing(200_000, 50_000, "conv_1");
+    renderRing(200_000, 50_000);
+    const user = userEvent.setup();
+
+    await user.click(screen.getAllByTestId("composer-context-ring")[1]);
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(getSessionContextBreakdown).not.toHaveBeenCalled();
   });
 
   it("stays grayscale — never warning/destructive — even at high usage", () => {

@@ -304,6 +304,26 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   arriving (the highlighted row stays put), a file and a session with the same
   name (the later one gets a suffix such as `@README.md (file)`), Attach to
   agent from the file viewer (adds a token at the end).
+- `context-breakdown`: the context ring in the in-session workspace bar shows
+  the measured share of the window on hover; clicking it opens a breakdown of
+  what fills the window. The server resolves every row against the last turn's
+  reported usage it reads in the same request, and the popover only renders
+  them: the header and Free space are measured; the system prompt, attachments
+  and conversation history are size-based estimates; Other is the measured
+  total minus those estimates (tool schemas, harness-added content, the last
+  reply) and says so when the estimates exceed the total. The system prompt
+  follows how the harness receives instructions: no figure and "Not delivered
+  by this harness" where it has no channel for them. Tool definitions list the
+  agent's MCP servers and tool counts without a size. Each attachment shows its
+  size and whether it was sent inline (with an estimate, or "Size only" for
+  PDFs and other binary files), saved to the workspace, or not delivered (file
+  removed, or a native harness could not write it to disk); a native harness
+  receives each attachment it can decode as a file path. History notes how
+  many earlier items a compaction summary replaced, and has no figure for a
+  native harness that keeps its own history (all but Claude Code). An open
+  breakdown refreshes when a turn starts, when it ends, and when the measured
+  total or the context window changes. A server without the breakdown route
+  still shows the measured header.
 - `review-context`: submitting an Agent comment in PR Changes attaches a chip
   to the session composer. Hover previews the comment, click reveals it in
   Changes, and X deletes the saved comment. Failed deletion retains the chip.
@@ -623,6 +643,10 @@ and opens the composer with its prompt`).
   "attach", "side chat", "goal" or "plan mode", then press Enter to run the
   Add menu's action. A row that can't run stays listed with the reason.
 
+**Context breakdown** (open a session with at least one finished turn): hover
+the context ring at the right end of the workspace bar above the composer for
+the measured summary, then click it to open the breakdown.
+
 **Fork dialog** (Fork in the session header menu, or Fork from here on a
 message, with a native target): the same model, effort, and permission mode
 pickers, seeded from the source session when its harness family is kept.
@@ -706,6 +730,19 @@ Other connection providers alone do not enable the managed MCP picker.
   the URL, and no session created until Send. Component coverage:
   `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
 composer with its prompt`).
+
+- **`context-breakdown`:** in a session with a finished turn and an attached
+  image or text file, click the context ring. Check that the header matches the
+  hover tooltip, that each row is labelled measured or estimate, and that the
+  attachment rows name the files with their sizes. Cross-check the rows with
+  `measured` and `categories` from `GET /v1/sessions/<id>/context-breakdown`;
+  on a harness without an instruction channel (e.g. Cursor's terminal agent)
+  the System prompt row reads "Not delivered by this harness". Component coverage:
+  `web/src/components/composer/ComposerContextBreakdown.test.tsx` and
+  `web/src/components/composer/ComposerContextRing.test.tsx`; server
+  rows: `tests/server/test_context_breakdown.py`; instruction delivery:
+  `tests/runtime/test_prompt.py`; read access and measured total:
+  `tests/server/integration/test_sessions_permissions.py::test_context_breakdown_requires_read_access`.
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
@@ -1205,6 +1242,9 @@ node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
 
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
+- The context breakdown needs a finished turn: before one, the ring is hidden.
+  Its estimates come from stored content, so they can exceed the measured total
+  (Other then reads ~0) and do not track the harness's own trimming.
 
 - The launch action banner appears only on deployments whose launch code
   reports it; Omnigent's own sandbox providers never do. Its text comes from the

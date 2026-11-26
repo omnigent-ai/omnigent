@@ -225,6 +225,7 @@ from omnigent.runner.subagent_work import (
 from omnigent.runtime import routing_stamp, set_remote_routing_available
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    GATED_COMPOSED_INSTRUCTION_HARNESSES,
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
@@ -918,15 +919,6 @@ class InstructionComposition:
 
     authored_present: bool
     composed: str | None
-
-
-# Harnesses whose executor reads the wire ``instructions`` field itself and
-# needs the gated ``InstructionComposition.composed`` value there instead of
-# the default fallback-including composed-per-turn string — opencode-native
-# via its NativePrompt.system_prompt; hermes via HermesExecutor.run_turn's
-# system_prompt param. See the harness-conditional swap in
-# _stream_message_to_harness.
-_GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
 
 
 def _history_message_from_body(body: _JsonObject) -> _JsonObject:
@@ -6484,7 +6476,7 @@ def create_runner_app(
             )
             # Gated harnesses use nullable to avoid the fallback literal.
             _authored_bg = raw_author_instructions(cached_spec) is not None
-            if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+            if harness_name in GATED_COMPOSED_INSTRUCTION_HARNESSES:
                 instructions = build_instructions_nullable(
                     cached_spec, _raw_per_request_instructions, []
                 )
@@ -7283,7 +7275,7 @@ def create_runner_app(
                             ),
                         )
                         # Gated harnesses get nullable — skip the fallback literal.
-                        if harness_name in _GATED_COMPOSED_INSTRUCTION_HARNESSES:
+                        if harness_name in GATED_COMPOSED_INSTRUCTION_HARNESSES:
                             _instr_val = _ic_ds.composed
                             if _instr_val is not None:
                                 _instr_body = {**body, "instructions": _instr_val}
