@@ -3312,9 +3312,9 @@ def test_ensure_backend_databricks_preflight_ignores_launch_token(
     monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: False)
 
     with pytest.raises(click.ClickException) as exc:
-        _ensure_backend("https://myapp-1234.aws.databricksapps.com")
+        _ensure_backend(_HOST_DATABRICKS_SERVER)
 
-    assert "omnigent login https://myapp-1234.aws.databricksapps.com" in str(exc.value)
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
     assert login_calls == []
 
 

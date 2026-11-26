@@ -358,9 +358,12 @@ def test_host_enable_subcommand_installs_user_service(
     assert "Enabled the Omnigent host user service for local" in result.output
 
 
+_REMOTE_SERVER = "https://omnigent.example.com"
+
+
 @pytest.mark.parametrize(
     ("launch_token", "expected_preflight"),
-    [(None, [("https://myapp-1234.aws.databricksapps.com", True)]), ("launch-token", [])],
+    [(None, [(_REMOTE_SERVER, True)]), ("launch-token", [])],
     ids=["user-host", "launch-token-host"],
 )
 def test_host_enable_preflight_follows_launch_token(
@@ -372,7 +375,7 @@ def test_host_enable_preflight_follows_launch_token(
     """``host enable`` runs the sign-in pre-flight unless a launch token covers the host."""
     from omnigent.host.service import HostService
 
-    server = "https://myapp-1234.aws.databricksapps.com"
+    server = _REMOTE_SERVER
     if launch_token is not None:
         monkeypatch.setenv(HOST_TOKEN_ENV_VAR, launch_token)
     preflight: list[tuple[str, bool]] = []
