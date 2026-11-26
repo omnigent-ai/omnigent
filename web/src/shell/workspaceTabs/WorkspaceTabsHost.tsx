@@ -112,6 +112,7 @@ export function WorkspaceTabsHost({
       <CloseShellDialog
         open={shellClose.question !== null && shellClose.question.count === 1}
         shellLabel={shellClose.question?.label ?? null}
+        busy={shellClose.question?.busy}
         onCancel={() => shellClose.answerQuestion(false)}
         onConfirm={() => shellClose.answerQuestion(true)}
       />

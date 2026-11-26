@@ -1,5 +1,5 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { TerminalInfo } from "@/lib/terminals";
 
@@ -7,9 +7,6 @@ import { useTabsShellClose } from "./useTabsShellClose";
 
 const fetchMock = vi.hoisted(() => vi.fn<(url: string) => Promise<Response>>());
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: fetchMock }));
-// Only floating panes close an idle shell without asking.
-const floating = vi.hoisted(() => ({ on: false }));
-vi.mock("../useFloatingPanes", () => ({ useFloatingPanes: () => floating.on }));
 
 const shellState = (body: unknown) =>
   new Response(JSON.stringify(body), {
@@ -126,24 +123,9 @@ describe("useTabsShellClose", () => {
 });
 
 describe("useTabsShellClose with the runner's reading", () => {
-  beforeEach(() => {
-    floating.on = true;
-  });
   afterEach(() => {
-    floating.on = false;
     fetchMock.mockReset();
     vi.restoreAllMocks();
-  });
-
-  it("asks about an idle shell's tab, reading nothing, without floating panes", async () => {
-    floating.on = false;
-    fetchMock.mockResolvedValue(shellState({ state: "idle" }));
-    const { result } = closer(undefined, "conv_a");
-    act(() => {
-      void result.current.confirmCloseShell("terminal:t1");
-    });
-    expect(result.current.question).toMatchObject({ label: "zsh · s1", busy: null });
-    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("closes an idle shell's tab without asking", async () => {
@@ -206,7 +188,6 @@ describe("useTabsShellClose with the runner's reading", () => {
   });
 
   it("keeps the shell when the sidebar moves to another session while checking", async () => {
-    floating.on = true;
     fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
     const deleteTerminal = vi.fn(async () => undefined);
     const { result, rerender } = renderHook(
@@ -221,18 +202,5 @@ describe("useTabsShellClose with the runner's reading", () => {
     rerender({ sessionId: "conv_b" });
     await expect(closing).resolves.toBe(false);
     expect(result.current.question).toBeNull();
-  });
-
-  it("asks when floating panes turn off while it's checking", async () => {
-    floating.on = true;
-    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
-    const { result, rerender } = closer(undefined, "conv_a");
-    act(() => {
-      void result.current.confirmCloseShell("terminal:t1");
-    });
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    floating.on = false;
-    rerender();
-    expect(result.current.question).toMatchObject({ label: "zsh · s1", busy: null });
   });
 });

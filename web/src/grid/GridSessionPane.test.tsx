@@ -4,6 +4,7 @@ import type { Session } from "@/lib/types";
 import type * as ConversationEntryStateModule from "@/hooks/useConversationEntryState";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
 import type * as GridSessionsModule from "./GridSessionsContext";
+import type * as IdentityModule from "@/lib/identity";
 import {
   type ComponentProps,
   type ReactElement,
@@ -110,6 +111,29 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+// The runner's answer before a shell closes; unknown by default, so every close asks.
+const shellRead = vi.hoisted(() => ({
+  status: 200,
+  body: { state: "unknown" } as Record<string, unknown>,
+  asked: [] as string[],
+}));
+vi.mock("@/lib/identity", async (importOriginal) => {
+  const actual = await importOriginal<typeof IdentityModule>();
+  return {
+    ...actual,
+    authenticatedFetch: (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!url.endsWith("/shell")) return actual.authenticatedFetch(input, init);
+      shellRead.asked.push(url);
+      return Promise.resolve(
+        new Response(JSON.stringify(shellRead.body), {
+          status: shellRead.status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    },
+  };
+});
 vi.mock("@/shell/PullRequestPanel", () => ({ selectPullRequestInPanel: vi.fn() }));
 vi.mock("@/shell/FilesPanel", async (original) => ({
   ...(await original<typeof FilesPanelModule>()),
@@ -311,6 +335,17 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         >
           Close shells
         </button>
+        <button type="button" onClick={() => props.openTerminalTab("terminal:terminal_b")}>
+          Select shell b
+        </button>
+        <button
+          type="button"
+          onClick={() =>
+            props.onCloseTerminal(props.selectedTerminalKey!, { onConfirmed: vi.fn() })
+          }
+        >
+          Close selected shell
+        </button>
       </aside>
     );
   },
@@ -336,6 +371,9 @@ afterEach(() => {
   fixture.readOnlySessions = [];
   fixture.launches = {};
   fixture.inferenceConfigured = undefined;
+  shellRead.status = 200;
+  shellRead.body = { state: "unknown" };
+  shellRead.asked = [];
   vi.restoreAllMocks();
 });
 
@@ -507,7 +545,8 @@ it("closes workspace tabs without asking the viewer again", () => {
   expect(workspace).toHaveTextContent("No file");
 });
 
-it("asks once before a bulk shell close and kills nothing when cancelled", () => {
+it("asks once before a bulk shell close and kills nothing when cancelled", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
   fixture.terminals = [
     { id: "terminal_a", name: "a", session: "main", running: true },
     { id: "terminal_b", name: "b", session: "main", running: true },
@@ -516,13 +555,74 @@ it("asks once before a bulk shell close and kills nothing when cancelled", () =>
   const workspace = screen.getByTestId("workspace-first");
 
   fireEvent.click(within(workspace).getByText("Close shells"));
-  expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+  expect(await screen.findByRole("dialog")).toHaveTextContent("Close 2 shells?");
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(fixture.deleteTerminal).not.toHaveBeenCalled();
 
   fireEvent.click(within(workspace).getByText("Close shells"));
-  fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Close shells" }));
   expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
+});
+
+it("keeps a shell selected while an earlier close is still deleting", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  let finishDelete = () => {};
+  fixture.deleteTerminal = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        finishDelete = resolve;
+      }),
+  );
+  writeSessionWorkspaceState("first", { selectedTerminalKey: "terminal:terminal_a" });
+  render(twoCellGrid());
+  const workspace = screen.getByTestId("workspace-first");
+
+  fireEvent.click(within(workspace).getByText("Close selected shell"));
+  fireEvent.click(await screen.findByRole("button", { name: "Close shell" }));
+  expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"]]);
+  fireEvent.click(within(workspace).getByText("Select shell b"));
+  expect(workspace).toHaveAttribute("data-terminal", "terminal:terminal_b");
+
+  await act(async () => finishDelete());
+  expect(workspace).toHaveAttribute("data-terminal", "terminal:terminal_b");
+});
+
+it("asks about a bulk shell close when the server can't inspect shells", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  fixture.terminals = [
+    { id: "terminal_a", name: "a", session: "main", running: true },
+    { id: "terminal_b", name: "b", session: "main", running: true },
+  ];
+  // An older server has no shell route.
+  shellRead.status = 404;
+  shellRead.body = { detail: "Not Found" };
+  render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  expect(await screen.findByRole("dialog")).toHaveTextContent("Close 2 shells?");
+  expect(shellRead.asked).toHaveLength(2);
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+});
+
+it("closes idle shells without asking and asks about a busy one, naming its job", async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
+  fixture.terminals = [{ id: "terminal_a", name: "a", session: "main", running: true }];
+  shellRead.body = { state: "busy", foreground: "vim", background_jobs: 0 };
+  const { unmount } = render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  await waitFor(() => expect(screen.getByRole("dialog")).toHaveTextContent("vim is running in a"));
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+  unmount();
+
+  shellRead.body = { state: "idle" };
+  render(twoCellGrid());
+  fireEvent.click(within(screen.getByTestId("workspace-first")).getByText("Close shells"));
+  await waitFor(() => expect(fixture.deleteTerminal.mock.calls).toEqual([["terminal_a"]]));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(shellRead.asked).toHaveLength(2);
 });
 
 it("opens chat-linked folders and PRs in that pane's workspace", () => {
