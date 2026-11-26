@@ -1090,6 +1090,7 @@ def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
     assert out == []
     rejection = next(m for m in caplog.messages if "outside the trusted roots" in m)
     assert "sp@mkt" in rejection
+    assert str(install) not in rejection
     assert str((cfg / "plugins").resolve()) not in rejection
     assert str((tmp_path / "shared-cache").resolve()) not in rejection
 
