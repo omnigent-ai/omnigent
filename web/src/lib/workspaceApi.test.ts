@@ -37,6 +37,7 @@ import {
   listDirectoryViaWorkspaceApi,
   readFileViaWorkspaceApi,
   listBranchCommitsViaWorkspaceApi,
+  listRepositoryRefsViaWorkspaceApi,
   listWorkingCopyChangesViaWorkspaceApi,
   rankFilesViaWorkspaceApi,
   readBaseFileViaWorkspaceApi,
@@ -1557,6 +1558,73 @@ describe("Git comparisons through the workspace API", () => {
     expect(kinds).toEqual([ComparisonKind.BRANCH_POINT]);
     expect(methodCalls("ResolveWorkingCopyBase")).toHaveLength(0);
     expect(methodCalls("ListBranchCommits")).toHaveLength(0);
+  });
+
+  it("names a repository folder only to a host that lists comparison.repository", async () => {
+    enable("workspace_api_server_access");
+    let features: string[] = [];
+    const folders: string[] = [];
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(
+          capabilitiesBody(
+            "ResolveWorkingCopyBase",
+            "ListWorkingCopyChanges",
+            "ReadBaseFile",
+            "ListRepositoryRefs",
+            "ListBranchCommits",
+            "branch_commits",
+            ...features,
+          ),
+          { headers: PROTO_HEADERS },
+        ),
+      ListWorkingCopyChanges: (body) => {
+        folders.push(fromBinary(ListWorkingCopyChangesRequestSchema, body).repository);
+        const changes = create(ListWorkingCopyChangesResponseSchema, {
+          base: { kind: ComparisonKind.BRANCH_POINT, base: "b".repeat(40) },
+        });
+        return new Response(toBinary(ListWorkingCopyChangesResponseSchema, changes), {
+          headers: PROTO_HEADERS,
+        });
+      },
+    });
+    const branchPoint = { kind: ComparisonKind.BRANCH_POINT };
+    const folder = ".worktrees/feature";
+
+    // An older host would compare the workspace instead, so nothing is sent to it.
+    const older = "s-folder-older";
+    expect(
+      await listWorkingCopyChangesViaWorkspaceApi(older, branchPoint, undefined, folder),
+    ).toBeNull();
+    expect(
+      await resolveWorkingCopyBaseViaWorkspaceApi(older, branchPoint, undefined, folder),
+    ).toBeNull();
+    expect(await listRepositoryRefsViaWorkspaceApi(older, undefined, folder)).toBeNull();
+    expect(
+      await listBranchCommitsViaWorkspaceApi(older, { base: "main", head: "" }, undefined, folder),
+    ).toBeNull();
+    expect(
+      await readBaseFileViaWorkspaceApi(
+        older,
+        { commit: "c".repeat(40), path: "a.ts", object: "o".repeat(40) },
+        undefined,
+        folder,
+      ),
+    ).toBeNull();
+    expect(folders).toEqual([]);
+    // Its workspace listing still goes through.
+    await listWorkingCopyChangesViaWorkspaceApi(older, branchPoint);
+    expect(folders).toEqual([""]);
+
+    features = ["comparison.repository"];
+    const listed = await listWorkingCopyChangesViaWorkspaceApi(
+      "s-folder-current",
+      branchPoint,
+      undefined,
+      folder,
+    );
+    expect(listed?.base?.base).toBe("b".repeat(40));
+    expect(folders).toEqual(["", folder]);
   });
 
   it("answers null when the host doesn't serve the method", async () => {

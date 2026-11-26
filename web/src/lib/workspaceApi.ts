@@ -830,40 +830,55 @@ export function searchTextViaWorkspaceApi(
 // request the host rejects throws its ConnectError, whose message says why.
 const GIT_OPTIONS = { throwAnswers: true } as const;
 
-/** The optional features a comparison relies on: a host may serve the method without them. */
-function comparisonFeatures(comparison: ComparisonInit): string[] {
-  return comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : [];
+/** The feature a request naming a repository folder needs; an older host would answer for the workspace. */
+const REPOSITORY_FEATURE = "comparison.repository";
+
+function repositoryFeatures(repository: string): string[] {
+  return repository ? [REPOSITORY_FEATURE] : [];
 }
 
-/** Resolve a comparison's base and head commits. */
+/** The optional features a comparison relies on: a host may serve the method without them. */
+function comparisonFeatures(comparison: ComparisonInit, repository: string): string[] {
+  return [
+    ...(comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : []),
+    ...repositoryFeatures(repository),
+  ];
+}
+
+/**
+ * Resolve a comparison's base and head commits. `repository`, a folder relative to the
+ * workspace such as a worktree inside it, compares that repository; empty for the workspace.
+ */
 export function resolveWorkingCopyBaseViaWorkspaceApi(
   sessionId: string,
   comparison: ComparisonInit,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<WorkingCopyBase | null> {
   return viaWorkspaceApi(
     sessionId,
     "resolveWorkingCopyBase",
     async (client) => {
-      const response = await client.resolveWorkingCopyBase({ comparison }, { signal });
+      const response = await client.resolveWorkingCopyBase({ comparison, repository }, { signal });
       if (!response.base) throw new UnusableAnswerError("The workspace API sent no base");
       return response.base;
     },
-    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison, repository) },
   );
 }
 
-/** List the files a comparison changes, with its resolved base. */
+/** List the files a comparison changes, with its resolved base; paths are `repository`'s. */
 export function listWorkingCopyChangesViaWorkspaceApi(
   sessionId: string,
   comparison: ComparisonInit,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListWorkingCopyChangesResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listWorkingCopyChanges",
-    (client) => client.listWorkingCopyChanges({ comparison }, { signal }),
-    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
+    (client) => client.listWorkingCopyChanges({ comparison, repository }, { signal }),
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison, repository) },
   );
 }
 
@@ -878,12 +893,18 @@ export function readBaseFileViaWorkspaceApi(
   sessionId: string,
   file: { commit: string; path: string; object: string },
   signal?: AbortSignal,
+  repository = "",
 ): Promise<FileContentResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "readBaseFile",
-    (client) => collectFile(file.path, client.readBaseFile(file, { signal })),
-    { ...GIT_OPTIONS, signal, answerCodes: FILE_STATE_ANSWER_CODES },
+    (client) => collectFile(file.path, client.readBaseFile({ ...file, repository }, { signal })),
+    {
+      ...GIT_OPTIONS,
+      signal,
+      answerCodes: FILE_STATE_ANSWER_CODES,
+      features: repositoryFeatures(repository),
+    },
   );
 }
 
@@ -909,12 +930,13 @@ export function readLinkTextViaWorkspaceApi(
 export function listRepositoryRefsViaWorkspaceApi(
   sessionId: string,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListRepositoryRefsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listRepositoryRefs",
-    (client) => client.listRepositoryRefs({}, { signal }),
-    { ...GIT_OPTIONS, signal },
+    (client) => client.listRepositoryRefs({ repository }, { signal }),
+    { ...GIT_OPTIONS, signal, features: repositoryFeatures(repository) },
   );
 }
 
@@ -926,16 +948,23 @@ export function listBranchCommitsViaWorkspaceApi(
   sessionId: string,
   range: RevisionSpec,
   signal?: AbortSignal,
+  repository = "",
 ): Promise<ListBranchCommitsResponse | null> {
   return viaWorkspaceApi(
     sessionId,
     "listBranchCommits",
     (client) =>
-      client.listBranchCommits({ baseRevision: range.base, headRevision: range.head }, { signal }),
+      client.listBranchCommits(
+        { baseRevision: range.base, headRevision: range.head, repository },
+        { signal },
+      ),
     {
       ...GIT_OPTIONS,
       signal,
-      features: range.head ? ["branch_commits", "branch_commits.head"] : ["branch_commits"],
+      features: [
+        ...(range.head ? ["branch_commits", "branch_commits.head"] : ["branch_commits"]),
+        ...repositoryFeatures(repository),
+      ],
     },
   );
 }
