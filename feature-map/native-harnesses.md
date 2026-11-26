@@ -29,7 +29,7 @@ implements them separately, so a fix for one harness does not reach the others.
 - `agent-instructions`: supported native startup paths preserve authored instructions
   and add shared guidance for showing workspace screenshots; Pi authors can keep
   or replace its base prompt and disable automatic context files.
-- `long-term-memory`: on a server with memory on, Claude Code, Codex and Pi
+- `long-term-memory`: on a server with memory on, Claude Code, Codex, Pi and Antigravity
   sessions start with a note on the `memory_*` tools and a quoted index of up to
   100 saved memories (path, short description, last-updated date; the session's
   project first), and can save and recall memories across sessions and
@@ -712,9 +712,31 @@ Cross-harness journeys:
   checks authored instructions in actual scripted-provider requests before and
   after a real Pi fork with tool history. These checks do not prove browser
   launch, OS sandbox access or live-model adherence to the instructions.
-- **`long-term-memory`, Claude, Codex and Pi native:** start the instance's
+- **`agent-instructions`, Antigravity native:** startup text is composed by the
+  shared native instruction helper and written as an always-on rule under the
+  session's isolated `config/rules/omnigent_instructions.md`. Existing user rules
+  remain alongside it. Automatic launch, terminal re-creation and the CLI
+  fallback resolve the session's agent before composing the rule.
+  If a named child is unavailable, automatic launch and terminal re-creation
+  retain the shared resolver's parent-agent fallback; the CLI uses framework
+  guidance only. Existing fallback behavior is preserved in each path.
+  CLI instruction loading is best effort: fetch or corrupt-bundle failures warn
+  and use framework guidance. The runner's added fallback handles transient
+  instruction fetch failures. Relay initialization still requires a resolved
+  session bundle, so a persistent outage can prevent terminal creation.
+  For automatic launch and terminal re-creation, authorization and startup-policy
+  rejections remain launch failures. CLI instruction retrieval is separate from
+  authorization for its subsequent terminal request.
+  `tests/runner/test_app_native_startup_instructions.py::test_antigravity_startup_rule_is_ready_before_terminal_launch`
+  checks authored instructions, image guidance and memory before a mocked
+  terminal boundary, for fresh and resumed sessions.
+  `tests/harnesses/antigravity_native/test_antigravity_native.py::test_cli_fallback_delivers_effective_session_startup_instructions`
+  covers the CLI fallback, child-agent selection, missing children and missing
+  legacy bundles.
+  These component checks do not prove a native CLI consumed the rule.
+- **`long-term-memory`, Claude, Codex, Pi and Antigravity native:** start the instance's
   server with `OMNIGENT_FEATURES=memory`. The shared startup composer used by
-  all three launches is covered by
+  these launches is covered by
   `tests/runner/test_app_native_startup_instructions.py::test_startup_instructions_join_stable_text_notes_and_memory_in_order`
   and, with memory off,
   `tests/runner/test_app_native_startup_instructions.py::test_startup_instructions_without_memory_are_unchanged`.

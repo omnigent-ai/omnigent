@@ -11,6 +11,7 @@ from types import ModuleType
 from typing import Any, Literal
 
 import httpx
+import yaml
 
 from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
@@ -82,6 +83,7 @@ def create_native_session(
     harness: NativeHarness,
     metadata: Mapping[str, Any] | None = None,
     model: str | None = None,
+    instructions: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create an unbound wrapper session with caller metadata; return its response.
@@ -131,7 +133,12 @@ def create_native_session(
             wrapper = HERMES_NATIVE_WRAPPER_VALUE
         else:
             raise ValueError(f"Unsupported native harness: {harness}")
-        data = spec.read_text().encode()
+        if instructions is None:
+            data = spec.read_bytes()
+        else:
+            document = yaml.safe_load(spec.read_text())
+            document["prompt"] = instructions
+            data = yaml.safe_dump(document, sort_keys=False).encode()
 
     payload = dict(metadata) if metadata is not None else {}
     labels = dict(payload.get("labels", {}))

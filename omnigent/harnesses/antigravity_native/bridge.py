@@ -516,6 +516,36 @@ def build_mcp_config(
     }
 
 
+def write_agent_instructions(bridge_dir: Path, instructions: str | None) -> Path | None:
+    """Write composed startup text as a private, always-on agy rule."""
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    path = gemini_dir / "config" / "rules" / "omnigent_instructions.md"
+    try:
+        contained = gemini_dir.resolve().is_relative_to(bridge_dir.resolve()) and (
+            path.parent.resolve().is_relative_to(gemini_dir.resolve())
+        )
+    except RuntimeError:
+        contained = False
+    if not contained:
+        raise ValueError("Antigravity startup rules must stay inside the isolated Gemini dir.")
+    if instructions is None or not instructions.strip():
+        path.unlink(missing_ok=True)
+        return None
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="omnigent_instructions.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("---\ntrigger: always_on\n---\n\n")
+            handle.write(instructions)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+    return path
+
+
 def write_mcp_bridge_config(bridge_dir: Path) -> None:
     """Write the token config the shared Omnigent MCP relay requires.
 

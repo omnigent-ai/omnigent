@@ -265,6 +265,14 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                     if results:
                         control_results[stage] = results
                     parts = [{"text": f"{stage}_DONE" if results else f"{stage}_RESULT_MISSING"}]
+            authored_context = {
+                "systemInstruction": request.get("systemInstruction"),
+                "contents": [c for c in request.get("contents", []) if c.get("role") != "model"],
+            }
+            if "AGY-STARTUP" in json.dumps(authored_context):
+                for part in parts:
+                    if "text" in part:
+                        part["text"] = "AGY-STARTUP " + part["text"]
             response = {
                 "candidates": [
                     {
@@ -425,6 +433,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 client,
                 str(client.base_url).rstrip("/"),
                 harness="antigravity",
+                instructions="Begin every reply with AGY-STARTUP.",
                 metadata={"host_id": host["host_id"], "workspace": str(workspace)},
             )
             session_id = created["session_id"]
@@ -444,6 +453,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             page.get_by_role("button", name="Send", exact=True).click()
             replies = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
             expect(replies.filter(has_text="GATEWAY_SETUP_OK")).to_have_count(1, timeout=90_000)
+            expect(replies.filter(has_text="AGY-STARTUP GATEWAY_SETUP_OK")).to_have_count(1)
             expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
             assert tool_completed.is_set(), "gateway did not receive the real file tool result"
             assert any("GATEWAY_SETUP_OK" in json.dumps(r.get("contents")) for r in captured)
@@ -517,6 +527,9 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
             expect(page.get_by_test_id("error-pill")).to_have_count(0)
             expect(replies).to_have_count(3)
+            expect(
+                replies.filter(has_text="AGY-STARTUP GATEWAY_RECALL_OK: GATEWAY_TOOL_RESULT")
+            ).to_have_count(2)
             after_resume = transcript()
             assert after_resume[: len(before_resume)] == before_resume
             assert [item["type"] for item in after_resume[len(before_resume) :]] == [

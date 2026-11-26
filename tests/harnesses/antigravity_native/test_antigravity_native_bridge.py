@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shlex
+import stat
 import subprocess
 import threading
 from collections.abc import Callable
@@ -33,6 +34,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     seed_isolated_agy_home,
     send_interaction_keys_via_tui,
     update_conversation_id,
+    write_agent_instructions,
     write_bridge_state,
     write_mcp_bridge_config,
     write_mcp_config,
@@ -1628,6 +1630,67 @@ def test_inject_user_message_via_tui_short_message_raises_when_not_submitted(
 # ---------------------------------------------------------------------------
 # Omnigent MCP relay wiring (sys_* tools) — #1194
 # ---------------------------------------------------------------------------
+
+
+def test_write_agent_instructions_refreshes_only_the_owned_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Always-on startup text is private and coexists with the user's rules."""
+    bridge_dir = tmp_path / "bridge"
+    rules_dir = agy_gemini_dir(bridge_dir) / "config" / "rules"
+    rules_dir.mkdir(parents=True)
+    user_rule = rules_dir / "user-rule.md"
+    user_rule.write_text("Keep the user's rule.", encoding="utf-8")
+    instructions = "  Authored instructions.  \n\nFramework guidance."
+
+    path = write_agent_instructions(bridge_dir, instructions)
+
+    assert path == rules_dir / "omnigent_instructions.md"
+    assert path.read_text(encoding="utf-8") == (
+        "---\ntrigger: always_on\n---\n\n" + instructions + "\n"
+    )
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert write_agent_instructions(bridge_dir, "Updated on resume.") == path
+    assert "Updated on resume." in path.read_text(encoding="utf-8")
+    assert "Authored instructions." not in path.read_text(encoding="utf-8")
+    previous = path.read_bytes()
+
+    def fail_replace(*_args: object) -> None:
+        raise PermissionError("read-only startup rule")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("omnigent.harnesses.antigravity_native.bridge.os.replace", fail_replace)
+        with pytest.raises(PermissionError, match="read-only startup rule"):
+            write_agent_instructions(bridge_dir, "Replacement must not be visible.")
+    assert path.read_bytes() == previous
+    assert {entry.name for entry in rules_dir.iterdir()} == {path.name, user_rule.name}
+    assert write_agent_instructions(bridge_dir, None) is None
+    assert not path.exists()
+    assert user_rule.read_text(encoding="utf-8") == "Keep the user's rule."
+
+
+@pytest.mark.parametrize("linked_dir", ["gemini", "rules", "cyclic-rules"])
+def test_write_agent_instructions_never_follows_rules_outside_the_bridge(
+    tmp_path: Path, linked_dir: str
+) -> None:
+    """A linked user configuration must not receive a generated startup rule."""
+    bridge_dir = tmp_path / "bridge"
+    gemini_dir = agy_gemini_dir(bridge_dir)
+    real_rules = tmp_path / "real-rules"
+    real_rules.mkdir()
+    link = gemini_dir if linked_dir == "gemini" else gemini_dir / "config" / "rules"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(
+        link.name if linked_dir == "cyclic-rules" else real_rules, target_is_directory=True
+    )
+
+    expected_errors = (ValueError, OSError) if linked_dir == "cyclic-rules" else (ValueError,)
+    with pytest.raises(expected_errors) as raised:
+        write_agent_instructions(bridge_dir, "Startup text.")
+    if isinstance(raised.value, ValueError):
+        assert "isolated Gemini dir" in str(raised.value)
+
+    assert list(real_rules.iterdir()) == []
 
 
 def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:

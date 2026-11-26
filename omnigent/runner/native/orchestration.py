@@ -7240,6 +7240,7 @@ async def _auto_create_antigravity_terminal(
     *,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -7294,6 +7295,8 @@ async def _auto_create_antigravity_terminal(
         relay is started against this session's bridge dir before launch so the
         wrapped agy sees the ``sys_*`` tools (#1194). ``None`` skips relay wiring
         (the ``_run_turn_bg`` first-turn fallback re-ensures it).
+    :param agent_spec: Resolved session agent whose authored instructions and
+        memory guidance should be delivered before the first agy turn.
     :returns: The created terminal resource view.
     :raises RuntimeError: If the session snapshot or required runner env is
         unavailable.
@@ -7307,6 +7310,7 @@ async def _auto_create_antigravity_terminal(
         ensure_agy_feedback_survey_disabled,
         prepare_bridge_dir,
         seed_isolated_agy_home,
+        write_agent_instructions,
         write_bridge_state,
         write_mcp_config,
         write_tmux_target,
@@ -7417,6 +7421,17 @@ async def _auto_create_antigravity_terminal(
             trusted_workspace=workspace,
         ),
     }
+    startup_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id, workspace=workspace
+    )
+    try:
+        await asyncio.to_thread(write_agent_instructions, bridge_dir, startup_instructions)
+    except (OSError, ValueError) as error:
+        _logger.warning(
+            "Could not write Antigravity startup instructions (%s); terminal launch will continue",
+            type(error).__name__,
+            extra={"session_id": session_id},
+        )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
     # active turn and lost (#1494). Disable it before launch. agy now runs under
@@ -8117,6 +8132,25 @@ def _native_startup_instructions_from_spec(
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     return build_native_startup_instructions(spec)
+
+
+async def _antigravity_startup_agent_spec(
+    session_id: str,
+    resolve: Callable[[str], Awaitable[AgentSpec | None]],
+) -> AgentSpec | None:
+    """Prepare framework guidance if optional Antigravity instruction retrieval fails."""
+    from omnigent.runner._entry import AgentSpecFetchError
+
+    try:
+        return await resolve(session_id)
+    except AgentSpecFetchError:
+        _logger.warning(
+            "Could not fetch Antigravity startup instructions; preparing framework "
+            "guidance: session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return None
 
 
 async def _native_startup_instructions(
@@ -11251,6 +11285,7 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 

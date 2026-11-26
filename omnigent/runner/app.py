@@ -3709,6 +3709,13 @@ def create_runner_app(
 
                 _launch_pre = _antigravity_pre_launch
 
+                async def _antigravity_resolve_spec() -> AgentSpec | None:
+                    return await _native_runtime._antigravity_startup_agent_spec(
+                        session_id, _resolve_session_agent_spec_or_none
+                    )
+
+                _launch_resolve_spec = _antigravity_resolve_spec
+
             elif harness_name == "pi-native":
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
