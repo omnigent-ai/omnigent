@@ -2,7 +2,7 @@
 // with fuzzy-ranked actions and keyboard navigation from the QuickPick list, and the
 // commands features on screen offer through `usePaletteCommands`, under their headings.
 
-import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "zustand";
 import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
@@ -38,7 +38,7 @@ import {
 import { currentPaletteCommand, paletteCommandItems } from "./paletteCommandRows";
 import { PaletteSessionContext } from "./PaletteSessionContext";
 import type { PaletteTarget as PaletteRow } from "./paletteTarget";
-import { useSettingChoicesPage } from "./settingChoicesPage";
+import { pageStatusSummary, useSettingChoicesPage } from "./settingChoicesPage";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 const COMMAND_HISTORY_KEY = "command-palette:commands";
@@ -66,17 +66,6 @@ const CHILD_PAGE_COPY = {
     empty: "No actions for this session.",
   },
 } as const;
-
-/** The footer's line for what a page waits on, or why a choice didn't apply. */
-function pageStatusSummary(text: string): () => ReactNode {
-  return function PageStatus() {
-    return (
-      <span role="status" data-slot="palette-page-status">
-        {text}
-      </span>
-    );
-  };
-}
 
 /** The phone sheet fills the keyboard-aware viewport, clear of the title bar and home bar. */
 const MOBILE_SHEET_STYLE: CSSProperties = {

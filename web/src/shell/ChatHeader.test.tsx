@@ -9,6 +9,11 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import type { ServerInfo } from "@/lib/capabilities";
+import { resetUiFeatureOverridesForTests, writeUiFeatureOverride } from "@/lib/uiFeatureOverrides";
+import { useFeatureFlagsPickerStore } from "@/store/featureFlagsPicker";
 import { ChatHeader } from "./ChatHeader";
 import { claimChatPaneViewToggleHost, releaseChatPaneViewToggleHost } from "./chatPaneToolbarHost";
 import {
@@ -73,6 +78,7 @@ const mobileMenu = {
 
 function renderHeader(props: {
   sidebarOpen: boolean;
+  serverInfo?: ServerInfo;
   isChildSession?: boolean;
   subAgentName?: string | null;
   conversationId?: string;
@@ -103,7 +109,7 @@ function renderHeader(props: {
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
+        <TooltipProvider delayDuration={0}>
           <ChatHeader
             sidebarOpen={props.sidebarOpen}
             onOpenSidebar={props.onOpenSidebar ?? (() => {})}
@@ -141,11 +147,19 @@ function renderHeader(props: {
         </TooltipProvider>
       </QueryClientProvider>
     </MemoryRouter>,
+    {
+      wrapper: ({ children }) => (
+        <CapabilitiesProvider info={props.serverInfo ?? "loading"}>{children}</CapabilitiesProvider>
+      ),
+    },
   );
 }
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
+  resetUiFeatureOverridesForTests();
+  useFeatureFlagsPickerStore.setState({ open: false, replaced: false });
   vi.restoreAllMocks();
   setOmnigentHostConfig({});
   isIOSShellMock.mockReturnValue(false);
@@ -1247,5 +1261,45 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
     expect(screen.getByText("reviewer")).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — UI feature overrides", () => {
+  const serverInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { quick_pick_palette: true, canvas: false, session_overview: true },
+  };
+
+  it("hides the warning with no effective overrides", () => {
+    renderHeader({ sidebarOpen: true, serverInfo });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
+  });
+
+  it.each([false, true])("names overrides and opens the picker (mobile: %s)", async (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    expect(writeUiFeatureOverride("canvas", false)).toBe(true);
+    expect(writeUiFeatureOverride("session_overview", false)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({ sidebarOpen: true, serverInfo });
+    const label = "UI feature flags overridden: Canvas Off, Session cost sidebar Off";
+    const button = screen.getByRole("button", { name: label });
+    expect(button).toHaveClass("text-warning");
+    fireEvent.pointerMove(button, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+    fireEvent.click(button);
+    expect(useFeatureFlagsPickerStore.getState().open).toBe(true);
+  });
+
+  it.each<Record<string, boolean>>([
+    { quick_pick_palette: false, canvas: false },
+    { quick_pick_palette: true },
+  ])("hides stored decisions when the gate is disabled or flags are unreported", (features) => {
+    expect(writeUiFeatureOverride("canvas", true)).toBe(true);
+    resetUiFeatureOverridesForTests();
+    renderHeader({
+      sidebarOpen: true,
+      serverInfo: { ...serverInfo, features },
+    });
+    expect(screen.queryByRole("button", { name: /UI feature flags overridden/ })).toBeNull();
   });
 });

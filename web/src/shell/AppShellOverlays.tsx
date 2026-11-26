@@ -17,6 +17,9 @@ const QuickPickCommandPalette = lazy(() =>
     default: module.QuickPickCommandPalette,
   })),
 );
+const FeatureFlagsPicker = lazy(() =>
+  import("./FeatureFlagsPicker").then((module) => ({ default: module.FeatureFlagsPicker })),
+);
 const ThemePicker = lazy(() =>
   import("./ThemePicker").then((module) => ({ default: module.ThemePicker })),
 );
@@ -93,10 +96,11 @@ export function AppShellOverlays({
           onGoToSession={goToSession}
         />
       </Suspense>
-      {/* "Select theme…" from ⌘K; previews each theme as the user moves through them. */}
+      {/* ⌘K's theme and UI feature-flag pickers. */}
       {quickPick && (
         <Suspense fallback={null}>
           <ThemePicker />
+          <FeatureFlagsPicker />
         </Suspense>
       )}
       <RecentSessionsSwitcher
