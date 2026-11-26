@@ -11745,7 +11745,7 @@ def _reject_server_reserved_label_seed(
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
     if any(key.startswith(LOOP_TIMER_LABEL_PREFIX) for key in labels):
-        raise OmnigentError("Loop labels are server-owned", code=ErrorCode.INVALID_INPUT)
+        raise OmnigentError("Loop labels are server-internal", code=ErrorCode.INVALID_INPUT)
     if any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in labels):
         raise OmnigentError(
             "Scheduled run labels are server-internal", code=ErrorCode.INVALID_INPUT

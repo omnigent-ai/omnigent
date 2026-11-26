@@ -1662,18 +1662,21 @@ describe("Composer slash-command menu", () => {
   function renderSessionComposer(
     harness: "claude-native" | "codex-native" | "claude-sdk",
     advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+    strict = false,
   ) {
     const { sessionHarness } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness }));
     useChatStore.setState({ sessionHarness: harness });
     const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
-    render(
+    const composer = (
       <CapabilitiesProvider
         info={advertised === "loading" ? "loading" : { ...FALLBACK_SERVER_INFO, ...advertised }}
       >
         <Composer {...props} />
-      </CapabilitiesProvider>,
+      </CapabilitiesProvider>
     );
+    // StrictMode replays effects the way the development app does.
+    render(strict ? <StrictMode>{composer}</StrictMode> : composer);
     return props;
   }
 
@@ -1736,8 +1739,9 @@ describe("Composer slash-command menu", () => {
     harness: "claude-native" | "claude-sdk" | "codex-native",
     advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
     running: string | null = null,
+    strict = false,
   ) {
-    const props = renderSessionComposer(harness, advertised);
+    const props = renderSessionComposer(harness, advertised, strict);
     const stopLoop = vi.spyOn(sessionTimersApi, "stopSessionLoop").mockResolvedValue(running);
     const cancelTimer = vi.spyOn(sessionTimersApi, "cancelSessionTimer").mockResolvedValue(true);
     const setTimer = vi.spyOn(sessionTimersApi, "setSessionTimer").mockResolvedValue(savedLoop);
@@ -1860,15 +1864,26 @@ describe("Composer slash-command menu", () => {
     expect(textarea()).toHaveValue(typed);
   });
 
-  it("/loop shows the error and gives the command back when the timer is refused", async () => {
-    const { setTimer, sendPrompt, onSend } = renderLoopComposer("claude-sdk", savesTimers);
-    setTimer.mockRejectedValueOnce(new Error("This session is archived, so it can't take timers"));
-    submitLoop("/loop 5m check CI");
-    expect(await screen.findByText(/archived/)).toBeVisible();
-    expect(sendPrompt).not.toHaveBeenCalled();
-    expect(onSend).not.toHaveBeenCalled();
-    expect(textarea()).toHaveValue("/loop 5m check CI");
-  });
+  it.each([false, true])(
+    "/loop shows the error and gives the command back when the timer is refused (StrictMode: %s)",
+    async (strict) => {
+      const { setTimer, sendPrompt, onSend } = renderLoopComposer(
+        "claude-sdk",
+        savesTimers,
+        null,
+        strict,
+      );
+      setTimer.mockRejectedValueOnce(
+        new Error("This session is archived, so it can't take timers"),
+      );
+      submitLoop("/loop 5m check CI");
+      expect(await screen.findByText(/archived/)).toBeVisible();
+      expect(sendPrompt).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+      // Back in the visible composer, not parked in the session's saved draft.
+      expect(textarea()).toHaveValue("/loop 5m check CI");
+    },
+  );
 
   it("/loop cancels the timer it just saved when the first run is refused", async () => {
     const { cancelTimer, sendPrompt } = renderLoopComposer("claude-sdk", savesTimers);

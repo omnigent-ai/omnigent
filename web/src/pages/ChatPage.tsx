@@ -3022,12 +3022,12 @@ function ComposerImpl(
   const composerSessionIdRef = useRef(composerSessionId);
   // A /loop failure may land after the chat surface unmounted (the terminal view).
   const composerMountedRef = useRef(true);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    composerMountedRef.current = true;
+    return () => {
       composerMountedRef.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
   composerSessionIdRef.current = composerSessionId;
   const draftRef = useRef(value);
   draftRef.current = value;

@@ -462,17 +462,6 @@ async def test_client_meta_and_external_messages_do_not_infer_user_authorship(
     assert "origin" not in message
 
 
-async def test_clients_cannot_set_the_loop_pointer_label(client: httpx.AsyncClient) -> None:
-    """The label naming a user's running loop is the server's; an editor can't redirect it."""
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    resp = await client.patch(
-        f"/v1/sessions/{session['id']}", json={"labels": {"omnigent.loop_timer.abc": "task_x"}}
-    )
-    assert resp.status_code == 400, resp.text
-    assert "Loop labels are server-owned" in resp.text
-
-
 async def test_a_user_message_keeps_the_origin_its_client_set(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

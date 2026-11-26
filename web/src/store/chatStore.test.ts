@@ -11851,7 +11851,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         itemId: "msg_newer",
         itemType: "message",
         clearedPendingId: "pending_new",
-        data: { role: "user", content: [{ type: "input_text", text: "newer" }] },
+        data: {
+          role: "user",
+          origin: "loop",
+          content: [{ type: "input_text", text: "newer" }],
+        },
       });
 
       const state = useChatStore.getState();
@@ -11862,6 +11866,8 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const promoted = state.blocks[0] as UserMessageBlock;
       expect(promoted.ctx.itemId).toBe("msg_newer");
       expect(promoted.content).toEqual([{ type: "input_text", text: "newer" }]);
+      // A /loop run's label survives the promotion.
+      expect(promoted.origin).toBe("loop");
     });
 
     it("drops the matched entry by id even when the consumed text was reformatted", () => {
@@ -11930,7 +11936,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         itemId: "msg_hi",
         itemType: "message",
         clearedPendingId: null,
-        data: { role: "user", content: [{ type: "input_text", text: "the original draft" }] },
+        data: {
+          role: "user",
+          origin: "loop",
+          content: [{ type: "input_text", text: "the original draft" }],
+        },
       });
 
       const state = useChatStore.getState();
@@ -11938,6 +11948,8 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.pendingUserMessages).toEqual([]);
       expect(state.blocks).toHaveLength(1);
       expect((state.blocks[0] as UserMessageBlock).ctx.itemId).toBe("msg_hi");
+      // A /loop run's label survives the promotion.
+      expect((state.blocks[0] as UserMessageBlock).origin).toBe("loop");
     });
   });
 
