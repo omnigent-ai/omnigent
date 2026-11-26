@@ -849,10 +849,14 @@ export function InboxPage() {
     if (entry.kind === "ticket") {
       const { item } = entry;
       const others = item.responders.length - 1;
+      const otherApprovers =
+        others > 0 ? ` or ${others === 1 ? "1 other approver" : `${others} other approvers`}` : "";
       const waitingOn =
         item.reason === "product-ok"
-          ? `Waiting on a product OK from you${others > 0 ? ` or ${others === 1 ? "1 other approver" : `${others} other approvers`}` : ""}.`
-          : "Waiting on your answer.";
+          ? `Waiting on a product OK from you${otherApprovers}.`
+          : item.reason === "risk-ok"
+            ? `Waiting on a risk sign-off from you${otherApprovers}.`
+            : "Waiting on your answer.";
       return (
         <InboxCard
           key={entry.key}

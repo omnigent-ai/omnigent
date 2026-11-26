@@ -70,3 +70,24 @@ def test_product_ok_goes_to_approvers_and_owner_ok_binds_the_approved_sha() -> N
     assert sign_offs_for(PROJECT, outside, OWNER) == [{"key": "owner-ok", "value": sha}]
     # Without an approved SHA there is nothing to bind owner-ok to yet.
     assert sign_offs_for(PROJECT, ticket(ASK, requested_by="github:octocat"), OWNER) == []
+
+
+def test_an_ask_waits_on_product_ok_only_when_the_ticket_still_needs_it() -> None:
+    feature = {"key": "kind", "value": "feature"}
+    risk = {"key": "risk", "value": "auth"}
+    # The owner's own feature never needs product-ok: a plain question goes to the owner.
+    assert human_request_routing(PROJECT, [feature, ASK], OWNER) == ("owner", {OWNER})
+    # With risk still owed it waits on risk-ok, from whoever may give it.
+    assert human_request_routing(PROJECT, [feature, risk, ASK], OWNER) == (
+        "risk-ok",
+        {OWNER, APPROVER},
+    )
+    given = [feature, risk, {"key": "risk-ok"}, ASK]
+    assert human_request_routing(PROJECT, given, OWNER) == ("owner", {OWNER})
+    # A member's feature still waits on product-ok until it's given.
+    assert human_request_routing(PROJECT, [feature, ASK], MEMBER) == (
+        "product-ok",
+        {OWNER, APPROVER},
+    )
+    approved = [feature, {"key": "product-ok"}, ASK]
+    assert human_request_routing(PROJECT, approved, MEMBER) == ("owner", {OWNER})

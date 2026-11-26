@@ -224,8 +224,8 @@ export function groupInboxEntries<T extends { at: number }>(
 }
 
 // Ticket request reasons that are open asks for the viewer's decision or sign-off: a
-// routed `needs-human` ask, or a feature awaiting product-ok. A cc is informational.
-const TICKET_APPROVAL_REASONS: ReadonlySet<string> = new Set(["owner", "product-ok"]);
+// routed `needs-human` ask, or one awaiting product-ok or risk-ok. A cc is informational.
+const TICKET_APPROVAL_REASONS: ReadonlySet<string> = new Set(["owner", "product-ok", "risk-ok"]);
 
 /** Whether a ticket request needs the viewer's approval; unknown reasons don't count. */
 export function isTicketApprovalRequest(item: { reason: string }): boolean {

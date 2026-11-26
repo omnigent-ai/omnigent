@@ -90,6 +90,7 @@ def needs_product_ok(project: Any, ticket: dict[str, Any]) -> bool:
 
 # Why a ticket's open ``needs-human`` ask is routed to the people it is.
 REQUEST_PRODUCT_OK = "product-ok"
+REQUEST_RISK_OK = "risk-ok"
 REQUEST_OWNER = "owner"
 
 
@@ -98,18 +99,21 @@ def human_request_routing(
 ) -> tuple[str, set[str | None]]:
     """Who answers a ticket's ``needs-human`` ask, and why.
 
-    A feature still missing ``product-ok`` waits on any product approver (the owner
-    plus ``product_approvers``). A ``risk`` ticket still missing ``risk-ok`` also waits on
-    whoever may give it (:func:`risk_ok_givers`). Every other ask waits on the owner.
+    A feature that still needs ``product-ok`` (:func:`needs_product_ok`: not the owner's
+    own) waits on any product approver (the owner plus ``product_approvers``). A ``risk``
+    ticket still missing ``risk-ok`` also waits on whoever may give it
+    (:func:`risk_ok_givers`). Every other ask waits on the owner.
     """
     keys = {label.get("key") for label in labels or []}
+    ticket = {"labels": labels or [], "requested_by": requested_by}
     responders: set[str | None] = set()
     reason = REQUEST_OWNER
-    if ticket_kind(labels) == FEATURE_KIND and PRODUCT_OK_LABEL not in keys:
+    if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
+        reason = REQUEST_RISK_OK
+        responders |= risk_ok_givers(project, requested_by)
+    if needs_product_ok(project, ticket) and PRODUCT_OK_LABEL not in keys:
         reason = REQUEST_PRODUCT_OK
         responders |= {*product_approvers(project), project.user_id}
-    if RISK_LABEL in keys and RISK_OK_LABEL not in keys:
-        responders |= risk_ok_givers(project, requested_by)
     return reason, responders or {project.user_id}
 
 

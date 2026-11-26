@@ -26,6 +26,8 @@ export function needsWhom(
       ? `Needs ${first}`
       : waitingOn.reason === "product-ok"
         ? "Needs product approval"
-        : `Needs ${first} +${names.length - 1}`;
+        : waitingOn.reason === "risk-ok"
+          ? "Needs risk sign-off"
+          : `Needs ${first} +${names.length - 1}`;
   return { kind: "other", label, title: names.length ? `Waiting on ${names.join(", ")}` : label };
 }

@@ -9,10 +9,11 @@ export interface TicketRequest {
   title: string;
   stage: { id: string; name: string };
   /**
-   * `"product-ok"` for a feature awaiting a product approver; `"owner"` for other asks;
-   * `"cc"` when a person cc'd the viewer in a comment they haven't read yet.
+   * `"product-ok"` for a feature still awaiting a product approver; `"risk-ok"` for a
+   * `risk` ticket still awaiting its sign-off; `"owner"` for other asks; `"cc"` when a
+   * person cc'd the viewer in a comment they haven't read yet.
    */
-  reason: "product-ok" | "owner" | "cc";
+  reason: "product-ok" | "risk-ok" | "owner" | "cc";
   /** Everyone the ask is routed to; any one of them answering clears it for all. */
   responders: string[];
   /** Activity position of the ask's question (or of the label change), to scroll to. */

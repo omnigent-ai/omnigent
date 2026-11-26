@@ -47,7 +47,8 @@ async def test_needs_human_asks_reach_only_their_responders_and_clear_for_all(
         ticket = store.create(
             project["id"],
             CreateTicket(title=title, labels=[{"key": "kind", "value": kind}]),
-            TicketActor(ALICE),
+            # Bob's feature needs product-ok; the owner's own fix doesn't.
+            TicketActor(BOB if kind == "feature" else ALICE),
         )
         store.update(
             project["id"],
@@ -148,8 +149,8 @@ async def test_a_person_who_raises_an_ask_neither_sees_nor_answers_it(multi_user
     ticket = (
         await client.post(
             base,
-            json={"title": "Owner's feature", "labels": [{"key": "kind", "value": "feature"}]},
-            headers=_as_user(ALICE),
+            json={"title": "Bob's feature", "labels": [{"key": "kind", "value": "feature"}]},
+            headers=_as_user(BOB),
         )
     ).json()
     raised = await client.patch(
@@ -168,7 +169,7 @@ async def test_a_person_who_raises_an_ask_neither_sees_nor_answers_it(multi_user
     # The owner asked Bob: only Bob sees it, and the owner's follow-up doesn't answer it.
     assert await _requests(client, ALICE) == []
     bob = (await client.get(PATH, headers=_as_user(BOB))).json()["data"]
-    assert [item["title"] for item in bob] == ["Owner's feature"]
+    assert [item["title"] for item in bob] == ["Bob's feature"]
     assert bob[0]["question"] == "Bob, can you OK this?" and bob[0]["raised_by_user_id"] == ALICE
 
 

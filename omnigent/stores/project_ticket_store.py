@@ -1868,13 +1868,12 @@ class ProjectTicketStore:
         for the ask once it was answered (or, with *only_for_viewer*, when it isn't the viewer's).
         """
         from omnigent.server.product_approval import (
-            FEATURE_KIND,
+            REQUEST_PRODUCT_OK,
             RISK_OK_LABEL,
             human_request_routing,
             owner_sign_off_pending,
             pending_sign_offs,
             product_approvers,
-            ticket_kind,
         )
 
         reason, responders = human_request_routing(
@@ -1892,7 +1891,7 @@ class ProjectTicketStore:
         )
         product_ok_from = (
             product_approvers(routing_project)
-            if not owner_pending and not risk_owed and ticket_kind(ticket.labels) == FEATURE_KIND
+            if not owner_pending and not risk_owed and reason == REQUEST_PRODUCT_OK
             else set()
         )
         request = self._open_human_request(

@@ -26,6 +26,13 @@ describe("needsWhom", () => {
     expect(
       needsWhom(ask(["aaron@example.com", "corey@example.com"], "product-ok"), "kasey@example.com"),
     ).toMatchObject({ label: "Needs product approval" });
+    expect(
+      needsWhom(ask(["aaron@example.com", "corey@example.com"], "risk-ok"), "kasey@example.com"),
+    ).toMatchObject({ label: "Needs risk sign-off" });
+    // A plain question to several people names them rather than calling it a sign-off.
+    expect(
+      needsWhom(ask(["aaron@example.com", "corey@example.com"]), "kasey@example.com"),
+    ).toMatchObject({ label: "Needs Aaron +1" });
     expect(needsWhom(null, "kasey@example.com")).toBeNull();
     expect(needsWhom(undefined, "kasey@example.com")).toBeUndefined();
   });

@@ -420,7 +420,9 @@ describe("groupInboxEntriesByApproval", () => {
 
   it("counts only open asks, not a cc or an unknown reason, as needing approval", () => {
     expect(
-      ["owner", "product-ok", "cc", "mention"].map((reason) => isTicketApprovalRequest({ reason })),
-    ).toEqual([true, true, false, false]);
+      ["owner", "product-ok", "risk-ok", "cc", "mention"].map((reason) =>
+        isTicketApprovalRequest({ reason }),
+      ),
+    ).toEqual([true, true, true, false, false]);
   });
 });
