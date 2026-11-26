@@ -18,6 +18,7 @@ from omnigent.inner.pi_claude_plugins import (
 from omnigent.server.feature_flags import FEATURES_ENV_VAR
 
 _GENERATED = PI_CLAUDE_PLUGIN_RESOURCES_DIR
+_CACHE_LAYOUTS = ("directory", "symlinked_cache")
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -26,9 +27,16 @@ def _write_json(path: Path, data: object) -> None:
 
 
 @pytest.fixture
-def claude_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def claude_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Path:
     """A Claude config dir with the pi_claude_plugins feature enabled."""
     config = tmp_path / "claude"
+    if getattr(request, "param", "directory") == "symlinked_cache":
+        shared = tmp_path / "shared-cache"
+        shared.mkdir()
+        (config / "plugins").mkdir(parents=True)
+        (config / "plugins" / "cache").symlink_to(shared, target_is_directory=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     monkeypatch.setenv(FEATURES_ENV_VAR, "pi_claude_plugins")
     return config
@@ -81,7 +89,11 @@ def test_flag_off_leaves_settings_untouched(
     assert not (managed / _GENERATED).exists()
 
 
-def test_enabled_plugin_skills_and_namespaced_commands(claude_dir: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
+@pytest.mark.parametrize("install_path", ["resolved", "relative"])
+def test_enabled_plugin_skills_and_namespaced_commands(
+    claude_dir: Path, tmp_path: Path, install_path: str
+) -> None:
     """Skills are linked one directory each; commands get ``<plugin>:<command>`` names."""
     root = _install(
         claude_dir,
@@ -91,6 +103,20 @@ def test_enabled_plugin_skills_and_namespaced_commands(claude_dir: Path, tmp_pat
             "commands/review.md": "---\nallowed-tools: Bash(git:*)\n---\n"
             "Focus $ARGUMENTS from ${CLAUDE_PLUGIN_ROOT}\n",
             "commands/sub/deep.md": "Deep $ARGUMENTS\n",
+        },
+    )
+    _write_json(
+        claude_dir / "plugins" / "installed_plugins.json",
+        {
+            "plugins": {
+                "dp@market": [
+                    {
+                        "installPath": str(root)
+                        if install_path == "resolved"
+                        else "cache/market/dp/1.0.0"
+                    }
+                ]
+            }
         },
     )
     managed = tmp_path / "managed"
@@ -108,6 +134,7 @@ def test_enabled_plugin_skills_and_namespaced_commands(claude_dir: Path, tmp_pat
     assert "allowed-tools" in review
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_only_enabled_plugins_load(
     claude_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -134,6 +161,7 @@ def test_only_enabled_plugins_load(
     assert names == {"on", "managed"}
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
     claude_dir: Path, tmp_path: Path
 ) -> None:
@@ -157,15 +185,20 @@ def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
 
 
 @pytest.mark.parametrize(
-    "listed",
-    [lambda root: {"source": str(root), "skills": []}, lambda root: str(root)],
-    ids=["object", "string"],
+    ("listed", "claude_dir"),
+    [
+        pytest.param(lambda root: {"source": str(root), "skills": []}, "directory", id="object"),
+        pytest.param(str, "directory", id="string"),
+        pytest.param(str, "symlinked_cache", id="cache-alias"),
+    ],
+    indirect=["claude_dir"],
 )
 def test_user_package_entry_claims_the_plugin_skills(
     claude_dir: Path, tmp_path: Path, listed
 ) -> None:
     """A package the user lists for a plugin brings its skills, so they are not added again."""
-    root = _install(claude_dir, "dp@market", files=_skill("review"))
+    _install(claude_dir, "dp@market", files=_skill("review"))
+    root = claude_dir / "plugins" / "cache" / "market" / "dp" / "1.0.0"
 
     result = add_claude_plugin_resources({"packages": [listed(root)]}, tmp_path / "managed")
 
@@ -173,13 +206,15 @@ def test_user_package_entry_claims_the_plugin_skills(
     assert result["packages"] == [listed(root)]
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_user_entries_claim_by_exact_resolved_path(claude_dir: Path, tmp_path: Path) -> None:
     """A skill directory, a command file, or a commands directory the user lists is not added."""
-    root = _install(
+    _install(
         claude_dir,
         "dp@market",
         files={**_skill("review"), "commands/go.md": "GO\n", "commands/keep.md": "KEEP\n"},
     )
+    root = claude_dir / "plugins" / "cache" / "market" / "dp" / "1.0.0"
     managed = tmp_path / "managed"
     settings = {
         "skills": [str(root / "skills" / "review")],
@@ -228,6 +263,7 @@ def test_relaunch_drops_commands_of_removed_plugins(claude_dir: Path, tmp_path: 
     assert not (managed / _GENERATED).exists()
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_symlinks_are_never_bridged(claude_dir: Path, tmp_path: Path) -> None:
     """Symlinked command files, commands/ roots and skill dirs pointing elsewhere are skipped."""
     secret = tmp_path / "secret.md"
@@ -381,6 +417,7 @@ def _loop(tmp_path: Path) -> str:
     return str(loop_a)
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path: Path) -> None:
     """The ``omnigent pi`` terminal launch seeds the same managed settings as the gateway."""
     root = _install(claude_dir, "dp@market", files=_skill("review"))
@@ -580,25 +617,63 @@ def test_fifo_settings_file_skips_the_whole_bridge(claude_dir: Path, tmp_path: P
     assert add_claude_plugin_resources({}, tmp_path / "managed") == {}
 
 
+@pytest.mark.parametrize("claude_dir", _CACHE_LAYOUTS, indirect=True)
 def test_project_scoped_installs_are_not_loaded(claude_dir: Path, tmp_path: Path) -> None:
-    """A user-enabled key does not load another project's install; a user install still loads."""
+    """Only a trusted user install loads; unusable entries do not hide a later valid one."""
     user = _install(claude_dir, "dp@market", files=_skill("user"))
+    outside = _install(claude_dir, "outside@market", files=_skill("outside"))
+    outside = outside.rename(tmp_path / "outside")
+    linked = user.parent / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
     other = claude_dir / "plugins" / "cache" / "market" / "dp" / "0.9.0"
     for relative, content in _skill("other").items():
         (other / relative).parent.mkdir(parents=True, exist_ok=True)
         (other / relative).write_text(content, encoding="utf-8")
-    _write_json(
-        claude_dir / "plugins" / "installed_plugins.json",
-        {
-            "plugins": {
-                "dp@market": [
-                    {"scope": "project", "projectPath": "/elsewhere", "installPath": str(other)},
-                    {"scope": "user", "installPath": str(user)},
-                ]
-            }
-        },
-    )
+    entries = [
+        {"scope": "project", "projectPath": "/elsewhere", "installPath": str(other)},
+        {"installPath": str(outside)},
+        {"installPath": str(linked)},
+    ]
+    installed = claude_dir / "plugins" / "installed_plugins.json"
+    _write_json(installed, {"plugins": {"dp@market": entries}})
+    assert add_claude_plugin_resources({}, tmp_path / "managed") == {}
+    entries.append({"scope": "user", "installPath": str(user)})
+    _write_json(installed, {"plugins": {"dp@market": entries}})
 
     result = add_claude_plugin_resources({}, tmp_path / "managed")
 
     assert result["skills"] == [str(user / "skills" / "user")]
+
+
+@pytest.mark.parametrize("claude_dir", ["symlinked_cache"], indirect=True)
+@pytest.mark.parametrize("unusable", ["missing", "file", "stat-error"])
+def test_unusable_shared_install_does_not_hide_user_fallback(
+    claude_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unusable: str,
+) -> None:
+    """An unavailable shared installation cannot hide a healthy non-cache user install."""
+    stale = _install(claude_dir, "dp@market", files=_skill("review"))
+    fallback = claude_dir / "plugins" / "local" / "dp"
+    fallback.parent.mkdir()
+    stale.rename(fallback)
+    if unusable == "file":
+        stale.touch()
+    elif unusable == "stat-error":
+        original_is_dir = Path.is_dir
+
+        def is_dir(path: Path) -> bool:
+            if path == stale:
+                raise PermissionError("installation is unavailable")
+            return original_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", is_dir)
+    _write_json(
+        claude_dir / "plugins" / "installed_plugins.json",
+        {"plugins": {"dp@market": [{"installPath": str(stale)}, {"installPath": str(fallback)}]}},
+    )
+
+    result = add_claude_plugin_resources({}, tmp_path / "managed")
+
+    assert result["skills"] == [str(fallback / "skills" / "review")]

@@ -1335,6 +1335,8 @@ Cross-harness journeys:
   Omnigent provider. Run `/<plugin>:<command> focus`: the body expands with the
   arguments. The skill is listed for the model and `/skill:<name>` works. Disable the
   plugin in Claude Code and launch again: both are gone. `~/.pi/agent` stays unchanged.
+  Repeat with `~/.claude/plugins/cache` linked to a shared cache: enabled resources
+  still load, while symlinked files and resource directories inside a plugin stay skipped.
   Without the flag, nothing changes.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
