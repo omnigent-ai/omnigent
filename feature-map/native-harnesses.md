@@ -724,7 +724,9 @@ Cross-harness journeys:
   and use framework guidance. The runner's added fallback handles transient
   instruction fetch failures. Relay initialization still requires a resolved
   session bundle, so a persistent outage can prevent terminal creation.
-  Authorization and startup-policy rejections remain launch failures.
+  For automatic launch and terminal re-creation, authorization and startup-policy
+  rejections remain launch failures. CLI instruction retrieval is separate from
+  authorization for its subsequent terminal request.
   `tests/runner/test_app_native_startup_instructions.py::test_antigravity_startup_rule_is_ready_before_terminal_launch`
   checks authored instructions, image guidance and memory before a mocked
   terminal boundary, for fresh and resumed sessions.

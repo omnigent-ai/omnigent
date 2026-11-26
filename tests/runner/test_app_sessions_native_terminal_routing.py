@@ -963,6 +963,9 @@ async def test_create_session_repl_terminal_dispatch(
         pytest.param("antigravity", True, "worker", None, id="antigravity-True"),
         pytest.param("antigravity", False, "missing-worker", None, id="antigravity-missing-child"),
         pytest.param("antigravity", False, "worker", "fetch", id="antigravity-fetch-failure"),
+        pytest.param(
+            "antigravity", False, "worker", "fetch-recovery", id="antigravity-fetch-recovery"
+        ),
         pytest.param("antigravity", False, "worker", "auth", id="antigravity-auth-failure"),
         pytest.param("antigravity", False, "worker", "policy", id="antigravity-policy-failure"),
     ],
@@ -1013,13 +1016,15 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         nonlocal resolution_attempts
         resolution_attempts += 1
         assert (agent_id, session_id) == ("agent-root", sid)
-        if resolution_failure in ("fetch", "auth"):
+        if resolution_failure in ("fetch", "auth") or (
+            resolution_failure == "fetch-recovery" and resolution_attempts == 1
+        ):
             from omnigent.runner._entry import _AgentSpecCache, _resolve_agent_spec_from_server
 
             async with httpx.AsyncClient(
                 base_url="http://server.invalid",
                 transport=httpx.MockTransport(
-                    lambda _request: httpx.Response(503 if resolution_failure == "fetch" else 403)
+                    lambda _request: httpx.Response(403 if resolution_failure == "auth" else 503)
                 ),
             ) as client:
                 await _resolve_agent_spec_from_server(
@@ -1053,7 +1058,7 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     from omnigent.runner.native import orchestration
 
     actual_auto_create = getattr(orchestration, f"_auto_create_{terminal_name}_terminal")
-    if resolution_failure == "fetch":
+    if resolution_failure in ("fetch", "fetch-recovery"):
         from omnigent.harnesses.antigravity_native import bridge
 
         fake_home = tmp_path / "home"
@@ -1078,7 +1083,7 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         auto_create_calls.append(session_id)
         if terminal_name == "antigravity":
             selected = kwargs["agent_spec"]
-            if resolution_failure == "fetch":
+            if resolution_failure in ("fetch", "fetch-recovery"):
                 assert selected is None
                 return await actual_auto_create(
                     session_id, resource_registry, publish_event, **kwargs
@@ -1132,15 +1137,27 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         spec_resolver=resolve if terminal_name == "antigravity" else None,
     )
 
-    if resolution_failure == "fetch":
+    if resolution_failure in ("fetch", "fetch-recovery"):
 
-        async def refuse_process_launch(**kwargs: Any) -> None:
+        async def record_process_launch(**kwargs: Any) -> SessionResourceView:
             terminal_launches.append(kwargs)
-            raise AssertionError("Persistent bundle failure must precede terminal launch")
+            if resolution_failure == "fetch":
+                raise AssertionError("Persistent bundle failure must precede terminal launch")
+            return SessionResourceView(
+                id="terminal_antigravity_main",
+                type="terminal",
+                session_id=sid,
+                name="re-created",
+            )
+
+        async def no_native_io(*_args: Any, **_kwargs: Any) -> None:
+            pass
 
         monkeypatch.setattr(
-            app.state.session_resource_registry, "launch_required_terminal", refuse_process_launch
+            app.state.session_resource_registry, "launch_required_terminal", record_process_launch
         )
+        monkeypatch.setattr(orchestration, "_cold_start_agy_conversation", no_native_io)
+        monkeypatch.setattr(orchestration, "_run_antigravity_reader", no_native_io)
 
     async with _runner_client(app) as client:
         if cached_predecessor:
@@ -1169,14 +1186,25 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         assert auto_create_calls == []
         assert "preparing framework guidance" not in caplog.text
         return
-    if resolution_failure == "fetch":
-        assert resp.status_code == 500, resp.text
+    if resolution_failure in ("fetch", "fetch-recovery"):
         assert "Could not fetch Antigravity startup instructions" in caplog.text
         assert "HTTP 503" in caplog.text
         assert resolution_attempts == 2
         assert auto_create_calls == [sid]
-        assert terminal_launches == []
-        return
+        if resolution_failure == "fetch":
+            assert resp.status_code == 500, resp.text
+            assert terminal_launches == []
+            return
+        from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
+
+        assert len(terminal_launches) == 1
+        rule = (
+            bridge.agy_gemini_dir(bridge.bridge_dir_for_bridge_id(sid))
+            / "config/rules/omnigent_instructions.md"
+        )
+        assert rule.read_text(encoding="utf-8") == (
+            f"---\ntrigger: always_on\n---\n\n{WORKSPACE_IMAGE_INSTRUCTION}\n"
+        )
     assert resp.status_code == 200, resp.text
     assert resp.json()["name"] == "re-created", (
         f"Expected ensure to auto-create after dead pane; got {resp.json()['name']!r}"

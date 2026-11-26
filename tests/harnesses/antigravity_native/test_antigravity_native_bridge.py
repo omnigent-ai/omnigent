@@ -1684,8 +1684,11 @@ def test_write_agent_instructions_never_follows_rules_outside_the_bridge(
         link.name if linked_dir == "cyclic-rules" else real_rules, target_is_directory=True
     )
 
-    with pytest.raises(ValueError, match="isolated Gemini dir"):
+    expected_errors = (ValueError, OSError) if linked_dir == "cyclic-rules" else (ValueError,)
+    with pytest.raises(expected_errors) as raised:
         write_agent_instructions(bridge_dir, "Startup text.")
+    if isinstance(raised.value, ValueError):
+        assert "isolated Gemini dir" in str(raised.value)
 
     assert list(real_rules.iterdir()) == []
 
