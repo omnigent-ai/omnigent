@@ -10,9 +10,11 @@ import subprocess
 import sys
 import threading
 from _thread import LockType
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import TypeVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,6 +28,21 @@ pytestmark = pytest.mark.skipif(
 _TOKEN = b"5" * 64
 _INIT_FD = 41
 _LAUNCHER_FD = 42
+_Result = TypeVar("_Result")
+
+
+def _start_worker(action: Callable[[], _Result]) -> tuple[threading.Thread, Future[_Result]]:
+    result: Future[_Result] = Future()
+
+    def run() -> None:
+        try:
+            result.set_result(action())
+        except BaseException as error:
+            result.set_exception(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    return worker, result
 
 
 class _ContendedLock:
@@ -98,6 +115,7 @@ def test_readiness_requires_the_transferred_init_handle_and_kernel_sender(
         "truncated",
         "unexpected-before-rights",
         "family",
+        "launcher",
     ],
 )
 def test_invalid_readiness_never_admits_and_releases_every_received_handle(
@@ -108,7 +126,10 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
     control, process, close = readiness
     payload, metadata, flags, address = control.recvmsg.return_value
     handles = [_INIT_FD]
-    if problem == "family":
+    if problem == "launcher":
+        handles = []
+        process.pid = 84
+    elif problem == "family":
         handles = []
         control.family = socket.AF_INET
     elif problem == "token":
@@ -150,7 +171,7 @@ def test_invalid_readiness_never_admits_and_releases_every_received_handle(
         )
     assert sorted(call.args[0] for call in close.call_args_list) == sorted(handles)
     control.send.assert_not_called()
-    if problem == "family":
+    if problem in {"family", "launcher"}:
         control.recvmsg.assert_not_called()
 
 
@@ -435,13 +456,6 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
         return b"partial stdout\n", b""
 
     case.process.communicate.side_effect = communicate
-    result: Future[request_control.BwrapRequestResult] = Future()
-
-    def run() -> None:
-        try:
-            result.set_result(case.owner.run(deadline=1.0))
-        except Exception as error:
-            result.set_exception(error)
 
     def cancel() -> None:
         case.owner.cancel()
@@ -449,12 +463,10 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
 
     workers: list[threading.Thread] = []
     try:
-        worker = threading.Thread(target=run)
-        worker.start()
+        worker, result = _start_worker(lambda: case.owner.run(deadline=1.0))
         workers.append(worker)
         assert sending.wait(5)
-        canceller = threading.Thread(target=cancel)
-        canceller.start()
+        canceller, cancellation = _start_worker(cancel)
         workers.append(canceller)
         if cancel_during == "admission":
             assert contention.wait(5)
@@ -470,6 +482,7 @@ def test_cancellation_contends_with_admission_and_retains_cleanup_without_replay
         for worker in workers:
             worker.join(timeout=5)
     assert all(not worker.is_alive() for worker in workers)
+    cancellation.result(timeout=1)
     with pytest.raises(request_control.RequestCancelled, match="must not be replayed"):
         result.result(timeout=1)
     assert case.owner.admitted and case.owner.done.is_set()
@@ -497,30 +510,12 @@ def test_cancellation_contends_with_retirement_and_never_signals_released_descri
             assert release_close.wait(5)
 
     monkeypatch.setattr(request_control.os, "close", close)
-    result: Future[request_control.BwrapRequestResult] = Future()
-    cancellation: Future[None] = Future()
-
-    def run() -> None:
-        try:
-            result.set_result(case.owner.run(deadline=1.0))
-        except Exception as error:
-            result.set_exception(error)
-
-    def cancel() -> None:
-        try:
-            case.owner.cancel()
-            cancellation.set_result(None)
-        except Exception as error:
-            cancellation.set_exception(error)
-
     workers: list[threading.Thread] = []
     try:
-        worker = threading.Thread(target=run)
-        worker.start()
+        worker, result = _start_worker(lambda: case.owner.run(deadline=1.0))
         workers.append(worker)
         assert retiring.wait(5)
-        canceller = threading.Thread(target=cancel)
-        canceller.start()
+        canceller, cancellation = _start_worker(case.owner.cancel)
         workers.append(canceller)
         assert contention.wait(5)
         assert not cancellation.done() and not case.owner.done.is_set()
