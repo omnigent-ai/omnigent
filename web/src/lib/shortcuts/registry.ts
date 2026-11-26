@@ -157,10 +157,19 @@ function sessionStepChords(
   return environment.native ? [tab, arrowChord] : [arrowChord, tab];
 }
 
-// The transcript's message steps, which have always allowed Shift. AltGr matches on macOS
-// only, where Firefox reports Option as AltGr; elsewhere AltGr types a character.
+// The transcript's message steps. AltGr matches on macOS only, where Firefox reports Option as
+// AltGr; elsewhere AltGr types a character.
 function messageStepChord(key: "ArrowUp" | "ArrowDown", environment: ShortcutEnvironment): Chord {
   return { mod: true, alt: true, key, exactKey: true, matchesAltGraph: environment.mac };
+}
+
+// The transcript has always stepped with Shift held too. Off macOS that's Ctrl+Alt+Shift and an
+// arrow, Next and Previous session's chord, so only macOS keeps it.
+function messageStepWithShift(
+  key: "ArrowUp" | "ArrowDown",
+  environment: ShortcutEnvironment,
+): Chord[] {
+  return environment.mac ? [{ ...messageStepChord(key, environment), shift: true }] : [];
 }
 
 /** The open session's Pin, Fork and Archive chords, as the desktop app's Session menu binds them. */
@@ -401,9 +410,7 @@ const APP_BINDINGS = {
     group: "chats",
     label: "Go to previous message",
     chords: (environment) => [messageStepChord("ArrowUp", environment)],
-    secondaryChords: (environment) => [
-      { ...messageStepChord("ArrowUp", environment), shift: true },
-    ],
+    secondaryChords: (environment) => messageStepWithShift("ArrowUp", environment),
     flag: "quick_pick_palette",
     shownWhen: NOT_LISTED,
   },
@@ -411,9 +418,7 @@ const APP_BINDINGS = {
     group: "chats",
     label: "Go to next message",
     chords: (environment) => [messageStepChord("ArrowDown", environment)],
-    secondaryChords: (environment) => [
-      { ...messageStepChord("ArrowDown", environment), shift: true },
-    ],
+    secondaryChords: (environment) => messageStepWithShift("ArrowDown", environment),
     flag: "quick_pick_palette",
     shownWhen: NOT_LISTED,
   },

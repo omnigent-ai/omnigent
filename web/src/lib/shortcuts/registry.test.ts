@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { KeyChordInput } from "./chord";
+import { chordKeys, type KeyChordInput } from "./chord";
 import {
   activeShortcutChords,
   APP_SHORTCUT_BINDINGS,
@@ -146,6 +146,38 @@ describe("shortcut registry", () => {
         other,
       ),
     ).toBe(true);
+  });
+
+  it("gives a binding that waits for quick_pick_palette no chord another has, in any environment", () => {
+    // Chords the registry already shares on purpose, each with why.
+    const shared: Record<string, string> = {
+      // With quick_pick_palette on, Ctrl+Tab steps sessions instead of switching recent ones.
+      "session.next sessions.recent": "takes over",
+      "session.previous sessions.recent": "takes over",
+    };
+    const environments = [true, false].flatMap((isMac) =>
+      [true, false].flatMap((native) =>
+        [true, false].map((desktopMenu) => ({ mac: isMac, native, desktopMenu })),
+      ),
+    );
+    const collisions = new Set<string>();
+    for (const environment of environments) {
+      const owners = new Map<string, string[]>();
+      for (const binding of APP_SHORTCUT_BINDINGS) {
+        for (const chord of activeShortcutChords(binding.id, environment)) {
+          const signature = chordKeys(chord, environment.mac).join(" ");
+          owners.set(signature, [...(owners.get(signature) ?? []), binding.id]);
+        }
+      }
+      for (const ids of owners.values()) {
+        const distinct = [...new Set(ids)].toSorted();
+        const flagged = distinct.some((id) => shortcutBinding(id as ShortcutId).flag);
+        if (flagged && distinct.length > 1 && !(distinct.join(" ") in shared)) {
+          collisions.add(distinct.join(" "));
+        }
+      }
+    }
+    expect([...collisions]).toEqual([]);
   });
 
   it("gives a browser the Session menu's Pin, Fork and Archive keys, and the menu its own", () => {

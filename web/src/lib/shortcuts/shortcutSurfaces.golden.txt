@@ -1439,8 +1439,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -1551,8 +1551,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=sessions.recent -
 session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
@@ -1615,8 +1615,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -1727,8 +1727,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=sessions.recent -
 session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
@@ -1791,8 +1791,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -1903,8 +1903,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=sessions.recent -
 session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
@@ -1967,8 +1967,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+key:Tab+exact ctrl+alt+shift+key:ArrowDown+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Alt-Shift-ArrowDown | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+shift+key:Tab+exact ctrl+alt+shift+key:ArrowUp+exact | keys=Ctrl ⇧ Tab | aria=Control+Shift+Tab | editor=Ctrl-Shift-Tab Ctrl-Alt-Shift-ArrowUp | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -2079,8 +2079,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=sessions.recent -
 session.previous | search=sessions.recent -
 sessions.recent | search=sessions.recent sessions.recent
@@ -2143,8 +2143,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -2255,8 +2255,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=- sessions.recent
 session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
@@ -2319,8 +2319,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -2431,8 +2431,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=- sessions.recent
 session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
@@ -2495,8 +2495,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -2607,8 +2607,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=- sessions.recent
 session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
@@ -2671,8 +2671,8 @@ composer.cyclePermissionMode | Cycle permission mode (in session) | group=chats 
 composer.focus | Focus chat input | group=chats | chords=ctrl+shift+code:KeyL | keys=Ctrl ⇧ L | aria=Control+Shift+L | editor=Ctrl-Shift-l | matches=true
 dictation.toggle | Toggle voice dictation | group=chats | chords=mod+alt+code:KeyV | keys=Ctrl Alt V | aria=Control+Alt+V | editor=Mod-Alt-v | matches=true
 response.stop | Stop response | group=chats | chords=key:Escape | keys=Esc | aria=Escape | editor=Escape | matches=true
-message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact mod+alt+shift+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp Mod-Alt-Shift-ArrowUp | matches=true true
-message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact mod+alt+shift+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown Mod-Alt-Shift-ArrowDown | matches=true true
+message.previous | Go to previous message | group=chats | chords=mod+alt+key:ArrowUp+exact | keys=Ctrl Alt ↑ | aria=Control+Alt+ArrowUp | editor=Mod-Alt-ArrowUp | matches=true
+message.next | Go to next message | group=chats | chords=mod+alt+key:ArrowDown+exact | keys=Ctrl Alt ↓ | aria=Control+Alt+ArrowDown | editor=Mod-Alt-ArrowDown | matches=true
 session.next | Next session | group=navigation | chords=ctrl+alt+shift+key:ArrowDown+exact ctrl+key:Tab+exact | keys=Ctrl Alt ⇧ ↓ | aria=Control+Alt+Shift+ArrowDown | editor=Ctrl-Alt-Shift-ArrowDown Ctrl-Tab | matches=true true
 session.previous | Previous session | group=navigation | chords=ctrl+alt+shift+key:ArrowUp+exact ctrl+shift+key:Tab+exact | keys=Ctrl Alt ⇧ ↑ | aria=Control+Alt+Shift+ArrowUp | editor=Ctrl-Alt-Shift-ArrowUp Ctrl-Shift-Tab | matches=true true
 sessions.recent | Switch recent sessions | group=navigation | chords=ctrl+key:Tab+exact ctrl+shift+key:Tab+exact | keys=Ctrl Tab | aria=Control+Tab | editor=Ctrl-Tab Ctrl-Shift-Tab | matches=true true
@@ -2783,8 +2783,8 @@ composer.cyclePermissionMode | search=composer.cyclePermissionMode
 composer.focus | search=composer.focus
 dictation.toggle | search=dictation.toggle
 response.stop | search=approval.decline,fileViewer.exitFullScreen,question.cancel,response.stop,slash.dismiss
-message.previous | search=- -
-message.next | search=- -
+message.previous | search=-
+message.next | search=-
 session.next | search=- sessions.recent
 session.previous | search=- sessions.recent
 sessions.recent | search=sessions.recent sessions.recent
