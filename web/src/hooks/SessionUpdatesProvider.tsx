@@ -68,6 +68,12 @@ import { isTempConvId } from "@/lib/tempConversationId";
 // single frame can trigger.
 const DEBOUNCE_MS = 250;
 
+/**
+ * How long an unchanged sub-agent row stops snapshots from refetching its
+ * parent's child list, which bounds how long a missed new sibling stays hidden.
+ */
+export const CHILD_ROW_RECHECK_MS = 5 * 60_000;
+
 /** Query hash of the Archived view's project-picker scan. */
 const ARCHIVED_PROJECT_NAMES_HASH = hashKey(ARCHIVED_PROJECT_NAMES_KEY);
 
@@ -374,11 +380,10 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // the post-reconnect snapshot.
   const commentsFingerprintsRef = useRef(new Map<string, string>());
 
-  // Last streamed row (as JSON) per sub-agent session. Every watch-set change
-  // restates the whole watch-set in a snapshot, so only a new or changed row
-  // makes its parent's child list refetch. Cleared on disconnect: children
-  // created while offline get no discovery push, so reconnect refetches all.
-  const childRowFingerprintsRef = useRef(new Map<string, string>());
+  // Last streamed row (as JSON) per sub-agent and when it was recorded; snapshots
+  // refetch a parent's child list only for new, changed or expired rows.
+  // Cleared on disconnect, so the snapshot after a reconnect refetches every list.
+  const childRowFingerprintsRef = useRef(new Map<string, { row: string; at: number }>());
 
   // Last streamed archived flag per session, for the frozen Archived snapshot.
   const snapshotArchivedRef = useRef(new Map<string, boolean>());
@@ -632,28 +637,33 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
               if (!watchedIds.has(id)) childRowFingerprintsRef.current.delete(id);
             }
           }
-          // For child sessions the server includes parent_session_id in the
-          // wire item. Invalidate the parent's child_sessions cache when the
-          // row changed so tree views (SubagentsPanel, SubagentsGraphView)
-          // pick up status changes without polling.
+          // Child rows carry parent_session_id; refetch the parent's child list
+          // when a row changed so tree views pick up status without polling.
           const parentIds = new Set<string>();
+          const now = Date.now();
           for (const item of frame.items) {
             if (!item.parent_session_id) continue;
             const fingerprint = JSON.stringify(item);
             const parentList = queryClient
               .getQueryCache()
               .find({ queryKey: childSessionsQueryKey(item.parent_session_id), exact: true });
-            // A list whose refetch failed keeps retrying on later frames.
+            const seen = childRowFingerprintsRef.current.get(item.id);
+            // Expiry re-reads membership a discovery push may have missed;
+            // a failed list keeps retrying on later frames.
             if (
-              childRowFingerprintsRef.current.get(item.id) === fingerprint &&
+              seen?.row === fingerprint &&
+              now - seen.at < CHILD_ROW_RECHECK_MS &&
               parentList?.state.status !== "error"
             ) {
               continue;
             }
-            // An unmounted list only goes stale, so leave the row unrecorded
-            // and invalidate it again on the next frame.
-            if (parentList?.isActive()) childRowFingerprintsRef.current.set(item.id, fingerprint);
-            else childRowFingerprintsRef.current.delete(item.id);
+            // Invalidation only marks an unmounted list stale, and joins a first
+            // fetch without restarting it, so record the row once the list has data.
+            if (parentList?.isActive() && parentList.state.data !== undefined) {
+              childRowFingerprintsRef.current.set(item.id, { row: fingerprint, at: now });
+            } else {
+              childRowFingerprintsRef.current.delete(item.id);
+            }
             parentIds.add(item.parent_session_id);
           }
           for (const parentId of parentIds) {

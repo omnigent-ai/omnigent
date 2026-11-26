@@ -50,7 +50,7 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 import { SidebarDataContext, SidebarDataProvider, useSidebarView } from "./useSidebarData";
 import { useCanEdit } from "./usePermissions";
 import { sidebarConfig } from "@/lib/sidebarConfig";
-import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
+import { CHILD_ROW_RECHECK_MS, SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
 import { modalHostId } from "@/lib/sessionHost";
@@ -2051,6 +2051,74 @@ describe("SessionUpdatesProvider sub-agent list refetches that must keep working
     observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
     act(() => handler({ type: "snapshot", items: [conv("conv_a"), row] }));
     await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+  });
+
+  it("refetches a list whose first fetch was in flight when its child's row changed", async () => {
+    // Invalidation joins a first fetch instead of restarting it, so the next
+    // frame restating the row must refetch past the older response.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    let answerFirst: (rows: { id: string; busy: boolean }[]) => void = () => {};
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string; busy: boolean }[]>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            answerFirst = resolve;
+          }),
+      )
+      .mockResolvedValue([{ id: "child_1", busy: true }]);
+    const stop = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn: fetchChildren,
+      staleTime: Infinity,
+      retry: false,
+    }).subscribe(() => {});
+    onTestFinished(stop);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const running = subagentRow("child_1", "conv_a", "running");
+
+    act(() => handler({ type: "changed", items: [running] }));
+    act(() => answerFirst([{ id: "child_1", busy: false }]));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1", busy: false },
+      ]),
+    );
+    act(() => handler({ type: "snapshot", items: [conv("conv_a"), running] }));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1", busy: true },
+      ]),
+    );
+  });
+
+  it("eventually finds a new child no frame announced on later snapshots", async () => {
+    // Discovery pushes reach only the replica that published them.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    onTestFinished(() => clock.mockRestore());
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const fetchChildren = vi
+      .fn<() => Promise<{ id: string }[]>>()
+      .mockResolvedValueOnce([{ id: "child_1" }])
+      .mockResolvedValue([{ id: "child_1" }, { id: "child_2" }]);
+    observeChildList(client, "conv_a", fetchChildren, ["child_1"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const rows = [subagentRow("child_1", "conv_a")];
+
+    act(() => handler({ type: "snapshot", items: rows }));
+    await waitFor(() => expect(fetchChildren).toHaveBeenCalledTimes(1));
+    clock.mockReturnValue(1_000_000 + CHILD_ROW_RECHECK_MS);
+    act(() => handler({ type: "snapshot", items: [...rows, conv("conv_a")] }));
+    await waitFor(() =>
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        { id: "child_1" },
+        { id: "child_2" },
+      ]),
+    );
   });
 
   it("retries a child list whose refetch failed on the next frame that restates it", async () => {
