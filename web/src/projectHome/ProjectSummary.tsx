@@ -16,6 +16,7 @@ import {
   formatCents,
   getProjectStatusSummary,
   projectStatusSummaryKey,
+  prsMergedZeroNote,
   sortStatusMembers,
   type ProjectStatusMember,
   type ProjectStatusSortKey,
@@ -236,7 +237,11 @@ function HeadlineNumbers({
       <StatTile
         label="PRs merged"
         value={totals.prs_merged === null ? "—" : String(totals.prs_merged)}
-        note={sources.prs_merged === "unavailable" ? "Not tracked on this server" : undefined}
+        note={
+          sources.prs_merged === "unavailable"
+            ? "Not tracked on this server"
+            : prsMergedZeroNote(totals.prs_merged, totals.tickets_done)
+        }
         onOpen={
           totals.prs_merged === null
             ? undefined

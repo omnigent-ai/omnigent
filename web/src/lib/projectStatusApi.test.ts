@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { formatCents, sortStatusMembers, type ProjectStatusMember } from "./projectStatusApi";
+import {
+  formatCents,
+  prsMergedZeroNote,
+  sortStatusMembers,
+  type ProjectStatusMember,
+} from "./projectStatusApi";
 
 function member(name: string, values: Partial<ProjectStatusMember> = {}): ProjectStatusMember {
   return {
@@ -55,5 +60,14 @@ describe("sortStatusMembers", () => {
       "Reviewer",
     ]);
     expect(rows[0].name).toBe("Reviewer");
+  });
+});
+
+describe("prsMergedZeroNote", () => {
+  it("explains a zero only when tickets still finished", () => {
+    expect(prsMergedZeroNote(0, 12)).toBe("No finished ticket links a pull request");
+    expect(prsMergedZeroNote(0, 0)).toBeUndefined();
+    expect(prsMergedZeroNote(3, 12)).toBeUndefined();
+    expect(prsMergedZeroNote(null, 12)).toBeUndefined();
   });
 });

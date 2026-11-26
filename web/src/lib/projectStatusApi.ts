@@ -76,6 +76,19 @@ export function formatCents(cents: number | null): string {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(cents / 100);
 }
 
+/**
+ * Why "PRs merged" reads 0 while tickets still finished in the window: only pull requests
+ * linked to a ticket or session count, and work that lands as direct commits links none.
+ */
+export function prsMergedZeroNote(
+  prsMerged: number | null | undefined,
+  ticketsDone: number | null | undefined,
+): string | undefined {
+  return prsMerged === 0 && (ticketsDone ?? 0) > 0
+    ? "No finished ticket links a pull request"
+    : undefined;
+}
+
 export type ProjectStatusSortKey =
   "name" | "tickets_done" | "prs_merged" | "spend_cents" | "cost_per_merged_pr_cents";
 

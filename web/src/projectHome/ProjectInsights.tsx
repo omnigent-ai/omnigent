@@ -10,7 +10,7 @@ import {
   type ProjectTelemetry,
   type TelemetryPerson,
 } from "@/lib/projectTelemetryApi";
-import type { ProjectStatusWindow } from "@/lib/projectStatusApi";
+import { prsMergedZeroNote, type ProjectStatusWindow } from "@/lib/projectStatusApi";
 import { MemberName } from "./MemberName";
 import { TicketLoadError } from "./TicketControls";
 
@@ -60,11 +60,12 @@ function Panel({
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({ label, value, note }: { label: string; value: string; note?: string }) {
   return (
-    <div className="flex items-baseline justify-between gap-3">
+    <div className="grid grid-cols-[1fr_auto] items-baseline gap-x-3">
       <dt className="text-muted-foreground">{label}</dt>
       <dd className="font-medium tabular-nums">{value}</dd>
+      {note && <dd className="col-span-2 text-xs text-muted-foreground">{note}</dd>}
     </div>
   );
 }
@@ -194,7 +195,11 @@ export function InsightsPanels({ numbers }: { numbers: InsightsNumbers }) {
           decision="where to point performance and workflow fixes."
         >
           <Row label="Tickets shipped" value={formatTelemetryNumber(shipping.tickets_shipped)} />
-          <Row label="PRs merged" value={formatTelemetryNumber(shipping.merged_prs)} />
+          <Row
+            label="PRs merged"
+            value={formatTelemetryNumber(shipping.merged_prs)}
+            note={prsMergedZeroNote(shipping.merged_prs, shipping.tickets_shipped)}
+          />
           <Row
             label="Median time to merged"
             value={formatTelemetryNumber(shipping.time_to_merged_median_hours, " h")}
