@@ -49,7 +49,7 @@ def _wait(check, message: str, timeout: float = 90):
 @pytest.mark.timeout(360)
 @pytest.mark.parametrize("databricks", [False, True], ids=["direct", "databricks"])
 def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
-    tmp_path: Path, databricks: bool, page, built_spa
+    tmp_path: Path, databricks: bool, page, built_spa, request: pytest.FixtureRequest
 ) -> None:
     """Read a file, reload/recall, then automatically recover the owned terminal.
 
@@ -63,6 +63,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     tool_completed = threading.Event()
     control_calls: dict[str, str] = {}
     control_results: dict[str, list[dict]] = {}
+    missing_tools: dict[str, list[str]] = {}
     agent_id: str | None = None
     control_tools = {
         "AGY_RELAY_REVIEW": "sys_scheduled_task_create",
@@ -204,6 +205,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                         None,
                     )
                     if declaration is None:
+                        missing_tools[stage] = sorted(d["name"] for d in declarations)
                         parts = [{"text": f"{stage}_TOOL_MISSING"}]
                     else:
                         name = declaration["name"]
@@ -497,6 +499,15 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 for marker in control_tools:
                     composer.fill(f"Exercise {marker} once, then report the result.")
                     page.get_by_role("button", name="Send", exact=True).click()
+                    _wait(
+                        lambda marker=marker: marker in control_calls or marker in missing_tools,
+                        f"Native model never attempted {marker}",
+                        timeout=60,
+                    )
+                    assert marker in control_calls, (
+                        f"Missing {control_tools[marker]}; "
+                        f"native declarations: {missing_tools[marker]}"
+                    )
                     if marker != "AGY_NATIVE_DENY":
                         card = pending.first
                         expect(card).to_be_visible(timeout=60_000)
@@ -535,6 +546,49 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 assert native_settings is not None
                 assert native_settings.read_bytes() == native_settings_bytes
         finally:
+            from omnigent.process_logging import redact_log_text
+
+            diagnostics = Path(request.config.getoption("output", default="test-results")) / (
+                "agy-databricks" if databricks else "agy-direct"
+            )
+            diagnostics.mkdir(parents=True, exist_ok=True)
+            discovered = {
+                "native_tool_names": sorted(
+                    {
+                        d["name"]
+                        for body in captured
+                        for tool in body.get("tools", [])
+                        for d in tool.get("functionDeclarations", [])
+                    }
+                ),
+                "control_calls": control_calls,
+                "missing_tools": missing_tools,
+            }
+            if session_id is not None:
+                relay_file = (
+                    tmp_path
+                    / "data/antigravity-native"
+                    / (bridge_dir_for_bridge_id(session_id).name)
+                    / "tool_relay.json"
+                )
+                with contextlib.suppress(OSError, ValueError):
+                    relay = json.loads(relay_file.read_text())
+                    discovered["relay_tool_names"] = sorted(
+                        t["name"] for t in relay.get("tools", [])
+                    )
+            errors: list[str] = []
+            for log in (tmp_path / "data").rglob("*.log"):
+                with contextlib.suppress(OSError):
+                    with log.open("rb") as handle:
+                        handle.seek(max(0, log.stat().st_size - 64_000))
+                        lines = handle.read().decode(errors="replace").splitlines()
+                    for line in lines:
+                        if any(word in line.lower() for word in ("mcp", "tool_relay", "error")):
+                            errors.append(
+                                redact_log_text(line, include_whitespace_credentials=True)[:1200]
+                            )
+            discovered["service_errors"] = errors[-60:]
+            (diagnostics / "relay-discovery.json").write_text(json.dumps(discovered, indent=2))
             # Finish the recording before deleting the session and its native stream.
             page.context.close()
             (tmp_path / "gateway-requests.json").write_text(json.dumps(captured, indent=2))
