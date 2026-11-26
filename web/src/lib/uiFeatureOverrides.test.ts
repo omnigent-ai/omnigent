@@ -187,6 +187,16 @@ describe("UI feature overrides", () => {
     expect(canBootstrapQuickPick(off)).toBe(false);
   });
 
+  it("overrides warm switching on and off when the server advertises it as false", () => {
+    const reported = info({ quick_pick_palette: false, warm_switch_keep_mounted_ui: false });
+    expect(writeUiFeatureOverride("warm_switch_keep_mounted_ui", true)).toBe(true);
+    expect(isFeatureEnabled(reported, "warm_switch_keep_mounted_ui")).toBe(false);
+    expect(writeUiFeatureOverride("quick_pick_palette", true)).toBe(true);
+    expect(isFeatureEnabled(reported, "warm_switch_keep_mounted_ui")).toBe(true);
+    expect(writeUiFeatureOverride("warm_switch_keep_mounted_ui", false)).toBe(true);
+    expect(isFeatureEnabled(reported, "warm_switch_keep_mounted_ui")).toBe(false);
+  });
+
   it("gates other overrides on the effective reported QuickPick value", () => {
     localStorage.setItem(
       key,

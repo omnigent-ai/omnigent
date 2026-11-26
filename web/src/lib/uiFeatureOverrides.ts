@@ -14,6 +14,11 @@ export const OVERRIDABLE_UI_FEATURES: readonly OverridableUiFeature[] = [
     description: "Write chat messages in a CodeMirror editor that scrolls long drafts.",
   },
   {
+    feature: "warm_switch_keep_mounted_ui",
+    label: "Keep chat mounted on switch",
+    description: "Switch between loaded sidebar sessions without rebuilding the chat view.",
+  },
+  {
     feature: "quick_pick_palette",
     label: "QuickPick command palette",
     description: "Run ⌘K and the session switcher on the fuzzy-matching QuickPick list.",
